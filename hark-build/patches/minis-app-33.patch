@@ -1,0 +1,1134 @@
+diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
+--- a/src/android/app/build.gradle.kts
++++ b/src/android/app/build.gradle.kts
+@@ -321,6 +321,14 @@
+     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+     implementation("com.squareup.okhttp3:okhttp-sse:4.12.0")
+ 
++    // [Mines-offline-asr] Free on-device speech recognition. The System engine
++    // needs a recognition service the ROM ships (Chinese ROMs without the
++    // Google app have none) and the Provider engine needs a paid cloud model,
++    // so the mic button was dead on such a device. Vosk ships prebuilt .so for
++    // every ABI in the AAR, so this adds no NDK work on our side; the model is
++    // Apache-2.0 and downloaded once on first use (see OfflineAsrEngine).
++    implementation("com.alphacephei:vosk-android:0.3.47")
++
+     // Kotlinx Serialization
+     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+ 
+diff --git a/src/android/app/src/main/java/com/openminis/app/speech/OfflineAsrEngine.kt b/src/android/app/src/main/java/com/openminis/app/speech/OfflineAsrEngine.kt
+new file mode 100644
+--- a/src/android/app/src/main/java/com/openminis/app/speech/OfflineAsrEngine.kt
++++ b/src/android/app/src/main/java/com/openminis/app/speech/OfflineAsrEngine.kt
+@@ -0,0 +1,276 @@
++package com.openminis.app.speech
++
++import android.annotation.SuppressLint
++import android.content.Context
++import android.media.AudioFormat
++import android.media.AudioRecord
++import android.media.MediaRecorder
++import android.util.Log
++import com.openminis.app.MinisApp
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import org.json.JSONObject
++import org.vosk.Model
++import org.vosk.Recognizer
++import org.vosk.android.StorageService
++import java.io.File
++import java.util.Locale
++import java.util.concurrent.atomic.AtomicBoolean
++
++/**
++ * [Mines-offline-asr] Free, on-device speech recognition.
++ *
++ * Why this exists. The two engines that shipped before were both unusable on
++ * the device this was written for: the System engine needs a recognition
++ * service the ROM actually ships (Chinese ROMs without the Google app have
++ * none, so `SpeechRecognizer.isRecognitionAvailable` is false AND the
++ * `queryIntentServices` backstop returns empty), and the Provider engine needs
++ * a Voice Input group with a paid cloud model. With neither available the
++ * voice panel showed "当前没有可用的语音识别" and the mic was dead.
++ *
++ * Vosk runs the model entirely locally: no network, no key, no per-minute
++ * charge, and it streams partial results (unlike the one-shot REST provider
++ * path). Model is Apache-2.0 licensed and unpacked once on first use.
++ *
++ * The protocol mirrors BaiLongma's local Whisper service (manager.js spawns a
++ * long-lived recogniser process; here it is an in-process Vosk model instead,
++ * because Android gives us no Python).
++ */
++class OfflineAsrEngine(private val appContext: Context) : SpeechRecognitionEngine {
++
++    companion object {
++        private const val TAG = "OfflineASR"
++
++        /**
++         * Vosk model name. `vosk-model-small-cn-0.22` is ~40 MB unpacked and is
++         * the smallest one that is actually usable for Mandarin dictation;
++         * `vosk-model-small-en-us-0.15` covers English.
++         */
++        const val MODEL_ZH = "vosk-model-small-cn-0.22"
++        const val MODEL_EN = "vosk-model-small-en-us-0.15"
++
++        /** Where [StorageService.unpack] lands the model. */
++        fun modelDir(context: Context, name: String) = File(context.filesDir, name)
++
++        /** True when [name] is unpacked and loadable. */
++        fun modelReady(context: Context, name: String): Boolean {
++            val d = modelDir(context, name)
++            return d.isDirectory && (d.listFiles()?.isNotEmpty() == true)
++        }
++
++        /**
++         * Download + unpack a model. Idempotent, and safe to call repeatedly:
++         * a partial unpack is replaced, not resumed.
++         *
++         * Blocking — call from a background dispatcher.
++         */
++        fun ensureModel(context: Context, name: String, onProgress: (Float) -> Unit = {}): Boolean =
++            runCatching {
++                StorageService.unpack(context, name, "https://alphacephei.com/vosk/models/%s.zip".format(name),
++                    modelDir(context, name).parentFile ?: context.filesDir, onProgress)
++                modelReady(context, name)
++            }.getOrDefault(false)
++
++        private const val SAMPLE_RATE = 16_000
++        private const val MAX_RECORD_SECONDS = 120
++    }
++
++    override val id: String = "offline-vosk"
++    override val displayName: String = "离线识别（本机，免费）"
++    override val supportsPartialResults: Boolean = true
++
++    /**
++     * Cheap: the model directory exists and is non-empty. A model that failed
++     * to download leaves an empty or partial directory, which reads as not
++     * ready rather than as a broken engine.
++     */
++    override val isAvailable: Boolean
++        get() = !degraded && (modelReady(appContext, MODEL_ZH) || modelReady(appContext, MODEL_EN))
++
++    override val supportedLocales: List<Locale> = listOf(Locale.CHINA, Locale.US)
++
++    @Volatile private var degraded = false
++    private var model: Model? = null
++    private var recognizer: Recognizer? = null
++    private var recorder: AudioRecord? = null
++    private var captureJob: Job? = null
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++    private val recording = AtomicBoolean(false)
++
++    override fun markDegraded() { degraded = true }
++
++    override fun clearDegraded() { degraded = false }
++
++    /** Pick the model that matches the requested locale, preferring what is already on disk. */
++    private fun modelFor(locale: Locale): String {
++        val wantEn = locale.language.equals("en", ignoreCase = true)
++        val zh = modelReady(appContext, MODEL_ZH)
++        val en = modelReady(appContext, MODEL_EN)
++        return when {
++            wantEn && en -> MODEL_EN
++            !wantEn && zh -> MODEL_ZH
++            zh -> MODEL_ZH
++            en -> MODEL_EN
++            else -> if (wantEn) MODEL_EN else MODEL_ZH
++        }
++    }
++
++    @SuppressLint("MissingPermission")
++    override fun start(locale: Locale, listener: SpeechRecognitionEngine.Listener) {
++        val name = modelFor(locale)
++        if (!modelReady(appContext, name)) {
++            listener.onError(
++                RecognitionError.UNKNOWN,
++                "离线语音包还没下载：$name",
++            )
++            return
++        }
++        stopCapture()
++        recording.set(true)
++        scope.launch {
++            try {
++                val m = withContext(Dispatchers.IO) { Model(modelDir(appContext, name)) }
++                model = m
++                // 16 kHz mono float grammar off: Vosk's small models are
++                // dictation-oriented, and a grammar would reject anything the
++                // user says that is not in it.
++                val rec = Recognizer(m, SAMPLE_RATE.toFloat())
++                recognizer = rec
++            } catch (e: Throwable) {
++                Log.e(TAG, "model load failed", e)
++                recording.set(false)
++                listener.onError(RecognitionError.UNKNOWN, "离线模型加载失败：${e.message}")
++                return@launch
++            }
++
++            val minBuf = AudioRecord.getMinBufferSize(
++                SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
++            )
++            if (minBuf <= 0) {
++                recording.set(false)
++                listener.onError(RecognitionError.AUDIO_ERROR, "AudioRecord unsupported buffer size.")
++                return@launch
++            }
++            val rec = try {
++                AudioRecord(
++                    MediaRecorder.AudioSource.MIC,
++                    SAMPLE_RATE,
++                    AudioFormat.CHANNEL_IN_MONO,
++                    AudioFormat.ENCODING_PCM_16BIT,
++                    minBuf * 2,
++                )
++            } catch (e: Throwable) {
++                recording.set(false)
++                listener.onError(
++                    com.openminis.app.speech.MicInUse.captureFailure(appContext),
++                    "AudioRecord init failed: ${e.message}",
++                )
++                return@launch
++            }
++            if (rec.state != AudioRecord.STATE_INITIALIZED) {
++                recording.set(false)
++                rec.release()
++                listener.onError(
++                    com.openminis.app.speech.MicInUse.captureFailure(appContext),
++                    "AudioRecord not initialized.",
++                )
++                return@launch
++            }
++            recorder = rec
++            val maxBytes = SAMPLE_RATE * 2 * MAX_RECORD_SECONDS
++            var total = 0
++            val buf = ByteArray(minBuf)
++            val pending = StringBuilder()
++            try {
++                rec.startRecording()
++                listener.onReadyForSpeech()
++                while (recording.get()) {
++                    val n = rec.read(buf, 0, buf.size)
++                    if (n <= 0) continue
++                    total += n
++                    if (total > maxBytes) {
++                        listener.onError(RecognitionError.UNKNOWN, "已达到单次录音上限")
++                        break
++                    }
++                    val rms = rmsOf(buf, n)
++                    listener.onRmsDb(rms)
++                    // acceptWaveForm returns a JSON envelope; a non-empty
++                    // "partial" means an interim hypothesis we can show live.
++                    if (recognizer?.acceptWaveForm(buf, n) == true) {
++                        val text = finalText()
++                        if (text.isNotEmpty()) {
++                            pending.append(text)
++                            listener.onFinal(pending.toString())
++                            pending.setLength(0)
++                        }
++                    } else {
++                        val p = partialText()
++                        if (p.isNotEmpty()) listener.onPartial(p)
++                    }
++                }
++                // Flush whatever is buffered when the user stops.
++                val tail = finalText()
++                val rest = pending.toString() + tail
++                if (rest.isNotBlank()) listener.onFinal(rest.trim())
++            } catch (e: Throwable) {
++                Log.e(TAG, "capture failed", e)
++                listener.onError(
++                    com.openminis.app.speech.MicInUse.captureFailure(appContext),
++                    e.message,
++                )
++            } finally {
++                stopCapture()
++            }
++        }
++    }
++
++    override fun stop() {
++        // Setting the flag false makes the capture loop exit and flush its
++        // final result through the listener.
++        recording.set(false)
++    }
++
++    override fun cancel() {
++        recording.set(false)
++        scope.launch { stopCapture() }
++    }
++
++    private fun stopCapture() {
++        recording.set(false)
++        runCatching { recorder?.stop() }
++        runCatching { recorder?.release() }
++        recorder = null
++        runCatching { recognizer?.close() }
++        recognizer = null
++        // Model is the expensive part (tens of MB mmap'd); keep it cached so
++        // the next take starts instantly.
++    }
++
++    private fun finalText(): String = runCatching {
++        val r = recognizer?.result ?: return ""
++        JSONObject(r).optString("text", "")
++    }.getOrDefault("")
++
++    private fun partialText(): String = runCatching {
++        val r = recognizer?.partialResult ?: return ""
++        JSONObject(r).optString("partial", "")
++    }.getOrDefault("")
++
++    private fun rmsOf(buf: ByteArray, n: Int): Float {
++        var sum = 0.0
++        var i = 0
++        while (i + 1 < n) {
++            val lo = buf[i].toInt() and 0xFF
++            val hi = buf[i + 1].toInt()
++            val v = ((hi shl 8) or lo).toShort().toInt()
++            sum += v.toDouble() * v
++            i += 2
++        }
++        val mean = if (n > 0) sum / (n / 2) else 0.0
++        return (10 * kotlin.math.log10(mean.coerceAtLeast(1.0))).toFloat()
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/speech/SpeechRecognitionManager.kt b/src/android/app/src/main/java/com/openminis/app/speech/SpeechRecognitionManager.kt
+--- a/src/android/app/src/main/java/com/openminis/app/speech/SpeechRecognitionManager.kt
++++ b/src/android/app/src/main/java/com/openminis/app/speech/SpeechRecognitionManager.kt
+@@ -3,6 +3,10 @@
+ import android.content.Context
+ import android.content.SharedPreferences
+ import android.util.Log
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.launch
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.flow.asStateFlow
+@@ -173,6 +177,10 @@
+         engines.clear()
+         engines.add(SystemSpeechRecognitionEngine(appContext))
+         engines.add(ProviderSpeechRecognitionEngine(appContext))
++        // [Mines-offline-asr] Registered last but it is what makes the mic
++        // work at all on a ROM that ships no recognition service — see the
++        // KDoc on OfflineAsrEngine. Its model is fetched on demand below.
++        engines.add(OfflineAsrEngine(appContext))
+ 
+         _selectedEngineId.value = prefs.getString(KEY_ENGINE_ID, null) ?: pickDefaultEngineId()
+         prefs.getString(KEY_LOCALE, null)?.let { tag ->
+@@ -181,6 +189,10 @@
+         refreshAvailability()
+         refreshSupportedLocales()
+         observeAppLifecycle()
++        // [Mines-offline-asr] Last: only does anything when the two engines
++        // above are both unavailable, which is the state the voice panel
++        // reported as "当前没有可用的语音识别".
++        ensureOfflineModelAsync()
+     }
+ 
+     /**
+@@ -343,6 +355,45 @@
+     fun refreshAvailability() {
+         _isAvailable.value = engines.any { it.isAvailable }
+     }
++
++    /**
++     * [Mines-offline-asr] Fetch the free offline model in the background when
++     * nothing else can recognise speech, so the mic button stops being dead.
++     *
++     * This is the whole point of the offline engine: a Chinese ROM with no
++     * Google app has no recognition service, and the provider engine needs a
++     * paid cloud model, so without this the voice panel would say
++     * "当前没有可用的语音识别" forever. Once the ~40 MB model lands,
++     * [refreshAvailability] flips true and the offline engine becomes the
++     * selection — no user action required beyond the one-time download.
++     *
++     * Safe to call on every init: it returns immediately when the model is
++     * already there or a fetch is already running.
++     */
++    fun ensureOfflineModelAsync() {
++        if (!::appContext.isInitialized) return
++        val offline = engines.filterIsInstance<OfflineAsrEngine>().firstOrNull() ?: return
++        if (engines.any { it.isAvailable }) return
++        if (OfflineAsrEngine.modelReady(appContext, OfflineAsrEngine.MODEL_ZH) ||
++            OfflineAsrEngine.modelReady(appContext, OfflineAsrEngine.MODEL_EN)
++        ) return
++        if (offlineFetching) return
++        offlineFetching = true
++        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
++            try {
++                val ok = OfflineAsrEngine.ensureModel(appContext, OfflineAsrEngine.MODEL_ZH)
++                Log.i(TAG, "offline model fetch ok=$ok")
++                if (ok) {
++                    _selectedEngineId.value = offline.id
++                    refreshAvailability()
++                }
++            } finally {
++                offlineFetching = false
++            }
++        }
++    }
++
++    @Volatile private var offlineFetching = false
+ 
+     private fun currentEngine(): SpeechRecognitionEngine? {
+         val byId = engines.firstOrNull { it.id == _selectedEngineId.value }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
+@@ -195,11 +195,11 @@
+                     ) {
+                         BrandIcon(base)
+                         Spacer(Modifier.width(14.dp))
+-                        Text(base.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
++                        Text(base.name, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
+                         TextButton(onClick = { addAccount(base) }, modifier = Modifier.heightIn(min = 44.dp)) {
+                             Icon(Icons.Outlined.Add, null, modifier = Modifier.size(20.dp))
+                             Spacer(Modifier.width(4.dp))
+-                            Text("添加账号", fontSize = 16.sp)
++                            Text("添加账号", fontSize = 14.sp)
+                         }
+                     }
+                     ids.forEach { id ->
+@@ -217,7 +217,7 @@
+                             }
+                             Column(Modifier.weight(1f)) {
+                                 Text(e?.account?.takeIf { it.isNotBlank() } ?: "账号 ${id.substringAfter('#', "1")}",
+-                                    style = MaterialTheme.typography.bodyLarge)
++                                    style = MaterialTheme.typography.bodyMedium)
+                                 Text(if (isDef) "已连接 · 默认" else "已连接", style = MaterialTheme.typography.bodyMedium, color = Green)
+                             }
+                             Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+@@ -248,7 +248,7 @@
+                     Icon(Icons.Outlined.Add, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(26.dp))
+                 }
+                 Spacer(Modifier.width(14.dp))
+-                Text("添加网站登录", style = MaterialTheme.typography.titleMedium)
++                Text("添加网站登录", style = MaterialTheme.typography.titleSmall)
+             }
+         }
+     }
+@@ -260,7 +260,7 @@
+             title = { Text("其他网站") },
+             text = {
+                 OutlinedTextField(url, { url = it }, label = { Text("网址，例如 panel.example.com") }, singleLine = true,
+-                    textStyle = MaterialTheme.typography.titleMedium)
++                    textStyle = MaterialTheme.typography.titleSmall)
+             },
+             confirmButton = {
+                 Button(enabled = url.isNotBlank(), onClick = {
+@@ -302,7 +302,7 @@
+         BrandIcon(k)
+         Spacer(Modifier.width(14.dp))
+         Column(Modifier.weight(1f)) {
+-            Text(k.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Medium)
++            Text(k.name, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Medium)
+             Text(sub, style = MaterialTheme.typography.bodyMedium, color = if (connected) Green else MaterialTheme.colorScheme.onSurfaceVariant,
+                 maxLines = 2)
+         }
+@@ -311,7 +311,7 @@
+             Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+         } else {
+             FilledTonalButton(onClick = onConnect, modifier = Modifier.heightIn(min = 44.dp)) {
+-                Text("连接", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
++                Text("连接", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+             }
+         }
+     }
+@@ -347,10 +347,10 @@
+             BrandIcon(kind, 64.dp)
+             Spacer(Modifier.width(16.dp))
+             Column(Modifier.weight(1f)) {
+-                Text(kind.name, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
++                Text(kind.name, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+                 Text(
+                     if (entry != null) "已连接" + (entry.account.takeIf { it.isNotBlank() }?.let { " · $it" } ?: "") else kind.desc,
+-                    style = MaterialTheme.typography.bodyLarge,
++                    style = MaterialTheme.typography.bodyMedium,
+                     color = if (entry != null) Green else MaterialTheme.colorScheme.onSurfaceVariant,
+                 )
+             }
+@@ -364,7 +364,7 @@
+                     },
+                     border = BorderStroke(1.dp, Red),
+                     modifier = Modifier.heightIn(min = 44.dp),
+-                ) { Text("断开", color = Red, fontSize = 16.sp) }
++                ) { Text("断开", color = Red, fontSize = 14.sp) }
+             }
+         }
+ 
+@@ -375,9 +375,9 @@
+                 Icon(if (isDef) Icons.Filled.Star else Icons.Outlined.StarBorder, null,
+                     tint = if (isDef) Color(0xFFFFB300) else MaterialTheme.colorScheme.onSurfaceVariant)
+                 Spacer(Modifier.width(8.dp))
+-                Text(if (isDef) "默认账号：AI 不指定账号时用它" else "不是默认账号", style = MaterialTheme.typography.bodyLarge,
++                Text(if (isDef) "默认账号：AI 不指定账号时用它" else "不是默认账号", style = MaterialTheme.typography.bodyMedium,
+                     modifier = Modifier.weight(1f))
+-                if (!isDef) TextButton(onClick = { PlusVault.setDefault(context, kind.id) }) { Text("设为默认", fontSize = 16.sp) }
++                if (!isDef) TextButton(onClick = { PlusVault.setDefault(context, kind.id) }) { Text("设为默认", fontSize = 14.sp) }
+             }
+         }
+ 
+@@ -415,7 +415,7 @@
+             PlusSection(null) {
+                 Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+                     Column(Modifier.weight(1f)) {
+-                        Text("交给 AI 使用", style = MaterialTheme.typography.titleMedium)
++                        Text("交给 AI 使用", style = MaterialTheme.typography.titleSmall)
+                         Text("以 ${kind.envKey} 提供给沙箱，聊天里自动打码", style = MaterialTheme.typography.bodyMedium,
+                             color = MaterialTheme.colorScheme.onSurfaceVariant)
+                     }
+@@ -433,7 +433,7 @@
+                     var on by remember { mutableStateOf(PlusConnect.keepAliveOn(context, kind.id)) }
+                     Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+                         Column(Modifier.weight(1f)) {
+-                            Text("保活", style = MaterialTheme.typography.titleMedium)
++                            Text("保活", style = MaterialTheme.typography.titleSmall)
+                             val last = PlusVault.extra(kind.id, "keepalive_last")?.toLongOrNull()
+                             Text(
+                                 "免费服务器两周不登录会被归档。打开后每 10 天在后台用已保存的登录打开一次面板；登录失效会发通知提醒你。" +
+@@ -461,7 +461,7 @@
+                     @Suppress("UNUSED_EXPRESSION") permVersion
+                     val cur = PlusVault.level(kind, cap)
+                     Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp)) {
+-                        Text(cap.label + if (cap.locked) "（固定）" else "", style = MaterialTheme.typography.titleMedium)
++                        Text(cap.label + if (cap.locked) "（固定）" else "", style = MaterialTheme.typography.titleSmall)
+                         Spacer(Modifier.height(8.dp))
+                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                             PermLevel.entries.forEach { lv ->
+@@ -474,7 +474,7 @@
+                                         .clickable(enabled = !cap.locked) { PlusVault.setLevel(kind, cap, lv) },
+                                     contentAlignment = Alignment.Center,
+                                 ) {
+-                                    Text(lv.label, fontSize = 16.sp, fontWeight = if (sel) FontWeight.Bold else FontWeight.Normal,
++                                    Text(lv.label, fontSize = 14.sp, fontWeight = if (sel) FontWeight.Bold else FontWeight.Normal,
+                                         color = if (sel) color else if (cap.locked) MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
+                                         else MaterialTheme.colorScheme.onSurface)
+                                 }
+@@ -494,7 +494,7 @@
+         onClick = onClick,
+         modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp).heightIn(min = 56.dp),
+         shape = RoundedCornerShape(14.dp),
+-    ) { Text(text, fontSize = 18.sp, fontWeight = FontWeight.SemiBold) }
++    ) { Text(text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold) }
+ }
+ 
+ @Composable
+@@ -503,7 +503,7 @@
+         onClick = onClick,
+         modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp).padding(bottom = 10.dp).heightIn(min = 52.dp),
+         shape = RoundedCornerShape(14.dp),
+-    ) { Text(text, fontSize = 17.sp) }
++    ) { Text(text, fontSize = 14.sp) }
+ }
+ 
+ /** GitHub / Microsoft: OAuth device flow with the code shown big, copied, and the official page opened. */
+@@ -557,17 +557,17 @@
+         val c = code
+         if (c != null) {
+             Column(Modifier.fillMaxWidth().padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+-                Text("你的授权码", style = MaterialTheme.typography.titleMedium)
++                Text("你的授权码", style = MaterialTheme.typography.titleSmall)
+                 Spacer(Modifier.height(8.dp))
+                 Text(c.userCode, fontSize = 40.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace, letterSpacing = 4.sp,
+                     color = MaterialTheme.colorScheme.primary)
+                 Spacer(Modifier.height(8.dp))
+-                Text(status, style = MaterialTheme.typography.bodyLarge)
++                Text(status, style = MaterialTheme.typography.bodyMedium)
+             }
+             SecondaryAction("再打开授权页") { openExternal(context, c.verifyUrl) }
+         } else {
+             BigAction(if (PlusVault.entries.value.containsKey(kind.id)) "重新授权" else "一键授权") { start() }
+-            if (status.isNotEmpty()) Text(status, style = MaterialTheme.typography.bodyLarge,
++            if (status.isNotEmpty()) Text(status, style = MaterialTheme.typography.bodyMedium,
+                 modifier = Modifier.padding(horizontal = 16.dp).padding(bottom = 10.dp))
+         }
+         if (kind.loginUrl != null) SecondaryAction(if (kind.method == ConnMethod.GITHUB) "也在 Mines 浏览器里登录 GitHub 网页" else "网页登录 Outlook") {
+@@ -623,24 +623,24 @@
+                 Row(verticalAlignment = Alignment.CenterVertically) {
+                     Icon(Icons.Outlined.ContentPaste, null, tint = Green)
+                     Spacer(Modifier.width(8.dp))
+-                    Text("剪贴板里有 ${kind.name} 的${kind.keyLabel}", style = MaterialTheme.typography.titleMedium)
+-                }
+-                Text("••••" + f.takeLast(4), style = MaterialTheme.typography.bodyLarge, modifier = Modifier.padding(vertical = 6.dp))
++                    Text("剪贴板里有 ${kind.name} 的${kind.keyLabel}", style = MaterialTheme.typography.titleSmall)
++                }
++                Text("••••" + f.takeLast(4), style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(vertical = 6.dp))
+                 Button(
+                     onClick = { if (!needsAccount || account.isNotBlank()) save(f) else Toast.makeText(context, "先填上你的 Gmail 地址", Toast.LENGTH_SHORT).show() },
+                     colors = ButtonDefaults.buttonColors(containerColor = Green),
+                     modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
+-                ) { Text("一键填入并连接", fontSize = 18.sp, fontWeight = FontWeight.SemiBold) }
++                ) { Text("一键填入并连接", fontSize = 14.sp, fontWeight = FontWeight.SemiBold) }
+             }
+         }
+         if (needsAccount) OutlinedTextField(account, { account = it }, label = { Text("Gmail 地址") }, singleLine = true,
+-            textStyle = MaterialTheme.typography.titleMedium,
++            textStyle = MaterialTheme.typography.titleSmall,
+             modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp))
+         OutlinedTextField(
+             manual, { manual = it },
+             label = { Text(if (PlusVault.hasSecret(kind.id)) "或手动粘贴（已保存 ${PlusVault.preview(kind.id)}）" else "或手动粘贴${kind.keyLabel}") },
+             singleLine = true, visualTransformation = PasswordVisualTransformation(),
+-            textStyle = MaterialTheme.typography.titleMedium,
++            textStyle = MaterialTheme.typography.titleSmall,
+             modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp),
+         )
+         if (kind.id == "gemini") {
+@@ -660,7 +660,7 @@
+         if (manual.isNotBlank()) Button(
+             onClick = { if (!needsAccount || account.isNotBlank()) save(manual.trim()) else Toast.makeText(context, "先填上你的 Gmail 地址", Toast.LENGTH_SHORT).show() },
+             modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp).heightIn(min = 52.dp),
+-        ) { Text("保存并连接", fontSize = 17.sp) }
++        ) { Text("保存并连接", fontSize = 14.sp) }
+         Spacer(Modifier.height(6.dp))
+     }
+ }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ScheduledTaskCard.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ScheduledTaskCard.kt
+--- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ScheduledTaskCard.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ScheduledTaskCard.kt
+@@ -111,15 +111,21 @@
+             .fillMaxWidth()
+             .padding(vertical = 4.dp)
+             .clip(shape)
+-            .background(ScheduledAccent.copy(alpha = 0.07f))
+-            .border(0.8.dp, ScheduledAccent.copy(alpha = 0.35f), shape)
++            // [Mines-glass-cards] Black translucent glass, as asked: a dark
++            // scrim under the content instead of a 7%-alpha accent wash, with
++            // a light hairline edge so the card reads as a pane of glass
++            // floating on the transcript rather than a tinted rectangle. The
++            // accent survives on the icon, the chip and the cancel label — it
++            // is the card's identity colour, not its surface.
++            .background(Color.Black.copy(alpha = 0.55f))
++            .border(0.8.dp, Color.White.copy(alpha = 0.14f), shape)
+             .clickable { showingDetail = true }
+             .padding(horizontal = 14.dp, vertical = 10.dp),
+         verticalAlignment = Alignment.CenterVertically,
+     ) {
+         Box(
+             modifier = Modifier.size(34.dp).clip(CircleShape)
+-                .background(ScheduledAccent.copy(alpha = 0.15f)),
++                .background(ScheduledAccent.copy(alpha = 0.18f)),
+             contentAlignment = Alignment.Center,
+         ) {
+             Icon(
+@@ -153,7 +159,11 @@
+                     marker.label.ifEmpty { marker.prompt.take(40) },
+                     fontSize = 13.sp,
+                     fontWeight = FontWeight.Medium,
+-                    color = ChatColors.primaryText,
++                    // Forced light: the card surface is now a dark scrim in
++                    // BOTH themes (see the background above), so a
++                    // theme-following text colour would go dark-on-dark in
++                    // light mode and become unreadable.
++                    color = Color.White,
+                     maxLines = 1,
+                     overflow = TextOverflow.Ellipsis,
+                 )
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Avatars.kt b/src/android/app/src/main/java/com/openminis/app/plus/Avatars.kt
+--- a/src/android/app/src/main/java/com/openminis/app/plus/Avatars.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/Avatars.kt
+@@ -190,11 +190,17 @@
+     fun draw(
+         canvas: Canvas, w: Float, h: Float,
+         style: String, face: Boolean, ringColor: Int?, bob: Float = 0f,
++        // [Mines-pet-motion] Lateral sway and a vertical squash, so the desk
++        // pet can breathe, drift and dip instead of only translating. Both
++        // default to "no motion" so every existing caller (the Today card, the
++        // voice screen, the avatar picker) keeps its current still rendering.
++        sway: Float = 0f,
++        squash: Float = 1f,
+         crop: AvatarCrop = AvatarCrop(), version: Long = 0L, noBg: Boolean = false,
+     ) {
+         load(Avatars.normalize(style), version, noBg)
+         val size = minOf(w, h)
+-        val left = (w - size) / 2f
++        val left = (w - size) / 2f + sway * size
+         val top = (h - size) / 2f + bob * size
+         val c = custom
+         if (c != null) {
+@@ -214,6 +220,10 @@
+         }
+         if (face) {
+             val bmp = builtinFace ?: return
++            // Squash about the bottom edge, the way a head tucks rather than
++            // shrinking in place — scaling about the centre reads as a zoom.
++            val drawH = size * squash
++            val rect = RectF(left, top + (size - drawH), left + size, top + size)
+             canvas.save()
+             clip.reset(); clip.addCircle(left + size / 2, top + size / 2, size / 2, Path.Direction.CW)
+             canvas.clipPath(clip)
+@@ -221,7 +231,7 @@
+                 paint.color = (rc and 0x00FFFFFF) or (0x33 shl 24)
+                 canvas.drawCircle(left + size / 2, top + size / 2, size / 2, paint)
+             }
+-            canvas.drawBitmap(bmp, null, RectF(left, top, left + size, top + size), paint)
++            canvas.drawBitmap(bmp, null, rect, paint)
+             canvas.restore()
+             drawRing(canvas, left, top, size, ringColor)
+         } else {
+@@ -260,15 +270,38 @@
+         super.onDraw(canvas)
+         val st = PlusPrefs.state.value
+         val t = (System.currentTimeMillis() - start) / 1000f
++        // [Mines-pet-motion] The old motion was a single 0.02-amplitude sine at
++        // 2.2 rad/s — 2% of the height, which reads as nothing at all, so the
++        // desk pet looked like a static picture. Three composable motions
++        // instead, each on its own frequency so they never lock into one
++        // visible cycle:
++        //   • breathing — a slow vertical bob, 6% of the height
++        //   • sway      — a lateral drift, 2.5% of the width, out of phase
++        //   • blink     — the built-in *_face drawables have no separate eye
++        //                  frames, so "blink" is a brief scale dip on Y,
++        //                  which reads as the character tucking its chin
++        // The custom (GIF / animated WebP) path animates itself through
++        // Animatable and is left alone.
++        val breathing = sin(t * 1.6f) * 0.06f
++        val sway = sin(t * 0.9f + 1.1f) * 0.025f
++        val blink = if (blinkPhase(t)) 0.94f else 1f
+         renderer.draw(
+             canvas, width.toFloat(), height.toFloat(),
+             style ?: st.petStyle, face, if (showRing) st.petColor else null,
+-            bob = if (bob) sin(t * 2.2f) * 0.02f else 0f,
++            bob = if (bob) breathing else 0f,
++            sway = if (bob) sway else 0f,
++            squash = if (bob) blink else 1f,
+             crop = crop ?: AvatarCrop(st.avatarScale, st.avatarOffX, st.avatarOffY),
+             version = version ?: st.avatarVersion,
+             noBg = noBg ?: st.avatarRemoveBg,
+         )
+-        if (bob) postInvalidateDelayed(50)
++        if (bob) postInvalidateDelayed(33)
++    }
++
++    /** True during the ~120 ms dip of a ~4 s blink cycle. */
++    private fun blinkPhase(t: Float): Boolean {
++        val phase = (t * 1000f) % 4000f
++        return phase < 120f
+     }
+ 
+     override fun onDetachedFromWindow() {
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt
+@@ -88,9 +88,21 @@
+                 PlusPrefs.update(context) { it.copy(workMode = PlusState.MODE_LOCAL) }
+                 PlusVps.syncToSandbox(context)
+             }
++            // [Mines-server-card] "VPS" was jargon for what the section below
++            // already calls 服务器, and the card said nothing about WHICH
++            // server. Same name, plus the two facts you actually want before
++            // handing work over: what OS it runs, and where traffic leaves.
+             ModeCard(
+-                Modifier.weight(1f), Icons.Outlined.Cloud, "VPS", "重活交给服务器",
++                Modifier.weight(1f), Icons.Outlined.Cloud, "服务器", "重活交给服务器",
+                 selected = st.isVps,
++                facts = buildList {
++                    if (effective != PlusState.MODE_LOCAL) {
++                        best?.let { b ->
++                            add("系统：${b.osLabel.ifBlank { "检测中" }}")
++                            add("出口：${b.egressIp.ifBlank { "检测中" }}")
++                        }
++                    }
++                },
+             ) {
+                 PlusPrefs.update(context) { it.copy(workMode = PlusState.MODE_VPS) }
+                 check()
+@@ -186,6 +198,10 @@
+ private fun ModeCard(
+     modifier: Modifier, icon: ImageVector, title: String, sub: String,
+     selected: Boolean, onClick: () -> Unit,
++    // [Mines-server-card] Extra facts rendered under the subtitle — the VPS
++    // card shows 系统 and 出口地址 so the user can see at a glance which box
++    // they are about to hand work to, and where traffic leaves from.
++    facts: List<String> = emptyList(),
+ ) {
+     val primary = MaterialTheme.colorScheme.primary
+     Column(
+@@ -208,6 +224,21 @@
+         Spacer(Modifier.height(10.dp))
+         Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+         Text(sub, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
++        // A single-line card keeps a fixed height, so the facts are only
++        // drawn when there is something to say — an empty VPS card would
++        // otherwise grow a pair of blank lines.
++        if (facts.isNotEmpty()) {
++            Spacer(Modifier.height(6.dp))
++            facts.forEach { f ->
++                Text(
++                    f,
++                    style = MaterialTheme.typography.bodySmall,
++                    color = if (selected) primary else MaterialTheme.colorScheme.onSurfaceVariant,
++                    maxLines = 1,
++                    overflow = TextOverflow.Ellipsis,
++                )
++            }
++        }
+     }
+ }
+ 
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusPrefs.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusPrefs.kt
+--- a/src/android/app/src/main/java/com/openminis/app/plus/PlusPrefs.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/PlusPrefs.kt
+@@ -20,6 +20,15 @@
+     /** Last measured TCP connect latency in ms, -1 = unknown, -2 = unreachable. */
+     val lastLatencyMs: Int = -1,
+     val lastCheckedAt: Long = 0L,
++    /**
++     * [Mines-server-card] What the box reports about itself, collected during
++     * the periodic probe and shown on the 工作位置 card. Empty until the first
++     * successful probe — an empty string reads as "检测中", never as a wrong
++     * value.
++     */
++    val osLabel: String = "",
++    /** The IP the server's own traffic leaves from, as it sees itself. */
++    val egressIp: String = "",
+ ) {
+     val target: String get() = "$user@$host"
+ }
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt
+--- a/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt
+@@ -57,14 +57,58 @@
+         val results = withContext(Dispatchers.IO) {
+             servers.map { s -> async { s.id to (if (s.enabled) probe(s) else -1) } }.awaitAll()
+         }.toMap()
++        // [Mines-server-card] A reachable box is worth describing: ask it what
++        // it is and where its traffic leaves, so the 工作位置 card can show
++        // 系统 / 出口 without the user opening a terminal. Runs only for the
++        // server that is actually online, and a failure leaves the previous
++        // values alone rather than blanking them.
++        val facts = HashMap<String, Pair<String, String>>()
++        val best = servers.filter { it.enabled && (results[it.id] ?: -1) >= 0 }
++            .minByOrNull { results[it.id] ?: Int.MAX_VALUE }
++        best?.let { s ->
++            describe(s)?.let { facts[s.id] = it }
++        }
+         val now = System.currentTimeMillis()
+         PlusPrefs.update(context) { st ->
+             st.copy(servers = st.servers.map { s ->
+                 val r = results[s.id] ?: return@map s
+-                s.copy(lastLatencyMs = r, lastCheckedAt = now)
++                val f = facts[s.id]
++                if (f == null) s.copy(lastLatencyMs = r, lastCheckedAt = now)
++                else s.copy(lastLatencyMs = r, lastCheckedAt = now, osLabel = f.first, egressIp = f.second)
+             })
+         }
+         syncToSandbox(context)
++    }
++
++    /**
++     * [Mines-server-card] Ask a reachable server for its OS and egress IP.
++     *
++     * `uname -sr` for the system, and the address the box itself sees as its
++     * outbound one — an echo service reached from the server, not from the
++     * phone, which is the whole point (the phone's own egress is irrelevant
++     * when the work runs there). Both come back in one SSH round trip so a
++     * slow link costs one connection, not two.
++     *
++     * Returns null on any failure; callers keep the last known values.
++     */
++    suspend fun describe(server: VpsServer): Pair<String, String>? = withContext(Dispatchers.IO) {
++        runCatching {
++            val cmd = "uname -sr 2>/dev/null; " +
++                "(curl -fsS --max-time 6 https://api.ipify.org 2>/dev/null || " +
++                " curl -fsS --max-time 6 https://ifconfig.me 2>/dev/null || " +
++                " wget -qO- --timeout=6 https://api.ipify.org 2>/dev/null) | tail -n 1"
++            val out = com.openminis.app.sandbox.ShellExecutor.execute(
++                null,
++                "minis-vps run ${server.id} $cmd",
++                timeout = 25_000L,
++            )
++            if (out.exitCode != 0) return@runCatching null
++            val lines = out.output.lines().map { it.trim() }.filter { it.isNotEmpty() }
++            val os = lines.firstOrNull()?.take(48) ?: return@runCatching null
++            val ip = lines.lastOrNull { it.matches(Regex("^[0-9a-fA-F.:]{7,45}$")) }?.take(45)
++            if (ip.isNullOrEmpty()) return@runCatching null
++            os to ip
++        }.getOrNull()
+     }
+ 
+     /** Servers in the order minis-vps should try them. */
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt b/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt
+--- a/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt
+@@ -282,12 +282,20 @@
+             val petSize = height / 1.6f
+             val left = width - petSize
+             val topY = height - petSize
+-            // Gentle bob only (no blink): the characters are pictures.
+-            val bob = if (held) -0.03f else sin(t * 2.2f) * 0.018f
++            // [Mines-pet-motion] Dropped the old `bob` local: it was a single
++            // 1.8%-amplitude sine, replaced below by breathing + sway + dip.
++            // [Mines-pet-motion] Same three composable motions AvatarView got:
++            // a 6% breath, a 2.5% sway out of phase, and a brief dip on a ~4 s
++            // cycle. The old single 1.8%-amplitude sine at 12 fps was
++            // effectively a still image.
++            val breathing = sin(t * 1.6f) * 0.06f
++            val sway = sin(t * 0.9f + 1.1f) * 0.025f
++            val dip = if (((t * 1000f) % 4000f) < 120f) 0.94f else 1f
+             canvas.save()
+             canvas.translate(left, topY)
+             renderer.draw(canvas, petSize, petSize, st.petStyle, face = false,
+-                ringColor = if (st.petStyle == Avatars.CUSTOM) st.petColor else null, bob = bob,
++                ringColor = if (st.petStyle == Avatars.CUSTOM) st.petColor else null, bob = breathing,
++                sway = sway, squash = dip,
+                 crop = AvatarCrop(st.avatarScale, st.avatarOffX, st.avatarOffY),
+                 version = st.avatarVersion, noBg = st.avatarRemoveBg)
+             canvas.restore()
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt
+--- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt
+@@ -62,8 +62,8 @@
+   android-a11y-cli <group> <subcommand> [flags]
+ 
+ Groups:
+-  ui        dump | find | info | node | screenshot
+-  tap       node | xy | text | id
++  ui        list | dump | find | info | node | screenshot
++  tap       node | xy | text | id | <编号>
+   input     text | clear | key
+   scroll    node | xy | to-text
+   gesture   swipe | pinch | path
+@@ -74,8 +74,21 @@
+   extract   text | list | form
+   service   status | ping
+ 
++推荐流程（两步一次交互，不用啃整棵界面树）：
++  1. android-a11y-cli ui list              → 屏幕上可点的东西，带编号
++  2. android-a11y-cli tap 3                → 点第 3 个
++     android-a11y-cli input text 3 "内容"  → 往第 3 个输入框打字
++
++需要"看清屏幕再决定"时（Google Computer Use 那套看图打法）：
++  android-a11y-cli ui screenshot           → 截图，自己看
++  android-a11y-cli tap xy 540 1200         → 按坐标点
++
++ui list 参数：--limit N（默认60） --depth N（默认40） --all（含不可点节点）
++dump / find 输出完整 JSON，节点多了会很大，只在 list 不够用时才用。
++
+ Output: JSON envelope { ok, data | error: { code, message } }.
+ Use --compact to emit on a single line; --quiet to strip the envelope.
++ui list 与帮助文本本身是纯文本，不带信封。
+ 
+ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
+ """
+@@ -170,12 +183,22 @@
+                     args,
+                     "SERVICE_NOT_RUNNING",
+                     if (restricted) {
+-                        "Android is blocking the accessibility toggle for this install " +
+-                            "(\"Restricted setting\" — applies to apps installed from a " +
+-                            "downloaded APK). Allow it via App info → ⋮ → Allow restricted " +
+-                            "settings, then enable Minis under Settings → Accessibility. " +
+-                            "Settings → Permissions → System Permissions has a one-tap fix " +
+-                            "when Shizuku is available."
++                        // [Mines-a11y-restricted-ux] The old text named the
++                        // cause but left the user to hunt for the toggle, and
++                        // the one-tap path it pointed at (Settings →
++                        // Permissions → System Permissions) needs Shizuku,
++                        // which is the very thing that is not available. Spell
++                        // out the manual route, name the package so the right
++                        // entry is findable in a long app list, and link to
++                        // the in-app page that can repair it with Shizuku once
++                        // Shizuku is connected.
++                        "Android 把这个安装包标记成了「受限设置」，辅助功能开关是灰的，点不动。" +
++                            "原因：APK 是从浏览器/文件管理器下载后点开的，系统会默认拦一下。" +
++                            "\n\n手动解开（一次就好）：" +
++                            "\n  设置 → 应用 → 找到 Minis（包名 com.openminis.mines.plus）→ 右上角 ⋮ → 允许受限设置" +
++                            "\n  然后回到 设置 → 辅助功能 → Minis，打开开关" +
++                            "\n\n连上 Shizuku 后可以一键修：[设置 → 权限](minis://settings/permissions)" +
++                            "\n\n如果刚才那次就是重新安装的，注意：卸载后用「用 Play 商店安装」以外的来源再装，还是会受限。"
+                     } else {
+                         "Accessibility permission was revoked (this happens after a force-stop). " +
+                             "Re-enable Minis under Settings → Accessibility, or use Settings → " +
+@@ -290,8 +313,108 @@
+             "info"       -> uiInfo(args)
+             "node"       -> uiNode(args)
+             "screenshot" -> uiScreenshot(args, sessionId)
++            // [Mines-a11y-list] The one command that makes this tool usable:
++            // a numbered snapshot of what is actually tappable, so a tap is a
++            // single follow-up instead of dump → parse JSON → tap node <id>.
++            "list"       -> uiList(args)
+             else         -> NativeOffloadResult(2, "$TOOL ui: unknown action\n$UI_HELP")
+         }
++    }
++
++    /**
++     * [Mines-a11y-list] Numbered snapshot of the interactive elements on
++     * screen, as plain text.
++     *
++     * The old surface was `ui dump` (a full JSON tree, hundreds of nodes, most
++     * of them layout containers) followed by `tap node <id>`. Driving the UI
++     * that way costs three round trips per interaction and the intermediate
++     * output is large enough to crowd out everything else in the transcript.
++     *
++     * `ui list` prints only what a person would tap or type into, numbered:
++     *
++     *     1  [设置]            Button            (540, 210)
++     *     2  [搜索]            EditText          (540, 320)
++     *
++     * and `tap 1` resolves the number against the most recent snapshot, so
++     * the common case is `ui list` → `tap 3`. `--all` keeps non-interactive
++     * nodes for when the list alone is not enough.
++     */
++    private fun uiList(args: OffloadArgs): NativeOffloadResult {
++        val svc = svcOrThrow()
++        val limit = args.getInt("limit") ?: 60
++        val depth = args.getInt("depth") ?: 40
++        val all = args.hasFlag("all")
++        val collected = ArrayList<AccessibilityNodeInfo>()
++        for (root in svc.rootNodes()) {
++            collectListable(root, depth, 0, collected, limit, all)
++        }
++        val sb = StringBuilder()
++        val ids = ArrayList<String>(collected.size)
++        val (pkg, cls) = svc.foregroundPackage()
++        sb.append("$pkg / $cls\n")
++        collected.forEachIndexed { i, n ->
++            // Register the node so the number stays resolvable after this
++            // command returns — AccessibilityNodeInfo handles go stale, but
++            // the registry keeps them alive for the tap that follows.
++            val id = svc.nodeRegistry.put(n)
++            ids.add(id)
++            val rect = Rect(); n.getBoundsInScreen(rect)
++            val label = listLabel(n)
++            val kind = shortKind(n)
++            sb.append("%3d  %-28s %-16s (%d, %d)%s\n".format(
++                i + 1,
++                label.take(28).padEnd(28),
++                kind,
++                rect.centerX(), rect.centerY(),
++                if (n.isEditable) "  [输入框]" else "",
++            ))
++        }
++        if (collected.isEmpty()) sb.append("（没有找到可操作的元素，加 --all 看全部节点）\n")
++        lastListIds = ids
++        sb.append("\n提示：tap <编号> 直接点，例如 tap 2；input text <编号> \"内容\" 往输入框打字\n")
++        return NativeOffloadResult(0, sb.toString())
++    }
++
++    /** Last snapshot's numbers → registry ids, so `tap 3` needs no re-walk. */
++    private var lastListIds: List<String> = emptyList()
++
++    private fun collectListable(
++        node: AccessibilityNodeInfo?, maxDepth: Int, depth: Int,
++        out: MutableList<AccessibilityNodeInfo>, limit: Int, all: Boolean,
++    ) {
++        if (node == null || depth > maxDepth || out.size >= limit) return
++        val hasText = !node.text.isNullOrEmpty() || !node.contentDescription.isNullOrEmpty()
++        val interactive = node.isClickable || node.isLongClickable || node.isEditable || node.isScrollable
++        // A node with text but no action is usually a label belonging to a
++        // clickable parent; keeping it would double every row in the list.
++        if (all || interactive || (hasText && node.childCount == 0)) out.add(node)
++        for (i in 0 until node.childCount) {
++            collectListable(node.getChild(i), maxDepth, depth + 1, out, limit, all)
++        }
++    }
++
++    private fun listLabel(n: AccessibilityNodeInfo): String {
++        val t = n.text?.toString()?.trim()
++        if (!t.isNullOrEmpty()) return t
++        val d = n.contentDescription?.toString()?.trim()
++        if (!d.isNullOrEmpty()) return d
++        val rid = n.viewIdResourceName?.substringAfterLast('/')
++        if (!rid.isNullOrEmpty()) return rid
++        return n.className?.toString()?.substringAfterLast('.') ?: "?"
++    }
++
++    private fun shortKind(n: AccessibilityNodeInfo): String = when {
++        n.isEditable -> "EditText"
++        n.isScrollable -> "ScrollView"
++        n.isCheckable -> "CheckBox"
++        n.isClickable -> n.className?.toString()?.substringAfterLast('.') ?: "View"
++        else -> n.className?.toString()?.substringAfterLast('.') ?: "View"
++    }
++
++    /** Resolve a `ui list` number to a live node, or null when it is stale. */
++    private fun listNode(svc: MinisAccessibilityService, index: Int): AccessibilityNodeInfo? {
++        if (index < 1 || index > lastListIds.size) return null
++        return svc.nodeRegistry.get(lastListIds[index - 1])
+     }
+ 
+     private fun uiDump(args: OffloadArgs): NativeOffloadResult {
+@@ -541,13 +664,36 @@
+     // ── tap ──────────────────────────────────────────────────────────────
+ 
+     private fun tapSub(args: OffloadArgs): NativeOffloadResult {
+-        return when (args.positional.getOrNull(1)) {
++        return when (val sub = args.positional.getOrNull(1)) {
+             null   -> NativeOffloadResult(2, TAP_HELP)
+             "node" -> tapNode(args)
+             "xy"   -> tapXY(args)
+             "text" -> tapText(args)
+             "id"   -> tapId(args)
+-            else   -> NativeOffloadResult(2, "$TOOL tap: unknown action\n$TAP_HELP")
++            // [Mines-a11y-list] `tap 3` — a bare number is a `ui list` index,
++            // which is the whole point of the snapshot: no re-walking the tree,
++            // no parsing a JSON envelope to find a nodeId.
++            else -> {
++                val n = sub?.toIntOrNull()
++                if (n != null) tapListIndex(args, n)
++                else NativeOffloadResult(2, "$TOOL tap: unknown action\n$TAP_HELP")
++            }
++        }
++    }
++
++    /** [Mines-a11y-list] Tap the n-th element of the last `ui list`. */
++    private fun tapListIndex(args: OffloadArgs, index: Int): NativeOffloadResult {
++        val svc = svcOrThrow()
++        val n = listNode(svc, index)
++            ?: return err(args, "STALE_INDEX",
++                "编号 $index 不在上次的快照里（快照只有 ${lastListIds.size} 项，或界面已变）。先跑一次 ui list")
++        val rect = Rect(); n.getBoundsInScreen(rect)
++        // Prefer the real click action; fall back to a coordinate tap for the
++        // many nodes that carry text but no clickable flag of their own.
++        return if (n.isClickable && n.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
++            ok(args, JSONObject().put("index", index).put("action", "click"))
++        } else {
++            tapXYRaw(svc, rect.centerX(), rect.centerY(), args)
+         }
+     }
+ 
+@@ -653,11 +799,35 @@
+     private fun inputSub(args: OffloadArgs): NativeOffloadResult {
+         return when (args.positional.getOrNull(1)) {
+             null    -> NativeOffloadResult(2, INPUT_HELP)
+-            "text"  -> inputText(args)
++            // [Mines-a11y-list] `input text 3 "内容"` — the first argument is
++            // a `ui list` number rather than the text itself, so typing into
++            // a field the agent just saw costs one command instead of
++            // find → parse → --node <id>.
++            "text"  -> if (args.positional.getOrNull(2)?.toIntOrNull() != null &&
++                           args.positional.getOrNull(3) != null) inputTextByIndex(args)
++                       else inputText(args)
+             "clear" -> inputClear(args)
+             "key"   -> inputKey(args)
+             else    -> NativeOffloadResult(2, "$TOOL input: unknown action\n$INPUT_HELP")
+         }
++    }
++
++    /** [Mines-a11y-list] `input text <编号> <text>` into a snapshot field. */
++    private fun inputTextByIndex(args: OffloadArgs): NativeOffloadResult {
++        val svc = svcOrThrow()
++        val index = args.positional.getOrNull(2)!!.toInt()
++        val text = args.positional.getOrNull(3)!!
++        val n = listNode(svc, index)
++            ?: return err(args, "STALE_INDEX",
++                "编号 $index 不在上次的快照里（快照只有 ${lastListIds.size} 项，或界面已变）。先跑一次 ui list")
++        val finalText = when {
++            args.hasFlag("clear")  -> text
++            args.hasFlag("append") -> (n.text?.toString() ?: "") + text
++            else                   -> text
++        }
++        return if (svc.setNodeText(n, finalText))
++            ok(args, JSONObject().put("index", index).put("text", finalText).put("action", "setText"))
++        else err(args, "ACTION_FAILED", "setText returned false")
+     }
+ 
+     private fun inputText(args: OffloadArgs): NativeOffloadResult {
