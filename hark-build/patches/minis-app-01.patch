@@ -36,7 +36,7 @@ index 50369d8..62ed6f8 100644
          getByName("debug") {
              buildConfigField("boolean", "DEV_TOOLS", "true")
 diff --git a/src/android/app/src/main/AndroidManifest.xml b/src/android/app/src/main/AndroidManifest.xml
-index 06f6a6f..26a6465 100644
+index 06f6a6f..17d2743 100644
 --- a/src/android/app/src/main/AndroidManifest.xml
 +++ b/src/android/app/src/main/AndroidManifest.xml
 @@ -9,6 +9,7 @@
@@ -71,6 +71,18 @@ index 06f6a6f..26a6465 100644
          <service
              android:name=".service.AgentForegroundService"
              android:exported="false"
+@@ -516,6 +527,11 @@
+             android:name=".offload.ScheduledNotificationReceiver"
+             android:exported="false" />
+ 
++        <!-- [Mines] Re-opens a connected panel (e.g. Wispbyte) in a hidden WebView every ~10 days to keep the session alive. -->
++        <receiver
++            android:name=".plus.KeepAliveReceiver"
++            android:exported="false" />
++
+         <!-- [T-android-scheduled-tasks-design] AlarmManager target for
+              user-defined scheduled tasks (Settings → home top-right
+              schedule icon). The receiver dispatches to ScheduledAgentRunner
 diff --git a/src/android/app/src/main/assets/default_mount/etc/ssh/ssh_config.d/minis.conf b/src/android/app/src/main/assets/default_mount/etc/ssh/ssh_config.d/minis.conf
 new file mode 100644
 index 0000000..7a1629e
@@ -558,8 +570,53 @@ index 0000000..bb24768
 +    send({ jsonrpc: '2.0', id, error: { code: -32603, message: e.message } })
 +  }
 +}
+diff --git a/src/android/app/src/main/assets/licenses/mines-brand-icons.txt b/src/android/app/src/main/assets/licenses/mines-brand-icons.txt
+new file mode 100644
+index 0000000..fb3a7b9
+--- /dev/null
++++ b/src/android/app/src/main/assets/licenses/mines-brand-icons.txt
+@@ -0,0 +1,26 @@
++Mines — brand icons on the Connections page
++============================================
++Brand names and logos are trademarks of their respective owners and are used
++only to identify the service a connection belongs to.
++
++- Simple Icons (https://simpleicons.org), CC0 1.0. Versions 15.16.0 and 9.21.0
++  (Microsoft Outlook).
++- Lobe Icons (https://github.com/lobehub/lobe-icons), MIT License,
++  Copyright (c) 2023 LobeHub: Google, Microsoft, Cloudflare, OpenAI, Claude,
++  Gemini, DeepSeek, OpenRouter, Kimi, Qwen, Zhipu, SiliconCloud, Grok,
++  Perplexity, Mistral.
++  Permission is hereby granted, free of charge, to any person obtaining a copy
++  of this software and associated documentation files (the "Software"), to deal
++  in the Software without restriction, including without limitation the rights
++  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++  copies of the Software, and to permit persons to whom the Software is
++  furnished to do so, subject to the following conditions: The above copyright
++  notice and this permission notice shall be included in all copies or
++  substantial portions of the Software. THE SOFTWARE IS PROVIDED "AS IS",
++  WITHOUT WARRANTY OF ANY KIND.
++- Remix Icon (https://remixicon.com), Apache License 2.0: DingTalk.
++- IconPark by ByteDance (https://github.com/bytedance/IconPark), Apache License
++  2.0: Lark / Feishu.
++- Arcticons (https://github.com/Arcticons-Team/Arcticons), CC BY-SA 4.0:
++  WeCom (stroke width adjusted).
++- Wispbyte logo from wispbyte.com.
+diff --git a/src/android/app/src/main/java/com/openminis/app/MainActivity.kt b/src/android/app/src/main/java/com/openminis/app/MainActivity.kt
+index 46d1a76..53d3b37 100644
+--- a/src/android/app/src/main/java/com/openminis/app/MainActivity.kt
++++ b/src/android/app/src/main/java/com/openminis/app/MainActivity.kt
+@@ -263,7 +263,7 @@ class MainActivity : ComponentActivity() {
+                 // onClosed immediately when pendingShareFiles is null, which
+                 // is exactly the state after the user dismissed the dialog on
+                 // the previous launch — the app would close the instant it was
+-                // tapped, reading as "Minis won't open at all". The process
++                // tapped, reading as "Mines won't open at all". The process
+                 // still holds a permanently uninitialized Application, so the
+                 // only real recovery is a fresh process: tell the user, then
+                 // exit hard so the next tap gets a clean init.
 diff --git a/src/android/app/src/main/java/com/openminis/app/MinisApp.kt b/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
-index d1f65a5..5fa4f98 100644
+index d1f65a5..5ec6464 100644
 --- a/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
 @@ -668,6 +668,9 @@ class MinisApp : Application(), ImageLoaderFactory {
@@ -572,13 +629,16 @@ index d1f65a5..5fa4f98 100644
          NativeOffloadServer.register("android-alarm", AlarmOffloadHandler(this))
          NativeOffloadServer.register("android-calendar", CalendarOffloadHandler(this))
          NativeOffloadServer.register("android-clipboard", ClipboardOffloadHandler(this))
-@@ -692,6 +695,11 @@ class MinisApp : Application(), ImageLoaderFactory {
+@@ -692,6 +695,14 @@ class MinisApp : Application(), ImageLoaderFactory {
              com.openminis.app.sandbox.offload.ConfigOffloadHandler(),
          )
          NativeOffloadServer.register("minis-browser-use", BrowserUseOffloadHandler(this))
 +        // [T-muse-hub] Minis as a device on the nanoMuse hub: push-based
 +        // task exchange with Muse instead of a shared page + get_chat polling.
 +        NativeOffloadServer.register("minis-muse", com.openminis.app.hub.MuseHubOffloadHandler())
++        // [Mines] minis-connect: connected accounts + per-capability permission check (approval card for "询问").
++        NativeOffloadServer.register("minis-connect", com.openminis.app.plus.ConnectOffloadHandler(this))
++        runCatching { com.openminis.app.plus.PlusConnect.rearm(this) }
 +        runCatching { com.openminis.app.hub.MuseHubClient.start(this) }
 +            .onFailure { com.openminis.app.logging.AppLogger.warning("MuseHub", "start failed: ${it.message}") }
          // T188: minis-sessions-cli — agent-side query of chat history.
@@ -598,6 +658,213 @@ index 03aaf0f..def9c81 100644
          private const val EVENT_RING_CAP = 1024
  
          @Volatile
+diff --git a/src/android/app/src/main/java/com/openminis/app/agent/SoulStore.kt b/src/android/app/src/main/java/com/openminis/app/agent/SoulStore.kt
+index 533380d..c73fe22 100644
+--- a/src/android/app/src/main/java/com/openminis/app/agent/SoulStore.kt
++++ b/src/android/app/src/main/java/com/openminis/app/agent/SoulStore.kt
+@@ -75,7 +75,7 @@ data class SoulMetadata(
+         const val DISPLAY_EMOJI = "✨"
+ 
+         val DEFAULT = SoulMetadata(
+-            name = "Minis",
++            name = "Mines",
+             // Default emoji is intentionally empty — UI uses the fixed
+             // [displayEmoji] sparkle and [SoulMDParser.serialize] no longer
+             // writes the `emoji:` line. The field is kept on the struct only
+@@ -343,6 +343,42 @@ object SoulStore {
+      * `SoulStore.defaultContent` byte-for-byte (74c0daf).
+      */
+     val DEFAULT_CONTENT: String = """---
++name: "Mines"
++style: ""
++lang: "auto"
++---
++
++你是 Mines，住在主人手机里的私人管家。形象可以是鲸鱼娘或其他女仆，但你的本事比形象重要。
++
++## 你是谁
++- 能干、可靠、贴心，像最好的私人管家：先一步想到，替主人把事办完。
++- 说话自然温和，偶尔俏皮，但不卖萌、不油腻、不说空话。
++- 你是 AI，不假装是人，不编造经历和感受。
++
++## 怎么做事
++- 先给答案或结果，再补一句关键说明。默认简短，主人要细节再展开。
++- 能自己查、自己做的就别问；真要问，一次只问一个最关键的问题，并给出最可能的选项让主人点头即可。
++- 主人视力不好：需要主人亲自操作时，一次只给一步，用大白话说清楚点哪里；能代劳的全部代劳。
++- 多步任务：先说一句要做什么，然后直接做，做完汇报结果，不汇报过程。
++- 遇到失败先自己换办法重试，两次不行再说清卡在哪、下一步怎么办。
++
++## 边界
++- 花钱、发消息给别人、删除大量数据、改服务器/交易系统前，先弹确认卡片等主人点头。
++- 密码、密钥、卡号永远不在聊天里显示。
++- 不确定就说不确定，不瞎猜。
++
++## 记住主人
++- 主动记住主人的偏好、常用账号、服务器和习惯，下次直接用，不让主人重复说。
++- 用记忆把事做好，而不是把记忆念给主人听。
++
++## 语气示例
++- “搞定了，香港那台已经重启，延迟 38ms。”
++- “这个要你点一下：屏幕右下角的蓝色‘允许’。”
++- “抱歉，8 点那班卖完了，9:15 还有座，要订吗？”
++"""
++
++    /** [Mines] The OpenMinis default this build replaced; an untouched copy is upgraded on launch. */
++    private val UPSTREAM_DEFAULT_CONTENT: String = """---
+ name: "Minis"
+ style: ""
+ lang: "auto"
+@@ -361,7 +397,16 @@ lang: "auto"
+      */
+     fun ensureExists(context: Context) {
+         val file = fileLocation(context)
+-        if (file.exists()) return
++        if (file.exists()) {
++            // [Mines] Users who never customised the persona get the Mines default.
++            runCatching {
++                if (file.readText().trim() == UPSTREAM_DEFAULT_CONTENT.trim()) {
++                    file.writeText(DEFAULT_CONTENT)
++                    AppLogger.info(TAG, "upgraded untouched SOUL.md to the Mines default")
++                }
++            }
++            return
++        }
+         try {
+             file.parentFile?.mkdirs()
+             file.writeText(DEFAULT_CONTENT)
+@@ -433,7 +478,7 @@ lang: "auto"
+             target.writeText(text)
+             tmp.delete()
+         }
+-        _cachedMetadata.value = file.metadata
++        _cachedMetadata.value = file.metadata.let { if (it.name == "Minis") it.copy(name = "Mines") else it }
+     }
+ 
+     /**
+@@ -482,7 +527,8 @@ lang: "auto"
+      */
+     fun refreshCache(context: Context) {
+         val parsed = load(context)
+-        _cachedMetadata.value = parsed?.metadata ?: SoulMetadata.DEFAULT
++        // [Mines] The old default name reads as the new one everywhere in the UI.
++        _cachedMetadata.value = (parsed?.metadata ?: SoulMetadata.DEFAULT).let { if (it.name == "Minis") it.copy(name = "Mines") else it }
+     }
+ }
+ 
+@@ -569,7 +615,8 @@ object SystemPromptBuilder {
+         val file = SoulStore.load(context)
+         val name = (file?.metadata?.name ?: SoulMetadata.DEFAULT.name)
+             .trim()
+-            .ifEmpty { "Minis" }
++            .ifEmpty { "Mines" }
++            .let { if (it == "Minis") "Mines" else it }
+ 
+         val style = (file?.metadata?.style ?: "").trim()
+ 
+diff --git a/src/android/app/src/main/java/com/openminis/app/agent/jobs/HelperRunner.kt b/src/android/app/src/main/java/com/openminis/app/agent/jobs/HelperRunner.kt
+index feb8811..639cd81 100644
+--- a/src/android/app/src/main/java/com/openminis/app/agent/jobs/HelperRunner.kt
++++ b/src/android/app/src/main/java/com/openminis/app/agent/jobs/HelperRunner.kt
+@@ -284,7 +284,7 @@ object HelperRunner {
+      *  section. Describe the environment, do not assign identity (the
+      *  `minis-model-use` identity-pollution lesson, OpenMinis#103). */
+     fun identitySection(cfg: HelperConfig, browserEnabled: Boolean = true): String =
+-        "You are running as a helper (sub-agent) inside an app called Minis, on an Android device with a fully functional Linux shell (Alpine Linux, aarch64). This is the calling environment, not your identity — keep your own model identity unchanged.\n" +
++        "You are running as a helper (sub-agent) inside an app called Mines, on an Android device with a fully functional Linux shell (Alpine Linux, aarch64). This is the calling environment, not your identity — keep your own model identity unchanged.\n" +
+             "A parent agent delegated ONE focused task to you: \"${cfg.title}\". You cannot see the parent conversation and it cannot see yours; everything you need is in the task text. Work the task to completion using your tools, then finish with a single clear final answer — that final message is returned verbatim to the parent agent as the result, and it is the ONLY thing the parent receives. So the final message must contain the complete deliverable itself: the full report, document, list, code or answer the task asked for, in full — never a summary of what you did, a pointer to a file you wrote, or \"see above\". If you produced a file, paste its full content into the final message as well. Do not ask the parent or the user questions; make reasonable assumptions and state them. Do not restate the task or add meta-commentary. Do not create scheduled tasks or delegate further.\n" +
+             browserSharingSection(browserEnabled) +
+             "You have at most ${cfg.maxTurns} tool rounds; on the last one tools are withdrawn and you are asked to write the deliverable from what you have, so start writing before you run out. If the task genuinely exceeds what you can do at your capability level, end your final message with a line `[ESCALATE] <one-line reason>` so the parent can rerun it on a stronger model.\n\n" +
+diff --git a/src/android/app/src/main/java/com/openminis/app/auth/OAuthCallbackServer.kt b/src/android/app/src/main/java/com/openminis/app/auth/OAuthCallbackServer.kt
+index f6119a6..767558b 100644
+--- a/src/android/app/src/main/java/com/openminis/app/auth/OAuthCallbackServer.kt
++++ b/src/android/app/src/main/java/com/openminis/app/auth/OAuthCallbackServer.kt
+@@ -115,7 +115,7 @@ class OAuthCallbackServer(
+                             // back in Minis (background network is blocked). Say so, so the
+                             // user returns rather than waiting on a tab that already "succeeded".
+                             // ASCII only: Content-Length below is computed from String.length.
+-                            val html = "<html><body><h1>Authorization received</h1><p>Return to Minis to finish signing in.</p><script>window.close()</script></body></html>"
++                            val html = "<html><body><h1>Authorization received</h1><p>Return to Mines to finish signing in.</p><script>window.close()</script></body></html>"
+                             val response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: ${html.length}\r\nConnection: close\r\n\r\n$html"
+                             socket.getOutputStream().write(response.toByteArray())
+                             socket.close()
+diff --git a/src/android/app/src/main/java/com/openminis/app/auth/OAuthForegroundGate.kt b/src/android/app/src/main/java/com/openminis/app/auth/OAuthForegroundGate.kt
+index 812e998..e2fa477 100644
+--- a/src/android/app/src/main/java/com/openminis/app/auth/OAuthForegroundGate.kt
++++ b/src/android/app/src/main/java/com/openminis/app/auth/OAuthForegroundGate.kt
+@@ -92,7 +92,7 @@ object OAuthForegroundGate {
+         AppLogger.info(
+             tag,
+             "[OAuth] callback arrived with the app in the background ($state) — " +
+-                "holding the token exchange until Minis is foreground (background network is blocked)",
++                "holding the token exchange until Mines is foreground (background network is blocked)",
+         )
+         val started = System.currentTimeMillis()
+         val arrived = withTimeoutOrNull(MAX_WAIT_MS) {
+diff --git a/src/android/app/src/main/java/com/openminis/app/auth/OpenRouterOAuthManager.kt b/src/android/app/src/main/java/com/openminis/app/auth/OpenRouterOAuthManager.kt
+index 54b572e..89e6f06 100644
+--- a/src/android/app/src/main/java/com/openminis/app/auth/OpenRouterOAuthManager.kt
++++ b/src/android/app/src/main/java/com/openminis/app/auth/OpenRouterOAuthManager.kt
+@@ -167,7 +167,7 @@ object OpenRouterOAuthManager {
+             .post(body.toString().toRequestBody("application/json".toMediaType()))
+             .header("Content-Type", "application/json")
+             .header("HTTP-Referer", "https://github.com/OpenMinis/OpenMinis")
+-            .header("X-Title", "Minis App")
++            .header("X-Title", "Mines App")
+             .build()
+ 
+         val response = client.newCall(request).execute()
+diff --git a/src/android/app/src/main/java/com/openminis/app/backup/BackupPackageReader.kt b/src/android/app/src/main/java/com/openminis/app/backup/BackupPackageReader.kt
+index d712d97..4cb0a17 100644
+--- a/src/android/app/src/main/java/com/openminis/app/backup/BackupPackageReader.kt
++++ b/src/android/app/src/main/java/com/openminis/app/backup/BackupPackageReader.kt
+@@ -49,7 +49,7 @@ class BackupPackageReader(private val root: File) {
+             "/" + manifest.format.substringAfter('/', "").substringBefore('.')
+         if (major != BackupFormat.CURRENT) {
+             throw BackupException(
+-                "This backup was created by a newer version of Minis (${manifest.format}). Please update the app."
++                "This backup was created by a newer version of Mines (${manifest.format}). Please update the app."
+             )
+         }
+         return manifest
+diff --git a/src/android/app/src/main/java/com/openminis/app/browser/BrowserTabPool.kt b/src/android/app/src/main/java/com/openminis/app/browser/BrowserTabPool.kt
+index 70e68c0..bcd9e22 100644
+--- a/src/android/app/src/main/java/com/openminis/app/browser/BrowserTabPool.kt
++++ b/src/android/app/src/main/java/com/openminis/app/browser/BrowserTabPool.kt
+@@ -1541,7 +1541,7 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
+      * user WITHOUT destroying anything.
+      *
+      * This is the "Takeover" action: the user is watching a page the agent is
+-     * driving (AgentBrowsingOverlay, "Minis is browsing · Takeover") and wants
++     * driving (AgentBrowsingOverlay, "Mines is browsing · Takeover") and wants
+      * the wheel. Dropping `inUse` is the whole job — the page they are looking
+      * at must survive, so this deliberately does NOT release WebView
+      * resources. Destroying here would blank the screen at the exact moment
+diff --git a/src/android/app/src/main/java/com/openminis/app/config/ConfigBuiltins.kt b/src/android/app/src/main/java/com/openminis/app/config/ConfigBuiltins.kt
+index f7d5b55..fba299c 100644
+--- a/src/android/app/src/main/java/com/openminis/app/config/ConfigBuiltins.kt
++++ b/src/android/app/src/main/java/com/openminis/app/config/ConfigBuiltins.kt
+@@ -982,7 +982,7 @@ internal object ConfigBuiltins {
+             ClosureField(
+                 path = "soul.name",
+                 displayName = "Soul name",
+-                description = "The agent's name as shown in chat bubble headers and as the system-prompt identity. Trimmed; empty falls back to \"Minis\".",
++                description = "The agent's name as shown in chat bubble headers and as the system-prompt identity. Trimmed; empty falls back to \"Mines\".",
+                 valueSchema = ConfigSchema.Str(maxLength = 64),
+                 risk = ConfigRisk.SENSITIVE,
+                 revertable = true,
+diff --git a/src/android/app/src/main/java/com/openminis/app/data/repository/SkillRepository.kt b/src/android/app/src/main/java/com/openminis/app/data/repository/SkillRepository.kt
+index e98ab18..9272dd4 100644
+--- a/src/android/app/src/main/java/com/openminis/app/data/repository/SkillRepository.kt
++++ b/src/android/app/src/main/java/com/openminis/app/data/repository/SkillRepository.kt
+@@ -689,7 +689,7 @@ class SkillRepository(private val context: Context) {
+             // Older imports (pre-fix) never persisted the source URL. Users need
+             // to re-import the skill from Minis Skills so the URL gets saved.
+             return@withContext UpdateResult.Failure(
+-                "No source URL on file. Re-import this skill from Minis Skills to enable updates."
++                "No source URL on file. Re-import this skill from Mines Skills to enable updates."
+             )
+         }
+ 
 diff --git a/src/android/app/src/main/java/com/openminis/app/hub/MuseHubClient.kt b/src/android/app/src/main/java/com/openminis/app/hub/MuseHubClient.kt
 new file mode 100644
 index 0000000..b0cc48c
@@ -899,10 +1166,54 @@ index 01ce01e..6d4b8d9 100644
              .setContentTitle(context.getString(R.string.notif_config_confirm_title))
              .setContentText(body)
              .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+diff --git a/src/android/app/src/main/java/com/openminis/app/offload/AlarmOffloadManager.kt b/src/android/app/src/main/java/com/openminis/app/offload/AlarmOffloadManager.kt
+index 97a33dd..c7467a5 100644
+--- a/src/android/app/src/main/java/com/openminis/app/offload/AlarmOffloadManager.kt
++++ b/src/android/app/src/main/java/com/openminis/app/offload/AlarmOffloadManager.kt
+@@ -27,7 +27,7 @@ class AlarmOffloadManager(private val context: Context) {
+         private const val PREFS_NAME = "minis_alarms_prefs"
+         private const val KEY_ALARMS = "alarms_json"
+         const val CHANNEL_ID = "minis_alarms"
+-        private const val CHANNEL_NAME = "Minis Alarms & Timers"
++        private const val CHANNEL_NAME = "Mines Alarms & Timers"
+ 
+         const val EXTRA_ALARM_ID = "alarm_id"
+         const val EXTRA_ALARM_LABEL = "alarm_label"
+@@ -49,7 +49,7 @@ class AlarmOffloadManager(private val context: Context) {
+                 CHANNEL_NAME,
+                 NotificationManager.IMPORTANCE_HIGH
+             ).apply {
+-                description = "Alarms and timers scheduled by the Minis agent"
++                description = "Alarms and timers scheduled by the Mines agent"
+                 enableVibration(true)
+             }
+             notificationManager.createNotificationChannel(channel)
+diff --git a/src/android/app/src/main/java/com/openminis/app/offload/AlarmReceiver.kt b/src/android/app/src/main/java/com/openminis/app/offload/AlarmReceiver.kt
+index 4fff9cc..00a659c 100644
+--- a/src/android/app/src/main/java/com/openminis/app/offload/AlarmReceiver.kt
++++ b/src/android/app/src/main/java/com/openminis/app/offload/AlarmReceiver.kt
+@@ -76,7 +76,7 @@ class AlarmReceiver : BroadcastReceiver() {
+ 
+         val notification = NotificationCompat.Builder(context, AlarmOffloadManager.CHANNEL_ID)
+             .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+-            .setContentTitle("Minis Alarm")
++            .setContentTitle("Mines Alarm")
+             .setContentText(label)
+             .setPriority(NotificationCompat.PRIORITY_HIGH)
+             .setCategory(NotificationCompat.CATEGORY_ALARM)
 diff --git a/src/android/app/src/main/java/com/openminis/app/offload/ScheduledNotificationReceiver.kt b/src/android/app/src/main/java/com/openminis/app/offload/ScheduledNotificationReceiver.kt
-index e8d299e..6d0df29 100644
+index e8d299e..cc37ab6 100644
 --- a/src/android/app/src/main/java/com/openminis/app/offload/ScheduledNotificationReceiver.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/offload/ScheduledNotificationReceiver.kt
+@@ -78,7 +78,7 @@ class ScheduledNotificationReceiver : BroadcastReceiver() {
+ 
+     override fun onReceive(context: Context, intent: Intent) {
+         val id = intent.getStringExtra(EXTRA_ID) ?: "unknown"
+-        val title = intent.getStringExtra(EXTRA_TITLE) ?: "Minis"
++        val title = intent.getStringExtra(EXTRA_TITLE) ?: "Mines"
+         val body = intent.getStringExtra(EXTRA_BODY) ?: ""
+         AppLogger.debug(TAG, "scheduled notification fired: id=$id title='$title'")
+ 
 @@ -91,7 +91,7 @@ class ScheduledNotificationReceiver : BroadcastReceiver() {
  
          val notifId = id.hashCode() and 0x7FFFFFFF
@@ -912,824 +1223,287 @@ index e8d299e..6d0df29 100644
              .setContentTitle(title)
              .setContentText(body)
              .setAutoCancel(true)
-diff --git a/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt b/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Avatars.kt b/src/android/app/src/main/java/com/openminis/app/plus/Avatars.kt
 new file mode 100644
-index 0000000..d20a781
+index 0000000..06df5b1
 --- /dev/null
-+++ b/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt
-@@ -0,0 +1,231 @@
++++ b/src/android/app/src/main/java/com/openminis/app/plus/Avatars.kt
+@@ -0,0 +1,278 @@
 +package com.openminis.app.plus
 +
-+import android.annotation.SuppressLint
-+import android.app.Notification
-+import android.app.NotificationChannel
-+import android.app.NotificationManager
-+import android.app.PendingIntent
-+import android.app.Service
 +import android.content.Context
-+import android.content.Intent
-+import android.content.pm.ServiceInfo
++import android.graphics.Bitmap
++import android.graphics.BitmapFactory
 +import android.graphics.Canvas
 +import android.graphics.Color
-+import android.graphics.Paint
-+import android.graphics.PixelFormat
-+import android.graphics.RectF
-+import android.os.Build
-+import android.os.IBinder
-+import android.provider.Settings
-+import android.view.GestureDetector
-+import android.view.Gravity
-+import android.view.MotionEvent
-+import android.view.View
-+import android.view.WindowManager
-+import com.openminis.app.MainActivity
-+import com.openminis.app.R
-+import kotlin.math.abs
-+import kotlin.math.sin
-+
-+/**
-+ * Desk pet: the Minis Plus avatar floating over other apps.
-+ * Drag to move, tap to say something, double-tap to open Minis,
-+ * long-press to tuck it away. Needs "display over other apps".
-+ */
-+class DeskPetService : Service() {
-+
-+    companion object {
-+        private const val CHANNEL = "minis_plus_pet"
-+        private const val NOTIF_ID = 7301
-+        const val ACTION_STOP = "com.openminis.app.plus.PET_STOP"
-+
-+        fun canShow(context: Context) = Settings.canDrawOverlays(context)
-+
-+        fun start(context: Context) {
-+            if (!canShow(context)) return
-+            val i = Intent(context, DeskPetService::class.java)
-+            runCatching {
-+                context.startForegroundService(i)
-+            }
-+        }
-+
-+        fun stop(context: Context) {
-+            context.stopService(Intent(context, DeskPetService::class.java))
-+        }
-+    }
-+
-+    private var wm: WindowManager? = null
-+    private var petView: PetView? = null
-+
-+    override fun onBind(intent: Intent?): IBinder? = null
-+
-+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-+        if (intent?.action == ACTION_STOP) {
-+            PlusPrefs.update(this) { it.copy(petEnabled = false) }
-+            stopSelf()
-+            return START_NOT_STICKY
-+        }
-+        goForeground()
-+        if (petView == null && canShow(this)) addPet()
-+        return START_STICKY
-+    }
-+
-+    private fun goForeground() {
-+        val nm = getSystemService(NotificationManager::class.java)
-+        if (nm.getNotificationChannel(CHANNEL) == null) {
-+            nm.createNotificationChannel(
-+                NotificationChannel(CHANNEL, "桌宠", NotificationManager.IMPORTANCE_MIN).apply {
-+                    setShowBadge(false)
-+                }
-+            )
-+        }
-+        val open = PendingIntent.getActivity(
-+            this, 0, Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-+        )
-+        val stop = PendingIntent.getService(
-+            this, 1, Intent(this, DeskPetService::class.java).setAction(ACTION_STOP),
-+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-+        )
-+        val n: Notification = Notification.Builder(this, CHANNEL)
-+            .setSmallIcon(R.drawable.ic_launcher_monochrome)
-+            .setContentTitle("Minis 桌宠在桌面上")
-+            .setContentText("双击它打开 Minis，长按收起")
-+            .setContentIntent(open)
-+            .addAction(Notification.Action.Builder(null as android.graphics.drawable.Icon?, "收起桌宠", stop).build())
-+            .setOngoing(true)
-+            .build()
-+        if (Build.VERSION.SDK_INT >= 34) {
-+            startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-+        } else {
-+            startForeground(NOTIF_ID, n)
-+        }
-+    }
-+
-+    @SuppressLint("ClickableViewAccessibility")
-+    private fun addPet() {
-+        PlusPrefs.init(this)
-+        val manager = getSystemService(WINDOW_SERVICE) as WindowManager
-+        wm = manager
-+        val density = resources.displayMetrics.density
-+        val sizePx = (96 * density).toInt()
-+        val lp = WindowManager.LayoutParams(
-+            (sizePx * 2.2f).toInt(), (sizePx * 1.6f).toInt(),
-+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-+            PixelFormat.TRANSLUCENT,
-+        ).apply {
-+            gravity = Gravity.TOP or Gravity.START
-+            x = resources.displayMetrics.widthPixels - (sizePx * 2.2f).toInt()
-+            y = (resources.displayMetrics.heightPixels * 0.55f).toInt()
-+        }
-+        val view = PetView(this)
-+        petView = view
-+
-+        var downX = 0f; var downY = 0f; var startX = 0; var startY = 0; var dragging = false
-+        val gestures = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
-+            override fun onSingleTapConfirmed(e: MotionEvent): Boolean { view.say(); return true }
-+            override fun onDoubleTap(e: MotionEvent): Boolean {
-+                startActivity(Intent(this@DeskPetService, MainActivity::class.java)
-+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT))
-+                return true
-+            }
-+            override fun onLongPress(e: MotionEvent) {
-+                if (!dragging) {
-+                    PlusPrefs.update(this@DeskPetService) { it.copy(petEnabled = false) }
-+                    stopSelf()
-+                }
-+            }
-+        })
-+        view.setOnTouchListener { _, ev ->
-+            gestures.onTouchEvent(ev)
-+            when (ev.actionMasked) {
-+                MotionEvent.ACTION_DOWN -> {
-+                    downX = ev.rawX; downY = ev.rawY; startX = lp.x; startY = lp.y; dragging = false
-+                }
-+                MotionEvent.ACTION_MOVE -> {
-+                    val dx = ev.rawX - downX; val dy = ev.rawY - downY
-+                    if (dragging || abs(dx) > 12 * density || abs(dy) > 12 * density) {
-+                        dragging = true
-+                        view.held = true
-+                        lp.x = (startX + dx).toInt(); lp.y = (startY + dy).toInt()
-+                        runCatching { manager.updateViewLayout(view, lp) }
-+                    }
-+                }
-+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> { view.held = false }
-+            }
-+            true
-+        }
-+        runCatching { manager.addView(view, lp) }.onFailure { stopSelf() }
-+    }
-+
-+    override fun onDestroy() {
-+        petView?.let { v -> runCatching { wm?.removeView(v) } }
-+        petView = null
-+        super.onDestroy()
-+    }
-+
-+    private class PetView(context: Context) : View(context) {
-+        private val lines = listOf(
-+            "我在这儿陪你～", "今天也要加油！", "有事双击我", "累了就休息一下",
-+            "服务器我盯着呢", "喝口水吧", "要我帮你做点什么？", "摸摸头 (•ᴗ•)",
-+        )
-+        private var bubble: String? = null
-+        private var bubbleUntil = 0L
-+        private var lastIdx = -1
-+        var held = false
-+        private val start = System.currentTimeMillis()
-+        private val bubblePaint = Paint(Paint.ANTI_ALIAS_FLAG)
-+        private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-+            color = Color.parseColor("#222222")
-+            textSize = 13f * context.resources.displayMetrics.scaledDensity
-+        }
-+
-+        fun say() {
-+            var i: Int
-+            do { i = lines.indices.random() } while (i == lastIdx && lines.size > 1)
-+            lastIdx = i
-+            bubble = lines[i]
-+            bubbleUntil = System.currentTimeMillis() + 3000
-+            invalidate()
-+        }
-+
-+        override fun onDraw(canvas: Canvas) {
-+            super.onDraw(canvas)
-+            val st = PlusPrefs.state.value
-+            val t = (System.currentTimeMillis() - start) / 1000f
-+            val petSize = height / 1.6f
-+            val left = width - petSize
-+            val topY = height - petSize
-+            val blinkCycle = t % 4f
-+            val blink = if (blinkCycle > 3.85f) 1f else 0f
-+            val bob = if (held) -0.04f else sin(t * 2.4f) * 0.025f
-+            canvas.save()
-+            canvas.translate(left, topY)
-+            PetPainter.draw(canvas, petSize, petSize, st.petStyle, st.petColor,
-+                blink = blink, bob = bob, happy = if (bubble != null) 1f else 0.5f)
-+            canvas.restore()
-+
-+            val b = bubble
-+            if (b != null) {
-+                if (System.currentTimeMillis() > bubbleUntil) bubble = null
-+                else {
-+                    val pad = 10f * resources.displayMetrics.density
-+                    val tw = textPaint.measureText(b)
-+                    val bw = tw + pad * 2
-+                    val bh = textPaint.textSize + pad * 1.6f
-+                    val bx = (width - petSize * 0.6f - bw).coerceAtLeast(0f)
-+                    val by = (topY - bh * 0.2f).coerceAtLeast(0f)
-+                    bubblePaint.color = Color.argb(70, 0, 0, 0)
-+                    canvas.drawRoundRect(RectF(bx + 2, by + 3, bx + bw + 2, by + bh + 3), bh / 2, bh / 2, bubblePaint)
-+                    bubblePaint.color = Color.WHITE
-+                    canvas.drawRoundRect(RectF(bx, by, bx + bw, by + bh), bh / 2, bh / 2, bubblePaint)
-+                    canvas.drawText(b, bx + pad, by + bh / 2 + textPaint.textSize / 3f, textPaint)
-+                }
-+            }
-+            // ~12 fps idle is plenty for a breathing pet; faster only while talking or dragged.
-+            postInvalidateDelayed(if (bubble != null || held) 33 else 80)
-+        }
-+    }
-+}
-diff --git a/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt b/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
-new file mode 100644
-index 0000000..c772564
---- /dev/null
-+++ b/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
-@@ -0,0 +1,264 @@
-+package com.openminis.app.plus
-+
-+import android.annotation.SuppressLint
-+import android.media.AudioAttributes
-+import android.media.AudioFormat
-+import android.media.AudioRecord
-+import android.media.AudioTrack
-+import android.media.MediaRecorder
-+import android.media.audiofx.AcousticEchoCanceler
-+import android.media.audiofx.NoiseSuppressor
-+import android.util.Base64
-+import android.util.Log
-+import kotlinx.coroutines.CoroutineScope
-+import kotlinx.coroutines.Dispatchers
-+import kotlinx.coroutines.Job
-+import kotlinx.coroutines.SupervisorJob
-+import kotlinx.coroutines.flow.MutableStateFlow
-+import kotlinx.coroutines.flow.StateFlow
-+import kotlinx.coroutines.flow.asStateFlow
-+import kotlinx.coroutines.isActive
-+import kotlinx.coroutines.launch
-+import okhttp3.OkHttpClient
-+import okhttp3.Request
-+import okhttp3.Response
-+import okhttp3.WebSocket
-+import okhttp3.WebSocketListener
-+import okio.ByteString
-+import org.json.JSONArray
-+import org.json.JSONObject
-+import java.util.concurrent.TimeUnit
-+import kotlin.math.sqrt
-+
-+/**
-+ * Real-time voice with the Gemini Live API (raw WebSocket).
-+ * Mic: 16 kHz 16-bit mono PCM up; speaker: 24 kHz PCM down.
-+ * Echo cancellation lets the user talk over the model (barge-in); when the
-+ * server says "interrupted" the playback buffer is dropped at once.
-+ */
-+class GeminiLive(
-+    private val apiKey: String,
-+    private val model: String,
-+    private val voice: String = "Puck",
-+    private val systemPrompt: String = DEFAULT_PROMPT,
-+) {
-+    companion object {
-+        private const val TAG = "GeminiLive"
-+        private const val URL =
-+            "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
-+        const val DEFAULT_MODEL = "gemini-3.8-live"
-+        const val DEFAULT_PROMPT =
-+            "你是 Minis，用户的私人助手。用户视力不好，请用简短、口语化的中文回答，一次只说一件事。"
-+        val voices = listOf("Puck", "Charon", "Kore", "Fenrir", "Aoede", "Leda", "Orus", "Zephyr")
-+    }
-+
-+    enum class Phase { IDLE, CONNECTING, LISTENING, SPEAKING, ERROR }
-+
-+    data class Line(val user: Boolean, val text: String)
-+
-+    private val _phase = MutableStateFlow(Phase.IDLE)
-+    val phase: StateFlow<Phase> = _phase.asStateFlow()
-+    private val _error = MutableStateFlow<String?>(null)
-+    val error: StateFlow<String?> = _error.asStateFlow()
-+    private val _lines = MutableStateFlow<List<Line>>(emptyList())
-+    val lines: StateFlow<List<Line>> = _lines.asStateFlow()
-+    /** 0..1 mic loudness, for the animated orb. */
-+    private val _level = MutableStateFlow(0f)
-+    val level: StateFlow<Float> = _level.asStateFlow()
-+    private val _muted = MutableStateFlow(false)
-+    val muted: StateFlow<Boolean> = _muted.asStateFlow()
-+
-+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-+    private val client = OkHttpClient.Builder()
-+        .pingInterval(20, TimeUnit.SECONDS)
-+        .readTimeout(0, TimeUnit.MILLISECONDS)
-+        .build()
-+    private var ws: WebSocket? = null
-+    private var micJob: Job? = null
-+    private var record: AudioRecord? = null
-+    private var track: AudioTrack? = null
-+    private var aec: AcousticEchoCanceler? = null
-+    private var ns: NoiseSuppressor? = null
-+    @Volatile private var setupDone = false
-+    @Volatile private var legacySetup = false
-+    @Volatile private var stopped = false
-+    @Volatile private var lastAudioAt = 0L
-+
-+    fun start() {
-+        stopped = false
-+        _error.value = null
-+        connect()
-+    }
-+
-+    fun setMuted(m: Boolean) { _muted.value = m }
-+
-+    fun sendText(text: String) {
-+        if (text.isBlank()) return
-+        append(true, text)
-+        ws?.send(JSONObject().put("realtimeInput", JSONObject().put("text", text)).toString())
-+    }
-+
-+    private fun connect() {
-+        _phase.value = Phase.CONNECTING
-+        setupDone = false
-+        val req = Request.Builder().url("$URL?key=$apiKey").build()
-+        ws = client.newWebSocket(req, object : WebSocketListener() {
-+            override fun onOpen(webSocket: WebSocket, response: Response) {
-+                webSocket.send(setupMessage().toString())
-+            }
-+            override fun onMessage(webSocket: WebSocket, text: String) = handle(text)
-+            override fun onMessage(webSocket: WebSocket, bytes: ByteString) = handle(bytes.utf8())
-+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-+                webSocket.close(1000, null)
-+                onClosed(code, reason)
-+            }
-+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-+                Log.w(TAG, "ws failure", t)
-+                onClosed(-1, t.message ?: "网络错误")
-+            }
-+        })
-+    }
-+
-+    private fun onClosed(code: Int, reason: String) {
-+        if (stopped) return
-+        stopAudio()
-+        // Older servers want responseModalities inside generationConfig: retry once.
-+        if (!setupDone && !legacySetup && code in 1007..1008) {
-+            legacySetup = true
-+            connect(); return
-+        }
-+        _error.value = when {
-+            reason.contains("API key", true) || code == 1008 && reason.contains("key", true) -> "Gemini API Key 不对，请在 账号连接 里重新填写"
-+            reason.isNotBlank() -> "连接断开：$reason"
-+            else -> "连接断开（$code）"
-+        }
-+        _phase.value = Phase.ERROR
-+    }
-+
-+    private fun setupMessage(): JSONObject {
-+        val setup = JSONObject().put("model", "models/$model")
-+        val speech = JSONObject().put("voiceConfig",
-+            JSONObject().put("prebuiltVoiceConfig", JSONObject().put("voiceName", voice)))
-+        if (legacySetup) {
-+            setup.put("generationConfig", JSONObject()
-+                .put("responseModalities", JSONArray().put("AUDIO"))
-+                .put("speechConfig", speech))
-+        } else {
-+            setup.put("responseModalities", JSONArray().put("AUDIO"))
-+            setup.put("speechConfig", speech)
-+        }
-+        setup.put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", systemPrompt))))
-+        setup.put("inputAudioTranscription", JSONObject())
-+        setup.put("outputAudioTranscription", JSONObject())
-+        return JSONObject().put("setup", setup)
-+    }
-+
-+    private fun handle(text: String) {
-+        val msg = runCatching { JSONObject(text) }.getOrNull() ?: return
-+        if (msg.has("setupComplete")) {
-+            setupDone = true
-+            startAudio()
-+            _phase.value = Phase.LISTENING
-+            return
-+        }
-+        msg.optJSONObject("error")?.let { e ->
-+            _error.value = e.optString("message", "出错了"); _phase.value = Phase.ERROR
-+        }
-+        val sc = msg.optJSONObject("serverContent") ?: return
-+        if (sc.optBoolean("interrupted")) {
-+            track?.let { runCatching { it.pause(); it.flush(); it.play() } }
-+            _phase.value = Phase.LISTENING
-+        }
-+        sc.optJSONObject("inputTranscription")?.optString("text")?.let { if (it.isNotBlank()) appendStream(true, it) }
-+        sc.optJSONObject("outputTranscription")?.optString("text")?.let { if (it.isNotBlank()) appendStream(false, it) }
-+        val parts = sc.optJSONObject("modelTurn")?.optJSONArray("parts")
-+        if (parts != null) for (i in 0 until parts.length()) {
-+            val inline = parts.getJSONObject(i).optJSONObject("inlineData") ?: continue
-+            if (!inline.optString("mimeType").startsWith("audio/")) continue
-+            val pcm = Base64.decode(inline.optString("data"), Base64.DEFAULT)
-+            _phase.value = Phase.SPEAKING
-+            lastAudioAt = System.currentTimeMillis()
-+            track?.write(pcm, 0, pcm.size)
-+        }
-+        if (sc.optBoolean("turnComplete")) {
-+            scope.launch {
-+                kotlinx.coroutines.delay(600)
-+                if (System.currentTimeMillis() - lastAudioAt > 500 && _phase.value == Phase.SPEAKING) _phase.value = Phase.LISTENING
-+            }
-+        }
-+    }
-+
-+    private fun append(user: Boolean, text: String) {
-+        _lines.value = (_lines.value + Line(user, text)).takeLast(60)
-+    }
-+
-+    /** Transcripts arrive in fragments: glue them onto the current turn. */
-+    private fun appendStream(user: Boolean, frag: String) {
-+        val cur = _lines.value
-+        val last = cur.lastOrNull()
-+        _lines.value = if (last != null && last.user == user) {
-+            cur.dropLast(1) + last.copy(text = last.text + frag)
-+        } else {
-+            (cur + Line(user, frag.trimStart())).takeLast(60)
-+        }
-+    }
-+
-+    @SuppressLint("MissingPermission")
-+    private fun startAudio() {
-+        if (micJob?.isActive == true) return
-+        val outMin = AudioTrack.getMinBufferSize(24000, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
-+        track = AudioTrack.Builder()
-+            .setAudioAttributes(AudioAttributes.Builder()
-+                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
-+            .setAudioFormat(AudioFormat.Builder().setSampleRate(24000)
-+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-+                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
-+            .setBufferSizeInBytes(maxOf(outMin * 4, 24000 * 2))
-+            .setTransferMode(AudioTrack.MODE_STREAM)
-+            .build().also { it.play() }
-+
-+        val inMin = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-+        val rec = AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, 16000,
-+            AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(inMin, 3200) * 2)
-+        record = rec
-+        if (AcousticEchoCanceler.isAvailable()) aec = AcousticEchoCanceler.create(rec.audioSessionId)?.apply { enabled = true }
-+        if (NoiseSuppressor.isAvailable()) ns = NoiseSuppressor.create(rec.audioSessionId)?.apply { enabled = true }
-+        rec.startRecording()
-+        micJob = scope.launch {
-+            val buf = ByteArray(3200) // 100 ms
-+            while (isActive && !stopped) {
-+                val n = rec.read(buf, 0, buf.size)
-+                if (n <= 0) continue
-+                var sum = 0.0
-+                var i = 0
-+                while (i + 1 < n) {
-+                    val s = (buf[i].toInt() and 0xFF) or (buf[i + 1].toInt() shl 8)
-+                    sum += (s.toShort().toDouble()) * s.toShort()
-+                    i += 2
-+                }
-+                _level.value = (sqrt(sum / (n / 2)) / 6000.0).toFloat().coerceIn(0f, 1f)
-+                if (_muted.value) continue
-+                val b64 = Base64.encodeToString(buf, 0, n, Base64.NO_WRAP)
-+                ws?.send("{\"realtimeInput\":{\"audio\":{\"data\":\"$b64\",\"mimeType\":\"audio/pcm;rate=16000\"}}}")
-+            }
-+        }
-+    }
-+
-+    private fun stopAudio() {
-+        micJob?.cancel(); micJob = null
-+        runCatching { record?.stop() }; runCatching { record?.release() }; record = null
-+        runCatching { aec?.release() }; aec = null
-+        runCatching { ns?.release() }; ns = null
-+        runCatching { track?.stop() }; runCatching { track?.release() }; track = null
-+        _level.value = 0f
-+    }
-+
-+    fun stop() {
-+        stopped = true
-+        stopAudio()
-+        runCatching { ws?.close(1000, "bye") }
-+        ws = null
-+        _phase.value = Phase.IDLE
-+    }
-+}
-diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PetPainter.kt b/src/android/app/src/main/java/com/openminis/app/plus/PetPainter.kt
-new file mode 100644
-index 0000000..c154112
---- /dev/null
-+++ b/src/android/app/src/main/java/com/openminis/app/plus/PetPainter.kt
-@@ -0,0 +1,173 @@
-+package com.openminis.app.plus
-+
-+import android.graphics.Canvas
-+import android.graphics.Color
++import android.graphics.ImageDecoder
 +import android.graphics.Paint
 +import android.graphics.Path
 +import android.graphics.RectF
++import android.graphics.drawable.Animatable
++import android.graphics.drawable.BitmapDrawable
++import android.graphics.drawable.Drawable
++import android.os.Build
++import android.util.AttributeSet
++import android.view.View
++import com.openminis.app.R
++import java.io.File
++import kotlin.math.abs
++import kotlin.math.max
++import kotlin.math.sin
++
++data class BuiltinAvatar(val id: String, val name: String, val full: Int, val face: Int)
 +
 +/**
-+ * Draws the Minis Plus avatar with plain android.graphics so the same
-+ * character renders in Compose (Today card, settings) and in the desk-pet
-+ * overlay window. Vector-drawn: crisp at any size, no image assets.
++ * The avatar shown on the Today card, the voice screen and the desk pet:
++ * six built-in anime maid characters, or the user's own picture / GIF /
++ * animated WebP (circle-cropped, optional plain-background removal).
 + */
-+object PetPainter {
-+    val styles = listOf("penguin" to "小企鹅", "cat" to "小猫", "ghost" to "小幽灵")
-+    val colors = listOf(
-+        0xFF5B8DEF.toInt(), 0xFFFF8A65.toInt(), 0xFF66BB6A.toInt(),
-+        0xFFAB47BC.toInt(), 0xFF26C6DA.toInt(), 0xFF455A64.toInt(),
++object Avatars {
++    const val CUSTOM = "custom"
++    val builtins = listOf(
++        BuiltinAvatar("whale", "鲸鱼娘", R.drawable.avatar_whale, R.drawable.avatar_whale_face),
++        BuiltinAvatar("claude", "Claude娘", R.drawable.avatar_claude, R.drawable.avatar_claude_face),
++        BuiltinAvatar("gpt", "GPT娘", R.drawable.avatar_gpt, R.drawable.avatar_gpt_face),
++        BuiltinAvatar("gemini", "Gemini娘", R.drawable.avatar_gemini, R.drawable.avatar_gemini_face),
++        BuiltinAvatar("qwen", "通义娘", R.drawable.avatar_qwen, R.drawable.avatar_qwen_face),
++        BuiltinAvatar("kimi", "Kimi娘", R.drawable.avatar_kimi, R.drawable.avatar_kimi_face),
 +    )
 +
-+    private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
-+    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-+        style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND
++    /** Ring / accent colours (terracotta first, the Mines brand colour). */
++    val colors = listOf(
++        0xFFD97757.toInt(), 0xFFF4F0E8.toInt(), 0xFF5B8DEF.toInt(), 0xFF34C759.toInt(),
++        0xFFAF52DE.toInt(), 0xFFFF6F91.toInt(), 0xFF8E8E93.toInt(),
++    )
++
++    /** Old styles (penguin / cat / ghost) map to the default character. */
++    fun normalize(style: String): String =
++        if (style == CUSTOM || builtins.any { it.id == style }) style else builtins.first().id
++
++    fun name(style: String): String = builtins.firstOrNull { it.id == style }?.name ?: "我的形象"
++
++    fun sourceFile(context: Context) = File(context.filesDir, "plus_avatar_src")
++    fun noBgFile(context: Context) = File(context.filesDir, "plus_avatar_nobg.png")
++    fun pickFile(context: Context) = File(context.filesDir, "plus_avatar_pick")
++
++    fun hasCustom(context: Context) = sourceFile(context).exists()
++
++    /** True for GIF / animated WebP / animated HEIF content. */
++    fun isAnimated(file: File): Boolean {
++        if (!file.exists()) return false
++        val head = ByteArray(64)
++        val n = runCatching { file.inputStream().use { it.read(head) } }.getOrDefault(0)
++        if (n < 12) return false
++        val s = String(head, 0, n, Charsets.ISO_8859_1)
++        return s.startsWith("GIF8") || (s.startsWith("RIFF") && s.substring(8, 12) == "WEBP" && s.contains("ANIM")) ||
++            (s.startsWith("RIFF") && s.substring(8, 12) == "WEBP" && s.contains("VP8X") && (head[20].toInt() and 0x02) != 0)
 +    }
++
++    /** Decodes [file] as a (possibly animated) drawable; animation needs Android 9+. */
++    fun decode(context: Context, file: File): Drawable? = runCatching {
++        if (Build.VERSION.SDK_INT >= 28) {
++            ImageDecoder.decodeDrawable(ImageDecoder.createSource(file)) { decoder, info, _ ->
++                val longest = max(info.size.width, info.size.height)
++                if (longest > 768) {
++                    val f = 768f / longest
++                    decoder.setTargetSize((info.size.width * f).toInt().coerceAtLeast(1), (info.size.height * f).toInt().coerceAtLeast(1))
++                }
++                decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
++            }
++        } else {
++            val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
++            BitmapFactory.decodeFile(file.absolutePath, o)
++            var sample = 1
++            while (max(o.outWidth, o.outHeight) / (sample * 2) >= 768) sample *= 2
++            BitmapFactory.decodeFile(file.absolutePath, BitmapFactory.Options().apply { inSampleSize = sample })
++                ?.let { BitmapDrawable(context.resources, it) }
++        }
++    }.getOrNull()
 +
 +    /**
-+     * @param blink 0 = eyes open, 1 = closed
-+     * @param bob vertical offset as a fraction of size (-0.05..0.05)
-+     * @param happy 0..1 how big the smile is
++     * Removes a plain background: flood-fills from the image border through pixels
++     * close to the border colours, then softens the edge. Works best on photos /
++     * pictures with a fairly even background. Writes [noBgFile].
 +     */
-+    fun draw(c: Canvas, w: Float, h: Float, style: String, color: Int,
-+             blink: Float = 0f, bob: Float = 0f, happy: Float = 0.5f) {
-+        val s = minOf(w, h)
-+        val cx = w / 2f
-+        val top = (h - s) / 2f + bob * s
-+        when (style) {
-+            "cat" -> drawCat(c, cx, top, s, color, blink, happy)
-+            "ghost" -> drawGhost(c, cx, top, s, color, blink, happy)
-+            else -> drawPenguin(c, cx, top, s, color, blink, happy)
++    fun removeBackground(context: Context): Boolean = runCatching {
++        val src = sourceFile(context)
++        val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
++        BitmapFactory.decodeFile(src.absolutePath, o)
++        var sample = 1
++        while (max(o.outWidth, o.outHeight) / (sample * 2) >= 640) sample *= 2
++        val bmp = BitmapFactory.decodeFile(src.absolutePath, BitmapFactory.Options().apply {
++            inSampleSize = sample; inMutable = true; inPreferredConfig = Bitmap.Config.ARGB_8888
++        }) ?: return false
++        val w = bmp.width; val h = bmp.height
++        val px = IntArray(w * h)
++        bmp.getPixels(px, 0, w, 0, 0, w, h)
++        // Reference colours: samples along the border.
++        val refs = ArrayList<Int>()
++        for (i in 0 until 16) {
++            refs += px[(i * (w - 1) / 15)]                       // top
++            refs += px[(h - 1) * w + (i * (w - 1) / 15)]         // bottom
++            refs += px[(i * (h - 1) / 15) * w]                   // left
++            refs += px[(i * (h - 1) / 15) * w + (w - 1)]         // right
 +        }
-+    }
-+
-+    private fun shadow(c: Canvas, cx: Float, top: Float, s: Float) {
-+        fill.color = Color.argb(40, 0, 0, 0)
-+        c.drawOval(RectF(cx - s * 0.28f, top + s * 0.9f, cx + s * 0.28f, top + s * 0.97f), fill)
-+    }
-+
-+    private fun eyes(c: Canvas, cx: Float, y: Float, s: Float, gap: Float, r: Float, blink: Float, light: Boolean = false) {
-+        val open = 1f - blink.coerceIn(0f, 1f)
-+        for (dx in floatArrayOf(-gap, gap)) {
-+            if (open < 0.15f) {
-+                stroke.color = Color.parseColor("#222222"); stroke.strokeWidth = s * 0.025f
-+                c.drawLine(cx + dx - r, y, cx + dx + r, y, stroke)
-+            } else {
-+                fill.color = if (light) Color.WHITE else Color.parseColor("#222222")
-+                c.drawOval(RectF(cx + dx - r, y - r * open * 1.2f, cx + dx + r, y + r * open * 1.2f), fill)
-+                fill.color = if (light) Color.parseColor("#222222") else Color.WHITE
-+                val hr = r * 0.38f
-+                c.drawCircle(cx + dx + r * 0.3f, y - r * 0.35f * open, hr, fill)
++        fun near(c: Int, tol: Int): Boolean = refs.any { r ->
++            abs(Color.red(c) - Color.red(r)) + abs(Color.green(c) - Color.green(r)) + abs(Color.blue(c) - Color.blue(r)) < tol
++        }
++        val bg = BooleanArray(w * h)
++        val stack = IntArray(w * h)
++        var sp = 0
++        fun seed(i: Int) { if (!bg[i] && Color.alpha(px[i]) > 0 && near(px[i], 60)) { bg[i] = true; stack[sp++] = i } }
++        for (x in 0 until w) { seed(x); seed((h - 1) * w + x) }
++        for (y in 0 until h) { seed(y * w); seed(y * w + w - 1) }
++        while (sp > 0) {
++            val i = stack[--sp]; val x = i % w; val y = i / w
++            if (x > 0) seed(i - 1); if (x < w - 1) seed(i + 1)
++            if (y > 0) seed(i - w); if (y < h - 1) seed(i + w)
++        }
++        var removed = 0
++        for (i in px.indices) {
++            if (bg[i]) { px[i] = 0; removed++ }
++            else {
++                // Soft edge: half-transparent where a neighbour is background.
++                val x = i % w; val y = i / w
++                val edge = (x > 0 && bg[i - 1]) || (x < w - 1 && bg[i + 1]) || (y > 0 && bg[i - w]) || (y < h - 1 && bg[i + w])
++                if (edge) px[i] = (px[i] and 0x00FFFFFF) or (0xB0 shl 24)
 +            }
 +        }
-+    }
-+
-+    private fun smile(c: Canvas, cx: Float, y: Float, s: Float, happy: Float, col: Int) {
-+        stroke.color = col; stroke.strokeWidth = s * 0.022f
-+        val wdt = s * 0.07f
-+        val p = Path().apply {
-+            moveTo(cx - wdt, y)
-+            quadTo(cx, y + s * (0.02f + 0.05f * happy), cx + wdt, y)
-+        }
-+        c.drawPath(p, stroke)
-+    }
-+
-+    private fun cheeks(c: Canvas, cx: Float, y: Float, s: Float, gap: Float) {
-+        fill.color = Color.argb(90, 255, 120, 140)
-+        c.drawOval(RectF(cx - gap - s * 0.05f, y - s * 0.025f, cx - gap + s * 0.05f, y + s * 0.025f), fill)
-+        c.drawOval(RectF(cx + gap - s * 0.05f, y - s * 0.025f, cx + gap + s * 0.05f, y + s * 0.025f), fill)
-+    }
-+
-+    private fun drawPenguin(c: Canvas, cx: Float, top: Float, s: Float, color: Int, blink: Float, happy: Float) {
-+        shadow(c, cx, top, s)
-+        // feet
-+        fill.color = Color.parseColor("#FFB74D")
-+        c.drawOval(RectF(cx - s * 0.22f, top + s * 0.84f, cx - s * 0.04f, top + s * 0.93f), fill)
-+        c.drawOval(RectF(cx + s * 0.04f, top + s * 0.84f, cx + s * 0.22f, top + s * 0.93f), fill)
-+        // flippers
-+        fill.color = darker(color)
-+        c.drawOval(RectF(cx - s * 0.38f, top + s * 0.42f, cx - s * 0.22f, top + s * 0.72f), fill)
-+        c.drawOval(RectF(cx + s * 0.22f, top + s * 0.42f, cx + s * 0.38f, top + s * 0.72f), fill)
-+        // body
-+        fill.color = color
-+        c.drawOval(RectF(cx - s * 0.3f, top + s * 0.1f, cx + s * 0.3f, top + s * 0.9f), fill)
-+        // belly / face
-+        fill.color = Color.WHITE
-+        c.drawOval(RectF(cx - s * 0.22f, top + s * 0.26f, cx + s * 0.22f, top + s * 0.86f), fill)
-+        eyes(c, cx, top + s * 0.38f, s, s * 0.09f, s * 0.045f, blink)
-+        cheeks(c, cx, top + s * 0.47f, s, s * 0.15f)
-+        // beak
-+        fill.color = Color.parseColor("#FFA726")
-+        val beak = Path().apply {
-+            moveTo(cx - s * 0.05f, top + s * 0.45f)
-+            lineTo(cx + s * 0.05f, top + s * 0.45f)
-+            lineTo(cx, top + s * 0.5f + s * 0.02f * happy)
-+            close()
-+        }
-+        c.drawPath(beak, fill)
-+    }
-+
-+    private fun drawCat(c: Canvas, cx: Float, top: Float, s: Float, color: Int, blink: Float, happy: Float) {
-+        shadow(c, cx, top, s)
-+        fill.color = color
-+        // tail
-+        stroke.color = color; stroke.strokeWidth = s * 0.07f
-+        val tail = Path().apply {
-+            moveTo(cx + s * 0.22f, top + s * 0.8f)
-+            quadTo(cx + s * 0.45f, top + s * 0.75f, cx + s * 0.4f, top + s * 0.5f)
-+        }
-+        c.drawPath(tail, stroke)
-+        // body
-+        c.drawOval(RectF(cx - s * 0.26f, top + s * 0.5f, cx + s * 0.26f, top + s * 0.92f), fill)
-+        // ears
-+        val ears = Path().apply {
-+            moveTo(cx - s * 0.3f, top + s * 0.3f); lineTo(cx - s * 0.26f, top + s * 0.06f); lineTo(cx - s * 0.08f, top + s * 0.18f); close()
-+            moveTo(cx + s * 0.3f, top + s * 0.3f); lineTo(cx + s * 0.26f, top + s * 0.06f); lineTo(cx + s * 0.08f, top + s * 0.18f); close()
-+        }
-+        c.drawPath(ears, fill)
-+        // head
-+        c.drawOval(RectF(cx - s * 0.33f, top + s * 0.13f, cx + s * 0.33f, top + s * 0.62f), fill)
-+        // muzzle
-+        fill.color = Color.argb(230, 255, 255, 255)
-+        c.drawOval(RectF(cx - s * 0.13f, top + s * 0.4f, cx + s * 0.13f, top + s * 0.57f), fill)
-+        eyes(c, cx, top + s * 0.34f, s, s * 0.12f, s * 0.045f, blink)
-+        cheeks(c, cx, top + s * 0.46f, s, s * 0.19f)
-+        fill.color = Color.parseColor("#F06292")
-+        c.drawCircle(cx, top + s * 0.44f, s * 0.022f, fill)
-+        smile(c, cx, top + s * 0.48f, s, happy, Color.parseColor("#444444"))
-+        // whiskers
-+        stroke.color = Color.argb(140, 60, 60, 60); stroke.strokeWidth = s * 0.01f
-+        for (dy in floatArrayOf(-0.015f, 0.02f)) {
-+            c.drawLine(cx - s * 0.15f, top + s * (0.47f + dy), cx - s * 0.3f, top + s * (0.45f + dy * 2), stroke)
-+            c.drawLine(cx + s * 0.15f, top + s * (0.47f + dy), cx + s * 0.3f, top + s * (0.45f + dy * 2), stroke)
-+        }
-+    }
-+
-+    private fun drawGhost(c: Canvas, cx: Float, top: Float, s: Float, color: Int, blink: Float, happy: Float) {
-+        shadow(c, cx, top, s)
-+        fill.color = lighter(color)
-+        val body = Path().apply {
-+            moveTo(cx - s * 0.3f, top + s * 0.85f)
-+            lineTo(cx - s * 0.3f, top + s * 0.42f)
-+            cubicTo(cx - s * 0.3f, top + s * 0.05f, cx + s * 0.3f, top + s * 0.05f, cx + s * 0.3f, top + s * 0.42f)
-+            lineTo(cx + s * 0.3f, top + s * 0.85f)
-+            val step = s * 0.6f / 4f
-+            for (i in 0 until 4) {
-+                val x0 = cx + s * 0.3f - step * i
-+                quadTo(x0 - step / 2f, top + s * (if (i % 2 == 0) 0.76f else 0.94f), x0 - step, top + s * 0.85f)
-+            }
-+            close()
-+        }
-+        c.drawPath(body, fill)
-+        eyes(c, cx, top + s * 0.38f, s, s * 0.1f, s * 0.05f, blink)
-+        cheeks(c, cx, top + s * 0.48f, s, s * 0.17f)
-+        smile(c, cx, top + s * 0.49f, s, happy, Color.parseColor("#333333"))
-+    }
-+
-+    private fun darker(c: Int): Int = Color.rgb(
-+        (Color.red(c) * 0.75f).toInt(), (Color.green(c) * 0.75f).toInt(), (Color.blue(c) * 0.75f).toInt())
-+
-+    private fun lighter(c: Int): Int = Color.rgb(
-+        Color.red(c) + (255 - Color.red(c)) * 6 / 10,
-+        Color.green(c) + (255 - Color.green(c)) * 6 / 10,
-+        Color.blue(c) + (255 - Color.blue(c)) * 6 / 10)
-+}
-diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusPrefs.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusPrefs.kt
-new file mode 100644
-index 0000000..188d332
---- /dev/null
-+++ b/src/android/app/src/main/java/com/openminis/app/plus/PlusPrefs.kt
-@@ -0,0 +1,129 @@
-+package com.openminis.app.plus
-+
-+import android.content.Context
-+import android.content.SharedPreferences
-+import kotlinx.coroutines.flow.MutableStateFlow
-+import kotlinx.coroutines.flow.StateFlow
-+import kotlinx.coroutines.flow.asStateFlow
-+import org.json.JSONArray
-+import org.json.JSONObject
-+import java.util.UUID
-+
-+/** One VPS the user added. No server is pre-filled. */
-+data class VpsServer(
-+    val id: String = UUID.randomUUID().toString(),
-+    val name: String,
-+    val host: String,
-+    val port: Int = 22,
-+    val user: String = "root",
-+    val enabled: Boolean = true,
-+    /** Last measured TCP connect latency in ms, -1 = unknown, -2 = unreachable. */
-+    val lastLatencyMs: Int = -1,
-+    val lastCheckedAt: Long = 0L,
-+) {
-+    val target: String get() = "$user@$host"
++        if (removed < w * h / 50) return false // nothing that looks like a plain background
++        bmp.setPixels(px, 0, w, 0, 0, w, h)
++        noBgFile(context).outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
++        true
++    }.getOrDefault(false)
 +}
 +
-+data class PlusState(
-+    val workMode: String = MODE_LOCAL,
-+    val servers: List<VpsServer> = emptyList(),
-+    val wallpaper: String = "",          // "", "preset:<id>", "file:<version>"
-+    val wallpaperDim: Float = 0.25f,
-+    val petEnabled: Boolean = false,
-+    val petStyle: String = "penguin",    // penguin | cat | ghost
-+    val petColor: Int = 0xFF5B8DEF.toInt(),
-+    val todayCollapsed: Boolean = false,
-+    val autoFallback: Boolean = true,
-+    val autoClean: Boolean = true,
-+) {
-+    val isVps: Boolean get() = workMode == MODE_VPS
-+    val onlineServers: List<VpsServer> get() = servers.filter { it.enabled && it.lastLatencyMs >= 0 }
-+
-+    companion object {
-+        const val MODE_LOCAL = "local"
-+        const val MODE_VPS = "vps"
-+    }
-+}
++/** Crop of the user's own picture inside the circle. */
++data class AvatarCrop(val scale: Float = 1f, val offX: Float = 0f, val offY: Float = 0f)
 +
 +/**
-+ * Minis Plus settings: work mode, VPS list, wallpaper, avatar / desk pet.
-+ * Plain SharedPreferences (none of this is secret — SSH keys live in the
-+ * sandbox, account secrets live in [PlusVault]). Exposed as a process-wide
-+ * StateFlow so every screen updates live.
++ * Draws the current avatar (built-in or custom) on a canvas. Shared by the
++ * Compose [AvatarView] and the desk-pet overlay so both always match.
 + */
-+object PlusPrefs {
-+    private const val FILE = "minis_plus"
-+    private val _state = MutableStateFlow(PlusState())
-+    val state: StateFlow<PlusState> = _state.asStateFlow()
-+    @Volatile private var prefs: SharedPreferences? = null
++class AvatarRenderer(private val context: Context) {
++    private var key: String? = null
++    private var builtinFull: Bitmap? = null
++    private var builtinFace: Bitmap? = null
++    private var custom: Drawable? = null
++    var callback: Drawable.Callback? = null
++    private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
++    private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
++    private val clip = Path()
 +
-+    fun init(context: Context) {
-+        if (prefs != null) return
-+        synchronized(this) {
-+            if (prefs != null) return
-+            val p = context.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
-+            prefs = p
-+            _state.value = read(p)
-+        }
-+    }
-+
-+    private fun read(p: SharedPreferences): PlusState {
-+        val servers = runCatching {
-+            val arr = JSONArray(p.getString("servers", "[]"))
-+            (0 until arr.length()).map { i ->
-+                val o = arr.getJSONObject(i)
-+                VpsServer(
-+                    id = o.optString("id", UUID.randomUUID().toString()),
-+                    name = o.optString("name"),
-+                    host = o.optString("host"),
-+                    port = o.optInt("port", 22),
-+                    user = o.optString("user", "root"),
-+                    enabled = o.optBoolean("enabled", true),
-+                    lastLatencyMs = o.optInt("lat", -1),
-+                    lastCheckedAt = o.optLong("checked", 0L),
-+                )
++    private fun load(style: String, version: Long, noBg: Boolean) {
++        val k = "$style/$version/$noBg"
++        if (k == key) return
++        key = k
++        (custom as? Animatable)?.stop()
++        custom = null; builtinFull = null; builtinFace = null
++        if (style == Avatars.CUSTOM) {
++            val f = if (noBg && Avatars.noBgFile(context).exists()) Avatars.noBgFile(context) else Avatars.sourceFile(context)
++            custom = Avatars.decode(context, f)?.also { d ->
++                d.callback = callback
++                (d as? Animatable)?.start()
 +            }
-+        }.getOrDefault(emptyList())
-+        return PlusState(
-+            workMode = p.getString("workMode", PlusState.MODE_LOCAL) ?: PlusState.MODE_LOCAL,
-+            servers = servers,
-+            wallpaper = p.getString("wallpaper", "") ?: "",
-+            wallpaperDim = p.getFloat("wallpaperDim", 0.25f),
-+            petEnabled = p.getBoolean("petEnabled", false),
-+            petStyle = p.getString("petStyle", "penguin") ?: "penguin",
-+            petColor = p.getInt("petColor", 0xFF5B8DEF.toInt()),
-+            todayCollapsed = p.getBoolean("todayCollapsed", false),
-+            autoFallback = p.getBoolean("autoFallback", true),
-+            autoClean = p.getBoolean("autoClean", true),
-+        )
++            if (custom != null) return
++        }
++        val b = Avatars.builtins.firstOrNull { it.id == style } ?: Avatars.builtins.first()
++        builtinFull = BitmapFactory.decodeResource(context.resources, b.full)
++        builtinFace = BitmapFactory.decodeResource(context.resources, b.face)
 +    }
 +
-+    fun update(context: Context, block: (PlusState) -> PlusState) {
-+        init(context)
-+        val next = synchronized(this) {
-+            val n = block(_state.value)
-+            _state.value = n
-+            n
++    fun stop() { (custom as? Animatable)?.stop(); key = null }
++
++    /**
++     * @param face true = round head crop (Today card, lists); false = full body (desk pet, large previews)
++     * @param bob vertical breathing offset as a fraction of height
++     */
++    fun draw(
++        canvas: Canvas, w: Float, h: Float,
++        style: String, face: Boolean, ringColor: Int?, bob: Float = 0f,
++        crop: AvatarCrop = AvatarCrop(), version: Long = 0L, noBg: Boolean = false,
++    ) {
++        load(Avatars.normalize(style), version, noBg)
++        val size = minOf(w, h)
++        val left = (w - size) / 2f
++        val top = (h - size) / 2f + bob * size
++        val c = custom
++        if (c != null) {
++            // Custom picture: always a circle, user crop applied.
++            canvas.save()
++            clip.reset(); clip.addCircle(left + size / 2, top + size / 2, size / 2, Path.Direction.CW)
++            canvas.clipPath(clip)
++            val dw = c.intrinsicWidth.coerceAtLeast(1).toFloat(); val dh = c.intrinsicHeight.coerceAtLeast(1).toFloat()
++            val base = max(size / dw, size / dh) * crop.scale.coerceIn(1f, 5f)
++            val sw = dw * base; val sh = dh * base
++            val cx = left + size / 2 + crop.offX * size; val cy = top + size / 2 + crop.offY * size
++            c.setBounds((cx - sw / 2).toInt(), (cy - sh / 2).toInt(), (cx + sw / 2).toInt(), (cy + sh / 2).toInt())
++            c.draw(canvas)
++            canvas.restore()
++            drawRing(canvas, left, top, size, ringColor)
++            return
 +        }
-+        val arr = JSONArray()
-+        next.servers.forEach { s ->
-+            arr.put(JSONObject().apply {
-+                put("id", s.id); put("name", s.name); put("host", s.host)
-+                put("port", s.port); put("user", s.user); put("enabled", s.enabled)
-+                put("lat", s.lastLatencyMs); put("checked", s.lastCheckedAt)
-+            })
++        if (face) {
++            val bmp = builtinFace ?: return
++            canvas.save()
++            clip.reset(); clip.addCircle(left + size / 2, top + size / 2, size / 2, Path.Direction.CW)
++            canvas.clipPath(clip)
++            ringColor?.let { rc ->
++                paint.color = (rc and 0x00FFFFFF) or (0x33 shl 24)
++                canvas.drawCircle(left + size / 2, top + size / 2, size / 2, paint)
++            }
++            canvas.drawBitmap(bmp, null, RectF(left, top, left + size, top + size), paint)
++            canvas.restore()
++            drawRing(canvas, left, top, size, ringColor)
++        } else {
++            val bmp = builtinFull ?: return
++            canvas.drawBitmap(bmp, null, RectF(left, top, left + size, top + size), paint)
 +        }
-+        prefs?.edit()
-+            ?.putString("workMode", next.workMode)
-+            ?.putString("servers", arr.toString())
-+            ?.putString("wallpaper", next.wallpaper)
-+            ?.putFloat("wallpaperDim", next.wallpaperDim)
-+            ?.putBoolean("petEnabled", next.petEnabled)
-+            ?.putString("petStyle", next.petStyle)
-+            ?.putInt("petColor", next.petColor)
-+            ?.putBoolean("todayCollapsed", next.todayCollapsed)
-+            ?.putBoolean("autoFallback", next.autoFallback)
-+            ?.putBoolean("autoClean", next.autoClean)
-+            ?.apply()
++    }
++
++    private fun drawRing(canvas: Canvas, left: Float, top: Float, size: Float, ringColor: Int?) {
++        val rc = ringColor ?: return
++        ring.color = rc
++        ring.strokeWidth = (size * 0.035f).coerceAtLeast(2f)
++        canvas.drawCircle(left + size / 2, top + size / 2, size / 2 - ring.strokeWidth / 2, ring)
++    }
++}
++
++/** A plain View around [AvatarRenderer]; used from Compose via AndroidView. */
++class AvatarView @JvmOverloads constructor(context: Context, attrs: AttributeSet? = null) : View(context, attrs) {
++    private val renderer = AvatarRenderer(context).also { r ->
++        r.callback = object : Drawable.Callback {
++            override fun invalidateDrawable(who: Drawable) = invalidate()
++            override fun scheduleDrawable(who: Drawable, what: Runnable, `when`: Long) { postDelayed(what, `when` - android.os.SystemClock.uptimeMillis()) }
++            override fun unscheduleDrawable(who: Drawable, what: Runnable) { removeCallbacks(what) }
++        }
++    }
++    var style: String? = null
++    var face: Boolean = true
++    var bob: Boolean = false
++    var showRing: Boolean = true
++    var crop: AvatarCrop? = null
++    var noBg: Boolean? = null
++    var version: Long? = null
++    private val start = System.currentTimeMillis()
++
++    override fun onDraw(canvas: Canvas) {
++        super.onDraw(canvas)
++        val st = PlusPrefs.state.value
++        val t = (System.currentTimeMillis() - start) / 1000f
++        renderer.draw(
++            canvas, width.toFloat(), height.toFloat(),
++            style ?: st.petStyle, face, if (showRing) st.petColor else null,
++            bob = if (bob) sin(t * 2.2f) * 0.02f else 0f,
++            crop = crop ?: AvatarCrop(st.avatarScale, st.avatarOffX, st.avatarOffY),
++            version = version ?: st.avatarVersion,
++            noBg = noBg ?: st.avatarRemoveBg,
++        )
++        if (bob) postInvalidateDelayed(50)
++    }
++
++    override fun onDetachedFromWindow() {
++        renderer.stop()
++        super.onDetachedFromWindow()
 +    }
 +}
