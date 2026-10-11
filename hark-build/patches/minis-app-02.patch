@@ -1,3 +1,420 @@
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Avatars.kt b/src/android/app/src/main/java/com/openminis/app/plus/Avatars.kt
+new file mode 100644
+index 0000000..06df5b1
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/Avatars.kt
+@@ -0,0 +1,278 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import android.graphics.Bitmap
++import android.graphics.BitmapFactory
++import android.graphics.Canvas
++import android.graphics.Color
++import android.graphics.ImageDecoder
++import android.graphics.Paint
++import android.graphics.Path
++import android.graphics.RectF
++import android.graphics.drawable.Animatable
++import android.graphics.drawable.BitmapDrawable
++import android.graphics.drawable.Drawable
++import android.os.Build
++import android.util.AttributeSet
++import android.view.View
++import com.openminis.app.R
++import java.io.File
++import kotlin.math.abs
++import kotlin.math.max
++import kotlin.math.sin
++
++data class BuiltinAvatar(val id: String, val name: String, val full: Int, val face: Int)
++
++/**
++ * The avatar shown on the Today card, the voice screen and the desk pet:
++ * six built-in anime maid characters, or the user's own picture / GIF /
++ * animated WebP (circle-cropped, optional plain-background removal).
++ */
++object Avatars {
++    const val CUSTOM = "custom"
++    val builtins = listOf(
++        BuiltinAvatar("whale", "鲸鱼娘", R.drawable.avatar_whale, R.drawable.avatar_whale_face),
++        BuiltinAvatar("claude", "Claude娘", R.drawable.avatar_claude, R.drawable.avatar_claude_face),
++        BuiltinAvatar("gpt", "GPT娘", R.drawable.avatar_gpt, R.drawable.avatar_gpt_face),
++        BuiltinAvatar("gemini", "Gemini娘", R.drawable.avatar_gemini, R.drawable.avatar_gemini_face),
++        BuiltinAvatar("qwen", "通义娘", R.drawable.avatar_qwen, R.drawable.avatar_qwen_face),
++        BuiltinAvatar("kimi", "Kimi娘", R.drawable.avatar_kimi, R.drawable.avatar_kimi_face),
++    )
++
++    /** Ring / accent colours (terracotta first, the Mines brand colour). */
++    val colors = listOf(
++        0xFFD97757.toInt(), 0xFFF4F0E8.toInt(), 0xFF5B8DEF.toInt(), 0xFF34C759.toInt(),
++        0xFFAF52DE.toInt(), 0xFFFF6F91.toInt(), 0xFF8E8E93.toInt(),
++    )
++
++    /** Old styles (penguin / cat / ghost) map to the default character. */
++    fun normalize(style: String): String =
++        if (style == CUSTOM || builtins.any { it.id == style }) style else builtins.first().id
++
++    fun name(style: String): String = builtins.firstOrNull { it.id == style }?.name ?: "我的形象"
++
++    fun sourceFile(context: Context) = File(context.filesDir, "plus_avatar_src")
++    fun noBgFile(context: Context) = File(context.filesDir, "plus_avatar_nobg.png")
++    fun pickFile(context: Context) = File(context.filesDir, "plus_avatar_pick")
++
++    fun hasCustom(context: Context) = sourceFile(context).exists()
++
++    /** True for GIF / animated WebP / animated HEIF content. */
++    fun isAnimated(file: File): Boolean {
++        if (!file.exists()) return false
++        val head = ByteArray(64)
++        val n = runCatching { file.inputStream().use { it.read(head) } }.getOrDefault(0)
++        if (n < 12) return false
++        val s = String(head, 0, n, Charsets.ISO_8859_1)
++        return s.startsWith("GIF8") || (s.startsWith("RIFF") && s.substring(8, 12) == "WEBP" && s.contains("ANIM")) ||
++            (s.startsWith("RIFF") && s.substring(8, 12) == "WEBP" && s.contains("VP8X") && (head[20].toInt() and 0x02) != 0)
++    }
++
++    /** Decodes [file] as a (possibly animated) drawable; animation needs Android 9+. */
++    fun decode(context: Context, file: File): Drawable? = runCatching {
++        if (Build.VERSION.SDK_INT >= 28) {
++            ImageDecoder.decodeDrawable(ImageDecoder.createSource(file)) { decoder, info, _ ->
++                val longest = max(info.size.width, info.size.height)
++                if (longest > 768) {
++                    val f = 768f / longest
++                    decoder.setTargetSize((info.size.width * f).toInt().coerceAtLeast(1), (info.size.height * f).toInt().coerceAtLeast(1))
++                }
++                decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
++            }
++        } else {
++            val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
++            BitmapFactory.decodeFile(file.absolutePath, o)
++            var sample = 1
++            while (max(o.outWidth, o.outHeight) / (sample * 2) >= 768) sample *= 2
++            BitmapFactory.decodeFile(file.absolutePath, BitmapFactory.Options().apply { inSampleSize = sample })
++                ?.let { BitmapDrawable(context.resources, it) }
++        }
++    }.getOrNull()
++
++    /**
++     * Removes a plain background: flood-fills from the image border through pixels
++     * close to the border colours, then softens the edge. Works best on photos /
++     * pictures with a fairly even background. Writes [noBgFile].
++     */
++    fun removeBackground(context: Context): Boolean = runCatching {
++        val src = sourceFile(context)
++        val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
++        BitmapFactory.decodeFile(src.absolutePath, o)
++        var sample = 1
++        while (max(o.outWidth, o.outHeight) / (sample * 2) >= 640) sample *= 2
++        val bmp = BitmapFactory.decodeFile(src.absolutePath, BitmapFactory.Options().apply {
++            inSampleSize = sample; inMutable = true; inPreferredConfig = Bitmap.Config.ARGB_8888
++        }) ?: return false
++        val w = bmp.width; val h = bmp.height
++        val px = IntArray(w * h)
++        bmp.getPixels(px, 0, w, 0, 0, w, h)
++        // Reference colours: samples along the border.
++        val refs = ArrayList<Int>()
++        for (i in 0 until 16) {
++            refs += px[(i * (w - 1) / 15)]                       // top
++            refs += px[(h - 1) * w + (i * (w - 1) / 15)]         // bottom
++            refs += px[(i * (h - 1) / 15) * w]                   // left
++            refs += px[(i * (h - 1) / 15) * w + (w - 1)]         // right
++        }
++        fun near(c: Int, tol: Int): Boolean = refs.any { r ->
++            abs(Color.red(c) - Color.red(r)) + abs(Color.green(c) - Color.green(r)) + abs(Color.blue(c) - Color.blue(r)) < tol
++        }
++        val bg = BooleanArray(w * h)
++        val stack = IntArray(w * h)
++        var sp = 0
++        fun seed(i: Int) { if (!bg[i] && Color.alpha(px[i]) > 0 && near(px[i], 60)) { bg[i] = true; stack[sp++] = i } }
++        for (x in 0 until w) { seed(x); seed((h - 1) * w + x) }
++        for (y in 0 until h) { seed(y * w); seed(y * w + w - 1) }
++        while (sp > 0) {
++            val i = stack[--sp]; val x = i % w; val y = i / w
++            if (x > 0) seed(i - 1); if (x < w - 1) seed(i + 1)
++            if (y > 0) seed(i - w); if (y < h - 1) seed(i + w)
++        }
++        var removed = 0
++        for (i in px.indices) {
++            if (bg[i]) { px[i] = 0; removed++ }
++            else {
++                // Soft edge: half-transparent where a neighbour is background.
++                val x = i % w; val y = i / w
++                val edge = (x > 0 && bg[i - 1]) || (x < w - 1 && bg[i + 1]) || (y > 0 && bg[i - w]) || (y < h - 1 && bg[i + w])
++                if (edge) px[i] = (px[i] and 0x00FFFFFF) or (0xB0 shl 24)
++            }
++        }
++        if (removed < w * h / 50) return false // nothing that looks like a plain background
++        bmp.setPixels(px, 0, w, 0, 0, w, h)
++        noBgFile(context).outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
++        true
++    }.getOrDefault(false)
++}
++
++/** Crop of the user's own picture inside the circle. */
++data class AvatarCrop(val scale: Float = 1f, val offX: Float = 0f, val offY: Float = 0f)
++
++/**
++ * Draws the current avatar (built-in or custom) on a canvas. Shared by the
++ * Compose [AvatarView] and the desk-pet overlay so both always match.
++ */
++class AvatarRenderer(private val context: Context) {
++    private var key: String? = null
++    private var builtinFull: Bitmap? = null
++    private var builtinFace: Bitmap? = null
++    private var custom: Drawable? = null
++    var callback: Drawable.Callback? = null
++    private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
++    private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
++    private val clip = Path()
++
++    private fun load(style: String, version: Long, noBg: Boolean) {
++        val k = "$style/$version/$noBg"
++        if (k == key) return
++        key = k
++        (custom as? Animatable)?.stop()
++        custom = null; builtinFull = null; builtinFace = null
++        if (style == Avatars.CUSTOM) {
++            val f = if (noBg && Avatars.noBgFile(context).exists()) Avatars.noBgFile(context) else Avatars.sourceFile(context)
++            custom = Avatars.decode(context, f)?.also { d ->
++                d.callback = callback
++                (d as? Animatable)?.start()
++            }
++            if (custom != null) return
++        }
++        val b = Avatars.builtins.firstOrNull { it.id == style } ?: Avatars.builtins.first()
++        builtinFull = BitmapFactory.decodeResource(context.resources, b.full)
++        builtinFace = BitmapFactory.decodeResource(context.resources, b.face)
++    }
++
++    fun stop() { (custom as? Animatable)?.stop(); key = null }
++
++    /**
++     * @param face true = round head crop (Today card, lists); false = full body (desk pet, large previews)
++     * @param bob vertical breathing offset as a fraction of height
++     */
++    fun draw(
++        canvas: Canvas, w: Float, h: Float,
++        style: String, face: Boolean, ringColor: Int?, bob: Float = 0f,
++        crop: AvatarCrop = AvatarCrop(), version: Long = 0L, noBg: Boolean = false,
++    ) {
++        load(Avatars.normalize(style), version, noBg)
++        val size = minOf(w, h)
++        val left = (w - size) / 2f
++        val top = (h - size) / 2f + bob * size
++        val c = custom
++        if (c != null) {
++            // Custom picture: always a circle, user crop applied.
++            canvas.save()
++            clip.reset(); clip.addCircle(left + size / 2, top + size / 2, size / 2, Path.Direction.CW)
++            canvas.clipPath(clip)
++            val dw = c.intrinsicWidth.coerceAtLeast(1).toFloat(); val dh = c.intrinsicHeight.coerceAtLeast(1).toFloat()
++            val base = max(size / dw, size / dh) * crop.scale.coerceIn(1f, 5f)
++            val sw = dw * base; val sh = dh * base
++            val cx = left + size / 2 + crop.offX * size; val cy = top + size / 2 + crop.offY * size
++            c.setBounds((cx - sw / 2).toInt(), (cy - sh / 2).toInt(), (cx + sw / 2).toInt(), (cy + sh / 2).toInt())
++            c.draw(canvas)
++            canvas.restore()
++            drawRing(canvas, left, top, size, ringColor)
++            return
++        }
++        if (face) {
++            val bmp = builtinFace ?: return
++            canvas.save()
++            clip.reset(); clip.addCircle(left + size / 2, top + size / 2, size / 2, Path.Direction.CW)
++            canvas.clipPath(clip)
++            ringColor?.let { rc ->
++                paint.color = (rc and 0x00FFFFFF) or (0x33 shl 24)
++                canvas.drawCircle(left + size / 2, top + size / 2, size / 2, paint)
++            }
++            canvas.drawBitmap(bmp, null, RectF(left, top, left + size, top + size), paint)
++            canvas.restore()
++            drawRing(canvas, left, top, size, ringColor)
++        } else {
++            val bmp = builtinFull ?: return
++            canvas.drawBitmap(bmp, null, RectF(left, top, left + size, top + size), paint)
++        }
++    }
++
++    private fun drawRing(canvas: Canvas, left: Float, top: Float, size: Float, ringColor: Int?) {
++        val rc = ringColor ?: return
++        ring.color = rc
++        ring.strokeWidth = (size * 0.035f).coerceAtLeast(2f)
++        canvas.drawCircle(left + size / 2, top + size / 2, size / 2 - ring.strokeWidth / 2, ring)
++    }
++}
++
++/** A plain View around [AvatarRenderer]; used from Compose via AndroidView. */
++class AvatarView @JvmOverloads constructor(context: Context, attrs: AttributeSet? = null) : View(context, attrs) {
++    private val renderer = AvatarRenderer(context).also { r ->
++        r.callback = object : Drawable.Callback {
++            override fun invalidateDrawable(who: Drawable) = invalidate()
++            override fun scheduleDrawable(who: Drawable, what: Runnable, `when`: Long) { postDelayed(what, `when` - android.os.SystemClock.uptimeMillis()) }
++            override fun unscheduleDrawable(who: Drawable, what: Runnable) { removeCallbacks(what) }
++        }
++    }
++    var style: String? = null
++    var face: Boolean = true
++    var bob: Boolean = false
++    var showRing: Boolean = true
++    var crop: AvatarCrop? = null
++    var noBg: Boolean? = null
++    var version: Long? = null
++    private val start = System.currentTimeMillis()
++
++    override fun onDraw(canvas: Canvas) {
++        super.onDraw(canvas)
++        val st = PlusPrefs.state.value
++        val t = (System.currentTimeMillis() - start) / 1000f
++        renderer.draw(
++            canvas, width.toFloat(), height.toFloat(),
++            style ?: st.petStyle, face, if (showRing) st.petColor else null,
++            bob = if (bob) sin(t * 2.2f) * 0.02f else 0f,
++            crop = crop ?: AvatarCrop(st.avatarScale, st.avatarOffX, st.avatarOffY),
++            version = version ?: st.avatarVersion,
++            noBg = noBg ?: st.avatarRemoveBg,
++        )
++        if (bob) postInvalidateDelayed(50)
++    }
++
++    override fun onDetachedFromWindow() {
++        renderer.stop()
++        super.onDetachedFromWindow()
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ChatOrganizer.kt b/src/android/app/src/main/java/com/openminis/app/plus/ChatOrganizer.kt
+new file mode 100644
+index 0000000..549a879
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/ChatOrganizer.kt
+@@ -0,0 +1,127 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import android.content.SharedPreferences
++import com.openminis.app.data.db.ChatSessionEntity
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import org.json.JSONObject
++
++/**
++ * Tidies the conversation list without touching the database:
++ *  - auto-archive: a chat idle for N days (default 7) leaves the main list;
++ *    it shows under the 「已归档」 chip and comes back as soon as it is
++ *    opened (or with 「全部恢复」). Pinned chats are never archived.
++ *  - topics: chats are grouped by keywords in their title and last message
++ *    (服务器 / 交易 / Mines 开发 / 编程 / 生活), shown as filter chips. Local
++ *    and instant; no model call, nothing leaves the phone.
++ * State is a small SharedPreferences file, so it survives updates and costs
++ * no migration.
++ */
++object ChatOrganizer {
++    const val FILTER_ALL = "all"
++    const val FILTER_ARCHIVED = "archived"
++    private const val FILE = "mines_chat_tidy"
++
++    data class Topic(val name: String, val keywords: List<String>)
++
++    val topics = listOf(
++        Topic("服务器", listOf("服务器", "vps", "ssh", "阿里云", "ecs", "linux", "docker", "nginx", "宝塔", "面板", "域名", "dns", "cloudflare", "端口", "部署", "梦云", "wispbyte")),
++        Topic("交易", listOf("交易", "okx", "币安", "binance", "比特币", "btc", "eth", "合约", "量化", "行情", "仓位", "k线", "策略", "hermes", "现货", "止损")),
++        Topic("Mines 开发", listOf("mines", "minis", "apk", "插件", "构建", "build", "actions", "github", "补丁", "kotlin", "安卓", "android", "dsh")),
++        Topic("编程", listOf("代码", "python", "javascript", "bug", "报错", "脚本", "api", "函数", "编译", "sql")),
++        Topic("生活", listOf("天气", "吃", "餐厅", "旅行", "机票", "酒店", "购物", "电影", "健康", "快递", "外卖")),
++    )
++
++    data class Settings(val autoArchive: Boolean = true, val days: Int = 7, val topicChips: Boolean = true)
++
++    private val _settings = MutableStateFlow(Settings())
++    val settings: StateFlow<Settings> = _settings.asStateFlow()
++    private val _filter = MutableStateFlow(FILTER_ALL)
++    val filter: StateFlow<String> = _filter.asStateFlow()
++    /** id → when the user last restored/opened it (restarts the idle clock). */
++    private val _restored = MutableStateFlow<Map<String, Long>>(emptyMap())
++    val restored: StateFlow<Map<String, Long>> = _restored.asStateFlow()
++    @Volatile private var prefs: SharedPreferences? = null
++
++    fun init(context: Context) {
++        if (prefs != null) return
++        synchronized(this) {
++            if (prefs != null) return
++            val p = context.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
++            prefs = p
++            _settings.value = Settings(
++                autoArchive = p.getBoolean("auto", true),
++                days = p.getInt("days", 7).coerceIn(1, 365),
++                topicChips = p.getBoolean("chips", true),
++            )
++            _restored.value = runCatching {
++                val o = JSONObject(p.getString("restored", "{}") ?: "{}")
++                o.keys().asSequence().associateWith { o.getLong(it) }
++            }.getOrDefault(emptyMap())
++        }
++    }
++
++    fun update(context: Context, block: (Settings) -> Settings) {
++        init(context)
++        val n = block(_settings.value).let { it.copy(days = it.days.coerceIn(1, 365)) }
++        _settings.value = n
++        prefs?.edit()?.putBoolean("auto", n.autoArchive)?.putInt("days", n.days)?.putBoolean("chips", n.topicChips)?.apply()
++        if (!n.topicChips && _filter.value != FILTER_ARCHIVED) _filter.value = FILTER_ALL
++    }
++
++    fun setFilter(f: String) { _filter.value = f }
++
++    private fun saveRestored() {
++        prefs?.edit()?.putString("restored", JSONObject(_restored.value as Map<*, *>).toString())?.apply()
++    }
++
++    /** Opening a chat (or 恢复) puts it back in the main list. */
++    fun restore(context: Context, id: String) {
++        init(context)
++        _restored.value = _restored.value + (id to System.currentTimeMillis())
++        saveRestored()
++    }
++
++    fun restoreAll(context: Context, ids: Collection<String>) {
++        init(context)
++        val now = System.currentTimeMillis()
++        _restored.value = _restored.value + ids.associateWith { now }
++        saveRestored()
++        _filter.value = FILTER_ALL
++    }
++
++    fun isArchived(s: ChatSessionEntity, now: Long = System.currentTimeMillis()): Boolean {
++        val st = _settings.value
++        if (!st.autoArchive || s.pinnedAt != null || s.modelId.isEmpty()) return false
++        val lastTouch = maxOf(s.updatedAt, _restored.value[s.id] ?: 0L)
++        return now - lastTouch > st.days * 86_400_000L
++    }
++
++    fun topicOf(s: ChatSessionEntity): String? {
++        val text = ((s.title ?: "") + " " + (s.lastMessage ?: "").take(400)).lowercase()
++        if (text.isBlank()) return null
++        var best: String? = null; var bestHits = 0
++        for (t in topics) {
++            val hits = t.keywords.count { text.contains(it) }
++            if (hits > bestHits) { best = t.name; bestHits = hits }
++        }
++        return best
++    }
++
++    /** Topic chips worth showing: topics with at least one live chat. */
++    fun chipCounts(all: List<ChatSessionEntity>): List<Pair<String, Int>> {
++        val live = all.filter { !isArchived(it) }
++        return topics.map { t -> t.name to live.count { topicOf(it) == t.name } }.filter { it.second > 0 }
++    }
++
++    fun archivedCount(all: List<ChatSessionEntity>): Int = all.count { isArchived(it) }
++
++    /** The list the home screen shows for the current filter. */
++    fun apply(all: List<ChatSessionEntity>, filter: String): List<ChatSessionEntity> = when (filter) {
++        FILTER_ARCHIVED -> all.filter { isArchived(it) }
++        FILTER_ALL -> all.filter { !isArchived(it) }
++        else -> all.filter { !isArchived(it) && topicOf(it) == filter }
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt b/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt
 new file mode 100644
 index 0000000..f89f07d
@@ -320,6 +737,203 @@ index 0000000..f89f07d
 +        }
 +    }
 +}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/DshLlmBridge.kt b/src/android/app/src/main/java/com/openminis/app/plus/DshLlmBridge.kt
+new file mode 100644
+index 0000000..b41acd1
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/DshLlmBridge.kt
+@@ -0,0 +1,191 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import android.util.Log
++import com.openminis.app.MinisApp
++import com.openminis.app.data.model.ProviderCredential
++import com.openminis.app.data.model.ProviderInstance
++import com.openminis.app.data.model.ProviderType
++import com.openminis.app.sandbox.PRootKernel
++import com.openminis.app.sandbox.RootfsManager
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
++import kotlinx.coroutines.withContext
++import org.json.JSONObject
++import java.io.File
++import java.net.HttpURLConnection
++import java.net.URL
++import java.util.UUID
++
++/**
++ * Model-provider dsh plugins (e.g. dsh-workbuddy-connect) inside Mines.
++ *
++ * The plugins run in the sandbox under minis-dsh's socket, which implements
++ * dsh's `llm` service. `socket.mjs --gateway` serves every registered
++ * provider route as an OpenAI-compatible endpoint on 127.0.0.1:8790
++ * (`/p/<route>/v1`). This object keeps that gateway process alive while the
++ * app runs and adds one Mines provider per route, so the plugin's models show
++ * up as their own group in the model picker. Requests go Mines → gateway →
++ * the plugin's own endpoint (for WorkBuddy: its loopback shim → WorkBuddy).
++ */
++object DshLlmBridge {
++    private const val TAG = "DshLlmBridge"
++    const val PORT = 8790
++    private const val PREFS = "mines_dsh_llm"
++    private val lock = Mutex()
++    @Volatile private var process: Process? = null
++
++    data class Route(val id: String, val name: String, val plugin: String, val models: Int, val proxied: Int)
++
++    private fun home(context: Context) = File(RootfsManager.getInstance(context).rootfsDir, "root/.minis-dsh")
++
++    /** True when an installed, working plugin registered at least one model route. */
++    fun hasModelPlugins(context: Context): Boolean = runCatching {
++        val st = JSONObject(File(home(context), "status.json").readText())
++        st.keys().asSequence().any { k ->
++            val o = st.optJSONObject(k)
++            o != null && o.optBoolean("ok") && (o.optJSONArray("llm")?.length() ?: 0) > 0
++        }
++    }.getOrDefault(false)
++
++    /** Routes as last written by the socket (`llm.json`). */
++    fun routes(context: Context): List<Route> = runCatching {
++        val idx = JSONObject(File(home(context), "llm.json").readText())
++        val arr = idx.optJSONArray("providers") ?: return@runCatching emptyList()
++        (0 until arr.length()).map { i ->
++            val p = arr.getJSONObject(i)
++            val ms = p.optJSONArray("models")
++            var proxied = 0
++            if (ms != null) for (j in 0 until ms.length()) if (ms.getJSONObject(j).optBoolean("proxied")) proxied++
++            Route(p.optString("id"), p.optString("name"), p.optString("plugin"), ms?.length() ?: 0, proxied)
++        }
++    }.getOrDefault(emptyList())
++
++    fun healthy(): Boolean = runCatching {
++        val c = URL("http://127.0.0.1:$PORT/health").openConnection() as HttpURLConnection
++        c.connectTimeout = 400; c.readTimeout = 800
++        c.inputStream.use { it.readBytes() }
++        c.responseCode == 200
++    }.getOrDefault(false)
++
++    private fun fetchIndex(): JSONObject? = runCatching {
++        val c = URL("http://127.0.0.1:$PORT/index").openConnection() as HttpURLConnection
++        c.connectTimeout = 600; c.readTimeout = 8000
++        JSONObject(c.inputStream.use { it.readBytes() }.toString(Charsets.UTF_8))
++    }.getOrNull()
++
++    /** Stop the gateway (e.g. after a new sign-in, so the plugin re-reads it). */
++    fun restart() {
++        process?.let { runCatching { it.destroy() } }
++        process = null
++    }
++
++    /**
++     * Make sure the gateway runs (when any model plugin is installed) and that
++     * each route with usable models has a Mines provider. Safe to call often.
++     * Returns a short Chinese status line for the UI.
++     */
++    suspend fun ensure(context: Context, force: Boolean = false): String = withContext(Dispatchers.IO) {
++        lock.withLock {
++            val app = context.applicationContext
++            // Wait for the sandbox (first launch boots it in the background).
++            var waited = 0
++            while (!PRootKernel.isBooted && waited < 60_000) { delay(500); waited += 500 }
++            if (!PRootKernel.isBooted) return@withLock "沙箱还没启动"
++            if (!force && !hasModelPlugins(app)) return@withLock "没有提供模型的插件"
++            if (!healthy()) {
++                start(app)
++                var t = 0
++                while (!healthy() && t < 30_000) { delay(500); t += 500 }
++                if (!healthy()) return@withLock "插件模型服务没起来（看插件页的检查结果）"
++            }
++            val idx = fetchIndex() ?: return@withLock "读不到插件模型列表"
++            sync(app, idx)
++        }
++    }
++
++    private fun start(context: Context) {
++        process?.let { if (it.isAlive) return; process = null }
++        val cmd = "MINIS_DSH_HOME=/root/.minis-dsh MINIS_DSH_GATEWAY_PORT=$PORT exec node /usr/local/lib/minis-dsh/socket.mjs --gateway"
++        val pb = ProcessBuilder(PRootKernel.buildProotCommand(cmd)).redirectErrorStream(true)
++        val env = pb.environment()
++        env["PROOT_TMP_DIR"] = PRootKernel.getProotTmpDir(context).absolutePath
++        if (PRootKernel.nativeLibDir.isNotEmpty()) env["LD_LIBRARY_PATH"] = PRootKernel.nativeLibDir
++        if (PRootKernel.prootLoaderPath.isNotEmpty()) env["PROOT_LOADER"] = PRootKernel.prootLoaderPath
++        if (PRootKernel.prootLoader32Path.isNotEmpty()) env["PROOT_LOADER_32"] = PRootKernel.prootLoader32Path
++        for ((k, v) in PRootKernel.customEnvironment) env[k] = v
++        val p = pb.start()
++        process = p
++        // Drain output so the pipe never fills; the socket logs to its own file.
++        Thread({ runCatching { p.inputStream.use { s -> val b = ByteArray(4096); while (s.read(b) >= 0) {} } } }, "dsh-gateway-drain")
++            .apply { isDaemon = true }.start()
++        Log.i(TAG, "gateway started")
++    }
++
++    private fun sync(context: Context, idx: JSONObject): String {
++        val repo = (context.applicationContext as? MinisApp)?.providerRepositoryOrNull ?: return "供应商还没加载"
++        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++        val arr = idx.optJSONArray("providers") ?: return "没有插件模型"
++        var added = 0; var ready = 0
++        for (i in 0 until arr.length()) {
++            val p = arr.getJSONObject(i)
++            val route = p.optString("id")
++            if (route.isBlank()) continue
++            val name = p.optString("name").ifBlank { route }
++            val ms = p.optJSONArray("models")
++            var proxied = 0
++            if (ms != null) for (j in 0 until ms.length()) if (ms.getJSONObject(j).optBoolean("proxied")) proxied++
++            val known = prefs.getString("inst_$route", null)?.let { repo.instance(it) }
++            if (known != null) {
++                ready++
++                if (prefs.getInt("count_$route", -1) != proxied) {
++                    repo.triggerAsyncModelReconcile(known.id, forceRefresh = true)
++                    prefs.edit().putInt("count_$route", proxied).apply()
++                }
++                continue
++            }
++            if (proxied == 0) continue
++            val inst = ProviderInstance(
++                id = UUID.randomUUID().toString(),
++                label = "$name（插件）",
++                providerType = ProviderType.openAI,
++                credentialType = ProviderCredential.apiKey,
++                customBaseURL = "http://127.0.0.1:$PORT/p/$route/v1",
++                appendV1Suffix = true,
++            )
++            repo.addInstance(inst)
++            repo.saveApiKey(inst.id, "minis-dsh")
++            repo.triggerAsyncModelReconcile(inst.id, forceRefresh = true)
++            prefs.edit().putString("inst_$route", inst.id).putInt("count_$route", proxied).apply()
++            added++; ready++
++        }
++        return when {
++            added > 0 -> "已把 $added 组插件模型加进模型列表"
++            ready > 0 -> "插件模型已就绪（$ready 组）"
++            else -> "插件已加载，但还没有可用模型（多半是还没登录）"
++        }
++    }
++
++    /**
++     * Phone sign-in for dsh-workbuddy-connect: copy what the user picked or
++     * pasted into the sandbox and let `minis-dsh wb-login` store it as the
++     * plugin's own credential. Restarts the gateway so it is read at once.
++     */
++    suspend fun workBuddyLogin(context: Context, content: String, international: Boolean): String = withContext(Dispatchers.IO) {
++        val dir = home(context).apply { mkdirs() }
++        val f = File(dir, "wb-import-${System.currentTimeMillis()}.json")
++        f.writeText(content)
++        val r = com.openminis.app.sandbox.ShellExecutor.execute(
++            context.applicationContext,
++            "minis-dsh wb-login /root/.minis-dsh/${f.name}${if (international) " --ai" else ""} && minis-dsh list",
++            timeout = 180_000L,
++        )
++        f.delete()
++        restart()
++        val line = r.output.lines().firstOrNull { it.startsWith("已保存") || it.contains("看不懂") || it.contains("没有可用") }
++            ?: r.output.lines().lastOrNull().orEmpty()
++        if (r.exitCode == 0) "$line · ${ensure(context, force = true)}" else line
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt b/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
 new file mode 100644
 index 0000000..63cd207
@@ -590,531 +1204,68 @@ index 0000000..63cd207
 +        _phase.value = Phase.IDLE
 +    }
 +}
-diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusConnect.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusConnect.kt
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/HumanVerify.kt b/src/android/app/src/main/java/com/openminis/app/plus/HumanVerify.kt
 new file mode 100644
-index 0000000..1840fc1
+index 0000000..849f722
 --- /dev/null
-+++ b/src/android/app/src/main/java/com/openminis/app/plus/PlusConnect.kt
-@@ -0,0 +1,446 @@
++++ b/src/android/app/src/main/java/com/openminis/app/plus/HumanVerify.kt
+@@ -0,0 +1,284 @@
 +package com.openminis.app.plus
 +
-+import android.annotation.SuppressLint
-+import android.app.AlarmManager
++import android.Manifest
 +import android.app.NotificationChannel
 +import android.app.NotificationManager
 +import android.app.PendingIntent
-+import android.content.BroadcastReceiver
-+import android.content.ClipboardManager
-+import android.content.Context
-+import android.content.Intent
-+import android.os.Handler
-+import android.os.Looper
-+import android.os.SystemClock
-+import android.webkit.CookieManager
-+import android.webkit.WebView
-+import android.webkit.WebViewClient
-+import com.openminis.app.MainActivity
-+import com.openminis.app.R
-+import com.openminis.app.config.ConfigRisk
-+import com.openminis.app.config.confirm.ConfigConfirmationGate
-+import com.openminis.app.config.confirm.ConfirmOutcome
-+import com.openminis.app.config.confirm.PendingConfigChange
-+import com.openminis.app.config.confirm.PendingConfigChangeItem
-+import com.openminis.app.sandbox.NativeOffloadHandler
-+import com.openminis.app.sandbox.NativeOffloadRequest
-+import com.openminis.app.sandbox.NativeOffloadResult
-+import kotlinx.coroutines.runBlocking
-+import okhttp3.FormBody
-+import okhttp3.OkHttpClient
-+import okhttp3.Request
-+import org.json.JSONArray
-+import org.json.JSONObject
-+import java.net.URI
-+import java.util.concurrent.TimeUnit
-+
-+/** Modern mobile Chrome UA for the login WebView (sites refuse "wv" UAs). */
-+const val MINES_MOBILE_UA =
-+    "Mozilla/5.0 (Linux; Android 15; RMX5062) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Mobile Safari/537.36"
-+
-+/**
-+ * Connection flows that do not need a page of their own:
-+ * OAuth device flows (GitHub, Microsoft), clipboard key detection,
-+ * web-session snapshots, Wispbyte keep-alive, and the agent's permission check.
-+ */
-+object PlusConnect {
-+    private val http by lazy {
-+        OkHttpClient.Builder().connectTimeout(20, TimeUnit.SECONDS).readTimeout(30, TimeUnit.SECONDS).build()
-+    }
-+
-+    // ---------------- OAuth device flow ----------------
-+
-+    data class DeviceCode(
-+        val userCode: String,
-+        val verifyUrl: String,
-+        val deviceCode: String,
-+        val interval: Int,
-+        val expiresIn: Int,
-+    )
-+
-+    sealed class PollResult {
-+        data class Done(val token: String, val refresh: String?, val expiresIn: Long) : PollResult()
-+        object Pending : PollResult()
-+        object SlowDown : PollResult()
-+        data class Failed(val message: String) : PollResult()
-+    }
-+
-+    /** GitHub CLI's public OAuth app (device flow enabled, no client secret needed). */
-+    private const val GH_CLIENT = "178c6fc778ccc68e1d6a"
-+    private const val GH_SCOPES = "repo read:org gist workflow"
-+
-+    /** Microsoft Graph Command Line Tools public client (device code, delegated scopes). */
-+    private const val MS_CLIENT = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
-+    private const val MS_SCOPES = "offline_access User.Read Mail.ReadWrite Mail.Send Calendars.ReadWrite Files.ReadWrite"
-+    private const val MS_BASE = "https://login.microsoftonline.com/common/oauth2/v2.0"
-+
-+    private fun postForm(url: String, form: Map<String, String>): JSONObject {
-+        val body = FormBody.Builder().apply { form.forEach { (k, v) -> add(k, v) } }.build()
-+        val req = Request.Builder().url(url).post(body).header("Accept", "application/json").build()
-+        http.newCall(req).execute().use { r ->
-+            val text = r.body?.string().orEmpty()
-+            return runCatching { JSONObject(text) }.getOrElse { JSONObject().put("error", "http_${r.code}") }
-+        }
-+    }
-+
-+    fun startDevice(kindId: String): DeviceCode {
-+        val o = if (kindId == "github") postForm("https://github.com/login/device/code",
-+            mapOf("client_id" to GH_CLIENT, "scope" to GH_SCOPES))
-+        else postForm("$MS_BASE/devicecode", mapOf("client_id" to MS_CLIENT, "scope" to MS_SCOPES))
-+        if (!o.has("device_code")) error(o.optString("error_description", o.optString("error", "请求失败")))
-+        return DeviceCode(
-+            userCode = o.getString("user_code"),
-+            verifyUrl = o.optString("verification_uri", if (kindId == "github") "https://github.com/login/device" else "https://microsoft.com/devicelogin"),
-+            deviceCode = o.getString("device_code"),
-+            interval = o.optInt("interval", 5),
-+            expiresIn = o.optInt("expires_in", 900),
-+        )
-+    }
-+
-+    fun pollDevice(kindId: String, code: DeviceCode): PollResult = runCatching {
-+        val o = if (kindId == "github") postForm("https://github.com/login/oauth/access_token", mapOf(
-+            "client_id" to GH_CLIENT, "device_code" to code.deviceCode,
-+            "grant_type" to "urn:ietf:params:oauth:grant-type:device_code"))
-+        else postForm("$MS_BASE/token", mapOf(
-+            "client_id" to MS_CLIENT, "device_code" to code.deviceCode,
-+            "grant_type" to "urn:ietf:params:oauth:grant-type:device_code"))
-+        val token = o.optString("access_token")
-+        when {
-+            token.isNotEmpty() -> PollResult.Done(token, o.optString("refresh_token").ifEmpty { null }, o.optLong("expires_in", 0))
-+            o.optString("error") == "authorization_pending" -> PollResult.Pending
-+            o.optString("error") == "slow_down" -> PollResult.SlowDown
-+            else -> PollResult.Failed(o.optString("error_description", o.optString("error", "授权失败")))
-+        }
-+    }.getOrElse { PollResult.Pending } // network blip: keep polling
-+
-+    /** Account name for a fresh token. */
-+    fun whoAmI(kindId: String, token: String): String = runCatching {
-+        val (url, field) = if (kindId == "github") "https://api.github.com/user" to "login"
-+        else "https://graph.microsoft.com/v1.0/me" to "userPrincipalName"
-+        val req = Request.Builder().url(url).header("Authorization", "Bearer $token")
-+            .header("Accept", "application/json").header("User-Agent", "Mines").build()
-+        http.newCall(req).execute().use { r -> JSONObject(r.body?.string().orEmpty()).optString(field) }
-+    }.getOrDefault("")
-+
-+    fun saveOAuth(context: Context, kind: ConnectionKind, r: PollResult.Done, account: String) {
-+        PlusVault.init(context)
-+        PlusVault.save(context, kind, account, r.token, share = PlusVault.entries.value[kind.id]?.shareWithAi ?: true, via = "oauth")
-+        PlusVault.setSecretExtra(kind.id, "refresh", r.refresh)
-+        if (r.expiresIn > 0) PlusVault.setExtra(kind.id, "expires", (System.currentTimeMillis() + r.expiresIn * 1000).toString())
-+    }
-+
-+    /** Fresh Microsoft Graph token (refreshes when within 5 minutes of expiry). */
-+    fun microsoftToken(context: Context): String? {
-+        PlusVault.init(context)
-+        val id = PlusVault.defaultAccount("microsoft") ?: return null
-+        val tok = PlusVault.secret(id) ?: return null
-+        val exp = PlusVault.extra(id, "expires")?.toLongOrNull() ?: 0L
-+        if (exp > System.currentTimeMillis() + 300_000) return tok
-+        val refresh = PlusVault.secretExtra(id, "refresh") ?: return tok
-+        return runCatching {
-+            val o = postForm("$MS_BASE/token", mapOf("client_id" to MS_CLIENT, "grant_type" to "refresh_token",
-+                "refresh_token" to refresh, "scope" to MS_SCOPES))
-+            val t = o.optString("access_token")
-+            if (t.isEmpty()) return@runCatching tok
-+            val kind = PlusVault.kind(id)!!
-+            saveOAuth(context, kind, PollResult.Done(t, o.optString("refresh_token").ifEmpty { refresh }, o.optLong("expires_in", 3600)),
-+                PlusVault.entries.value[id]?.account ?: "")
-+            t
-+        }.getOrDefault(tok)
-+    }
-+
-+    // ---------------- clipboard key pick-up ----------------
-+
-+    /** A key for [kind] currently on the clipboard, if any. */
-+    fun keyOnClipboard(context: Context, kind: ConnectionKind): String? {
-+        val rx = kind.keyRegex ?: return null
-+        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return null
-+        val text = runCatching { cm.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString() }.getOrNull() ?: return null
-+        if (text.length > 4000) return null
-+        val m = rx.find(text.trim()) ?: return null
-+        return m.value.let { if (kind.id == "gmail") it.replace(" ", "") else it }
-+    }
-+
-+    // ---------------- web sessions ----------------
-+
-+    fun hostOf(url: String?): String = runCatching { URI(url ?: "").host?.lowercase() }.getOrNull().orEmpty()
-+
-+    /** Snapshot the cookies of a signed-in site into the encrypted vault (restored if WebView data is cleared). */
-+    fun snapshotCookies(kind: ConnectionKind, urls: Collection<String>) {
-+        val cm = CookieManager.getInstance()
-+        cm.flush()
-+        val arr = JSONArray()
-+        urls.map { hostOf(it) }.filter { it.isNotEmpty() }.distinct().forEach { host ->
-+            val c = cm.getCookie("https://$host/") ?: return@forEach
-+            arr.put(JSONObject().put("host", host).put("cookie", c))
-+        }
-+        if (arr.length() > 0) PlusVault.setSecretExtra(kind.id, "cookies", arr.toString())
-+    }
-+
-+    /** Put saved cookies back when the WebView store lost them (e.g. after "clear browser data"). */
-+    fun restoreCookies(kind: ConnectionKind) {
-+        val raw = PlusVault.secretExtra(kind.id, "cookies") ?: return
-+        val cm = CookieManager.getInstance()
-+        runCatching {
-+            val arr = JSONArray(raw)
-+            for (i in 0 until arr.length()) {
-+                val o = arr.getJSONObject(i)
-+                val host = o.getString("host")
-+                if (cm.getCookie("https://$host/").isNullOrEmpty()) {
-+                    o.getString("cookie").split(";").map { it.trim() }.filter { it.contains('=') }.forEach {
-+                        cm.setCookie("https://$host/", "$it; Path=/; Secure")
-+                    }
-+                }
-+            }
-+            cm.flush()
-+        }
-+    }
-+
-+    fun clearCookies(kind: ConnectionKind) {
-+        val raw = PlusVault.secretExtra(kind.id, "cookies") ?: return
-+        val cm = CookieManager.getInstance()
-+        runCatching {
-+            val arr = JSONArray(raw)
-+            for (i in 0 until arr.length()) {
-+                val host = arr.getJSONObject(i).getString("host")
-+                cm.getCookie("https://$host/")?.split(";")?.map { it.substringBefore('=').trim() }?.forEach { name ->
-+                    cm.setCookie("https://$host/", "$name=; Max-Age=0; Path=/")
-+                    cm.setCookie("https://$host/", "$name=; Max-Age=0; Path=/; Domain=.$host")
-+                }
-+            }
-+            cm.flush()
-+        }
-+    }
-+
-+    // ---------------- Wispbyte keep-alive ----------------
-+
-+    private const val KEEP_CHANNEL = "mines_keepalive"
-+    private const val KEEP_EVERY_MS = 10L * 24 * 3600 * 1000
-+
-+    fun keepAliveOn(context: Context, kindId: String): Boolean {
-+        PlusVault.init(context)
-+        return PlusVault.extra(kindId, "keepalive") == "1"
-+    }
-+
-+    fun setKeepAlive(context: Context, kindId: String, on: Boolean) {
-+        PlusVault.init(context)
-+        PlusVault.setExtra(kindId, "keepalive", if (on) "1" else "0")
-+        schedule(context, kindId, on)
-+    }
-+
-+    /** Re-arm every enabled keep-alive (called at app start; alarms die on reboot / update). */
-+    fun rearm(context: Context) {
-+        PlusVault.init(context)
-+        PlusVault.entries.value.keys.filter { PlusVault.extra(it, "keepalive") == "1" }.forEach { schedule(context, it, true) }
-+    }
-+
-+    private fun pending(context: Context, kindId: String) = PendingIntent.getBroadcast(
-+        context, kindId.hashCode(),
-+        Intent(context, KeepAliveReceiver::class.java).putExtra("kind", kindId),
-+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-+    )
-+
-+    private fun schedule(context: Context, kindId: String, on: Boolean) {
-+        val am = context.getSystemService(AlarmManager::class.java) ?: return
-+        val pi = pending(context, kindId)
-+        am.cancel(pi)
-+        if (!on) return
-+        val last = PlusVault.extra(kindId, "keepalive_last")?.toLongOrNull() ?: System.currentTimeMillis()
-+        val dueIn = (last + KEEP_EVERY_MS - System.currentTimeMillis()).coerceIn(60_000L, KEEP_EVERY_MS)
-+        am.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, SystemClock.elapsedRealtime() + dueIn, pi)
-+    }
-+
-+    fun notifyUser(context: Context, title: String, text: String, id: Int) {
-+        val nm = context.getSystemService(NotificationManager::class.java) ?: return
-+        if (nm.getNotificationChannel(KEEP_CHANNEL) == null) {
-+            nm.createNotificationChannel(NotificationChannel(KEEP_CHANNEL, "账号保活", NotificationManager.IMPORTANCE_DEFAULT))
-+        }
-+        val open = PendingIntent.getActivity(context, id,
-+            Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-+        runCatching {
-+            nm.notify(id, android.app.Notification.Builder(context, KEEP_CHANNEL)
-+                .setSmallIcon(R.drawable.ic_launcher_monochrome)
-+                .setContentTitle(title).setContentText(text)
-+                .setStyle(android.app.Notification.BigTextStyle().bigText(text))
-+                .setContentIntent(open).setAutoCancel(true).build())
-+        }
-+    }
-+
-+    /** Opens the panel in a hidden WebView with the saved session; reports when the session is gone. */
-+    @SuppressLint("SetJavaScriptEnabled")
-+    fun runKeepAlive(context: Context, kindId: String, done: () -> Unit) {
-+        val kind = PlusVault.kind(kindId)
-+        val url = kind?.panelUrl ?: kind?.loginUrl
-+        if (kind == null || url == null) { done(); return }
-+        restoreCookies(kind)
-+        val main = Handler(Looper.getMainLooper())
-+        main.post {
-+            var finished = false
-+            val wv = runCatching { WebView(context.applicationContext) }.getOrNull()
-+            if (wv == null) { done(); return@post }
-+            fun finish(ok: Boolean?) {
-+                if (finished) return
-+                finished = true
-+                when (ok) {
-+                    true -> {
-+                        PlusVault.setExtra(kindId, "keepalive_last", System.currentTimeMillis().toString())
-+                        snapshotCookies(kind, listOf(url))
-+                    }
-+                    false -> notifyUser(context, "${kind.name} 登录已过期",
-+                        "保活没成功：登录已失效。打开 Mines → 设置 → 账号连接 → ${kind.name}，点「重新登录」就好。", 7400 + (kindId.hashCode() and 0xff))
-+                    null -> Unit // inconclusive (network); try again next round
-+                }
-+                schedule(context, kindId, true)
-+                runCatching { wv.stopLoading(); wv.destroy() }
-+                done()
-+            }
-+            wv.settings.javaScriptEnabled = true
-+            wv.settings.domStorageEnabled = true
-+            wv.settings.userAgentString = MINES_MOBILE_UA
-+            CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
-+            wv.webViewClient = object : WebViewClient() {
-+                override fun onPageFinished(view: WebView, u: String) {
-+                    val loggedOut = u.contains("/login") || u.contains("github.com/session") || u.contains("/signin")
-+                    val matched = kind.doneUrl?.matches(u) == true
-+                    if (loggedOut) finish(false) else if (matched) finish(true)
-+                }
-+            }
-+            wv.loadUrl(url)
-+            main.postDelayed({
-+                val u = wv.url.orEmpty()
-+                finish(if (kind.doneUrl?.matches(u) == true) true else if (u.contains("login")) false else null)
-+            }, 40_000)
-+        }
-+    }
-+
-+    // ---------------- agent permission gate (minis-connect) ----------------
-+
-+    fun promptLine(): String {
-+        val e = PlusVault.entries.value
-+        if (e.isEmpty()) return ""
-+        return "\n- Mines connected accounts: " + e.keys.sorted().joinToString(", ") +
-+            ". Before acting through one of them run `minis-connect check <service> <capability>` (capabilities: `minis-connect list`); exit 0 = go ahead, otherwise do not."
-+    }
-+}
-+
-+class KeepAliveReceiver : BroadcastReceiver() {
-+    override fun onReceive(context: Context, intent: Intent) {
-+        val kindId = intent.getStringExtra("kind") ?: return
-+        PlusVault.init(context)
-+        if (!PlusConnect.keepAliveOn(context, kindId)) return
-+        val result = goAsync()
-+        PlusConnect.runKeepAlive(context, kindId) { runCatching { result.finish() } }
-+    }
-+}
-+
-+/**
-+ * `minis-connect` — lets the agent see what is connected and ask before acting.
-+ *   minis-connect list
-+ *   minis-connect check <service> <capability> [--why "what I'm about to do"]
-+ *   minis-connect token microsoft      (prints a fresh Graph token after a read check)
-+ */
-+class ConnectOffloadHandler(private val context: Context) : NativeOffloadHandler {
-+    override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
-+        PlusVault.init(context)
-+        val args = request.argv.drop(1)
-+        val sub = args.firstOrNull() ?: "list"
-+        return when (sub) {
-+            "list" -> NativeOffloadResult(0, list())
-+            "check" -> check(args.getOrNull(1), args.getOrNull(2), why(args), opt(args, "--account"))
-+            "token" -> token(args.getOrNull(1))
-+            else -> NativeOffloadResult(0, HELP)
-+        }
-+    }
-+
-+    private fun why(args: List<String>): String? {
-+        val i = args.indexOf("--why")
-+        if (i < 0) return null
-+        return args.drop(i + 1).takeWhile { it != "--account" }.joinToString(" ").ifBlank { null }
-+    }
-+
-+    private fun opt(args: List<String>, name: String): String? {
-+        val i = args.indexOf(name)
-+        return if (i >= 0) args.getOrNull(i + 1) else null
-+    }
-+
-+    private fun list(): String {
-+        val out = JSONArray()
-+        PlusVault.entries.value.values.forEach { e ->
-+            val k = PlusVault.kind(e.kindId) ?: return@forEach
-+            out.put(JSONObject().apply {
-+                put("service", PlusVault.baseId(k.id)); put("account_id", k.id); put("name", k.name)
-+                put("account", e.account); put("via", e.via)
-+                put("default", PlusVault.defaultAccount(PlusVault.baseId(k.id)) == k.id)
-+                put("env", if (e.shareWithAi && k.envKey != null) k.envKey else JSONObject.NULL)
-+                put("browser_session", e.via == "web")
-+                put("capabilities", JSONObject().apply {
-+                    PlusVault.capabilities(k.profile).forEach { c -> put(c.id, PlusVault.level(k, c).name.lowercase()) }
-+                })
-+            })
-+        }
-+        return JSONObject().put("connections", out)
-+            .put("note", "allow = go ahead; ask = run `minis-connect check` and wait for the user's answer; deny = never do it. Signed-in web sessions are shared with the browser tool.")
-+            .toString(2)
-+    }
-+
-+    private fun check(service: String?, capId: String?, why: String?, account: String?): NativeOffloadResult {
-+        if (service == null || capId == null) return NativeOffloadResult(2, "usage: minis-connect check <service> <capability> [--why text]")
-+        PlusVault.kind(service) ?: return NativeOffloadResult(4, "unknown service '$service' (see minis-connect list)")
-+        val entryId = if (service.contains('#')) service.takeIf { PlusVault.entries.value.containsKey(it) }
-+            else PlusVault.resolveAccount(PlusVault.baseId(service), account)
-+        val kind = entryId?.let { PlusVault.kind(it) }
-+            ?: return NativeOffloadResult(4, (if (account != null) "no account '$account' on $service. " else "$service is not connected. ") +
-+                "Ask the user to connect it in Settings → 账号连接 (see minis-connect list).")
-+        val who = PlusVault.entries.value[kind.id]?.account?.takeIf { it.isNotBlank() }?.let { " ($it)" } ?: ""
-+        val cap = PlusVault.capabilities(kind.profile).firstOrNull { it.id == capId }
-+            ?: PlusVault.capabilities(kind.profile).firstOrNull { it.id == "publish" && capId in setOf("send", "post", "write", "deploy", "push") }
-+            ?: return NativeOffloadResult(2, "unknown capability '$capId' for ${kind.id}; known: " +
-+                PlusVault.capabilities(kind.profile).joinToString(",") { it.id })
-+        return when (PlusVault.level(kind, cap)) {
-+            PermLevel.ALLOW -> NativeOffloadResult(0, "allowed: ${kind.name}$who · ${cap.label}" +
-+                (if (PlusVault.defaultAccount(PlusVault.baseId(kind.id)) != kind.id) ". This is not the default account: use its value from ${kind.envKey ?: "the env"}_ACCOUNTS" else ""))
-+            PermLevel.DENY -> NativeOffloadResult(3, "denied: the user does not allow ${cap.label} on ${kind.name}. Do not do it; tell the user it is switched off in 账号连接.")
-+            PermLevel.ASK -> {
-+                val change = PendingConfigChange(
-+                    items = listOf(PendingConfigChangeItem(
-+                        displayName = "${kind.name}$who · ${cap.label}",
-+                        path = "connections.${kind.id}.${cap.id}",
-+                        oldDisplay = "",
-+                        newDisplay = why ?: "AI 想用 ${kind.name} ${cap.label}",
-+                        verb = "允许一次",
-+                        risk = if (cap.id in setOf("pay", "trade", "delete")) ConfigRisk.DESTRUCTIVE else ConfigRisk.SENSITIVE,
-+                    )),
-+                    caption = "AI 想用你连接的 ${kind.name} 做一件事：${why ?: cap.label}",
-+                )
-+                when (runBlocking { ConfigConfirmationGate.requestConfirmation(change) }) {
-+                    is ConfirmOutcome.Approved -> NativeOffloadResult(0, "approved once by the user: ${kind.name} · ${cap.label}")
-+                    is ConfirmOutcome.Rejected -> NativeOffloadResult(3, "the user said no. Do not do it.")
-+                    is ConfirmOutcome.TimedOut -> NativeOffloadResult(5, "no answer from the user within 2 minutes. Do not do it; ask in chat.")
-+                }
-+            }
-+        }
-+    }
-+
-+    private fun token(service: String?): NativeOffloadResult {
-+        if (service != "microsoft") return NativeOffloadResult(2, "only `minis-connect token microsoft` is supported; other tokens are in env vars")
-+        val kind = PlusVault.kind(PlusVault.defaultAccount("microsoft") ?: "microsoft")!!
-+        val read = PlusVault.capabilities(kind.profile).first { it.id == "read" }
-+        if (PlusVault.level(kind, read) == PermLevel.DENY) return NativeOffloadResult(3, "denied by the user")
-+        PlusConnect.microsoftToken(context) ?: return NativeOffloadResult(4, "Microsoft is not connected")
-+        // The token goes into the redacted env var, never into the transcript.
-+        PlusVault.setShare(context, kind, true)
-+        return NativeOffloadResult(0, "MS_GRAPH_TOKEN refreshed; use \$MS_GRAPH_TOKEN in your next shell command (never print it).")
-+    }
-+
-+    companion object {
-+        const val HELP = """minis-connect — accounts the user connected in Mines (设置 → 账号连接)
-+  minis-connect list                                  services, accounts, env vars, permission levels
-+  minis-connect check <service> <capability> [--account <name>] [--why "what you are about to do"]
-+        without --account the service's default account is used; <VAR> env = default account,
-+        <VAR>_ACCOUNTS = JSON {account: secret} when several accounts are shared
-+        exit 0 = allowed (or the user approved just now), 3 = denied/refused, 5 = no answer
-+  minis-connect token microsoft                       refresh ${'$'}MS_GRAPH_TOKEN (Microsoft Graph)
-+Run `check` before every action through a connected account; never act when it does not exit 0."""
-+    }
-+}
-diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusPrefs.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusPrefs.kt
-new file mode 100644
-index 0000000..381e3b8
---- /dev/null
-+++ b/src/android/app/src/main/java/com/openminis/app/plus/PlusPrefs.kt
-@@ -0,0 +1,154 @@
-+package com.openminis.app.plus
-+
 +import android.content.Context
 +import android.content.SharedPreferences
++import android.content.pm.PackageManager
++import android.os.Build
++import android.service.notification.StatusBarNotification
++import android.webkit.CookieManager
++import androidx.core.app.NotificationCompat
++import androidx.core.content.ContextCompat
++import kotlinx.coroutines.delay
 +import kotlinx.coroutines.flow.MutableStateFlow
 +import kotlinx.coroutines.flow.StateFlow
 +import kotlinx.coroutines.flow.asStateFlow
-+import org.json.JSONArray
 +import org.json.JSONObject
-+import java.util.UUID
-+
-+/** One VPS the user added. No server is pre-filled. */
-+data class VpsServer(
-+    val id: String = UUID.randomUUID().toString(),
-+    val name: String,
-+    val host: String,
-+    val port: Int = 22,
-+    val user: String = "root",
-+    val enabled: Boolean = true,
-+    /** Last measured TCP connect latency in ms, -1 = unknown, -2 = unreachable. */
-+    val lastLatencyMs: Int = -1,
-+    val lastCheckedAt: Long = 0L,
-+) {
-+    val target: String get() = "$user@$host"
-+}
-+
-+data class PlusState(
-+    val workMode: String = MODE_LOCAL,
-+    val servers: List<VpsServer> = emptyList(),
-+    val wallpaper: String = "",          // "", "preset:<id>", "file:<version>"
-+    val wallpaperDim: Float = 0.25f,
-+    /** Wallpaper opacity, 0..1 (separate from the dim layer). */
-+    val wallpaperAlpha: Float = 1f,
-+    /** Also show the wallpaper behind the conversation list. */
-+    val wallpaperOnHome: Boolean = false,
-+    val petEnabled: Boolean = false,
-+    val petStyle: String = "whale",      // Avatars.builtins id, or "custom"
-+    val petColor: Int = 0xFFD97757.toInt(),
-+    /** Bumped whenever the custom picture or its crop changes (cache key). */
-+    val avatarVersion: Long = 0L,
-+    val avatarScale: Float = 1f,
-+    val avatarOffX: Float = 0f,
-+    val avatarOffY: Float = 0f,
-+    val avatarRemoveBg: Boolean = false,
-+    val todayCollapsed: Boolean = false,
-+    val autoFallback: Boolean = true,
-+    val autoClean: Boolean = true,
-+) {
-+    val isVps: Boolean get() = workMode == MODE_VPS
-+    val onlineServers: List<VpsServer> get() = servers.filter { it.enabled && it.lastLatencyMs >= 0 }
-+
-+    companion object {
-+        const val MODE_LOCAL = "local"
-+        const val MODE_VPS = "vps"
-+    }
-+}
 +
 +/**
-+ * Minis Plus settings: work mode, VPS list, wallpaper, avatar / desk pet.
-+ * Plain SharedPreferences (none of this is secret — SSH keys live in the
-+ * sandbox, account secrets live in [PlusVault]). Exposed as a process-wide
-+ * StateFlow so every screen updates live.
++ * Human verification for the agent's browser.
++ *
++ * 1. Challenges: after the agent navigates / clicks / types, the page is
++ *    checked for Cloudflare (interstitial + Turnstile), hCaptcha, reCAPTCHA
++ *    and slider captchas (Alibaba Baxia / NoCaptcha, Geetest, Tencent,
++ *    NetEase). When one shows up the agent's call waits, the user gets a
++ *    notification and an in-chat prompt 「需要你点一下验证」 that opens the
++ *    browser on that tab with the controls handed over, and the call returns
++ *    as soon as the challenge clears (cf_clearance set / challenge gone / URL
++ *    changed). The agent never tries to solve it itself.
++ * 2. One-time codes: when a page asks for an SMS / e-mail code, codes that
++ *    arrive in notifications in the next 2 minutes (4–8 digits next to
++ *    验证码 / code / OTP …) are filled into the code field. Codes stay in
++ *    memory only: never logged, never written to disk, never shown to the
++ *    model.
++ * Cookies live in the WebView's persistent store and are flushed after every
++ * cleared challenge, so a site stays signed in across restarts.
 + */
-+object PlusPrefs {
-+    private const val FILE = "minis_plus"
-+    private val _state = MutableStateFlow(PlusState())
-+    val state: StateFlow<PlusState> = _state.asStateFlow()
++object HumanVerify {
++    private const val FILE = "mines_human_verify"
++    private const val CHANNEL = "mines_verify"
++    private const val NOTIF_ID = 47021
++    /** Each wait inside one browser call stays under the tool's 75 s guard. */
++    const val WAIT_SLICE_MS = 50_000L
++    private const val OTP_WINDOW_MS = 120_000L
++
++    data class Settings(val challenges: Boolean = true, val otpAutofill: Boolean = true)
++    data class Pending(val url: String, val kind: String, val since: Long = System.currentTimeMillis()) {
++        val host: String get() = runCatching { android.net.Uri.parse(url).host.orEmpty() }.getOrDefault("")
++    }
++
++    private val _settings = MutableStateFlow(Settings())
++    val settings: StateFlow<Settings> = _settings.asStateFlow()
++    private val _pending = MutableStateFlow<Pending?>(null)
++    val pending: StateFlow<Pending?> = _pending.asStateFlow()
 +    @Volatile private var prefs: SharedPreferences? = null
 +
 +    fun init(context: Context) {
@@ -1123,82 +1274,494 @@ index 0000000..381e3b8
 +            if (prefs != null) return
 +            val p = context.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
 +            prefs = p
-+            _state.value = read(p)
++            _settings.value = Settings(p.getBoolean("challenges", true), p.getBoolean("otp", true))
 +        }
 +    }
 +
-+    private fun read(p: SharedPreferences): PlusState {
-+        val servers = runCatching {
-+            val arr = JSONArray(p.getString("servers", "[]"))
-+            (0 until arr.length()).map { i ->
-+                val o = arr.getJSONObject(i)
-+                VpsServer(
-+                    id = o.optString("id", UUID.randomUUID().toString()),
-+                    name = o.optString("name"),
-+                    host = o.optString("host"),
-+                    port = o.optInt("port", 22),
-+                    user = o.optString("user", "root"),
-+                    enabled = o.optBoolean("enabled", true),
-+                    lastLatencyMs = o.optInt("lat", -1),
-+                    lastCheckedAt = o.optLong("checked", 0L),
-+                )
-+            }
-+        }.getOrDefault(emptyList())
-+        return PlusState(
-+            workMode = p.getString("workMode", PlusState.MODE_LOCAL) ?: PlusState.MODE_LOCAL,
-+            servers = servers,
-+            wallpaper = p.getString("wallpaper", "") ?: "",
-+            wallpaperDim = p.getFloat("wallpaperDim", 0.25f),
-+            wallpaperAlpha = p.getFloat("wallpaperAlpha", 1f),
-+            wallpaperOnHome = p.getBoolean("wallpaperOnHome", false),
-+            petEnabled = p.getBoolean("petEnabled", false),
-+            petStyle = Avatars.normalize(p.getString("petStyle", "whale") ?: "whale"),
-+            // build-3..19 default blue → Mines terracotta
-+            petColor = p.getInt("petColor", 0xFFD97757.toInt()).let { if (it == 0xFF5B8DEF.toInt() && !p.contains("avatarVersion")) 0xFFD97757.toInt() else it },
-+            avatarVersion = p.getLong("avatarVersion", 0L),
-+            avatarScale = p.getFloat("avatarScale", 1f),
-+            avatarOffX = p.getFloat("avatarOffX", 0f),
-+            avatarOffY = p.getFloat("avatarOffY", 0f),
-+            avatarRemoveBg = p.getBoolean("avatarRemoveBg", false),
-+            todayCollapsed = p.getBoolean("todayCollapsed", false),
-+            autoFallback = p.getBoolean("autoFallback", true),
-+            autoClean = p.getBoolean("autoClean", true),
-+        )
-+    }
-+
-+    fun update(context: Context, block: (PlusState) -> PlusState) {
++    fun update(context: Context, block: (Settings) -> Settings) {
 +        init(context)
-+        val next = synchronized(this) {
-+            val n = block(_state.value)
-+            _state.value = n
-+            n
++        val n = block(_settings.value)
++        _settings.value = n
++        prefs?.edit()?.putBoolean("challenges", n.challenges)?.putBoolean("otp", n.otpAutofill)?.apply()
++    }
++
++    fun clearPending(context: Context?) {
++        _pending.value = null
++        context?.let { runCatching { androidx.core.app.NotificationManagerCompat.from(it).cancel(NOTIF_ID) } }
++    }
++
++    // ── challenge detection ────────────────────────────────────────────
++
++    /** Returns a JSON string {kind, otp, otpEmpty}. kind "" = no challenge. */
++    const val DETECT_JS = """(function(){
++try{
++var vis=function(e){if(!e)return false;var r=e.getBoundingClientRect();if(r.width<8||r.height<8)return false;var s=getComputedStyle(e);return s.visibility!=='hidden'&&s.display!=='none'&&s.opacity!=='0';};
++var q=function(s){try{return document.querySelectorAll(s);}catch(x){return [];}};
++var any=function(s){var l=q(s);for(var i=0;i<l.length;i++){if(vis(l[i]))return true;}return false;};
++var t=(document.title||'').toLowerCase();var b=((document.body&&document.body.innerText)||'').slice(0,4000).toLowerCase();
++var kind='';
++if(t.indexOf('just a moment')>=0||t.indexOf('attention required')>=0||t.indexOf('请稍候')>=0||any('#challenge-form,#cf-challenge-running,.cf-browser-verification,#challenge-stage,#cf-please-wait'))kind='Cloudflare';
++if(!kind){var tr=q('input[name="cf-turnstile-response"]');var trEmpty=false;for(var i=0;i<tr.length;i++){if(!tr[i].value)trEmpty=true;}
++ if((any('iframe[src*="challenges.cloudflare.com"]')||any('.cf-turnstile'))&&(tr.length===0||trEmpty))kind='Cloudflare Turnstile';}
++if(!kind){var hr=q('textarea[name="h-captcha-response"]');var hEmpty=hr.length===0;for(var i=0;i<hr.length;i++){if(!hr[i].value)hEmpty=true;}
++ if(any('iframe[src*="hcaptcha.com"]')&&hEmpty)kind='hCaptcha';}
++if(!kind){var rr=q('textarea[name="g-recaptcha-response"]');var rEmpty=rr.length===0;for(var i=0;i<rr.length;i++){if(!rr[i].value)rEmpty=true;}
++ var fr=q('iframe[src*="recaptcha/api2/anchor"],iframe[src*="recaptcha/enterprise/anchor"],iframe[src*="recaptcha/api2/bframe"]');
++ for(var i=0;i<fr.length;i++){var src=fr[i].getAttribute('src')||'';if(src.indexOf('size=invisible')<0&&vis(fr[i])&&rEmpty){kind='reCAPTCHA';break;}}}
++if(!kind&&any('#nc_1_n1z,.nc_iconfont.btn_slide,#nc_1_wrapper,.baxia-dialog,#baxia-dialog-content,iframe[src*="punish"],iframe[src*="_____tmd_____"]'))kind='阿里滑块验证';
++if(!kind&&any('.geetest_slider_button,.geetest_panel_box,.geetest_holder,.geetest_box'))kind='极验验证';
++if(!kind&&any('#tcaptcha_iframe,#tcaptcha_iframe_dy,iframe[src*="captcha.qq.com"],iframe[src*="turing.captcha"]'))kind='腾讯验证码';
++if(!kind&&any('.yidun_slider,.yidun_panel,.yidun'))kind='网易易盾验证';
++if(!kind&&(b.indexOf('verify you are human')>=0||b.indexOf('确认您是真人')>=0||b.indexOf('请按住滑块')>=0||b.indexOf('拖动滑块')>=0||b.indexOf('请完成安全验证')>=0)&&b.length<1500)kind='人机验证';
++var otp=null;var ins=q('input');var cands=[];
++for(var i=0;i<ins.length;i++){var e=ins[i];if(!vis(e)||e.disabled||e.readOnly)continue;var ty=(e.type||'text').toLowerCase();if(['text','tel','number','password',''].indexOf(ty)<0)continue;
++ var h=((e.name||'')+' '+(e.id||'')+' '+(e.placeholder||'')+' '+(e.getAttribute('aria-label')||'')+' '+(e.className||'')).toLowerCase();
++ var ml=e.maxLength;
++ if((e.autocomplete||'').indexOf('one-time-code')>=0||/otp|smscode|sms_code|verif.*code|checkcode|authcode|验证码|校验码|动态码|code/.test(h)){if(!/captcha|图形|image/.test(h))cands.push(e);}
++ else if(ml===1&&(ty==='tel'||ty==='number'||ty==='text')){cands.push(e);}}
++var single=cands.filter(function(e){return e.maxLength===1;});
++var otpEmpty=cands.length>0&&cands.every(function(e){return !e.value;});
++return JSON.stringify({kind:kind,otp:cands.length>0,split:single.length>=4,otpEmpty:otpEmpty});
++}catch(x){return JSON.stringify({kind:'',otp:false,split:false,otpEmpty:false});}
++})()"""
++
++    data class Scan(val kind: String, val otpField: Boolean, val otpEmpty: Boolean)
++
++    fun parseScan(raw: String?): Scan = runCatching {
++        val o = JSONObject(raw ?: "{}")
++        Scan(o.optString("kind"), o.optBoolean("otp"), o.optBoolean("otpEmpty"))
++    }.getOrDefault(Scan("", false, false))
++
++    private fun hasClearance(url: String): Boolean = runCatching {
++        CookieManager.getInstance().getCookie(url)?.contains("cf_clearance=") == true
++    }.getOrDefault(false)
++
++    private fun notify(context: Context, p: Pending) {
++        runCatching {
++            if (Build.VERSION.SDK_INT >= 33 &&
++                ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
++            ) return
++            val nm = context.getSystemService(NotificationManager::class.java)
++            if (Build.VERSION.SDK_INT >= 26 && nm.getNotificationChannel(CHANNEL) == null) {
++                nm.createNotificationChannel(NotificationChannel(CHANNEL, "需要你验证", NotificationManager.IMPORTANCE_HIGH))
++            }
++            val launch = context.packageManager.getLaunchIntentForPackage(context.packageName)
++            val pi = launch?.let { PendingIntent.getActivity(context, NOTIF_ID, it, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT) }
++            val n = NotificationCompat.Builder(context, CHANNEL)
++                .setSmallIcon(android.R.drawable.ic_dialog_alert)
++                .setContentTitle("需要你点一下验证")
++                .setContentText("${p.host.ifBlank { "网页" }} 弹出了${p.kind}，Mines 在等你，点完会自动继续")
++                .setPriority(NotificationCompat.PRIORITY_HIGH)
++                .setAutoCancel(true)
++                .apply { if (pi != null) setContentIntent(pi) }
++                .build()
++            nm.notify(NOTIF_ID, n)
 +        }
-+        val arr = JSONArray()
-+        next.servers.forEach { s ->
-+            arr.put(JSONObject().apply {
-+                put("id", s.id); put("name", s.name); put("host", s.host)
-+                put("port", s.port); put("user", s.user); put("enabled", s.enabled)
-+                put("lat", s.lastLatencyMs); put("checked", s.lastCheckedAt)
-+            })
++    }
++
++    /**
++     * Called by the browser after a page-changing action. If a challenge is up,
++     * waits (≤ [WAIT_SLICE_MS]) for the user to clear it.
++     * @return null when there was nothing to do, otherwise a note for the agent.
++     */
++    suspend fun handle(
++        context: Context?,
++        scan: Scan,
++        url: String,
++        rescan: suspend () -> Scan,
++        currentUrl: suspend () -> String,
++    ): String? {
++        if (context == null || !_settings.value.challenges) return null
++        if (scan.kind.isBlank()) {
++            if (_pending.value != null) clearPending(context)
++            return null
 +        }
-+        prefs?.edit()
-+            ?.putString("workMode", next.workMode)
-+            ?.putString("servers", arr.toString())
-+            ?.putString("wallpaper", next.wallpaper)
-+            ?.putFloat("wallpaperDim", next.wallpaperDim)
-+            ?.putFloat("wallpaperAlpha", next.wallpaperAlpha)
-+            ?.putBoolean("wallpaperOnHome", next.wallpaperOnHome)
-+            ?.putLong("avatarVersion", next.avatarVersion)
-+            ?.putFloat("avatarScale", next.avatarScale)
-+            ?.putFloat("avatarOffX", next.avatarOffX)
-+            ?.putFloat("avatarOffY", next.avatarOffY)
-+            ?.putBoolean("avatarRemoveBg", next.avatarRemoveBg)
-+            ?.putBoolean("petEnabled", next.petEnabled)
-+            ?.putString("petStyle", next.petStyle)
-+            ?.putInt("petColor", next.petColor)
-+            ?.putBoolean("todayCollapsed", next.todayCollapsed)
-+            ?.putBoolean("autoFallback", next.autoFallback)
-+            ?.putBoolean("autoClean", next.autoClean)
-+            ?.apply()
++        // Shorter here: this wait follows the action itself inside one guarded call.
++        return waitForHuman(context, scan.kind, url, rescan, currentUrl, maxWaitMs = 30_000L)
++    }
++
++    suspend fun waitForHuman(
++        context: Context,
++        kind: String,
++        url: String,
++        rescan: suspend () -> Scan,
++        currentUrl: suspend () -> String,
++        maxWaitMs: Long = WAIT_SLICE_MS,
++    ): String {
++        val prior = _pending.value
++        if (prior == null || prior.url.substringBefore('#') != url.substringBefore('#')) {
++            val p = Pending(url, kind)
++            _pending.value = p
++            notify(context, p)
++        }
++        val hadClearance = hasClearance(url)
++        val start = System.currentTimeMillis()
++        while (System.currentTimeMillis() - start < maxWaitMs) {
++            delay(1500)
++            val now = runCatching { currentUrl() }.getOrDefault(url)
++            val urlChanged = now.substringBefore('#') != url.substringBefore('#')
++            val cleared = urlChanged || (!hadClearance && hasClearance(now)) || runCatching { rescan().kind.isBlank() }.getOrDefault(false)
++            if (cleared) {
++                delay(800) // let the site finish its redirect
++                clearPending(context)
++                runCatching { CookieManager.getInstance().flush() }
++                return "[人工验证] 页面出现$kind，用户已完成验证，现在可以继续操作（先截图看看当前页面）。"
++            }
++        }
++        return "[需要人工验证] 页面出现$kind，已通知用户点一下。不要自己去点或破解验证码；请调用 browser 的 wait_for_human 动作继续等待（每次最多约 50 秒），用户完成后会自动继续。"
++    }
++
++    // ── one-time codes ─────────────────────────────────────────────────
++
++    @Volatile private var armedAt = 0L
++    @Volatile private var code: String? = null
++    @Volatile private var codeAt = 0L
++
++    /** A page is asking for a code (or the agent said it requested one). */
++    fun armOtp() {
++        if (System.currentTimeMillis() - armedAt > OTP_WINDOW_MS) { armedAt = System.currentTimeMillis(); code = null }
++    }
++
++    private val KEYWORDS = Regex("(验证码|校验码|动态码|確認碼|驗證碼|动态密码|短信码|verification|security code|one[- ]time|passcode|\\bcode\\b|\\botp\\b)", RegexOption.IGNORE_CASE)
++    private val DIGITS = Regex("(?<![0-9])([0-9]{4,8})(?![0-9])")
++
++    /** From the notification listener. Never logs the text or the code. */
++    fun onNotification(context: Context, sbn: StatusBarNotification) {
++        if (!_settings.value.otpAutofill) return
++        val now = System.currentTimeMillis()
++        if (armedAt == 0L || now - armedAt > OTP_WINDOW_MS) return
++        if (sbn.packageName == context.packageName) return
++        val ex = sbn.notification?.extras ?: return
++        val text = listOfNotNull(
++            ex.getCharSequence("android.title"), ex.getCharSequence("android.text"), ex.getCharSequence("android.bigText"),
++        ).joinToString(" ")
++        extractCode(text)?.let { code = it; codeAt = now }
++    }
++
++    fun extractCode(text: String): String? {
++        val kw = KEYWORDS.findAll(text).map { it.range.first }.toList()
++        if (kw.isEmpty()) return null
++        return DIGITS.findAll(text)
++            .filterNot { m -> // skip things that look like years / amounts / phone numbers
++                val v = m.value
++                (v.length == 4 && v.startsWith("20") && text.getOrNull(m.range.last + 1) == '年') ||
++                    text.getOrNull(m.range.first - 1) == '¥' || text.getOrNull(m.range.first - 1) == '$'
++            }
++            .minByOrNull { m -> kw.minOf { k -> kotlin.math.abs(k - m.range.first) } }
++            ?.value
++    }
++
++    /** A code that arrived after the page asked, not used yet. Consumes it. */
++    fun takeCode(): String? {
++        val c = code ?: return null
++        if (codeAt < armedAt || System.currentTimeMillis() - codeAt > OTP_WINDOW_MS) return null
++        code = null
++        return c
++    }
++
++    /** Keep a code that could not be placed yet (still within its window). */
++    fun putBack(c: String) { code = c; codeAt = System.currentTimeMillis() }
++
++    fun hasFreshCode(): Boolean = code != null && codeAt >= armedAt && System.currentTimeMillis() - codeAt <= OTP_WINDOW_MS
++
++    /** Waits up to [timeoutMs] for a code; null on timeout. */
++    suspend fun awaitCode(timeoutMs: Long): String? {
++        armOtp()
++        val start = System.currentTimeMillis()
++        while (System.currentTimeMillis() - start < timeoutMs) {
++            takeCode()?.let { return it }
++            delay(700)
++        }
++        return null
++    }
++
++    /** JS that types [code] into the page's code field(s); returns "ok" / "nofield". */
++    fun fillJs(code: String, selector: String?): String {
++        val sel = JSONObject.quote(selector ?: "")
++        val c = JSONObject.quote(code)
++        return """(function(){try{
++var code=$c,sel=$sel;
++var setv=function(e,v){var p=Object.getPrototypeOf(e);var d=Object.getOwnPropertyDescriptor(p,'value');if(d&&d.set){d.set.call(e,v);}else{e.value=v;}
++ e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));};
++var vis=function(e){var r=e.getBoundingClientRect();return r.width>4&&r.height>4;};
++if(sel){var t=document.querySelector(sel);if(!t)return 'nofield';t.focus();setv(t,code);return 'ok';}
++var ins=[].slice.call(document.querySelectorAll('input')).filter(function(e){return vis(e)&&!e.disabled&&!e.readOnly;});
++var single=ins.filter(function(e){return e.maxLength===1;});
++if(single.length>=code.length){for(var i=0;i<code.length;i++){single[i].focus();setv(single[i],code[i]);}return 'ok';}
++var t=ins.find(function(e){var h=((e.name||'')+' '+(e.id||'')+' '+(e.placeholder||'')+' '+(e.getAttribute('aria-label')||'')).toLowerCase();
++ return (e.autocomplete||'').indexOf('one-time-code')>=0||(/otp|smscode|sms_code|verif.*code|checkcode|authcode|验证码|校验码|动态码|code/.test(h)&&!/captcha|图形|image/.test(h));});
++if(!t)return 'nofield';t.focus();setv(t,code);return 'ok';
++}catch(x){return 'nofield';}})()"""
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/LocalGateway.kt b/src/android/app/src/main/java/com/openminis/app/plus/LocalGateway.kt
+new file mode 100644
+index 0000000..5877f6f
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/LocalGateway.kt
+@@ -0,0 +1,108 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import com.openminis.app.MinisApp
++import com.openminis.app.data.model.ProviderCredential
++import com.openminis.app.data.model.ProviderInstance
++import com.openminis.app.data.model.ProviderType
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.async
++import kotlinx.coroutines.awaitAll
++import kotlinx.coroutines.coroutineScope
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.withContext
++import org.json.JSONObject
++import java.net.HttpURLConnection
++import java.net.URL
++import java.util.UUID
++
++/**
++ * Finds OpenAI-compatible model gateways running on this phone (e.g. a
++ * WorkBuddy reverse-proxy app on 127.0.0.1:8788, Ollama, LM Studio, LiteLLM)
++ * and adds one as a provider in one tap.
++ */
++object LocalGateway {
++    /** 8788 first: the user's WorkBuddy proxy app. 8790 is Mines' own plugin gateway, skipped. */
++    val PORTS = listOf(8788, 8317, 11434, 1234, 4000, 8000, 8080, 3000, 5000, 8888)
++    private const val PREFS = "mines_local_gateway"
++
++    data class Found(
++        val port: Int,
++        val models: List<String>,
++        /** The gateway answered 401/403: it wants a key. */
++        val needsKey: Boolean,
++    ) {
++        val baseUrl: String get() = "http://127.0.0.1:$port/v1"
++        val title: String get() = when (port) {
++            8788 -> "WorkBuddy 网关"
++            11434 -> "Ollama"
++            1234 -> "LM Studio"
++            4000 -> "LiteLLM"
++            else -> "本机模型网关"
++        }
++    }
++
++    private val _found = MutableStateFlow<List<Found>>(emptyList())
++    val found: StateFlow<List<Found>> = _found.asStateFlow()
++
++    private fun probe(port: Int, key: String? = null): Found? = runCatching {
++        val c = URL("http://127.0.0.1:$port/v1/models").openConnection() as HttpURLConnection
++        c.connectTimeout = 600; c.readTimeout = 2500
++        if (!key.isNullOrBlank()) c.setRequestProperty("Authorization", "Bearer $key")
++        val code = c.responseCode
++        if (code == 401 || code == 403) return@runCatching Found(port, emptyList(), needsKey = true)
++        if (code !in 200..299) return@runCatching null
++        val body = c.inputStream.use { it.readBytes() }.toString(Charsets.UTF_8)
++        val arr = JSONObject(body).optJSONArray("data") ?: return@runCatching null
++        Found(port, (0 until arr.length()).mapNotNull { arr.optJSONObject(it)?.optString("id")?.takeIf { s -> s.isNotBlank() } }, false)
++    }.getOrNull()
++
++    /** Ports already added as a provider (by base URL). */
++    private fun addedPorts(context: Context): Set<Int> {
++        val repo = (context.applicationContext as? MinisApp)?.providerRepositoryOrNull ?: return emptySet()
++        return repo.config.value.instances.mapNotNull { inst ->
++            val b = inst.customBaseURL ?: return@mapNotNull null
++            Regex("^https?://(127\\.0\\.0\\.1|localhost):(\\d+)").find(b)?.groupValues?.get(2)?.toIntOrNull()
++        }.toSet()
++    }
++
++    fun dismissed(context: Context): Set<Int> =
++        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getStringSet("dismissed", emptySet())!!
++            .mapNotNull { it.toIntOrNull() }.toSet()
++
++    fun dismiss(context: Context, port: Int) {
++        val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++        p.edit().putStringSet("dismissed", dismissed(context).map { it.toString() }.toSet() + port.toString()).apply()
++        _found.value = _found.value.filter { it.port != port }
++    }
++
++    /** Probe all ports in parallel; keeps only gateways not yet added or dismissed. */
++    suspend fun scan(context: Context, includeDismissed: Boolean = false): List<Found> = withContext(Dispatchers.IO) {
++        val skip = addedPorts(context) + if (includeDismissed) emptySet() else dismissed(context)
++        val res = coroutineScope { PORTS.filter { it !in skip }.map { p -> async { probe(p) } }.awaitAll() }.filterNotNull()
++        _found.value = res
++        res
++    }
++
++    /** Add [port] as an OpenAI-compatible provider; returns a status line. */
++    suspend fun add(context: Context, f: Found, key: String?): String = withContext(Dispatchers.IO) {
++        val repo = (context.applicationContext as? MinisApp)?.providerRepositoryOrNull ?: return@withContext "供应商还没加载，稍后再试"
++        val check = probe(f.port, key) ?: return@withContext "连不上 127.0.0.1:${f.port}，确认网关 App 正在运行"
++        if (check.needsKey) return@withContext "密钥不对，网关拒绝了"
++        val inst = ProviderInstance(
++            id = UUID.randomUUID().toString(),
++            label = "${f.title} :${f.port}",
++            providerType = ProviderType.openAI,
++            credentialType = ProviderCredential.apiKey,
++            customBaseURL = f.baseUrl,
++            appendV1Suffix = true,
++        )
++        repo.addInstance(inst)
++        if (!key.isNullOrBlank()) repo.saveApiKey(inst.id, key.trim())
++        repo.triggerAsyncModelReconcile(inst.id, forceRefresh = true)
++        _found.value = _found.value.filter { it.port != f.port }
++        "已添加 ${f.title}，${check.models.size} 个模型"
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MinesUpdate.kt b/src/android/app/src/main/java/com/openminis/app/plus/MinesUpdate.kt
+new file mode 100644
+index 0000000..c454fbe
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/MinesUpdate.kt
+@@ -0,0 +1,151 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import com.openminis.app.BuildConfig
++import com.openminis.app.data.UpdateChecker
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.withContext
++import org.json.JSONArray
++import org.json.JSONObject
++import java.io.File
++import java.net.HttpURLConnection
++import java.net.URL
++
++/**
++ * In-app update for Mines builds published on GitHub
++ * (ddfc1991/openminis-agent-android, releases `build-<n>` with `mines-<n>.apk`).
++ *
++ * Every build has the same package, signing key and versionCode, so Android
++ * installs a newer build in place — and an older one too, which is what makes
++ * rollback possible: before installing, the APK the phone is running now is
++ * copied aside, and 「回到上一版」 installs that copy.
++ */
++object MinesUpdate {
++    const val OWNER = "ddfc1991"
++    const val REPO = "openminis-agent-android"
++    private const val PREFS = "mines_update"
++    val currentBuild: Int get() = BuildConfig.MINES_BUILD
++
++    data class Release(
++        val build: Int,
++        val tag: String,
++        val apkUrl: String,
++        val apkSize: Long,
++        val pageUrl: String,
++        val publishedAt: String,
++        val notes: String,
++    )
++
++    sealed class State {
++        data object Idle : State()
++        data object Checking : State()
++        data class UpToDate(val latest: Int) : State()
++        data class Available(val release: Release) : State()
++        data class Downloading(val release: Release, val progress: Float) : State()
++        data class Ready(val release: Release, val apk: File) : State()
++        data class Failed(val message: String) : State()
++    }
++
++    private val _state = MutableStateFlow<State>(State.Idle)
++    val state: StateFlow<State> = _state.asStateFlow()
++
++    private fun get(url: String): String {
++        val c = URL(url).openConnection() as HttpURLConnection
++        c.connectTimeout = 8000; c.readTimeout = 15000
++        c.setRequestProperty("Accept", "application/vnd.github+json")
++        c.setRequestProperty("User-Agent", "Mines-build-$currentBuild")
++        val code = c.responseCode
++        if (code == 403) throw IllegalStateException("GitHub 暂时限流了，过一会再试")
++        if (code !in 200..299) throw IllegalStateException("GitHub 返回 $code")
++        return c.inputStream.use { it.readBytes() }.toString(Charsets.UTF_8)
++    }
++
++    private fun parse(arr: JSONArray): List<Release> = (0 until arr.length()).mapNotNull { i ->
++        val r = arr.getJSONObject(i)
++        if (r.optBoolean("draft")) return@mapNotNull null
++        val tag = r.optString("tag_name")
++        val n = Regex("^build-(\\d+)$").find(tag)?.groupValues?.get(1)?.toIntOrNull() ?: return@mapNotNull null
++        val assets = r.optJSONArray("assets") ?: return@mapNotNull null
++        val apk = (0 until assets.length()).map { assets.getJSONObject(it) }
++            .firstOrNull { it.optString("name").startsWith("mines-") && it.optString("name").endsWith(".apk") }
++            ?: return@mapNotNull null
++        Release(n, tag, apk.optString("browser_download_url"), apk.optLong("size"), r.optString("html_url"),
++            r.optString("published_at"), r.optString("body"))
++    }
++
++    /** The change list for a build: the message of the commit its tag points at. */
++    private fun changelog(tag: String): String = runCatching {
++        val c = JSONObject(get("https://api.github.com/repos/$OWNER/$REPO/commits/$tag"))
++        c.optJSONObject("commit")?.optString("message").orEmpty()
++    }.getOrDefault("")
++
++    suspend fun check(context: Context, quiet: Boolean = false): State = withContext(Dispatchers.IO) {
++        if (!quiet) _state.value = State.Checking
++        val result = runCatching {
++            val all = parse(JSONArray(get("https://api.github.com/repos/$OWNER/$REPO/releases?per_page=20")))
++            val latest = all.maxByOrNull { it.build } ?: return@runCatching State.Failed("还没有发布的版本")
++            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putLong("checked", System.currentTimeMillis()).apply()
++            if (currentBuild > 0 && latest.build <= currentBuild) State.UpToDate(latest.build)
++            else State.Available(latest.copy(notes = changelog(latest.tag).ifBlank { latest.notes }))
++        }.getOrElse { State.Failed(it.message ?: "检查失败") }
++        if (!(quiet && result is State.Failed)) _state.value = result
++        result
++    }
++
++    /** At most once a day, silently (for the home card). */
++    suspend fun checkDaily(context: Context) {
++        val last = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getLong("checked", 0L)
++        if (System.currentTimeMillis() - last > 20 * 3600_000L || _state.value is State.Idle) check(context, quiet = true)
++    }
++
++    fun dismissedBuild(context: Context): Int = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getInt("dismissed", 0)
++    fun dismiss(context: Context, build: Int) {
++        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putInt("dismissed", build).apply()
++    }
++
++    private fun updatesDir(context: Context) = File(context.filesDir, "updates").apply { mkdirs() }
++
++    /** The copy of the build that was running before the last update, if any. */
++    fun rollbackApk(context: Context): Pair<Int, File>? {
++        val f = updatesDir(context).listFiles()?.filter { it.name.startsWith("rollback-build-") && it.name.endsWith(".apk") }
++            ?.maxByOrNull { it.lastModified() } ?: return null
++        val n = Regex("rollback-build-(\\d+)\\.apk").find(f.name)?.groupValues?.get(1)?.toIntOrNull() ?: 0
++        return if (n == currentBuild) null else n to f
++    }
++
++    /** Keep the APK we are running now, so the user can go back to it. */
++    private fun saveRollback(context: Context) {
++        val dir = updatesDir(context)
++        val target = File(dir, "rollback-build-$currentBuild.apk")
++        if (target.exists() && target.length() > 0) return
++        dir.listFiles()?.filter { it.name.startsWith("rollback-build-") }?.forEach { it.delete() }
++        File(context.applicationInfo.sourceDir).copyTo(target, overwrite = true)
++    }
++
++    suspend fun download(context: Context, release: Release) = withContext(Dispatchers.IO) {
++        _state.value = State.Downloading(release, 0f)
++        runCatching { saveRollback(context) }
++        when (val r = UpdateChecker.download(context, release.apkUrl, versionName = null) { p ->
++            _state.value = State.Downloading(release, p)
++        }) {
++            is UpdateChecker.DownloadResult.Success -> {
++                val dest = File(updatesDir(context), "mines-${release.build}.apk")
++                if (r.file != dest) { r.file.copyTo(dest, overwrite = true); r.file.delete() }
++                _state.value = State.Ready(release, dest)
++            }
++            is UpdateChecker.DownloadResult.Error -> _state.value = State.Failed("下载失败：${r.message}")
++        }
++    }
++
++    /** Launches the system installer; asks for the install permission first when needed. */
++    fun install(context: Context, apk: File): Boolean {
++        if (!UpdateChecker.canInstall(context)) {
++            UpdateChecker.openInstallPermissionSettings(context)
++            return false
++        }
++        return UpdateChecker.installApk(context, apk)
 +    }
 +}
