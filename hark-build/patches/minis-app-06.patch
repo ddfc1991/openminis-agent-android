@@ -1,253 +1,782 @@
-diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/MarketScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/MarketScreen.kt
 new file mode 100644
-index 0000000..6fc7973
+index 0000000..0836dbf
 --- /dev/null
-+++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
-@@ -0,0 +1,228 @@
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/MarketScreen.kt
+@@ -0,0 +1,383 @@
 +package com.openminis.app.ui.plus
 +
-+import android.graphics.BitmapFactory
-+import androidx.compose.animation.core.LinearEasing
-+import androidx.compose.animation.core.RepeatMode
-+import androidx.compose.animation.core.animateFloat
-+import androidx.compose.animation.core.infiniteRepeatable
-+import androidx.compose.animation.core.rememberInfiniteTransition
-+import androidx.compose.animation.core.tween
-+import androidx.compose.foundation.Canvas
-+import androidx.compose.foundation.Image
-+import androidx.compose.foundation.background
-+import androidx.compose.foundation.layout.Box
++import android.content.Context
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
 +import androidx.compose.foundation.layout.Column
-+import androidx.compose.foundation.layout.ColumnScope
-+import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
 +import androidx.compose.foundation.layout.fillMaxWidth
 +import androidx.compose.foundation.layout.padding
-+import androidx.compose.foundation.layout.size
-+import androidx.compose.foundation.rememberScrollState
-+import androidx.compose.foundation.shape.RoundedCornerShape
-+import androidx.compose.foundation.verticalScroll
-+import androidx.compose.material.icons.Icons
-+import androidx.compose.material.icons.automirrored.filled.ArrowBack
-+import androidx.compose.material3.ExperimentalMaterial3Api
-+import androidx.compose.material3.Icon
-+import androidx.compose.material3.IconButton
++import androidx.compose.foundation.layout.width
++import androidx.compose.material3.Button
 +import androidx.compose.material3.MaterialTheme
-+import androidx.compose.material3.Scaffold
++import androidx.compose.material3.OutlinedButton
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.Tab
++import androidx.compose.material3.TabRow
 +import androidx.compose.material3.Text
-+import androidx.compose.material3.TopAppBar
++import androidx.compose.material3.TextButton
 +import androidx.compose.runtime.Composable
-+import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.LaunchedEffect
 +import androidx.compose.runtime.getValue
-+import androidx.compose.runtime.produceState
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
 +import androidx.compose.ui.Modifier
-+import androidx.compose.ui.draw.clip
-+import androidx.compose.ui.graphics.Brush
 +import androidx.compose.ui.graphics.Color
-+import androidx.compose.ui.graphics.ImageBitmap
-+import androidx.compose.ui.graphics.asImageBitmap
-+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
-+import androidx.compose.ui.graphics.nativeCanvas
-+import androidx.compose.ui.layout.ContentScale
 +import androidx.compose.ui.platform.LocalContext
-+import androidx.compose.ui.text.font.FontWeight
-+import androidx.compose.ui.unit.Dp
++import androidx.compose.ui.platform.LocalLifecycleOwner
++import androidx.compose.ui.text.style.TextOverflow
 +import androidx.compose.ui.unit.dp
-+import androidx.compose.ui.unit.sp
-+import com.openminis.app.plus.PlusPrefs
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.repeatOnLifecycle
 +import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.launch
 +import kotlinx.coroutines.withContext
++import org.json.JSONArray
++import org.json.JSONObject
 +import java.io.File
-+import kotlin.math.sin
++import java.net.HttpURLConnection
++import java.net.URL
++import java.net.URLEncoder
 +
-+/** Lets screens outside the NavHost lambda (the conversation list) open Plus pages. */
-+object PlusNav {
-+    @Volatile var navigate: ((String) -> Unit)? = null
-+    /** Route asked for while no screen was up (e.g. from the desk pet); opened on next start. */
-+    @Volatile var pending: String? = null
-+    fun go(route: String) { navigate?.invoke(route) ?: run { pending = route } }
++/** 市场: dsh plugins + MCP servers (tab 1) and community skills (tab 2). */
++@Composable
++fun MarketScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit) {
++    var tab by remember { mutableIntStateOf(0) }
++    PlusPage("市场", onBack) {
++        TabRow(selectedTabIndex = tab) {
++            Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("插件", style = MaterialTheme.typography.titleMedium) })
++            Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("技能", style = MaterialTheme.typography.titleMedium) })
++        }
++        if (tab == 0) PluginMarket(onOpenTerminal) else SkillMarket()
++    }
 +}
 +
-+object PlusRoutes {
-+    const val WORK = "plus_work_location"
-+    const val CONNECTIONS = "plus_connections"
-+    const val PERSONALIZE = "plus_personalize"
-+    const val VOICE = "plus_voice_live"
-+    const val SANDBOX = "plus_sandbox"
-+    const val PLUGINS = "plus_plugins"
-+    const val MIGRATE = "plus_migrate"
-+    const val SERVER = "plus_server/{id}"
-+    fun server(id: String) = "plus_server/$id"
-+}
++// ── plugins ────────────────────────────────────────────────────────────
 +
-+/** Built-in wallpapers: soft gradients, look good under both light and dark bubbles. */
-+data class WallpaperPreset(val id: String, val name: String, val colors: List<Color>)
++private data class NpmPkg(val name: String, val version: String, val description: String)
 +
-+val wallpaperPresets = listOf(
-+    WallpaperPreset("aurora", "极光", listOf(Color(0xFF0F2027), Color(0xFF203A43), Color(0xFF2C5364), Color(0xFF3FA08F))),
-+    WallpaperPreset("sunset", "晚霞", listOf(Color(0xFFFFB199), Color(0xFFFF6F91), Color(0xFF845EC2))),
-+    WallpaperPreset("ocean", "深海", listOf(Color(0xFF1A2980), Color(0xFF26D0CE))),
-+    WallpaperPreset("mint", "薄荷", listOf(Color(0xFFE0F7EF), Color(0xFFB8F2E6), Color(0xFFAED9E0))),
-+    WallpaperPreset("peach", "蜜桃", listOf(Color(0xFFFFF1EB), Color(0xFFFFD6C9), Color(0xFFF7B7A3))),
-+    WallpaperPreset("night", "星夜", listOf(Color(0xFF141E30), Color(0xFF243B55))),
-+    WallpaperPreset("lavender", "薰衣草", listOf(Color(0xFFE6DEFF), Color(0xFFC3B1E1), Color(0xFF9D8EC7))),
-+    WallpaperPreset("forest", "森林", listOf(Color(0xFF134E5E), Color(0xFF71B280))),
++private data class McpPick(val name: String, val pkg: String, val args: String, val title: String, val note: String)
++
++private val curatedMcp = listOf(
++    McpPick("memory", "@modelcontextprotocol/server-memory", "", "长期记忆", "把要记住的事存成知识图谱"),
++    McpPick("thinking", "@modelcontextprotocol/server-sequential-thinking", "", "分步思考", "复杂问题一步一步想清楚"),
++    McpPick("files", "@modelcontextprotocol/server-filesystem", "/root", "沙箱文件", "读写沙箱 /root 里的文件"),
++    McpPick("context7", "@upstash/context7-mcp", "", "最新编程文档", "查各种库的最新文档和示例"),
++    McpPick("weread", "mcp-server-weread", "", "微信读书", "读书笔记和书架（需要在 MCP 页填 Cookie）"),
 +)
 +
-+fun wallpaperFile(context: android.content.Context) = File(context.filesDir, "plus_wallpaper.jpg")
-+
-+/** Loads the custom wallpaper image, downsampled to screen size. */
-+@Composable
-+fun rememberWallpaperBitmap(spec: String): ImageBitmap? {
-+    val context = LocalContext.current
-+    val bmp by produceState<ImageBitmap?>(initialValue = null, spec) {
-+        value = if (!spec.startsWith("file:")) null else withContext(Dispatchers.IO) {
-+            runCatching {
-+                val f = wallpaperFile(context)
-+                if (!f.exists()) return@runCatching null
-+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-+                BitmapFactory.decodeFile(f.absolutePath, bounds)
-+                val target = maxOf(context.resources.displayMetrics.heightPixels, 1)
-+                var sample = 1
-+                while (bounds.outHeight / (sample * 2) >= target) sample *= 2
-+                BitmapFactory.decodeFile(f.absolutePath, BitmapFactory.Options().apply { inSampleSize = sample })
-+                    ?.asImageBitmap()
-+            }.getOrNull()
-+        }
-+    }
-+    return bmp
++private fun httpGet(url: String, timeoutMs: Int = 12000): String {
++    val c = URL(url).openConnection() as HttpURLConnection
++    c.connectTimeout = timeoutMs; c.readTimeout = timeoutMs
++    c.setRequestProperty("User-Agent", "Mines")
++    c.setRequestProperty("Accept", "application/json")
++    val code = c.responseCode
++    if (code == 403 || code == 429) throw IllegalStateException("对方限流了，过一会再试")
++    if (code !in 200..299) throw IllegalStateException("HTTP $code")
++    return c.inputStream.use { it.readBytes() }.toString(Charsets.UTF_8)
 +}
 +
-+/** Chat background. Draws nothing when no wallpaper is chosen. */
++private fun searchNpm(query: String): List<NpmPkg> {
++    val q = if (query.isBlank()) "keywords:dsh-plugin" else "$query keywords:dsh-plugin"
++    val j = JSONObject(httpGet("https://registry.npmjs.org/-/v1/search?size=60&text=" + URLEncoder.encode(q, "UTF-8")))
++    val arr = j.optJSONArray("objects") ?: return emptyList()
++    return (0 until arr.length()).mapNotNull { i ->
++        val p = arr.getJSONObject(i).optJSONObject("package") ?: return@mapNotNull null
++        NpmPkg(p.optString("name"), p.optString("version"), p.optString("description"))
++    }
++}
++
++private fun rootfs(ctx: Context) = com.openminis.app.sandbox.RootfsManager.getInstance(ctx).rootfsDir
++
++private data class InstalledPlugin(val enabled: Boolean, val ok: Boolean?, val reason: String)
++
++private fun installedPlugins(ctx: Context): Map<String, InstalledPlugin> = runCatching {
++    val home = File(rootfs(ctx), "root/.minis-dsh")
++    val state = JSONObject(File(home, "plugins.json").readText())
++    val status = runCatching { JSONObject(File(home, "status.json").readText()) }.getOrNull()
++    val arr = state.optJSONArray("plugins") ?: JSONArray()
++    (0 until arr.length()).associate { i ->
++        val p = arr.getJSONObject(i)
++        val st = status?.optJSONObject(p.optString("package"))
++        p.optString("package") to InstalledPlugin(p.optBoolean("enabled", true), st?.optBoolean("ok"), st?.optString("reason").orEmpty())
++    }
++}.getOrDefault(emptyMap())
++
++private fun installedMcp(ctx: Context): Set<String> = runCatching {
++    val f = File(rootfs(ctx), "var/minis/mcp-servers/servers.json")
++    JSONObject(f.readText()).optJSONObject("mcpServers")?.keys()?.asSequence()?.toSet() ?: emptySet()
++}.getOrDefault(emptySet())
++
++private fun safeName(s: String) = s.isNotBlank() && s.none { it == ' ' || it == ';' || it == '&' || it == '|' || it == '`' || it == '$' || it == '\'' || it == '"' }
++
 +@Composable
-+fun ChatWallpaperLayer(modifier: Modifier = Modifier, home: Boolean = false) {
-+    val context = LocalContext.current
-+    PlusPrefs.init(context)
-+    val st by PlusPrefs.state.collectAsState()
-+    val spec = st.wallpaper
-+    if (spec.isEmpty() || (home && !st.wallpaperOnHome)) return
-+    val dark = MaterialTheme.colorScheme.background.let { (it.red + it.green + it.blue) / 3f < 0.5f }
-+    Box(modifier) {
-+        if (spec.startsWith("preset:")) {
-+            val p = wallpaperPresets.firstOrNull { it.id == spec.removePrefix("preset:") }
-+            if (p != null) Box(Modifier.fillMaxSize().background(Brush.linearGradient(p.colors.map { it.copy(alpha = st.wallpaperAlpha.coerceIn(0f, 1f)) })))
-+        } else {
-+            val bmp = rememberWallpaperBitmap(spec)
-+            if (bmp != null) Image(bmp, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop, alpha = st.wallpaperAlpha.coerceIn(0f, 1f))
++private fun PluginMarket(onOpenTerminal: (String) -> Unit) {
++    val ctx = LocalContext.current
++    val scope = rememberCoroutineScope()
++    var query by remember { mutableStateOf("") }
++    var results by remember { mutableStateOf<List<NpmPkg>>(emptyList()) }
++    var msg by remember { mutableStateOf("正在加载…") }
++    var tick by remember { mutableIntStateOf(0) }
++    var installed by remember { mutableStateOf<Map<String, InstalledPlugin>>(emptyMap()) }
++    var mcp by remember { mutableStateOf<Set<String>>(emptySet()) }
++    val owner = LocalLifecycleOwner.current
++    LaunchedEffect(owner) { owner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) { tick++ } }
++    LaunchedEffect(tick) {
++        withContext(Dispatchers.IO) { installed = installedPlugins(ctx); mcp = installedMcp(ctx) }
++    }
++    fun search() = scope.launch {
++        msg = "正在搜索…"
++        runCatching { withContext(Dispatchers.IO) { searchNpm(query.trim()) } }
++            .onSuccess { results = it; msg = if (it.isEmpty()) "没找到" else "" }
++            .onFailure { msg = "搜索失败：${it.message}" }
++    }
++    LaunchedEffect(Unit) { search() }
++
++    PlusSection("搜索 dsh 插件", footer = "装好后在「插件」页能看到它加了哪些工具；标红的是 Mines 暂不支持的（需要 dsh 内部服务）。") {
++        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
++            OutlinedTextField(query, { query = it }, label = { Text("关键词（可空）") }, singleLine = true, modifier = Modifier.fillMaxWidth())
++            Button(onClick = { search() }, modifier = Modifier.fillMaxWidth()) { Text("搜索") }
 +        }
-+        // Dim layer keeps message text readable.
-+        Box(
-+            Modifier.fillMaxSize().background(
-+                (if (dark) Color.Black else Color.White).copy(alpha = st.wallpaperDim.coerceIn(0f, 0.85f))
++    }
++    PlusSection("常用 MCP 服务", footer = "一键加到 Mines 的 MCP 里，第一次用时自动下载。") {
++        curatedMcp.forEachIndexed { i, m ->
++            val has = m.name in mcp
++            MarketRow(
++                title = m.title, sub = "${m.note} · ${m.pkg}",
++                status = if (has) "已添加" else null,
++                primary = if (has) "移除" else "添加",
++                primaryDanger = has,
++                onPrimary = {
++                    if (has) onOpenTerminal("minis-dsh mcp-remove ${m.name}")
++                    else onOpenTerminal("minis-dsh mcp-add ${m.name} ${m.pkg}${if (m.args.isNotBlank()) " " + m.args else ""}")
++                },
 +            )
-+        )
++            if (i < curatedMcp.lastIndex) PlusDivider()
++        }
++    }
++    PlusSection(if (results.isEmpty()) "插件" else "插件 · ${results.size}") {
++        if (msg.isNotBlank()) Text(msg, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(16.dp))
++        results.forEachIndexed { i, p ->
++            val inst = installed[p.name]
++            val status = when {
++                inst == null -> null
++                !inst.enabled -> "已装 · 已停用"
++                inst.ok == true -> "已装 · 正常"
++                inst.ok == false -> "已装 · 用不了：${inst.reason}"
++                else -> "已装"
++            }
++            MarketRow(
++                title = p.name, sub = "${p.description.ifBlank { "（无简介）" }} · v${p.version}",
++                status = status, statusBad = inst?.ok == false,
++                primary = if (inst == null) "安装" else "更新",
++                onPrimary = { if (safeName(p.name)) onOpenTerminal("minis-dsh add ${p.name}@latest") },
++                secondary = if (inst != null) "卸载" else null,
++                onSecondary = { if (safeName(p.name)) onOpenTerminal("minis-dsh remove ${p.name}") },
++            )
++            if (i < results.lastIndex) PlusDivider()
++        }
 +    }
 +}
 +
-+/** True when a wallpaper is drawn on this screen (bars then go translucent). */
 +@Composable
-+fun wallpaperOn(home: Boolean = false): Boolean {
-+    val context = LocalContext.current
-+    PlusPrefs.init(context)
-+    val st by PlusPrefs.state.collectAsState()
-+    return st.wallpaper.isNotEmpty() && (!home || st.wallpaperOnHome)
-+}
-+
-+/**
-+ * The avatar: round head crop by default ([face] = false shows the full-body
-+ * character). Uses the same renderer as the desk pet, so custom GIF / animated
-+ * WebP pictures animate here too.
-+ */
-+@Composable
-+fun PetAvatar(
-+    size: Dp,
-+    style: String? = null,
-+    color: Int? = null,
-+    animated: Boolean = true,
-+    face: Boolean = true,
-+    crop: com.openminis.app.plus.AvatarCrop? = null,
-+    noBg: Boolean? = null,
-+    version: Long? = null,
++private fun MarketRow(
++    title: String, sub: String, status: String?, statusBad: Boolean = false,
++    primary: String, onPrimary: () -> Unit, primaryDanger: Boolean = false,
++    secondary: String? = null, onSecondary: () -> Unit = {},
++    onClick: (() -> Unit)? = null,
 +) {
-+    val context = LocalContext.current
-+    PlusPrefs.init(context)
-+    val st by PlusPrefs.state.collectAsState()
-+    androidx.compose.ui.viewinterop.AndroidView(
-+        factory = { com.openminis.app.plus.AvatarView(it) },
-+        update = { v ->
-+            v.style = style; v.face = face; v.bob = animated && !face
-+            v.showRing = face; v.crop = crop; v.noBg = noBg; v.version = version
-+            v.tag = st // re-run update (and redraw) whenever prefs change
-+            v.invalidate()
-+        },
-+        modifier = Modifier.size(size),
-+    )
++    Row(
++        Modifier.fillMaxWidth().then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
++            .padding(horizontal = 14.dp, vertical = 12.dp),
++        verticalAlignment = Alignment.CenterVertically,
++    ) {
++        Column(Modifier.weight(1f)) {
++            Text(title, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
++            Text(sub, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 3, overflow = TextOverflow.Ellipsis)
++            if (status != null) Text(status, style = MaterialTheme.typography.bodyMedium,
++                color = if (statusBad) Color(0xFFFF3B30) else Color(0xFF34C759))
++        }
++        Spacer(Modifier.width(8.dp))
++        Column(horizontalAlignment = Alignment.End) {
++            if (primaryDanger) OutlinedButton(onClick = onPrimary) { Text(primary, color = Color(0xFFFF3B30)) }
++            else Button(onClick = onPrimary) { Text(primary) }
++            if (secondary != null) TextButton(onClick = onSecondary) { Text(secondary, color = Color(0xFFFF3B30)) }
++        }
++    }
 +}
 +
-+@OptIn(ExperimentalMaterial3Api::class)
++// ── skills ─────────────────────────────────────────────────────────────
++
++private data class RemoteSkill(val repo: String, val dir: String, val files: List<String>) {
++    val name: String get() = dir.substringAfterLast('/').ifBlank { repo.substringAfter('/') }
++}
++
++private object SkillMarketData {
++    val DEFAULT_REPOS = listOf("anthropics/skills", "obra/superpowers", "ComposioHQ/awesome-claude-skills")
++    private const val PREFS = "mines_skill_market"
++    val cache = mutableMapOf<String, List<RemoteSkill>>()
++
++    fun repos(ctx: Context): List<String> {
++        val raw = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("repos", null) ?: return DEFAULT_REPOS
++        return raw.split('\n').map { it.trim() }.filter { it.matches(Regex("^[\\w.-]+/[\\w.-]+$")) }
++    }
++
++    fun setRepos(ctx: Context, list: List<String>) {
++        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("repos", list.joinToString("\n")).apply()
++    }
++
++    fun list(repo: String): List<RemoteSkill> {
++        cache[repo]?.let { return it }
++        val j = JSONObject(httpGet("https://api.github.com/repos/$repo/git/trees/HEAD?recursive=1", 20000))
++        val tree = j.optJSONArray("tree") ?: JSONArray()
++        val blobs = (0 until tree.length()).map { tree.getJSONObject(it) }.filter { it.optString("type") == "blob" }
++            .map { it.optString("path") to it.optLong("size") }
++        val dirs = blobs.map { it.first }.filter { it == "SKILL.md" || it.endsWith("/SKILL.md") }
++            .map { it.removeSuffix("SKILL.md").trimEnd('/') }
++        val out = dirs.map { d ->
++            val prefix = if (d.isEmpty()) "" else "$d/"
++            RemoteSkill(repo, d, blobs.filter { (p, size) ->
++                p.startsWith(prefix) && size < 2_000_000 &&
++                    // files of a nested skill belong to that one, not this one
++                    dirs.none { o -> o != d && o.startsWith(prefix) && p.startsWith("$o/") }
++            }.map { it.first }.take(200))
++        }.sortedBy { it.name.lowercase() }
++        cache[repo] = out
++        return out
++    }
++
++    fun skillsDir(ctx: Context) = File(ctx.filesDir, "minis-global/skills")
++
++    fun installedSource(ctx: Context, name: String): String? {
++        val d = File(skillsDir(ctx), name)
++        if (!d.isDirectory) return null
++        return File(d, ".mines-source").takeIf { it.isFile }?.readText()?.trim() ?: "local"
++    }
++
++    fun description(s: RemoteSkill): String = runCatching {
++        val path = if (s.dir.isEmpty()) "SKILL.md" else "${s.dir}/SKILL.md"
++        val text = httpGet("https://raw.githubusercontent.com/${s.repo}/HEAD/$path")
++        Regex("(?m)^description:\\s*(.+)$").find(text)?.groupValues?.get(1)?.trim()?.trim('"', '\'')
++            ?: text.lines().firstOrNull { it.isNotBlank() && !it.startsWith("---") && !it.startsWith("name:") }.orEmpty()
++    }.getOrDefault("")
++
++    fun install(ctx: Context, s: RemoteSkill): String {
++        val target = File(skillsDir(ctx), s.name)
++        val src = installedSource(ctx, s.name)
++        if (src == "local") return "已经有一个同名的本地技能「${s.name}」，没有覆盖"
++        val tmp = File(ctx.cacheDir, "skill-dl-${s.name}").apply { deleteRecursively(); mkdirs() }
++        val prefix = if (s.dir.isEmpty()) "" else "${s.dir}/"
++        for (p in s.files) {
++            val rel = p.removePrefix(prefix)
++            if (rel.contains("..")) continue
++            val url = "https://raw.githubusercontent.com/${s.repo}/HEAD/" + p.split('/').joinToString("/") { URLEncoder.encode(it, "UTF-8").replace("+", "%20") }
++            val c = URL(url).openConnection() as HttpURLConnection
++            c.connectTimeout = 12000; c.readTimeout = 20000
++            if (c.responseCode !in 200..299) continue
++            val f = File(tmp, rel).apply { parentFile?.mkdirs() }
++            c.inputStream.use { inp -> f.outputStream().use { inp.copyTo(it) } }
++        }
++        if (!File(tmp, "SKILL.md").isFile) { tmp.deleteRecursively(); return "下载失败（没拿到 SKILL.md）" }
++        File(tmp, ".mines-source").writeText("${s.repo}/${s.dir}\n")
++        target.deleteRecursively()
++        target.parentFile?.mkdirs()
++        if (!tmp.renameTo(target)) { tmp.copyRecursively(target, overwrite = true); tmp.deleteRecursively() }
++        (ctx.applicationContext as? com.openminis.app.MinisApp)?.skillRepository?.requestReload("mines-market", force = true)
++        return if (src == null) "已安装「${s.name}」" else "已更新「${s.name}」"
++    }
++
++    fun uninstall(ctx: Context, name: String): String {
++        val d = File(skillsDir(ctx), name)
++        if (installedSource(ctx, name) == "local") return "这是本地技能，请在 设置 → 技能 里删"
++        d.deleteRecursively()
++        (ctx.applicationContext as? com.openminis.app.MinisApp)?.skillRepository?.requestReload("mines-market", force = true)
++        return "已卸载「$name」"
++    }
++}
++
 +@Composable
-+fun PlusPage(title: String, onBack: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
-+    Scaffold(
-+        topBar = {
-+            TopAppBar(
-+                title = { Text(title) },
-+                navigationIcon = {
-+                    IconButton(onClick = onBack) {
-+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
++private fun SkillMarket() {
++    val ctx = LocalContext.current
++    val scope = rememberCoroutineScope()
++    var repos by remember { mutableStateOf(SkillMarketData.repos(ctx)) }
++    var repo by remember { mutableStateOf(repos.firstOrNull() ?: "") }
++    var skills by remember { mutableStateOf<List<RemoteSkill>>(emptyList()) }
++    var msg by remember { mutableStateOf("") }
++    var filter by remember { mutableStateOf("") }
++    var newRepo by remember { mutableStateOf("") }
++    var expanded by remember { mutableStateOf<String?>(null) }
++    var desc by remember { mutableStateOf("") }
++    var busy by remember { mutableStateOf<String?>(null) }
++    var tick by remember { mutableIntStateOf(0) }
++
++    LaunchedEffect(repo) {
++        if (repo.isBlank()) return@LaunchedEffect
++        msg = "正在读取 $repo …"; skills = emptyList()
++        runCatching { withContext(Dispatchers.IO) { SkillMarketData.list(repo) } }
++            .onSuccess { skills = it; msg = if (it.isEmpty()) "这个仓库里没有 SKILL.md" else "" }
++            .onFailure { msg = "读取失败：${it.message}" }
++    }
++
++    PlusSection("技能仓库", footer = "GitHub 上的 SKILL.md 技能合集。可以加自己的仓库（用户名/仓库名）。") {
++        repos.forEachIndexed { i, r ->
++            Row(Modifier.fillMaxWidth().clickable { repo = r }.padding(horizontal = 14.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
++                Text((if (r == repo) "● " else "○ ") + r, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f),
++                    color = if (r == repo) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
++                if (r !in SkillMarketData.DEFAULT_REPOS) TextButton(onClick = {
++                    repos = repos - r; SkillMarketData.setRepos(ctx, repos); if (repo == r) repo = repos.firstOrNull() ?: ""
++                }) { Text("移除", color = Color(0xFFFF3B30)) }
++            }
++            if (i < repos.lastIndex) PlusDivider()
++        }
++        PlusDivider()
++        Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
++            OutlinedTextField(newRepo, { newRepo = it.trim() }, label = { Text("添加仓库，如 owner/repo") }, singleLine = true, modifier = Modifier.weight(1f))
++            Spacer(Modifier.width(8.dp))
++            Button(enabled = newRepo.matches(Regex("^[\\w.-]+/[\\w.-]+$")), onClick = {
++                repos = (repos + newRepo).distinct(); SkillMarketData.setRepos(ctx, repos); repo = newRepo; newRepo = ""
++            }) { Text("添加") }
++        }
++    }
++
++    val shown = skills.filter { filter.isBlank() || it.name.contains(filter, true) || it.dir.contains(filter, true) }
++    PlusSection(if (skills.isEmpty()) "技能" else "技能 · ${skills.size}", footer = if (shown.size > 80) "只显示前 80 个，用上面的搜索框找" else null) {
++        if (skills.size > 12) OutlinedTextField(filter, { filter = it }, label = { Text("搜索技能") }, singleLine = true,
++            modifier = Modifier.fillMaxWidth().padding(12.dp))
++        if (msg.isNotBlank()) Text(msg, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(16.dp))
++        val list = shown.take(80)
++        list.forEachIndexed { i, s ->
++            val src = remember(tick, s.name) { SkillMarketData.installedSource(ctx, s.name) }
++            val key = s.repo + "/" + s.dir
++            MarketRow(
++                title = s.name,
++                sub = if (expanded == key) desc.ifBlank { "正在读取简介…" } else "${s.dir.ifBlank { "/" }} · ${s.files.size} 个文件 · 点一下看简介",
++                status = when (src) { null -> null; "local" -> "已有同名本地技能"; else -> "已安装" },
++                statusBad = src == "local",
++                primary = if (busy == key) "…" else if (src == null) "安装" else "更新",
++                onPrimary = {
++                    if (busy == null && src != "local") {
++                        busy = key
++                        scope.launch {
++                            msg = withContext(Dispatchers.IO) { runCatching { SkillMarketData.install(ctx, s) }.getOrElse { "安装失败：${it.message}" } }
++                            busy = null; tick++
++                        }
++                    }
++                },
++                secondary = if (src != null && src != "local") "卸载" else null,
++                onSecondary = { scope.launch { msg = withContext(Dispatchers.IO) { SkillMarketData.uninstall(ctx, s.name) }; tick++ } },
++                onClick = {
++                    if (expanded == key) expanded = null else {
++                        expanded = key; desc = ""
++                        scope.launch { desc = withContext(Dispatchers.IO) { SkillMarketData.description(s) }.ifBlank { "（没有简介）" } }
 +                    }
 +                },
 +            )
-+        },
-+    ) { padding ->
-+        Column(
-+            Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState())
-+                .padding(bottom = 32.dp),
-+            content = content,
++            if (i < list.lastIndex) PlusDivider()
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/MigrateScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/MigrateScreen.kt
+new file mode 100644
+index 0000000..9625470
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/MigrateScreen.kt
+@@ -0,0 +1,372 @@
++package com.openminis.app.ui.plus
++
++import android.content.Context
++import android.content.Intent
++import android.content.pm.ApplicationInfo
++import android.net.Uri
++import androidx.activity.compose.rememberLauncherForActivityResult
++import androidx.activity.result.contract.ActivityResultContracts
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.outlined.FileOpen
++import androidx.compose.material.icons.outlined.OpenInNew
++import androidx.compose.material.icons.outlined.RestartAlt
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.Button
++import androidx.compose.material3.LinearProgressIndicator
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.input.PasswordVisualTransformation
++import androidx.compose.ui.unit.dp
++import com.openminis.app.MinisApp
++import com.openminis.app.backup.BackupCategory
++import com.openminis.app.backup.BackupImporter
++import com.openminis.app.backup.BackupManifest
++import com.openminis.app.backup.BackupPackageReader
++import com.openminis.app.backup.BackupZip
++import com.openminis.app.data.db.AppDatabase
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import java.io.File
++
++/**
++ * Move data from the earlier Mines install (package com.openminis.mines) into
++ * this one, which installs beside it because the earlier APK was signed with
++ * a throwaway key.
++ *
++ * Why it goes through a backup file and not a raw copy of the old data dir:
++ *  - the earlier build is a release (non-debuggable) APK, so `run-as` refuses
++ *    it even from the Shizuku shell uid, and the shell uid cannot read
++ *    /data/data of another app;
++ *  - provider API keys are sealed with the old app's own Android Keystore
++ *    key, which never leaves that app, so copied files would arrive without
++ *    usable keys anyway.
++ * The old app's own backup export decrypts them and writes a portable
++ * package, which this app's existing importer reads. Nothing here writes to
++ * or deletes anything belonging to the old app.
++ *
++ * Providers and skills are imported first and verified; everything else in
++ * the package follows on a best-effort basis.
++ */
++object MinesMigration {
++    const val OLD_PACKAGE = "com.openminis.mines"
++    private const val PREFS = "mines_migration"
++
++    fun oldInstalled(ctx: Context): Boolean =
++        ctx.packageName != OLD_PACKAGE && runCatching {
++            ctx.packageManager.getApplicationInfo(OLD_PACKAGE, 0); true
++        }.getOrDefault(false)
++
++    fun oldDebuggable(ctx: Context): Boolean = runCatching {
++        (ctx.packageManager.getApplicationInfo(OLD_PACKAGE, 0).flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
++    }.getOrDefault(false)
++
++    private fun prefs(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++    fun shouldPrompt(ctx: Context): Boolean = oldInstalled(ctx) && !prefs(ctx).getBoolean("prompted", false)
++    fun markPrompted(ctx: Context) { prefs(ctx).edit().putBoolean("prompted", true).apply() }
++    fun markDone(ctx: Context, summary: String) {
++        prefs(ctx).edit().putBoolean("prompted", true).putString("last_summary", summary).apply()
++    }
++    fun lastSummary(ctx: Context): String? = prefs(ctx).getString("last_summary", null)
++
++    fun openOldApp(ctx: Context): Boolean {
++        val i = ctx.packageManager.getLaunchIntentForPackage(OLD_PACKAGE) ?: return false
++        ctx.startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
++        return true
++    }
++
++    private fun skillsDir(ctx: Context) = File(ctx.filesDir, "minis-global/skills")
++    fun skillNames(ctx: Context): Set<String> =
++        skillsDir(ctx).listFiles()?.filter { it.isDirectory && !it.name.startsWith(".") }?.map { it.name }?.toSet()
++            ?: emptySet()
++
++    fun providerCount(ctx: Context): Int =
++        (ctx.applicationContext as? MinisApp)?.providerRepositoryOrNull?.instances?.size ?: 0
++
++    class Picked(val extracted: File, val manifest: BackupManifest) {
++        val categories: Set<BackupCategory> =
++            manifest.categories.keys.mapNotNull(BackupCategory::fromKey).toSet()
++        val encrypted: Boolean get() = manifest.encryption != null
++        val providersInPackage: Int get() = manifest.categories[BackupCategory.PROVIDERS.key]?.entries ?: 0
++        val skillsInPackage: Int get() = manifest.categories[BackupCategory.SKILLS.key]?.entries ?: 0
++        val hasKeys: Boolean? get() = manifest.categories[BackupCategory.PROVIDERS.key]?.includesCredentials
++    }
++
++    /** Copy the picked file to cache, unzip it and read its manifest. Off the main thread. */
++    fun pick(ctx: Context, uri: Uri): Picked {
++        val zip = File(ctx.cacheDir, "mines-migrate.minisbak")
++        ctx.contentResolver.openInputStream(uri)?.use { inp -> zip.outputStream().use { inp.copyTo(it) } }
++            ?: throw IllegalStateException("打不开这个文件")
++        val out = File(ctx.cacheDir, "mines-migrate").apply { deleteRecursively(); mkdirs() }
++        try {
++            BackupZip.extract(zip, out)
++        } finally {
++            zip.delete()
++        }
++        val root = BackupZip.packageRoot(out)
++        val manifest = BackupPackageReader(root).readManifest()
++        return Picked(out, manifest)
++    }
++
++    data class Result(
++        val providersNew: Int,
++        val providersExisting: Int,
++        val providersUnreadable: Int,
++        val keysRestored: Int,
++        val keysKept: Int,
++        val providersNow: Int,
++        val skillsInPackage: Int,
++        val skillsVerified: Int,
++        val skillsNew: Int,
++        val others: List<String>,
++        val problems: List<String>,
++    ) {
++        val providersMigrated: Int get() = providersNew + providersExisting
++        fun headline(): String = "已迁移 $providersMigrated 个供应商、$skillsVerified 个技能"
++    }
++
++    suspend fun run(
++        ctx: Context,
++        picked: Picked,
++        passphrase: String?,
++        onStatus: (String) -> Unit,
++    ): Result = withContext(Dispatchers.IO) {
++        val importer = BackupImporter(ctx, AppDatabase.getInstance(ctx))
++        val problems = mutableListOf<String>()
++        val skillsBefore = skillNames(ctx)
++
++        // Phase 1: providers + skills, the two things that matter most.
++        val first = setOf(BackupCategory.PROVIDERS, BackupCategory.SKILLS).intersect(picked.categories)
++        if (first.isEmpty()) problems += "备份里没有供应商和技能"
++        var pr: BackupImporter.CategoryReport? = null
++        if (first.isNotEmpty()) {
++            onStatus("正在迁移供应商和技能…")
++            val r1 = importer.import(
++                picked.extracted,
++                BackupImporter.Options(categories = first, passphrase = passphrase),
++                onProgress = { onStatus(it) },
++            )
++            pr = r1.categories.firstOrNull { it.category == BackupCategory.PROVIDERS.key }
++            r1.categories.forEach { c -> c.failed?.let { problems += "${c.category}: $it" } }
++            if (r1.integrityFailed.isNotEmpty()) problems += "${r1.integrityFailed.size} 个文件校验失败"
++        }
++        // Verify against what is actually on the device now.
++        val skillsAfter = skillNames(ctx)
++        val skillsNew = (skillsAfter - skillsBefore).size
++        val skillsVerified = if (picked.skillsInPackage > 0) minOf(picked.skillsInPackage, skillsAfter.size) else skillsNew
++        if (picked.skillsInPackage > skillsAfter.size) {
++            problems += "备份里有 ${picked.skillsInPackage} 个技能，本机只找到 ${skillsAfter.size} 个"
++        }
++
++        // Phase 2: everything else, best effort.
++        val rest = picked.categories - first
++        val others = mutableListOf<String>()
++        if (rest.isNotEmpty()) {
++            onStatus("正在迁移其余内容…")
++            runCatching {
++                importer.import(
++                    picked.extracted,
++                    BackupImporter.Options(categories = rest, passphrase = passphrase),
++                    onProgress = { onStatus(it) },
++                )
++            }.onSuccess { r2 ->
++                r2.categories.forEach { c ->
++                    if (c.failed != null) problems += "${c.category}: ${c.failed}"
++                    else others += "${categoryName(c.category)} ${c.imported + c.updated}"
++                }
++            }.onFailure { problems += "其余内容：${it.message}" }
++        }
++        picked.extracted.deleteRecursively()
++
++        Result(
++            providersNew = pr?.imported ?: 0,
++            providersExisting = pr?.skipped ?: 0,
++            providersUnreadable = pr?.unreadable ?: 0,
++            keysRestored = pr?.credentialsRestored ?: 0,
++            keysKept = pr?.credentialsKept ?: 0,
++            providersNow = providerCount(ctx),
++            skillsInPackage = picked.skillsInPackage,
++            skillsVerified = skillsVerified,
++            skillsNew = skillsNew,
++            others = others,
++            problems = problems,
 +        )
++    }
++
++    private fun categoryName(key: String) = when (key) {
++        BackupCategory.CHATS.key -> "对话"
++        BackupCategory.MEMORY.key -> "记忆"
++        BackupCategory.MCP_SERVERS.key -> "MCP"
++        BackupCategory.SHARED_FILES.key -> "共享文件"
++        BackupCategory.ENVIRONMENT_VARIABLES.key -> "环境变量"
++        BackupCategory.VOICE_CORRECTIONS.key -> "语音纠错"
++        else -> key
++    }
++
++    /** Relaunch so every repository re-reads what was restored. */
++    fun restart(ctx: Context) {
++        val i = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName) ?: return
++        ctx.startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
++        android.os.Process.killProcess(android.os.Process.myPid())
 +    }
 +}
 +
 +@Composable
-+fun PlusSection(title: String?, footer: String? = null, content: @Composable ColumnScope.() -> Unit) {
-+    Column(Modifier.fillMaxWidth().padding(top = 18.dp)) {
-+        if (title != null) Text(
-+            title,
-+            style = MaterialTheme.typography.labelSmall,
++fun MigrateScreen(onBack: () -> Unit) {
++    val context = LocalContext.current
++    val scope = rememberCoroutineScope()
++    val oldInstalled = remember { MinesMigration.oldInstalled(context) }
++    var picked by remember { mutableStateOf<MinesMigration.Picked?>(null) }
++    var passphrase by remember { mutableStateOf("") }
++    var busy by remember { mutableStateOf(false) }
++    var status by remember { mutableStateOf<String?>(null) }
++    var error by remember { mutableStateOf<String?>(null) }
++    var result by remember { mutableStateOf<MinesMigration.Result?>(null) }
++    val last = remember { MinesMigration.lastSummary(context) }
++
++    val pickLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
++        if (uri == null) return@rememberLauncherForActivityResult
++        busy = true; error = null; result = null; status = "正在读取备份…"
++        scope.launch {
++            try {
++                picked = withContext(Dispatchers.IO) { MinesMigration.pick(context, uri) }
++            } catch (e: Exception) {
++                error = "这个文件读不了：${e.message ?: "格式不对"}"
++            } finally {
++                busy = false; status = null
++            }
++        }
++    }
++
++    PlusPage("从旧版迁移", onBack) {
++        Text(
++            "把旧版 Mines 的供应商（地址、密钥、模型）和技能搬到这里，其余内容尽量一起带上。旧版的数据只读不改，迁完两个可以并存。",
++            style = MaterialTheme.typography.bodyMedium,
 +            color = MaterialTheme.colorScheme.onSurfaceVariant,
-+            fontWeight = FontWeight.Medium,
-+            letterSpacing = 0.5.sp,
-+            modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp),
++            modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
 +        )
-+        Column(
-+            Modifier.fillMaxWidth().padding(horizontal = 16.dp)
-+                .clip(RoundedCornerShape(12.dp))
-+                .background(MaterialTheme.colorScheme.surfaceContainerLow),
-+            content = content,
-+        )
-+        if (footer != null) Text(
-+            footer,
-+            style = MaterialTheme.typography.bodySmall,
-+            color = MaterialTheme.colorScheme.onSurfaceVariant,
-+            modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp),
-+            lineHeight = 16.sp,
-+        )
++        if (last != null && result == null) {
++            Text("上次：$last", style = MaterialTheme.typography.bodySmall,
++                color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(horizontal = 20.dp))
++        }
++
++        PlusSection(
++            "第一步 · 在旧版导出",
++            footer = "在旧版里：设置 → 备份 → 勾选「供应商」「技能」（其余随意）→ 导出，建议设一个密码，存到「下载」。" +
++                if (oldInstalled) "" else "\n没检测到旧版 Mines；如果已有备份文件，直接做第二步。",
++        ) {
++            ActionRow(Icons.Outlined.OpenInNew, if (oldInstalled) "打开旧版 Mines" else "旧版未安装") {
++                if (!MinesMigration.openOldApp(context)) error = "打不开旧版 Mines"
++            }
++        }
++
++        PlusSection("第二步 · 选择备份文件", footer = "支持 Minis / Mines 的 .minisbak 备份。") {
++            ActionRow(Icons.Outlined.FileOpen, picked?.let { "已选：${it.manifest.deviceName} · ${it.manifest.createdAt.take(16)}" } ?: "选择备份文件") {
++                if (!busy) pickLauncher.launch(arrayOf("*/*"))
++            }
++        }
++
++        picked?.let { p ->
++            PlusSection(
++                "第三步 · 导入",
++                footer = buildString {
++                    append("备份里有 ${p.providersInPackage} 个供应商、${p.skillsInPackage} 个技能。")
++                    if (p.hasKeys == false) append("\n注意：这个备份没带 API 密钥，导出时请勾上含密钥的选项。")
++                },
++            ) {
++                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                    if (p.encrypted) {
++                        OutlinedTextField(
++                            passphrase, { passphrase = it }, label = { Text("备份密码") }, singleLine = true,
++                            visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(),
++                        )
++                    }
++                    Button(
++                        enabled = !busy && (!p.encrypted || passphrase.isNotEmpty()),
++                        modifier = Modifier.fillMaxWidth(),
++                        onClick = {
++                            busy = true; error = null
++                            scope.launch {
++                                try {
++                                    val r = MinesMigration.run(context, p, passphrase.ifEmpty { null }) { status = it }
++                                    result = r
++                                    picked = null
++                                    MinesMigration.markDone(context, r.headline())
++                                } catch (e: Exception) {
++                                    error = "导入失败：${e.message ?: e.javaClass.simpleName}"
++                                } finally {
++                                    busy = false; status = null
++                                }
++                            }
++                        },
++                    ) { Text("开始迁移") }
++                }
++            }
++        }
++
++        if (busy) {
++            Column(Modifier.padding(horizontal = 20.dp, vertical = 12.dp)) {
++                LinearProgressIndicator(Modifier.fillMaxWidth())
++                status?.let { Text(it, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 6.dp)) }
++            }
++        }
++        error?.let {
++            Text(it, color = Color(0xFFFF3B30), style = MaterialTheme.typography.bodyMedium,
++                modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp))
++        }
++
++        result?.let { r ->
++            PlusSection("结果", footer = "重启后新数据全部生效。") {
++                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
++                    Text(r.headline(), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
++                    Text("供应商：新增 ${r.providersNew}，已存在 ${r.providersExisting}，本机现有 ${r.providersNow} 个；密钥写入 ${r.keysRestored} 个" +
++                        if (r.keysKept > 0) "（保留本机已有 ${r.keysKept} 个）" else "",
++                        style = MaterialTheme.typography.bodySmall)
++                    Text("技能：备份 ${r.skillsInPackage} 个，本机确认 ${r.skillsVerified} 个（新增 ${r.skillsNew}）",
++                        style = MaterialTheme.typography.bodySmall)
++                    if (r.providersUnreadable > 0) Text("${r.providersUnreadable} 个供应商读不了，已跳过",
++                        style = MaterialTheme.typography.bodySmall, color = Color(0xFFFF9500))
++                    if (r.others.isNotEmpty()) Text("其余：" + r.others.joinToString("、"), style = MaterialTheme.typography.bodySmall)
++                    r.problems.forEach { Text("⚠ $it", style = MaterialTheme.typography.bodySmall, color = Color(0xFFFF9500)) }
++                }
++                PlusDivider()
++                ActionRow(Icons.Outlined.RestartAlt, "立即重启 Mines") { MinesMigration.restart(context) }
++            }
++        }
 +    }
 +}
-diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxScreen.kt
++
++/** One-time prompt on first launch when the earlier Mines is installed beside this one. */
++@Composable
++fun MinesMigrationPrompt(onOpen: () -> Unit) {
++    val context = LocalContext.current
++    var show by remember { mutableStateOf(MinesMigration.shouldPrompt(context)) }
++    if (!show) return
++    AlertDialog(
++        onDismissRequest = { MinesMigration.markPrompted(context); show = false },
++        title = { Text("从旧版迁移？") },
++        text = { Text("检测到旧版 Mines。要把它的供应商、技能和其他内容搬过来吗？旧版数据不会被改动。以后也可以在 设置 → Mines → 从旧版迁移 里做。") },
++        confirmButton = {
++            TextButton(onClick = { MinesMigration.markPrompted(context); show = false; onOpen() }) { Text("去迁移") }
++        },
++        dismissButton = {
++            TextButton(onClick = { MinesMigration.markPrompted(context); show = false }) { Text("以后再说") }
++        },
++    )
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesExtras.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesExtras.kt
 new file mode 100644
-index 0000000..8592139
+index 0000000..f8e9041
 --- /dev/null
-+++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxScreen.kt
-@@ -0,0 +1,193 @@
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesExtras.kt
+@@ -0,0 +1,305 @@
 +package com.openminis.app.ui.plus
 +
-+import android.app.ActivityManager
 +import android.content.Intent
-+import android.net.Uri
-+import android.os.PowerManager
-+import android.provider.Settings
-+import android.widget.Toast
 +import androidx.compose.foundation.background
-+import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.horizontalScroll
++import androidx.compose.foundation.layout.Arrangement
 +import androidx.compose.foundation.layout.Column
 +import androidx.compose.foundation.layout.Row
 +import androidx.compose.foundation.layout.Spacer
@@ -255,14 +784,17 @@ index 0000000..8592139
 +import androidx.compose.foundation.layout.height
 +import androidx.compose.foundation.layout.padding
 +import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.rememberScrollState
 +import androidx.compose.foundation.shape.RoundedCornerShape
 +import androidx.compose.material.icons.Icons
-+import androidx.compose.material.icons.outlined.CleaningServices
++import androidx.compose.material.icons.outlined.Restore
 +import androidx.compose.material3.Button
++import androidx.compose.material3.FilterChip
 +import androidx.compose.material3.LinearProgressIndicator
 +import androidx.compose.material3.MaterialTheme
 +import androidx.compose.material3.OutlinedButton
-+import androidx.compose.material3.Switch
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.Slider
 +import androidx.compose.material3.Text
 +import androidx.compose.material3.TextButton
 +import androidx.compose.runtime.Composable
@@ -277,962 +809,563 @@ index 0000000..8592139
 +import androidx.compose.ui.Alignment
 +import androidx.compose.ui.Modifier
 +import androidx.compose.ui.draw.clip
-+import androidx.compose.ui.graphics.Color
 +import androidx.compose.ui.platform.LocalContext
 +import androidx.compose.ui.platform.LocalLifecycleOwner
 +import androidx.compose.ui.text.font.FontWeight
 +import androidx.compose.ui.unit.dp
 +import androidx.lifecycle.Lifecycle
 +import androidx.lifecycle.repeatOnLifecycle
-+import com.openminis.app.offload.ShizukuManager
-+import com.openminis.app.plus.PlusPrefs
-+import com.openminis.app.plus.SandboxCare
-+import com.openminis.app.plus.SandboxProc
-+import com.openminis.app.sandbox.PhantomProcessGuard
-+import kotlinx.coroutines.Dispatchers
++import com.openminis.app.data.db.ChatSessionEntity
++import com.openminis.app.plus.ChatOrganizer
++import com.openminis.app.plus.DshLlmBridge
++import com.openminis.app.plus.HumanVerify
++import com.openminis.app.plus.LocalGateway
++import com.openminis.app.plus.MinesUpdate
 +import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
++import java.text.SimpleDateFormat
++import java.util.Date
++import java.util.Locale
++
++// ── a simple card used on the home screen ──────────────────────────────
++
++@Composable
++private fun HomeCard(title: String, body: String, content: @Composable () -> Unit) {
++    Column(
++        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)
++            .clip(RoundedCornerShape(14.dp))
++            .background(MaterialTheme.colorScheme.surfaceContainerLow)
++            .padding(14.dp),
++        verticalArrangement = Arrangement.spacedBy(8.dp),
++    ) {
++        Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
++        Text(body, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
++        content()
++    }
++}
++
++/** 「发现本机模型网关 → 添加」, one tap. Used on the home screen and the plugin page. */
++@Composable
++fun LocalGatewayCards(scanOnShow: Boolean = true) {
++    val ctx = LocalContext.current
++    val scope = rememberCoroutineScope()
++    val found by LocalGateway.found.collectAsState()
++    var keys by remember { mutableStateOf(mapOf<Int, String>()) }
++    var result by remember { mutableStateOf<String?>(null) }
++    LaunchedEffect(scanOnShow) { if (scanOnShow) LocalGateway.scan(ctx) }
++    result?.let { r ->
++        HomeCard("本机模型网关", r) { TextButton(onClick = { result = null }) { Text("好的") } }
++    }
++    found.forEach { f ->
++        HomeCard(
++            "发现本机模型网关 · ${f.title}",
++            "127.0.0.1:${f.port}" + if (f.needsKey) " · 需要密钥" else " · ${f.models.size} 个模型，可以直接用",
++        ) {
++            if (f.needsKey) OutlinedTextField(
++                keys[f.port] ?: "", { v -> keys = keys + (f.port to v.trim()) },
++                label = { Text("网关的密钥") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
++            )
++            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                Button(
++                    enabled = !f.needsKey || !keys[f.port].isNullOrBlank(),
++                    onClick = { scope.launch { result = LocalGateway.add(ctx, f, keys[f.port]) } },
++                    modifier = Modifier.weight(1f),
++                ) { Text("添加") }
++                OutlinedButton(onClick = { LocalGateway.dismiss(ctx, f.port) }) { Text("不用") }
++            }
++        }
++    }
++}
++
++/** Update card on the home screen (only when a newer build exists). */
++@Composable
++fun UpdateHomeCard(onOpen: () -> Unit) {
++    val ctx = LocalContext.current
++    val st by MinesUpdate.state.collectAsState()
++    LaunchedEffect(Unit) { delay(4000); runCatching { MinesUpdate.checkDaily(ctx) } }
++    val av = st as? MinesUpdate.State.Available ?: return
++    if (MinesUpdate.dismissedBuild(ctx) >= av.release.build) return
++    var hidden by remember { mutableStateOf(false) }
++    if (hidden) return
++    HomeCard("Mines 有新版本 build-${av.release.build}", av.release.notes.lines().firstOrNull { it.isNotBlank() }?.take(80) ?: "点开看看更新了什么") {
++        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++            Button(onClick = onOpen, modifier = Modifier.weight(1f)) { Text("看看") }
++            OutlinedButton(onClick = { MinesUpdate.dismiss(ctx, av.release.build); hidden = true }) { Text("以后") }
++        }
++    }
++}
++
++/** Starts the plugin-model gateway once per app run (no-op without model plugins). */
++@Composable
++fun DshModelsAutoStart() {
++    val ctx = LocalContext.current
++    LaunchedEffect(Unit) {
++        if (autoStarted) return@LaunchedEffect
++        autoStarted = true
++        delay(3000)
++        runCatching { DshLlmBridge.ensure(ctx) }
++    }
++}
++private var autoStarted = false
++
++/** Topic / archive chips above the conversation list. */
++@Composable
++fun ChatFilterChips(all: List<ChatSessionEntity>) {
++    val ctx = LocalContext.current
++    ChatOrganizer.init(ctx)
++    val settings by ChatOrganizer.settings.collectAsState()
++    val filter by ChatOrganizer.filter.collectAsState()
++    val restored by ChatOrganizer.restored.collectAsState()
++    val chips = remember(all, settings, restored) { if (settings.topicChips) ChatOrganizer.chipCounts(all) else emptyList() }
++    val archived = remember(all, settings, restored) { ChatOrganizer.archivedCount(all) }
++    if (chips.isEmpty() && archived == 0 && filter == ChatOrganizer.FILTER_ALL) return
++    Row(
++        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 2.dp),
++        horizontalArrangement = Arrangement.spacedBy(8.dp),
++        verticalAlignment = Alignment.CenterVertically,
++    ) {
++        FilterChip(selected = filter == ChatOrganizer.FILTER_ALL, onClick = { ChatOrganizer.setFilter(ChatOrganizer.FILTER_ALL) }, label = { Text("全部") })
++        chips.forEach { (name, n) ->
++            FilterChip(selected = filter == name, onClick = { ChatOrganizer.setFilter(if (filter == name) ChatOrganizer.FILTER_ALL else name) }, label = { Text("$name $n") })
++        }
++        if (archived > 0 || filter == ChatOrganizer.FILTER_ARCHIVED) {
++            FilterChip(selected = filter == ChatOrganizer.FILTER_ARCHIVED, onClick = {
++                ChatOrganizer.setFilter(if (filter == ChatOrganizer.FILTER_ARCHIVED) ChatOrganizer.FILTER_ALL else ChatOrganizer.FILTER_ARCHIVED)
++            }, label = { Text("已归档 $archived") })
++        }
++    }
++    if (filter == ChatOrganizer.FILTER_ARCHIVED) {
++        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
++            Text("超过 ${settings.days} 天没动的对话。点开就会回到列表。", style = MaterialTheme.typography.bodyMedium,
++                color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
++            TextButton(onClick = { ChatOrganizer.restoreAll(ctx, all.filter { ChatOrganizer.isArchived(it) }.map { it.id }) }) { Text("全部恢复") }
++        }
++    }
++}
++
++// ── 对话整理 settings ──────────────────────────────────────────────────
++
++@Composable
++fun TidyScreen(onBack: () -> Unit) {
++    val ctx = LocalContext.current
++    ChatOrganizer.init(ctx)
++    val s by ChatOrganizer.settings.collectAsState()
++    PlusPage("对话整理", onBack) {
++        PlusSection("自动归档", footer = "置顶的对话不会被归档。归档只是从列表里收起来，内容都在；在首页点「已归档」可以找回，点开就恢复。") {
++            SwitchRow("自动归档不活跃的对话", "超过 ${s.days} 天没有新消息就收起来", s.autoArchive) { on -> ChatOrganizer.update(ctx) { it.copy(autoArchive = on) } }
++            if (s.autoArchive) {
++                PlusDivider()
++                Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
++                    Text("${s.days} 天", style = MaterialTheme.typography.titleMedium)
++                    Slider(
++                        value = s.days.toFloat(), valueRange = 1f..60f, steps = 58,
++                        onValueChange = { v -> ChatOrganizer.update(ctx) { it.copy(days = v.toInt()) } },
++                    )
++                }
++            }
++        }
++        PlusSection("按话题分组", footer = "根据标题和最后一条消息里的关键词，把对话分到 " +
++            ChatOrganizer.topics.joinToString("、") { it.name } + "，在首页顶部点一下就只看这一类。全部在手机上完成，不调用模型。") {
++            SwitchRow("首页显示话题标签", null, s.topicChips) { on -> ChatOrganizer.update(ctx) { it.copy(topicChips = on) } }
++        }
++    }
++}
++
++// ── 浏览器验证 settings ────────────────────────────────────────────────
++
++@Composable
++fun VerifyScreen(onBack: () -> Unit) {
++    val ctx = LocalContext.current
++    HumanVerify.init(ctx)
++    val s by HumanVerify.settings.collectAsState()
++    var tick by remember { mutableIntStateOf(0) }
++    val owner = LocalLifecycleOwner.current
++    LaunchedEffect(owner) { owner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) { tick++ } }
++    val listenerOn = remember(tick) { com.openminis.app.offload.MinisNotificationListenerService.isEnabled(ctx) }
++    PlusPage("浏览器验证", onBack) {
++        PlusSection("人机验证", footer = "AI 用浏览器时遇到 Cloudflare、hCaptcha、reCAPTCHA、阿里滑块、极验、腾讯验证码，会停下来通知你「需要你点一下验证」，打开那个网页交给你，你点完就自动继续。AI 不会自己去破解验证码。") {
++            SwitchRow("遇到验证时叫我", null, s.challenges) { on -> HumanVerify.update(ctx) { it.copy(challenges = on) } }
++        }
++        PlusSection("短信 / 邮件验证码", footer = "网页要验证码时，2 分钟内收到的短信或邮件通知里的验证码（4–8 位数字）会自动填进去。验证码只在内存里用一次，不记录、不保存，也不发给 AI。需要「通知使用权」。") {
++            SwitchRow("自动填验证码", null, s.otpAutofill) { on -> HumanVerify.update(ctx) { it.copy(otpAutofill = on) } }
++            PlusDivider()
++            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
++                Text(if (listenerOn) "通知使用权：已打开" else "通知使用权：未打开", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
++                if (!listenerOn) Button(onClick = {
++                    runCatching {
++                        ctx.startActivity(Intent(com.openminis.app.offload.MinisNotificationListenerService.SETTINGS_ACTION).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
++                    }
++                }) { Text("去打开") }
++            }
++        }
++        PlusSection("登录状态") {
++            Text("各网站的登录状态（Cookie）分网站保存在手机上，验证通过后立刻存盘，重启后还在。", style = MaterialTheme.typography.bodyMedium,
++                modifier = Modifier.padding(16.dp))
++        }
++    }
++}
++
++// ── 检查更新 ───────────────────────────────────────────────────────────
++
++@Composable
++fun UpdateScreen(onBack: () -> Unit) {
++    val ctx = LocalContext.current
++    val scope = rememberCoroutineScope()
++    val st by MinesUpdate.state.collectAsState()
++    var tick by remember { mutableIntStateOf(0) }
++    val rollback = remember(tick) { MinesUpdate.rollbackApk(ctx) }
++    var confirmRollback by remember { mutableStateOf(false) }
++    LaunchedEffect(Unit) { if (st is MinesUpdate.State.Idle || st is MinesUpdate.State.Failed) MinesUpdate.check(ctx) }
++    PlusPage("检查更新", onBack) {
++        PlusSection("当前版本") {
++            Text(
++                if (MinesUpdate.currentBuild > 0) "Mines build-${MinesUpdate.currentBuild}" else "Mines（本地构建，无编号）",
++                style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(16.dp),
++            )
++        }
++        PlusSection("新版本", footer = "从 GitHub 下载（${MinesUpdate.OWNER}/${MinesUpdate.REPO}）。装之前会先把现在这版存一份，装坏了可以一键回去。") {
++            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
++                when (val s = st) {
++                    MinesUpdate.State.Idle, MinesUpdate.State.Checking -> Text("正在检查…", style = MaterialTheme.typography.bodyLarge)
++                    is MinesUpdate.State.UpToDate -> Text("已经是最新（最新是 build-${s.latest}）", style = MaterialTheme.typography.bodyLarge)
++                    is MinesUpdate.State.Failed -> Text(s.message, style = MaterialTheme.typography.bodyLarge)
++                    is MinesUpdate.State.Available -> {
++                        ReleaseInfo(s.release)
++                        Button(onClick = { scope.launch { MinesUpdate.download(ctx, s.release) } }, modifier = Modifier.fillMaxWidth().height(52.dp)) {
++                            Text("下载并安装（${"%.1f".format(s.release.apkSize / 1048576.0)} MB）")
++                        }
++                    }
++                    is MinesUpdate.State.Downloading -> {
++                        ReleaseInfo(s.release)
++                        Text("正在下载 ${(s.progress * 100).toInt()}%", style = MaterialTheme.typography.bodyLarge)
++                        LinearProgressIndicator(progress = { s.progress }, modifier = Modifier.fillMaxWidth())
++                    }
++                    is MinesUpdate.State.Ready -> {
++                        ReleaseInfo(s.release)
++                        Button(onClick = { MinesUpdate.install(ctx, s.apk); tick++ }, modifier = Modifier.fillMaxWidth().height(52.dp)) { Text("安装 build-${s.release.build}") }
++                        Text("如果提示「允许安装未知应用」，打开后回来再点一次。", style = MaterialTheme.typography.bodyMedium)
++                    }
++                }
++                if (st !is MinesUpdate.State.Downloading) OutlinedButton(onClick = { scope.launch { MinesUpdate.check(ctx) } }, modifier = Modifier.fillMaxWidth()) { Text("重新检查") }
++            }
++        }
++        if (rollback != null) PlusSection("回到上一版", footer = "安装保存下来的 build-${rollback.first}。数据不会丢。") {
++            ActionRow(Icons.Outlined.Restore, "回到 build-${rollback.first}") { confirmRollback = true }
++        }
++    }
++    if (confirmRollback && rollback != null) androidx.compose.material3.AlertDialog(
++        onDismissRequest = { confirmRollback = false },
++        title = { Text("回到 build-${rollback.first}？") },
++        text = { Text("会打开系统安装界面，装回上一个版本。") },
++        confirmButton = { Button(onClick = { confirmRollback = false; MinesUpdate.install(ctx, rollback.second) }) { Text("回去") } },
++        dismissButton = { TextButton(onClick = { confirmRollback = false }) { Text("取消") } },
++    )
++}
++
++@Composable
++private fun ReleaseInfo(r: MinesUpdate.Release) {
++    Text("build-${r.build}", style = MaterialTheme.typography.titleLarge)
++    val date = runCatching {
++        SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply { timeZone = java.util.TimeZone.getTimeZone("UTC") }.parse(r.publishedAt)
++    }.getOrNull()
++    if (date != null) Text("发布于 " + SimpleDateFormat("M月d日 HH:mm", Locale.CHINA).format(date), style = MaterialTheme.typography.bodyMedium,
++        color = MaterialTheme.colorScheme.onSurfaceVariant)
++    if (r.notes.isNotBlank()) Text(r.notes.take(1500), style = MaterialTheme.typography.bodyMedium)
++    Spacer(Modifier.width(0.dp))
++}
++
++@Suppress("unused")
++private fun fmt(t: Long) = SimpleDateFormat("M-d HH:mm", Locale.CHINA).format(Date(t))
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PersonalizeScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PersonalizeScreen.kt
+new file mode 100644
+index 0000000..34a2b67
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PersonalizeScreen.kt
+@@ -0,0 +1,259 @@
++package com.openminis.app.ui.plus
++
++import android.content.Intent
++import android.net.Uri
++import android.provider.Settings
++import android.widget.Toast
++import androidx.activity.compose.rememberLauncherForActivityResult
++import androidx.activity.result.contract.ActivityResultContracts
++import androidx.compose.foundation.BorderStroke
++import androidx.compose.foundation.Image
++import androidx.compose.foundation.background
++import androidx.compose.foundation.border
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.horizontalScroll
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.outlined.Image
++import androidx.compose.material.icons.outlined.NotInterested
++import androidx.compose.material3.Icon
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Slider
++import androidx.compose.material3.Switch
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Brush
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.layout.ContentScale
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.platform.LocalLifecycleOwner
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.LifecycleEventObserver
++import com.openminis.app.plus.DeskPetService
++import com.openminis.app.plus.PlusPrefs
++import kotlinx.coroutines.Dispatchers
 +import kotlinx.coroutines.launch
 +import kotlinx.coroutines.withContext
 +
-+/** Sandbox monitor: memory, running processes, one-tap cleanup, anti-kill. */
 +@Composable
-+fun SandboxScreen(onBack: () -> Unit) {
++fun PersonalizeScreen(onBack: () -> Unit) {
 +    val context = LocalContext.current
 +    PlusPrefs.init(context)
 +    val st by PlusPrefs.state.collectAsState()
 +    val scope = rememberCoroutineScope()
-+    var procs by remember { mutableStateOf(emptyList<SandboxProc>()) }
-+    var availMb by remember { mutableStateOf(0L) }
-+    var totalMb by remember { mutableStateOf(1L) }
-+    var tick by remember { mutableIntStateOf(0) }
-+    val shizuku by ShizukuManager.snapshot.collectAsState()
-+    val owner = LocalLifecycleOwner.current
++    var wantPet by remember { mutableStateOf(false) }
 +
-+    LaunchedEffect(owner) {
-+        owner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
-+            while (true) {
-+                val (list, mem) = withContext(Dispatchers.IO) {
-+                    val am = context.getSystemService(ActivityManager::class.java)
-+                    val mi = ActivityManager.MemoryInfo().also { am.getMemoryInfo(it) }
-+                    SandboxCare.list() to mi
-+                }
-+                procs = list; availMb = mem.availMem / 1048576; totalMb = mem.totalMem / 1048576
-+                tick++
-+                delay(3000)
++    val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
++        if (uri != null) scope.launch {
++            val ok = withContext(Dispatchers.IO) {
++                runCatching {
++                    context.contentResolver.openInputStream(uri)?.use { input ->
++                        wallpaperFile(context).outputStream().use { input.copyTo(it) }
++                    } != null
++                }.getOrDefault(false)
 +            }
++            if (ok) PlusPrefs.update(context) { it.copy(wallpaper = "file:${System.currentTimeMillis()}") }
++            else Toast.makeText(context, "图片读取失败", Toast.LENGTH_SHORT).show()
 +        }
 +    }
 +
-+    PlusPage("沙箱与防杀", onBack) {
-+        val sandboxMb = procs.sumOf { it.rssKb } / 1024
-+        val usedFrac = 1f - availMb.toFloat() / totalMb
-+        // ---- Memory ----
-+        Column(
-+            Modifier.fillMaxWidth().padding(16.dp).clip(RoundedCornerShape(16.dp))
-+                .background(MaterialTheme.colorScheme.surfaceContainerLow).padding(16.dp),
-+        ) {
-+            Text("沙箱正在用 $sandboxMb MB", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
-+            Spacer(Modifier.height(4.dp))
-+            Text("手机还剩 ${availMb / 1024.0}".take(9) + " GB 可用 · ${procs.size} 个进程",
-+                style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-+            Spacer(Modifier.height(10.dp))
-+            LinearProgressIndicator(
-+                progress = { usedFrac.coerceIn(0f, 1f) },
-+                modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)),
-+                color = if (usedFrac > 0.85f) Color(0xFFFF3B30) else MaterialTheme.colorScheme.primary,
-+            )
-+            Spacer(Modifier.height(12.dp))
-+            Button(onClick = {
-+                scope.launch {
-+                    val n = withContext(Dispatchers.IO) { SandboxCare.cleanHeavy() }
-+                    Toast.makeText(context, if (n == 0) "没有要清理的" else "关掉了 $n 个占内存的进程", Toast.LENGTH_SHORT).show()
++    // Coming back from the overlay-permission screen: start the pet if granted.
++    val owner = LocalLifecycleOwner.current
++    DisposableEffect(owner) {
++        val obs = LifecycleEventObserver { _, e ->
++            if (e == Lifecycle.Event.ON_RESUME && wantPet && DeskPetService.canShow(context)) {
++                wantPet = false
++                PlusPrefs.update(context) { it.copy(petEnabled = true) }
++                DeskPetService.start(context)
++            }
++        }
++        owner.lifecycle.addObserver(obs)
++        onDispose { owner.lifecycle.removeObserver(obs) }
++    }
++
++    PlusPage("壁纸与形象", onBack) {
++        // ---- Wallpaper ----
++        PlusSection("聊天壁纸") {
++            // live preview
++            Box(
++                Modifier.fillMaxWidth().height(150.dp).padding(12.dp).clip(RoundedCornerShape(12.dp))
++                    .background(MaterialTheme.colorScheme.background),
++            ) {
++                ChatWallpaperLayer(Modifier.fillMaxSize())
++                Column(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                    Bubble("今天帮我看看服务器", mine = true)
++                    Bubble("好的，两台都在线，延迟 38 ms", mine = false)
 +                }
-+            }, modifier = Modifier.fillMaxWidth()) {
-+                androidx.compose.material3.Icon(Icons.Outlined.CleaningServices, null)
-+                Spacer(Modifier.width(8.dp))
-+                Text("一键清理")
 +            }
-+        }
-+
-+        PlusSection(null, footer = "浏览器、Node、Python 这类进程闲置 10 分钟（没用 CPU）就自动关掉。") {
-+            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-+                Text("自动清理闲置进程", Modifier.weight(1f))
-+                Switch(st.autoClean, onCheckedChange = { on -> PlusPrefs.update(context) { it.copy(autoClean = on) } })
++            Row(
++                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 4.dp),
++                horizontalArrangement = Arrangement.spacedBy(10.dp),
++            ) {
++                Swatch("不用", selected = st.wallpaper.isEmpty(), onClick = {
++                    PlusPrefs.update(context) { it.copy(wallpaper = "") }
++                }) {
++                    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceVariant), contentAlignment = Alignment.Center) {
++                        Icon(Icons.Outlined.NotInterested, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
++                    }
++                }
++                Swatch("相册", selected = st.wallpaper.startsWith("file:"), onClick = { picker.launch("image/*") }) {
++                    val bmp = rememberWallpaperBitmap(st.wallpaper)
++                    if (bmp != null) Image(bmp, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
++                    else Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceVariant), contentAlignment = Alignment.Center) {
++                        Icon(Icons.Outlined.Image, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
++                    }
++                }
++                wallpaperPresets.forEach { p ->
++                    Swatch(p.name, selected = st.wallpaper == "preset:${p.id}", onClick = {
++                        PlusPrefs.update(context) { it.copy(wallpaper = "preset:${p.id}") }
++                    }) {
++                        Box(Modifier.fillMaxSize().background(Brush.linearGradient(p.colors)))
++                    }
++                }
 +            }
-+        }
-+
-+        // ---- Processes ----
-+        PlusSection("正在运行") {
-+            if (procs.isEmpty()) Text("沙箱现在很干净", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(16.dp))
-+            procs.take(15).forEachIndexed { i, p ->
++            if (st.wallpaper.isNotEmpty()) {
++                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
++                    Text("壁纸透明度 ${(st.wallpaperAlpha * 100).toInt()}%", style = MaterialTheme.typography.bodyMedium,
++                        modifier = Modifier.width(132.dp))
++                    Slider(
++                        value = st.wallpaperAlpha, valueRange = 0f..1f,
++                        onValueChange = { v -> PlusPrefs.update(context) { it.copy(wallpaperAlpha = v) } },
++                        modifier = Modifier.weight(1f),
++                    )
++                }
 +                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
 +                    Column(Modifier.weight(1f)) {
-+                        Text(p.name, style = MaterialTheme.typography.bodyLarge, maxLines = 1)
-+                        Text("${p.rssKb / 1024} MB · pid ${p.pid}", style = MaterialTheme.typography.bodySmall,
-+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
++                        Text("首页也用这张壁纸", style = MaterialTheme.typography.bodyLarge)
++                        Text("对话列表背后也显示", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
 +                    }
-+                    TextButton(onClick = { SandboxCare.kill(p.pid); procs = procs.filterNot { it.pid == p.pid } }) {
-+                        Text("关闭", color = Color(0xFFFF3B30))
-+                    }
++                    Switch(st.wallpaperOnHome, onCheckedChange = { on -> PlusPrefs.update(context) { it.copy(wallpaperOnHome = on) } })
 +                }
-+                if (i < minOf(procs.size, 15) - 1) PlusDivider()
-+            }
-+        }
-+
-+        // ---- Anti-kill ----
-+        val pm = context.getSystemService(PowerManager::class.java)
-+        val batteryOk = remember(tick) { pm.isIgnoringBatteryOptimizations(context.packageName) }
-+        val killerOff = remember(tick) { PhantomProcessGuard.killerDisabled(context) }
-+        PlusSection("防止被安卓杀掉", footer = "安卓 12 起，系统会杀掉超过 32 个的子进程，沙箱命令跑到一半就断。关掉这个限制需要 Shizuku（免 root）。") {
-+            CheckRow("电池优化已关闭", batteryOk, "去关闭") {
-+                runCatching {
-+                    context.startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-+                        Uri.parse("package:${context.packageName}")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
++                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
++                    Text("遮罩", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.width(132.dp))
++                    Spacer(Modifier.width(12.dp))
++                    Slider(
++                        value = st.wallpaperDim, valueRange = 0f..0.8f,
++                        onValueChange = { v -> PlusPrefs.update(context) { it.copy(wallpaperDim = v) } },
++                        modifier = Modifier.weight(1f),
++                    )
 +                }
 +            }
-+            PlusDivider()
-+            val label = when (shizuku.state) {
-+                ShizukuManager.State.NOT_INSTALLED -> "安装 Shizuku"
-+                ShizukuManager.State.NOT_RUNNING -> "打开 Shizuku"
-+                ShizukuManager.State.NEED_PERMISSION -> "授权"
-+                ShizukuManager.State.READY -> "一键关闭"
-+            }
-+            CheckRow("子进程限制已关闭", killerOff, label) {
-+                when (shizuku.state) {
-+                    ShizukuManager.State.NOT_INSTALLED -> ShizukuManager.openInstallPage(context)
-+                    ShizukuManager.State.NOT_RUNNING -> ShizukuManager.openShizukuApp(context)
-+                    ShizukuManager.State.NEED_PERMISSION -> ShizukuManager.requestPermission()
-+                    ShizukuManager.State.READY -> scope.launch {
-+                        val ok = withContext(Dispatchers.IO) {
-+                            PhantomProcessGuard.DISABLE_COMMANDS.map { cmd ->
-+                                ShizukuManager.runProcess(arrayOf("sh", "-c", cmd), timeoutMs = 8000).exitCode == 0
-+                            }.all { it }
-+                        }
-+                        PhantomProcessGuard.refresh(context)
-+                        Toast.makeText(context, if (ok) "已关闭，沙箱可以并行跑更多命令了" else "没完全成功，请重启 Shizuku 后再试", Toast.LENGTH_LONG).show()
-+                        tick++
-+                    }
-+                }
-+            }
-+            PlusDivider()
-+            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-+                Text("同时最多跑 ${PhantomProcessGuard.budget} 个沙箱命令", Modifier.weight(1f),
-+                    style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-+            }
-+        }
-+    }
-+}
-+
-+@Composable
-+private fun CheckRow(title: String, ok: Boolean, action: String, onAction: () -> Unit) {
-+    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-+        Box(Modifier.width(22.dp)) { Text(if (ok) "✓" else "!", color = if (ok) Color(0xFF34C759) else Color(0xFFFF9500), fontWeight = FontWeight.Bold) }
-+        Text(title, Modifier.weight(1f))
-+        if (!ok) OutlinedButton(onClick = onAction) { Text(action) }
-+    }
-+}
-diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt
-new file mode 100644
-index 0000000..615bf73
---- /dev/null
-+++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt
-@@ -0,0 +1,168 @@
-+package com.openminis.app.ui.plus
-+
-+import androidx.compose.foundation.background
-+import androidx.compose.foundation.layout.Arrangement
-+import androidx.compose.foundation.layout.Column
-+import androidx.compose.foundation.layout.Row
-+import androidx.compose.foundation.layout.Spacer
-+import androidx.compose.foundation.layout.fillMaxWidth
-+import androidx.compose.foundation.layout.height
-+import androidx.compose.foundation.layout.padding
-+import androidx.compose.foundation.shape.RoundedCornerShape
-+import androidx.compose.material3.Button
-+import androidx.compose.material3.CircularProgressIndicator
-+import androidx.compose.material3.LinearProgressIndicator
-+import androidx.compose.material3.MaterialTheme
-+import androidx.compose.material3.OutlinedButton
-+import androidx.compose.material3.Text
-+import androidx.compose.runtime.Composable
-+import androidx.compose.runtime.LaunchedEffect
-+import androidx.compose.runtime.collectAsState
-+import androidx.compose.runtime.getValue
-+import androidx.compose.runtime.mutableStateOf
-+import androidx.compose.runtime.remember
-+import androidx.compose.runtime.setValue
-+import androidx.compose.ui.Modifier
-+import androidx.compose.ui.draw.clip
-+import androidx.compose.ui.graphics.Color
-+import androidx.compose.ui.platform.LocalContext
-+import androidx.compose.ui.platform.LocalLifecycleOwner
-+import androidx.compose.ui.text.font.FontWeight
-+import androidx.compose.ui.unit.dp
-+import androidx.lifecycle.Lifecycle
-+import androidx.lifecycle.repeatOnLifecycle
-+import com.openminis.app.plus.PlusPrefs
-+import com.openminis.app.plus.VpsServer
-+import com.openminis.app.sandbox.FreshProcessShell
-+import kotlinx.coroutines.delay
-+
-+data class ServerStats(
-+    val host: String, val uptime: String, val cpuPct: Float, val cores: Int, val load: String,
-+    val memUsedMb: Long, val memTotalMb: Long, val diskUsedGb: Float, val diskTotalGb: Float,
-+    val rxKbs: Float, val txKbs: Float,
-+)
-+
-+private const val PROBE = """
-+hostname; nproc; cat /proc/loadavg; uptime -p 2>/dev/null || uptime
-+grep -E '^(MemTotal|MemAvailable):' /proc/meminfo
-+df -kP / | tail -1
-+head -1 /proc/stat; awk 'NR>2{rx+=${'$'}2;tx+=${'$'}10}END{print "NET",rx,tx}' /proc/net/dev
-+sleep 1
-+head -1 /proc/stat; awk 'NR>2{rx+=${'$'}2;tx+=${'$'}10}END{print "NET",rx,tx}' /proc/net/dev
-+"""
-+
-+internal fun parseStats(out: String): ServerStats? = runCatching {
-+    val lines = out.lines().map { it.trim() }.filter { it.isNotEmpty() }
-+    val host = lines[0]
-+    val cores = lines[1].toInt()
-+    val load = lines[2].split(' ').take(3).joinToString(" ")
-+    val uptime = lines[3].removePrefix("up ")
-+    fun kb(key: String) = lines.first { it.startsWith(key) }.split(Regex("\\s+"))[1].toLong()
-+    val memTotal = kb("MemTotal:"); val memAvail = kb("MemAvailable:")
-+    val df = lines.first { it.endsWith(" /") }.split(Regex("\\s+"))
-+    val cpu = lines.filter { it.startsWith("cpu ") }
-+    val net = lines.filter { it.startsWith("NET") }
-+    fun cpuVals(l: String) = l.split(Regex("\\s+")).drop(1).map { it.toLong() }
-+    val a = cpuVals(cpu[0]); val b = cpuVals(cpu[1])
-+    val idleA = a[3] + a.getOrElse(4) { 0 }; val idleB = b[3] + b.getOrElse(4) { 0 }
-+    val dt = (b.sum() - a.sum()).coerceAtLeast(1)
-+    val cpuPct = 100f * (dt - (idleB - idleA)) / dt
-+    val n0 = net[0].split(' '); val n1 = net[1].split(' ')
-+    ServerStats(
-+        host, uptime, cpuPct.coerceIn(0f, 100f), cores, load,
-+        (memTotal - memAvail) / 1024, memTotal / 1024,
-+        df[2].toLong() / 1048576f, df[1].toLong() / 1048576f,
-+        (n1[1].toDouble() - n0[1].toDouble()).toFloat() / 1024f,
-+        (n1[2].toDouble() - n0[2].toDouble()).toFloat() / 1024f,
-+    )
-+}.getOrNull()
-+
-+/** Live status of one server, ServerBox-style. Runs `minis-vps` in the sandbox. */
-+@Composable
-+fun ServerDetailScreen(serverId: String, onBack: () -> Unit, onOpenTerminal: (String) -> Unit) {
-+    val context = LocalContext.current
-+    PlusPrefs.init(context)
-+    val st by PlusPrefs.state.collectAsState()
-+    val server: VpsServer? = st.servers.firstOrNull { it.id == serverId }
-+    var stats by remember { mutableStateOf<ServerStats?>(null) }
-+    var error by remember { mutableStateOf<String?>(null) }
-+    var loading by remember { mutableStateOf(true) }
-+    val owner = LocalLifecycleOwner.current
-+
-+    if (server != null) LaunchedEffect(owner, serverId) {
-+        val shell = FreshProcessShell(context, "plus-server-monitor", emptyMap())
-+        owner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
-+            while (true) {
-+                val (out, code) = runCatching {
-+                    shell.execute("minis-vps run \"\$(cat <<'EOF'\n$PROBE\nEOF\n)\"", 30_000,
-+                        mapOf("MINIS_VPS_SERVERS" to "${server.user}@${server.host}:${server.port}"))
-+                }.getOrElse { (it.message ?: "沙箱没准备好") to -1 }
-+                val parsed = if (code == 0) parseStats(out) else null
-+                if (parsed != null) { stats = parsed; error = null }
-+                else error = when {
-+                    out.contains("Permission denied") -> "还没授权：点下面“授权”，输一次密码"
-+                    out.contains("连不上") || code == 255 -> "连不上这台服务器"
-+                    else -> out.lines().lastOrNull { it.isNotBlank() }?.take(160) ?: "读取失败（$code）"
-+                }
-+                loading = false
-+                delay(5000)
-+            }
-+        }
-+    }
-+
-+    PlusPage(server?.name?.ifBlank { server.host } ?: "服务器", onBack) {
-+        if (server == null) { Text("这台服务器已删除", Modifier.padding(20.dp)); return@PlusPage }
-+        Text("${server.target}:${server.port}", color = MaterialTheme.colorScheme.onSurfaceVariant,
-+            modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp))
-+        val s = stats
-+        if (loading && s == null) {
-+            Row(Modifier.padding(20.dp)) { CircularProgressIndicator(); Spacer(Modifier.padding(8.dp)); Text("正在读取…") }
-+        }
-+        error?.let { e ->
-+            Text(e, color = Color(0xFFFF3B30), modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp))
-+        }
-+        if (s != null) {
-+            Column(Modifier.padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-+                Meter("CPU · ${s.cores} 核", "%.0f%%".format(s.cpuPct), s.cpuPct / 100f, "负载 ${s.load}")
-+                Meter("内存", "${s.memUsedMb} / ${s.memTotalMb} MB", s.memUsedMb.toFloat() / s.memTotalMb, null)
-+                Meter("硬盘", "%.1f / %.1f GB".format(s.diskUsedGb, s.diskTotalGb), s.diskUsedGb / s.diskTotalGb, null)
-+                Meter("网速", "↓ %s  ↑ %s".format(rate(s.rxKbs), rate(s.txKbs)), null, "已运行 ${s.uptime} · ${s.host}")
-+            }
-+        }
-+        PlusSection("操作") {
-+            Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-+                Button(onClick = { onOpenTerminal("MINIS_VPS_SERVERS=${server.user}@${server.host}:${server.port} minis-vps shell") },
-+                    modifier = Modifier.weight(1f)) { Text("终端") }
-+                OutlinedButton(onClick = { onOpenTerminal("minis-vps setup ${server.target} ${server.port}") },
-+                    modifier = Modifier.weight(1f)) { Text("授权") }
-+            }
-+        }
-+    }
-+}
-+
-+private fun rate(kbs: Float) = if (kbs >= 1024) "%.1f MB/s".format(kbs / 1024) else "%.0f KB/s".format(kbs)
-+
-+@Composable
-+private fun Meter(title: String, value: String, frac: Float?, sub: String?) {
-+    Column(
-+        Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp))
-+            .background(MaterialTheme.colorScheme.surfaceContainerLow).padding(14.dp),
-+    ) {
-+        Row {
-+            Text(title, Modifier.weight(1f), color = MaterialTheme.colorScheme.onSurfaceVariant)
-+            Text(value, fontWeight = FontWeight.SemiBold)
-+        }
-+        if (frac != null) {
 +            Spacer(Modifier.height(8.dp))
-+            LinearProgressIndicator(
-+                progress = { frac.coerceIn(0f, 1f) },
-+                modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
-+                color = if (frac > 0.85f) Color(0xFFFF3B30) else MaterialTheme.colorScheme.primary,
-+            )
 +        }
-+        if (sub != null) {
-+            Spacer(Modifier.height(6.dp))
-+            Text(sub, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-+        }
-+    }
-+}
-diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
-new file mode 100644
-index 0000000..9bd7854
---- /dev/null
-+++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
-@@ -0,0 +1,164 @@
-+package com.openminis.app.ui.plus
 +
-+import androidx.compose.animation.AnimatedVisibility
-+import androidx.compose.foundation.background
-+import androidx.compose.foundation.clickable
-+import androidx.compose.foundation.layout.Arrangement
-+import androidx.compose.foundation.layout.Box
-+import androidx.compose.foundation.layout.Column
-+import androidx.compose.foundation.layout.Row
-+import androidx.compose.foundation.layout.Spacer
-+import androidx.compose.foundation.layout.fillMaxWidth
-+import androidx.compose.foundation.layout.height
-+import androidx.compose.foundation.layout.padding
-+import androidx.compose.foundation.layout.size
-+import androidx.compose.foundation.layout.width
-+import androidx.compose.foundation.shape.CircleShape
-+import androidx.compose.foundation.shape.RoundedCornerShape
-+import androidx.compose.material.icons.Icons
-+import androidx.compose.material.icons.outlined.ExpandLess
-+import androidx.compose.material.icons.outlined.ExpandMore
-+import androidx.compose.material.icons.outlined.Mic
-+import androidx.compose.material3.Icon
-+import androidx.compose.material3.MaterialTheme
-+import androidx.compose.material3.Text
-+import androidx.compose.runtime.Composable
-+import androidx.compose.runtime.LaunchedEffect
-+import androidx.compose.runtime.collectAsState
-+import androidx.compose.runtime.getValue
-+import androidx.compose.runtime.setValue
-+import androidx.compose.ui.Alignment
-+import androidx.compose.ui.Modifier
-+import androidx.compose.ui.draw.clip
-+import androidx.compose.ui.graphics.Brush
-+import androidx.compose.ui.graphics.Color
-+import androidx.compose.ui.platform.LocalContext
-+import androidx.compose.ui.text.font.FontWeight
-+import androidx.compose.ui.unit.dp
-+import com.openminis.app.plus.PlusPrefs
-+import com.openminis.app.plus.PlusState
-+import com.openminis.app.plus.PlusVault
-+import com.openminis.app.plus.PlusVps
-+import java.text.SimpleDateFormat
-+import java.util.Calendar
-+import java.util.Locale
-+
-+/**
-+ * "Today" header on the conversation list: greeting with the avatar, and
-+ * one-tap chips for where work runs, servers, and connected accounts.
-+ */
-+@Composable
-+fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier) {
-+    val context = LocalContext.current
-+    PlusPrefs.init(context)
-+    PlusVault.init(context)
-+    val st by PlusPrefs.state.collectAsState()
-+    val vault by PlusVault.entries.collectAsState()
-+    LaunchedEffect(Unit) {
-+        PlusVps.startMonitor(context)
-+        com.openminis.app.plus.SandboxCare.startAuto(context)
-+        if (PlusPrefs.state.value.petEnabled && com.openminis.app.plus.DeskPetService.canShow(context)) {
-+            com.openminis.app.plus.DeskPetService.start(context)
-+        }
-+    }
-+
-+    var switcher by androidx.compose.runtime.saveable.rememberSaveable { androidx.compose.runtime.mutableStateOf(false) }
-+    if (switcher) AvatarSwitcherSheet(onDismiss = { switcher = false })
-+    LaunchedEffect(Unit) { com.openminis.app.plus.PlusConnect.rearm(context) }
-+
-+    val cal = Calendar.getInstance()
-+    val hour = cal.get(Calendar.HOUR_OF_DAY)
-+    val greet = when (hour) {
-+        in 5..10 -> "早上好"
-+        in 11..12 -> "中午好"
-+        in 13..17 -> "下午好"
-+        in 18..22 -> "晚上好"
-+        else -> "夜深了，早点休息"
-+    }
-+    val date = SimpleDateFormat("M月d日 EEEE", Locale.CHINA).format(cal.time)
-+    val primary = MaterialTheme.colorScheme.primary
-+
-+    Column(
-+        modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)
-+            .clip(RoundedCornerShape(20.dp))
-+            .background(
-+                Brush.linearGradient(
-+                    listOf(primary.copy(alpha = 0.16f), MaterialTheme.colorScheme.surfaceContainerLow)
-+                )
-+            ),
-+    ) {
-+        Row(
-+            Modifier.fillMaxWidth()
-+                .clickable { PlusPrefs.update(context) { it.copy(todayCollapsed = !it.todayCollapsed) } }
-+                .padding(start = 12.dp, end = 12.dp, top = 10.dp, bottom = if (st.todayCollapsed) 10.dp else 4.dp),
-+            verticalAlignment = Alignment.CenterVertically,
-+        ) {
-+            Box(Modifier.clickable { switcher = true }) {
-+                PetAvatar(size = if (st.todayCollapsed) 40.dp else 60.dp)
++        // ---- Avatar ----
++        PlusSection("我的形象", footer = "形象会出现在首页卡片和桌宠上。点首页卡片上的头像、或长按桌宠，随时能换。也可以用相册里的图片或动图（GIF / 动态 WebP）。") {
++            Box(Modifier.fillMaxWidth().padding(top = 16.dp), contentAlignment = Alignment.Center) {
++                PetAvatar(size = 160.dp, face = st.petStyle == com.openminis.app.plus.Avatars.CUSTOM, animated = true)
 +            }
-+            Spacer(Modifier.width(10.dp))
-+            Column(Modifier.weight(1f)) {
-+                Text(greet, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-+                Text(date, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-+            }
-+            androidx.compose.material3.FilledTonalIconButton(onClick = { onOpen(PlusRoutes.VOICE) }) {
-+                Icon(Icons.Outlined.Mic, contentDescription = "实时语音")
-+            }
-+            Icon(
-+                if (st.todayCollapsed) Icons.Outlined.ExpandMore else Icons.Outlined.ExpandLess,
-+                contentDescription = if (st.todayCollapsed) "展开" else "收起",
-+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-+            )
-+        }
-+        AnimatedVisibility(!st.todayCollapsed) {
-+            Row(
-+                Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, bottom = 12.dp),
-+                horizontalArrangement = Arrangement.spacedBy(8.dp),
-+            ) {
-+                val eff = PlusVps.effectiveMode(st)
-+                val online = st.onlineServers.size
-+                Chip(
-+                    Modifier.weight(1f), "工作位置",
-+                    when {
-+                        !st.isVps -> "本机"
-+                        eff == PlusState.MODE_LOCAL -> "已回本机"
-+                        else -> "VPS"
-+                    },
-+                    dot = when {
-+                        !st.isVps -> Color(0xFF007AFF)
-+                        eff == PlusState.MODE_LOCAL -> Color(0xFFFF9500)
-+                        else -> Color(0xFF34C759)
-+                    },
-+                ) { onOpen(PlusRoutes.WORK) }
-+                Chip(
-+                    Modifier.weight(1f), "服务器",
-+                    if (st.servers.isEmpty()) "未添加" else "$online/${st.servers.size} 在线",
-+                    dot = if (st.servers.isEmpty()) Color.Gray else if (online > 0) Color(0xFF34C759) else Color(0xFFFF3B30),
-+                ) { onOpen(PlusRoutes.WORK) }
-+                Chip(
-+                    Modifier.weight(1f), "账号",
-+                    if (vault.isEmpty()) "去连接" else "${vault.size} 个已连接",
-+                    dot = if (vault.isEmpty()) Color.Gray else Color(0xFF34C759),
-+                ) { onOpen(PlusRoutes.CONNECTIONS) }
-+            }
-+        }
-+    }
-+}
-+
-+@Composable
-+private fun Chip(modifier: Modifier, label: String, value: String, dot: Color, onClick: () -> Unit) {
-+    Column(
-+        modifier.clip(RoundedCornerShape(12.dp))
-+            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.7f))
-+            .clickable(onClick = onClick)
-+            .padding(horizontal = 10.dp, vertical = 8.dp),
-+    ) {
-+        Text(label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-+        Spacer(Modifier.height(2.dp))
-+        Row(verticalAlignment = Alignment.CenterVertically) {
-+            Box(Modifier.size(7.dp).background(dot, CircleShape))
-+            Spacer(Modifier.width(5.dp))
-+            Text(value, style = MaterialTheme.typography.labelLarge, maxLines = 1)
-+        }
-+    }
-+}
-diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
-new file mode 100644
-index 0000000..38a175e
---- /dev/null
-+++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
-@@ -0,0 +1,216 @@
-+package com.openminis.app.ui.plus
-+
-+import android.Manifest
-+import android.content.pm.PackageManager
-+import android.view.WindowManager
-+import androidx.activity.compose.rememberLauncherForActivityResult
-+import androidx.activity.result.contract.ActivityResultContracts
-+import androidx.compose.animation.core.animateFloatAsState
-+import androidx.compose.foundation.Canvas
-+import androidx.compose.foundation.background
-+import androidx.compose.foundation.clickable
-+import androidx.compose.foundation.layout.Arrangement
-+import androidx.compose.foundation.layout.Box
-+import androidx.compose.foundation.layout.Column
-+import androidx.compose.foundation.layout.Row
-+import androidx.compose.foundation.layout.Spacer
-+import androidx.compose.foundation.layout.fillMaxSize
-+import androidx.compose.foundation.layout.fillMaxWidth
-+import androidx.compose.foundation.layout.height
-+import androidx.compose.foundation.layout.padding
-+import androidx.compose.foundation.layout.size
-+import androidx.compose.foundation.lazy.LazyColumn
-+import androidx.compose.foundation.lazy.items
-+import androidx.compose.foundation.lazy.rememberLazyListState
-+import androidx.compose.foundation.shape.CircleShape
-+import androidx.compose.foundation.shape.RoundedCornerShape
-+import androidx.compose.material.icons.Icons
-+import androidx.compose.material.icons.automirrored.filled.ArrowBack
-+import androidx.compose.material.icons.filled.CallEnd
-+import androidx.compose.material.icons.filled.Mic
-+import androidx.compose.material.icons.filled.MicOff
-+import androidx.compose.material3.Button
-+import androidx.compose.material3.ExperimentalMaterial3Api
-+import androidx.compose.material3.Icon
-+import androidx.compose.material3.IconButton
-+import androidx.compose.material3.MaterialTheme
-+import androidx.compose.material3.Scaffold
-+import androidx.compose.material3.Text
-+import androidx.compose.material3.TopAppBar
-+import androidx.compose.runtime.Composable
-+import androidx.compose.runtime.DisposableEffect
-+import androidx.compose.runtime.LaunchedEffect
-+import androidx.compose.runtime.collectAsState
-+import androidx.compose.runtime.getValue
-+import androidx.compose.runtime.mutableStateOf
-+import androidx.compose.runtime.remember
-+import androidx.compose.runtime.setValue
-+import androidx.compose.ui.Alignment
-+import androidx.compose.ui.Modifier
-+import androidx.compose.ui.draw.clip
-+import androidx.compose.ui.graphics.Brush
-+import androidx.compose.ui.graphics.Color
-+import androidx.compose.ui.platform.LocalContext
-+import androidx.compose.ui.text.style.TextAlign
-+import androidx.compose.ui.unit.dp
-+import androidx.core.content.ContextCompat
-+import com.openminis.app.plus.GeminiLive
-+import com.openminis.app.plus.PlusVault
-+
-+/**
-+ * Full-screen live voice call with Gemini. Needs a Gemini key saved under
-+ * 账号连接; talks back instantly and can be interrupted mid-sentence.
-+ */
-+@OptIn(ExperimentalMaterial3Api::class)
-+@Composable
-+fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
-+    val context = LocalContext.current
-+    PlusVault.init(context)
-+    val key = remember { PlusVault.secret("gemini") }
-+    var hasMic by remember {
-+        mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
-+    }
-+    val askMic = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { hasMic = it }
-+    val live = remember(key) {
-+        key?.let { GeminiLive(it, PlusVault.extra("gemini", "model") ?: GeminiLive.DEFAULT_MODEL,
-+            PlusVault.extra("gemini", "voice") ?: "Puck") }
-+    }
-+
-+    // Keep the screen on during a call; hang up when leaving.
-+    DisposableEffect(Unit) {
-+        val act = context as? android.app.Activity
-+        act?.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-+        onDispose {
-+            act?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-+            live?.stop()
-+        }
-+    }
-+    LaunchedEffect(live, hasMic) {
-+        if (live != null && hasMic) live.start()
-+        else if (live != null && !hasMic) askMic.launch(Manifest.permission.RECORD_AUDIO)
-+    }
-+
-+    Scaffold(
-+        containerColor = Color(0xFF0E1320),
-+        topBar = {
-+            TopAppBar(
-+                title = { Text("实时语音", color = Color.White) },
-+                navigationIcon = {
-+                    IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回", tint = Color.White) }
-+                },
-+                colors = androidx.compose.material3.TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
-+            )
-+        },
-+    ) { pad ->
-+        Column(Modifier.fillMaxSize().padding(pad), horizontalAlignment = Alignment.CenterHorizontally) {
-+            if (live == null) {
-+                Spacer(Modifier.height(80.dp))
-+                PetAvatar(size = 120.dp)
-+                Spacer(Modifier.height(24.dp))
-+                Text("先填一个 Gemini API Key", color = Color.White, style = MaterialTheme.typography.titleMedium)
-+                Spacer(Modifier.height(16.dp))
-+                Button(onClick = onOpenConnections) { Text("去 账号连接 填写") }
-+                return@Column
-+            }
-+            val phase by live.phase.collectAsState()
-+            val level by live.level.collectAsState()
-+            val muted by live.muted.collectAsState()
-+            val error by live.error.collectAsState()
-+            val lines by live.lines.collectAsState()
-+
-+            Spacer(Modifier.height(24.dp))
-+            Orb(phase, level)
-+            Spacer(Modifier.height(16.dp))
 +            Text(
-+                when (phase) {
-+                    GeminiLive.Phase.IDLE -> "准备中"
-+                    GeminiLive.Phase.CONNECTING -> "正在连接…"
-+                    GeminiLive.Phase.LISTENING -> if (muted) "已静音" else "我在听，直接说"
-+                    GeminiLive.Phase.SPEAKING -> "说话中（随时打断我）"
-+                    GeminiLive.Phase.ERROR -> error ?: "出错了"
-+                },
-+                color = if (phase == GeminiLive.Phase.ERROR) Color(0xFFFF6B6B) else Color.White,
-+                style = MaterialTheme.typography.titleMedium,
-+                textAlign = TextAlign.Center,
-+                modifier = Modifier.padding(horizontal = 24.dp),
++                com.openminis.app.plus.Avatars.name(st.petStyle),
++                style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold,
++                modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
++                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
 +            )
-+            if (phase == GeminiLive.Phase.ERROR) {
-+                Spacer(Modifier.height(12.dp))
-+                Button(onClick = { live.start() }) { Text("重新连接") }
-+            }
-+
-+            val listState = rememberLazyListState()
-+            LaunchedEffect(lines.size, lines.lastOrNull()?.text?.length) {
-+                if (lines.isNotEmpty()) listState.animateScrollToItem(lines.lastIndex)
-+            }
-+            LazyColumn(
-+                state = listState,
-+                modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
-+                verticalArrangement = Arrangement.spacedBy(8.dp),
++            AvatarGrid()
++            Text("边框颜色", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(start = 16.dp, top = 4.dp))
++            Row(
++                Modifier.fillMaxWidth().padding(vertical = 12.dp),
++                horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterHorizontally),
 +            ) {
-+                items(lines) { l ->
-+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = if (l.user) Arrangement.End else Arrangement.Start) {
-+                        Text(
-+                            l.text,
-+                            color = Color.White,
-+                            style = MaterialTheme.typography.bodyLarge,
-+                            modifier = Modifier.clip(RoundedCornerShape(16.dp))
-+                                .background(if (l.user) Color(0xFF3A5BD9) else Color(0x33FFFFFF))
-+                                .padding(horizontal = 12.dp, vertical = 8.dp),
-+                        )
-+                    }
++                com.openminis.app.plus.Avatars.colors.forEach { c ->
++                    val sel = st.petColor == c
++                    Box(
++                        Modifier.size(if (sel) 38.dp else 32.dp).clip(CircleShape).background(Color(c))
++                            .border(BorderStroke(if (sel) 3.dp else 1.dp, if (sel) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.outlineVariant), CircleShape)
++                            .clickable { PlusPrefs.update(context) { it.copy(petColor = c) } }
++                    )
 +                }
 +            }
++        }
 +
++        // ---- Desk pet ----
++        PlusSection("桌宠", footer = "打开后它会浮在所有应用上面。拖动它换位置，点一下说话，双击打开 Mines，长按换形象或收起。") {
 +            Row(
-+                Modifier.fillMaxWidth().padding(bottom = 36.dp),
-+                horizontalArrangement = Arrangement.SpaceEvenly,
++                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
 +                verticalAlignment = Alignment.CenterVertically,
 +            ) {
-+                RoundButton(if (muted) Icons.Filled.MicOff else Icons.Filled.Mic,
-+                    if (muted) "取消静音" else "静音", if (muted) Color(0xFFFF9500) else Color(0x33FFFFFF)) {
-+                    live.setMuted(!muted)
++                Column(Modifier.weight(1f)) {
++                    Text("显示桌宠", fontWeight = FontWeight.Medium)
++                    if (!DeskPetService.canShow(context)) Text(
++                        "需要允许“显示在其他应用上层”",
++                        style = MaterialTheme.typography.bodySmall,
++                        color = MaterialTheme.colorScheme.onSurfaceVariant,
++                    )
 +                }
-+                RoundButton(Icons.Filled.CallEnd, "挂断", Color(0xFFFF3B30)) { live.stop(); onBack() }
++                Switch(st.petEnabled, onCheckedChange = { on ->
++                    if (!on) {
++                        PlusPrefs.update(context) { it.copy(petEnabled = false) }
++                        DeskPetService.stop(context)
++                    } else if (DeskPetService.canShow(context)) {
++                        PlusPrefs.update(context) { it.copy(petEnabled = true) }
++                        DeskPetService.start(context)
++                    } else {
++                        wantPet = true
++                        runCatching {
++                            context.startActivity(
++                                Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:${context.packageName}"))
++                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
++                            )
++                        }
++                    }
++                })
 +            }
 +        }
 +    }
 +}
 +
 +@Composable
-+private fun Orb(phase: GeminiLive.Phase, level: Float) {
-+    val target = when (phase) {
-+        GeminiLive.Phase.SPEAKING -> 1.15f
-+        GeminiLive.Phase.LISTENING -> 1f + level * 0.35f
-+        else -> 0.9f
-+    }
-+    val scale by animateFloatAsState(target, label = "orb")
-+    Box(Modifier.size(220.dp), contentAlignment = Alignment.Center) {
-+        Canvas(Modifier.fillMaxSize()) {
-+            val r = size.minDimension / 2f * 0.8f * scale
-+            drawCircle(
-+                Brush.radialGradient(
-+                    listOf(
-+                        if (phase == GeminiLive.Phase.SPEAKING) Color(0xFF8E7CFF) else Color(0xFF4FA3FF),
-+                        Color(0x004FA3FF),
-+                    ),
-+                    center = center, radius = r * 1.25f,
-+                ),
-+                radius = r * 1.25f,
-+            )
-+        }
-+        PetAvatar(size = 120.dp)
++private fun Bubble(text: String, mine: Boolean) {
++    Row(Modifier.fillMaxWidth(), horizontalArrangement = if (mine) Arrangement.End else Arrangement.Start) {
++        Text(
++            text,
++            style = MaterialTheme.typography.bodySmall,
++            color = if (mine) Color.White else MaterialTheme.colorScheme.onSurface,
++            modifier = Modifier.clip(RoundedCornerShape(14.dp))
++                .background(if (mine) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceContainerHigh)
++                .padding(horizontal = 10.dp, vertical = 6.dp),
++        )
 +    }
 +}
 +
 +@Composable
-+private fun RoundButton(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, bg: Color, onClick: () -> Unit) {
++private fun Swatch(label: String, selected: Boolean, onClick: () -> Unit, content: @Composable () -> Unit) {
 +    Column(horizontalAlignment = Alignment.CenterHorizontally) {
 +        Box(
-+            Modifier.size(68.dp).clip(CircleShape).background(bg).clickable(onClick = onClick),
-+            contentAlignment = Alignment.Center,
-+        ) { Icon(icon, label, tint = Color.White, modifier = Modifier.size(30.dp)) }
-+        Spacer(Modifier.height(6.dp))
-+        Text(label, color = Color.White, style = MaterialTheme.typography.labelMedium)
++            Modifier.size(width = 56.dp, height = 84.dp).clip(RoundedCornerShape(10.dp))
++                .border(BorderStroke(if (selected) 3.dp else 1.dp,
++                    if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant),
++                    RoundedCornerShape(10.dp))
++                .clickable(onClick = onClick),
++        ) { content() }
++        Text(label, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(top = 4.dp))
 +    }
 +}
-diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PluginsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PluginsScreen.kt
 new file mode 100644
-index 0000000..10a588d
+index 0000000..6345608
 --- /dev/null
-+++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
-@@ -0,0 +1,197 @@
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PluginsScreen.kt
+@@ -0,0 +1,208 @@
 +package com.openminis.app.ui.plus
 +
-+import android.annotation.SuppressLint
-+import android.graphics.Bitmap
-+import android.webkit.CookieManager
-+import android.webkit.WebChromeClient
-+import android.webkit.WebResourceRequest
-+import android.webkit.WebView
-+import android.webkit.WebViewClient
-+import androidx.compose.foundation.layout.Box
-+import androidx.compose.foundation.layout.Column
-+import androidx.compose.foundation.layout.fillMaxSize
-+import androidx.compose.foundation.layout.fillMaxWidth
-+import androidx.compose.foundation.layout.heightIn
-+import androidx.compose.foundation.layout.navigationBarsPadding
-+import androidx.compose.foundation.layout.padding
-+import androidx.compose.foundation.shape.RoundedCornerShape
-+import androidx.compose.material.icons.Icons
-+import androidx.compose.material.icons.filled.Close
-+import androidx.compose.material3.Button
-+import androidx.compose.material3.ExperimentalMaterial3Api
-+import androidx.compose.material3.Icon
-+import androidx.compose.material3.IconButton
-+import androidx.compose.material3.LinearProgressIndicator
-+import androidx.compose.material3.MaterialTheme
-+import androidx.compose.material3.Scaffold
-+import androidx.compose.material3.Surface
-+import androidx.compose.material3.Text
-+import androidx.compose.material3.TopAppBar
-+import androidx.compose.runtime.Composable
-+import androidx.compose.runtime.DisposableEffect
-+import androidx.compose.runtime.LaunchedEffect
-+import androidx.compose.runtime.getValue
-+import androidx.compose.runtime.mutableIntStateOf
-+import androidx.compose.runtime.mutableStateOf
-+import androidx.compose.runtime.remember
-+import androidx.compose.runtime.setValue
-+import androidx.compose.ui.Modifier
-+import androidx.compose.ui.platform.LocalContext
-+import androidx.compose.ui.text.font.FontWeight
-+import androidx.compose.ui.text.style.TextOverflow
-+import androidx.compose.ui.unit.dp
-+import androidx.compose.ui.unit.sp
-+import androidx.compose.ui.viewinterop.AndroidView
-+import com.openminis.app.browser.GoogleAuthRouter
-+import com.openminis.app.plus.ConnectionKind
-+import com.openminis.app.plus.MINES_MOBILE_UA
-+import com.openminis.app.plus.PlusConnect
-+import kotlinx.coroutines.delay
-+import kotlinx.coroutines.launch
-+import kotlinx.coroutines.suspendCancellableCoroutine
-+import kotlin.coroutines.resume
-+
-+/**
-+ * Full-screen in-app browser on a service's official login page.
-+ * Uses the app-wide WebView cookie store, so the AI's browser tool shares the
-+ * sign-in. Detects success from cookies / URL / a JS probe and closes itself;
-+ * a big "我已登录好了" button is always there as a fallback.
-+ */
-+@OptIn(ExperimentalMaterial3Api::class)
-+@SuppressLint("SetJavaScriptEnabled")
-+@Composable
-+fun WebLoginScreen(
-+    kind: ConnectionKind,
-+    url: String,
-+    title: String,
-+    detect: Boolean,
-+    onDone: (account: String, urls: Set<String>) -> Unit,
-+    onClose: () -> Unit,
-+) {
-+    val context = LocalContext.current
-+    var progress by remember { mutableIntStateOf(0) }
-+    var current by remember { mutableStateOf(url) }
-+    val visited = remember { mutableSetOf(url) }
-+    var webView by remember { mutableStateOf<WebView?>(null) }
-+    var finished by remember { mutableStateOf(false) }
-+    val scope = androidx.compose.runtime.rememberCoroutineScope()
-+
-+    suspend fun eval(js: String): String {
-+        val wv = webView ?: return ""
-+        return suspendCancellableCoroutine { cont ->
-+            runCatching {
-+                wv.evaluateJavascript("(function(){try{return String($js)}catch(e){return ''}})()") { r ->
-+                    val v = r?.trim('"')?.takeUnless { it == "null" || it == "undefined" }.orEmpty()
-+                    if (cont.isActive) cont.resume(v)
-+                }
-+            }.onFailure { if (cont.isActive) cont.resume("") }
-+        }
-+    }
-+
-+    suspend fun finish() {
-+        if (finished) return
-+        finished = true
-+        val account = kind.accountJs?.let { eval(it) }.orEmpty()
-+        CookieManager.getInstance().flush()
-+        onDone(account, visited.toSet())
-+    }
-+
-+    // Poll for "signed in": two positive checks in a row, so a page that briefly
-+    // shows the dashboard before a client-side redirect to /login does not count.
-+    if (detect && (kind.doneCookies.isNotEmpty() || kind.doneUrl != null || kind.doneJs != null)) {
-+        LaunchedEffect(kind.id) {
-+            var hits = 0
-+            delay(1500)
-+            while (!finished) {
-+                val u = current
-+                val cm = CookieManager.getInstance()
-+                val cookieHit = kind.doneCookies.isNotEmpty() && visited.any { v ->
-+                    val c = cm.getCookie(v).orEmpty()
-+                    kind.doneCookies.any { name -> c.contains(if (name.contains('=')) name else "$name=") }
-+                }
-+                val urlHit = kind.doneUrl?.matches(u) == true
-+                val jsHit = kind.doneJs?.let { eval(it).isNotBlank() } == true
-+                hits = if (cookieHit || urlHit || jsHit) hits + 1 else 0
-+                if (hits >= 2) { finish(); break }
-+                delay(1500)
-+            }
-+        }
-+    }
-+
-+    DisposableEffect(Unit) {
-+        onDispose { runCatching { webView?.stopLoading(); webView?.destroy() } }
-+    }
-+
-+    Scaffold(
-+        topBar = {
-+            TopAppBar(
-+                title = {
-+                    Column {
-+                        Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold)
-+                        Text(PlusConnect.hostOf(current), style = MaterialTheme.typography.bodySmall,
-+                            color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
-+                    }
-+                },
-+                navigationIcon = {
-+                    IconButton(onClick = onClose) { Icon(Icons.Filled.Close, contentDescription = "关闭") }
-+                },
-+            )
-+        },
-+        bottomBar = {
-+            Surface(tonalElevation = 3.dp) {
-+                Button(
-+                    onClick = { if (detect) scope.launch { finish() } else onClose() },
-+                    modifier = Modifier.fillMaxWidth().navigationBarsPadding().padding(12.dp).heightIn(min = 56.dp),
-+                    shape = RoundedCornerShape(14.dp),
-+                ) { Text(if (detect) "我已登录好了" else "完成", fontSize = 18.sp, fontWeight = FontWeight.SemiBold) }
-+            }
-+        },
-+    ) { padding ->
-+        Box(Modifier.fillMaxSize().padding(padding)) {
-+            AndroidView(
-+                modifier = Modifier.fillMaxSize(),
-+                factory = { ctx ->
-+                    WebView(ctx).apply {
-+                        settings.javaScriptEnabled = true
-+                        settings.domStorageEnabled = true
-+                        settings.databaseEnabled = true
-+                        settings.loadWithOverviewMode = true
-+                        settings.useWideViewPort = true
-+                        settings.setSupportMultipleWindows(false)
-+                        settings.javaScriptCanOpenWindowsAutomatically = true
-+                        settings.userAgentString = MINES_MOBILE_UA
-+                        CookieManager.getInstance().setAcceptCookie(true)
-+                        CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
-+                        webChromeClient = object : WebChromeClient() {
-+                            override fun onProgressChanged(view: WebView, newProgress: Int) { progress = newProgress }
-+                        }
-+                        webViewClient = object : WebViewClient() {
-+                            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-+                                val u = request.url.toString()
-+                                // Google blocks sign-in inside WebViews; hand that hop to Chrome.
-+                                if (GoogleAuthRouter.shouldRouteExternally(u)) {
-+                                    GoogleAuthRouter.openInCustomTab(ctx, u); return true
-+                                }
-+                                if (!u.startsWith("http")) return true // app deep links (weixin://, etc.)
-+                                return false
-+                            }
-+                            override fun onPageStarted(view: WebView, u: String, favicon: Bitmap?) {
-+                                current = u; visited.add(u)
-+                            }
-+                            override fun onPageFinished(view: WebView, u: String) {
-+                                current = u; visited.add(u)
-+                                CookieManager.getInstance().flush()
-+                            }
-+                        }
-+                        loadUrl(url)
-+                        webView = this
-+                    }
-+                },
-+            )
-+            if (progress in 1..99) LinearProgressIndicator(
-+                progress = { progress / 100f }, modifier = Modifier.fillMaxWidth(),
-+            )
-+        }
-+    }
-+}
-+
-diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt
-new file mode 100644
-index 0000000..0f4905e
---- /dev/null
-+++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt
-@@ -0,0 +1,308 @@
-+package com.openminis.app.ui.plus
-+
-+import androidx.compose.foundation.BorderStroke
 +import androidx.compose.foundation.background
-+import androidx.compose.foundation.border
-+import androidx.compose.foundation.clickable
 +import androidx.compose.foundation.layout.Arrangement
 +import androidx.compose.foundation.layout.Box
 +import androidx.compose.foundation.layout.Column
 +import androidx.compose.foundation.layout.Row
 +import androidx.compose.foundation.layout.Spacer
 +import androidx.compose.foundation.layout.fillMaxWidth
-+import androidx.compose.foundation.layout.height
 +import androidx.compose.foundation.layout.padding
 +import androidx.compose.foundation.layout.size
 +import androidx.compose.foundation.layout.width
 +import androidx.compose.foundation.shape.CircleShape
-+import androidx.compose.foundation.shape.RoundedCornerShape
-+import androidx.compose.foundation.text.KeyboardOptions
 +import androidx.compose.material.icons.Icons
-+import androidx.compose.material.icons.outlined.Add
-+import androidx.compose.material.icons.outlined.Cloud
-+import androidx.compose.material.icons.outlined.PhoneAndroid
++import androidx.compose.material.icons.outlined.ContentPaste
++import androidx.compose.material.icons.outlined.FileOpen
 +import androidx.compose.material.icons.outlined.Refresh
-+import androidx.compose.material3.AlertDialog
-+import androidx.compose.material3.CircularProgressIndicator
-+import androidx.compose.material3.Icon
++import androidx.compose.material.icons.outlined.Storefront
++import androidx.compose.material3.Button
 +import androidx.compose.material3.MaterialTheme
 +import androidx.compose.material3.OutlinedTextField
 +import androidx.compose.material3.Switch
@@ -1240,572 +1373,185 @@ index 0000000..0f4905e
 +import androidx.compose.material3.TextButton
 +import androidx.compose.runtime.Composable
 +import androidx.compose.runtime.LaunchedEffect
-+import androidx.compose.runtime.collectAsState
 +import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableIntStateOf
 +import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.produceState
 +import androidx.compose.runtime.remember
-+import androidx.compose.runtime.rememberCoroutineScope
 +import androidx.compose.runtime.setValue
 +import androidx.compose.ui.Alignment
 +import androidx.compose.ui.Modifier
-+import androidx.compose.ui.draw.clip
 +import androidx.compose.ui.graphics.Color
-+import androidx.compose.ui.graphics.vector.ImageVector
 +import androidx.compose.ui.platform.LocalContext
-+import androidx.compose.ui.text.font.FontWeight
-+import androidx.compose.ui.text.input.KeyboardType
++import androidx.compose.ui.platform.LocalLifecycleOwner
 +import androidx.compose.ui.unit.dp
-+import com.openminis.app.plus.PlusPrefs
-+import com.openminis.app.plus.PlusState
-+import com.openminis.app.plus.PlusVps
-+import com.openminis.app.plus.VpsServer
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.repeatOnLifecycle
++import kotlinx.coroutines.Dispatchers
 +import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import org.json.JSONObject
++import java.io.File
 +
-+private val Green = Color(0xFF34C759)
-+private val Red = Color(0xFFFF3B30)
++private data class PluginRow(val pkg: String, val enabled: Boolean, val ok: Boolean?, val reason: String, val tools: List<String>)
 +
++/**
++ * dsh plugin center. The work happens in the sandbox (`minis-dsh`), shown in
++ * the terminal so the user sees progress; this page lists what is installed
++ * and which tools each plugin adds, read from the files minis-dsh keeps.
++ */
 +@Composable
-+fun WorkLocationScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onOpenServer: (String) -> Unit = {}) {
++fun PluginsScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onOpenMarket: () -> Unit = {}) {
 +    val context = LocalContext.current
-+    PlusPrefs.init(context)
-+    val st by PlusPrefs.state.collectAsState()
-+    val scope = rememberCoroutineScope()
-+    var checking by remember { mutableStateOf(false) }
-+    var editing by remember { mutableStateOf<VpsServer?>(null) }
-+    var adding by remember { mutableStateOf(false) }
-+
-+    fun check() {
-+        if (checking) return
-+        checking = true
-+        scope.launch { runCatching { PlusVps.probeAll(context) }; checking = false }
++    val scope = androidx.compose.runtime.rememberCoroutineScope()
++    var modelMsg by remember { mutableStateOf("") }
++    var showPaste by remember { mutableStateOf(false) }
++    var input by remember { mutableStateOf("") }
++    var tick by remember { mutableIntStateOf(0) }
++    // Re-read whenever the page comes back (e.g. returning from the terminal).
++    val owner = LocalLifecycleOwner.current
++    LaunchedEffect(owner) { owner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) { tick++ } }
++    val rows by produceState(initialValue = emptyList<PluginRow>(), tick) {
++        value = withContext(Dispatchers.IO) { readPlugins(context) }
 +    }
-+    LaunchedEffect(Unit) { if (st.servers.isNotEmpty()) check() }
 +
-+    PlusPage("工作位置", onBack) {
-+        val effective = PlusVps.effectiveMode(st)
-+        val best = PlusVps.orderedTargets(st).firstOrNull()
-+        // -- Mode picker --
-+        Row(
-+            Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(top = 16.dp),
-+            horizontalArrangement = Arrangement.spacedBy(12.dp),
-+        ) {
-+            ModeCard(
-+                Modifier.weight(1f), Icons.Outlined.PhoneAndroid, "本机", "在手机沙箱里干活",
-+                selected = !st.isVps,
-+            ) {
-+                PlusPrefs.update(context) { it.copy(workMode = PlusState.MODE_LOCAL) }
-+                PlusVps.syncToSandbox(context)
-+            }
-+            ModeCard(
-+                Modifier.weight(1f), Icons.Outlined.Cloud, "VPS", "重活交给服务器",
-+                selected = st.isVps,
-+            ) {
-+                PlusPrefs.update(context) { it.copy(workMode = PlusState.MODE_VPS) }
-+                check()
-+            }
-+        }
++    PlusPage("插件", onBack) {
 +        Text(
-+            when {
-+                !st.isVps -> "现在：在本机运行"
-+                effective == PlusState.MODE_LOCAL -> "现在：服务器都连不上，已自动回到本机"
-+                best != null && best.lastLatencyMs >= 0 -> "现在：用 ${best.name.ifBlank { best.host }}（${best.lastLatencyMs} ms）"
-+                else -> "现在：VPS 模式，正在检测服务器"
-+            },
++            "可以装 DeepSeek Harness（dsh）的插件。加工具的插件会出现在 Mines 的 MCP 里；提供模型的插件（比如 WorkBuddy）会在模型选择里多出一组模型。",
 +            style = MaterialTheme.typography.bodyMedium,
-+            color = if (st.isVps && effective == PlusState.MODE_LOCAL) Red else MaterialTheme.colorScheme.onSurfaceVariant,
-+            modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp),
++            color = MaterialTheme.colorScheme.onSurfaceVariant,
++            modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
 +        )
-+
-+        PlusSection(
-+            "服务器",
-+            footer = "可以加多台。每 90 秒检测一次，自动用延迟最低的那台；正在用的断了就换下一台。点服务器看 CPU、内存、硬盘、网速；新服务器先在里面点“授权”，输一次密码，以后免密。",
-+        ) {
-+            if (st.servers.isEmpty()) {
-+                Text(
-+                    "还没有服务器",
-+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-+                    modifier = Modifier.padding(16.dp),
-+                )
++        PlusSection(null) {
++            ActionRow(Icons.Outlined.Storefront, "去市场找插件和技能", onOpenMarket)
++        }
++        val routes = remember(tick) { com.openminis.app.plus.DshLlmBridge.routes(context) }
++        if (routes.isNotEmpty()) PlusSection("插件模型", footer = "这些模型由插件提供，Mines 通过本机 127.0.0.1:${com.openminis.app.plus.DshLlmBridge.PORT} 转给插件。0 个模型多半是还没登录。") {
++            routes.forEachIndexed { i, r ->
++                Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
++                    Column(Modifier.weight(1f)) {
++                        Text(r.name, style = MaterialTheme.typography.titleMedium)
++                        Text("${r.proxied} 个模型可用 · 来自 ${r.plugin}", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
++                    }
++                }
++                if (i < routes.lastIndex) PlusDivider()
 +            }
-+            st.servers.forEach { s ->
-+                ServerRow(
-+                    s,
-+                    onClick = { onOpenServer(s.id) },
-+                    onEdit = { editing = s },
-+                    onToggle = { on ->
-+                        PlusPrefs.update(context) { cur ->
-+                            cur.copy(servers = cur.servers.map { if (it.id == s.id) it.copy(enabled = on) else it })
-+                        }
-+                        PlusVps.syncToSandbox(context)
-+                    },
-+                    onAuthorize = { onOpenTerminal("minis-vps setup ${s.target} ${s.port}") },
-+                )
-+                PlusDivider()
-+            }
-+            ActionRow(Icons.Outlined.Add, "添加服务器") { adding = true }
 +            PlusDivider()
-+            Row(
-+                Modifier.fillMaxWidth().clickable { check() }.padding(horizontal = 16.dp, vertical = 14.dp),
-+                verticalAlignment = Alignment.CenterVertically,
-+            ) {
-+                if (checking) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
-+                else Icon(Icons.Outlined.Refresh, null, tint = MaterialTheme.colorScheme.primary)
-+                Spacer(Modifier.width(12.dp))
-+                Text(if (checking) "检测中…" else "立即检测", color = MaterialTheme.colorScheme.primary)
++            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
++                Button(onClick = { modelMsg = "正在启动…"; scope.launch { modelMsg = com.openminis.app.plus.DshLlmBridge.ensure(context, force = true); tick++ } },
++                    modifier = Modifier.fillMaxWidth()) { Text("加入模型列表 / 刷新") }
++                if (modelMsg.isNotBlank()) Text(modelMsg, style = MaterialTheme.typography.bodyMedium)
 +            }
 +        }
-+
-+        PlusSection("连接", footer = "所有服务器都连不上时，自动回到本机继续，不会卡住。") {
-+            Row(
-+                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
-+                verticalAlignment = Alignment.CenterVertically,
-+            ) {
-+                Text("断线自动回本机", Modifier.weight(1f))
-+                Switch(st.autoFallback, onCheckedChange = { on ->
-+                    PlusPrefs.update(context) { it.copy(autoFallback = on) }
-+                    PlusVps.syncToSandbox(context)
-+                })
-+            }
-+        }
-+    }
-+
-+    if (adding || editing != null) {
-+        ServerDialog(
-+            initial = editing,
-+            onDismiss = { adding = false; editing = null },
-+            onSave = { srv ->
-+                PlusPrefs.update(context) { cur ->
-+                    val exists = cur.servers.any { it.id == srv.id }
-+                    cur.copy(servers = if (exists) cur.servers.map { if (it.id == srv.id) srv else it } else cur.servers + srv)
-+                }
-+                adding = false; editing = null
-+                check()
-+            },
-+            onDelete = { srv ->
-+                PlusPrefs.update(context) { cur -> cur.copy(servers = cur.servers.filterNot { it.id == srv.id }) }
-+                editing = null
-+                PlusVps.syncToSandbox(context)
-+            },
-+        )
-+    }
-+}
-+
-+@Composable
-+private fun ModeCard(
-+    modifier: Modifier, icon: ImageVector, title: String, sub: String,
-+    selected: Boolean, onClick: () -> Unit,
-+) {
-+    val primary = MaterialTheme.colorScheme.primary
-+    Column(
-+        modifier
-+            .clip(RoundedCornerShape(16.dp))
-+            .background(if (selected) primary.copy(alpha = 0.12f) else MaterialTheme.colorScheme.surfaceContainerLow)
-+            .border(
-+                BorderStroke(if (selected) 2.dp else 1.dp, if (selected) primary else MaterialTheme.colorScheme.outlineVariant),
-+                RoundedCornerShape(16.dp),
-+            )
-+            .clickable(onClick = onClick)
-+            .padding(16.dp),
-+    ) {
-+        Box(
-+            Modifier.size(40.dp).background(if (selected) primary else MaterialTheme.colorScheme.surfaceVariant, CircleShape),
-+            contentAlignment = Alignment.Center,
-+        ) {
-+            Icon(icon, null, tint = if (selected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant)
-+        }
-+        Spacer(Modifier.height(10.dp))
-+        Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-+        Text(sub, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-+    }
-+}
-+
-+@Composable
-+private fun ServerRow(s: VpsServer, onClick: () -> Unit, onEdit: () -> Unit, onToggle: (Boolean) -> Unit, onAuthorize: () -> Unit) {
-+    Row(
-+        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 12.dp),
-+        verticalAlignment = Alignment.CenterVertically,
-+    ) {
-+        val dot = when {
-+            !s.enabled -> Color.Gray
-+            s.lastLatencyMs >= 0 -> Green
-+            s.lastLatencyMs == -2 -> Red
-+            else -> Color(0xFFFFCC00)
-+        }
-+        Box(Modifier.size(10.dp).background(dot, CircleShape))
-+        Spacer(Modifier.width(12.dp))
-+        Column(Modifier.weight(1f)) {
-+            Text(s.name.ifBlank { s.host }, style = MaterialTheme.typography.bodyLarge)
-+            Text(
-+                "${s.target}:${s.port} · " + when {
-+                    !s.enabled -> "已停用"
-+                    s.lastLatencyMs >= 0 -> "${s.lastLatencyMs} ms"
-+                    s.lastLatencyMs == -2 -> "连不上"
-+                    else -> "未检测"
-+                },
-+                style = MaterialTheme.typography.bodySmall,
-+                color = MaterialTheme.colorScheme.onSurfaceVariant,
-+            )
-+        }
-+        TextButton(onClick = onEdit) { Text("编辑") }
-+        Switch(s.enabled, onCheckedChange = onToggle)
-+    }
-+}
-+
-+@Composable
-+internal fun ActionRow(icon: ImageVector, title: String, onClick: () -> Unit) {
-+    Row(
-+        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 14.dp),
-+        verticalAlignment = Alignment.CenterVertically,
-+    ) {
-+        Icon(icon, null, tint = MaterialTheme.colorScheme.primary)
-+        Spacer(Modifier.width(12.dp))
-+        Text(title, color = MaterialTheme.colorScheme.primary)
-+    }
-+}
-+
-+@Composable
-+internal fun PlusDivider() {
-+    Box(
-+        Modifier.fillMaxWidth().padding(start = 16.dp).height(0.5.dp)
-+            .background(MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
-+    )
-+}
-+
-+@Composable
-+private fun ServerDialog(
-+    initial: VpsServer?, onDismiss: () -> Unit,
-+    onSave: (VpsServer) -> Unit, onDelete: (VpsServer) -> Unit,
-+) {
-+    var name by remember { mutableStateOf(initial?.name ?: "") }
-+    var host by remember { mutableStateOf(initial?.host ?: "") }
-+    var port by remember { mutableStateOf((initial?.port ?: 22).toString()) }
-+    var user by remember { mutableStateOf(initial?.user ?: "root") }
-+    val valid = host.isNotBlank() && !host.contains(' ') && (port.toIntOrNull() ?: 0) in 1..65535 &&
-+        user.isNotBlank() && user.all { it.isLetterOrDigit() || it in "._-" }
-+    AlertDialog(
-+        onDismissRequest = onDismiss,
-+        title = { Text(if (initial == null) "添加服务器" else "编辑服务器") },
-+        text = {
-+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-+                OutlinedTextField(name, { name = it }, label = { Text("名字（随便起）") }, singleLine = true)
-+                OutlinedTextField(host, { host = it.trim() }, label = { Text("地址 / IP") }, singleLine = true,
-+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri))
-+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-+                    OutlinedTextField(user, { user = it.trim() }, label = { Text("用户") }, singleLine = true,
-+                        modifier = Modifier.weight(1f))
-+                    OutlinedTextField(port, { port = it.filter(Char::isDigit).take(5) }, label = { Text("端口") },
-+                        singleLine = true, modifier = Modifier.weight(0.7f),
-+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
++        if (rows.any { it.pkg == "dsh-workbuddy-connect" }) {
++            val picker = androidx.activity.compose.rememberLauncherForActivityResult(
++                androidx.activity.result.contract.ActivityResultContracts.OpenDocument(),
++            ) { uri ->
++                if (uri != null) scope.launch {
++                    modelMsg = "正在导入登录…"
++                    val text = withContext(Dispatchers.IO) {
++                        runCatching { context.contentResolver.openInputStream(uri)?.use { it.readBytes().toString(Charsets.UTF_8) } }.getOrNull()
++                    }
++                    modelMsg = if (text.isNullOrBlank()) "读不到这个文件" else com.openminis.app.plus.DshLlmBridge.workBuddyLogin(context, text, international = false)
++                    tick++
 +                }
 +            }
-+        },
-+        confirmButton = {
-+            TextButton(enabled = valid, onClick = {
-+                val base = initial ?: VpsServer(name = "", host = "")
-+                onSave(base.copy(name = name.trim(), host = host, port = port.toInt(), user = user,
-+                    lastLatencyMs = if (initial?.host == host && initial.port == port.toInt()) base.lastLatencyMs else -1))
-+            }) { Text("保存") }
-+        },
-+        dismissButton = {
-+            Row {
-+                if (initial != null) TextButton(onClick = { onDelete(initial) }) { Text("删除", color = Red) }
-+                TextButton(onClick = onDismiss) { Text("取消") }
++            PlusSection("WorkBuddy 手机登录", footer = "手机上没有 WorkBuddy 桌面版，插件找不到登录。三选一：① 选登录文件：电脑上用 DSH 装过这个插件后，拷贝电脑里的 ~/.dsh/.workbuddy-auth.json（国际版是 .workbuddy-ai-auth.json）到手机再选它；② 粘贴登录信息（JSON 或访问令牌）；③ 如果你手机上开着 WorkBuddy 网关 App，直接用下面「发现本机模型网关」添加，不用登录插件。新版桌面端的 workbuddy-desktop.info 是加密的，手机解不开。") {
++                ActionRow(Icons.Outlined.FileOpen, "选择登录文件") { picker.launch(arrayOf("*/*")) }
++                PlusDivider()
++                ActionRow(Icons.Outlined.ContentPaste, "粘贴登录信息") { showPaste = true }
++                if (modelMsg.isNotBlank() && routes.isEmpty()) Text(modelMsg, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(12.dp))
 +            }
-+        },
-+    )
-+}
-diff --git a/src/android/app/src/main/java/com/openminis/app/ui/sandbox/FilePreviewScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/sandbox/FilePreviewScreen.kt
-index 332d5c0..d3a3dbe 100644
---- a/src/android/app/src/main/java/com/openminis/app/ui/sandbox/FilePreviewScreen.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/ui/sandbox/FilePreviewScreen.kt
-@@ -1352,7 +1352,7 @@ private suspend fun saveImageToGallery(context: Context, src: File): Boolean =
-                     put(MediaStore.Images.Media.MIME_TYPE, mime)
-                     put(
-                         MediaStore.Images.Media.RELATIVE_PATH,
--                        Environment.DIRECTORY_PICTURES + "/Minis",
-+                        Environment.DIRECTORY_PICTURES + "/Mines",
-                     )
-                     put(MediaStore.Images.Media.IS_PENDING, 1)
-                 }
-@@ -1370,7 +1370,7 @@ private suspend fun saveImageToGallery(context: Context, src: File): Boolean =
-                 val dir = Environment.getExternalStoragePublicDirectory(
-                     Environment.DIRECTORY_PICTURES,
-                 )
--                val minisDir = File(dir, "Minis").also { it.mkdirs() }
-+                val minisDir = File(dir, "Mines").also { it.mkdirs() }
-                 val dest = File(minisDir, filename)
-                 src.inputStream().use { input ->
-                     dest.outputStream().use { input.copyTo(it) }
-diff --git a/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
-index ce5246e..b056b04 100644
---- a/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
-@@ -821,7 +821,9 @@ fun SessionListScreen(
-             .map { list -> list.count { it.enabled } }
-     }.collectAsState(initial = 0)
- 
-+    val minesHomeWallpaper = com.openminis.app.ui.plus.wallpaperOn(home = true)
-     Scaffold(
-+        containerColor = MaterialTheme.colorScheme.background,
-         topBar = {
-             TopAppBar(
-                 title = {
-@@ -953,10 +955,16 @@ fun SessionListScreen(
-                         }
-                     }
-                 },
-+                colors = androidx.compose.material3.TopAppBarDefaults.topAppBarColors(
-+                    containerColor = MaterialTheme.colorScheme.surface.copy(alpha = if (minesHomeWallpaper) 0.6f else 1f),
-+                    scrolledContainerColor = MaterialTheme.colorScheme.surface.copy(alpha = if (minesHomeWallpaper) 0.6f else 1f),
-+                ),
-             )
-         },
-         // No default FAB — we draw dual FABs manually at bottom
-     ) { padding ->
-+        // [Mines] Optional wallpaper behind the conversation list too.
-+        com.openminis.app.ui.plus.ChatWallpaperLayer(Modifier.fillMaxSize(), home = true)
-         Box(
-             modifier = Modifier
-                 .fillMaxSize()
-@@ -1009,11 +1017,17 @@ fun SessionListScreen(
-                         )
-                     }
-                 } else {
-+                    androidx.compose.foundation.layout.Column(Modifier.fillMaxSize()) {
-+                    if (!isSelecting) {
-+                        com.openminis.app.ui.plus.TodayCard(
-+                            onOpen = { route -> com.openminis.app.ui.plus.PlusNav.go(route) },
++            LocalGatewayCards()
++        }
++        if (showPaste) WorkBuddyPasteDialog(onDismiss = { showPaste = false }) { text, intl ->
++            showPaste = false
++            modelMsg = "正在保存登录…"
++            scope.launch { modelMsg = com.openminis.app.plus.DshLlmBridge.workBuddyLogin(context, text, intl); tick++ }
++        }
++        PlusSection("安装", footer = "填 npm 包名，比如 @zhaoolee/dsh-notes；或 github:用户/仓库。第一次会自动装 Node.js。") {
++            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                OutlinedTextField(input, { input = it.trim() }, label = { Text("插件名或链接") }, singleLine = true,
++                    modifier = Modifier.fillMaxWidth())
++                Button(
++                    enabled = input.isNotBlank() && input.none { it == ' ' || it == ';' || it == '&' || it == '|' || it == '`' || it == '$' },
++                    onClick = { onOpenTerminal("minis-dsh add ${normalize(input)}"); input = "" },
++                    modifier = Modifier.fillMaxWidth(),
++                ) { Text("安装") }
++            }
++        }
++        PlusSection(if (rows.isEmpty()) "已安装" else "已安装 · ${rows.size}") {
++            if (rows.isEmpty()) Text("还没有插件", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(16.dp))
++            rows.forEachIndexed { i, r ->
++                Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
++                    Box(Modifier.size(9.dp).background(
++                        when { !r.enabled -> Color.Gray; r.ok == true -> Color(0xFF34C759); r.ok == false -> Color(0xFFFF3B30); else -> Color(0xFFFFCC00) },
++                        CircleShape))
++                    Spacer(Modifier.width(10.dp))
++                    Column(Modifier.weight(1f)) {
++                        Text(r.pkg, style = MaterialTheme.typography.bodyLarge)
++                        Text(
++                            when {
++                                !r.enabled -> "已停用"
++                                r.ok == true -> if (r.tools.isEmpty()) "已加载（只加提示词）" else "工具：" + r.tools.joinToString("、")
++                                r.ok == false -> "用不了：${r.reason}"
++                                else -> "未检查"
++                            },
++                            style = MaterialTheme.typography.bodySmall,
++                            color = MaterialTheme.colorScheme.onSurfaceVariant,
 +                        )
 +                    }
-                     LazyColumn(
-                         // [T-android-newchat-list-autoscroll] Hoisted state so
-                         // the new-session autoscroll effect above can drive it.
-                         state = listState,
--                        modifier = Modifier.fillMaxSize(),
-+                        modifier = Modifier.fillMaxWidth().weight(1f),
-                         // Leave space for bottom FAB row
-                         contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 96.dp),
-                     ) {
-@@ -1210,6 +1224,7 @@ fun SessionListScreen(
-                             renderSessionRows(periodSessions)
-                         }
-                     }
-+                    } // Plus: Today card column
-                 }
-             }
- 
-diff --git a/src/android/app/src/main/java/com/openminis/app/ui/settings/AboutScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/settings/AboutScreen.kt
-index ab206b2..aa38f1d 100644
---- a/src/android/app/src/main/java/com/openminis/app/ui/settings/AboutScreen.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/ui/settings/AboutScreen.kt
-@@ -15,6 +15,7 @@ import androidx.compose.foundation.shape.CircleShape
- import androidx.compose.foundation.text.selection.SelectionContainer
- import androidx.compose.material.icons.Icons
- import androidx.compose.material.icons.outlined.Code
-+import androidx.compose.material.icons.outlined.Gavel
- import androidx.compose.material3.MaterialTheme
- import androidx.compose.material3.Text
- import androidx.compose.runtime.Composable
-@@ -99,6 +100,15 @@ fun AboutScreen(onBack: () -> Unit) {
-                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
-                 )
-             }
-+            // Mines: attribution — this app continues OpenMinis development.
-+            Text(
-+                stringResource(R.string.about_mines_attribution),
-+                style = MaterialTheme.typography.titleSmall,
-+                fontWeight = FontWeight.SemiBold,
-+                color = MaterialTheme.colorScheme.primary,
-+                textAlign = TextAlign.Center,
-+                modifier = Modifier.padding(horizontal = 24.dp),
-+            )
-             Text(
-                 stringResource(R.string.about_minis_tagline),
-                 style = MaterialTheme.typography.bodyMedium,
-@@ -112,13 +122,24 @@ fun AboutScreen(onBack: () -> Unit) {
-             SettingsRow(
-                 icon = Icons.Outlined.Code,
-                 iconColor = tileBlue,
--                title = stringResource(R.string.about_github_repository),
-+                title = stringResource(R.string.about_openminis_source),
-+                subtitle = OPENMINIS_REPO_URL.removePrefix("https://"),
-                 // Settings → ABOUT siblings (Privacy Policy / Submit GitHub
-                 // Issues) all use openExternalUrl directly. The
-                 // LocalInAppBrowserLauncher ambient defaults to a no-op when
-                 // no InAppBrowserHost is in the tree above this screen — and
-                 // nothing wraps Settings, so the row used to be a dead tap.
--                onClick = { openExternalUrl(context, "https://github.com/OpenMinis/OpenMinis") },
-+                onClick = { openExternalUrl(context, OPENMINIS_REPO_URL) },
-+                trailing = { ExternalLinkIcon() },
-+            )
-+            // Mines keeps the original OpenMinis GPL-3.0 LICENSE and
-+            // copyright notices unchanged.
-+            SettingsRow(
-+                icon = Icons.Outlined.Gavel,
-+                iconColor = tileBlue,
-+                title = stringResource(R.string.about_license_title),
-+                subtitle = stringResource(R.string.about_license_subtitle),
-+                onClick = { openExternalUrl(context, "$OPENMINIS_REPO_URL/blob/main/LICENSE") },
-                 trailing = { ExternalLinkIcon() },
-                 showDivider = false,
-             )
-@@ -133,6 +154,9 @@ fun AboutScreen(onBack: () -> Unit) {
-     }
- }
- 
-+/** Upstream project Mines continues. */
-+private const val OPENMINIS_REPO_URL = "https://github.com/OpenMinis/OpenMinis"
-+
- @Composable
- private fun ExternalLinkIcon() {
-     Text(
-diff --git a/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt
-index d97d5af..ab4786b 100644
---- a/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt
-@@ -37,6 +37,11 @@ import androidx.compose.material.icons.outlined.FrontHand
- import androidx.compose.material.icons.outlined.Info
- import androidx.compose.material.icons.outlined.Inventory2
- import androidx.compose.material.icons.outlined.Lock
-+import androidx.compose.material.icons.outlined.Cloud
-+import androidx.compose.material.icons.outlined.Key
-+import androidx.compose.material.icons.outlined.Memory
-+import androidx.compose.material.icons.outlined.Mic
-+import androidx.compose.material.icons.outlined.Wallpaper
- import androidx.compose.material.icons.outlined.Palette
- import androidx.compose.material.icons.outlined.Groups
- import androidx.compose.material.icons.outlined.Handyman
-@@ -112,6 +117,8 @@ fun SettingsScreen(
-     // About row below still has a TODO onClick in HEAD; future settings-bucket
-     // work will wire this through.
-     onAboutClick: () -> Unit = {},
-+    /** Minis Plus pages (work location, connections, wallpaper & avatar). */
-+    onPlusClick: (String) -> Unit = {},
- ) {
-     val context = LocalContext.current
-     var showFeedbackSheet by remember { mutableStateOf(false) }
-@@ -136,6 +143,63 @@ fun SettingsScreen(
-                 .padding(padding)
-                 .verticalScroll(rememberScrollState()),
-         ) {
-+            // -- Minis Plus --
-+            SettingsSection(
-+                title = "Mines",
-+                footer = "工作位置决定任务在手机还是服务器上跑；账号密钥加密保存，AI 看不到明文。",
-+            ) {
-+                SettingsItem(
-+                    icon = Icons.Outlined.Cloud,
-+                    iconColor = Color(0xFF34C759),
-+                    title = "工作位置",
-+                    subtitle = "本机 / 多台 VPS，自动选最快的",
-+                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.WORK) },
-+                )
-+                SettingsItem(
-+                    icon = Icons.Outlined.Mic,
-+                    iconColor = Color(0xFF5856D6),
-+                    title = "实时语音",
-+                    subtitle = "像打电话一样和 Mines 说话，可随时打断",
-+                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.VOICE) },
-+                )
-+                SettingsItem(
-+                    icon = Icons.Outlined.Key,
-+                    iconColor = Color(0xFFFF9500),
-+                    title = "账号连接",
-+                    subtitle = "Gemini、GitHub、Google 等账号和密钥",
-+                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.CONNECTIONS) },
-+                )
-+                SettingsItem(
-+                    icon = Icons.Outlined.Memory,
-+                    iconColor = Color(0xFF007AFF),
-+                    title = "沙箱与防杀",
-+                    subtitle = "看内存、一键清理、防止被系统杀掉",
-+                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.SANDBOX) },
-+                )
-+                SettingsItem(
-+                    icon = Icons.Outlined.Extension,
-+                    iconColor = Color(0xFF30B0C7),
-+                    title = "插件",
-+                    subtitle = "安装 dsh 插件，给 AI 加新工具",
-+                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.PLUGINS) },
-+                )
-+                SettingsItem(
-+                    icon = Icons.Outlined.Wallpaper,
-+                    iconColor = Color(0xFFAF52DE),
-+                    title = "壁纸与形象",
-+                    subtitle = "聊天壁纸、虚拟形象、桌宠",
-+                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.PERSONALIZE) },
-+                )
-+                SettingsItem(
-+                    icon = Icons.Outlined.Backup,
-+                    iconColor = Color(0xFF8E8E93),
-+                    title = "从旧版迁移",
-+                    subtitle = "搬来旧版 Mines 的供应商、技能和其他内容",
-+                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.MIGRATE) },
-+                    showDivider = false,
-+                )
++                    Switch(r.enabled, onCheckedChange = { on -> onOpenTerminal("minis-dsh ${if (on) "on" else "off"} ${r.pkg} && minis-dsh list") })
++                    TextButton(onClick = { onOpenTerminal("minis-dsh remove ${r.pkg}") }) { Text("卸载", color = Color(0xFFFF3B30)) }
++                }
++                if (i < rows.lastIndex) PlusDivider()
 +            }
++            if (rows.isNotEmpty()) {
++                PlusDivider()
++                ActionRow(Icons.Outlined.Refresh, "重新检查") { onOpenTerminal("minis-dsh list") }
++            }
++        }
++    }
++}
 +
-             // -- LLM Providers --
-             SettingsSection(
-                 title = stringResource(R.string.settings_section_llm_providers),
-@@ -503,7 +567,7 @@ private fun buildFeedbackMailto(): String {
- 
-         Screenshot (optional): Please attach a screenshot if relevant.
-     """.trimIndent()
--    val subject = java.net.URLEncoder.encode("Minis Feedback", "UTF-8")
-+    val subject = java.net.URLEncoder.encode("Mines Feedback", "UTF-8")
-     val encodedBody = java.net.URLEncoder.encode(body, "UTF-8")
-     return "mailto:dev@openminis.app?subject=$subject&body=$encodedBody"
- }
-diff --git a/src/android/app/src/main/java/com/openminis/app/ui/settings/ShizukuPermissionScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/settings/ShizukuPermissionScreen.kt
-index c982778..ab305e6 100644
---- a/src/android/app/src/main/java/com/openminis/app/ui/settings/ShizukuPermissionScreen.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/ui/settings/ShizukuPermissionScreen.kt
-@@ -42,7 +42,7 @@ import com.openminis.app.offload.ShizukuManager
-  *                        suits them; Sui is the rooted-user option.
-  *   NOT_RUNNING       → "Open Manager App and press Start" — launches the
-  *                        installed manager.
-- *   NEED_PERMISSION   → "Authorize Minis" CTA → triggers system dialog.
-+ *   NEED_PERMISSION   → "Authorize Mines" CTA → triggers system dialog.
-  *   READY             → green status row with version + uid.
-  *
-  * [T-android-sui-support] (GH#110 / GH#97) Sui is a Magisk/KernelSU module
-diff --git a/src/android/app/src/main/java/com/openminis/app/ui/settings/SoulSettingsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/settings/SoulSettingsScreen.kt
-index 0a58336..74aa26c 100644
---- a/src/android/app/src/main/java/com/openminis/app/ui/settings/SoulSettingsScreen.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/ui/settings/SoulSettingsScreen.kt
-@@ -304,7 +304,7 @@ fun SoulSettingsScreen(onBack: () -> Unit) {
-                 }
-                 Column(modifier = Modifier.padding(start = 4.dp)) {
-                     Text(
--                        text = name.ifBlank { "Minis" },
-+                        text = name.ifBlank { "Mines" },
-                         fontSize = 17.sp,
-                         fontWeight = FontWeight.SemiBold,
-                         color = MaterialTheme.colorScheme.onSurface,
-diff --git a/src/android/app/src/main/java/com/openminis/app/ui/terminal/canvas/TerminalNativeView.kt b/src/android/app/src/main/java/com/openminis/app/ui/terminal/canvas/TerminalNativeView.kt
-index a903d1d..74f033c 100644
---- a/src/android/app/src/main/java/com/openminis/app/ui/terminal/canvas/TerminalNativeView.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/ui/terminal/canvas/TerminalNativeView.kt
-@@ -282,7 +282,7 @@ class TerminalNativeView @JvmOverloads constructor(
-                             val text = em.getSelectedText(sel[0], sel[1], sel[2], sel[3])
-                             if (text.isNotEmpty()) {
-                                 val cb = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
--                                cb.setPrimaryClip(ClipData.newPlainText("Minis Shell", text))
-+                                cb.setPrimaryClip(ClipData.newPlainText("Mines Shell", text))
-                             }
-                         }
-                         mode.finish()
-diff --git a/src/android/app/src/main/java/com/openminis/app/webapp/WebAppActivity.kt b/src/android/app/src/main/java/com/openminis/app/webapp/WebAppActivity.kt
-index 90a02a6..bb2cb10 100644
---- a/src/android/app/src/main/java/com/openminis/app/webapp/WebAppActivity.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/webapp/WebAppActivity.kt
-@@ -205,7 +205,7 @@ class WebAppActivity : ComponentActivity() {
- 
-     /**
-      * T-pwa-3: replaces the prior toast-and-finish with an inline error
--     * screen offering an "Open in Minis" escape hatch.
-+     * screen offering an "Open in Mines" escape hatch.
-      */
-     @OptIn(ExperimentalMaterial3Api::class)
-     private fun renderSourceMissing(sourceSessionId: String?) {
++private fun normalize(s: String): String {
++    val gh = Regex("^https?://github\\.com/([^/]+)/([^/#?]+)").find(s)
++    return if (gh != null) "github:${gh.groupValues[1]}/${gh.groupValues[2].removeSuffix(".git")}" else s
++}
++
++private fun readPlugins(context: android.content.Context): List<PluginRow> = runCatching {
++    val root = com.openminis.app.sandbox.RootfsManager.getInstance(context).rootfsDir
++    val home = File(root, "root/.minis-dsh")
++    val state = JSONObject(File(home, "plugins.json").readText())
++    val status = runCatching { JSONObject(File(home, "status.json").readText()) }.getOrNull()
++    val arr = state.optJSONArray("plugins") ?: return@runCatching emptyList()
++    (0 until arr.length()).map { i ->
++        val p = arr.getJSONObject(i)
++        val pkg = p.optString("package")
++        val st = status?.optJSONObject(pkg)
++        val tools = st?.optJSONArray("tools")?.let { t -> (0 until t.length()).map { t.getString(it) } } ?: emptyList()
++        PluginRow(pkg, p.optBoolean("enabled", true), st?.optBoolean("ok"), st?.optString("reason") ?: "", tools)
++    }
++}.getOrDefault(emptyList())
++
++@Composable
++private fun WorkBuddyPasteDialog(onDismiss: () -> Unit, onSave: (String, Boolean) -> Unit) {
++    var text by remember { mutableStateOf("") }
++    var intl by remember { mutableStateOf(false) }
++    androidx.compose.material3.AlertDialog(
++        onDismissRequest = onDismiss,
++        title = { Text("粘贴 WorkBuddy 登录") },
++        text = {
++            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                OutlinedTextField(text, { text = it }, label = { Text("登录 JSON 或访问令牌") }, minLines = 3, maxLines = 6,
++                    modifier = Modifier.fillMaxWidth())
++                Row(verticalAlignment = Alignment.CenterVertically) {
++                    Text("国际版（WorkBuddy AI）", modifier = Modifier.weight(1f))
++                    Switch(intl, onCheckedChange = { intl = it })
++                }
++            }
++        },
++        confirmButton = { Button(enabled = text.isNotBlank(), onClick = { onSave(text.trim(), intl) }) { Text("保存") } },
++        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
++    )
++}
