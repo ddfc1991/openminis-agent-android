@@ -1,5 +1,5 @@
 diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
-index 50369d8..62ed6f8 100644
+index 50369d8..f5585b6 100644
 --- a/src/android/app/build.gradle.kts
 +++ b/src/android/app/build.gradle.kts
 @@ -33,7 +33,9 @@ android {
@@ -13,7 +13,16 @@ index 50369d8..62ed6f8 100644
          minSdk = 26
          targetSdk = 35
          versionCode = 28
-@@ -75,6 +77,21 @@ android {
+@@ -47,6 +49,8 @@ android {
+         // `release`. Kept separate from BuildConfig.DEBUG so a non-debuggable
+         // build can still carry the tooling.
+         buildConfigField("boolean", "DEV_TOOLS", "false")
++        // Mines: the GitHub Actions run number (build-<n>), for the in-app update check.
++        buildConfigField("int", "MINES_BUILD", (System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 0).toString())
+ 
+         // System prompt prefix required by Anthropic for Claude Code OAuth
+         // credentials. Empty in the public mirror (see provider-customization.properties).
+@@ -75,6 +79,21 @@ android {
          }
      }
  
@@ -101,10 +110,10 @@ index 0000000..7a1629e
 +    IPQoS none
 diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-dsh b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-dsh
 new file mode 100644
-index 0000000..01db9e9
+index 0000000..4056b74
 --- /dev/null
 +++ b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-dsh
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,198 @@
 +#!/bin/sh
 +# minis-dsh: use DeepSeek Harness (dsh) plugins in Minis, without installing dsh.
 +#
@@ -112,6 +121,10 @@ index 0000000..01db9e9
 +#   minis-dsh remove <package>                          uninstall it
 +#   minis-dsh list                                      what is installed and which tools each one adds
 +#   minis-dsh off|on <package>                          disable / re-enable without uninstalling
++#   minis-dsh gateway                                   serve plugin models (OpenAI format) on 127.0.0.1:8790
++#   minis-dsh wb-login <file> [--ai]                    phone sign-in for dsh-workbuddy-connect
++#   minis-dsh mcp-add <name> <npm-package> [args…]       add an MCP server (runs with npx)
++#   minis-dsh mcp-remove <name>                         remove it
 +#
 +# All plugins share ONE MCP server named "dsh" in Minis (started only when a
 +# tool is called), so adding plugins doesn't add background processes.
@@ -196,13 +209,14 @@ index 0000000..01db9e9
 +    NPMI="npm install --no-audit --no-fund --omit=dev --ignore-scripts --legacy-peer-deps"
 +    # The pieces of dsh that plugins import directly (about 11 MB, installed once).
 +    [ -d "$H/node_modules/@deepseek-ai/dsh-tools" ] || (cd "$H" && $NPMI @deepseek-ai/dsh-tools@next @deepseek-ai/cordis@next \
-+        @deepseek-ai/dsh-scope@next @deepseek-ai/dsh-llm@next @deepseek-ai/dsh-sandbox@next >&2) || true
++        @deepseek-ai/dsh-scope@next @deepseek-ai/dsh-llm@next @deepseek-ai/dsh-sandbox@next \
++        @deepseek-ai/dsh-llm-pi-ai@next @deepseek-ai/schemastery @deepseek-ai/dsh-home-paths@next >&2) || true
 +    (cd "$H" && $NPMI "$1" >&2)
 +    name=$(pkg_name "$1"); [ -n "$name" ] || name="$1"
 +    set_state add "$name"
 +    # Fill in any other dsh library the plugin imports (only @deepseek-ai/*).
 +    i=0
-+    while [ $i -lt 8 ]; do
++    while [ $i -lt 16 ]; do
 +        miss=$(MINIS_DSH_HOME="$H" node "$SOCK" --check 2>&1 | grep -F "$name" | grep -o "Cannot find package '@deepseek-ai/[^']*'" | sed "s/Cannot find package '//;s/'//" | head -1)
 +        [ -n "$miss" ] || break
 +        echo "补装 $miss …" >&2
@@ -226,7 +240,77 @@ index 0000000..01db9e9
 +    need_node
 +    MINIS_DSH_HOME="$H" node "$SOCK" --check
 +    ;;
-+*) sed -n '2,13p' "$0" ;;
++gateway)
++    need_node
++    exec env MINIS_DSH_HOME="$H" node "$SOCK" --gateway ;;
++wb-login)
++    # The phone has no WorkBuddy desktop app, so the plugin can't read its
++    # sign-in. Take a sign-in the user copies over instead and store it as the
++    # plugin's own credential copy ($DSH_HOME/.workbuddy[-ai]-auth.json), which
++    # the plugin reads and refreshes by itself.
++    [ -n "$1" ] || { echo "用法: minis-dsh wb-login <登录文件> [--ai]" >&2; exit 2; }
++    need_node
++    IN="$1" AI="${2:-}" node --input-type=module -e '
++      import fs from "node:fs"; import path from "node:path"
++      const text = fs.readFileSync(process.env.IN, "utf8").trim()
++      const home = process.env.DSH_HOME || path.join(process.env.HOME || "/root", ".dsh")
++      const ms = (v) => typeof v !== "number" || v <= 0 ? 0 : (v > 1e12 ? v : v * 1000)
++      const str = (v) => typeof v === "string" && v ? v : undefined
++      let doc; try { doc = JSON.parse(text) } catch {}
++      let cred
++      if (doc && doc.version === 1 && doc.credential) cred = doc.credential
++      else if (doc && typeof doc === "object") {
++        const auth = doc.auth && typeof doc.auth === "object" ? doc.auth : doc
++        const acc = doc.account && typeof doc.account === "object" ? doc.account : doc
++        if (str(auth.accessToken)) cred = {
++          accessToken: auth.accessToken, refreshToken: str(auth.refreshToken) || "",
++          expiresAtMs: ms(auth.expiresAt) || ms(auth.expiresAtMs) || Date.now() + 6 * 3600e3,
++          ...(ms(auth.refreshExpiresAt) ? { refreshExpiresAtMs: ms(auth.refreshExpiresAt) } : {}),
++          domain: str(auth.domain) || "", uid: str(acc.uid) || "",
++          ...(str(acc.enterpriseId) ? { enterpriseId: acc.enterpriseId } : {}),
++          ...(str(acc.nickname) ? { nickname: acc.nickname } : {}), source: "desktop" }
++        else { console.error("这个文件里没有可用的登录令牌。新版 WorkBuddy 桌面端的 .info 文件是加密的，手机解不开：请在电脑上用 DSH 装好 WorkBuddy 插件并运行一次，然后拷贝电脑上的 ~/.dsh/.workbuddy-auth.json（国际版是 .workbuddy-ai-auth.json）。"); process.exit(3) }
++      } else if (/^[A-Za-z0-9._~+\/=-]{20,}$/.test(text)) {
++        cred = { accessToken: text, refreshToken: "", expiresAtMs: Date.now() + 6 * 3600e3, domain: process.env.AI ? "www.workbuddy.ai" : "", uid: "", source: "desktop" }
++      } else { console.error("看不懂这个登录信息。"); process.exit(3) }
++      if (process.env.AI && !cred.domain) cred.domain = "www.workbuddy.ai"
++      const global = /(^|\.)workbuddy\.ai$/i.test((cred.domain || "").trim())
++      fs.mkdirSync(home, { recursive: true, mode: 0o700 })
++      const out = path.join(home, global ? ".workbuddy-ai-auth.json" : ".workbuddy-auth.json")
++      fs.writeFileSync(out, JSON.stringify({ version: 1, credential: cred }, null, 2) + "\n", { mode: 0o600 })
++      console.log(`已保存 ${global ? "WorkBuddy AI（国际版）" : "WorkBuddy（国内版）"} 登录${cred.nickname ? "：" + cred.nickname : ""}`)
++    '
++    case "$1" in "$H"/*) rm -f "$1" ;; esac   # the app's temporary import copy
++    ;;
++mcp-add)
++    [ -n "$2" ] || { echo "用法: minis-dsh mcp-add <名字> <npm 包> [参数…]" >&2; exit 2; }
++    need_node
++    name="$1"; pkg="$2"; shift 2
++    [ -f "$SERVERS" ] || { mkdir -p "$(dirname "$SERVERS")"; echo '{"mcpServers":{}}' > "$SERVERS"; }
++    echo "预先下载 $pkg …" >&2
++    npm cache add "$pkg" >/dev/null 2>&1 || true
++    SERVERS="$SERVERS" NAME="$name" PKG="$pkg" ARGS="$*" node --input-type=module -e '
++      import fs from "node:fs"
++      const f = process.env.SERVERS
++      const j = JSON.parse(fs.readFileSync(f, "utf8") || "{}"); j.mcpServers ||= {}
++      const extra = (process.env.ARGS || "").split(" ").filter(Boolean)
++      j.mcpServers[process.env.NAME] = { command: "npx", args: ["-y", process.env.PKG, ...extra], note: "来自 Mines 市场" }
++      fs.writeFileSync(f, JSON.stringify(j, null, 2))
++    '
++    echo "已添加 MCP 服务 $name"
++    ;;
++mcp-remove)
++    need_node
++    SERVERS="$SERVERS" NAME="$1" node --input-type=module -e '
++      import fs from "node:fs"
++      const f = process.env.SERVERS
++      const j = JSON.parse(fs.readFileSync(f, "utf8") || "{}")
++      if (j.mcpServers) delete j.mcpServers[process.env.NAME]
++      fs.writeFileSync(f, JSON.stringify(j, null, 2))
++    '
++    echo "已移除 MCP 服务 $1"
++    ;;
++*) sed -n '2,17p' "$0" ;;
 +esac
 diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-vps b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-vps
 new file mode 100755
@@ -352,32 +436,55 @@ index 0000000..c1033ef
 +esac
 diff --git a/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-dsh/socket.mjs b/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-dsh/socket.mjs
 new file mode 100644
-index 0000000..bb24768
+index 0000000..466fe61
 --- /dev/null
 +++ b/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-dsh/socket.mjs
-@@ -0,0 +1,214 @@
+@@ -0,0 +1,371 @@
 +#!/usr/bin/env node
 +// minis-dsh socket: loads DeepSeek Harness (dsh) plugins without dsh itself,
 +// gives each one a compatible `ctx`, and serves the tools they register as a
 +// single stdio MCP server that Minis already knows how to call.
 +//
 +// Supported ctx surface: tools.register, systemPrompt.section/context,
-+// commands.register (recorded), skills (recorded), on()/effect()/logger().
-+// A plugin that `inject`s a service outside this set (model, sessions, web UI…)
++// commands.register (recorded), skills (recorded), on()/effect()/logger(),
++// and llm.registerAdapter (model-provider plugins such as dsh-workbuddy-connect;
++// their models are served to Mines by `--gateway`, see below).
++// A plugin that `inject`s a service outside this set (sessions, web UI…)
 +// is skipped and reported by `minis-dsh list`.
 +import fs from 'node:fs'
 +import path from 'node:path'
 +import { createRequire } from 'node:module'
 +import { pathToFileURL } from 'node:url'
++import http from 'node:http'
 +
 +const HOME = process.env.MINIS_DSH_HOME || path.join(process.env.HOME || '/root', '.minis-dsh')
 +const STATE = path.join(HOME, 'plugins.json')
-+const SUPPORTED = new Set(['tools', 'systemPrompt', 'commands', 'skills', 'logger', 'agents'])
++const SUPPORTED = new Set(['tools', 'systemPrompt', 'commands', 'skills', 'logger', 'agents', 'llm'])
++const fmt = (v) => v instanceof Error ? (v.stack || v.message) : (typeof v === 'string' ? v : (() => { try { return JSON.stringify(v) } catch { return String(v) } })())
 +const log = (...a) => { try { fs.appendFileSync(path.join(HOME, 'socket.log'), `[${new Date().toISOString()}] ${a.join(' ')}\n`) } catch {} }
 +
 +const tools = new Map()        // name -> { def, plugin }
 +const sections = []            // { plugin, order, text|fn }
-+const status = {}              // plugin -> { ok, reason, tools: [] }
++const status = {}              // plugin -> { ok, reason, tools: [], llm: [] }
++const adapters = new Map()     // provider route id -> { adapter, plugin }
++
++// The `llm` service: model-provider plugins register an adapter per provider
++// route. Mines does not run dsh's model loop; the gateway below turns each
++// registered route into an OpenAI-compatible endpoint Mines already speaks.
++function makeLlm(pluginName) {
++  return {
++    registerAdapter(ids, adapter) {
++      const list = Array.isArray(ids) ? ids : [ids]
++      for (const id of list) {
++        adapters.set(String(id), { adapter, plugin: pluginName })
++        if (!status[pluginName].llm.includes(String(id))) status[pluginName].llm.push(String(id))
++      }
++      return () => { for (const id of list) adapters.delete(String(id)) }
++    },
++    adapters() { return [...adapters.keys()] },
++    prepareCall() { throw new Error('minis-dsh: llm.prepareCall is not available in Mines') },
++  }
++}
 +
 +function makeCtx(pluginName, config) {
 +  const disposers = []
@@ -410,13 +517,25 @@ index 0000000..bb24768
 +    commands: { register() { return () => {} } },
 +    skills: { register() { return () => {} } },
 +    agents: {},
++    llm: makeLlm(pluginName),
 +    on() { return () => {} },
 +    emit() {}, serial: async () => {}, parallel: async () => {},
 +    effect(fn) { try { const d = fn(); if (typeof d === 'function') disposers.push(d) } catch (e) { log(pluginName, 'effect', e.message) } return () => {} },
-+    logger(name) { const f = (...a) => log(`${pluginName}/${name}:`, ...a); return { info: f, warn: f, error: f, debug: f, success: f } },
++    // Callable (`ctx.logger('x').info()`) and usable directly (`ctx.logger.warn()`).
++    logger: Object.assign(
++      (name) => { const f = (...a) => log(`${pluginName}/${name}:`, ...a.map(fmt)); return { info: f, warn: f, error: f, debug: f, success: f } },
++      Object.fromEntries(['info', 'warn', 'error', 'debug', 'success'].map(k => [k, (...a) => log(`${pluginName}:`, ...a.map(fmt))])),
++    ),
 +    plugin() { return () => {} },
-+    inject(_deps, fn) { try { fn(ctx) } catch (e) { log(pluginName, 'inject', e.message) } },
-+    get(name) { return ctx[name] },
++    // Optional services: run the callback only when every one is provided
++    // here (dsh does the same when a service is absent).
++    inject(deps, fn) {
++      const need = Array.isArray(deps) ? deps : Object.keys(deps || {})
++      if (need.some(d => !SUPPORTED.has(d))) return () => {}
++      try { fn(ctx) } catch (e) { log(pluginName, 'inject', e.message) }
++      return () => {}
++    },
++    get(name) { return SUPPORTED.has(name) ? ctx[name] : undefined },
 +    set() {}, provide() {}, mixin() {},
 +    scope: { dispose: () => disposers.forEach(d => { try { d() } catch {} }) },
 +  }
@@ -444,7 +563,7 @@ index 0000000..bb24768
 +
 +async function loadPlugin(entry) {
 +  const name = entry.package
-+  status[name] = { ok: false, reason: '', tools: [] }
++  status[name] = { ok: false, reason: '', tools: [], llm: [] }
 +  try {
 +    const req = createRequire(path.join(HOME, 'node_modules', 'noop.js'))
 +    let resolved
@@ -501,19 +620,141 @@ index 0000000..bb24768
 +  try { state = JSON.parse(fs.readFileSync(STATE, 'utf8')) } catch {}
 +  process.on('exit', () => { try { fs.writeFileSync(path.join(HOME, 'status.json'), JSON.stringify(status, null, 2)) } catch {} })
 +  for (const p of state.plugins || []) {
-+    if (p.enabled === false) { status[p.package] = { ok: false, reason: '已停用', tools: [] }; continue }
++    if (p.enabled === false) { status[p.package] = { ok: false, reason: '已停用', tools: [], llm: [] }; continue }
 +    await loadPlugin(p)
 +  }
 +  try { fs.writeFileSync(path.join(HOME, 'status.json'), JSON.stringify(status, null, 2)) } catch {}
 +}
 +
++// --- model gateway helpers ---------------------------------------------
++const GATEWAY_PORT = Number(process.env.MINIS_DSH_GATEWAY_PORT || 8790)
++
++// pi-ai backed adapters (dsh-llm-pi-ai PiAiAdapter and subclasses) expose
++// their per-route profile through `config.profiles()`; each model carries the
++// wire protocol (`api`) and the endpoint it talks to (`baseUrl`).
++function profileOf(adapter, route) {
++  try { return adapter?.config?.profiles?.()?.get(route) } catch { return undefined }
++}
++function descriptorsOf(adapter, route) {
++  try {
++    const snap = typeof adapter.current === 'function' ? adapter.current() : undefined
++    const ms = snap?.models?.getModels?.(route)
++    if (Array.isArray(ms) && ms.length) return ms
++  } catch {}
++  try {
++    const p = profileOf(adapter, route)
++    const ms = p?.piProvider?.getModels?.()
++    if (Array.isArray(ms)) return ms
++  } catch {}
++  return []
++}
++async function routeInfo(route) {
++  const a = adapters.get(route)
++  if (!a) return undefined
++  let listed = []
++  try { listed = await a.adapter.listModels(route) } catch (e) { log('listModels', route, e.message) }
++  const desc = descriptorsOf(a.adapter, route)
++  const byId = new Map(desc.map(d => [d.id, d]))
++  const models = (listed.length ? listed : desc).map(m => {
++    const d = byId.get(m.id)
++    return { id: m.id, name: m.name || m.id, api: d?.api || '', images: (m.inputModalities || d?.input || []).includes('image'),
++      context: d?.contextWindow || 0, proxied: !!d && d.api === 'openai-completions' && !!d.baseUrl }
++  })
++  let name = route
++  try { name = a.adapter.providerInfo?.(route)?.name || profileOf(a.adapter, route)?.displayName || route } catch {}
++  return { id: route, name, plugin: a.plugin, models }
++}
++async function writeLlmIndex() {
++  const out = { port: GATEWAY_PORT, updatedAt: Date.now(), providers: [] }
++  for (const route of adapters.keys()) { const r = await routeInfo(route); if (r) out.providers.push(r) }
++  try { fs.writeFileSync(path.join(HOME, 'llm.json'), JSON.stringify(out, null, 2)) } catch {}
++  return out
++}
++// Plugins register their routes from async start-up work (a loopback shim
++// has to bind first), so give them a moment before reporting.
++async function settle(ms = 2500) {
++  const want = Object.values(status).some(s => s.ok) ? ms : 0
++  const t0 = Date.now()
++  while (Date.now() - t0 < want) {
++    await new Promise(r => setTimeout(r, 250))
++    if (adapters.size && Date.now() - t0 > 800) break
++  }
++}
++
 +// --- `node socket.mjs --check`: load everything and print a report ---
 +if (process.argv.includes('--check')) {
 +  await boot()
++  await settle()
++  const idx = await writeLlmIndex()
++  try { fs.writeFileSync(path.join(HOME, 'status.json'), JSON.stringify(status, null, 2)) } catch {}
 +  for (const [name, st] of Object.entries(status)) {
-+    console.log(`${st.ok ? '✓' : '✗'} ${name}${st.ok ? `  工具: ${st.tools.join(', ') || '无'}` : `  ${st.reason}`}`)
++    const llm = idx.providers.filter(p => p.plugin === name)
++    const llmText = llm.length ? `  模型: ${llm.map(p => `${p.name}(${p.models.length})`).join(', ')}` : ''
++    console.log(`${st.ok ? '✓' : '✗'} ${name}${st.ok ? `  工具: ${st.tools.join(', ') || '无'}${llmText}` : `  ${st.reason}`}`)
 +  }
 +  process.exit(0)
++}
++
++// --- `node socket.mjs --gateway`: OpenAI-compatible endpoint for plugin models ---
++//   GET  /health
++//   GET  /p/<route>/v1/models
++//   POST /p/<route>/v1/chat/completions   (proxied to the plugin's own endpoint)
++// Bound to 127.0.0.1 only. Mines adds one provider per route.
++if (process.argv.includes('--gateway')) {
++  await boot()
++  await settle(4000)
++  await writeLlmIndex()
++  setInterval(() => { writeLlmIndex().catch(() => {}) }, 60_000).unref()
++  const json = (res, code, body) => { const b = JSON.stringify(body); res.writeHead(code, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(b) }); res.end(b) }
++  const err = (res, code, msg) => json(res, code, { error: { message: msg, type: 'minis_dsh', code } })
++  const readBody = (req) => new Promise((ok, bad) => { const c = []; req.on('data', d => c.push(d)); req.on('end', () => ok(Buffer.concat(c))); req.on('error', bad) })
++  const server = http.createServer(async (req, res) => {
++    try {
++      const url = new URL(req.url || '/', 'http://127.0.0.1')
++      if (url.pathname === '/health') return json(res, 200, { ok: true, routes: [...adapters.keys()] })
++      if (url.pathname === '/index') return json(res, 200, await writeLlmIndex())
++      const m = /^\/p\/([^/]+)(?:\/v1)?(\/.*)$/.exec(url.pathname)
++      if (!m) return err(res, 404, 'unknown path')
++      const route = decodeURIComponent(m[1]); const rest = m[2]
++      const a = adapters.get(route)
++      if (!a) return err(res, 404, `插件模型 ${route} 还没加载（检查登录或插件是否启用）`)
++      if (req.method === 'GET' && (rest === '/models' || rest === '/models/')) {
++        const info = await routeInfo(route)
++        return json(res, 200, { object: 'list', data: (info?.models || []).filter(x => x.proxied).map(x => ({ id: x.id, object: 'model', created: 0, owned_by: route, name: x.name, context_length: x.context || undefined })) })
++      }
++      if (req.method === 'POST' && (rest === '/chat/completions' || rest === '/chat/completions/')) {
++        const raw = await readBody(req)
++        let body; try { body = JSON.parse(raw.toString('utf8')) } catch { return err(res, 400, 'bad json') }
++        const d = descriptorsOf(a.adapter, route).find(x => x.id === body.model)
++        if (!d) return err(res, 404, `没有模型 ${body.model}`)
++        if (d.api !== 'openai-completions' || !d.baseUrl) return err(res, 501, `模型 ${body.model} 用的是 ${d.api || '未知'} 接口，Mines 暂时只能转发 OpenAI 格式`)
++        let key = ''
++        try { key = (await a.adapter.config?.resolveApiKey?.(route, profileOf(a.adapter, route))) || '' } catch (e) { return err(res, 401, `登录信息不可用：${e.message}`) }
++        const ac = new AbortController(); res.on('close', () => ac.abort())
++        let up
++        try {
++          up = await fetch(d.baseUrl.replace(/\/$/, '') + '/chat/completions', {
++            method: 'POST', signal: ac.signal,
++            headers: { 'content-type': 'application/json', accept: req.headers.accept || '*/*', ...(key ? { authorization: `Bearer ${key}` } : {}) },
++            body: JSON.stringify(body),
++          })
++        } catch (e) { return err(res, 502, `插件端点连不上：${e.message}`) }
++        res.writeHead(up.status, { 'content-type': up.headers.get('content-type') || 'application/json', 'cache-control': 'no-cache' })
++        if (!up.body) return res.end()
++        const reader = up.body.getReader()
++        for (;;) { const { done, value } = await reader.read(); if (done) break; res.write(Buffer.from(value)) }
++        return res.end()
++      }
++      return err(res, 404, `unsupported: ${req.method} ${rest}`)
++    } catch (e) {
++      log('gateway', e.stack || e.message)
++      if (!res.headersSent) err(res, 500, e.message); else res.end()
++    }
++  })
++  server.on('error', (e) => { log('gateway listen', e.message); process.exit(3) })
++  server.listen(GATEWAY_PORT, '127.0.0.1', () => log('gateway listening', GATEWAY_PORT))
++  process.on('SIGTERM', () => process.exit(0))
++  await new Promise(() => {})
 +}
 +
 +// --- stdio MCP server (newline-delimited JSON-RPC) ---
@@ -616,10 +857,22 @@ index 46d1a76..53d3b37 100644
                  // only real recovery is a fresh process: tell the user, then
                  // exit hard so the next tap gets a clean init.
 diff --git a/src/android/app/src/main/java/com/openminis/app/MinisApp.kt b/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
-index d1f65a5..5ec6464 100644
+index d1f65a5..629d5d7 100644
 --- a/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
-@@ -668,6 +668,9 @@ class MinisApp : Application(), ImageLoaderFactory {
+@@ -239,6 +239,11 @@ class MinisApp : Application(), ImageLoaderFactory {
+     @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
+     override fun onCreate() {
+         super.onCreate()
++        // [Mines] Split proxy installs its ProxySelector before any HTTP client is built.
++        runCatching { com.openminis.app.plus.SplitProxy.init(this) }
++        runCatching { com.openminis.app.plus.HumanVerify.init(this) }
++        runCatching { com.openminis.app.plus.ChatOrganizer.init(this) }
++        runCatching { com.openminis.app.plus.SmartRouter.init(this) }
+         // [T-android-content-capture-off] Opt every Compose window out of
+         // Android content capture, before any of them exists.
+         //
+@@ -668,6 +673,9 @@ class MinisApp : Application(), ImageLoaderFactory {
          // the server only needs the rootfs tmp directory, which can be
          // materialized lazily. Starting here means the abstract socket is
          // reachable even before any shell session is launched.
@@ -629,7 +882,7 @@ index d1f65a5..5ec6464 100644
          NativeOffloadServer.register("android-alarm", AlarmOffloadHandler(this))
          NativeOffloadServer.register("android-calendar", CalendarOffloadHandler(this))
          NativeOffloadServer.register("android-clipboard", ClipboardOffloadHandler(this))
-@@ -692,6 +695,14 @@ class MinisApp : Application(), ImageLoaderFactory {
+@@ -692,6 +700,14 @@ class MinisApp : Application(), ImageLoaderFactory {
              com.openminis.app.sandbox.offload.ConfigOffloadHandler(),
          )
          NativeOffloadServer.register("minis-browser-use", BrowserUseOffloadHandler(this))
@@ -826,6 +1079,23 @@ index d712d97..4cb0a17 100644
              )
          }
          return manifest
+diff --git a/src/android/app/src/main/java/com/openminis/app/browser/BrowserAction.kt b/src/android/app/src/main/java/com/openminis/app/browser/BrowserAction.kt
+index 5c8f7e7..0b70d00 100644
+--- a/src/android/app/src/main/java/com/openminis/app/browser/BrowserAction.kt
++++ b/src/android/app/src/main/java/com/openminis/app/browser/BrowserAction.kt
+@@ -25,7 +25,11 @@ enum class BrowserAction(val value: String) {
+     GET_COOKIES("get_cookies"),
+     SET_COOKIES("set_cookies"),
+     SCROLL_AND_COLLECT("scroll_and_collect"),
+-    WAIT_FOR_DOM_STABLE("wait_for_dom_stable");
++    WAIT_FOR_DOM_STABLE("wait_for_dom_stable"),
++    // [Mines] Human verification: wait (≤50 s per call) for the user to clear a captcha.
++    WAIT_FOR_HUMAN("wait_for_human"),
++    // [Mines] Wait for an SMS / e-mail one-time code and fill it in (code never shown).
++    WAIT_FOR_OTP("wait_for_otp");
+ 
+     /**
+      * [T-browser-readaction-follow-tab-and-yolo-android] True when this action
 diff --git a/src/android/app/src/main/java/com/openminis/app/browser/BrowserTabPool.kt b/src/android/app/src/main/java/com/openminis/app/browser/BrowserTabPool.kt
 index 70e68c0..bcd9e22 100644
 --- a/src/android/app/src/main/java/com/openminis/app/browser/BrowserTabPool.kt
@@ -839,6 +1109,100 @@ index 70e68c0..bcd9e22 100644
       * the wheel. Dropping `inUse` is the whole job — the page they are looking
       * at must survive, so this deliberately does NOT release WebView
       * resources. Destroying here would blank the screen at the exact moment
+diff --git a/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt b/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt
+index b16eb7a..4d603b7 100644
+--- a/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt
++++ b/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt
+@@ -761,6 +761,8 @@ class BrowserUseManager(
+                 input.scrollCount, input.itemSelector, input.keywords,
+             )
+             BrowserAction.WAIT_FOR_DOM_STABLE -> return waitForDomStable(input.timeoutMs)
++            BrowserAction.WAIT_FOR_HUMAN -> return minesWaitForHuman()
++            BrowserAction.WAIT_FOR_OTP -> return minesWaitForOtp(input.selector)
+             BrowserAction.NEW_TAB, BrowserAction.CLOSE_TAB, BrowserAction.LIST_TABS ->
+                 return BrowserActionResult.error("Tab management actions must be routed through BrowserTabPool")
+         }
+@@ -784,9 +786,80 @@ class BrowserUseManager(
+             }
+         }
+ 
++        // [Mines] Human verification + one-time-code autofill.
++        if (result.success && BrowserAction.visualChangeActions.contains(input.action) && input.action != BrowserAction.SCROLL && input.action != BrowserAction.HOVER) {
++            result = minesAfterAction(result)
++        }
++
+         return result
+     }
+ 
++    // -- [Mines] Human verification --
++
++    private suspend fun minesScan(): com.openminis.app.plus.HumanVerify.Scan =
++        com.openminis.app.plus.HumanVerify.parseScan(
++            runCatching { evaluateJavascript(com.openminis.app.plus.HumanVerify.DETECT_JS) }.getOrNull()
++        )
++
++    private suspend fun minesUrl(): String = withContext(Dispatchers.Main) { webView.url } ?: ""
++
++    private suspend fun minesAfterAction(result: BrowserActionResult): BrowserActionResult {
++        val ctx = appContext ?: return result
++        val hv = com.openminis.app.plus.HumanVerify
++        hv.init(ctx)
++        val st = hv.settings.value
++        if (!st.challenges && !st.otpAutofill) return result
++        val scan = minesScan()
++        var text = result.text
++        var snap = false
++        if (st.challenges) {
++            hv.handle(ctx, scan, minesUrl(), rescan = { minesScan() }, currentUrl = { minesUrl() })?.let { text += "\n" + it; snap = true }
++        }
++        if (st.otpAutofill && scan.otpField) {
++            hv.armOtp()
++            if (scan.otpEmpty) hv.takeCode()?.let { code ->
++                val r = runCatching { evaluateJavascript(hv.fillJs(code, null)) }.getOrNull()
++                if (r == "ok") text += "\n[验证码] 已自动填入刚收到的短信/邮件验证码（${code.length} 位）。"
++            }
++        }
++        val out = result.copy(text = text)
++        return if (snap) attachSnapshot(out) else out
++    }
++
++    private suspend fun minesWaitForHuman(): BrowserActionResult {
++        val ctx = appContext ?: return BrowserActionResult.error("no app context")
++        val hv = com.openminis.app.plus.HumanVerify
++        hv.init(ctx)
++        val scan = minesScan()
++        if (scan.kind.isBlank()) {
++            hv.clearPending(ctx)
++            return attachSnapshot(BrowserActionResult(text = "当前页面没有人机验证，可以继续。", pageURL = minesUrl()))
++        }
++        val note = hv.waitForHuman(ctx, scan.kind, minesUrl(), rescan = { minesScan() }, currentUrl = { minesUrl() })
++        return attachSnapshot(BrowserActionResult(text = note, pageURL = minesUrl()))
++    }
++
++    private suspend fun minesWaitForOtp(selector: String?): BrowserActionResult {
++        val ctx = appContext ?: return BrowserActionResult.error("no app context")
++        val hv = com.openminis.app.plus.HumanVerify
++        hv.init(ctx)
++        if (!hv.settings.value.otpAutofill) {
++            return BrowserActionResult.error("验证码自动填写已在设置里关闭，请让用户把验证码告诉你")
++        }
++        if (!com.openminis.app.offload.MinisNotificationListenerService.isConnected()) {
++            return BrowserActionResult.error("Mines 没有通知使用权，收不到短信验证码。请让用户在 设置 → 浏览器验证 里打开通知使用权，或把验证码直接告诉你")
++        }
++        val code = hv.awaitCode(com.openminis.app.plus.HumanVerify.WAIT_SLICE_MS)
++            ?: return BrowserActionResult(text = "约 50 秒内没收到验证码短信/邮件通知。确认已经点了发送验证码后，可以再调用一次 wait_for_otp。", success = true)
++        val r = runCatching { evaluateJavascript(hv.fillJs(code, selector)) }.getOrNull()
++        return if (r == "ok") {
++            attachSnapshot(BrowserActionResult(text = "已收到验证码并填入（${code.length} 位，内容不显示）。接下来点击提交/登录按钮。", pageURL = minesUrl()))
++        } else {
++            hv.putBack(code)
++            BrowserActionResult(text = "收到了验证码，但页面上找不到验证码输入框。请用 selector 指定输入框再调用 wait_for_otp（验证码会保留 2 分钟）。", success = true)
++        }
++    }
++
+     private suspend fun attachSnapshot(result: BrowserActionResult): BrowserActionResult {
+         return try {
+             delay(300) // Let page settle
 diff --git a/src/android/app/src/main/java/com/openminis/app/config/ConfigBuiltins.kt b/src/android/app/src/main/java/com/openminis/app/config/ConfigBuiltins.kt
 index f7d5b55..fba299c 100644
 --- a/src/android/app/src/main/java/com/openminis/app/config/ConfigBuiltins.kt
@@ -1201,6 +1565,19 @@ index 4fff9cc..00a659c 100644
              .setContentText(label)
              .setPriority(NotificationCompat.PRIORITY_HIGH)
              .setCategory(NotificationCompat.CATEGORY_ALARM)
+diff --git a/src/android/app/src/main/java/com/openminis/app/offload/MinisNotificationListenerService.kt b/src/android/app/src/main/java/com/openminis/app/offload/MinisNotificationListenerService.kt
+index 47811df..1abf033 100644
+--- a/src/android/app/src/main/java/com/openminis/app/offload/MinisNotificationListenerService.kt
++++ b/src/android/app/src/main/java/com/openminis/app/offload/MinisNotificationListenerService.kt
+@@ -40,6 +40,8 @@ class MinisNotificationListenerService : NotificationListenerService() {
+         // until the listener has actually observed its own post.
+         val key = postKey(sbn.packageName, sbn.id)
+         postedLatches.remove(key)?.countDown()
++        // [Mines] One-time codes for the agent's browser (memory only, never logged).
++        runCatching { com.openminis.app.plus.HumanVerify.onNotification(applicationContext, sbn) }
+     }
+ 
+     override fun onNotificationRemoved(sbn: StatusBarNotification) {}
 diff --git a/src/android/app/src/main/java/com/openminis/app/offload/ScheduledNotificationReceiver.kt b/src/android/app/src/main/java/com/openminis/app/offload/ScheduledNotificationReceiver.kt
 index e8d299e..cc37ab6 100644
 --- a/src/android/app/src/main/java/com/openminis/app/offload/ScheduledNotificationReceiver.kt
@@ -1223,287 +1600,3 @@ index e8d299e..cc37ab6 100644
              .setContentTitle(title)
              .setContentText(body)
              .setAutoCancel(true)
-diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Avatars.kt b/src/android/app/src/main/java/com/openminis/app/plus/Avatars.kt
-new file mode 100644
-index 0000000..06df5b1
---- /dev/null
-+++ b/src/android/app/src/main/java/com/openminis/app/plus/Avatars.kt
-@@ -0,0 +1,278 @@
-+package com.openminis.app.plus
-+
-+import android.content.Context
-+import android.graphics.Bitmap
-+import android.graphics.BitmapFactory
-+import android.graphics.Canvas
-+import android.graphics.Color
-+import android.graphics.ImageDecoder
-+import android.graphics.Paint
-+import android.graphics.Path
-+import android.graphics.RectF
-+import android.graphics.drawable.Animatable
-+import android.graphics.drawable.BitmapDrawable
-+import android.graphics.drawable.Drawable
-+import android.os.Build
-+import android.util.AttributeSet
-+import android.view.View
-+import com.openminis.app.R
-+import java.io.File
-+import kotlin.math.abs
-+import kotlin.math.max
-+import kotlin.math.sin
-+
-+data class BuiltinAvatar(val id: String, val name: String, val full: Int, val face: Int)
-+
-+/**
-+ * The avatar shown on the Today card, the voice screen and the desk pet:
-+ * six built-in anime maid characters, or the user's own picture / GIF /
-+ * animated WebP (circle-cropped, optional plain-background removal).
-+ */
-+object Avatars {
-+    const val CUSTOM = "custom"
-+    val builtins = listOf(
-+        BuiltinAvatar("whale", "鲸鱼娘", R.drawable.avatar_whale, R.drawable.avatar_whale_face),
-+        BuiltinAvatar("claude", "Claude娘", R.drawable.avatar_claude, R.drawable.avatar_claude_face),
-+        BuiltinAvatar("gpt", "GPT娘", R.drawable.avatar_gpt, R.drawable.avatar_gpt_face),
-+        BuiltinAvatar("gemini", "Gemini娘", R.drawable.avatar_gemini, R.drawable.avatar_gemini_face),
-+        BuiltinAvatar("qwen", "通义娘", R.drawable.avatar_qwen, R.drawable.avatar_qwen_face),
-+        BuiltinAvatar("kimi", "Kimi娘", R.drawable.avatar_kimi, R.drawable.avatar_kimi_face),
-+    )
-+
-+    /** Ring / accent colours (terracotta first, the Mines brand colour). */
-+    val colors = listOf(
-+        0xFFD97757.toInt(), 0xFFF4F0E8.toInt(), 0xFF5B8DEF.toInt(), 0xFF34C759.toInt(),
-+        0xFFAF52DE.toInt(), 0xFFFF6F91.toInt(), 0xFF8E8E93.toInt(),
-+    )
-+
-+    /** Old styles (penguin / cat / ghost) map to the default character. */
-+    fun normalize(style: String): String =
-+        if (style == CUSTOM || builtins.any { it.id == style }) style else builtins.first().id
-+
-+    fun name(style: String): String = builtins.firstOrNull { it.id == style }?.name ?: "我的形象"
-+
-+    fun sourceFile(context: Context) = File(context.filesDir, "plus_avatar_src")
-+    fun noBgFile(context: Context) = File(context.filesDir, "plus_avatar_nobg.png")
-+    fun pickFile(context: Context) = File(context.filesDir, "plus_avatar_pick")
-+
-+    fun hasCustom(context: Context) = sourceFile(context).exists()
-+
-+    /** True for GIF / animated WebP / animated HEIF content. */
-+    fun isAnimated(file: File): Boolean {
-+        if (!file.exists()) return false
-+        val head = ByteArray(64)
-+        val n = runCatching { file.inputStream().use { it.read(head) } }.getOrDefault(0)
-+        if (n < 12) return false
-+        val s = String(head, 0, n, Charsets.ISO_8859_1)
-+        return s.startsWith("GIF8") || (s.startsWith("RIFF") && s.substring(8, 12) == "WEBP" && s.contains("ANIM")) ||
-+            (s.startsWith("RIFF") && s.substring(8, 12) == "WEBP" && s.contains("VP8X") && (head[20].toInt() and 0x02) != 0)
-+    }
-+
-+    /** Decodes [file] as a (possibly animated) drawable; animation needs Android 9+. */
-+    fun decode(context: Context, file: File): Drawable? = runCatching {
-+        if (Build.VERSION.SDK_INT >= 28) {
-+            ImageDecoder.decodeDrawable(ImageDecoder.createSource(file)) { decoder, info, _ ->
-+                val longest = max(info.size.width, info.size.height)
-+                if (longest > 768) {
-+                    val f = 768f / longest
-+                    decoder.setTargetSize((info.size.width * f).toInt().coerceAtLeast(1), (info.size.height * f).toInt().coerceAtLeast(1))
-+                }
-+                decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
-+            }
-+        } else {
-+            val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-+            BitmapFactory.decodeFile(file.absolutePath, o)
-+            var sample = 1
-+            while (max(o.outWidth, o.outHeight) / (sample * 2) >= 768) sample *= 2
-+            BitmapFactory.decodeFile(file.absolutePath, BitmapFactory.Options().apply { inSampleSize = sample })
-+                ?.let { BitmapDrawable(context.resources, it) }
-+        }
-+    }.getOrNull()
-+
-+    /**
-+     * Removes a plain background: flood-fills from the image border through pixels
-+     * close to the border colours, then softens the edge. Works best on photos /
-+     * pictures with a fairly even background. Writes [noBgFile].
-+     */
-+    fun removeBackground(context: Context): Boolean = runCatching {
-+        val src = sourceFile(context)
-+        val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-+        BitmapFactory.decodeFile(src.absolutePath, o)
-+        var sample = 1
-+        while (max(o.outWidth, o.outHeight) / (sample * 2) >= 640) sample *= 2
-+        val bmp = BitmapFactory.decodeFile(src.absolutePath, BitmapFactory.Options().apply {
-+            inSampleSize = sample; inMutable = true; inPreferredConfig = Bitmap.Config.ARGB_8888
-+        }) ?: return false
-+        val w = bmp.width; val h = bmp.height
-+        val px = IntArray(w * h)
-+        bmp.getPixels(px, 0, w, 0, 0, w, h)
-+        // Reference colours: samples along the border.
-+        val refs = ArrayList<Int>()
-+        for (i in 0 until 16) {
-+            refs += px[(i * (w - 1) / 15)]                       // top
-+            refs += px[(h - 1) * w + (i * (w - 1) / 15)]         // bottom
-+            refs += px[(i * (h - 1) / 15) * w]                   // left
-+            refs += px[(i * (h - 1) / 15) * w + (w - 1)]         // right
-+        }
-+        fun near(c: Int, tol: Int): Boolean = refs.any { r ->
-+            abs(Color.red(c) - Color.red(r)) + abs(Color.green(c) - Color.green(r)) + abs(Color.blue(c) - Color.blue(r)) < tol
-+        }
-+        val bg = BooleanArray(w * h)
-+        val stack = IntArray(w * h)
-+        var sp = 0
-+        fun seed(i: Int) { if (!bg[i] && Color.alpha(px[i]) > 0 && near(px[i], 60)) { bg[i] = true; stack[sp++] = i } }
-+        for (x in 0 until w) { seed(x); seed((h - 1) * w + x) }
-+        for (y in 0 until h) { seed(y * w); seed(y * w + w - 1) }
-+        while (sp > 0) {
-+            val i = stack[--sp]; val x = i % w; val y = i / w
-+            if (x > 0) seed(i - 1); if (x < w - 1) seed(i + 1)
-+            if (y > 0) seed(i - w); if (y < h - 1) seed(i + w)
-+        }
-+        var removed = 0
-+        for (i in px.indices) {
-+            if (bg[i]) { px[i] = 0; removed++ }
-+            else {
-+                // Soft edge: half-transparent where a neighbour is background.
-+                val x = i % w; val y = i / w
-+                val edge = (x > 0 && bg[i - 1]) || (x < w - 1 && bg[i + 1]) || (y > 0 && bg[i - w]) || (y < h - 1 && bg[i + w])
-+                if (edge) px[i] = (px[i] and 0x00FFFFFF) or (0xB0 shl 24)
-+            }
-+        }
-+        if (removed < w * h / 50) return false // nothing that looks like a plain background
-+        bmp.setPixels(px, 0, w, 0, 0, w, h)
-+        noBgFile(context).outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
-+        true
-+    }.getOrDefault(false)
-+}
-+
-+/** Crop of the user's own picture inside the circle. */
-+data class AvatarCrop(val scale: Float = 1f, val offX: Float = 0f, val offY: Float = 0f)
-+
-+/**
-+ * Draws the current avatar (built-in or custom) on a canvas. Shared by the
-+ * Compose [AvatarView] and the desk-pet overlay so both always match.
-+ */
-+class AvatarRenderer(private val context: Context) {
-+    private var key: String? = null
-+    private var builtinFull: Bitmap? = null
-+    private var builtinFace: Bitmap? = null
-+    private var custom: Drawable? = null
-+    var callback: Drawable.Callback? = null
-+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-+    private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
-+    private val clip = Path()
-+
-+    private fun load(style: String, version: Long, noBg: Boolean) {
-+        val k = "$style/$version/$noBg"
-+        if (k == key) return
-+        key = k
-+        (custom as? Animatable)?.stop()
-+        custom = null; builtinFull = null; builtinFace = null
-+        if (style == Avatars.CUSTOM) {
-+            val f = if (noBg && Avatars.noBgFile(context).exists()) Avatars.noBgFile(context) else Avatars.sourceFile(context)
-+            custom = Avatars.decode(context, f)?.also { d ->
-+                d.callback = callback
-+                (d as? Animatable)?.start()
-+            }
-+            if (custom != null) return
-+        }
-+        val b = Avatars.builtins.firstOrNull { it.id == style } ?: Avatars.builtins.first()
-+        builtinFull = BitmapFactory.decodeResource(context.resources, b.full)
-+        builtinFace = BitmapFactory.decodeResource(context.resources, b.face)
-+    }
-+
-+    fun stop() { (custom as? Animatable)?.stop(); key = null }
-+
-+    /**
-+     * @param face true = round head crop (Today card, lists); false = full body (desk pet, large previews)
-+     * @param bob vertical breathing offset as a fraction of height
-+     */
-+    fun draw(
-+        canvas: Canvas, w: Float, h: Float,
-+        style: String, face: Boolean, ringColor: Int?, bob: Float = 0f,
-+        crop: AvatarCrop = AvatarCrop(), version: Long = 0L, noBg: Boolean = false,
-+    ) {
-+        load(Avatars.normalize(style), version, noBg)
-+        val size = minOf(w, h)
-+        val left = (w - size) / 2f
-+        val top = (h - size) / 2f + bob * size
-+        val c = custom
-+        if (c != null) {
-+            // Custom picture: always a circle, user crop applied.
-+            canvas.save()
-+            clip.reset(); clip.addCircle(left + size / 2, top + size / 2, size / 2, Path.Direction.CW)
-+            canvas.clipPath(clip)
-+            val dw = c.intrinsicWidth.coerceAtLeast(1).toFloat(); val dh = c.intrinsicHeight.coerceAtLeast(1).toFloat()
-+            val base = max(size / dw, size / dh) * crop.scale.coerceIn(1f, 5f)
-+            val sw = dw * base; val sh = dh * base
-+            val cx = left + size / 2 + crop.offX * size; val cy = top + size / 2 + crop.offY * size
-+            c.setBounds((cx - sw / 2).toInt(), (cy - sh / 2).toInt(), (cx + sw / 2).toInt(), (cy + sh / 2).toInt())
-+            c.draw(canvas)
-+            canvas.restore()
-+            drawRing(canvas, left, top, size, ringColor)
-+            return
-+        }
-+        if (face) {
-+            val bmp = builtinFace ?: return
-+            canvas.save()
-+            clip.reset(); clip.addCircle(left + size / 2, top + size / 2, size / 2, Path.Direction.CW)
-+            canvas.clipPath(clip)
-+            ringColor?.let { rc ->
-+                paint.color = (rc and 0x00FFFFFF) or (0x33 shl 24)
-+                canvas.drawCircle(left + size / 2, top + size / 2, size / 2, paint)
-+            }
-+            canvas.drawBitmap(bmp, null, RectF(left, top, left + size, top + size), paint)
-+            canvas.restore()
-+            drawRing(canvas, left, top, size, ringColor)
-+        } else {
-+            val bmp = builtinFull ?: return
-+            canvas.drawBitmap(bmp, null, RectF(left, top, left + size, top + size), paint)
-+        }
-+    }
-+
-+    private fun drawRing(canvas: Canvas, left: Float, top: Float, size: Float, ringColor: Int?) {
-+        val rc = ringColor ?: return
-+        ring.color = rc
-+        ring.strokeWidth = (size * 0.035f).coerceAtLeast(2f)
-+        canvas.drawCircle(left + size / 2, top + size / 2, size / 2 - ring.strokeWidth / 2, ring)
-+    }
-+}
-+
-+/** A plain View around [AvatarRenderer]; used from Compose via AndroidView. */
-+class AvatarView @JvmOverloads constructor(context: Context, attrs: AttributeSet? = null) : View(context, attrs) {
-+    private val renderer = AvatarRenderer(context).also { r ->
-+        r.callback = object : Drawable.Callback {
-+            override fun invalidateDrawable(who: Drawable) = invalidate()
-+            override fun scheduleDrawable(who: Drawable, what: Runnable, `when`: Long) { postDelayed(what, `when` - android.os.SystemClock.uptimeMillis()) }
-+            override fun unscheduleDrawable(who: Drawable, what: Runnable) { removeCallbacks(what) }
-+        }
-+    }
-+    var style: String? = null
-+    var face: Boolean = true
-+    var bob: Boolean = false
-+    var showRing: Boolean = true
-+    var crop: AvatarCrop? = null
-+    var noBg: Boolean? = null
-+    var version: Long? = null
-+    private val start = System.currentTimeMillis()
-+
-+    override fun onDraw(canvas: Canvas) {
-+        super.onDraw(canvas)
-+        val st = PlusPrefs.state.value
-+        val t = (System.currentTimeMillis() - start) / 1000f
-+        renderer.draw(
-+            canvas, width.toFloat(), height.toFloat(),
-+            style ?: st.petStyle, face, if (showRing) st.petColor else null,
-+            bob = if (bob) sin(t * 2.2f) * 0.02f else 0f,
-+            crop = crop ?: AvatarCrop(st.avatarScale, st.avatarOffX, st.avatarOffY),
-+            version = version ?: st.avatarVersion,
-+            noBg = noBg ?: st.avatarRemoveBg,
-+        )
-+        if (bob) postInvalidateDelayed(50)
-+    }
-+
-+    override fun onDetachedFromWindow() {
-+        renderer.stop()
-+        super.onDetachedFromWindow()
-+    }
-+}
