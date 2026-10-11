@@ -1,0 +1,1404 @@
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxScreen.kt
+new file mode 100644
+index 0000000..8592139
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxScreen.kt
+@@ -0,0 +1,193 @@
++package com.openminis.app.ui.plus
++
++import android.app.ActivityManager
++import android.content.Intent
++import android.net.Uri
++import android.os.PowerManager
++import android.provider.Settings
++import android.widget.Toast
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.outlined.CleaningServices
++import androidx.compose.material3.Button
++import androidx.compose.material3.LinearProgressIndicator
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedButton
++import androidx.compose.material3.Switch
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.platform.LocalLifecycleOwner
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.repeatOnLifecycle
++import com.openminis.app.offload.ShizukuManager
++import com.openminis.app.plus.PlusPrefs
++import com.openminis.app.plus.SandboxCare
++import com.openminis.app.plus.SandboxProc
++import com.openminis.app.sandbox.PhantomProcessGuard
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++
++/** Sandbox monitor: memory, running processes, one-tap cleanup, anti-kill. */
++@Composable
++fun SandboxScreen(onBack: () -> Unit) {
++    val context = LocalContext.current
++    PlusPrefs.init(context)
++    val st by PlusPrefs.state.collectAsState()
++    val scope = rememberCoroutineScope()
++    var procs by remember { mutableStateOf(emptyList<SandboxProc>()) }
++    var availMb by remember { mutableStateOf(0L) }
++    var totalMb by remember { mutableStateOf(1L) }
++    var tick by remember { mutableIntStateOf(0) }
++    val shizuku by ShizukuManager.snapshot.collectAsState()
++    val owner = LocalLifecycleOwner.current
++
++    LaunchedEffect(owner) {
++        owner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
++            while (true) {
++                val (list, mem) = withContext(Dispatchers.IO) {
++                    val am = context.getSystemService(ActivityManager::class.java)
++                    val mi = ActivityManager.MemoryInfo().also { am.getMemoryInfo(it) }
++                    SandboxCare.list() to mi
++                }
++                procs = list; availMb = mem.availMem / 1048576; totalMb = mem.totalMem / 1048576
++                tick++
++                delay(3000)
++            }
++        }
++    }
++
++    PlusPage("沙箱与防杀", onBack) {
++        val sandboxMb = procs.sumOf { it.rssKb } / 1024
++        val usedFrac = 1f - availMb.toFloat() / totalMb
++        // ---- Memory ----
++        Column(
++            Modifier.fillMaxWidth().padding(16.dp).clip(RoundedCornerShape(16.dp))
++                .background(MaterialTheme.colorScheme.surfaceContainerLow).padding(16.dp),
++        ) {
++            Text("沙箱正在用 $sandboxMb MB", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
++            Spacer(Modifier.height(4.dp))
++            Text("手机还剩 ${availMb / 1024.0}".take(9) + " GB 可用 · ${procs.size} 个进程",
++                style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
++            Spacer(Modifier.height(10.dp))
++            LinearProgressIndicator(
++                progress = { usedFrac.coerceIn(0f, 1f) },
++                modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)),
++                color = if (usedFrac > 0.85f) Color(0xFFFF3B30) else MaterialTheme.colorScheme.primary,
++            )
++            Spacer(Modifier.height(12.dp))
++            Button(onClick = {
++                scope.launch {
++                    val n = withContext(Dispatchers.IO) { SandboxCare.cleanHeavy() }
++                    Toast.makeText(context, if (n == 0) "没有要清理的" else "关掉了 $n 个占内存的进程", Toast.LENGTH_SHORT).show()
++                }
++            }, modifier = Modifier.fillMaxWidth()) {
++                androidx.compose.material3.Icon(Icons.Outlined.CleaningServices, null)
++                Spacer(Modifier.width(8.dp))
++                Text("一键清理")
++            }
++        }
++
++        PlusSection(null, footer = "浏览器、Node、Python 这类进程闲置 10 分钟（没用 CPU）就自动关掉。") {
++            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
++                Text("自动清理闲置进程", Modifier.weight(1f))
++                Switch(st.autoClean, onCheckedChange = { on -> PlusPrefs.update(context) { it.copy(autoClean = on) } })
++            }
++        }
++
++        // ---- Processes ----
++        PlusSection("正在运行") {
++            if (procs.isEmpty()) Text("沙箱现在很干净", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(16.dp))
++            procs.take(15).forEachIndexed { i, p ->
++                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
++                    Column(Modifier.weight(1f)) {
++                        Text(p.name, style = MaterialTheme.typography.bodyLarge, maxLines = 1)
++                        Text("${p.rssKb / 1024} MB · pid ${p.pid}", style = MaterialTheme.typography.bodySmall,
++                            color = MaterialTheme.colorScheme.onSurfaceVariant)
++                    }
++                    TextButton(onClick = { SandboxCare.kill(p.pid); procs = procs.filterNot { it.pid == p.pid } }) {
++                        Text("关闭", color = Color(0xFFFF3B30))
++                    }
++                }
++                if (i < minOf(procs.size, 15) - 1) PlusDivider()
++            }
++        }
++
++        // ---- Anti-kill ----
++        val pm = context.getSystemService(PowerManager::class.java)
++        val batteryOk = remember(tick) { pm.isIgnoringBatteryOptimizations(context.packageName) }
++        val killerOff = remember(tick) { PhantomProcessGuard.killerDisabled(context) }
++        PlusSection("防止被安卓杀掉", footer = "安卓 12 起，系统会杀掉超过 32 个的子进程，沙箱命令跑到一半就断。关掉这个限制需要 Shizuku（免 root）。") {
++            CheckRow("电池优化已关闭", batteryOk, "去关闭") {
++                runCatching {
++                    context.startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
++                        Uri.parse("package:${context.packageName}")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
++                }
++            }
++            PlusDivider()
++            val label = when (shizuku.state) {
++                ShizukuManager.State.NOT_INSTALLED -> "安装 Shizuku"
++                ShizukuManager.State.NOT_RUNNING -> "打开 Shizuku"
++                ShizukuManager.State.NEED_PERMISSION -> "授权"
++                ShizukuManager.State.READY -> "一键关闭"
++            }
++            CheckRow("子进程限制已关闭", killerOff, label) {
++                when (shizuku.state) {
++                    ShizukuManager.State.NOT_INSTALLED -> ShizukuManager.openInstallPage(context)
++                    ShizukuManager.State.NOT_RUNNING -> ShizukuManager.openShizukuApp(context)
++                    ShizukuManager.State.NEED_PERMISSION -> ShizukuManager.requestPermission()
++                    ShizukuManager.State.READY -> scope.launch {
++                        val ok = withContext(Dispatchers.IO) {
++                            PhantomProcessGuard.DISABLE_COMMANDS.map { cmd ->
++                                ShizukuManager.runProcess(arrayOf("sh", "-c", cmd), timeoutMs = 8000).exitCode == 0
++                            }.all { it }
++                        }
++                        PhantomProcessGuard.refresh(context)
++                        Toast.makeText(context, if (ok) "已关闭，沙箱可以并行跑更多命令了" else "没完全成功，请重启 Shizuku 后再试", Toast.LENGTH_LONG).show()
++                        tick++
++                    }
++                }
++            }
++            PlusDivider()
++            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
++                Text("同时最多跑 ${PhantomProcessGuard.budget} 个沙箱命令", Modifier.weight(1f),
++                    style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
++            }
++        }
++    }
++}
++
++@Composable
++private fun CheckRow(title: String, ok: Boolean, action: String, onAction: () -> Unit) {
++    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
++        Box(Modifier.width(22.dp)) { Text(if (ok) "✓" else "!", color = if (ok) Color(0xFF34C759) else Color(0xFFFF9500), fontWeight = FontWeight.Bold) }
++        Text(title, Modifier.weight(1f))
++        if (!ok) OutlinedButton(onClick = onAction) { Text(action) }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt
+new file mode 100644
+index 0000000..615bf73
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt
+@@ -0,0 +1,168 @@
++package com.openminis.app.ui.plus
++
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.Button
++import androidx.compose.material3.CircularProgressIndicator
++import androidx.compose.material3.LinearProgressIndicator
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedButton
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.platform.LocalLifecycleOwner
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.repeatOnLifecycle
++import com.openminis.app.plus.PlusPrefs
++import com.openminis.app.plus.VpsServer
++import com.openminis.app.sandbox.FreshProcessShell
++import kotlinx.coroutines.delay
++
++data class ServerStats(
++    val host: String, val uptime: String, val cpuPct: Float, val cores: Int, val load: String,
++    val memUsedMb: Long, val memTotalMb: Long, val diskUsedGb: Float, val diskTotalGb: Float,
++    val rxKbs: Float, val txKbs: Float,
++)
++
++private const val PROBE = """
++hostname; nproc; cat /proc/loadavg; uptime -p 2>/dev/null || uptime
++grep -E '^(MemTotal|MemAvailable):' /proc/meminfo
++df -kP / | tail -1
++head -1 /proc/stat; awk 'NR>2{rx+=${'$'}2;tx+=${'$'}10}END{print "NET",rx,tx}' /proc/net/dev
++sleep 1
++head -1 /proc/stat; awk 'NR>2{rx+=${'$'}2;tx+=${'$'}10}END{print "NET",rx,tx}' /proc/net/dev
++"""
++
++internal fun parseStats(out: String): ServerStats? = runCatching {
++    val lines = out.lines().map { it.trim() }.filter { it.isNotEmpty() }
++    val host = lines[0]
++    val cores = lines[1].toInt()
++    val load = lines[2].split(' ').take(3).joinToString(" ")
++    val uptime = lines[3].removePrefix("up ")
++    fun kb(key: String) = lines.first { it.startsWith(key) }.split(Regex("\\s+"))[1].toLong()
++    val memTotal = kb("MemTotal:"); val memAvail = kb("MemAvailable:")
++    val df = lines.first { it.endsWith(" /") }.split(Regex("\\s+"))
++    val cpu = lines.filter { it.startsWith("cpu ") }
++    val net = lines.filter { it.startsWith("NET") }
++    fun cpuVals(l: String) = l.split(Regex("\\s+")).drop(1).map { it.toLong() }
++    val a = cpuVals(cpu[0]); val b = cpuVals(cpu[1])
++    val idleA = a[3] + a.getOrElse(4) { 0 }; val idleB = b[3] + b.getOrElse(4) { 0 }
++    val dt = (b.sum() - a.sum()).coerceAtLeast(1)
++    val cpuPct = 100f * (dt - (idleB - idleA)) / dt
++    val n0 = net[0].split(' '); val n1 = net[1].split(' ')
++    ServerStats(
++        host, uptime, cpuPct.coerceIn(0f, 100f), cores, load,
++        (memTotal - memAvail) / 1024, memTotal / 1024,
++        df[2].toLong() / 1048576f, df[1].toLong() / 1048576f,
++        (n1[1].toDouble() - n0[1].toDouble()).toFloat() / 1024f,
++        (n1[2].toDouble() - n0[2].toDouble()).toFloat() / 1024f,
++    )
++}.getOrNull()
++
++/** Live status of one server, ServerBox-style. Runs `minis-vps` in the sandbox. */
++@Composable
++fun ServerDetailScreen(serverId: String, onBack: () -> Unit, onOpenTerminal: (String) -> Unit) {
++    val context = LocalContext.current
++    PlusPrefs.init(context)
++    val st by PlusPrefs.state.collectAsState()
++    val server: VpsServer? = st.servers.firstOrNull { it.id == serverId }
++    var stats by remember { mutableStateOf<ServerStats?>(null) }
++    var error by remember { mutableStateOf<String?>(null) }
++    var loading by remember { mutableStateOf(true) }
++    val owner = LocalLifecycleOwner.current
++
++    if (server != null) LaunchedEffect(owner, serverId) {
++        val shell = FreshProcessShell(context, "plus-server-monitor", emptyMap())
++        owner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
++            while (true) {
++                val (out, code) = runCatching {
++                    shell.execute("minis-vps run \"\$(cat <<'EOF'\n$PROBE\nEOF\n)\"", 30_000,
++                        mapOf("MINIS_VPS_SERVERS" to "${server.user}@${server.host}:${server.port}"))
++                }.getOrElse { (it.message ?: "沙箱没准备好") to -1 }
++                val parsed = if (code == 0) parseStats(out) else null
++                if (parsed != null) { stats = parsed; error = null }
++                else error = when {
++                    out.contains("Permission denied") -> "还没授权：点下面“授权”，输一次密码"
++                    out.contains("连不上") || code == 255 -> "连不上这台服务器"
++                    else -> out.lines().lastOrNull { it.isNotBlank() }?.take(160) ?: "读取失败（$code）"
++                }
++                loading = false
++                delay(5000)
++            }
++        }
++    }
++
++    PlusPage(server?.name?.ifBlank { server.host } ?: "服务器", onBack) {
++        if (server == null) { Text("这台服务器已删除", Modifier.padding(20.dp)); return@PlusPage }
++        Text("${server.target}:${server.port}", color = MaterialTheme.colorScheme.onSurfaceVariant,
++            modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp))
++        val s = stats
++        if (loading && s == null) {
++            Row(Modifier.padding(20.dp)) { CircularProgressIndicator(); Spacer(Modifier.padding(8.dp)); Text("正在读取…") }
++        }
++        error?.let { e ->
++            Text(e, color = Color(0xFFFF3B30), modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp))
++        }
++        if (s != null) {
++            Column(Modifier.padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
++                Meter("CPU · ${s.cores} 核", "%.0f%%".format(s.cpuPct), s.cpuPct / 100f, "负载 ${s.load}")
++                Meter("内存", "${s.memUsedMb} / ${s.memTotalMb} MB", s.memUsedMb.toFloat() / s.memTotalMb, null)
++                Meter("硬盘", "%.1f / %.1f GB".format(s.diskUsedGb, s.diskTotalGb), s.diskUsedGb / s.diskTotalGb, null)
++                Meter("网速", "↓ %s  ↑ %s".format(rate(s.rxKbs), rate(s.txKbs)), null, "已运行 ${s.uptime} · ${s.host}")
++            }
++        }
++        PlusSection("操作") {
++            Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                Button(onClick = { onOpenTerminal("MINIS_VPS_SERVERS=${server.user}@${server.host}:${server.port} minis-vps shell") },
++                    modifier = Modifier.weight(1f)) { Text("终端") }
++                OutlinedButton(onClick = { onOpenTerminal("minis-vps setup ${server.target} ${server.port}") },
++                    modifier = Modifier.weight(1f)) { Text("授权") }
++            }
++        }
++    }
++}
++
++private fun rate(kbs: Float) = if (kbs >= 1024) "%.1f MB/s".format(kbs / 1024) else "%.0f KB/s".format(kbs)
++
++@Composable
++private fun Meter(title: String, value: String, frac: Float?, sub: String?) {
++    Column(
++        Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp))
++            .background(MaterialTheme.colorScheme.surfaceContainerLow).padding(14.dp),
++    ) {
++        Row {
++            Text(title, Modifier.weight(1f), color = MaterialTheme.colorScheme.onSurfaceVariant)
++            Text(value, fontWeight = FontWeight.SemiBold)
++        }
++        if (frac != null) {
++            Spacer(Modifier.height(8.dp))
++            LinearProgressIndicator(
++                progress = { frac.coerceIn(0f, 1f) },
++                modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
++                color = if (frac > 0.85f) Color(0xFFFF3B30) else MaterialTheme.colorScheme.primary,
++            )
++        }
++        if (sub != null) {
++            Spacer(Modifier.height(6.dp))
++            Text(sub, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
+new file mode 100644
+index 0000000..e21be50
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
+@@ -0,0 +1,159 @@
++package com.openminis.app.ui.plus
++
++import androidx.compose.animation.AnimatedVisibility
++import androidx.compose.foundation.background
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.outlined.ExpandLess
++import androidx.compose.material.icons.outlined.ExpandMore
++import androidx.compose.material.icons.outlined.Mic
++import androidx.compose.material3.Icon
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Brush
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import com.openminis.app.plus.PlusPrefs
++import com.openminis.app.plus.PlusState
++import com.openminis.app.plus.PlusVault
++import com.openminis.app.plus.PlusVps
++import java.text.SimpleDateFormat
++import java.util.Calendar
++import java.util.Locale
++
++/**
++ * "Today" header on the conversation list: greeting with the avatar, and
++ * one-tap chips for where work runs, servers, and connected accounts.
++ */
++@Composable
++fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier) {
++    val context = LocalContext.current
++    PlusPrefs.init(context)
++    PlusVault.init(context)
++    val st by PlusPrefs.state.collectAsState()
++    val vault by PlusVault.entries.collectAsState()
++    LaunchedEffect(Unit) {
++        PlusVps.startMonitor(context)
++        com.openminis.app.plus.SandboxCare.startAuto(context)
++        if (PlusPrefs.state.value.petEnabled && com.openminis.app.plus.DeskPetService.canShow(context)) {
++            com.openminis.app.plus.DeskPetService.start(context)
++        }
++    }
++
++    val cal = Calendar.getInstance()
++    val hour = cal.get(Calendar.HOUR_OF_DAY)
++    val greet = when (hour) {
++        in 5..10 -> "早上好"
++        in 11..12 -> "中午好"
++        in 13..17 -> "下午好"
++        in 18..22 -> "晚上好"
++        else -> "夜深了，早点休息"
++    }
++    val date = SimpleDateFormat("M月d日 EEEE", Locale.CHINA).format(cal.time)
++    val primary = MaterialTheme.colorScheme.primary
++
++    Column(
++        modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)
++            .clip(RoundedCornerShape(20.dp))
++            .background(
++                Brush.linearGradient(
++                    listOf(primary.copy(alpha = 0.16f), MaterialTheme.colorScheme.surfaceContainerLow)
++                )
++            ),
++    ) {
++        Row(
++            Modifier.fillMaxWidth()
++                .clickable { PlusPrefs.update(context) { it.copy(todayCollapsed = !it.todayCollapsed) } }
++                .padding(start = 12.dp, end = 12.dp, top = 10.dp, bottom = if (st.todayCollapsed) 10.dp else 4.dp),
++            verticalAlignment = Alignment.CenterVertically,
++        ) {
++            Box(Modifier.clickable { onOpen(PlusRoutes.PERSONALIZE) }) {
++                PetAvatar(size = if (st.todayCollapsed) 36.dp else 56.dp)
++            }
++            Spacer(Modifier.width(10.dp))
++            Column(Modifier.weight(1f)) {
++                Text(greet, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
++                Text(date, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
++            }
++            androidx.compose.material3.FilledTonalIconButton(onClick = { onOpen(PlusRoutes.VOICE) }) {
++                Icon(Icons.Outlined.Mic, contentDescription = "实时语音")
++            }
++            Icon(
++                if (st.todayCollapsed) Icons.Outlined.ExpandMore else Icons.Outlined.ExpandLess,
++                contentDescription = if (st.todayCollapsed) "展开" else "收起",
++                tint = MaterialTheme.colorScheme.onSurfaceVariant,
++            )
++        }
++        AnimatedVisibility(!st.todayCollapsed) {
++            Row(
++                Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, bottom = 12.dp),
++                horizontalArrangement = Arrangement.spacedBy(8.dp),
++            ) {
++                val eff = PlusVps.effectiveMode(st)
++                val online = st.onlineServers.size
++                Chip(
++                    Modifier.weight(1f), "工作位置",
++                    when {
++                        !st.isVps -> "本机"
++                        eff == PlusState.MODE_LOCAL -> "已回本机"
++                        else -> "VPS"
++                    },
++                    dot = when {
++                        !st.isVps -> Color(0xFF007AFF)
++                        eff == PlusState.MODE_LOCAL -> Color(0xFFFF9500)
++                        else -> Color(0xFF34C759)
++                    },
++                ) { onOpen(PlusRoutes.WORK) }
++                Chip(
++                    Modifier.weight(1f), "服务器",
++                    if (st.servers.isEmpty()) "未添加" else "$online/${st.servers.size} 在线",
++                    dot = if (st.servers.isEmpty()) Color.Gray else if (online > 0) Color(0xFF34C759) else Color(0xFFFF3B30),
++                ) { onOpen(PlusRoutes.WORK) }
++                Chip(
++                    Modifier.weight(1f), "账号",
++                    if (vault.isEmpty()) "去连接" else "${vault.size} 个已连接",
++                    dot = if (vault.isEmpty()) Color.Gray else Color(0xFF34C759),
++                ) { onOpen(PlusRoutes.CONNECTIONS) }
++            }
++        }
++    }
++}
++
++@Composable
++private fun Chip(modifier: Modifier, label: String, value: String, dot: Color, onClick: () -> Unit) {
++    Column(
++        modifier.clip(RoundedCornerShape(12.dp))
++            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.7f))
++            .clickable(onClick = onClick)
++            .padding(horizontal = 10.dp, vertical = 8.dp),
++    ) {
++        Text(label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
++        Spacer(Modifier.height(2.dp))
++        Row(verticalAlignment = Alignment.CenterVertically) {
++            Box(Modifier.size(7.dp).background(dot, CircleShape))
++            Spacer(Modifier.width(5.dp))
++            Text(value, style = MaterialTheme.typography.labelLarge, maxLines = 1)
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
+new file mode 100644
+index 0000000..38a175e
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
+@@ -0,0 +1,216 @@
++package com.openminis.app.ui.plus
++
++import android.Manifest
++import android.content.pm.PackageManager
++import android.view.WindowManager
++import androidx.activity.compose.rememberLauncherForActivityResult
++import androidx.activity.result.contract.ActivityResultContracts
++import androidx.compose.animation.core.animateFloatAsState
++import androidx.compose.foundation.Canvas
++import androidx.compose.foundation.background
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.items
++import androidx.compose.foundation.lazy.rememberLazyListState
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.automirrored.filled.ArrowBack
++import androidx.compose.material.icons.filled.CallEnd
++import androidx.compose.material.icons.filled.Mic
++import androidx.compose.material.icons.filled.MicOff
++import androidx.compose.material3.Button
++import androidx.compose.material3.ExperimentalMaterial3Api
++import androidx.compose.material3.Icon
++import androidx.compose.material3.IconButton
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Scaffold
++import androidx.compose.material3.Text
++import androidx.compose.material3.TopAppBar
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Brush
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.style.TextAlign
++import androidx.compose.ui.unit.dp
++import androidx.core.content.ContextCompat
++import com.openminis.app.plus.GeminiLive
++import com.openminis.app.plus.PlusVault
++
++/**
++ * Full-screen live voice call with Gemini. Needs a Gemini key saved under
++ * 账号连接; talks back instantly and can be interrupted mid-sentence.
++ */
++@OptIn(ExperimentalMaterial3Api::class)
++@Composable
++fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
++    val context = LocalContext.current
++    PlusVault.init(context)
++    val key = remember { PlusVault.secret("gemini") }
++    var hasMic by remember {
++        mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
++    }
++    val askMic = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { hasMic = it }
++    val live = remember(key) {
++        key?.let { GeminiLive(it, PlusVault.extra("gemini", "model") ?: GeminiLive.DEFAULT_MODEL,
++            PlusVault.extra("gemini", "voice") ?: "Puck") }
++    }
++
++    // Keep the screen on during a call; hang up when leaving.
++    DisposableEffect(Unit) {
++        val act = context as? android.app.Activity
++        act?.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
++        onDispose {
++            act?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
++            live?.stop()
++        }
++    }
++    LaunchedEffect(live, hasMic) {
++        if (live != null && hasMic) live.start()
++        else if (live != null && !hasMic) askMic.launch(Manifest.permission.RECORD_AUDIO)
++    }
++
++    Scaffold(
++        containerColor = Color(0xFF0E1320),
++        topBar = {
++            TopAppBar(
++                title = { Text("实时语音", color = Color.White) },
++                navigationIcon = {
++                    IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回", tint = Color.White) }
++                },
++                colors = androidx.compose.material3.TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
++            )
++        },
++    ) { pad ->
++        Column(Modifier.fillMaxSize().padding(pad), horizontalAlignment = Alignment.CenterHorizontally) {
++            if (live == null) {
++                Spacer(Modifier.height(80.dp))
++                PetAvatar(size = 120.dp)
++                Spacer(Modifier.height(24.dp))
++                Text("先填一个 Gemini API Key", color = Color.White, style = MaterialTheme.typography.titleMedium)
++                Spacer(Modifier.height(16.dp))
++                Button(onClick = onOpenConnections) { Text("去 账号连接 填写") }
++                return@Column
++            }
++            val phase by live.phase.collectAsState()
++            val level by live.level.collectAsState()
++            val muted by live.muted.collectAsState()
++            val error by live.error.collectAsState()
++            val lines by live.lines.collectAsState()
++
++            Spacer(Modifier.height(24.dp))
++            Orb(phase, level)
++            Spacer(Modifier.height(16.dp))
++            Text(
++                when (phase) {
++                    GeminiLive.Phase.IDLE -> "准备中"
++                    GeminiLive.Phase.CONNECTING -> "正在连接…"
++                    GeminiLive.Phase.LISTENING -> if (muted) "已静音" else "我在听，直接说"
++                    GeminiLive.Phase.SPEAKING -> "说话中（随时打断我）"
++                    GeminiLive.Phase.ERROR -> error ?: "出错了"
++                },
++                color = if (phase == GeminiLive.Phase.ERROR) Color(0xFFFF6B6B) else Color.White,
++                style = MaterialTheme.typography.titleMedium,
++                textAlign = TextAlign.Center,
++                modifier = Modifier.padding(horizontal = 24.dp),
++            )
++            if (phase == GeminiLive.Phase.ERROR) {
++                Spacer(Modifier.height(12.dp))
++                Button(onClick = { live.start() }) { Text("重新连接") }
++            }
++
++            val listState = rememberLazyListState()
++            LaunchedEffect(lines.size, lines.lastOrNull()?.text?.length) {
++                if (lines.isNotEmpty()) listState.animateScrollToItem(lines.lastIndex)
++            }
++            LazyColumn(
++                state = listState,
++                modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
++                verticalArrangement = Arrangement.spacedBy(8.dp),
++            ) {
++                items(lines) { l ->
++                    Row(Modifier.fillMaxWidth(), horizontalArrangement = if (l.user) Arrangement.End else Arrangement.Start) {
++                        Text(
++                            l.text,
++                            color = Color.White,
++                            style = MaterialTheme.typography.bodyLarge,
++                            modifier = Modifier.clip(RoundedCornerShape(16.dp))
++                                .background(if (l.user) Color(0xFF3A5BD9) else Color(0x33FFFFFF))
++                                .padding(horizontal = 12.dp, vertical = 8.dp),
++                        )
++                    }
++                }
++            }
++
++            Row(
++                Modifier.fillMaxWidth().padding(bottom = 36.dp),
++                horizontalArrangement = Arrangement.SpaceEvenly,
++                verticalAlignment = Alignment.CenterVertically,
++            ) {
++                RoundButton(if (muted) Icons.Filled.MicOff else Icons.Filled.Mic,
++                    if (muted) "取消静音" else "静音", if (muted) Color(0xFFFF9500) else Color(0x33FFFFFF)) {
++                    live.setMuted(!muted)
++                }
++                RoundButton(Icons.Filled.CallEnd, "挂断", Color(0xFFFF3B30)) { live.stop(); onBack() }
++            }
++        }
++    }
++}
++
++@Composable
++private fun Orb(phase: GeminiLive.Phase, level: Float) {
++    val target = when (phase) {
++        GeminiLive.Phase.SPEAKING -> 1.15f
++        GeminiLive.Phase.LISTENING -> 1f + level * 0.35f
++        else -> 0.9f
++    }
++    val scale by animateFloatAsState(target, label = "orb")
++    Box(Modifier.size(220.dp), contentAlignment = Alignment.Center) {
++        Canvas(Modifier.fillMaxSize()) {
++            val r = size.minDimension / 2f * 0.8f * scale
++            drawCircle(
++                Brush.radialGradient(
++                    listOf(
++                        if (phase == GeminiLive.Phase.SPEAKING) Color(0xFF8E7CFF) else Color(0xFF4FA3FF),
++                        Color(0x004FA3FF),
++                    ),
++                    center = center, radius = r * 1.25f,
++                ),
++                radius = r * 1.25f,
++            )
++        }
++        PetAvatar(size = 120.dp)
++    }
++}
++
++@Composable
++private fun RoundButton(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, bg: Color, onClick: () -> Unit) {
++    Column(horizontalAlignment = Alignment.CenterHorizontally) {
++        Box(
++            Modifier.size(68.dp).clip(CircleShape).background(bg).clickable(onClick = onClick),
++            contentAlignment = Alignment.Center,
++        ) { Icon(icon, label, tint = Color.White, modifier = Modifier.size(30.dp)) }
++        Spacer(Modifier.height(6.dp))
++        Text(label, color = Color.White, style = MaterialTheme.typography.labelMedium)
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt
+new file mode 100644
+index 0000000..0f4905e
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt
+@@ -0,0 +1,308 @@
++package com.openminis.app.ui.plus
++
++import androidx.compose.foundation.BorderStroke
++import androidx.compose.foundation.background
++import androidx.compose.foundation.border
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.foundation.text.KeyboardOptions
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.outlined.Add
++import androidx.compose.material.icons.outlined.Cloud
++import androidx.compose.material.icons.outlined.PhoneAndroid
++import androidx.compose.material.icons.outlined.Refresh
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.CircularProgressIndicator
++import androidx.compose.material3.Icon
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.Switch
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.vector.ImageVector
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.input.KeyboardType
++import androidx.compose.ui.unit.dp
++import com.openminis.app.plus.PlusPrefs
++import com.openminis.app.plus.PlusState
++import com.openminis.app.plus.PlusVps
++import com.openminis.app.plus.VpsServer
++import kotlinx.coroutines.launch
++
++private val Green = Color(0xFF34C759)
++private val Red = Color(0xFFFF3B30)
++
++@Composable
++fun WorkLocationScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onOpenServer: (String) -> Unit = {}) {
++    val context = LocalContext.current
++    PlusPrefs.init(context)
++    val st by PlusPrefs.state.collectAsState()
++    val scope = rememberCoroutineScope()
++    var checking by remember { mutableStateOf(false) }
++    var editing by remember { mutableStateOf<VpsServer?>(null) }
++    var adding by remember { mutableStateOf(false) }
++
++    fun check() {
++        if (checking) return
++        checking = true
++        scope.launch { runCatching { PlusVps.probeAll(context) }; checking = false }
++    }
++    LaunchedEffect(Unit) { if (st.servers.isNotEmpty()) check() }
++
++    PlusPage("工作位置", onBack) {
++        val effective = PlusVps.effectiveMode(st)
++        val best = PlusVps.orderedTargets(st).firstOrNull()
++        // -- Mode picker --
++        Row(
++            Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(top = 16.dp),
++            horizontalArrangement = Arrangement.spacedBy(12.dp),
++        ) {
++            ModeCard(
++                Modifier.weight(1f), Icons.Outlined.PhoneAndroid, "本机", "在手机沙箱里干活",
++                selected = !st.isVps,
++            ) {
++                PlusPrefs.update(context) { it.copy(workMode = PlusState.MODE_LOCAL) }
++                PlusVps.syncToSandbox(context)
++            }
++            ModeCard(
++                Modifier.weight(1f), Icons.Outlined.Cloud, "VPS", "重活交给服务器",
++                selected = st.isVps,
++            ) {
++                PlusPrefs.update(context) { it.copy(workMode = PlusState.MODE_VPS) }
++                check()
++            }
++        }
++        Text(
++            when {
++                !st.isVps -> "现在：在本机运行"
++                effective == PlusState.MODE_LOCAL -> "现在：服务器都连不上，已自动回到本机"
++                best != null && best.lastLatencyMs >= 0 -> "现在：用 ${best.name.ifBlank { best.host }}（${best.lastLatencyMs} ms）"
++                else -> "现在：VPS 模式，正在检测服务器"
++            },
++            style = MaterialTheme.typography.bodyMedium,
++            color = if (st.isVps && effective == PlusState.MODE_LOCAL) Red else MaterialTheme.colorScheme.onSurfaceVariant,
++            modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp),
++        )
++
++        PlusSection(
++            "服务器",
++            footer = "可以加多台。每 90 秒检测一次，自动用延迟最低的那台；正在用的断了就换下一台。点服务器看 CPU、内存、硬盘、网速；新服务器先在里面点“授权”，输一次密码，以后免密。",
++        ) {
++            if (st.servers.isEmpty()) {
++                Text(
++                    "还没有服务器",
++                    color = MaterialTheme.colorScheme.onSurfaceVariant,
++                    modifier = Modifier.padding(16.dp),
++                )
++            }
++            st.servers.forEach { s ->
++                ServerRow(
++                    s,
++                    onClick = { onOpenServer(s.id) },
++                    onEdit = { editing = s },
++                    onToggle = { on ->
++                        PlusPrefs.update(context) { cur ->
++                            cur.copy(servers = cur.servers.map { if (it.id == s.id) it.copy(enabled = on) else it })
++                        }
++                        PlusVps.syncToSandbox(context)
++                    },
++                    onAuthorize = { onOpenTerminal("minis-vps setup ${s.target} ${s.port}") },
++                )
++                PlusDivider()
++            }
++            ActionRow(Icons.Outlined.Add, "添加服务器") { adding = true }
++            PlusDivider()
++            Row(
++                Modifier.fillMaxWidth().clickable { check() }.padding(horizontal = 16.dp, vertical = 14.dp),
++                verticalAlignment = Alignment.CenterVertically,
++            ) {
++                if (checking) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
++                else Icon(Icons.Outlined.Refresh, null, tint = MaterialTheme.colorScheme.primary)
++                Spacer(Modifier.width(12.dp))
++                Text(if (checking) "检测中…" else "立即检测", color = MaterialTheme.colorScheme.primary)
++            }
++        }
++
++        PlusSection("连接", footer = "所有服务器都连不上时，自动回到本机继续，不会卡住。") {
++            Row(
++                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
++                verticalAlignment = Alignment.CenterVertically,
++            ) {
++                Text("断线自动回本机", Modifier.weight(1f))
++                Switch(st.autoFallback, onCheckedChange = { on ->
++                    PlusPrefs.update(context) { it.copy(autoFallback = on) }
++                    PlusVps.syncToSandbox(context)
++                })
++            }
++        }
++    }
++
++    if (adding || editing != null) {
++        ServerDialog(
++            initial = editing,
++            onDismiss = { adding = false; editing = null },
++            onSave = { srv ->
++                PlusPrefs.update(context) { cur ->
++                    val exists = cur.servers.any { it.id == srv.id }
++                    cur.copy(servers = if (exists) cur.servers.map { if (it.id == srv.id) srv else it } else cur.servers + srv)
++                }
++                adding = false; editing = null
++                check()
++            },
++            onDelete = { srv ->
++                PlusPrefs.update(context) { cur -> cur.copy(servers = cur.servers.filterNot { it.id == srv.id }) }
++                editing = null
++                PlusVps.syncToSandbox(context)
++            },
++        )
++    }
++}
++
++@Composable
++private fun ModeCard(
++    modifier: Modifier, icon: ImageVector, title: String, sub: String,
++    selected: Boolean, onClick: () -> Unit,
++) {
++    val primary = MaterialTheme.colorScheme.primary
++    Column(
++        modifier
++            .clip(RoundedCornerShape(16.dp))
++            .background(if (selected) primary.copy(alpha = 0.12f) else MaterialTheme.colorScheme.surfaceContainerLow)
++            .border(
++                BorderStroke(if (selected) 2.dp else 1.dp, if (selected) primary else MaterialTheme.colorScheme.outlineVariant),
++                RoundedCornerShape(16.dp),
++            )
++            .clickable(onClick = onClick)
++            .padding(16.dp),
++    ) {
++        Box(
++            Modifier.size(40.dp).background(if (selected) primary else MaterialTheme.colorScheme.surfaceVariant, CircleShape),
++            contentAlignment = Alignment.Center,
++        ) {
++            Icon(icon, null, tint = if (selected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant)
++        }
++        Spacer(Modifier.height(10.dp))
++        Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
++        Text(sub, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
++    }
++}
++
++@Composable
++private fun ServerRow(s: VpsServer, onClick: () -> Unit, onEdit: () -> Unit, onToggle: (Boolean) -> Unit, onAuthorize: () -> Unit) {
++    Row(
++        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 12.dp),
++        verticalAlignment = Alignment.CenterVertically,
++    ) {
++        val dot = when {
++            !s.enabled -> Color.Gray
++            s.lastLatencyMs >= 0 -> Green
++            s.lastLatencyMs == -2 -> Red
++            else -> Color(0xFFFFCC00)
++        }
++        Box(Modifier.size(10.dp).background(dot, CircleShape))
++        Spacer(Modifier.width(12.dp))
++        Column(Modifier.weight(1f)) {
++            Text(s.name.ifBlank { s.host }, style = MaterialTheme.typography.bodyLarge)
++            Text(
++                "${s.target}:${s.port} · " + when {
++                    !s.enabled -> "已停用"
++                    s.lastLatencyMs >= 0 -> "${s.lastLatencyMs} ms"
++                    s.lastLatencyMs == -2 -> "连不上"
++                    else -> "未检测"
++                },
++                style = MaterialTheme.typography.bodySmall,
++                color = MaterialTheme.colorScheme.onSurfaceVariant,
++            )
++        }
++        TextButton(onClick = onEdit) { Text("编辑") }
++        Switch(s.enabled, onCheckedChange = onToggle)
++    }
++}
++
++@Composable
++internal fun ActionRow(icon: ImageVector, title: String, onClick: () -> Unit) {
++    Row(
++        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 14.dp),
++        verticalAlignment = Alignment.CenterVertically,
++    ) {
++        Icon(icon, null, tint = MaterialTheme.colorScheme.primary)
++        Spacer(Modifier.width(12.dp))
++        Text(title, color = MaterialTheme.colorScheme.primary)
++    }
++}
++
++@Composable
++internal fun PlusDivider() {
++    Box(
++        Modifier.fillMaxWidth().padding(start = 16.dp).height(0.5.dp)
++            .background(MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
++    )
++}
++
++@Composable
++private fun ServerDialog(
++    initial: VpsServer?, onDismiss: () -> Unit,
++    onSave: (VpsServer) -> Unit, onDelete: (VpsServer) -> Unit,
++) {
++    var name by remember { mutableStateOf(initial?.name ?: "") }
++    var host by remember { mutableStateOf(initial?.host ?: "") }
++    var port by remember { mutableStateOf((initial?.port ?: 22).toString()) }
++    var user by remember { mutableStateOf(initial?.user ?: "root") }
++    val valid = host.isNotBlank() && !host.contains(' ') && (port.toIntOrNull() ?: 0) in 1..65535 &&
++        user.isNotBlank() && user.all { it.isLetterOrDigit() || it in "._-" }
++    AlertDialog(
++        onDismissRequest = onDismiss,
++        title = { Text(if (initial == null) "添加服务器" else "编辑服务器") },
++        text = {
++            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                OutlinedTextField(name, { name = it }, label = { Text("名字（随便起）") }, singleLine = true)
++                OutlinedTextField(host, { host = it.trim() }, label = { Text("地址 / IP") }, singleLine = true,
++                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri))
++                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                    OutlinedTextField(user, { user = it.trim() }, label = { Text("用户") }, singleLine = true,
++                        modifier = Modifier.weight(1f))
++                    OutlinedTextField(port, { port = it.filter(Char::isDigit).take(5) }, label = { Text("端口") },
++                        singleLine = true, modifier = Modifier.weight(0.7f),
++                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
++                }
++            }
++        },
++        confirmButton = {
++            TextButton(enabled = valid, onClick = {
++                val base = initial ?: VpsServer(name = "", host = "")
++                onSave(base.copy(name = name.trim(), host = host, port = port.toInt(), user = user,
++                    lastLatencyMs = if (initial?.host == host && initial.port == port.toInt()) base.lastLatencyMs else -1))
++            }) { Text("保存") }
++        },
++        dismissButton = {
++            Row {
++                if (initial != null) TextButton(onClick = { onDelete(initial) }) { Text("删除", color = Red) }
++                TextButton(onClick = onDismiss) { Text("取消") }
++            }
++        },
++    )
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
+index ce5246e..87c4132 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
+@@ -1009,11 +1009,17 @@ fun SessionListScreen(
+                         )
+                     }
+                 } else {
++                    androidx.compose.foundation.layout.Column(Modifier.fillMaxSize()) {
++                    if (!isSelecting) {
++                        com.openminis.app.ui.plus.TodayCard(
++                            onOpen = { route -> com.openminis.app.ui.plus.PlusNav.go(route) },
++                        )
++                    }
+                     LazyColumn(
+                         // [T-android-newchat-list-autoscroll] Hoisted state so
+                         // the new-session autoscroll effect above can drive it.
+                         state = listState,
+-                        modifier = Modifier.fillMaxSize(),
++                        modifier = Modifier.fillMaxWidth().weight(1f),
+                         // Leave space for bottom FAB row
+                         contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 96.dp),
+                     ) {
+@@ -1210,6 +1216,7 @@ fun SessionListScreen(
+                             renderSessionRows(periodSessions)
+                         }
+                     }
++                    } // Plus: Today card column
+                 }
+             }
+ 
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt
+index d97d5af..5ced635 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt
+@@ -37,6 +37,11 @@ import androidx.compose.material.icons.outlined.FrontHand
+ import androidx.compose.material.icons.outlined.Info
+ import androidx.compose.material.icons.outlined.Inventory2
+ import androidx.compose.material.icons.outlined.Lock
++import androidx.compose.material.icons.outlined.Cloud
++import androidx.compose.material.icons.outlined.Key
++import androidx.compose.material.icons.outlined.Memory
++import androidx.compose.material.icons.outlined.Mic
++import androidx.compose.material.icons.outlined.Wallpaper
+ import androidx.compose.material.icons.outlined.Palette
+ import androidx.compose.material.icons.outlined.Groups
+ import androidx.compose.material.icons.outlined.Handyman
+@@ -112,6 +117,8 @@ fun SettingsScreen(
+     // About row below still has a TODO onClick in HEAD; future settings-bucket
+     // work will wire this through.
+     onAboutClick: () -> Unit = {},
++    /** Minis Plus pages (work location, connections, wallpaper & avatar). */
++    onPlusClick: (String) -> Unit = {},
+ ) {
+     val context = LocalContext.current
+     var showFeedbackSheet by remember { mutableStateOf(false) }
+@@ -136,6 +143,56 @@ fun SettingsScreen(
+                 .padding(padding)
+                 .verticalScroll(rememberScrollState()),
+         ) {
++            // -- Minis Plus --
++            SettingsSection(
++                title = "Mines",
++                footer = "工作位置决定任务在手机还是服务器上跑；账号密钥加密保存，AI 看不到明文。",
++            ) {
++                SettingsItem(
++                    icon = Icons.Outlined.Cloud,
++                    iconColor = Color(0xFF34C759),
++                    title = "工作位置",
++                    subtitle = "本机 / 多台 VPS，自动选最快的",
++                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.WORK) },
++                )
++                SettingsItem(
++                    icon = Icons.Outlined.Mic,
++                    iconColor = Color(0xFF5856D6),
++                    title = "实时语音",
++                    subtitle = "像打电话一样和 Minis 说话，可随时打断",
++                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.VOICE) },
++                )
++                SettingsItem(
++                    icon = Icons.Outlined.Key,
++                    iconColor = Color(0xFFFF9500),
++                    title = "账号连接",
++                    subtitle = "Gemini、GitHub、Google 等账号和密钥",
++                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.CONNECTIONS) },
++                )
++                SettingsItem(
++                    icon = Icons.Outlined.Memory,
++                    iconColor = Color(0xFF007AFF),
++                    title = "沙箱与防杀",
++                    subtitle = "看内存、一键清理、防止被系统杀掉",
++                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.SANDBOX) },
++                )
++                SettingsItem(
++                    icon = Icons.Outlined.Extension,
++                    iconColor = Color(0xFF30B0C7),
++                    title = "插件",
++                    subtitle = "安装 dsh 插件，给 AI 加新工具",
++                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.PLUGINS) },
++                )
++                SettingsItem(
++                    icon = Icons.Outlined.Wallpaper,
++                    iconColor = Color(0xFFAF52DE),
++                    title = "壁纸与形象",
++                    subtitle = "聊天壁纸、虚拟形象、桌宠",
++                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.PERSONALIZE) },
++                    showDivider = false,
++                )
++            }
++
+             // -- LLM Providers --
+             SettingsSection(
+                 title = stringResource(R.string.settings_section_llm_providers),
+diff --git a/src/android/app/src/main/res/values-de/strings.xml b/src/android/app/src/main/res/values-de/strings.xml
+index 0365a16..79f9db4 100644
+--- a/src/android/app/src/main/res/values-de/strings.xml
++++ b/src/android/app/src/main/res/values-de/strings.xml
+@@ -1,6 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="app_name">Minis</string>
++    <string name="app_name">Mines</string>
+     <string name="new_chat">Neuer Chat</string>
+     <string name="settings">Einstellungen</string>
+     <string name="providers">KI-Anbieter</string>
+diff --git a/src/android/app/src/main/res/values-es/strings.xml b/src/android/app/src/main/res/values-es/strings.xml
+index b5aebef..3daa042 100644
+--- a/src/android/app/src/main/res/values-es/strings.xml
++++ b/src/android/app/src/main/res/values-es/strings.xml
+@@ -1,6 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="app_name">Minis</string>
++    <string name="app_name">Mines</string>
+     <string name="new_chat">Nuevo chat</string>
+     <string name="settings">Ajustes</string>
+     <string name="providers">Proveedores</string>
+diff --git a/src/android/app/src/main/res/values-fil/strings.xml b/src/android/app/src/main/res/values-fil/strings.xml
+index 78f6955..f0e4e0d 100644
+--- a/src/android/app/src/main/res/values-fil/strings.xml
++++ b/src/android/app/src/main/res/values-fil/strings.xml
+@@ -1,6 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="app_name">Minis</string>
++    <string name="app_name">Mines</string>
+     <string name="new_chat">Bagong Chat</string>
+     <string name="settings">Mga Setting</string>
+     <string name="providers">Mga Provider</string>
+diff --git a/src/android/app/src/main/res/values-fr/strings.xml b/src/android/app/src/main/res/values-fr/strings.xml
+index 3135e72..9ddbaee 100644
+--- a/src/android/app/src/main/res/values-fr/strings.xml
++++ b/src/android/app/src/main/res/values-fr/strings.xml
+@@ -1,6 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="app_name">Minis</string>
++    <string name="app_name">Mines</string>
+     <string name="new_chat">Nouvelle conversation</string>
+     <string name="settings">Réglages</string>
+     <string name="providers">Fournisseurs AI</string>
+diff --git a/src/android/app/src/main/res/values-hr/strings.xml b/src/android/app/src/main/res/values-hr/strings.xml
+index 86aa739..ec85ab2 100644
+--- a/src/android/app/src/main/res/values-hr/strings.xml
++++ b/src/android/app/src/main/res/values-hr/strings.xml
+@@ -1,6 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="app_name">Minis</string>
++    <string name="app_name">Mines</string>
+     <string name="new_chat">Novi razgovor</string>
+     <string name="settings">Postavke</string>
+     <string name="providers">Pružatelji</string>
+diff --git a/src/android/app/src/main/res/values-in/strings.xml b/src/android/app/src/main/res/values-in/strings.xml
+index bbe6577..944f344 100644
+--- a/src/android/app/src/main/res/values-in/strings.xml
++++ b/src/android/app/src/main/res/values-in/strings.xml
+@@ -5,7 +5,7 @@
+      directory is never consulted and the app would silently fall back
+      to English. -->
+ <resources>
+-    <string name="app_name">Minis</string>
++    <string name="app_name">Mines</string>
+     <string name="new_chat">Obrolan Baru</string>
+     <string name="settings">Pengaturan</string>
+     <string name="providers">Penyedia</string>
+diff --git a/src/android/app/src/main/res/values-ja/strings.xml b/src/android/app/src/main/res/values-ja/strings.xml
+index aefd2fe..70a136f 100644
+--- a/src/android/app/src/main/res/values-ja/strings.xml
++++ b/src/android/app/src/main/res/values-ja/strings.xml
+@@ -1,6 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="app_name">Minis</string>
++    <string name="app_name">Mines</string>
+     <string name="new_chat">新しいチャット</string>
+     <string name="settings">設定</string>
+     <string name="providers">AIプロバイダー</string>
+diff --git a/src/android/app/src/main/res/values-ko/strings.xml b/src/android/app/src/main/res/values-ko/strings.xml
+index 3ecb2ad..2124769 100644
+--- a/src/android/app/src/main/res/values-ko/strings.xml
++++ b/src/android/app/src/main/res/values-ko/strings.xml
+@@ -1,6 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="app_name">Minis</string>
++    <string name="app_name">Mines</string>
+     <string name="new_chat">새 채팅</string>
+     <string name="settings">설정</string>
+     <string name="providers">AI 공급자</string>
+diff --git a/src/android/app/src/main/res/values-ms/strings.xml b/src/android/app/src/main/res/values-ms/strings.xml
+index daec398..8c0bb98 100644
+--- a/src/android/app/src/main/res/values-ms/strings.xml
++++ b/src/android/app/src/main/res/values-ms/strings.xml
+@@ -1,6 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="app_name">Minis</string>
++    <string name="app_name">Mines</string>
+     <string name="new_chat">Sembang Baharu</string>
+     <string name="settings">Tetapan</string>
+     <string name="providers">Pembekal</string>
+diff --git a/src/android/app/src/main/res/values-pl/strings.xml b/src/android/app/src/main/res/values-pl/strings.xml
+index b801460..dad8402 100644
+--- a/src/android/app/src/main/res/values-pl/strings.xml
++++ b/src/android/app/src/main/res/values-pl/strings.xml
+@@ -1,6 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="app_name">Minis</string>
++    <string name="app_name">Mines</string>
+     <string name="new_chat">Nowy czat</string>
+     <string name="settings">Ustawienia</string>
+     <string name="providers">Dostawcy</string>
+diff --git a/src/android/app/src/main/res/values-pt-rBR/strings.xml b/src/android/app/src/main/res/values-pt-rBR/strings.xml
+index 49f0ce4..abe9f59 100644
+--- a/src/android/app/src/main/res/values-pt-rBR/strings.xml
++++ b/src/android/app/src/main/res/values-pt-rBR/strings.xml
+@@ -1,6 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="app_name">Minis</string>
++    <string name="app_name">Mines</string>
+     <string name="new_chat">Nova conversa</string>
+     <string name="settings">Configurações</string>
+     <string name="providers">Provedores</string>
+diff --git a/src/android/app/src/main/res/values-ro/strings.xml b/src/android/app/src/main/res/values-ro/strings.xml
+index 390c84a..25d4b6f 100644
+--- a/src/android/app/src/main/res/values-ro/strings.xml
++++ b/src/android/app/src/main/res/values-ro/strings.xml
+@@ -1,6 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="app_name">Minis</string>
++    <string name="app_name">Mines</string>
+     <string name="new_chat">Conversație nouă</string>
+     <string name="settings">Setări</string>
+     <string name="providers">Furnizori</string>
+diff --git a/src/android/app/src/main/res/values-ru/strings.xml b/src/android/app/src/main/res/values-ru/strings.xml
+index b680246..2e5d41d 100644
+--- a/src/android/app/src/main/res/values-ru/strings.xml
++++ b/src/android/app/src/main/res/values-ru/strings.xml
+@@ -1,6 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="app_name">Minis</string>
++    <string name="app_name">Mines</string>
+     <string name="new_chat">Новый чат</string>
+     <string name="settings">Настройки</string>
+     <string name="providers">Провайдеры</string>
+diff --git a/src/android/app/src/main/res/values-th/strings.xml b/src/android/app/src/main/res/values-th/strings.xml
+index 13fefee..1aae680 100644
+--- a/src/android/app/src/main/res/values-th/strings.xml
++++ b/src/android/app/src/main/res/values-th/strings.xml
+@@ -1,6 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="app_name">Minis</string>
++    <string name="app_name">Mines</string>
+     <string name="new_chat">แชทใหม่</string>
+     <string name="settings">การตั้งค่า</string>
+     <string name="providers">ผู้ให้บริการ</string>
+diff --git a/src/android/app/src/main/res/values-tr/strings.xml b/src/android/app/src/main/res/values-tr/strings.xml
+index b7c54d6..6ad4e5c 100644
+--- a/src/android/app/src/main/res/values-tr/strings.xml
++++ b/src/android/app/src/main/res/values-tr/strings.xml
+@@ -1,6 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="app_name">Minis</string>
++    <string name="app_name">Mines</string>
+     <string name="new_chat">Yeni Sohbet</string>
+     <string name="settings">Ayarlar</string>
+     <string name="providers">Sağlayıcılar</string>
+diff --git a/src/android/app/src/main/res/values-zh-rTW/strings.xml b/src/android/app/src/main/res/values-zh-rTW/strings.xml
+index 4df0eb6..c5ee80c 100644
+--- a/src/android/app/src/main/res/values-zh-rTW/strings.xml
++++ b/src/android/app/src/main/res/values-zh-rTW/strings.xml
+@@ -1,6 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="app_name">Minis</string>
++    <string name="app_name">Mines</string>
+     <string name="new_chat">新增對話</string>
+     <string name="settings">設定</string>
+     <string name="providers">供應商</string>
+diff --git a/src/android/app/src/main/res/values-zh/strings.xml b/src/android/app/src/main/res/values-zh/strings.xml
+index 67c9056..d7bc06a 100644
+--- a/src/android/app/src/main/res/values-zh/strings.xml
++++ b/src/android/app/src/main/res/values-zh/strings.xml
+@@ -1,6 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="app_name">Minis</string>
++    <string name="app_name">Mines</string>
+     <string name="new_chat">新对话</string>
+     <string name="settings">设置</string>
+     <string name="providers">AI 服务商</string>
+diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
+index 74183d5..08eef60 100644
+--- a/src/android/app/src/main/res/values/strings.xml
++++ b/src/android/app/src/main/res/values/strings.xml
+@@ -1,6 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="app_name">Minis</string>
++    <string name="app_name">Mines</string>
+     <string name="new_chat">New Chat</string>
+     <string name="settings">Settings</string>
+     <string name="providers">Providers</string>
