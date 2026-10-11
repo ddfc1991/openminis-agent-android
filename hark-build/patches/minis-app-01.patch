@@ -1,5 +1,5 @@
 diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
-index 50369d8..3fca9d3 100644
+index 50369d8..6a32a6c 100644
 --- a/src/android/app/build.gradle.kts
 +++ b/src/android/app/build.gradle.kts
 @@ -33,7 +33,9 @@ android {
@@ -7,9 +7,9 @@ index 50369d8..3fca9d3 100644
  
      defaultConfig {
 -        applicationId = "com.openminis.app"
-+        // Minis Plus: own package so it installs beside the official Minis
++        // Mines: own package so it installs beside the official Minis
 +        // (different signing key can never update it in place).
-+        applicationId = "com.openminis.app.plus"
++        applicationId = "com.openminis.mines"
          minSdk = 26
          targetSdk = 35
          versionCode = 28
@@ -56,12 +56,141 @@ index 0000000..7a1629e
 +    ConnectionAttempts 3
 +    StrictHostKeyChecking accept-new
 +    IPQoS none
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-dsh b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-dsh
+new file mode 100644
+index 0000000..01db9e9
+--- /dev/null
++++ b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-dsh
+@@ -0,0 +1,123 @@
++#!/bin/sh
++# minis-dsh: use DeepSeek Harness (dsh) plugins in Minis, without installing dsh.
++#
++#   minis-dsh add <npm-package | github:owner/repo>   install a dsh plugin
++#   minis-dsh remove <package>                          uninstall it
++#   minis-dsh list                                      what is installed and which tools each one adds
++#   minis-dsh off|on <package>                          disable / re-enable without uninstalling
++#
++# All plugins share ONE MCP server named "dsh" in Minis (started only when a
++# tool is called), so adding plugins doesn't add background processes.
++# Works for plugins that add tools / prompt sections; plugins that need dsh's
++# own model loop, sessions or web UI are reported as unsupported.
++set -e
++H="${MINIS_DSH_HOME:-$HOME/.minis-dsh}"
++SOCK=/usr/local/lib/minis-dsh/socket.mjs
++SERVERS="${MINIS_MCP_SERVERS:-/var/minis/mcp-servers/servers.json}"
++mkdir -p "$H"
++[ -f "$H/package.json" ] || printf '{"name":"minis-dsh-plugins","private":true,"type":"module"}\n' > "$H/package.json"
++[ -f "$H/plugins.json" ] || printf '{"plugins":[]}\n' > "$H/plugins.json"
++
++need_node() {
++    command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && return
++    echo "第一次使用，正在安装 Node.js（只装一次）…" >&2
++    apk add --no-cache nodejs npm >/dev/null
++}
++
++# Edit plugins.json / servers.json with node (always present after need_node).
++js() { node --input-type=module -e "$1" -- "$@"; }
++
++register_mcp() {
++    [ -f "$SERVERS" ] || { echo "minis-dsh: 找不到 Minis 的 MCP 配置（$SERVERS）" >&2; return 0; }
++    NODE_BIN=$(command -v node)
++    SERVERS="$SERVERS" NODE_BIN="$NODE_BIN" SOCK="$SOCK" H="$H" node --input-type=module -e '
++      import fs from "node:fs"
++      const f = process.env.SERVERS
++      const j = JSON.parse(fs.readFileSync(f, "utf8") || "{}")
++      j.mcpServers ||= {}
++      j.mcpServers.dsh = { command: process.env.NODE_BIN, args: [process.env.SOCK],
++        env: { MINIS_DSH_HOME: process.env.H }, note: "dsh 插件插座（minis-dsh 管理）" }
++      fs.writeFileSync(f, JSON.stringify(j, null, 2))
++    '
++}
++
++unregister_if_empty() {
++    [ -f "$SERVERS" ] || return 0
++    H="$H" SERVERS="$SERVERS" node --input-type=module -e '
++      import fs from "node:fs"
++      const p = JSON.parse(fs.readFileSync(process.env.H + "/plugins.json", "utf8"))
++      if ((p.plugins || []).length) process.exit(0)
++      const j = JSON.parse(fs.readFileSync(process.env.SERVERS, "utf8"))
++      if (j.mcpServers) delete j.mcpServers.dsh
++      fs.writeFileSync(process.env.SERVERS, JSON.stringify(j, null, 2))
++    '
++}
++
++set_state() { # op pkg
++    H="$H" OP="$1" PKG="$2" node --input-type=module -e '
++      import fs from "node:fs"
++      const f = process.env.H + "/plugins.json"
++      const j = JSON.parse(fs.readFileSync(f, "utf8")); j.plugins ||= []
++      const pkg = process.env.PKG, op = process.env.OP
++      const i = j.plugins.findIndex(p => p.package === pkg)
++      if (op === "add") { if (i < 0) j.plugins.push({ package: pkg, enabled: true }); else j.plugins[i].enabled = true }
++      if (op === "remove" && i >= 0) j.plugins.splice(i, 1)
++      if (op === "off" && i >= 0) j.plugins[i].enabled = false
++      if (op === "on" && i >= 0) j.plugins[i].enabled = true
++      fs.writeFileSync(f, JSON.stringify(j, null, 2))
++    '
++}
++
++# npm spec -> installed package name
++pkg_name() {
++    case "$1" in
++        github:*|*/*.git|https://*|git+*)
++            (cd "$H" && node -e 'const d=require("./package.json").dependencies||{};const s=process.argv[1];for(const[k,v]of Object.entries(d))if(v.includes(s.replace(/^github:/,"").replace(/^https:\/\/github.com\//,"").replace(/\.git$/,""))){console.log(k);process.exit(0)}' "$1") ;;
++        @*/*@*) echo "${1%@*}" ;;
++        @*) echo "$1" ;;
++        *@*) echo "${1%%@*}" ;;
++        *) echo "$1" ;;
++    esac
++}
++
++cmd="${1:-help}"; [ $# -gt 0 ] && shift
++case "$cmd" in
++add)
++    [ -n "$1" ] || { echo "用法: minis-dsh add <npm 包名 或 github:用户/仓库>" >&2; exit 2; }
++    need_node
++    echo "安装 $1 …" >&2
++    NPMI="npm install --no-audit --no-fund --omit=dev --ignore-scripts --legacy-peer-deps"
++    # The pieces of dsh that plugins import directly (about 11 MB, installed once).
++    [ -d "$H/node_modules/@deepseek-ai/dsh-tools" ] || (cd "$H" && $NPMI @deepseek-ai/dsh-tools@next @deepseek-ai/cordis@next \
++        @deepseek-ai/dsh-scope@next @deepseek-ai/dsh-llm@next @deepseek-ai/dsh-sandbox@next >&2) || true
++    (cd "$H" && $NPMI "$1" >&2)
++    name=$(pkg_name "$1"); [ -n "$name" ] || name="$1"
++    set_state add "$name"
++    # Fill in any other dsh library the plugin imports (only @deepseek-ai/*).
++    i=0
++    while [ $i -lt 8 ]; do
++        miss=$(MINIS_DSH_HOME="$H" node "$SOCK" --check 2>&1 | grep -F "$name" | grep -o "Cannot find package '@deepseek-ai/[^']*'" | sed "s/Cannot find package '//;s/'//" | head -1)
++        [ -n "$miss" ] || break
++        echo "补装 $miss …" >&2
++        (cd "$H" && { $NPMI "$miss@next" >/dev/null 2>&1 || $NPMI "$miss" >/dev/null 2>&1; }) || break
++        i=$((i+1))
++    done
++    register_mcp
++    MINIS_DSH_HOME="$H" node "$SOCK" --check | grep -F "$name" || true
++    ;;
++remove|rm)
++    need_node
++    name=$(pkg_name "$1")
++    set_state remove "$name"
++    (cd "$H" && npm uninstall --no-audit --no-fund "$name" >/dev/null 2>&1) || true
++    unregister_if_empty
++    echo "已卸载 $name"
++    ;;
++off|on)
++    need_node; set_state "$cmd" "$1"; echo "$1: $cmd" ;;
++list|ls)
++    need_node
++    MINIS_DSH_HOME="$H" node "$SOCK" --check
++    ;;
++*) sed -n '2,13p' "$0" ;;
++esac
 diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-vps b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-vps
 new file mode 100755
-index 0000000..b8b02c5
+index 0000000..c1033ef
 --- /dev/null
 +++ b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-vps
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,116 @@
 +#!/bin/sh
 +# minis-vps: use a VPS as Minis' back-end processor, over plain ssh.
 +#
@@ -77,6 +206,8 @@ index 0000000..b8b02c5
 +#   minis-vps get  <remote> [local]    copy a file/dir back
 +#   minis-vps shell                    interactive login
 +#   minis-vps status                   quick health: uptime, memory, disk, public IP
++#   minis-vps attach <name>            follow a background job live; reconnects by itself if the network drops
++#   minis-vps jobs                     list background jobs and whether they are still running
 +#   minis-vps servers                  list the servers Minis Plus is using, fastest first
 +#
 +# Minis Plus: servers added under 设置 → 工作位置 arrive as MINIS_VPS_SERVERS
@@ -156,9 +287,246 @@ index 0000000..b8b02c5
 +get)    need_ssh; load; rsync -az -e "ssh $SSH_OPTS -i $KEY -p $VPS_PORT" "$VPS_TARGET:$1" "${2:-.}" ;;
 +shell)  need_ssh; load; ssh -t -i "$KEY" -p "$VPS_PORT" -o ServerAliveInterval=15 "$VPS_TARGET" ;;
 +status) need_ssh; load; s 'uptime; free -m | sed -n 2p; df -h / | tail -1; curl -s --max-time 5 https://ipinfo.io/ip; echo' ;;
++attach)
++    need_ssh; load; valid_name "$1"
++    [ -f "$HOME/.config/minis-vps-jobs/$1" ] && SERVERS=$(cat "$HOME/.config/minis-vps-jobs/$1")
++    cache="$HOME/.cache/minis-vps/$1.log"; mkdir -p "$(dirname "$cache")"; : > "$cache"
++    tail -n +1 -f "$cache" & tp=$!
++    trap 'kill $tp 2>/dev/null' EXIT INT TERM
++    set +e
++    while :; do
++        off=$(wc -c < "$cache")
++        s "f=~/minis-jobs/$1; [ -f \$f.log ] || { echo 'minis-vps: no such job' >&2; exit 3; }; tail -c +$((off+1)) -f \$f.log & t=\$!; while kill -0 \$(cat \$f.pid) 2>/dev/null; do sleep 2; done; sleep 1; kill \$t" >> "$cache"
++        rc=$?
++        [ "$rc" -ne 255 ] && break
++        echo "minis-vps: 断线了，3 秒后从断点续上…" >&2; sleep 3
++    done
++    sleep 1; echo "minis-vps: $1 已结束" >&2
++    ;;
++jobs)   need_ssh; load; s 'cd ~/minis-jobs 2>/dev/null || exit 0; for p in *.pid; do [ -f "$p" ] || continue; n=${p%.pid}; if kill -0 $(cat "$p") 2>/dev/null; then st=running; else st=done; fi; echo "$n $st"; done' ;;
 +servers) load; for srv in $SERVERS; do echo "$srv"; done ;;
-+*)      sed -n '2,23p' "$0" ;;
++*)      sed -n '2,25p' "$0" ;;
 +esac
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-dsh/socket.mjs b/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-dsh/socket.mjs
+new file mode 100644
+index 0000000..bb24768
+--- /dev/null
++++ b/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-dsh/socket.mjs
+@@ -0,0 +1,214 @@
++#!/usr/bin/env node
++// minis-dsh socket: loads DeepSeek Harness (dsh) plugins without dsh itself,
++// gives each one a compatible `ctx`, and serves the tools they register as a
++// single stdio MCP server that Minis already knows how to call.
++//
++// Supported ctx surface: tools.register, systemPrompt.section/context,
++// commands.register (recorded), skills (recorded), on()/effect()/logger().
++// A plugin that `inject`s a service outside this set (model, sessions, web UI…)
++// is skipped and reported by `minis-dsh list`.
++import fs from 'node:fs'
++import path from 'node:path'
++import { createRequire } from 'node:module'
++import { pathToFileURL } from 'node:url'
++
++const HOME = process.env.MINIS_DSH_HOME || path.join(process.env.HOME || '/root', '.minis-dsh')
++const STATE = path.join(HOME, 'plugins.json')
++const SUPPORTED = new Set(['tools', 'systemPrompt', 'commands', 'skills', 'logger', 'agents'])
++const log = (...a) => { try { fs.appendFileSync(path.join(HOME, 'socket.log'), `[${new Date().toISOString()}] ${a.join(' ')}\n`) } catch {} }
++
++const tools = new Map()        // name -> { def, plugin }
++const sections = []            // { plugin, order, text|fn }
++const status = {}              // plugin -> { ok, reason, tools: [] }
++
++function makeCtx(pluginName, config) {
++  const disposers = []
++  const reg = (fn) => { disposers.push(fn); return fn }
++  const ctx = {
++    name: pluginName,
++    config,
++    tools: {
++      register(def) {
++        if (!def || !def.name) throw new Error('tool needs a name')
++        tools.set(def.name, { def, plugin: pluginName })
++        status[pluginName].tools.push(def.name)
++        return reg(() => tools.delete(def.name))
++      },
++      guard() { return () => {} },
++      schemas() { return [...tools.values()].map(t => schemaOf(t.def)) },
++    },
++    systemPrompt: {
++      section(a, b) {
++        const s = typeof a === 'object' ? a : { name: a, ...(typeof b === 'object' ? b : { text: b }) }
++        sections.push({ plugin: pluginName, order: s.order ?? 100, text: s.text ?? s.content, fn: s.render })
++        return () => {}
++      },
++      context(a, b) {
++        const s = typeof a === 'object' ? a : { name: a, render: b }
++        sections.push({ plugin: pluginName, order: s.order ?? 900, fn: s.render ?? s.value ?? s.text })
++        return () => {}
++      },
++    },
++    commands: { register() { return () => {} } },
++    skills: { register() { return () => {} } },
++    agents: {},
++    on() { return () => {} },
++    emit() {}, serial: async () => {}, parallel: async () => {},
++    effect(fn) { try { const d = fn(); if (typeof d === 'function') disposers.push(d) } catch (e) { log(pluginName, 'effect', e.message) } return () => {} },
++    logger(name) { const f = (...a) => log(`${pluginName}/${name}:`, ...a); return { info: f, warn: f, error: f, debug: f, success: f } },
++    plugin() { return () => {} },
++    inject(_deps, fn) { try { fn(ctx) } catch (e) { log(pluginName, 'inject', e.message) } },
++    get(name) { return ctx[name] },
++    set() {}, provide() {}, mixin() {},
++    scope: { dispose: () => disposers.forEach(d => { try { d() } catch {} }) },
++  }
++  return new Proxy(ctx, {
++    get(t, k) {
++      if (k in t) return t[k]
++      if (typeof k === 'string' && k.startsWith('$')) return t
++      return undefined
++    },
++  })
++}
++
++function schemaOf(def) {
++  const params = def.parameters || def.inputSchema || def.input_schema || def.schema || { type: 'object', properties: {} }
++  return { name: def.name, description: def.description || '', inputSchema: params }
++}
++
++function injectList(mod) {
++  const inj = mod.inject
++  if (!inj) return []
++  if (Array.isArray(inj)) return inj
++  if (typeof inj === 'object') return Object.entries(inj).filter(([, v]) => v === true || (v && v.required !== false)).map(([k]) => k)
++  return []
++}
++
++async function loadPlugin(entry) {
++  const name = entry.package
++  status[name] = { ok: false, reason: '', tools: [] }
++  try {
++    const req = createRequire(path.join(HOME, 'node_modules', 'noop.js'))
++    let resolved
++    try { resolved = req.resolve(name) } catch {
++      const pj = JSON.parse(fs.readFileSync(path.join(HOME, 'node_modules', name, 'package.json'), 'utf8'))
++      const main = (pj.exports && (pj.exports['.']?.default || pj.exports['.']?.import || pj.exports['.'])) || pj.module || pj.main || 'index.js'
++      resolved = path.join(HOME, 'node_modules', name, typeof main === 'string' ? main : 'index.js')
++    }
++    const raw = await import(pathToFileURL(resolved).href)
++    const candidates = []
++    const push = (m) => { if (m && (typeof m.apply === 'function' || typeof m === 'function')) candidates.push(m) }
++    push(raw); push(raw.default)
++    if (raw.default && typeof raw.default === 'object') Object.values(raw.default).forEach(push)
++    if (!candidates.length) throw new Error('不是 dsh 插件（找不到 apply）')
++    const mod = candidates[0]
++    const missing = injectList(mod).filter(s => !SUPPORTED.has(s))
++    if (missing.length) { status[name].reason = `需要 dsh 内部服务：${missing.join(', ')}`; return }
++    const ctx = makeCtx(name, entry.config || {})
++    if (typeof mod.apply === 'function') await mod.apply(ctx, entry.config || {})
++    else if (mod.prototype && mod.prototype.constructor) new mod(ctx, entry.config || {})
++    else await mod(ctx, entry.config || {})
++    status[name].ok = true
++  } catch (e) {
++    status[name].reason = e.message
++    log('load', name, e.stack || e.message)
++  }
++}
++
++function renderResult(def, args, value) {
++  try {
++    if (def.output && typeof def.output.render === 'function') {
++      const blocks = def.output.render(args, value)
++      if (Array.isArray(blocks) && blocks.length) {
++        return blocks.map(b => b.type === 'text' ? { type: 'text', text: b.text } : { type: 'text', text: JSON.stringify(b) })
++      }
++    }
++  } catch {}
++  return [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }]
++}
++
++async function instructions() {
++  const parts = []
++  for (const s of sections.sort((a, b) => a.order - b.order)) {
++    try {
++      const v = s.text ?? (typeof s.fn === 'function' ? await s.fn() : s.fn)
++      if (typeof v === 'string' && v.trim()) parts.push(v.trim())
++    } catch {}
++  }
++  return parts.join('\n\n')
++}
++
++async function boot() {
++  let state = { plugins: [] }
++  try { state = JSON.parse(fs.readFileSync(STATE, 'utf8')) } catch {}
++  process.on('exit', () => { try { fs.writeFileSync(path.join(HOME, 'status.json'), JSON.stringify(status, null, 2)) } catch {} })
++  for (const p of state.plugins || []) {
++    if (p.enabled === false) { status[p.package] = { ok: false, reason: '已停用', tools: [] }; continue }
++    await loadPlugin(p)
++  }
++  try { fs.writeFileSync(path.join(HOME, 'status.json'), JSON.stringify(status, null, 2)) } catch {}
++}
++
++// --- `node socket.mjs --check`: load everything and print a report ---
++if (process.argv.includes('--check')) {
++  await boot()
++  for (const [name, st] of Object.entries(status)) {
++    console.log(`${st.ok ? '✓' : '✗'} ${name}${st.ok ? `  工具: ${st.tools.join(', ') || '无'}` : `  ${st.reason}`}`)
++  }
++  process.exit(0)
++}
++
++// --- stdio MCP server (newline-delimited JSON-RPC) ---
++await boot()
++let buf = ''
++const send = (msg) => process.stdout.write(JSON.stringify(msg) + '\n')
++process.stdin.setEncoding('utf8')
++process.stdin.on('data', (chunk) => {
++  buf += chunk
++  let i
++  while ((i = buf.indexOf('\n')) >= 0) {
++    const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1)
++    if (line) handle(line)
++  }
++})
++process.stdin.on('end', () => process.exit(0))
++
++async function handle(line) {
++  let msg
++  try { msg = JSON.parse(line) } catch { return }
++  const { id, method, params } = msg
++  if (id === undefined) return // notification
++  try {
++    if (method === 'initialize') {
++      send({ jsonrpc: '2.0', id, result: {
++        protocolVersion: params?.protocolVersion || '2025-06-18',
++        capabilities: { tools: {} },
++        serverInfo: { name: 'minis-dsh', version: '1.0.0' },
++        instructions: await instructions(),
++      } })
++    } else if (method === 'tools/list') {
++      send({ jsonrpc: '2.0', id, result: { tools: [...tools.values()].map(t => schemaOf(t.def)) } })
++    } else if (method === 'tools/call') {
++      const t = tools.get(params?.name)
++      if (!t) return send({ jsonrpc: '2.0', id, result: { isError: true, content: [{ type: 'text', text: `no tool ${params?.name}` }] } })
++      const args = params.arguments || {}
++      const ac = new AbortController()
++      const exec = {
++        name: t.def.name, args, signal: ac.signal, id: String(id),
++        deferContext() {}, concludeTurn() {},
++      }
++      try {
++        const value = await t.def.execute(args, exec)
++        send({ jsonrpc: '2.0', id, result: { content: renderResult(t.def, args, value) } })
++      } catch (e) {
++        send({ jsonrpc: '2.0', id, result: { isError: true, content: [{ type: 'text', text: e.message || String(e) }] } })
++      }
++    } else if (method === 'ping') {
++      send({ jsonrpc: '2.0', id, result: {} })
++    } else {
++      send({ jsonrpc: '2.0', id, error: { code: -32601, message: `unsupported: ${method}` } })
++    }
++  } catch (e) {
++    send({ jsonrpc: '2.0', id, error: { code: -32603, message: e.message } })
++  }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/MinisApp.kt b/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
 index d1f65a5..45b805a 100644
 --- a/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
@@ -466,10 +834,10 @@ index 0000000..d2f3b7f
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt b/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt
 new file mode 100644
-index 0000000..8f87354
+index 0000000..865a731
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt
-@@ -0,0 +1,230 @@
+@@ -0,0 +1,231 @@
 +package com.openminis.app.plus
 +
 +import android.annotation.SuppressLint
@@ -696,8 +1064,279 @@ index 0000000..8f87354
 +                    canvas.drawText(b, bx + pad, by + bh / 2 + textPaint.textSize / 3f, textPaint)
 +                }
 +            }
-+            postInvalidateDelayed(33)
++            // ~12 fps idle is plenty for a breathing pet; faster only while talking or dragged.
++            postInvalidateDelayed(if (bubble != null || held) 33 else 80)
 +        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt b/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
+new file mode 100644
+index 0000000..c772564
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
+@@ -0,0 +1,264 @@
++package com.openminis.app.plus
++
++import android.annotation.SuppressLint
++import android.media.AudioAttributes
++import android.media.AudioFormat
++import android.media.AudioRecord
++import android.media.AudioTrack
++import android.media.MediaRecorder
++import android.media.audiofx.AcousticEchoCanceler
++import android.media.audiofx.NoiseSuppressor
++import android.util.Base64
++import android.util.Log
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.isActive
++import kotlinx.coroutines.launch
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.Response
++import okhttp3.WebSocket
++import okhttp3.WebSocketListener
++import okio.ByteString
++import org.json.JSONArray
++import org.json.JSONObject
++import java.util.concurrent.TimeUnit
++import kotlin.math.sqrt
++
++/**
++ * Real-time voice with the Gemini Live API (raw WebSocket).
++ * Mic: 16 kHz 16-bit mono PCM up; speaker: 24 kHz PCM down.
++ * Echo cancellation lets the user talk over the model (barge-in); when the
++ * server says "interrupted" the playback buffer is dropped at once.
++ */
++class GeminiLive(
++    private val apiKey: String,
++    private val model: String,
++    private val voice: String = "Puck",
++    private val systemPrompt: String = DEFAULT_PROMPT,
++) {
++    companion object {
++        private const val TAG = "GeminiLive"
++        private const val URL =
++            "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
++        const val DEFAULT_MODEL = "gemini-3.8-live"
++        const val DEFAULT_PROMPT =
++            "你是 Minis，用户的私人助手。用户视力不好，请用简短、口语化的中文回答，一次只说一件事。"
++        val voices = listOf("Puck", "Charon", "Kore", "Fenrir", "Aoede", "Leda", "Orus", "Zephyr")
++    }
++
++    enum class Phase { IDLE, CONNECTING, LISTENING, SPEAKING, ERROR }
++
++    data class Line(val user: Boolean, val text: String)
++
++    private val _phase = MutableStateFlow(Phase.IDLE)
++    val phase: StateFlow<Phase> = _phase.asStateFlow()
++    private val _error = MutableStateFlow<String?>(null)
++    val error: StateFlow<String?> = _error.asStateFlow()
++    private val _lines = MutableStateFlow<List<Line>>(emptyList())
++    val lines: StateFlow<List<Line>> = _lines.asStateFlow()
++    /** 0..1 mic loudness, for the animated orb. */
++    private val _level = MutableStateFlow(0f)
++    val level: StateFlow<Float> = _level.asStateFlow()
++    private val _muted = MutableStateFlow(false)
++    val muted: StateFlow<Boolean> = _muted.asStateFlow()
++
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++    private val client = OkHttpClient.Builder()
++        .pingInterval(20, TimeUnit.SECONDS)
++        .readTimeout(0, TimeUnit.MILLISECONDS)
++        .build()
++    private var ws: WebSocket? = null
++    private var micJob: Job? = null
++    private var record: AudioRecord? = null
++    private var track: AudioTrack? = null
++    private var aec: AcousticEchoCanceler? = null
++    private var ns: NoiseSuppressor? = null
++    @Volatile private var setupDone = false
++    @Volatile private var legacySetup = false
++    @Volatile private var stopped = false
++    @Volatile private var lastAudioAt = 0L
++
++    fun start() {
++        stopped = false
++        _error.value = null
++        connect()
++    }
++
++    fun setMuted(m: Boolean) { _muted.value = m }
++
++    fun sendText(text: String) {
++        if (text.isBlank()) return
++        append(true, text)
++        ws?.send(JSONObject().put("realtimeInput", JSONObject().put("text", text)).toString())
++    }
++
++    private fun connect() {
++        _phase.value = Phase.CONNECTING
++        setupDone = false
++        val req = Request.Builder().url("$URL?key=$apiKey").build()
++        ws = client.newWebSocket(req, object : WebSocketListener() {
++            override fun onOpen(webSocket: WebSocket, response: Response) {
++                webSocket.send(setupMessage().toString())
++            }
++            override fun onMessage(webSocket: WebSocket, text: String) = handle(text)
++            override fun onMessage(webSocket: WebSocket, bytes: ByteString) = handle(bytes.utf8())
++            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
++                webSocket.close(1000, null)
++                onClosed(code, reason)
++            }
++            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
++                Log.w(TAG, "ws failure", t)
++                onClosed(-1, t.message ?: "网络错误")
++            }
++        })
++    }
++
++    private fun onClosed(code: Int, reason: String) {
++        if (stopped) return
++        stopAudio()
++        // Older servers want responseModalities inside generationConfig: retry once.
++        if (!setupDone && !legacySetup && code in 1007..1008) {
++            legacySetup = true
++            connect(); return
++        }
++        _error.value = when {
++            reason.contains("API key", true) || code == 1008 && reason.contains("key", true) -> "Gemini API Key 不对，请在 账号连接 里重新填写"
++            reason.isNotBlank() -> "连接断开：$reason"
++            else -> "连接断开（$code）"
++        }
++        _phase.value = Phase.ERROR
++    }
++
++    private fun setupMessage(): JSONObject {
++        val setup = JSONObject().put("model", "models/$model")
++        val speech = JSONObject().put("voiceConfig",
++            JSONObject().put("prebuiltVoiceConfig", JSONObject().put("voiceName", voice)))
++        if (legacySetup) {
++            setup.put("generationConfig", JSONObject()
++                .put("responseModalities", JSONArray().put("AUDIO"))
++                .put("speechConfig", speech))
++        } else {
++            setup.put("responseModalities", JSONArray().put("AUDIO"))
++            setup.put("speechConfig", speech)
++        }
++        setup.put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", systemPrompt))))
++        setup.put("inputAudioTranscription", JSONObject())
++        setup.put("outputAudioTranscription", JSONObject())
++        return JSONObject().put("setup", setup)
++    }
++
++    private fun handle(text: String) {
++        val msg = runCatching { JSONObject(text) }.getOrNull() ?: return
++        if (msg.has("setupComplete")) {
++            setupDone = true
++            startAudio()
++            _phase.value = Phase.LISTENING
++            return
++        }
++        msg.optJSONObject("error")?.let { e ->
++            _error.value = e.optString("message", "出错了"); _phase.value = Phase.ERROR
++        }
++        val sc = msg.optJSONObject("serverContent") ?: return
++        if (sc.optBoolean("interrupted")) {
++            track?.let { runCatching { it.pause(); it.flush(); it.play() } }
++            _phase.value = Phase.LISTENING
++        }
++        sc.optJSONObject("inputTranscription")?.optString("text")?.let { if (it.isNotBlank()) appendStream(true, it) }
++        sc.optJSONObject("outputTranscription")?.optString("text")?.let { if (it.isNotBlank()) appendStream(false, it) }
++        val parts = sc.optJSONObject("modelTurn")?.optJSONArray("parts")
++        if (parts != null) for (i in 0 until parts.length()) {
++            val inline = parts.getJSONObject(i).optJSONObject("inlineData") ?: continue
++            if (!inline.optString("mimeType").startsWith("audio/")) continue
++            val pcm = Base64.decode(inline.optString("data"), Base64.DEFAULT)
++            _phase.value = Phase.SPEAKING
++            lastAudioAt = System.currentTimeMillis()
++            track?.write(pcm, 0, pcm.size)
++        }
++        if (sc.optBoolean("turnComplete")) {
++            scope.launch {
++                kotlinx.coroutines.delay(600)
++                if (System.currentTimeMillis() - lastAudioAt > 500 && _phase.value == Phase.SPEAKING) _phase.value = Phase.LISTENING
++            }
++        }
++    }
++
++    private fun append(user: Boolean, text: String) {
++        _lines.value = (_lines.value + Line(user, text)).takeLast(60)
++    }
++
++    /** Transcripts arrive in fragments: glue them onto the current turn. */
++    private fun appendStream(user: Boolean, frag: String) {
++        val cur = _lines.value
++        val last = cur.lastOrNull()
++        _lines.value = if (last != null && last.user == user) {
++            cur.dropLast(1) + last.copy(text = last.text + frag)
++        } else {
++            (cur + Line(user, frag.trimStart())).takeLast(60)
++        }
++    }
++
++    @SuppressLint("MissingPermission")
++    private fun startAudio() {
++        if (micJob?.isActive == true) return
++        val outMin = AudioTrack.getMinBufferSize(24000, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
++        track = AudioTrack.Builder()
++            .setAudioAttributes(AudioAttributes.Builder()
++                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
++                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
++            .setAudioFormat(AudioFormat.Builder().setSampleRate(24000)
++                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
++                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
++            .setBufferSizeInBytes(maxOf(outMin * 4, 24000 * 2))
++            .setTransferMode(AudioTrack.MODE_STREAM)
++            .build().also { it.play() }
++
++        val inMin = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
++        val rec = AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, 16000,
++            AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(inMin, 3200) * 2)
++        record = rec
++        if (AcousticEchoCanceler.isAvailable()) aec = AcousticEchoCanceler.create(rec.audioSessionId)?.apply { enabled = true }
++        if (NoiseSuppressor.isAvailable()) ns = NoiseSuppressor.create(rec.audioSessionId)?.apply { enabled = true }
++        rec.startRecording()
++        micJob = scope.launch {
++            val buf = ByteArray(3200) // 100 ms
++            while (isActive && !stopped) {
++                val n = rec.read(buf, 0, buf.size)
++                if (n <= 0) continue
++                var sum = 0.0
++                var i = 0
++                while (i + 1 < n) {
++                    val s = (buf[i].toInt() and 0xFF) or (buf[i + 1].toInt() shl 8)
++                    sum += (s.toShort().toDouble()) * s.toShort()
++                    i += 2
++                }
++                _level.value = (sqrt(sum / (n / 2)) / 6000.0).toFloat().coerceIn(0f, 1f)
++                if (_muted.value) continue
++                val b64 = Base64.encodeToString(buf, 0, n, Base64.NO_WRAP)
++                ws?.send("{\"realtimeInput\":{\"audio\":{\"data\":\"$b64\",\"mimeType\":\"audio/pcm;rate=16000\"}}}")
++            }
++        }
++    }
++
++    private fun stopAudio() {
++        micJob?.cancel(); micJob = null
++        runCatching { record?.stop() }; runCatching { record?.release() }; record = null
++        runCatching { aec?.release() }; aec = null
++        runCatching { ns?.release() }; ns = null
++        runCatching { track?.stop() }; runCatching { track?.release() }; track = null
++        _level.value = 0f
++    }
++
++    fun stop() {
++        stopped = true
++        stopAudio()
++        runCatching { ws?.close(1000, "bye") }
++        ws = null
++        _phase.value = Phase.IDLE
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PetPainter.kt b/src/android/app/src/main/java/com/openminis/app/plus/PetPainter.kt
@@ -881,10 +1520,10 @@ index 0000000..c154112
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusPrefs.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusPrefs.kt
 new file mode 100644
-index 0000000..eb8de5a
+index 0000000..188d332
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/PlusPrefs.kt
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,129 @@
 +package com.openminis.app.plus
 +
 +import android.content.Context
@@ -921,6 +1560,7 @@ index 0000000..eb8de5a
 +    val petColor: Int = 0xFF5B8DEF.toInt(),
 +    val todayCollapsed: Boolean = false,
 +    val autoFallback: Boolean = true,
++    val autoClean: Boolean = true,
 +) {
 +    val isVps: Boolean get() = workMode == MODE_VPS
 +    val onlineServers: List<VpsServer> get() = servers.filter { it.enabled && it.lastLatencyMs >= 0 }
@@ -980,6 +1620,7 @@ index 0000000..eb8de5a
 +            petColor = p.getInt("petColor", 0xFF5B8DEF.toInt()),
 +            todayCollapsed = p.getBoolean("todayCollapsed", false),
 +            autoFallback = p.getBoolean("autoFallback", true),
++            autoClean = p.getBoolean("autoClean", true),
 +        )
 +    }
 +
@@ -1008,748 +1649,7 @@ index 0000000..eb8de5a
 +            ?.putInt("petColor", next.petColor)
 +            ?.putBoolean("todayCollapsed", next.todayCollapsed)
 +            ?.putBoolean("autoFallback", next.autoFallback)
++            ?.putBoolean("autoClean", next.autoClean)
 +            ?.apply()
 +    }
-+}
-diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt
-new file mode 100644
-index 0000000..afa140b
---- /dev/null
-+++ b/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt
-@@ -0,0 +1,133 @@
-+package com.openminis.app.plus
-+
-+import android.content.Context
-+import android.content.SharedPreferences
-+import com.openminis.app.MinisApp
-+import kotlinx.coroutines.flow.MutableStateFlow
-+import kotlinx.coroutines.flow.StateFlow
-+import kotlinx.coroutines.flow.asStateFlow
-+import org.json.JSONArray
-+import org.json.JSONObject
-+
-+/** A service the Connections page knows how to hold a credential for. */
-+data class ConnectionKind(
-+    val id: String,
-+    val name: String,
-+    val desc: String,
-+    val color: Long,
-+    val letter: String,
-+    val accountLabel: String,
-+    val secretLabel: String,
-+    /** Env var the secret is exposed as (masked in transcripts by Minis' redactor). */
-+    val envKey: String?,
-+)
-+
-+data class ConnectionEntry(
-+    val kindId: String,
-+    val account: String,
-+    val shareWithAi: Boolean,
-+    val updatedAt: Long,
-+)
-+
-+/**
-+ * Account / credential vault behind the Connections page.
-+ * Secrets are stored in Minis' existing AES-256-GCM EncryptedSharedPreferences
-+ * (Android Keystore). The AI never reads the vault: when "交给 AI 使用" is on,
-+ * the secret is injected into the sandbox as an env var, and Minis' env-var
-+ * redactor masks the value in anything the model sees.
-+ */
-+object PlusVault {
-+    val kinds: List<ConnectionKind> = listOf(
-+        ConnectionKind("gemini", "Gemini", "实时语音、看图、长文本", 0xFF4285F4, "G", "备注", "API Key", "GEMINI_API_KEY"),
-+        ConnectionKind("openai", "OpenAI", "GPT 模型与语音", 0xFF10A37F, "O", "备注", "API Key", "OPENAI_API_KEY"),
-+        ConnectionKind("anthropic", "Claude", "Anthropic API", 0xFFD97757, "C", "备注", "API Key", "ANTHROPIC_API_KEY"),
-+        ConnectionKind("github", "GitHub", "仓库、Actions、Release", 0xFF24292F, "GH", "用户名", "Token", "GITHUB_TOKEN"),
-+        ConnectionKind("google", "Google", "Gmail、日历、云盘", 0xFFEA4335, "Go", "邮箱", "密码 / 应用专用密码", null),
-+        ConnectionKind("cloudflare", "Cloudflare", "域名、DNS、Workers", 0xFFF38020, "CF", "邮箱", "API Token", "CLOUDFLARE_API_TOKEN"),
-+        ConnectionKind("telegram", "Telegram Bot", "消息推送与机器人", 0xFF229ED9, "TG", "Bot 名称", "Bot Token", "TELEGRAM_BOT_TOKEN"),
-+        ConnectionKind("okx", "OKX", "行情与交易（只读建议）", 0xFF000000, "OK", "API Key", "Secret", null),
-+        ConnectionKind("binance", "Binance", "行情与交易（只读建议）", 0xFFF0B90B, "B", "API Key", "Secret", null),
-+        ConnectionKind("custom", "其他账号", "任何网站的账号密码", 0xFF8E8E93, "+", "账号", "密码", null),
-+    )
-+
-+    private const val META = "plus_vault_meta"
-+    private const val SECRETS = "plus_vault_secrets"
-+    private val _entries = MutableStateFlow<Map<String, ConnectionEntry>>(emptyMap())
-+    val entries: StateFlow<Map<String, ConnectionEntry>> = _entries.asStateFlow()
-+    @Volatile private var meta: SharedPreferences? = null
-+    @Volatile private var secrets: SharedPreferences? = null
-+
-+    fun init(context: Context) {
-+        if (meta != null) return
-+        synchronized(this) {
-+            if (meta != null) return
-+            val ctx = context.applicationContext
-+            val m = ctx.getSharedPreferences(META, Context.MODE_PRIVATE)
-+            secrets = runCatching {
-+                com.openminis.app.util.EncryptedPrefsFactory.safeCreate(ctx, SECRETS)
-+            }.getOrNull()
-+            meta = m
-+            _entries.value = runCatching {
-+                val arr = JSONArray(m.getString("entries", "[]"))
-+                (0 until arr.length()).associate { i ->
-+                    val o = arr.getJSONObject(i)
-+                    val e = ConnectionEntry(o.getString("kind"), o.optString("account"),
-+                        o.optBoolean("share", false), o.optLong("updated"))
-+                    e.kindId to e
-+                }
-+            }.getOrDefault(emptyMap())
-+        }
-+    }
-+
-+    fun hasSecret(kindId: String): Boolean = secrets?.contains(kindId) == true
-+
-+    /** Masked preview only — the UI never shows the full secret. */
-+    fun preview(kindId: String): String {
-+        val s = secrets?.getString(kindId, null) ?: return ""
-+        return if (s.length <= 4) "••••" else "••••" + s.takeLast(4)
-+    }
-+
-+    fun save(context: Context, kind: ConnectionKind, account: String, secret: String?, share: Boolean) {
-+        init(context)
-+        if (secret != null && secret.isNotEmpty()) secrets?.edit()?.putString(kind.id, secret)?.apply()
-+        val e = ConnectionEntry(kind.id, account.trim(), share, System.currentTimeMillis())
-+        _entries.value = _entries.value + (kind.id to e)
-+        persist()
-+        syncEnv(context, kind, share)
-+    }
-+
-+    fun remove(context: Context, kind: ConnectionKind) {
-+        init(context)
-+        secrets?.edit()?.remove(kind.id)?.apply()
-+        _entries.value = _entries.value - kind.id
-+        persist()
-+        syncEnv(context, kind, false)
-+    }
-+
-+    private fun persist() {
-+        val arr = JSONArray()
-+        _entries.value.values.forEach { e ->
-+            arr.put(JSONObject().apply {
-+                put("kind", e.kindId); put("account", e.account)
-+                put("share", e.shareWithAi); put("updated", e.updatedAt)
-+            })
-+        }
-+        meta?.edit()?.putString("entries", arr.toString())?.apply()
-+    }
-+
-+    private fun syncEnv(context: Context, kind: ConnectionKind, share: Boolean) {
-+        val key = kind.envKey ?: return
-+        val app = context.applicationContext as? MinisApp ?: return
-+        runCatching {
-+            val repo = app.envVarRepository
-+            val existing = repo.entries.value.firstOrNull { it.key == key }
-+            val secret = secrets?.getString(kind.id, null)
-+            if (share && secret != null) {
-+                if (existing == null) repo.add(key, secret, "来自 账号连接 · ${kind.name}")
-+                else repo.update(existing.id, key, secret, "来自 账号连接 · ${kind.name}")
-+            } else if (existing != null && existing.note.startsWith("来自 账号连接")) {
-+                repo.delete(existing.id)
-+            }
-+        }
-+    }
-+}
-diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt
-new file mode 100644
-index 0000000..215306f
---- /dev/null
-+++ b/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt
-@@ -0,0 +1,117 @@
-+package com.openminis.app.plus
-+
-+import android.content.Context
-+import android.util.Log
-+import com.openminis.app.MinisApp
-+import kotlinx.coroutines.CoroutineScope
-+import kotlinx.coroutines.Dispatchers
-+import kotlinx.coroutines.Job
-+import kotlinx.coroutines.SupervisorJob
-+import kotlinx.coroutines.async
-+import kotlinx.coroutines.awaitAll
-+import kotlinx.coroutines.delay
-+import kotlinx.coroutines.isActive
-+import kotlinx.coroutines.launch
-+import kotlinx.coroutines.withContext
-+import java.net.InetSocketAddress
-+import java.net.Socket
-+
-+/**
-+ * Health checks for the user's VPS list, and the bridge into the sandbox.
-+ *
-+ * Every check opens a TCP connection to the SSH port and reads the server
-+ * banner, so "online" means sshd is really answering (not just a ping).
-+ * The ordered list of healthy servers is published to the sandbox as env
-+ * vars, which `minis-vps` reads: it tries servers in order (lowest latency
-+ * first) and moves to the next one when a connection fails. When every
-+ * server is down and auto-fallback is on, the effective mode drops to local.
-+ */
-+object PlusVps {
-+    private const val TAG = "PlusVps"
-+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-+    private var monitor: Job? = null
-+
-+    /** Returns latency in ms, or -2 when unreachable / not an SSH server. */
-+    suspend fun probe(server: VpsServer, timeoutMs: Int = 5000): Int = withContext(Dispatchers.IO) {
-+        val start = System.nanoTime()
-+        try {
-+            Socket().use { sock ->
-+                sock.connect(InetSocketAddress(server.host, server.port), timeoutMs)
-+                val connectMs = ((System.nanoTime() - start) / 1_000_000).toInt()
-+                sock.soTimeout = timeoutMs
-+                val buf = ByteArray(64)
-+                val n = sock.getInputStream().read(buf)
-+                val banner = if (n > 0) String(buf, 0, n) else ""
-+                if (banner.startsWith("SSH-")) connectMs else -2
-+            }
-+        } catch (e: Exception) {
-+            Log.d(TAG, "probe ${server.host}:${server.port} failed: ${e.message}")
-+            -2
-+        }
-+    }
-+
-+    suspend fun probeAll(context: Context) {
-+        PlusPrefs.init(context)
-+        val servers = PlusPrefs.state.value.servers
-+        if (servers.isEmpty()) { syncToSandbox(context); return }
-+        val results = withContext(Dispatchers.IO) {
-+            servers.map { s -> async { s.id to (if (s.enabled) probe(s) else -1) } }.awaitAll()
-+        }.toMap()
-+        val now = System.currentTimeMillis()
-+        PlusPrefs.update(context) { st ->
-+            st.copy(servers = st.servers.map { s ->
-+                val r = results[s.id] ?: return@map s
-+                s.copy(lastLatencyMs = r, lastCheckedAt = now)
-+            })
-+        }
-+        syncToSandbox(context)
-+    }
-+
-+    /** Servers in the order minis-vps should try them. */
-+    fun orderedTargets(st: PlusState): List<VpsServer> {
-+        val enabled = st.servers.filter { it.enabled }
-+        val online = enabled.filter { it.lastLatencyMs >= 0 }.sortedBy { it.lastLatencyMs }
-+        val unknown = enabled.filter { it.lastLatencyMs == -1 }
-+        return online + unknown
-+    }
-+
-+    fun effectiveMode(st: PlusState): String {
-+        if (!st.isVps) return PlusState.MODE_LOCAL
-+        if (st.autoFallback && orderedTargets(st).isEmpty()) return PlusState.MODE_LOCAL
-+        return PlusState.MODE_VPS
-+    }
-+
-+    /** Publish work mode + server list into the sandbox environment. */
-+    fun syncToSandbox(context: Context) {
-+        val st = PlusPrefs.state.value
-+        val list = orderedTargets(st).joinToString(",") { "${it.user}@${it.host}:${it.port}" }
-+        val mode = effectiveMode(st)
-+        val app = context.applicationContext as? MinisApp ?: return
-+        runCatching {
-+            val repo = app.envVarRepository
-+            fun put(key: String, value: String, note: String) {
-+                val existing = repo.entries.value.firstOrNull { it.key == key }
-+                if (existing == null) repo.add(key, value, note)
-+                else if (repo.getValue(key) != value) repo.update(existing.id, key, value, note)
-+            }
-+            put("MINIS_WORK_MODE", mode,
-+                "Minis Plus 工作位置: local=手机沙箱, vps=把重任务交给 VPS（用 minis-vps run/bg 执行）")
-+            put("MINIS_VPS_SERVERS", list.ifEmpty { "none" },
-+                "Minis Plus 服务器列表，按延迟排序；minis-vps 自动选第一个可用的，断开切下一台")
-+        }.onFailure { Log.w(TAG, "env sync failed: ${it.message}") }
-+    }
-+
-+    /** Re-check servers every 90 s while VPS mode is on. */
-+    fun startMonitor(context: Context) {
-+        val appCtx = context.applicationContext
-+        PlusPrefs.init(appCtx)
-+        if (monitor?.isActive == true) return
-+        monitor = scope.launch {
-+            delay(3000)
-+            while (isActive) {
-+                if (PlusPrefs.state.value.isVps) runCatching { probeAll(appCtx) }
-+                delay(90_000)
-+            }
-+        }
-+    }
-+}
-diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/GlobalShellThrottle.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/GlobalShellThrottle.kt
-index d30794c..e7a3a6a 100644
---- a/src/android/app/src/main/java/com/openminis/app/sandbox/GlobalShellThrottle.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/sandbox/GlobalShellThrottle.kt
-@@ -51,8 +51,14 @@ import kotlinx.coroutines.withTimeoutOrNull
- object GlobalShellThrottle {
-     private const val TAG = "GlobalShellThrottle"
- 
--    /** Live Minis child processes the gate admits up to. */
--    const val PROCESS_BUDGET = 16
-+    /** Budget on a device that enforces the 32-process phantom limit. */
-+    const val DEFAULT_PROCESS_BUDGET = 16
-+
-+    /**
-+     * Live Minis child processes the gate admits up to. Raised by
-+     * [PhantomProcessGuard] when the phantom-process killer is off.
-+     */
-+    val PROCESS_BUDGET: Int get() = PhantomProcessGuard.budget
- 
-     /**
-      * What a command is assumed to cost before its processes show up in
-diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/NetIfacePublisher.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/NetIfacePublisher.kt
-new file mode 100644
-index 0000000..eae9a02
---- /dev/null
-+++ b/src/android/app/src/main/java/com/openminis/app/sandbox/NetIfacePublisher.kt
-@@ -0,0 +1,103 @@
-+package com.openminis.app.sandbox
-+
-+import android.content.Context
-+import android.net.ConnectivityManager
-+import android.net.LinkProperties
-+import android.net.Network
-+import android.util.Log
-+import java.io.File
-+import java.net.Inet4Address
-+import java.net.Inet6Address
-+
-+/**
-+ * [T-android-fake-netlink-real-ifaces] Publishes the device's real network
-+ * interfaces to the sandbox.
-+ *
-+ * The guest cannot open a NETLINK_ROUTE socket (SELinux), so proot's
-+ * `--fake-netlink` answers interface dumps itself. On its own it only knows
-+ * loopback, so `ip addr`, Go's net.Interfaces(), Node's os.networkInterfaces()
-+ * and friends saw a machine with no network ("没有 IP"). The app CAN ask
-+ * ConnectivityManager, so it writes the active network's addresses to a small
-+ * file that proot re-reads on every dump:
-+ *
-+ *     <ifname> <4|6> <address> <prefixlen>
-+ *
-+ * Only true addresses are written, so a guest that binds one gets a socket the
-+ * kernel accepts. The default-network callback keeps the file current across
-+ * Wi-Fi / mobile / VPN switches without restarting any shell.
-+ */
-+object NetIfacePublisher {
-+    private const val TAG = "NetIfacePublisher"
-+    const val ENV_KEY = "PROOT_FAKE_NETLINK_IFACES"
-+
-+    @Volatile private var callbackRegistered = false
-+
-+    private fun file(context: Context): File = File(PRootKernel.getProotTmpDir(context), "netifs")
-+
-+    /** Call from boot, before any shell spawns. Idempotent. */
-+    fun start(context: Context) {
-+        val app = context.applicationContext
-+        val target = file(app)
-+        PRootKernel.customEnvironment[ENV_KEY] = target.absolutePath
-+
-+        val cm = app.getSystemService(ConnectivityManager::class.java) ?: return
-+        runCatching { write(target, cm.getLinkProperties(cm.activeNetwork)) }
-+            .onFailure { Log.w(TAG, "initial snapshot failed: ${it.message}") }
-+
-+        if (callbackRegistered) return
-+        runCatching {
-+            cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
-+                // linkAddresses can still be empty at onAvailable (VPN, dual
-+                // stack coming up), so every event re-reads the current
-+                // LinkProperties; writing the same content twice is harmless.
-+                override fun onAvailable(network: Network) {
-+                    write(target, cm.getLinkProperties(network))
-+                }
-+
-+                override fun onCapabilitiesChanged(network: Network, caps: android.net.NetworkCapabilities) {
-+                    write(target, cm.getLinkProperties(network))
-+                }
-+
-+                override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
-+                    write(target, lp)
-+                }
-+
-+                override fun onLost(network: Network) {
-+                    write(target, null)
-+                }
-+            })
-+            callbackRegistered = true
-+        }.onFailure { Log.w(TAG, "registerDefaultNetworkCallback failed: ${it.message}") }
-+    }
-+
-+    @Synchronized
-+    private fun write(target: File, lp: LinkProperties?) {
-+        val sb = StringBuilder()
-+        val seen = HashSet<String>()
-+        if (lp != null) {
-+            val name = lp.interfaceName?.takeIf { it.isNotBlank() && it.length < 16 } ?: "net0"
-+            for (la in lp.linkAddresses) {
-+                val addr = la.address
-+                val family = when (addr) {
-+                    is Inet4Address -> 4
-+                    is Inet6Address -> 6
-+                    else -> continue
-+                }
-+                val host = addr.hostAddress?.substringBefore('%') ?: continue
-+                if (!seen.add(host)) continue
-+                sb.append(name).append(' ').append(family).append(' ')
-+                    .append(host).append(' ').append(la.prefixLength).append('\n')
-+            }
-+        }
-+        runCatching {
-+            target.parentFile?.mkdirs()
-+            val tmp = File(target.parentFile, "netifs.tmp")
-+            tmp.writeText(sb.toString())
-+            if (!tmp.renameTo(target)) {
-+                target.writeText(sb.toString())
-+                tmp.delete()
-+            }
-+            Log.i(TAG, "published ${sb.lines().count { it.isNotBlank() }} address(es)")
-+        }.onFailure { Log.w(TAG, "write failed: ${it.message}") }
-+    }
-+}
-diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/PRootKernel.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/PRootKernel.kt
-index 1310ec6..2b0dae1 100644
---- a/src/android/app/src/main/java/com/openminis/app/sandbox/PRootKernel.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/sandbox/PRootKernel.kt
-@@ -209,6 +209,13 @@ object PRootKernel {
-         // proxy toggles without a restart.
-         customEnvironment.putAll(systemProxyEnv(context))
- 
-+        // [T-android-fake-netlink-real-ifaces] Let proot's fake netlink report
-+        // the phone's real interfaces instead of loopback only.
-+        NetIfacePublisher.start(context)
-+
-+        // [T-android-phantom-budget] Size the shell throttle to the device.
-+        PhantomProcessGuard.refresh(context)
-+
-         // Register global bind mounts so direct file I/O tools (file_read, file_edit)
-         // can resolve /var/minis/{memory,skills,shared}/... (idempotent).
-         registerGlobalBindMounts(context)
-diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/PhantomProcessGuard.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/PhantomProcessGuard.kt
-new file mode 100644
-index 0000000..5a069c4
---- /dev/null
-+++ b/src/android/app/src/main/java/com/openminis/app/sandbox/PhantomProcessGuard.kt
-@@ -0,0 +1,66 @@
-+package com.openminis.app.sandbox
-+
-+import android.content.Context
-+import android.os.Build
-+import android.provider.Settings
-+import android.util.Log
-+
-+/**
-+ * [T-android-phantom-budget] Sizes [GlobalShellThrottle]'s process budget to
-+ * what the device actually enforces.
-+ *
-+ * The throttle exists because Android 12+ SIGKILLs an app's "phantom"
-+ * (child) processes beyond 32, which is what tears down PRoot shells
-+ * mid-command. Its budget of 16 is right for a stock phone, but it is also
-+ * why a fast phone feels slow: commands queue behind each other even when the
-+ * CPU is idle. When the killer is not in force (Android 11 and below, or the
-+ * user turned it off with Developer options → "Disable child process
-+ * restrictions", or Shizuku/adb ran
-+ * `settings put global settings_enable_monitor_phantom_procs false`), the
-+ * budget is raised so parallel work actually runs in parallel.
-+ */
-+object PhantomProcessGuard {
-+    private const val TAG = "PhantomProcessGuard"
-+    const val RELAXED_BUDGET = 64
-+    private const val FLAG = "settings_enable_monitor_phantom_procs"
-+
-+    @Volatile
-+    var budget: Int = GlobalShellThrottle.DEFAULT_PROCESS_BUDGET
-+        private set
-+
-+    /** True when the phantom-process killer cannot fire on this device. */
-+    fun killerDisabled(context: Context): Boolean {
-+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
-+        val v = runCatching { Settings.Global.getString(context.contentResolver, FLAG) }.getOrNull()
-+        if (v.equals("false", ignoreCase = true)) return true
-+        // The other switch: `device_config put activity_manager
-+        // max_phantom_processes <big>`. DeviceConfig is a system API, so read
-+        // it reflectively; on builds where the app may not read it this
-+        // returns null and we stay at the safe budget.
-+        val max = maxPhantomProcesses()
-+        return max != null && max >= RELAXED_BUDGET * 2
-+    }
-+
-+    private fun maxPhantomProcesses(): Int? = runCatching {
-+        val cls = Class.forName("android.provider.DeviceConfig")
-+        val m = cls.getMethod("getInt", String::class.java, String::class.java, Int::class.javaPrimitiveType)
-+        (m.invoke(null, "activity_manager", "max_phantom_processes", -1) as Int).takeIf { it > 0 }
-+    }.getOrNull()
-+
-+    fun refresh(context: Context) {
-+        val relaxed = killerDisabled(context)
-+        budget = if (relaxed) RELAXED_BUDGET else GlobalShellThrottle.DEFAULT_PROCESS_BUDGET
-+        Log.i(TAG, "phantom killer ${if (relaxed) "off" else "on"} -> process budget $budget")
-+    }
-+
-+    /**
-+     * Shell commands that switch the killer off; run them through Shizuku
-+     * (`android-shizuku-cli`) or `adb shell`. Kept here so the agent and the
-+     * UI quote the same thing.
-+     */
-+    val DISABLE_COMMANDS = listOf(
-+        "settings put global $FLAG false",
-+        "device_config set_sync_disabled_for_tests persistent",
-+        "device_config put activity_manager max_phantom_processes 2147483647",
-+    )
-+}
-diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/ShellTimeoutPolicy.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/ShellTimeoutPolicy.kt
-index e9aac6e..8ffdc40 100644
---- a/src/android/app/src/main/java/com/openminis/app/sandbox/ShellTimeoutPolicy.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/sandbox/ShellTimeoutPolicy.kt
-@@ -50,7 +50,6 @@ object ShellTimeoutPolicy {
-     private val networkPrefixes = setOf(
-         "ping", "dig", "nslookup", "host", "traceroute",
-         "curl", "wget", "http",
--        "ssh", "scp", "rsync",
-     )
- 
-     /** Install commands — any of these (possibly with subcommand) triggers. */
-@@ -75,6 +74,10 @@ object ShellTimeoutPolicy {
-     /** Long-running / daemon drivers. */
-     private val longRunningPrefixes = setOf(
-         "watch",
-+        // [T-android-ssh-timeout] Remote sessions: a deploy or a tail over ssh
-+        // routinely outlives the 3-minute network bucket it used to share
-+        // with curl, and being SIGKILLed mid-transfer is worse than waiting.
-+        "ssh ", "scp ", "sftp ", "rsync ", "sshpass ", "autossh ", "mosh ", "minis-muse ",
-         "node --watch", "npm run dev", "npm run start", "npm start",
-         "python -m http.server",
-         "serve", "http-server",
-diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt
-index 0ff6192..5a6e608 100644
---- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt
-@@ -243,7 +243,7 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
-                 val svc = MinisAccessibilityService.getInstance()
-                 val data = JSONObject()
-                     .put("running", svc != null)
--                    .put("serviceName", MinisAccessibilityService.SERVICE_ID)
-+                    .put("serviceName", MinisAccessibilityService.serviceId(context))
-                     .put("capabilities", JSONArray().apply {
-                         put("retrieveWindowContent"); put("performGestures"); put("watchEvents")
-                     })
-diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt
-index f410899..e44d214 100644
---- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt
-@@ -4146,6 +4146,7 @@ fun ChatScreen(
-                 // initial list measure, or per-row composition.
-                 val perfFirstLayoutFired = remember(sessionId) { java.util.concurrent.atomic.AtomicBoolean(false) }
-                 Box {
-+                com.openminis.app.ui.plus.ChatWallpaperLayer(Modifier.matchParentSize())
-                 AlwaysStretchOverscrollBox { sharedEffect ->
-                 LazyColumn(
-                     state = listState,
-diff --git a/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt b/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
-index 9dd250d..4c53c6e 100644
---- a/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
-@@ -515,6 +515,10 @@ fun AppNavigation(
-         quickActionStart != null -> quickActionStart
-         else -> Routes.SESSION_LIST
-     }
-+    androidx.compose.runtime.DisposableEffect(navController) {
-+        com.openminis.app.ui.plus.PlusNav.navigate = { route -> navController.safeNavigate(route) }
-+        onDispose { com.openminis.app.ui.plus.PlusNav.navigate = null }
-+    }
-     NavHost(
-         navController = navController,
-         startDestination = startDestination,
-@@ -608,8 +612,22 @@ fun AppNavigation(
-             )
-         }
- 
-+        composable(com.openminis.app.ui.plus.PlusRoutes.WORK) {
-+            com.openminis.app.ui.plus.WorkLocationScreen(
-+                onBack = { navController.safePopBackStack() },
-+                onOpenTerminal = { cmd -> navController.safeNavigate(Routes.terminal(cmd)) },
-+            )
-+        }
-+        composable(com.openminis.app.ui.plus.PlusRoutes.CONNECTIONS) {
-+            com.openminis.app.ui.plus.ConnectionsScreen(onBack = { navController.safePopBackStack() })
-+        }
-+        composable(com.openminis.app.ui.plus.PlusRoutes.PERSONALIZE) {
-+            com.openminis.app.ui.plus.PersonalizeScreen(onBack = { navController.safePopBackStack() })
-+        }
-+
-         composable(Routes.SETTINGS) {
-             SettingsScreen(
-+                onPlusClick = { route -> navController.safeNavigate(route) },
-                 onBack = { navController.safePopBackStack() },
-                 onProvidersClick = { navController.safeNavigate(Routes.PROVIDER_LIST) },
-                 onModelGroupsClick = { navController.safeNavigate(Routes.MODEL_GROUPS) },
-diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
-new file mode 100644
-index 0000000..e7fb1d3
---- /dev/null
-+++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
-@@ -0,0 +1,168 @@
-+package com.openminis.app.ui.plus
-+
-+import androidx.compose.foundation.background
-+import androidx.compose.foundation.clickable
-+import androidx.compose.foundation.layout.Arrangement
-+import androidx.compose.foundation.layout.Box
-+import androidx.compose.foundation.layout.Column
-+import androidx.compose.foundation.layout.Row
-+import androidx.compose.foundation.layout.Spacer
-+import androidx.compose.foundation.layout.fillMaxWidth
-+import androidx.compose.foundation.layout.padding
-+import androidx.compose.foundation.layout.size
-+import androidx.compose.foundation.layout.width
-+import androidx.compose.foundation.shape.RoundedCornerShape
-+import androidx.compose.material.icons.Icons
-+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
-+import androidx.compose.material.icons.outlined.Lock
-+import androidx.compose.material3.AlertDialog
-+import androidx.compose.material3.Icon
-+import androidx.compose.material3.MaterialTheme
-+import androidx.compose.material3.OutlinedTextField
-+import androidx.compose.material3.Switch
-+import androidx.compose.material3.Text
-+import androidx.compose.material3.TextButton
-+import androidx.compose.runtime.Composable
-+import androidx.compose.runtime.collectAsState
-+import androidx.compose.runtime.getValue
-+import androidx.compose.runtime.mutableStateOf
-+import androidx.compose.runtime.remember
-+import androidx.compose.runtime.setValue
-+import androidx.compose.ui.Alignment
-+import androidx.compose.ui.Modifier
-+import androidx.compose.ui.graphics.Color
-+import androidx.compose.ui.platform.LocalContext
-+import androidx.compose.ui.text.font.FontWeight
-+import androidx.compose.ui.text.input.PasswordVisualTransformation
-+import androidx.compose.ui.unit.dp
-+import androidx.compose.ui.unit.sp
-+import com.openminis.app.plus.ConnectionKind
-+import com.openminis.app.plus.PlusVault
-+
-+@Composable
-+fun ConnectionsScreen(onBack: () -> Unit) {
-+    val context = LocalContext.current
-+    PlusVault.init(context)
-+    val entries by PlusVault.entries.collectAsState()
-+    var open by remember { mutableStateOf<ConnectionKind?>(null) }
-+
-+    PlusPage("账号连接", onBack) {
-+        Row(
-+            Modifier.fillMaxWidth().padding(horizontal = 20.dp).padding(top = 12.dp),
-+            verticalAlignment = Alignment.CenterVertically,
-+        ) {
-+            Icon(Icons.Outlined.Lock, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
-+            Spacer(Modifier.width(8.dp))
-+            Text(
-+                "密钥加密存在这台手机里。AI 只能用，看不到明文。",
-+                style = MaterialTheme.typography.bodyMedium,
-+                color = MaterialTheme.colorScheme.onSurfaceVariant,
-+            )
-+        }
-+        val connected = PlusVault.kinds.filter { entries.containsKey(it.id) }
-+        val available = PlusVault.kinds.filterNot { entries.containsKey(it.id) }
-+        if (connected.isNotEmpty()) {
-+            PlusSection("已连接 · ${connected.size}") {
-+                connected.forEachIndexed { i, k ->
-+                    val e = entries[k.id]
-+                    ConnectionRow(k, sub = buildString {
-+                        append(e?.account?.ifBlank { null } ?: "已保存")
-+                        val pv = PlusVault.preview(k.id)
-+                        if (pv.isNotEmpty()) append(" · ").append(pv)
-+                        if (e?.shareWithAi == true && k.envKey != null) append(" · AI 可用")
-+                    }, connected = true) { open = k }
-+                    if (i < connected.lastIndex) PlusDivider()
-+                }
-+            }
-+        }
-+        PlusSection("可以连接") {
-+            available.forEachIndexed { i, k ->
-+                ConnectionRow(k, sub = k.desc, connected = false) { open = k }
-+                if (i < available.lastIndex) PlusDivider()
-+            }
-+        }
-+    }
-+
-+    open?.let { k -> ConnectionDialog(k, onDismiss = { open = null }) }
-+}
-+
-+@Composable
-+private fun ConnectionRow(k: ConnectionKind, sub: String, connected: Boolean, onClick: () -> Unit) {
-+    Row(
-+        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 12.dp),
-+        verticalAlignment = Alignment.CenterVertically,
-+    ) {
-+        Box(
-+            Modifier.size(38.dp).background(Color(k.color), RoundedCornerShape(10.dp)),
-+            contentAlignment = Alignment.Center,
-+        ) {
-+            Text(k.letter, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp)
-+        }
-+        Spacer(Modifier.width(14.dp))
-+        Column(Modifier.weight(1f)) {
-+            Text(k.name, style = MaterialTheme.typography.bodyLarge)
-+            Text(sub, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-+        }
-+        if (connected) {
-+            Text("已连接", color = Color(0xFF34C759), style = MaterialTheme.typography.labelMedium)
-+        } else {
-+            Text("连接", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelLarge)
-+        }
-+        Icon(
-+            Icons.AutoMirrored.Filled.KeyboardArrowRight, null,
-+            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
-+        )
-+    }
-+}
-+
-+@Composable
-+private fun ConnectionDialog(k: ConnectionKind, onDismiss: () -> Unit) {
-+    val context = LocalContext.current
-+    val existing = PlusVault.entries.value[k.id]
-+    var account by remember { mutableStateOf(existing?.account ?: "") }
-+    var secret by remember { mutableStateOf("") }
-+    var share by remember { mutableStateOf(existing?.shareWithAi ?: (k.envKey != null)) }
-+    val hasSaved = PlusVault.hasSecret(k.id)
-+    AlertDialog(
-+        onDismissRequest = onDismiss,
-+        title = { Text(k.name) },
-+        text = {
-+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-+                OutlinedTextField(account, { account = it }, label = { Text(k.accountLabel) }, singleLine = true)
-+                OutlinedTextField(
-+                    secret, { secret = it },
-+                    label = { Text(if (hasSaved) "${k.secretLabel}（留空=不改）" else k.secretLabel) },
-+                    singleLine = true,
-+                    visualTransformation = PasswordVisualTransformation(),
-+                )
-+                if (k.envKey != null) {
-+                    Row(verticalAlignment = Alignment.CenterVertically) {
-+                        Column(Modifier.weight(1f)) {
-+                            Text("交给 AI 使用")
-+                            Text(
-+                                "以 ${k.envKey} 提供给沙箱，聊天里自动打码",
-+                                style = MaterialTheme.typography.bodySmall,
-+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-+                            )
-+                        }
-+                        Switch(share, onCheckedChange = { share = it })
-+                    }
-+                }
-+            }
-+        },
-+        confirmButton = {
-+            TextButton(
-+                enabled = secret.isNotEmpty() || hasSaved || account.isNotBlank(),
-+                onClick = { PlusVault.save(context, k, account, secret.ifEmpty { null }, share); onDismiss() },
-+            ) { Text("保存") }
-+        },
-+        dismissButton = {
-+            Row {
-+                if (existing != null) TextButton(onClick = { PlusVault.remove(context, k); onDismiss() }) {
-+                    Text("断开", color = Color(0xFFFF3B30))
-+                }
-+                TextButton(onClick = onDismiss) { Text("取消") }
-+            }
-+        },
-+    )
 +}
