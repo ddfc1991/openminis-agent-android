@@ -1,3 +1,569 @@
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
+index 918385a..32b153d 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
+@@ -7034,9 +7034,12 @@ class ChatViewModel(
+                 // just failed. Falls back to `first()` when every candidate is
+                 // marked, so a fully-degraded group still resolves rather than
+                 // refusing to pick at all.
+-                RoutingStrategy.fallback ->
+-                    available.firstOrNull { it.id !in recentlyFailedEntryIds }
+-                        ?: available.first()
++                RoutingStrategy.fallback -> {
++                    // [Mines] 智能路由: fastest healthy member first when on.
++                    val ordered = com.openminis.app.plus.SmartRouter.order(available)
++                    ordered.firstOrNull { it.id !in recentlyFailedEntryIds }
++                        ?: ordered.first()
++                }
+             }
+ 
+         val instance = providerRepository.instance(targetEntry.providerInstanceId) ?: return false
+@@ -7461,7 +7464,10 @@ class ChatViewModel(
+             } catch (_: Exception) { continue }
+             result.add(FallbackCandidate(provider = p, entryId = entry.id))
+         }
+-        return result
++        // [Mines] 智能路由: walk the fallback chain fastest-healthy first.
++        return com.openminis.app.plus.SmartRouter.sortByHealth(result) { c ->
++            config.modelEntries.find { it.id == c.entryId }?.providerInstanceId
++        }
+     }
+ 
+     /**
+@@ -9485,7 +9491,7 @@ class ChatViewModel(
+      *
+      *  Also clears [ChatMessage.isAwaitingModelResponse] — without this, an
+      *  exception thrown after a tool turn (which sets isAwaitingModelResponse=
+-     *  true at runAgentLoop ~4015) leaves the "Minis is thinking" indicator
++     *  true at runAgentLoop ~4015) leaves the "Mines is thinking" indicator
+      *  on screen even though streaming is over. The flag is per-message and
+      *  is not implicitly cleared by isStreaming=false. */
+     private fun setInlineError(errorText: String) {
+@@ -10660,7 +10666,7 @@ class ChatViewModel(
+         val allToolInputs = mutableMapOf<String, String>()
+ 
+         // Add placeholder assistant message (once). Mark as awaiting so the
+-        // "Minis is thinking" indicator shows during the initial request gap
++        // "Mines is thinking" indicator shows during the initial request gap
+         // before the first stream chunk arrives. Mirrors iOS isAwaitingModelResponse.
+         // T300: snapshot the user's current thinking level at message
+         // creation so the renderer can hide Deep Thinking blocks for
+@@ -11046,7 +11052,7 @@ class ChatViewModel(
+                     // placeholder, while `loopExitedNormally = true` below
+                     // deliberately skips finalizeAtTurnLimit at the loop tail.
+                     //
+-                    // Without this the bubble stays on "Minis is thinking"
++                    // Without this the bubble stays on "Mines is thinking"
+                     // forever — the streamJob's finally only clears the GLOBAL
+                     // _isStreaming, not the per-message flags. Reachable with no
+                     // failure at all: ContextPolicy gives every model with a
+@@ -12808,7 +12814,7 @@ class ChatViewModel(
+             for (parts in slotResults) parts?.let { resultParts.addAll(it) }
+ 
+             // Update UI with tool statuses. Mark as awaiting the next model
+-            // response so "Minis is thinking" shows during the network gap
++            // response so "Mines is thinking" shows during the network gap
+             // between tool results being sent and the next turn's first chunk.
+             // Mirrors iOS isAwaitingModelResponse.
+             withContext(Dispatchers.Main) {
+@@ -14089,7 +14095,7 @@ class ChatViewModel(
+             // [T-vision-group-attribution / GH#182] iOS rewrites the tool block's
+             // live content here so the card names the model as it works. Android
+             // has no equivalent channel — no tool streams partial output to its
+-            // card, and the progress label ("Minis is reading Image",
++            // card, and the progress label ("Mines is reading Image",
+             // ChatToolFormatting.kt:102) is a static per-tool string. Building
+             // that plumbing is a separate change, so for now the per-attempt
+             // signal goes to the log, where a fallback is still traceable. The
+@@ -15324,6 +15330,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+             append("- Current date: ").append(dateStr).append(" (").append(tzId).append(")\n")
+             append("- Device language: ").append(lang).append("\n")
+             append("- minis-model-use models available: ").append(modelUseCount)
++            append(com.openminis.app.plus.PlusConnect.promptLine())
+         }
+     }
+ 
+@@ -16613,7 +16620,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+         if (lastIdx < 0) return
+         var last = msgs[lastIdx]
+ 
+-        // T73: clear "Minis is thinking…" the moment the user taps Stop.
++        // T73: clear "Mines is thinking…" the moment the user taps Stop.
+         // isAwaitingModelResponse is set true at runAgentLoop entry (≈ line
+         // 2785) so the typing indicator shows during the initial request
+         // gap before the first stream chunk. The cancel paths below didn't
+@@ -16681,7 +16688,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+         // Stop fired while still in the pre-first-chunk thinking gap (no
+         // partial text, no tool_use emitted, no committed history for this
+         // turn). The placeholder ChatMessage runAgentLoop pushed at L5248 is
+-        // not in the DB and would otherwise render as an empty "Minis" header
++        // not in the DB and would otherwise render as an empty "Mines" header
+         // bubble with no body. Drop it so the UI snaps back to idle the
+         // instant the user taps Stop. Mirrors the iOS #566/#569 boundary:
+         // a candidate WITH real text or any emitted tool_use is kept (handled
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/HelperUi.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/HelperUi.kt
+index 0a2e804..6de6b1c 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/chat/HelperUi.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/HelperUi.kt
+@@ -194,7 +194,7 @@ private fun helperModelStrategyLabel(f: HelperPhase.Finished): String? {
+  *
+  * Deliberately NOT [toolDisplayName] from ChatToolFormatting: that is a
+  * different vocabulary ("browser", "terminal", "file reader") built for the
+- * "Minis is using X" sentence, and reusing it here would rename the tool the
++ * "Mines is using X" sentence, and reusing it here would rename the tool the
+  * card is reporting.
+  */
+ internal fun helperToolLabel(name: String): String {
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/components/FullscreenImageViewer.kt b/src/android/app/src/main/java/com/openminis/app/ui/components/FullscreenImageViewer.kt
+index b7d2347..c22cc86 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/components/FullscreenImageViewer.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/components/FullscreenImageViewer.kt
+@@ -574,7 +574,7 @@ private suspend fun saveBytesToGallery(context: Context, original: OriginalImage
+                 val values = ContentValues().apply {
+                     put(MediaStore.Images.Media.DISPLAY_NAME, filename)
+                     put(MediaStore.Images.Media.MIME_TYPE, original.mime)
+-                    put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/Minis")
++                    put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/Mines")
+                     put(MediaStore.Images.Media.IS_PENDING, 1)
+                 }
+                 val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+@@ -587,7 +587,7 @@ private suspend fun saveBytesToGallery(context: Context, original: OriginalImage
+             } else {
+                 @Suppress("DEPRECATION")
+                 val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
+-                val minisDir = File(dir, "Minis").also { it.mkdirs() }
++                val minisDir = File(dir, "Mines").also { it.mkdirs() }
+                 File(minisDir, filename).writeBytes(original.bytes)
+             }
+             Log.i(EXPORT_TAG, "saved ORIGINAL ${original.mime} ${original.bytes.size} bytes as $filename")
+@@ -607,7 +607,7 @@ internal suspend fun saveToGallery(context: Context, bitmap: Bitmap): Boolean =
+                 val values = ContentValues().apply {
+                     put(MediaStore.Images.Media.DISPLAY_NAME, filename)
+                     put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+-                    put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/Minis")
++                    put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/Mines")
+                     put(MediaStore.Images.Media.IS_PENDING, 1)
+                 }
+                 val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+@@ -620,7 +620,7 @@ internal suspend fun saveToGallery(context: Context, bitmap: Bitmap): Boolean =
+             } else {
+                 @Suppress("DEPRECATION")
+                 val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
+-                val minisDir = File(dir, "Minis").also { it.mkdirs() }
++                val minisDir = File(dir, "Mines").also { it.mkdirs() }
+                 val file = File(minisDir, filename)
+                 stream = file.outputStream()
+                 stream.use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/components/QuickTestSheet.kt b/src/android/app/src/main/java/com/openminis/app/ui/components/QuickTestSheet.kt
+index 7fb4ed3..a5b6496 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/components/QuickTestSheet.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/components/QuickTestSheet.kt
+@@ -480,7 +480,7 @@ internal suspend fun performTest(
+                         // speaks in THAT voice, not the vendor default.
+                         val data = voice.synthesize(
+                             com.openminis.app.provider.voice.VoiceOutputRequest(
+-                                input = "Hi! This is Minis testing text to speech.",
++                                input = "Hi! This is Mines testing text to speech.",
+                                 model = entry.model.id,
+                                 voice = entry.model.id,
+                                 resolvedModel = entry.model,
+@@ -498,7 +498,7 @@ internal suspend fun performTest(
+                 if (!voice.supportsVoiceInput) {
+                     failure(context.getString(R.string.quicktest_voice_unsupported))
+                 } else {
+-                    val spoken = "Hello from Minis, testing speech to text."
++                    val spoken = "Hello from Mines, testing speech to text."
+                     val clip = synthesizeTestClip(context, spoken)
+                         ?: return@withContext failure(context.getString(R.string.quicktest_clip_failed))
+                     runCatching {
+@@ -531,7 +531,7 @@ internal suspend fun performTest(
+                     messages = listOf(
+                         LLMMessage(
+                             role = LLMMessage.Role.USER,
+-                            content = "Hi! I'm setting you up in Minis. Say hello back in one short, friendly sentence.",
++                            content = "Hi! I'm setting you up in Mines. Say hello back in one short, friendly sentence.",
+                         ),
+                     ),
+                     systemPrompt = null,
+@@ -550,7 +550,7 @@ internal suspend fun performTest(
+                 ?: return@withContext failure(context.getString(R.string.quicktest_image_unsupported))
+             runCatching {
+                 val resp = openAI.generateImage(
+-                    prompt = "A friendly cute mascot logo for an app called Minis, minimalist, centered, soft colors",
++                    prompt = "A friendly cute mascot logo for an app called Mines, minimalist, centered, soft colors",
+                     n = 1,
+                     size = "1024x1024",
+                     quality = null,
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt b/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
+index 9dd250d..7d26004 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
+@@ -515,6 +515,18 @@ fun AppNavigation(
+         quickActionStart != null -> quickActionStart
+         else -> Routes.SESSION_LIST
+     }
++    androidx.compose.runtime.DisposableEffect(navController) {
++        com.openminis.app.ui.plus.PlusNav.navigate = { route -> navController.safeNavigate(route) }
++        com.openminis.app.ui.plus.PlusNav.pending?.let { r ->
++            com.openminis.app.ui.plus.PlusNav.pending = null
++            navController.safeNavigate(r)
++        }
++        onDispose { com.openminis.app.ui.plus.PlusNav.navigate = null }
++    }
++    // Mines: one-time offer to pull data from the earlier Mines install.
++    com.openminis.app.ui.plus.MinesMigrationPrompt(
++        onOpen = { navController.safeNavigate(com.openminis.app.ui.plus.PlusRoutes.MIGRATE) },
++    )
+     NavHost(
+         navController = navController,
+         startDestination = startDestination,
+@@ -608,8 +620,70 @@ fun AppNavigation(
+             )
+         }
+ 
++        composable(com.openminis.app.ui.plus.PlusRoutes.WORK) {
++            com.openminis.app.ui.plus.WorkLocationScreen(
++                onBack = { navController.safePopBackStack() },
++                onOpenTerminal = { cmd -> navController.safeNavigate(Routes.terminal(cmd)) },
++                onOpenServer = { id -> navController.safeNavigate(com.openminis.app.ui.plus.PlusRoutes.server(id)) },
++            )
++        }
++        composable(
++            route = com.openminis.app.ui.plus.PlusRoutes.SERVER,
++            arguments = listOf(navArgument("id") { type = NavType.StringType }),
++        ) { entry ->
++            com.openminis.app.ui.plus.ServerDetailScreen(
++                serverId = entry.arguments?.getString("id") ?: "",
++                onBack = { navController.safePopBackStack() },
++                onOpenTerminal = { cmd -> navController.safeNavigate(Routes.terminal(cmd)) },
++            )
++        }
++        composable(com.openminis.app.ui.plus.PlusRoutes.SANDBOX) {
++            com.openminis.app.ui.plus.SandboxScreen(onBack = { navController.safePopBackStack() })
++        }
++        composable(com.openminis.app.ui.plus.PlusRoutes.PLUGINS) {
++            com.openminis.app.ui.plus.PluginsScreen(
++                onBack = { navController.safePopBackStack() },
++                onOpenTerminal = { cmd -> navController.safeNavigate(Routes.terminal(cmd)) },
++                onOpenMarket = { navController.safeNavigate(com.openminis.app.ui.plus.PlusRoutes.MARKET) },
++            )
++        }
++        composable(com.openminis.app.ui.plus.PlusRoutes.MARKET) {
++            com.openminis.app.ui.plus.MarketScreen(
++                onBack = { navController.safePopBackStack() },
++                onOpenTerminal = { cmd -> navController.safeNavigate(Routes.terminal(cmd)) },
++            )
++        }
++        composable(com.openminis.app.ui.plus.PlusRoutes.ROUTING) {
++            com.openminis.app.ui.plus.RoutingScreen(onBack = { navController.safePopBackStack() })
++        }
++        composable(com.openminis.app.ui.plus.PlusRoutes.TIDY) {
++            com.openminis.app.ui.plus.TidyScreen(onBack = { navController.safePopBackStack() })
++        }
++        composable(com.openminis.app.ui.plus.PlusRoutes.VERIFY) {
++            com.openminis.app.ui.plus.VerifyScreen(onBack = { navController.safePopBackStack() })
++        }
++        composable(com.openminis.app.ui.plus.PlusRoutes.UPDATE) {
++            com.openminis.app.ui.plus.UpdateScreen(onBack = { navController.safePopBackStack() })
++        }
++        composable(com.openminis.app.ui.plus.PlusRoutes.MIGRATE) {
++            com.openminis.app.ui.plus.MigrateScreen(onBack = { navController.safePopBackStack() })
++        }
++        composable(com.openminis.app.ui.plus.PlusRoutes.CONNECTIONS) {
++            com.openminis.app.ui.plus.ConnectionsScreen(onBack = { navController.safePopBackStack() })
++        }
++        composable(com.openminis.app.ui.plus.PlusRoutes.VOICE) {
++            com.openminis.app.ui.plus.VoiceLiveScreen(
++                onBack = { navController.safePopBackStack() },
++                onOpenConnections = { navController.safeNavigate(com.openminis.app.ui.plus.PlusRoutes.CONNECTIONS) },
++            )
++        }
++        composable(com.openminis.app.ui.plus.PlusRoutes.PERSONALIZE) {
++            com.openminis.app.ui.plus.PersonalizeScreen(onBack = { navController.safePopBackStack() })
++        }
++
+         composable(Routes.SETTINGS) {
+             SettingsScreen(
++                onPlusClick = { route -> navController.safeNavigate(route) },
+                 onBack = { navController.safePopBackStack() },
+                 onProvidersClick = { navController.safeNavigate(Routes.PROVIDER_LIST) },
+                 onModelGroupsClick = { navController.safeNavigate(Routes.MODEL_GROUPS) },
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/AvatarPicker.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/AvatarPicker.kt
+new file mode 100644
+index 0000000..32851a7
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/AvatarPicker.kt
+@@ -0,0 +1,270 @@
++package com.openminis.app.ui.plus
++
++import android.net.Uri
++import android.widget.Toast
++import androidx.activity.compose.rememberLauncherForActivityResult
++import androidx.activity.result.contract.ActivityResultContracts
++import androidx.compose.foundation.BorderStroke
++import androidx.compose.foundation.background
++import androidx.compose.foundation.border
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.gestures.detectTransformGestures
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.ExperimentalLayoutApi
++import androidx.compose.foundation.layout.FlowRow
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.navigationBarsPadding
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.outlined.AddPhotoAlternate
++import androidx.compose.material3.Button
++import androidx.compose.material3.ExperimentalMaterial3Api
++import androidx.compose.material3.Icon
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.ModalBottomSheet
++import androidx.compose.material3.OutlinedButton
++import androidx.compose.material3.Surface
++import androidx.compose.material3.Switch
++import androidx.compose.material3.Text
++import androidx.compose.material3.rememberModalBottomSheetState
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableFloatStateOf
++import androidx.compose.runtime.mutableLongStateOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.input.pointer.pointerInput
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import androidx.compose.ui.window.Dialog
++import androidx.compose.ui.window.DialogProperties
++import com.openminis.app.plus.AvatarCrop
++import com.openminis.app.plus.Avatars
++import com.openminis.app.plus.PlusPrefs
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++
++/** Grid of characters (+ the user's own picture) — used in 壁纸与形象 and the quick switcher sheet. */
++@OptIn(ExperimentalLayoutApi::class)
++@Composable
++fun AvatarGrid(onPicked: () -> Unit = {}) {
++    val context = LocalContext.current
++    PlusPrefs.init(context)
++    val st by PlusPrefs.state.collectAsState()
++    var editing by remember { mutableStateOf(false) }
++    val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
++        if (uri != null) {
++            val ok = runCatching {
++                context.contentResolver.openInputStream(uri)?.use { input ->
++                    Avatars.pickFile(context).outputStream().use { input.copyTo(it) }
++                } != null
++            }.getOrDefault(false)
++            if (ok) editing = true else Toast.makeText(context, "图片读取失败", Toast.LENGTH_SHORT).show()
++        }
++    }
++    FlowRow(
++        Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
++        horizontalArrangement = Arrangement.SpaceEvenly,
++        verticalArrangement = Arrangement.spacedBy(10.dp),
++        maxItemsInEachRow = 3,
++    ) {
++        Avatars.builtins.forEach { b ->
++            AvatarTile(b.name, selected = st.petStyle == b.id, onClick = {
++                PlusPrefs.update(context) { it.copy(petStyle = b.id) }; onPicked()
++            }) { PetAvatar(84.dp, style = b.id, animated = false) }
++        }
++        if (Avatars.hasCustom(context)) {
++            AvatarTile("我的", selected = st.petStyle == Avatars.CUSTOM, onClick = {
++                PlusPrefs.update(context) { it.copy(petStyle = Avatars.CUSTOM) }; onPicked()
++            }) { PetAvatar(84.dp, style = Avatars.CUSTOM, animated = false) }
++        }
++        AvatarTile("相册…", selected = false, onClick = { picker.launch("image/*") }) {
++            Box(Modifier.size(84.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)),
++                contentAlignment = Alignment.Center) {
++                Icon(Icons.Outlined.AddPhotoAlternate, contentDescription = "从相册选", tint = MaterialTheme.colorScheme.primary,
++                    modifier = Modifier.size(36.dp))
++            }
++        }
++    }
++    if (editing) CustomAvatarEditor(onDone = { saved -> editing = false; if (saved) onPicked() })
++}
++
++@Composable
++private fun AvatarTile(label: String, selected: Boolean, onClick: () -> Unit, content: @Composable () -> Unit) {
++    Column(
++        Modifier.width(104.dp).clip(RoundedCornerShape(16.dp))
++            .border(BorderStroke(if (selected) 3.dp else 1.dp,
++                if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant), RoundedCornerShape(16.dp))
++            .clickable(onClick = onClick).padding(vertical = 10.dp),
++        horizontalAlignment = Alignment.CenterHorizontally,
++    ) {
++        content()
++        Spacer(Modifier.height(6.dp))
++        Text(label, fontSize = 15.sp, fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal, maxLines = 1)
++    }
++}
++
++/** Quick switcher: tap the avatar on the Today card. */
++@OptIn(ExperimentalMaterial3Api::class)
++@Composable
++fun AvatarSwitcherSheet(onDismiss: () -> Unit) {
++    val state = rememberModalBottomSheetState(skipPartiallyExpanded = true)
++    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = state) {
++        Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(bottom = 16.dp)) {
++            Text("换个形象", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold,
++                modifier = Modifier.padding(horizontal = 20.dp))
++            AvatarGrid(onPicked = onDismiss)
++        }
++    }
++}
++
++/**
++ * Circle crop for the user's own picture / GIF / animated WebP: drag to move,
++ * pinch to zoom. "去掉背景" works on still pictures with a plain background.
++ */
++@Composable
++fun CustomAvatarEditor(onDone: (saved: Boolean) -> Unit) {
++    val context = LocalContext.current
++    val scope = rememberCoroutineScope()
++    val pick = Avatars.pickFile(context)
++    val animated = remember { Avatars.isAnimated(pick) }
++    var scale by remember { mutableFloatStateOf(1f) }
++    var offX by remember { mutableFloatStateOf(0f) }
++    var offY by remember { mutableFloatStateOf(0f) }
++    var removeBg by remember { mutableStateOf(false) }
++    var busy by remember { mutableStateOf(false) }
++    // The preview renders the picked file through the same renderer by staging it as the source.
++    val previewVersion by remember { mutableLongStateOf(System.nanoTime()) }
++    remember {
++        // Keep the previous custom picture until the user saves: preview from a staging copy.
++        runCatching { pick.copyTo(Avatars.sourceFile(context).resolveSibling("plus_avatar_preview"), overwrite = true) }
++    }
++
++    Dialog(onDismissRequest = { onDone(false) }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
++        Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.surface) {
++            Column(Modifier.fillMaxSize().navigationBarsPadding().padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
++                Text("调整头像", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
++                Text("拖动移动，双指缩放", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
++                Spacer(Modifier.height(24.dp))
++                Box(
++                    Modifier.size(280.dp).pointerInput(Unit) {
++                        detectTransformGestures { _, pan, zoom, _ ->
++                            scale = (scale * zoom).coerceIn(1f, 5f)
++                            offX = (offX + pan.x / size.width).coerceIn(-1f, 1f)
++                            offY = (offY + pan.y / size.height).coerceIn(-1f, 1f)
++                        }
++                    },
++                    contentAlignment = Alignment.Center,
++                ) {
++                    StagedAvatarPreview(280.dp, AvatarCrop(scale, offX, offY), previewVersion)
++                }
++                Spacer(Modifier.height(20.dp))
++                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
++                    Column(Modifier.weight(1f)) {
++                        Text("去掉背景", style = MaterialTheme.typography.titleMedium)
++                        Text(if (animated) "动图不支持去背景" else "纯色背景的图片效果最好", style = MaterialTheme.typography.bodyMedium,
++                            color = MaterialTheme.colorScheme.onSurfaceVariant)
++                    }
++                    Switch(removeBg, onCheckedChange = { removeBg = it }, enabled = !animated)
++                }
++                Spacer(Modifier.weight(1f))
++                Button(
++                    enabled = !busy,
++                    onClick = {
++                        busy = true
++                        scope.launch {
++                            val ok = withContext(Dispatchers.IO) {
++                                runCatching {
++                                    pick.copyTo(Avatars.sourceFile(context), overwrite = true)
++                                    Avatars.noBgFile(context).delete()
++                                    if (removeBg && !animated) Avatars.removeBackground(context) else true
++                                }.getOrDefault(false)
++                            }
++                            if (removeBg && !ok) Toast.makeText(context, "没找到纯色背景，已保留原图", Toast.LENGTH_SHORT).show()
++                            PlusPrefs.update(context) {
++                                it.copy(petStyle = Avatars.CUSTOM, avatarScale = scale, avatarOffX = offX, avatarOffY = offY,
++                                    avatarRemoveBg = removeBg && ok && !animated, avatarVersion = System.currentTimeMillis())
++                            }
++                            busy = false
++                            onDone(true)
++                        }
++                    },
++                    modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp),
++                    shape = RoundedCornerShape(14.dp),
++                ) { Text(if (busy) "处理中…" else "用这张", fontSize = 18.sp, fontWeight = FontWeight.SemiBold) }
++                Spacer(Modifier.height(8.dp))
++                OutlinedButton(onClick = { onDone(false) }, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
++                    shape = RoundedCornerShape(14.dp)) { Text("取消", fontSize = 17.sp) }
++            }
++        }
++    }
++}
++
++/** Preview of the staged (not yet saved) picture with a crop. */
++@Composable
++private fun StagedAvatarPreview(size: androidx.compose.ui.unit.Dp, crop: AvatarCrop, version: Long) {
++    val context = LocalContext.current
++    androidx.compose.ui.viewinterop.AndroidView(
++        factory = { StagedPreviewView(it) },
++        update = { v -> v.crop = crop; v.version = version; v.invalidate() },
++        modifier = Modifier.size(size),
++    )
++    @Suppress("UNUSED_EXPRESSION") context
++}
++
++private class StagedPreviewView(context: android.content.Context) : android.view.View(context) {
++    var crop = AvatarCrop()
++    var version = 0L
++    private var drawable: android.graphics.drawable.Drawable? = null
++    private var loaded = -1L
++    private val clip = android.graphics.Path()
++    private val ring = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
++        style = android.graphics.Paint.Style.STROKE; color = 0xFFD97757.toInt()
++    }
++
++    override fun onDraw(canvas: android.graphics.Canvas) {
++        if (loaded != version) {
++            loaded = version
++            val f = Avatars.sourceFile(context).resolveSibling("plus_avatar_preview")
++            drawable = Avatars.decode(context, f)?.also { d ->
++                d.callback = this
++                (d as? android.graphics.drawable.Animatable)?.start()
++            }
++        }
++        val d = drawable ?: return
++        val size = minOf(width, height).toFloat()
++        canvas.save()
++        clip.reset(); clip.addCircle(width / 2f, height / 2f, size / 2, android.graphics.Path.Direction.CW)
++        canvas.clipPath(clip)
++        val dw = d.intrinsicWidth.coerceAtLeast(1).toFloat(); val dh = d.intrinsicHeight.coerceAtLeast(1).toFloat()
++        val base = maxOf(size / dw, size / dh) * crop.scale
++        val cx = width / 2f + crop.offX * size; val cy = height / 2f + crop.offY * size
++        d.setBounds((cx - dw * base / 2).toInt(), (cy - dh * base / 2).toInt(), (cx + dw * base / 2).toInt(), (cy + dh * base / 2).toInt())
++        d.draw(canvas)
++        canvas.restore()
++        ring.strokeWidth = 4f * resources.displayMetrics.density
++        canvas.drawCircle(width / 2f, height / 2f, size / 2 - ring.strokeWidth / 2, ring)
++    }
++
++    override fun verifyDrawable(who: android.graphics.drawable.Drawable): Boolean = who === drawable || super.verifyDrawable(who)
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
 new file mode 100644
 index 0000000..862d521
@@ -709,784 +1275,3 @@ index 0000000..862d521
 +    }
 +}
 +
-diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/MigrateScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/MigrateScreen.kt
-new file mode 100644
-index 0000000..9625470
---- /dev/null
-+++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/MigrateScreen.kt
-@@ -0,0 +1,372 @@
-+package com.openminis.app.ui.plus
-+
-+import android.content.Context
-+import android.content.Intent
-+import android.content.pm.ApplicationInfo
-+import android.net.Uri
-+import androidx.activity.compose.rememberLauncherForActivityResult
-+import androidx.activity.result.contract.ActivityResultContracts
-+import androidx.compose.foundation.layout.Arrangement
-+import androidx.compose.foundation.layout.Column
-+import androidx.compose.foundation.layout.fillMaxWidth
-+import androidx.compose.foundation.layout.padding
-+import androidx.compose.material.icons.Icons
-+import androidx.compose.material.icons.outlined.FileOpen
-+import androidx.compose.material.icons.outlined.OpenInNew
-+import androidx.compose.material.icons.outlined.RestartAlt
-+import androidx.compose.material3.AlertDialog
-+import androidx.compose.material3.Button
-+import androidx.compose.material3.LinearProgressIndicator
-+import androidx.compose.material3.MaterialTheme
-+import androidx.compose.material3.OutlinedTextField
-+import androidx.compose.material3.Text
-+import androidx.compose.material3.TextButton
-+import androidx.compose.runtime.Composable
-+import androidx.compose.runtime.getValue
-+import androidx.compose.runtime.mutableStateOf
-+import androidx.compose.runtime.remember
-+import androidx.compose.runtime.rememberCoroutineScope
-+import androidx.compose.runtime.setValue
-+import androidx.compose.ui.Modifier
-+import androidx.compose.ui.graphics.Color
-+import androidx.compose.ui.platform.LocalContext
-+import androidx.compose.ui.text.font.FontWeight
-+import androidx.compose.ui.text.input.PasswordVisualTransformation
-+import androidx.compose.ui.unit.dp
-+import com.openminis.app.MinisApp
-+import com.openminis.app.backup.BackupCategory
-+import com.openminis.app.backup.BackupImporter
-+import com.openminis.app.backup.BackupManifest
-+import com.openminis.app.backup.BackupPackageReader
-+import com.openminis.app.backup.BackupZip
-+import com.openminis.app.data.db.AppDatabase
-+import kotlinx.coroutines.Dispatchers
-+import kotlinx.coroutines.launch
-+import kotlinx.coroutines.withContext
-+import java.io.File
-+
-+/**
-+ * Move data from the earlier Mines install (package com.openminis.mines) into
-+ * this one, which installs beside it because the earlier APK was signed with
-+ * a throwaway key.
-+ *
-+ * Why it goes through a backup file and not a raw copy of the old data dir:
-+ *  - the earlier build is a release (non-debuggable) APK, so `run-as` refuses
-+ *    it even from the Shizuku shell uid, and the shell uid cannot read
-+ *    /data/data of another app;
-+ *  - provider API keys are sealed with the old app's own Android Keystore
-+ *    key, which never leaves that app, so copied files would arrive without
-+ *    usable keys anyway.
-+ * The old app's own backup export decrypts them and writes a portable
-+ * package, which this app's existing importer reads. Nothing here writes to
-+ * or deletes anything belonging to the old app.
-+ *
-+ * Providers and skills are imported first and verified; everything else in
-+ * the package follows on a best-effort basis.
-+ */
-+object MinesMigration {
-+    const val OLD_PACKAGE = "com.openminis.mines"
-+    private const val PREFS = "mines_migration"
-+
-+    fun oldInstalled(ctx: Context): Boolean =
-+        ctx.packageName != OLD_PACKAGE && runCatching {
-+            ctx.packageManager.getApplicationInfo(OLD_PACKAGE, 0); true
-+        }.getOrDefault(false)
-+
-+    fun oldDebuggable(ctx: Context): Boolean = runCatching {
-+        (ctx.packageManager.getApplicationInfo(OLD_PACKAGE, 0).flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
-+    }.getOrDefault(false)
-+
-+    private fun prefs(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-+    fun shouldPrompt(ctx: Context): Boolean = oldInstalled(ctx) && !prefs(ctx).getBoolean("prompted", false)
-+    fun markPrompted(ctx: Context) { prefs(ctx).edit().putBoolean("prompted", true).apply() }
-+    fun markDone(ctx: Context, summary: String) {
-+        prefs(ctx).edit().putBoolean("prompted", true).putString("last_summary", summary).apply()
-+    }
-+    fun lastSummary(ctx: Context): String? = prefs(ctx).getString("last_summary", null)
-+
-+    fun openOldApp(ctx: Context): Boolean {
-+        val i = ctx.packageManager.getLaunchIntentForPackage(OLD_PACKAGE) ?: return false
-+        ctx.startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-+        return true
-+    }
-+
-+    private fun skillsDir(ctx: Context) = File(ctx.filesDir, "minis-global/skills")
-+    fun skillNames(ctx: Context): Set<String> =
-+        skillsDir(ctx).listFiles()?.filter { it.isDirectory && !it.name.startsWith(".") }?.map { it.name }?.toSet()
-+            ?: emptySet()
-+
-+    fun providerCount(ctx: Context): Int =
-+        (ctx.applicationContext as? MinisApp)?.providerRepositoryOrNull?.instances?.size ?: 0
-+
-+    class Picked(val extracted: File, val manifest: BackupManifest) {
-+        val categories: Set<BackupCategory> =
-+            manifest.categories.keys.mapNotNull(BackupCategory::fromKey).toSet()
-+        val encrypted: Boolean get() = manifest.encryption != null
-+        val providersInPackage: Int get() = manifest.categories[BackupCategory.PROVIDERS.key]?.entries ?: 0
-+        val skillsInPackage: Int get() = manifest.categories[BackupCategory.SKILLS.key]?.entries ?: 0
-+        val hasKeys: Boolean? get() = manifest.categories[BackupCategory.PROVIDERS.key]?.includesCredentials
-+    }
-+
-+    /** Copy the picked file to cache, unzip it and read its manifest. Off the main thread. */
-+    fun pick(ctx: Context, uri: Uri): Picked {
-+        val zip = File(ctx.cacheDir, "mines-migrate.minisbak")
-+        ctx.contentResolver.openInputStream(uri)?.use { inp -> zip.outputStream().use { inp.copyTo(it) } }
-+            ?: throw IllegalStateException("打不开这个文件")
-+        val out = File(ctx.cacheDir, "mines-migrate").apply { deleteRecursively(); mkdirs() }
-+        try {
-+            BackupZip.extract(zip, out)
-+        } finally {
-+            zip.delete()
-+        }
-+        val root = BackupZip.packageRoot(out)
-+        val manifest = BackupPackageReader(root).readManifest()
-+        return Picked(out, manifest)
-+    }
-+
-+    data class Result(
-+        val providersNew: Int,
-+        val providersExisting: Int,
-+        val providersUnreadable: Int,
-+        val keysRestored: Int,
-+        val keysKept: Int,
-+        val providersNow: Int,
-+        val skillsInPackage: Int,
-+        val skillsVerified: Int,
-+        val skillsNew: Int,
-+        val others: List<String>,
-+        val problems: List<String>,
-+    ) {
-+        val providersMigrated: Int get() = providersNew + providersExisting
-+        fun headline(): String = "已迁移 $providersMigrated 个供应商、$skillsVerified 个技能"
-+    }
-+
-+    suspend fun run(
-+        ctx: Context,
-+        picked: Picked,
-+        passphrase: String?,
-+        onStatus: (String) -> Unit,
-+    ): Result = withContext(Dispatchers.IO) {
-+        val importer = BackupImporter(ctx, AppDatabase.getInstance(ctx))
-+        val problems = mutableListOf<String>()
-+        val skillsBefore = skillNames(ctx)
-+
-+        // Phase 1: providers + skills, the two things that matter most.
-+        val first = setOf(BackupCategory.PROVIDERS, BackupCategory.SKILLS).intersect(picked.categories)
-+        if (first.isEmpty()) problems += "备份里没有供应商和技能"
-+        var pr: BackupImporter.CategoryReport? = null
-+        if (first.isNotEmpty()) {
-+            onStatus("正在迁移供应商和技能…")
-+            val r1 = importer.import(
-+                picked.extracted,
-+                BackupImporter.Options(categories = first, passphrase = passphrase),
-+                onProgress = { onStatus(it) },
-+            )
-+            pr = r1.categories.firstOrNull { it.category == BackupCategory.PROVIDERS.key }
-+            r1.categories.forEach { c -> c.failed?.let { problems += "${c.category}: $it" } }
-+            if (r1.integrityFailed.isNotEmpty()) problems += "${r1.integrityFailed.size} 个文件校验失败"
-+        }
-+        // Verify against what is actually on the device now.
-+        val skillsAfter = skillNames(ctx)
-+        val skillsNew = (skillsAfter - skillsBefore).size
-+        val skillsVerified = if (picked.skillsInPackage > 0) minOf(picked.skillsInPackage, skillsAfter.size) else skillsNew
-+        if (picked.skillsInPackage > skillsAfter.size) {
-+            problems += "备份里有 ${picked.skillsInPackage} 个技能，本机只找到 ${skillsAfter.size} 个"
-+        }
-+
-+        // Phase 2: everything else, best effort.
-+        val rest = picked.categories - first
-+        val others = mutableListOf<String>()
-+        if (rest.isNotEmpty()) {
-+            onStatus("正在迁移其余内容…")
-+            runCatching {
-+                importer.import(
-+                    picked.extracted,
-+                    BackupImporter.Options(categories = rest, passphrase = passphrase),
-+                    onProgress = { onStatus(it) },
-+                )
-+            }.onSuccess { r2 ->
-+                r2.categories.forEach { c ->
-+                    if (c.failed != null) problems += "${c.category}: ${c.failed}"
-+                    else others += "${categoryName(c.category)} ${c.imported + c.updated}"
-+                }
-+            }.onFailure { problems += "其余内容：${it.message}" }
-+        }
-+        picked.extracted.deleteRecursively()
-+
-+        Result(
-+            providersNew = pr?.imported ?: 0,
-+            providersExisting = pr?.skipped ?: 0,
-+            providersUnreadable = pr?.unreadable ?: 0,
-+            keysRestored = pr?.credentialsRestored ?: 0,
-+            keysKept = pr?.credentialsKept ?: 0,
-+            providersNow = providerCount(ctx),
-+            skillsInPackage = picked.skillsInPackage,
-+            skillsVerified = skillsVerified,
-+            skillsNew = skillsNew,
-+            others = others,
-+            problems = problems,
-+        )
-+    }
-+
-+    private fun categoryName(key: String) = when (key) {
-+        BackupCategory.CHATS.key -> "对话"
-+        BackupCategory.MEMORY.key -> "记忆"
-+        BackupCategory.MCP_SERVERS.key -> "MCP"
-+        BackupCategory.SHARED_FILES.key -> "共享文件"
-+        BackupCategory.ENVIRONMENT_VARIABLES.key -> "环境变量"
-+        BackupCategory.VOICE_CORRECTIONS.key -> "语音纠错"
-+        else -> key
-+    }
-+
-+    /** Relaunch so every repository re-reads what was restored. */
-+    fun restart(ctx: Context) {
-+        val i = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName) ?: return
-+        ctx.startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
-+        android.os.Process.killProcess(android.os.Process.myPid())
-+    }
-+}
-+
-+@Composable
-+fun MigrateScreen(onBack: () -> Unit) {
-+    val context = LocalContext.current
-+    val scope = rememberCoroutineScope()
-+    val oldInstalled = remember { MinesMigration.oldInstalled(context) }
-+    var picked by remember { mutableStateOf<MinesMigration.Picked?>(null) }
-+    var passphrase by remember { mutableStateOf("") }
-+    var busy by remember { mutableStateOf(false) }
-+    var status by remember { mutableStateOf<String?>(null) }
-+    var error by remember { mutableStateOf<String?>(null) }
-+    var result by remember { mutableStateOf<MinesMigration.Result?>(null) }
-+    val last = remember { MinesMigration.lastSummary(context) }
-+
-+    val pickLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-+        if (uri == null) return@rememberLauncherForActivityResult
-+        busy = true; error = null; result = null; status = "正在读取备份…"
-+        scope.launch {
-+            try {
-+                picked = withContext(Dispatchers.IO) { MinesMigration.pick(context, uri) }
-+            } catch (e: Exception) {
-+                error = "这个文件读不了：${e.message ?: "格式不对"}"
-+            } finally {
-+                busy = false; status = null
-+            }
-+        }
-+    }
-+
-+    PlusPage("从旧版迁移", onBack) {
-+        Text(
-+            "把旧版 Mines 的供应商（地址、密钥、模型）和技能搬到这里，其余内容尽量一起带上。旧版的数据只读不改，迁完两个可以并存。",
-+            style = MaterialTheme.typography.bodyMedium,
-+            color = MaterialTheme.colorScheme.onSurfaceVariant,
-+            modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
-+        )
-+        if (last != null && result == null) {
-+            Text("上次：$last", style = MaterialTheme.typography.bodySmall,
-+                color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(horizontal = 20.dp))
-+        }
-+
-+        PlusSection(
-+            "第一步 · 在旧版导出",
-+            footer = "在旧版里：设置 → 备份 → 勾选「供应商」「技能」（其余随意）→ 导出，建议设一个密码，存到「下载」。" +
-+                if (oldInstalled) "" else "\n没检测到旧版 Mines；如果已有备份文件，直接做第二步。",
-+        ) {
-+            ActionRow(Icons.Outlined.OpenInNew, if (oldInstalled) "打开旧版 Mines" else "旧版未安装") {
-+                if (!MinesMigration.openOldApp(context)) error = "打不开旧版 Mines"
-+            }
-+        }
-+
-+        PlusSection("第二步 · 选择备份文件", footer = "支持 Minis / Mines 的 .minisbak 备份。") {
-+            ActionRow(Icons.Outlined.FileOpen, picked?.let { "已选：${it.manifest.deviceName} · ${it.manifest.createdAt.take(16)}" } ?: "选择备份文件") {
-+                if (!busy) pickLauncher.launch(arrayOf("*/*"))
-+            }
-+        }
-+
-+        picked?.let { p ->
-+            PlusSection(
-+                "第三步 · 导入",
-+                footer = buildString {
-+                    append("备份里有 ${p.providersInPackage} 个供应商、${p.skillsInPackage} 个技能。")
-+                    if (p.hasKeys == false) append("\n注意：这个备份没带 API 密钥，导出时请勾上含密钥的选项。")
-+                },
-+            ) {
-+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-+                    if (p.encrypted) {
-+                        OutlinedTextField(
-+                            passphrase, { passphrase = it }, label = { Text("备份密码") }, singleLine = true,
-+                            visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(),
-+                        )
-+                    }
-+                    Button(
-+                        enabled = !busy && (!p.encrypted || passphrase.isNotEmpty()),
-+                        modifier = Modifier.fillMaxWidth(),
-+                        onClick = {
-+                            busy = true; error = null
-+                            scope.launch {
-+                                try {
-+                                    val r = MinesMigration.run(context, p, passphrase.ifEmpty { null }) { status = it }
-+                                    result = r
-+                                    picked = null
-+                                    MinesMigration.markDone(context, r.headline())
-+                                } catch (e: Exception) {
-+                                    error = "导入失败：${e.message ?: e.javaClass.simpleName}"
-+                                } finally {
-+                                    busy = false; status = null
-+                                }
-+                            }
-+                        },
-+                    ) { Text("开始迁移") }
-+                }
-+            }
-+        }
-+
-+        if (busy) {
-+            Column(Modifier.padding(horizontal = 20.dp, vertical = 12.dp)) {
-+                LinearProgressIndicator(Modifier.fillMaxWidth())
-+                status?.let { Text(it, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 6.dp)) }
-+            }
-+        }
-+        error?.let {
-+            Text(it, color = Color(0xFFFF3B30), style = MaterialTheme.typography.bodyMedium,
-+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp))
-+        }
-+
-+        result?.let { r ->
-+            PlusSection("结果", footer = "重启后新数据全部生效。") {
-+                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-+                    Text(r.headline(), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-+                    Text("供应商：新增 ${r.providersNew}，已存在 ${r.providersExisting}，本机现有 ${r.providersNow} 个；密钥写入 ${r.keysRestored} 个" +
-+                        if (r.keysKept > 0) "（保留本机已有 ${r.keysKept} 个）" else "",
-+                        style = MaterialTheme.typography.bodySmall)
-+                    Text("技能：备份 ${r.skillsInPackage} 个，本机确认 ${r.skillsVerified} 个（新增 ${r.skillsNew}）",
-+                        style = MaterialTheme.typography.bodySmall)
-+                    if (r.providersUnreadable > 0) Text("${r.providersUnreadable} 个供应商读不了，已跳过",
-+                        style = MaterialTheme.typography.bodySmall, color = Color(0xFFFF9500))
-+                    if (r.others.isNotEmpty()) Text("其余：" + r.others.joinToString("、"), style = MaterialTheme.typography.bodySmall)
-+                    r.problems.forEach { Text("⚠ $it", style = MaterialTheme.typography.bodySmall, color = Color(0xFFFF9500)) }
-+                }
-+                PlusDivider()
-+                ActionRow(Icons.Outlined.RestartAlt, "立即重启 Mines") { MinesMigration.restart(context) }
-+            }
-+        }
-+    }
-+}
-+
-+/** One-time prompt on first launch when the earlier Mines is installed beside this one. */
-+@Composable
-+fun MinesMigrationPrompt(onOpen: () -> Unit) {
-+    val context = LocalContext.current
-+    var show by remember { mutableStateOf(MinesMigration.shouldPrompt(context)) }
-+    if (!show) return
-+    AlertDialog(
-+        onDismissRequest = { MinesMigration.markPrompted(context); show = false },
-+        title = { Text("从旧版迁移？") },
-+        text = { Text("检测到旧版 Mines。要把它的供应商、技能和其他内容搬过来吗？旧版数据不会被改动。以后也可以在 设置 → Mines → 从旧版迁移 里做。") },
-+        confirmButton = {
-+            TextButton(onClick = { MinesMigration.markPrompted(context); show = false; onOpen() }) { Text("去迁移") }
-+        },
-+        dismissButton = {
-+            TextButton(onClick = { MinesMigration.markPrompted(context); show = false }) { Text("以后再说") }
-+        },
-+    )
-+}
-diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PersonalizeScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PersonalizeScreen.kt
-new file mode 100644
-index 0000000..34a2b67
---- /dev/null
-+++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PersonalizeScreen.kt
-@@ -0,0 +1,259 @@
-+package com.openminis.app.ui.plus
-+
-+import android.content.Intent
-+import android.net.Uri
-+import android.provider.Settings
-+import android.widget.Toast
-+import androidx.activity.compose.rememberLauncherForActivityResult
-+import androidx.activity.result.contract.ActivityResultContracts
-+import androidx.compose.foundation.BorderStroke
-+import androidx.compose.foundation.Image
-+import androidx.compose.foundation.background
-+import androidx.compose.foundation.border
-+import androidx.compose.foundation.clickable
-+import androidx.compose.foundation.horizontalScroll
-+import androidx.compose.foundation.layout.Arrangement
-+import androidx.compose.foundation.layout.Box
-+import androidx.compose.foundation.layout.Column
-+import androidx.compose.foundation.layout.Row
-+import androidx.compose.foundation.layout.Spacer
-+import androidx.compose.foundation.layout.fillMaxSize
-+import androidx.compose.foundation.layout.fillMaxWidth
-+import androidx.compose.foundation.layout.height
-+import androidx.compose.foundation.layout.padding
-+import androidx.compose.foundation.layout.size
-+import androidx.compose.foundation.layout.width
-+import androidx.compose.foundation.rememberScrollState
-+import androidx.compose.foundation.shape.CircleShape
-+import androidx.compose.foundation.shape.RoundedCornerShape
-+import androidx.compose.material.icons.Icons
-+import androidx.compose.material.icons.outlined.Image
-+import androidx.compose.material.icons.outlined.NotInterested
-+import androidx.compose.material3.Icon
-+import androidx.compose.material3.MaterialTheme
-+import androidx.compose.material3.Slider
-+import androidx.compose.material3.Switch
-+import androidx.compose.material3.Text
-+import androidx.compose.runtime.Composable
-+import androidx.compose.runtime.DisposableEffect
-+import androidx.compose.runtime.collectAsState
-+import androidx.compose.runtime.getValue
-+import androidx.compose.runtime.mutableStateOf
-+import androidx.compose.runtime.remember
-+import androidx.compose.runtime.rememberCoroutineScope
-+import androidx.compose.runtime.setValue
-+import androidx.compose.ui.Alignment
-+import androidx.compose.ui.Modifier
-+import androidx.compose.ui.draw.clip
-+import androidx.compose.ui.graphics.Brush
-+import androidx.compose.ui.graphics.Color
-+import androidx.compose.ui.layout.ContentScale
-+import androidx.compose.ui.platform.LocalContext
-+import androidx.compose.ui.platform.LocalLifecycleOwner
-+import androidx.compose.ui.text.font.FontWeight
-+import androidx.compose.ui.unit.dp
-+import androidx.lifecycle.Lifecycle
-+import androidx.lifecycle.LifecycleEventObserver
-+import com.openminis.app.plus.DeskPetService
-+import com.openminis.app.plus.PlusPrefs
-+import kotlinx.coroutines.Dispatchers
-+import kotlinx.coroutines.launch
-+import kotlinx.coroutines.withContext
-+
-+@Composable
-+fun PersonalizeScreen(onBack: () -> Unit) {
-+    val context = LocalContext.current
-+    PlusPrefs.init(context)
-+    val st by PlusPrefs.state.collectAsState()
-+    val scope = rememberCoroutineScope()
-+    var wantPet by remember { mutableStateOf(false) }
-+
-+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
-+        if (uri != null) scope.launch {
-+            val ok = withContext(Dispatchers.IO) {
-+                runCatching {
-+                    context.contentResolver.openInputStream(uri)?.use { input ->
-+                        wallpaperFile(context).outputStream().use { input.copyTo(it) }
-+                    } != null
-+                }.getOrDefault(false)
-+            }
-+            if (ok) PlusPrefs.update(context) { it.copy(wallpaper = "file:${System.currentTimeMillis()}") }
-+            else Toast.makeText(context, "图片读取失败", Toast.LENGTH_SHORT).show()
-+        }
-+    }
-+
-+    // Coming back from the overlay-permission screen: start the pet if granted.
-+    val owner = LocalLifecycleOwner.current
-+    DisposableEffect(owner) {
-+        val obs = LifecycleEventObserver { _, e ->
-+            if (e == Lifecycle.Event.ON_RESUME && wantPet && DeskPetService.canShow(context)) {
-+                wantPet = false
-+                PlusPrefs.update(context) { it.copy(petEnabled = true) }
-+                DeskPetService.start(context)
-+            }
-+        }
-+        owner.lifecycle.addObserver(obs)
-+        onDispose { owner.lifecycle.removeObserver(obs) }
-+    }
-+
-+    PlusPage("壁纸与形象", onBack) {
-+        // ---- Wallpaper ----
-+        PlusSection("聊天壁纸") {
-+            // live preview
-+            Box(
-+                Modifier.fillMaxWidth().height(150.dp).padding(12.dp).clip(RoundedCornerShape(12.dp))
-+                    .background(MaterialTheme.colorScheme.background),
-+            ) {
-+                ChatWallpaperLayer(Modifier.fillMaxSize())
-+                Column(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-+                    Bubble("今天帮我看看服务器", mine = true)
-+                    Bubble("好的，两台都在线，延迟 38 ms", mine = false)
-+                }
-+            }
-+            Row(
-+                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 4.dp),
-+                horizontalArrangement = Arrangement.spacedBy(10.dp),
-+            ) {
-+                Swatch("不用", selected = st.wallpaper.isEmpty(), onClick = {
-+                    PlusPrefs.update(context) { it.copy(wallpaper = "") }
-+                }) {
-+                    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceVariant), contentAlignment = Alignment.Center) {
-+                        Icon(Icons.Outlined.NotInterested, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
-+                    }
-+                }
-+                Swatch("相册", selected = st.wallpaper.startsWith("file:"), onClick = { picker.launch("image/*") }) {
-+                    val bmp = rememberWallpaperBitmap(st.wallpaper)
-+                    if (bmp != null) Image(bmp, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
-+                    else Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceVariant), contentAlignment = Alignment.Center) {
-+                        Icon(Icons.Outlined.Image, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
-+                    }
-+                }
-+                wallpaperPresets.forEach { p ->
-+                    Swatch(p.name, selected = st.wallpaper == "preset:${p.id}", onClick = {
-+                        PlusPrefs.update(context) { it.copy(wallpaper = "preset:${p.id}") }
-+                    }) {
-+                        Box(Modifier.fillMaxSize().background(Brush.linearGradient(p.colors)))
-+                    }
-+                }
-+            }
-+            if (st.wallpaper.isNotEmpty()) {
-+                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
-+                    Text("壁纸透明度 ${(st.wallpaperAlpha * 100).toInt()}%", style = MaterialTheme.typography.bodyMedium,
-+                        modifier = Modifier.width(132.dp))
-+                    Slider(
-+                        value = st.wallpaperAlpha, valueRange = 0f..1f,
-+                        onValueChange = { v -> PlusPrefs.update(context) { it.copy(wallpaperAlpha = v) } },
-+                        modifier = Modifier.weight(1f),
-+                    )
-+                }
-+                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-+                    Column(Modifier.weight(1f)) {
-+                        Text("首页也用这张壁纸", style = MaterialTheme.typography.bodyLarge)
-+                        Text("对话列表背后也显示", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-+                    }
-+                    Switch(st.wallpaperOnHome, onCheckedChange = { on -> PlusPrefs.update(context) { it.copy(wallpaperOnHome = on) } })
-+                }
-+                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
-+                    Text("遮罩", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.width(132.dp))
-+                    Spacer(Modifier.width(12.dp))
-+                    Slider(
-+                        value = st.wallpaperDim, valueRange = 0f..0.8f,
-+                        onValueChange = { v -> PlusPrefs.update(context) { it.copy(wallpaperDim = v) } },
-+                        modifier = Modifier.weight(1f),
-+                    )
-+                }
-+            }
-+            Spacer(Modifier.height(8.dp))
-+        }
-+
-+        // ---- Avatar ----
-+        PlusSection("我的形象", footer = "形象会出现在首页卡片和桌宠上。点首页卡片上的头像、或长按桌宠，随时能换。也可以用相册里的图片或动图（GIF / 动态 WebP）。") {
-+            Box(Modifier.fillMaxWidth().padding(top = 16.dp), contentAlignment = Alignment.Center) {
-+                PetAvatar(size = 160.dp, face = st.petStyle == com.openminis.app.plus.Avatars.CUSTOM, animated = true)
-+            }
-+            Text(
-+                com.openminis.app.plus.Avatars.name(st.petStyle),
-+                style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold,
-+                modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
-+                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-+            )
-+            AvatarGrid()
-+            Text("边框颜色", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(start = 16.dp, top = 4.dp))
-+            Row(
-+                Modifier.fillMaxWidth().padding(vertical = 12.dp),
-+                horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterHorizontally),
-+            ) {
-+                com.openminis.app.plus.Avatars.colors.forEach { c ->
-+                    val sel = st.petColor == c
-+                    Box(
-+                        Modifier.size(if (sel) 38.dp else 32.dp).clip(CircleShape).background(Color(c))
-+                            .border(BorderStroke(if (sel) 3.dp else 1.dp, if (sel) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.outlineVariant), CircleShape)
-+                            .clickable { PlusPrefs.update(context) { it.copy(petColor = c) } }
-+                    )
-+                }
-+            }
-+        }
-+
-+        // ---- Desk pet ----
-+        PlusSection("桌宠", footer = "打开后它会浮在所有应用上面。拖动它换位置，点一下说话，双击打开 Mines，长按换形象或收起。") {
-+            Row(
-+                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
-+                verticalAlignment = Alignment.CenterVertically,
-+            ) {
-+                Column(Modifier.weight(1f)) {
-+                    Text("显示桌宠", fontWeight = FontWeight.Medium)
-+                    if (!DeskPetService.canShow(context)) Text(
-+                        "需要允许“显示在其他应用上层”",
-+                        style = MaterialTheme.typography.bodySmall,
-+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-+                    )
-+                }
-+                Switch(st.petEnabled, onCheckedChange = { on ->
-+                    if (!on) {
-+                        PlusPrefs.update(context) { it.copy(petEnabled = false) }
-+                        DeskPetService.stop(context)
-+                    } else if (DeskPetService.canShow(context)) {
-+                        PlusPrefs.update(context) { it.copy(petEnabled = true) }
-+                        DeskPetService.start(context)
-+                    } else {
-+                        wantPet = true
-+                        runCatching {
-+                            context.startActivity(
-+                                Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:${context.packageName}"))
-+                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-+                            )
-+                        }
-+                    }
-+                })
-+            }
-+        }
-+    }
-+}
-+
-+@Composable
-+private fun Bubble(text: String, mine: Boolean) {
-+    Row(Modifier.fillMaxWidth(), horizontalArrangement = if (mine) Arrangement.End else Arrangement.Start) {
-+        Text(
-+            text,
-+            style = MaterialTheme.typography.bodySmall,
-+            color = if (mine) Color.White else MaterialTheme.colorScheme.onSurface,
-+            modifier = Modifier.clip(RoundedCornerShape(14.dp))
-+                .background(if (mine) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceContainerHigh)
-+                .padding(horizontal = 10.dp, vertical = 6.dp),
-+        )
-+    }
-+}
-+
-+@Composable
-+private fun Swatch(label: String, selected: Boolean, onClick: () -> Unit, content: @Composable () -> Unit) {
-+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-+        Box(
-+            Modifier.size(width = 56.dp, height = 84.dp).clip(RoundedCornerShape(10.dp))
-+                .border(BorderStroke(if (selected) 3.dp else 1.dp,
-+                    if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant),
-+                    RoundedCornerShape(10.dp))
-+                .clickable(onClick = onClick),
-+        ) { content() }
-+        Text(label, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(top = 4.dp))
-+    }
-+}
-diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PluginsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PluginsScreen.kt
-new file mode 100644
-index 0000000..08a3e9b
---- /dev/null
-+++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PluginsScreen.kt
-@@ -0,0 +1,132 @@
-+package com.openminis.app.ui.plus
-+
-+import androidx.compose.foundation.background
-+import androidx.compose.foundation.layout.Arrangement
-+import androidx.compose.foundation.layout.Box
-+import androidx.compose.foundation.layout.Column
-+import androidx.compose.foundation.layout.Row
-+import androidx.compose.foundation.layout.Spacer
-+import androidx.compose.foundation.layout.fillMaxWidth
-+import androidx.compose.foundation.layout.padding
-+import androidx.compose.foundation.layout.size
-+import androidx.compose.foundation.layout.width
-+import androidx.compose.foundation.shape.CircleShape
-+import androidx.compose.material.icons.Icons
-+import androidx.compose.material.icons.outlined.Refresh
-+import androidx.compose.material3.Button
-+import androidx.compose.material3.MaterialTheme
-+import androidx.compose.material3.OutlinedTextField
-+import androidx.compose.material3.Switch
-+import androidx.compose.material3.Text
-+import androidx.compose.material3.TextButton
-+import androidx.compose.runtime.Composable
-+import androidx.compose.runtime.LaunchedEffect
-+import androidx.compose.runtime.getValue
-+import androidx.compose.runtime.mutableIntStateOf
-+import androidx.compose.runtime.mutableStateOf
-+import androidx.compose.runtime.produceState
-+import androidx.compose.runtime.remember
-+import androidx.compose.runtime.setValue
-+import androidx.compose.ui.Alignment
-+import androidx.compose.ui.Modifier
-+import androidx.compose.ui.graphics.Color
-+import androidx.compose.ui.platform.LocalContext
-+import androidx.compose.ui.platform.LocalLifecycleOwner
-+import androidx.compose.ui.unit.dp
-+import androidx.lifecycle.Lifecycle
-+import androidx.lifecycle.repeatOnLifecycle
-+import kotlinx.coroutines.Dispatchers
-+import kotlinx.coroutines.withContext
-+import org.json.JSONObject
-+import java.io.File
-+
-+private data class PluginRow(val pkg: String, val enabled: Boolean, val ok: Boolean?, val reason: String, val tools: List<String>)
-+
-+/**
-+ * dsh plugin center. The work happens in the sandbox (`minis-dsh`), shown in
-+ * the terminal so the user sees progress; this page lists what is installed
-+ * and which tools each plugin adds, read from the files minis-dsh keeps.
-+ */
-+@Composable
-+fun PluginsScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit) {
-+    val context = LocalContext.current
-+    var input by remember { mutableStateOf("") }
-+    var tick by remember { mutableIntStateOf(0) }
-+    // Re-read whenever the page comes back (e.g. returning from the terminal).
-+    val owner = LocalLifecycleOwner.current
-+    LaunchedEffect(owner) { owner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) { tick++ } }
-+    val rows by produceState(initialValue = emptyList<PluginRow>(), tick) {
-+        value = withContext(Dispatchers.IO) { readPlugins(context) }
-+    }
-+
-+    PlusPage("插件", onBack) {
-+        Text(
-+            "可以装 DeepSeek Harness（dsh）的插件。它们加的工具会出现在 Mines 的 MCP 里，全部插件共用一个进程，用到时才启动。",
-+            style = MaterialTheme.typography.bodyMedium,
-+            color = MaterialTheme.colorScheme.onSurfaceVariant,
-+            modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
-+        )
-+        PlusSection("安装", footer = "填 npm 包名，比如 @zhaoolee/dsh-notes；或 github:用户/仓库。第一次会自动装 Node.js。") {
-+            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-+                OutlinedTextField(input, { input = it.trim() }, label = { Text("插件名或链接") }, singleLine = true,
-+                    modifier = Modifier.fillMaxWidth())
-+                Button(
-+                    enabled = input.isNotBlank() && input.none { it == ' ' || it == ';' || it == '&' || it == '|' || it == '`' || it == '$' },
-+                    onClick = { onOpenTerminal("minis-dsh add ${normalize(input)}"); input = "" },
-+                    modifier = Modifier.fillMaxWidth(),
-+                ) { Text("安装") }
-+            }
-+        }
-+        PlusSection(if (rows.isEmpty()) "已安装" else "已安装 · ${rows.size}") {
-+            if (rows.isEmpty()) Text("还没有插件", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(16.dp))
-+            rows.forEachIndexed { i, r ->
-+                Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-+                    Box(Modifier.size(9.dp).background(
-+                        when { !r.enabled -> Color.Gray; r.ok == true -> Color(0xFF34C759); r.ok == false -> Color(0xFFFF3B30); else -> Color(0xFFFFCC00) },
-+                        CircleShape))
-+                    Spacer(Modifier.width(10.dp))
-+                    Column(Modifier.weight(1f)) {
-+                        Text(r.pkg, style = MaterialTheme.typography.bodyLarge)
-+                        Text(
-+                            when {
-+                                !r.enabled -> "已停用"
-+                                r.ok == true -> if (r.tools.isEmpty()) "已加载（只加提示词）" else "工具：" + r.tools.joinToString("、")
-+                                r.ok == false -> "用不了：${r.reason}"
-+                                else -> "未检查"
-+                            },
-+                            style = MaterialTheme.typography.bodySmall,
-+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-+                        )
-+                    }
-+                    Switch(r.enabled, onCheckedChange = { on -> onOpenTerminal("minis-dsh ${if (on) "on" else "off"} ${r.pkg} && minis-dsh list") })
-+                    TextButton(onClick = { onOpenTerminal("minis-dsh remove ${r.pkg}") }) { Text("卸载", color = Color(0xFFFF3B30)) }
-+                }
-+                if (i < rows.lastIndex) PlusDivider()
-+            }
-+            if (rows.isNotEmpty()) {
-+                PlusDivider()
-+                ActionRow(Icons.Outlined.Refresh, "重新检查") { onOpenTerminal("minis-dsh list") }
-+            }
-+        }
-+    }
-+}
-+
-+private fun normalize(s: String): String {
-+    val gh = Regex("^https?://github\\.com/([^/]+)/([^/#?]+)").find(s)
-+    return if (gh != null) "github:${gh.groupValues[1]}/${gh.groupValues[2].removeSuffix(".git")}" else s
-+}
-+
-+private fun readPlugins(context: android.content.Context): List<PluginRow> = runCatching {
-+    val root = com.openminis.app.sandbox.RootfsManager.getInstance(context).rootfsDir
-+    val home = File(root, "root/.minis-dsh")
-+    val state = JSONObject(File(home, "plugins.json").readText())
-+    val status = runCatching { JSONObject(File(home, "status.json").readText()) }.getOrNull()
-+    val arr = state.optJSONArray("plugins") ?: return@runCatching emptyList()
-+    (0 until arr.length()).map { i ->
-+        val p = arr.getJSONObject(i)
-+        val pkg = p.optString("package")
-+        val st = status?.optJSONObject(pkg)
-+        val tools = st?.optJSONArray("tools")?.let { t -> (0 until t.length()).map { t.getString(it) } } ?: emptyList()
-+        PluginRow(pkg, p.optBoolean("enabled", true), st?.optBoolean("ok"), st?.optString("reason") ?: "", tools)
-+    }
-+}.getOrDefault(emptyList())
