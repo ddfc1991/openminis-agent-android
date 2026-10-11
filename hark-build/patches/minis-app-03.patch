@@ -1,3 +1,615 @@
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusConnect.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusConnect.kt
+new file mode 100644
+index 0000000..1840fc1
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/PlusConnect.kt
+@@ -0,0 +1,446 @@
++package com.openminis.app.plus
++
++import android.annotation.SuppressLint
++import android.app.AlarmManager
++import android.app.NotificationChannel
++import android.app.NotificationManager
++import android.app.PendingIntent
++import android.content.BroadcastReceiver
++import android.content.ClipboardManager
++import android.content.Context
++import android.content.Intent
++import android.os.Handler
++import android.os.Looper
++import android.os.SystemClock
++import android.webkit.CookieManager
++import android.webkit.WebView
++import android.webkit.WebViewClient
++import com.openminis.app.MainActivity
++import com.openminis.app.R
++import com.openminis.app.config.ConfigRisk
++import com.openminis.app.config.confirm.ConfigConfirmationGate
++import com.openminis.app.config.confirm.ConfirmOutcome
++import com.openminis.app.config.confirm.PendingConfigChange
++import com.openminis.app.config.confirm.PendingConfigChangeItem
++import com.openminis.app.sandbox.NativeOffloadHandler
++import com.openminis.app.sandbox.NativeOffloadRequest
++import com.openminis.app.sandbox.NativeOffloadResult
++import kotlinx.coroutines.runBlocking
++import okhttp3.FormBody
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import org.json.JSONArray
++import org.json.JSONObject
++import java.net.URI
++import java.util.concurrent.TimeUnit
++
++/** Modern mobile Chrome UA for the login WebView (sites refuse "wv" UAs). */
++const val MINES_MOBILE_UA =
++    "Mozilla/5.0 (Linux; Android 15; RMX5062) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Mobile Safari/537.36"
++
++/**
++ * Connection flows that do not need a page of their own:
++ * OAuth device flows (GitHub, Microsoft), clipboard key detection,
++ * web-session snapshots, Wispbyte keep-alive, and the agent's permission check.
++ */
++object PlusConnect {
++    private val http by lazy {
++        OkHttpClient.Builder().connectTimeout(20, TimeUnit.SECONDS).readTimeout(30, TimeUnit.SECONDS).build()
++    }
++
++    // ---------------- OAuth device flow ----------------
++
++    data class DeviceCode(
++        val userCode: String,
++        val verifyUrl: String,
++        val deviceCode: String,
++        val interval: Int,
++        val expiresIn: Int,
++    )
++
++    sealed class PollResult {
++        data class Done(val token: String, val refresh: String?, val expiresIn: Long) : PollResult()
++        object Pending : PollResult()
++        object SlowDown : PollResult()
++        data class Failed(val message: String) : PollResult()
++    }
++
++    /** GitHub CLI's public OAuth app (device flow enabled, no client secret needed). */
++    private const val GH_CLIENT = "178c6fc778ccc68e1d6a"
++    private const val GH_SCOPES = "repo read:org gist workflow"
++
++    /** Microsoft Graph Command Line Tools public client (device code, delegated scopes). */
++    private const val MS_CLIENT = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
++    private const val MS_SCOPES = "offline_access User.Read Mail.ReadWrite Mail.Send Calendars.ReadWrite Files.ReadWrite"
++    private const val MS_BASE = "https://login.microsoftonline.com/common/oauth2/v2.0"
++
++    private fun postForm(url: String, form: Map<String, String>): JSONObject {
++        val body = FormBody.Builder().apply { form.forEach { (k, v) -> add(k, v) } }.build()
++        val req = Request.Builder().url(url).post(body).header("Accept", "application/json").build()
++        http.newCall(req).execute().use { r ->
++            val text = r.body?.string().orEmpty()
++            return runCatching { JSONObject(text) }.getOrElse { JSONObject().put("error", "http_${r.code}") }
++        }
++    }
++
++    fun startDevice(kindId: String): DeviceCode {
++        val o = if (kindId == "github") postForm("https://github.com/login/device/code",
++            mapOf("client_id" to GH_CLIENT, "scope" to GH_SCOPES))
++        else postForm("$MS_BASE/devicecode", mapOf("client_id" to MS_CLIENT, "scope" to MS_SCOPES))
++        if (!o.has("device_code")) error(o.optString("error_description", o.optString("error", "请求失败")))
++        return DeviceCode(
++            userCode = o.getString("user_code"),
++            verifyUrl = o.optString("verification_uri", if (kindId == "github") "https://github.com/login/device" else "https://microsoft.com/devicelogin"),
++            deviceCode = o.getString("device_code"),
++            interval = o.optInt("interval", 5),
++            expiresIn = o.optInt("expires_in", 900),
++        )
++    }
++
++    fun pollDevice(kindId: String, code: DeviceCode): PollResult = runCatching {
++        val o = if (kindId == "github") postForm("https://github.com/login/oauth/access_token", mapOf(
++            "client_id" to GH_CLIENT, "device_code" to code.deviceCode,
++            "grant_type" to "urn:ietf:params:oauth:grant-type:device_code"))
++        else postForm("$MS_BASE/token", mapOf(
++            "client_id" to MS_CLIENT, "device_code" to code.deviceCode,
++            "grant_type" to "urn:ietf:params:oauth:grant-type:device_code"))
++        val token = o.optString("access_token")
++        when {
++            token.isNotEmpty() -> PollResult.Done(token, o.optString("refresh_token").ifEmpty { null }, o.optLong("expires_in", 0))
++            o.optString("error") == "authorization_pending" -> PollResult.Pending
++            o.optString("error") == "slow_down" -> PollResult.SlowDown
++            else -> PollResult.Failed(o.optString("error_description", o.optString("error", "授权失败")))
++        }
++    }.getOrElse { PollResult.Pending } // network blip: keep polling
++
++    /** Account name for a fresh token. */
++    fun whoAmI(kindId: String, token: String): String = runCatching {
++        val (url, field) = if (kindId == "github") "https://api.github.com/user" to "login"
++        else "https://graph.microsoft.com/v1.0/me" to "userPrincipalName"
++        val req = Request.Builder().url(url).header("Authorization", "Bearer $token")
++            .header("Accept", "application/json").header("User-Agent", "Mines").build()
++        http.newCall(req).execute().use { r -> JSONObject(r.body?.string().orEmpty()).optString(field) }
++    }.getOrDefault("")
++
++    fun saveOAuth(context: Context, kind: ConnectionKind, r: PollResult.Done, account: String) {
++        PlusVault.init(context)
++        PlusVault.save(context, kind, account, r.token, share = PlusVault.entries.value[kind.id]?.shareWithAi ?: true, via = "oauth")
++        PlusVault.setSecretExtra(kind.id, "refresh", r.refresh)
++        if (r.expiresIn > 0) PlusVault.setExtra(kind.id, "expires", (System.currentTimeMillis() + r.expiresIn * 1000).toString())
++    }
++
++    /** Fresh Microsoft Graph token (refreshes when within 5 minutes of expiry). */
++    fun microsoftToken(context: Context): String? {
++        PlusVault.init(context)
++        val id = PlusVault.defaultAccount("microsoft") ?: return null
++        val tok = PlusVault.secret(id) ?: return null
++        val exp = PlusVault.extra(id, "expires")?.toLongOrNull() ?: 0L
++        if (exp > System.currentTimeMillis() + 300_000) return tok
++        val refresh = PlusVault.secretExtra(id, "refresh") ?: return tok
++        return runCatching {
++            val o = postForm("$MS_BASE/token", mapOf("client_id" to MS_CLIENT, "grant_type" to "refresh_token",
++                "refresh_token" to refresh, "scope" to MS_SCOPES))
++            val t = o.optString("access_token")
++            if (t.isEmpty()) return@runCatching tok
++            val kind = PlusVault.kind(id)!!
++            saveOAuth(context, kind, PollResult.Done(t, o.optString("refresh_token").ifEmpty { refresh }, o.optLong("expires_in", 3600)),
++                PlusVault.entries.value[id]?.account ?: "")
++            t
++        }.getOrDefault(tok)
++    }
++
++    // ---------------- clipboard key pick-up ----------------
++
++    /** A key for [kind] currently on the clipboard, if any. */
++    fun keyOnClipboard(context: Context, kind: ConnectionKind): String? {
++        val rx = kind.keyRegex ?: return null
++        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return null
++        val text = runCatching { cm.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString() }.getOrNull() ?: return null
++        if (text.length > 4000) return null
++        val m = rx.find(text.trim()) ?: return null
++        return m.value.let { if (kind.id == "gmail") it.replace(" ", "") else it }
++    }
++
++    // ---------------- web sessions ----------------
++
++    fun hostOf(url: String?): String = runCatching { URI(url ?: "").host?.lowercase() }.getOrNull().orEmpty()
++
++    /** Snapshot the cookies of a signed-in site into the encrypted vault (restored if WebView data is cleared). */
++    fun snapshotCookies(kind: ConnectionKind, urls: Collection<String>) {
++        val cm = CookieManager.getInstance()
++        cm.flush()
++        val arr = JSONArray()
++        urls.map { hostOf(it) }.filter { it.isNotEmpty() }.distinct().forEach { host ->
++            val c = cm.getCookie("https://$host/") ?: return@forEach
++            arr.put(JSONObject().put("host", host).put("cookie", c))
++        }
++        if (arr.length() > 0) PlusVault.setSecretExtra(kind.id, "cookies", arr.toString())
++    }
++
++    /** Put saved cookies back when the WebView store lost them (e.g. after "clear browser data"). */
++    fun restoreCookies(kind: ConnectionKind) {
++        val raw = PlusVault.secretExtra(kind.id, "cookies") ?: return
++        val cm = CookieManager.getInstance()
++        runCatching {
++            val arr = JSONArray(raw)
++            for (i in 0 until arr.length()) {
++                val o = arr.getJSONObject(i)
++                val host = o.getString("host")
++                if (cm.getCookie("https://$host/").isNullOrEmpty()) {
++                    o.getString("cookie").split(";").map { it.trim() }.filter { it.contains('=') }.forEach {
++                        cm.setCookie("https://$host/", "$it; Path=/; Secure")
++                    }
++                }
++            }
++            cm.flush()
++        }
++    }
++
++    fun clearCookies(kind: ConnectionKind) {
++        val raw = PlusVault.secretExtra(kind.id, "cookies") ?: return
++        val cm = CookieManager.getInstance()
++        runCatching {
++            val arr = JSONArray(raw)
++            for (i in 0 until arr.length()) {
++                val host = arr.getJSONObject(i).getString("host")
++                cm.getCookie("https://$host/")?.split(";")?.map { it.substringBefore('=').trim() }?.forEach { name ->
++                    cm.setCookie("https://$host/", "$name=; Max-Age=0; Path=/")
++                    cm.setCookie("https://$host/", "$name=; Max-Age=0; Path=/; Domain=.$host")
++                }
++            }
++            cm.flush()
++        }
++    }
++
++    // ---------------- Wispbyte keep-alive ----------------
++
++    private const val KEEP_CHANNEL = "mines_keepalive"
++    private const val KEEP_EVERY_MS = 10L * 24 * 3600 * 1000
++
++    fun keepAliveOn(context: Context, kindId: String): Boolean {
++        PlusVault.init(context)
++        return PlusVault.extra(kindId, "keepalive") == "1"
++    }
++
++    fun setKeepAlive(context: Context, kindId: String, on: Boolean) {
++        PlusVault.init(context)
++        PlusVault.setExtra(kindId, "keepalive", if (on) "1" else "0")
++        schedule(context, kindId, on)
++    }
++
++    /** Re-arm every enabled keep-alive (called at app start; alarms die on reboot / update). */
++    fun rearm(context: Context) {
++        PlusVault.init(context)
++        PlusVault.entries.value.keys.filter { PlusVault.extra(it, "keepalive") == "1" }.forEach { schedule(context, it, true) }
++    }
++
++    private fun pending(context: Context, kindId: String) = PendingIntent.getBroadcast(
++        context, kindId.hashCode(),
++        Intent(context, KeepAliveReceiver::class.java).putExtra("kind", kindId),
++        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
++    )
++
++    private fun schedule(context: Context, kindId: String, on: Boolean) {
++        val am = context.getSystemService(AlarmManager::class.java) ?: return
++        val pi = pending(context, kindId)
++        am.cancel(pi)
++        if (!on) return
++        val last = PlusVault.extra(kindId, "keepalive_last")?.toLongOrNull() ?: System.currentTimeMillis()
++        val dueIn = (last + KEEP_EVERY_MS - System.currentTimeMillis()).coerceIn(60_000L, KEEP_EVERY_MS)
++        am.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, SystemClock.elapsedRealtime() + dueIn, pi)
++    }
++
++    fun notifyUser(context: Context, title: String, text: String, id: Int) {
++        val nm = context.getSystemService(NotificationManager::class.java) ?: return
++        if (nm.getNotificationChannel(KEEP_CHANNEL) == null) {
++            nm.createNotificationChannel(NotificationChannel(KEEP_CHANNEL, "账号保活", NotificationManager.IMPORTANCE_DEFAULT))
++        }
++        val open = PendingIntent.getActivity(context, id,
++            Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
++            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
++        runCatching {
++            nm.notify(id, android.app.Notification.Builder(context, KEEP_CHANNEL)
++                .setSmallIcon(R.drawable.ic_launcher_monochrome)
++                .setContentTitle(title).setContentText(text)
++                .setStyle(android.app.Notification.BigTextStyle().bigText(text))
++                .setContentIntent(open).setAutoCancel(true).build())
++        }
++    }
++
++    /** Opens the panel in a hidden WebView with the saved session; reports when the session is gone. */
++    @SuppressLint("SetJavaScriptEnabled")
++    fun runKeepAlive(context: Context, kindId: String, done: () -> Unit) {
++        val kind = PlusVault.kind(kindId)
++        val url = kind?.panelUrl ?: kind?.loginUrl
++        if (kind == null || url == null) { done(); return }
++        restoreCookies(kind)
++        val main = Handler(Looper.getMainLooper())
++        main.post {
++            var finished = false
++            val wv = runCatching { WebView(context.applicationContext) }.getOrNull()
++            if (wv == null) { done(); return@post }
++            fun finish(ok: Boolean?) {
++                if (finished) return
++                finished = true
++                when (ok) {
++                    true -> {
++                        PlusVault.setExtra(kindId, "keepalive_last", System.currentTimeMillis().toString())
++                        snapshotCookies(kind, listOf(url))
++                    }
++                    false -> notifyUser(context, "${kind.name} 登录已过期",
++                        "保活没成功：登录已失效。打开 Mines → 设置 → 账号连接 → ${kind.name}，点「重新登录」就好。", 7400 + (kindId.hashCode() and 0xff))
++                    null -> Unit // inconclusive (network); try again next round
++                }
++                schedule(context, kindId, true)
++                runCatching { wv.stopLoading(); wv.destroy() }
++                done()
++            }
++            wv.settings.javaScriptEnabled = true
++            wv.settings.domStorageEnabled = true
++            wv.settings.userAgentString = MINES_MOBILE_UA
++            CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
++            wv.webViewClient = object : WebViewClient() {
++                override fun onPageFinished(view: WebView, u: String) {
++                    val loggedOut = u.contains("/login") || u.contains("github.com/session") || u.contains("/signin")
++                    val matched = kind.doneUrl?.matches(u) == true
++                    if (loggedOut) finish(false) else if (matched) finish(true)
++                }
++            }
++            wv.loadUrl(url)
++            main.postDelayed({
++                val u = wv.url.orEmpty()
++                finish(if (kind.doneUrl?.matches(u) == true) true else if (u.contains("login")) false else null)
++            }, 40_000)
++        }
++    }
++
++    // ---------------- agent permission gate (minis-connect) ----------------
++
++    fun promptLine(): String {
++        val e = PlusVault.entries.value
++        if (e.isEmpty()) return ""
++        return "\n- Mines connected accounts: " + e.keys.sorted().joinToString(", ") +
++            ". Before acting through one of them run `minis-connect check <service> <capability>` (capabilities: `minis-connect list`); exit 0 = go ahead, otherwise do not."
++    }
++}
++
++class KeepAliveReceiver : BroadcastReceiver() {
++    override fun onReceive(context: Context, intent: Intent) {
++        val kindId = intent.getStringExtra("kind") ?: return
++        PlusVault.init(context)
++        if (!PlusConnect.keepAliveOn(context, kindId)) return
++        val result = goAsync()
++        PlusConnect.runKeepAlive(context, kindId) { runCatching { result.finish() } }
++    }
++}
++
++/**
++ * `minis-connect` — lets the agent see what is connected and ask before acting.
++ *   minis-connect list
++ *   minis-connect check <service> <capability> [--why "what I'm about to do"]
++ *   minis-connect token microsoft      (prints a fresh Graph token after a read check)
++ */
++class ConnectOffloadHandler(private val context: Context) : NativeOffloadHandler {
++    override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
++        PlusVault.init(context)
++        val args = request.argv.drop(1)
++        val sub = args.firstOrNull() ?: "list"
++        return when (sub) {
++            "list" -> NativeOffloadResult(0, list())
++            "check" -> check(args.getOrNull(1), args.getOrNull(2), why(args), opt(args, "--account"))
++            "token" -> token(args.getOrNull(1))
++            else -> NativeOffloadResult(0, HELP)
++        }
++    }
++
++    private fun why(args: List<String>): String? {
++        val i = args.indexOf("--why")
++        if (i < 0) return null
++        return args.drop(i + 1).takeWhile { it != "--account" }.joinToString(" ").ifBlank { null }
++    }
++
++    private fun opt(args: List<String>, name: String): String? {
++        val i = args.indexOf(name)
++        return if (i >= 0) args.getOrNull(i + 1) else null
++    }
++
++    private fun list(): String {
++        val out = JSONArray()
++        PlusVault.entries.value.values.forEach { e ->
++            val k = PlusVault.kind(e.kindId) ?: return@forEach
++            out.put(JSONObject().apply {
++                put("service", PlusVault.baseId(k.id)); put("account_id", k.id); put("name", k.name)
++                put("account", e.account); put("via", e.via)
++                put("default", PlusVault.defaultAccount(PlusVault.baseId(k.id)) == k.id)
++                put("env", if (e.shareWithAi && k.envKey != null) k.envKey else JSONObject.NULL)
++                put("browser_session", e.via == "web")
++                put("capabilities", JSONObject().apply {
++                    PlusVault.capabilities(k.profile).forEach { c -> put(c.id, PlusVault.level(k, c).name.lowercase()) }
++                })
++            })
++        }
++        return JSONObject().put("connections", out)
++            .put("note", "allow = go ahead; ask = run `minis-connect check` and wait for the user's answer; deny = never do it. Signed-in web sessions are shared with the browser tool.")
++            .toString(2)
++    }
++
++    private fun check(service: String?, capId: String?, why: String?, account: String?): NativeOffloadResult {
++        if (service == null || capId == null) return NativeOffloadResult(2, "usage: minis-connect check <service> <capability> [--why text]")
++        PlusVault.kind(service) ?: return NativeOffloadResult(4, "unknown service '$service' (see minis-connect list)")
++        val entryId = if (service.contains('#')) service.takeIf { PlusVault.entries.value.containsKey(it) }
++            else PlusVault.resolveAccount(PlusVault.baseId(service), account)
++        val kind = entryId?.let { PlusVault.kind(it) }
++            ?: return NativeOffloadResult(4, (if (account != null) "no account '$account' on $service. " else "$service is not connected. ") +
++                "Ask the user to connect it in Settings → 账号连接 (see minis-connect list).")
++        val who = PlusVault.entries.value[kind.id]?.account?.takeIf { it.isNotBlank() }?.let { " ($it)" } ?: ""
++        val cap = PlusVault.capabilities(kind.profile).firstOrNull { it.id == capId }
++            ?: PlusVault.capabilities(kind.profile).firstOrNull { it.id == "publish" && capId in setOf("send", "post", "write", "deploy", "push") }
++            ?: return NativeOffloadResult(2, "unknown capability '$capId' for ${kind.id}; known: " +
++                PlusVault.capabilities(kind.profile).joinToString(",") { it.id })
++        return when (PlusVault.level(kind, cap)) {
++            PermLevel.ALLOW -> NativeOffloadResult(0, "allowed: ${kind.name}$who · ${cap.label}" +
++                (if (PlusVault.defaultAccount(PlusVault.baseId(kind.id)) != kind.id) ". This is not the default account: use its value from ${kind.envKey ?: "the env"}_ACCOUNTS" else ""))
++            PermLevel.DENY -> NativeOffloadResult(3, "denied: the user does not allow ${cap.label} on ${kind.name}. Do not do it; tell the user it is switched off in 账号连接.")
++            PermLevel.ASK -> {
++                val change = PendingConfigChange(
++                    items = listOf(PendingConfigChangeItem(
++                        displayName = "${kind.name}$who · ${cap.label}",
++                        path = "connections.${kind.id}.${cap.id}",
++                        oldDisplay = "",
++                        newDisplay = why ?: "AI 想用 ${kind.name} ${cap.label}",
++                        verb = "允许一次",
++                        risk = if (cap.id in setOf("pay", "trade", "delete")) ConfigRisk.DESTRUCTIVE else ConfigRisk.SENSITIVE,
++                    )),
++                    caption = "AI 想用你连接的 ${kind.name} 做一件事：${why ?: cap.label}",
++                )
++                when (runBlocking { ConfigConfirmationGate.requestConfirmation(change) }) {
++                    is ConfirmOutcome.Approved -> NativeOffloadResult(0, "approved once by the user: ${kind.name} · ${cap.label}")
++                    is ConfirmOutcome.Rejected -> NativeOffloadResult(3, "the user said no. Do not do it.")
++                    is ConfirmOutcome.TimedOut -> NativeOffloadResult(5, "no answer from the user within 2 minutes. Do not do it; ask in chat.")
++                }
++            }
++        }
++    }
++
++    private fun token(service: String?): NativeOffloadResult {
++        if (service != "microsoft") return NativeOffloadResult(2, "only `minis-connect token microsoft` is supported; other tokens are in env vars")
++        val kind = PlusVault.kind(PlusVault.defaultAccount("microsoft") ?: "microsoft")!!
++        val read = PlusVault.capabilities(kind.profile).first { it.id == "read" }
++        if (PlusVault.level(kind, read) == PermLevel.DENY) return NativeOffloadResult(3, "denied by the user")
++        PlusConnect.microsoftToken(context) ?: return NativeOffloadResult(4, "Microsoft is not connected")
++        // The token goes into the redacted env var, never into the transcript.
++        PlusVault.setShare(context, kind, true)
++        return NativeOffloadResult(0, "MS_GRAPH_TOKEN refreshed; use \$MS_GRAPH_TOKEN in your next shell command (never print it).")
++    }
++
++    companion object {
++        const val HELP = """minis-connect — accounts the user connected in Mines (设置 → 账号连接)
++  minis-connect list                                  services, accounts, env vars, permission levels
++  minis-connect check <service> <capability> [--account <name>] [--why "what you are about to do"]
++        without --account the service's default account is used; <VAR> env = default account,
++        <VAR>_ACCOUNTS = JSON {account: secret} when several accounts are shared
++        exit 0 = allowed (or the user approved just now), 3 = denied/refused, 5 = no answer
++  minis-connect token microsoft                       refresh ${'$'}MS_GRAPH_TOKEN (Microsoft Graph)
++Run `check` before every action through a connected account; never act when it does not exit 0."""
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusPrefs.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusPrefs.kt
+new file mode 100644
+index 0000000..381e3b8
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/PlusPrefs.kt
+@@ -0,0 +1,154 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import android.content.SharedPreferences
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import org.json.JSONArray
++import org.json.JSONObject
++import java.util.UUID
++
++/** One VPS the user added. No server is pre-filled. */
++data class VpsServer(
++    val id: String = UUID.randomUUID().toString(),
++    val name: String,
++    val host: String,
++    val port: Int = 22,
++    val user: String = "root",
++    val enabled: Boolean = true,
++    /** Last measured TCP connect latency in ms, -1 = unknown, -2 = unreachable. */
++    val lastLatencyMs: Int = -1,
++    val lastCheckedAt: Long = 0L,
++) {
++    val target: String get() = "$user@$host"
++}
++
++data class PlusState(
++    val workMode: String = MODE_LOCAL,
++    val servers: List<VpsServer> = emptyList(),
++    val wallpaper: String = "",          // "", "preset:<id>", "file:<version>"
++    val wallpaperDim: Float = 0.25f,
++    /** Wallpaper opacity, 0..1 (separate from the dim layer). */
++    val wallpaperAlpha: Float = 1f,
++    /** Also show the wallpaper behind the conversation list. */
++    val wallpaperOnHome: Boolean = false,
++    val petEnabled: Boolean = false,
++    val petStyle: String = "whale",      // Avatars.builtins id, or "custom"
++    val petColor: Int = 0xFFD97757.toInt(),
++    /** Bumped whenever the custom picture or its crop changes (cache key). */
++    val avatarVersion: Long = 0L,
++    val avatarScale: Float = 1f,
++    val avatarOffX: Float = 0f,
++    val avatarOffY: Float = 0f,
++    val avatarRemoveBg: Boolean = false,
++    val todayCollapsed: Boolean = false,
++    val autoFallback: Boolean = true,
++    val autoClean: Boolean = true,
++) {
++    val isVps: Boolean get() = workMode == MODE_VPS
++    val onlineServers: List<VpsServer> get() = servers.filter { it.enabled && it.lastLatencyMs >= 0 }
++
++    companion object {
++        const val MODE_LOCAL = "local"
++        const val MODE_VPS = "vps"
++    }
++}
++
++/**
++ * Minis Plus settings: work mode, VPS list, wallpaper, avatar / desk pet.
++ * Plain SharedPreferences (none of this is secret — SSH keys live in the
++ * sandbox, account secrets live in [PlusVault]). Exposed as a process-wide
++ * StateFlow so every screen updates live.
++ */
++object PlusPrefs {
++    private const val FILE = "minis_plus"
++    private val _state = MutableStateFlow(PlusState())
++    val state: StateFlow<PlusState> = _state.asStateFlow()
++    @Volatile private var prefs: SharedPreferences? = null
++
++    fun init(context: Context) {
++        if (prefs != null) return
++        synchronized(this) {
++            if (prefs != null) return
++            val p = context.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
++            prefs = p
++            _state.value = read(p)
++        }
++    }
++
++    private fun read(p: SharedPreferences): PlusState {
++        val servers = runCatching {
++            val arr = JSONArray(p.getString("servers", "[]"))
++            (0 until arr.length()).map { i ->
++                val o = arr.getJSONObject(i)
++                VpsServer(
++                    id = o.optString("id", UUID.randomUUID().toString()),
++                    name = o.optString("name"),
++                    host = o.optString("host"),
++                    port = o.optInt("port", 22),
++                    user = o.optString("user", "root"),
++                    enabled = o.optBoolean("enabled", true),
++                    lastLatencyMs = o.optInt("lat", -1),
++                    lastCheckedAt = o.optLong("checked", 0L),
++                )
++            }
++        }.getOrDefault(emptyList())
++        return PlusState(
++            workMode = p.getString("workMode", PlusState.MODE_LOCAL) ?: PlusState.MODE_LOCAL,
++            servers = servers,
++            wallpaper = p.getString("wallpaper", "") ?: "",
++            wallpaperDim = p.getFloat("wallpaperDim", 0.25f),
++            wallpaperAlpha = p.getFloat("wallpaperAlpha", 1f),
++            wallpaperOnHome = p.getBoolean("wallpaperOnHome", false),
++            petEnabled = p.getBoolean("petEnabled", false),
++            petStyle = Avatars.normalize(p.getString("petStyle", "whale") ?: "whale"),
++            // build-3..19 default blue → Mines terracotta
++            petColor = p.getInt("petColor", 0xFFD97757.toInt()).let { if (it == 0xFF5B8DEF.toInt() && !p.contains("avatarVersion")) 0xFFD97757.toInt() else it },
++            avatarVersion = p.getLong("avatarVersion", 0L),
++            avatarScale = p.getFloat("avatarScale", 1f),
++            avatarOffX = p.getFloat("avatarOffX", 0f),
++            avatarOffY = p.getFloat("avatarOffY", 0f),
++            avatarRemoveBg = p.getBoolean("avatarRemoveBg", false),
++            todayCollapsed = p.getBoolean("todayCollapsed", false),
++            autoFallback = p.getBoolean("autoFallback", true),
++            autoClean = p.getBoolean("autoClean", true),
++        )
++    }
++
++    fun update(context: Context, block: (PlusState) -> PlusState) {
++        init(context)
++        val next = synchronized(this) {
++            val n = block(_state.value)
++            _state.value = n
++            n
++        }
++        val arr = JSONArray()
++        next.servers.forEach { s ->
++            arr.put(JSONObject().apply {
++                put("id", s.id); put("name", s.name); put("host", s.host)
++                put("port", s.port); put("user", s.user); put("enabled", s.enabled)
++                put("lat", s.lastLatencyMs); put("checked", s.lastCheckedAt)
++            })
++        }
++        prefs?.edit()
++            ?.putString("workMode", next.workMode)
++            ?.putString("servers", arr.toString())
++            ?.putString("wallpaper", next.wallpaper)
++            ?.putFloat("wallpaperDim", next.wallpaperDim)
++            ?.putFloat("wallpaperAlpha", next.wallpaperAlpha)
++            ?.putBoolean("wallpaperOnHome", next.wallpaperOnHome)
++            ?.putLong("avatarVersion", next.avatarVersion)
++            ?.putFloat("avatarScale", next.avatarScale)
++            ?.putFloat("avatarOffX", next.avatarOffX)
++            ?.putFloat("avatarOffY", next.avatarOffY)
++            ?.putBoolean("avatarRemoveBg", next.avatarRemoveBg)
++            ?.putBoolean("petEnabled", next.petEnabled)
++            ?.putString("petStyle", next.petStyle)
++            ?.putInt("petColor", next.petColor)
++            ?.putBoolean("todayCollapsed", next.todayCollapsed)
++            ?.putBoolean("autoFallback", next.autoFallback)
++            ?.putBoolean("autoClean", next.autoClean)
++            ?.apply()
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt
 new file mode 100644
 index 0000000..0a14230
@@ -773,699 +1385,170 @@ index 0000000..7df8f25
 +        }
 +    }
 +}
-diff --git a/src/android/app/src/main/java/com/openminis/app/providers/MinisDocumentsProvider.kt b/src/android/app/src/main/java/com/openminis/app/providers/MinisDocumentsProvider.kt
-index 020d53e..d741810 100644
---- a/src/android/app/src/main/java/com/openminis/app/providers/MinisDocumentsProvider.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/providers/MinisDocumentsProvider.kt
-@@ -123,7 +123,7 @@ class MinisDocumentsProvider : DocumentsProvider() {
-         cursor.newRow()
-             .add(Root.COLUMN_ROOT_ID, ROOT_ID)
-             .add(Root.COLUMN_FLAGS, Root.FLAG_LOCAL_ONLY or Root.FLAG_SUPPORTS_IS_CHILD)
--            .add(Root.COLUMN_TITLE, "Minis")
-+            .add(Root.COLUMN_TITLE, "Mines")
-             .add(Root.COLUMN_DOCUMENT_ID, ROOT_DOC_ID)
-             .add(Root.COLUMN_MIME_TYPES, "*/*")
-             .add(Root.COLUMN_ICON, 0)
-@@ -133,7 +133,7 @@ class MinisDocumentsProvider : DocumentsProvider() {
-     override fun queryDocument(documentId: String, projection: Array<String>?): Cursor {
-         val cursor = MatrixCursor(projection ?: DOCUMENT_PROJECTION)
-         val file = resolveDoc(documentId)
--        val displayName = if (documentId.isEmpty()) "Minis" else file.name
-+        val displayName = if (documentId.isEmpty()) "Mines" else file.name
-         cursor.newRow()
-             .add(Document.COLUMN_DOCUMENT_ID, documentId)
-             .add(Document.COLUMN_DISPLAY_NAME, displayName)
-diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/ContainerDns.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/ContainerDns.kt
-index 5fad13e..a823e04 100644
---- a/src/android/app/src/main/java/com/openminis/app/sandbox/ContainerDns.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/sandbox/ContainerDns.kt
-@@ -155,7 +155,7 @@ object ContainerDns {
-      * active would reintroduce the system's influence.
-      */
-     fun customResolvConf(servers: List<String>): String = buildString {
--        append("# Written by Minis: Container Network DNS is set to Custom (Settings > Rootfs).\n")
-+        append("# Written by Mines: Container Network DNS is set to Custom (Settings > Rootfs).\n")
-         for (s in servers) append("nameserver ").append(s).append('\n')
-     }
- 
-diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/ExecutionCoordinator.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/ExecutionCoordinator.kt
-index 228b203..07eab08 100644
---- a/src/android/app/src/main/java/com/openminis/app/sandbox/ExecutionCoordinator.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/sandbox/ExecutionCoordinator.kt
-@@ -316,7 +316,7 @@ object ExecutionCoordinator {
-             }
-             is GlobalShellThrottle.Outcome.QueueTimedOut -> CommandResult(
-                 output = "Not run: waited ${outcome.waitedMs / 1000}s for Android's per-app process limit to " +
--                    "free up (${outcome.lastLiveCount} Minis processes running, budget " +
-+                    "free up (${outcome.lastLiveCount} Mines processes running, budget " +
-                     "${GlobalShellThrottle.PROCESS_BUDGET}), or for the shell to start. Nothing was executed; " +
-                     "retry once other commands or background processes have finished.",
-                 exitCode = 124,
-diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/GlobalShellThrottle.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/GlobalShellThrottle.kt
-index d30794c..e7a3a6a 100644
---- a/src/android/app/src/main/java/com/openminis/app/sandbox/GlobalShellThrottle.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/sandbox/GlobalShellThrottle.kt
-@@ -51,8 +51,14 @@ import kotlinx.coroutines.withTimeoutOrNull
- object GlobalShellThrottle {
-     private const val TAG = "GlobalShellThrottle"
- 
--    /** Live Minis child processes the gate admits up to. */
--    const val PROCESS_BUDGET = 16
-+    /** Budget on a device that enforces the 32-process phantom limit. */
-+    const val DEFAULT_PROCESS_BUDGET = 16
-+
-+    /**
-+     * Live Minis child processes the gate admits up to. Raised by
-+     * [PhantomProcessGuard] when the phantom-process killer is off.
-+     */
-+    val PROCESS_BUDGET: Int get() = PhantomProcessGuard.budget
- 
-     /**
-      * What a command is assumed to cost before its processes show up in
-diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/NativeOffload.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/NativeOffload.kt
-index 109d8e5..02fe55f 100644
---- a/src/android/app/src/main/java/com/openminis/app/sandbox/NativeOffload.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/sandbox/NativeOffload.kt
-@@ -52,7 +52,31 @@ fun interface NativeOffloadHandler {
- 
- object NativeOffloadServer {
-     private const val TAG = "NativeOffloadServer"
--    private const val SOCKET_NAME = "native-offload"
-+    private const val BASE_SOCKET_NAME = "native-offload"
-+    private const val UPSTREAM_PACKAGE = "com.openminis.app"
-+
-+    /**
-+     * [Mines] Abstract unix sockets live in ONE namespace shared by every app
-+     * on the device. Upstream used the fixed name "native-offload", so when
-+     * two builds of the app are installed side by side (Mines beside the
-+     * earlier Mines / official Minis) the second one to start found the name
-+     * already bound by the other app's live process, failed every bind retry
-+     * and threw from Application.onCreate: an endless crash loop at launch.
-+     * Suffix the name with the package so each install owns its own socket.
-+     * The upstream package keeps the original name.
-+     */
-+    @Volatile
-+    private var SOCKET_NAME: String = BASE_SOCKET_NAME
-+
-+    /** Call once from Application.onCreate, before [start] and before any shell launches. */
-+    fun configure(packageName: String) {
-+        if (serverSocket != null) return
-+        SOCKET_NAME = if (packageName.isBlank() || packageName == UPSTREAM_PACKAGE) {
-+            BASE_SOCKET_NAME
-+        } else {
-+            "$BASE_SOCKET_NAME.$packageName"
-+        }
-+    }
-     private const val MAGIC_REQ = 0x46464F4E  // 'N' 'O' 'F' 'F' little-endian
-     private const val MAGIC_RSP = 0x52464F4E  // 'N' 'O' 'F' 'R'
-     private const val VERSION = 1
-@@ -72,7 +96,7 @@ object NativeOffloadServer {
-     /** Run the opportunistic sweep every N replies, not on every single one. */
-     private const val SWEEP_EVERY_N_REPLIES = 50L
- 
--    const val socketName: String = SOCKET_NAME
-+    val socketName: String get() = SOCKET_NAME
- 
-     private val handlers = ConcurrentHashMap<String, NativeOffloadHandler>()
-     private val counter = AtomicLong(0)
-@@ -106,10 +130,35 @@ object NativeOffloadServer {
-         // overwhelming majority of cases the socket frees within the first
-         // 100-300ms window.
-         val s = bindWithRetry()
--            ?: throw java.io.IOException(
--                "failed to bind abstract socket '$SOCKET_NAME' after retries — " +
--                "previous process holding the namespace?",
--            )
-+        if (s == null) {
-+            // [Mines] Never crash Application.onCreate over this: the app
-+            // must still open (chat, settings, backup) even if the sandbox's
-+            // device tools are briefly unreachable. Keep retrying quietly.
-+            Log.e(TAG, "failed to bind abstract socket '$SOCKET_NAME' after retries; retrying in background")
-+            if (bindRetryThread == null) {
-+                bindRetryThread = thread(name = "native-offload-rebind", isDaemon = true) {
-+                    repeat(60) {
-+                        Thread.sleep(2_000L)
-+                        synchronized(this) { if (serverSocket != null) return@thread }
-+                        val ok = runCatching { LocalServerSocket(SOCKET_NAME) }.getOrNull()
-+                        if (ok != null) {
-+                            synchronized(this) {
-+                                if (serverSocket == null) adopt(ok) else runCatching { ok.close() }
-+                            }
-+                            return@thread
-+                        }
-+                    }
-+                }
-+            }
-+            return
-+        }
-+        adopt(s)
-+    }
-+
-+    @Volatile
-+    private var bindRetryThread: Thread? = null
-+
-+    private fun adopt(s: LocalServerSocket) {
-         serverSocket = s
-         acceptThread = thread(name = "native-offload-accept", isDaemon = true) {
-             runAcceptLoop(s)
-diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/NetIfacePublisher.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/NetIfacePublisher.kt
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SmartRouter.kt b/src/android/app/src/main/java/com/openminis/app/plus/SmartRouter.kt
 new file mode 100644
-index 0000000..eae9a02
+index 0000000..2c09928
 --- /dev/null
-+++ b/src/android/app/src/main/java/com/openminis/app/sandbox/NetIfacePublisher.kt
-@@ -0,0 +1,103 @@
-+package com.openminis.app.sandbox
++++ b/src/android/app/src/main/java/com/openminis/app/plus/SmartRouter.kt
+@@ -0,0 +1,161 @@
++package com.openminis.app.plus
 +
 +import android.content.Context
-+import android.net.ConnectivityManager
-+import android.net.LinkProperties
-+import android.net.Network
-+import android.util.Log
-+import java.io.File
-+import java.net.Inet4Address
-+import java.net.Inet6Address
++import android.content.SharedPreferences
++import com.openminis.app.MinisApp
++import com.openminis.app.data.model.ModelEntry
++import com.openminis.app.data.model.ModelGroup
++import com.openminis.app.data.model.ProviderInstance
++import com.openminis.app.data.model.ProviderType
++import com.openminis.app.data.model.RoutingStrategy
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.async
++import kotlinx.coroutines.awaitAll
++import kotlinx.coroutines.coroutineScope
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.withContext
++import java.net.HttpURLConnection
++import java.net.URL
 +
 +/**
-+ * [T-android-fake-netlink-real-ifaces] Publishes the device's real network
-+ * interfaces to the sandbox.
++ * Smart routing (智能路由): keeps a speed / health reading per provider and
++ * lets model groups use it.
 + *
-+ * The guest cannot open a NETLINK_ROUTE socket (SELinux), so proot's
-+ * `--fake-netlink` answers interface dumps itself. On its own it only knows
-+ * loopback, so `ip addr`, Go's net.Interfaces(), Node's os.networkInterfaces()
-+ * and friends saw a machine with no network ("没有 IP"). The app CAN ask
-+ * ConnectivityManager, so it writes the active network's addresses to a small
-+ * file that proot re-reads on every dump:
-+ *
-+ *     <ifname> <4|6> <address> <prefixlen>
-+ *
-+ * Only true addresses are written, so a guest that binds one gets a socket the
-+ * kernel accepts. The default-network callback keeps the file current across
-+ * Wi-Fi / mobile / VPN switches without restarting any shell.
++ *  - Speed test: one light request to each enabled provider's API host (any
++ *    HTTP answer = reachable; the time to the answer = latency). Runs on
++ *    demand and every few minutes while Mines is open.
++ *  - With 智能路由 on, a 「按顺序备用」 group starts with the fastest
++ *    healthy member instead of the first one, and its automatic fallback
++ *    chain (on errors / timeouts, already part of Mines) is walked in the
++ *    same fastest-first order.
++ *  - 「同模型自动成组」 builds one group per model that several providers
++ *    serve (e.g. the same DeepSeek model from three gateways), so the
++ *    fastest working one is used and the others back it up.
 + */
-+object NetIfacePublisher {
-+    private const val TAG = "NetIfacePublisher"
-+    const val ENV_KEY = "PROOT_FAKE_NETLINK_IFACES"
++object SmartRouter {
++    private const val FILE = "mines_smart_router"
++    const val GROUP_PREFIX = "⚡ "
 +
-+    @Volatile private var callbackRegistered = false
++    data class Stat(val latencyMs: Int, val ok: Boolean, val code: Int, val error: String?, val at: Long)
 +
-+    private fun file(context: Context): File = File(PRootKernel.getProotTmpDir(context), "netifs")
++    private val _enabled = MutableStateFlow(false)
++    val enabled: StateFlow<Boolean> = _enabled.asStateFlow()
++    private val _stats = MutableStateFlow<Map<String, Stat>>(emptyMap())
++    val stats: StateFlow<Map<String, Stat>> = _stats.asStateFlow()
++    private val _testing = MutableStateFlow(false)
++    val testing: StateFlow<Boolean> = _testing.asStateFlow()
++    @Volatile private var prefs: SharedPreferences? = null
 +
-+    /** Call from boot, before any shell spawns. Idempotent. */
-+    fun start(context: Context) {
-+        val app = context.applicationContext
-+        val target = file(app)
-+        PRootKernel.customEnvironment[ENV_KEY] = target.absolutePath
-+
-+        val cm = app.getSystemService(ConnectivityManager::class.java) ?: return
-+        runCatching { write(target, cm.getLinkProperties(cm.activeNetwork)) }
-+            .onFailure { Log.w(TAG, "initial snapshot failed: ${it.message}") }
-+
-+        if (callbackRegistered) return
-+        runCatching {
-+            cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
-+                // linkAddresses can still be empty at onAvailable (VPN, dual
-+                // stack coming up), so every event re-reads the current
-+                // LinkProperties; writing the same content twice is harmless.
-+                override fun onAvailable(network: Network) {
-+                    write(target, cm.getLinkProperties(network))
-+                }
-+
-+                override fun onCapabilitiesChanged(network: Network, caps: android.net.NetworkCapabilities) {
-+                    write(target, cm.getLinkProperties(network))
-+                }
-+
-+                override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
-+                    write(target, lp)
-+                }
-+
-+                override fun onLost(network: Network) {
-+                    write(target, null)
-+                }
-+            })
-+            callbackRegistered = true
-+        }.onFailure { Log.w(TAG, "registerDefaultNetworkCallback failed: ${it.message}") }
-+    }
-+
-+    @Synchronized
-+    private fun write(target: File, lp: LinkProperties?) {
-+        val sb = StringBuilder()
-+        val seen = HashSet<String>()
-+        if (lp != null) {
-+            val name = lp.interfaceName?.takeIf { it.isNotBlank() && it.length < 16 } ?: "net0"
-+            for (la in lp.linkAddresses) {
-+                val addr = la.address
-+                val family = when (addr) {
-+                    is Inet4Address -> 4
-+                    is Inet6Address -> 6
-+                    else -> continue
-+                }
-+                val host = addr.hostAddress?.substringBefore('%') ?: continue
-+                if (!seen.add(host)) continue
-+                sb.append(name).append(' ').append(family).append(' ')
-+                    .append(host).append(' ').append(la.prefixLength).append('\n')
-+            }
++    fun init(context: Context) {
++        if (prefs != null) return
++        synchronized(this) {
++            if (prefs != null) return
++            val p = context.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
++            prefs = p
++            _enabled.value = p.getBoolean("enabled", false)
 +        }
-+        runCatching {
-+            target.parentFile?.mkdirs()
-+            val tmp = File(target.parentFile, "netifs.tmp")
-+            tmp.writeText(sb.toString())
-+            if (!tmp.renameTo(target)) {
-+                target.writeText(sb.toString())
-+                tmp.delete()
++    }
++
++    fun setEnabled(context: Context, on: Boolean) {
++        init(context)
++        _enabled.value = on
++        prefs?.edit()?.putBoolean("enabled", on)?.apply()
++    }
++
++    private fun probeUrl(inst: ProviderInstance): String? {
++        inst.effectiveBaseURL?.let { return it.trimEnd('/') + "/models" }
++        return when (inst.providerType) {
++            ProviderType.anthropic -> "https://api.anthropic.com/v1/models"
++            ProviderType.gemini -> "https://generativelanguage.googleapis.com/v1beta/models"
++            ProviderType.openAI -> "https://api.openai.com/v1/models"
++            ProviderType.openRouter -> "https://openrouter.ai/api/v1/models"
++            ProviderType.xAI -> "https://api.x.ai/v1/models"
++            else -> null
++        }
++    }
++
++    private fun probe(url: String): Stat {
++        val t0 = System.nanoTime()
++        return try {
++            val c = URL(url).openConnection() as HttpURLConnection
++            c.connectTimeout = 5000; c.readTimeout = 6000
++            c.requestMethod = "GET"
++            val code = c.responseCode
++            runCatching { (if (code < 400) c.inputStream else c.errorStream)?.use { it.read() } }
++            c.disconnect()
++            val ms = ((System.nanoTime() - t0) / 1_000_000).toInt()
++            // 401/403/404 still means the host answered; 5xx / 429 means trouble.
++            Stat(ms, code < 500 && code != 429, code, null, System.currentTimeMillis())
++        } catch (e: Exception) {
++            Stat(((System.nanoTime() - t0) / 1_000_000).toInt(), false, 0, e.javaClass.simpleName, System.currentTimeMillis())
++        }
++    }
++
++    /** Measure every enabled provider in parallel. */
++    suspend fun testAll(context: Context) = withContext(Dispatchers.IO) {
++        val repo = (context.applicationContext as? MinisApp)?.providerRepositoryOrNull ?: return@withContext
++        _testing.value = true
++        try {
++            val insts = repo.config.value.instances.filter { it.isEnabled }
++            val res = coroutineScope {
++                insts.mapNotNull { i -> probeUrl(i)?.let { u -> i.id to u } }
++                    .map { (id, u) -> async { id to probe(u) } }.awaitAll()
 +            }
-+            Log.i(TAG, "published ${sb.lines().count { it.isNotBlank() }} address(es)")
-+        }.onFailure { Log.w(TAG, "write failed: ${it.message}") }
-+    }
-+}
-diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/PRootKernel.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/PRootKernel.kt
-index 1310ec6..2b0dae1 100644
---- a/src/android/app/src/main/java/com/openminis/app/sandbox/PRootKernel.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/sandbox/PRootKernel.kt
-@@ -209,6 +209,13 @@ object PRootKernel {
-         // proxy toggles without a restart.
-         customEnvironment.putAll(systemProxyEnv(context))
- 
-+        // [T-android-fake-netlink-real-ifaces] Let proot's fake netlink report
-+        // the phone's real interfaces instead of loopback only.
-+        NetIfacePublisher.start(context)
-+
-+        // [T-android-phantom-budget] Size the shell throttle to the device.
-+        PhantomProcessGuard.refresh(context)
-+
-         // Register global bind mounts so direct file I/O tools (file_read, file_edit)
-         // can resolve /var/minis/{memory,skills,shared}/... (idempotent).
-         registerGlobalBindMounts(context)
-diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/PhantomProcessGuard.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/PhantomProcessGuard.kt
-new file mode 100644
-index 0000000..5a069c4
---- /dev/null
-+++ b/src/android/app/src/main/java/com/openminis/app/sandbox/PhantomProcessGuard.kt
-@@ -0,0 +1,66 @@
-+package com.openminis.app.sandbox
-+
-+import android.content.Context
-+import android.os.Build
-+import android.provider.Settings
-+import android.util.Log
-+
-+/**
-+ * [T-android-phantom-budget] Sizes [GlobalShellThrottle]'s process budget to
-+ * what the device actually enforces.
-+ *
-+ * The throttle exists because Android 12+ SIGKILLs an app's "phantom"
-+ * (child) processes beyond 32, which is what tears down PRoot shells
-+ * mid-command. Its budget of 16 is right for a stock phone, but it is also
-+ * why a fast phone feels slow: commands queue behind each other even when the
-+ * CPU is idle. When the killer is not in force (Android 11 and below, or the
-+ * user turned it off with Developer options → "Disable child process
-+ * restrictions", or Shizuku/adb ran
-+ * `settings put global settings_enable_monitor_phantom_procs false`), the
-+ * budget is raised so parallel work actually runs in parallel.
-+ */
-+object PhantomProcessGuard {
-+    private const val TAG = "PhantomProcessGuard"
-+    const val RELAXED_BUDGET = 64
-+    private const val FLAG = "settings_enable_monitor_phantom_procs"
-+
-+    @Volatile
-+    var budget: Int = GlobalShellThrottle.DEFAULT_PROCESS_BUDGET
-+        private set
-+
-+    /** True when the phantom-process killer cannot fire on this device. */
-+    fun killerDisabled(context: Context): Boolean {
-+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
-+        val v = runCatching { Settings.Global.getString(context.contentResolver, FLAG) }.getOrNull()
-+        if (v.equals("false", ignoreCase = true)) return true
-+        // The other switch: `device_config put activity_manager
-+        // max_phantom_processes <big>`. DeviceConfig is a system API, so read
-+        // it reflectively; on builds where the app may not read it this
-+        // returns null and we stay at the safe budget.
-+        val max = maxPhantomProcesses()
-+        return max != null && max >= RELAXED_BUDGET * 2
++            _stats.value = _stats.value + res.toMap()
++        } finally {
++            _testing.value = false
++        }
 +    }
 +
-+    private fun maxPhantomProcesses(): Int? = runCatching {
-+        val cls = Class.forName("android.provider.DeviceConfig")
-+        val m = cls.getMethod("getInt", String::class.java, String::class.java, Int::class.javaPrimitiveType)
-+        (m.invoke(null, "activity_manager", "max_phantom_processes", -1) as Int).takeIf { it > 0 }
-+    }.getOrNull()
-+
-+    fun refresh(context: Context) {
-+        val relaxed = killerDisabled(context)
-+        budget = if (relaxed) RELAXED_BUDGET else GlobalShellThrottle.DEFAULT_PROCESS_BUDGET
-+        Log.i(TAG, "phantom killer ${if (relaxed) "off" else "on"} -> process budget $budget")
++    /** Re-test when the last reading is older than [maxAgeMs]. */
++    suspend fun refreshIfStale(context: Context, maxAgeMs: Long = 5 * 60_000L) {
++        val newest = _stats.value.values.maxOfOrNull { it.at } ?: 0L
++        if (System.currentTimeMillis() - newest > maxAgeMs) testAll(context)
 +    }
++
++    private fun rank(instanceId: String?): Int {
++        val s = instanceId?.let { _stats.value[it] } ?: return 50_000          // unknown: middle
++        return if (s.ok) s.latencyMs else 100_000 + s.latencyMs              // broken: last
++    }
++
++    /** Fastest healthy first (stable for equal / unknown). No-op when off. */
++    fun order(entries: List<ModelEntry>): List<ModelEntry> =
++        if (!_enabled.value) entries else entries.sortedBy { rank(it.providerInstanceId) }
++
++    fun <T> sortByHealth(items: List<T>, instanceIdOf: (T) -> String?): List<T> =
++        if (!_enabled.value) items else items.sortedBy { rank(instanceIdOf(it)) }
++
++    private fun family(modelId: String): String =
++        modelId.lowercase().substringAfterLast('/').replace(Regex("[\\s_]+"), "-").removeSuffix(":free")
 +
 +    /**
-+     * Shell commands that switch the killer off; run them through Shizuku
-+     * (`android-shizuku-cli`) or `adb shell`. Kept here so the agent and the
-+     * UI quote the same thing.
++     * One 「⚡ 模型名」 group (fallback strategy) per model that two or more
++     * enabled providers serve. Existing ⚡ groups are updated, others untouched.
++     * @return number of groups created or updated.
 +     */
-+    val DISABLE_COMMANDS = listOf(
-+        "settings put global $FLAG false",
-+        "device_config set_sync_disabled_for_tests persistent",
-+        "device_config put activity_manager max_phantom_processes 2147483647",
-+    )
++    fun buildSameModelGroups(context: Context): Int {
++        val repo = (context.applicationContext as? MinisApp)?.providerRepositoryOrNull ?: return 0
++        val cfg = repo.config.value
++        val enabledIds = cfg.instances.filter { it.isEnabled }.map { it.id }.toSet()
++        val byFamily = cfg.modelEntries
++            .filter { it.providerInstanceId in enabledIds && !it.isHidden && !it.isUnavailableFromProvider }
++            .groupBy { family(it.model.id) }
++            .filter { (_, es) -> es.map { it.providerInstanceId }.distinct().size >= 2 }
++        var n = 0
++        for ((fam, entries) in byFamily) {
++            val members = entries.distinctBy { it.providerInstanceId }.map { it.id }.toMutableList()
++            val name = GROUP_PREFIX + (entries.first().model.displayName.ifBlank { fam })
++            val existing = cfg.modelGroups.firstOrNull { it.name == name }
++            if (existing == null) {
++                repo.addGroup(ModelGroup(name = name, memberEntryIds = members, strategy = RoutingStrategy.fallback))
++                n++
++            } else if (existing.memberEntryIds.toSet() != members.toSet()) {
++                repo.updateGroup(existing.copy(memberEntryIds = members, strategy = RoutingStrategy.fallback))
++                n++
++            }
++        }
++        return n
++    }
 +}
-diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/ShellTimeoutPolicy.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/ShellTimeoutPolicy.kt
-index e9aac6e..2dc5b6a 100644
---- a/src/android/app/src/main/java/com/openminis/app/sandbox/ShellTimeoutPolicy.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/sandbox/ShellTimeoutPolicy.kt
-@@ -50,7 +50,8 @@ object ShellTimeoutPolicy {
-     private val networkPrefixes = setOf(
-         "ping", "dig", "nslookup", "host", "traceroute",
-         "curl", "wget", "http",
--        "ssh", "scp", "rsync",
-+        // [Mines] `minis-connect check` can wait up to 2 min for the user's approval card.
-+        "minis-connect",
-     )
- 
-     /** Install commands — any of these (possibly with subcommand) triggers. */
-@@ -75,6 +76,10 @@ object ShellTimeoutPolicy {
-     /** Long-running / daemon drivers. */
-     private val longRunningPrefixes = setOf(
-         "watch",
-+        // [T-android-ssh-timeout] Remote sessions: a deploy or a tail over ssh
-+        // routinely outlives the 3-minute network bucket it used to share
-+        // with curl, and being SIGKILLed mid-transfer is worse than waiting.
-+        "ssh ", "scp ", "sftp ", "rsync ", "sshpass ", "autossh ", "mosh ", "minis-muse ",
-         "node --watch", "npm run dev", "npm run start", "npm start",
-         "python -m http.server",
-         "serve", "http-server",
-diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/TerminalSession.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/TerminalSession.kt
-index 6c12262..63d26b0 100644
---- a/src/android/app/src/main/java/com/openminis/app/sandbox/TerminalSession.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/sandbox/TerminalSession.kt
-@@ -413,10 +413,10 @@ class TerminalSession(private val context: Context) {
-      */
-     private fun banner(sessionId: String?): String =
-         if (sessionId != null) {
--            "\u001b[2m[Minis] /var/minis/{workspace,attachments,offloads,browser} are this chat's " +
-+            "\u001b[2m[Mines] /var/minis/{workspace,attachments,offloads,browser} are this chat's " +
-                 "(session ${sessionId.take(8)}) — the agent in that chat sees the same files.\u001b[0m\r\n"
-         } else {
--            "\u001b[2m[Minis] Global terminal — not tied to any chat. /var/minis/workspace here is NOT " +
-+            "\u001b[2m[Mines] Global terminal — not tied to any chat. /var/minis/workspace here is NOT " +
-                 "any chat's workspace; open the terminal from a chat's menu to work in its files. " +
-                 "Shared: /var/minis/{shared,memory,skills}.\u001b[0m\r\n"
-         }
-diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt
-index 0ff6192..57866d4 100644
---- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt
-@@ -77,7 +77,7 @@ Groups:
- Output: JSON envelope { ok, data | error: { code, message } }.
- Use --compact to emit on a single line; --quiet to strip the envelope.
- 
--First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
-+First-run: enable "Mines" under Settings → Accessibility, then `service ping`.
- """
-         private const val SERVICE_HELP = "service status | ping\n"
-         private const val UI_HELP = """ui dump | find | info | node | screenshot
-@@ -173,12 +173,12 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
-                         "Android is blocking the accessibility toggle for this install " +
-                             "(\"Restricted setting\" — applies to apps installed from a " +
-                             "downloaded APK). Allow it via App info → ⋮ → Allow restricted " +
--                            "settings, then enable Minis under Settings → Accessibility. " +
-+                            "settings, then enable Mines under Settings → Accessibility. " +
-                             "Settings → Permissions → System Permissions has a one-tap fix " +
-                             "when Shizuku is available."
-                     } else {
-                         "Accessibility permission was revoked (this happens after a force-stop). " +
--                            "Re-enable Minis under Settings → Accessibility, or use Settings → " +
-+                            "Re-enable Mines under Settings → Accessibility, or use Settings → " +
-                             "Permissions → Integrations to repair it with Shizuku."
-                     },
-                     exit = 77,
-@@ -226,7 +226,7 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
-             }
-         } catch (e: NotRunning) {
-             err(args, "SERVICE_NOT_RUNNING",
--                e.message ?: "Accessibility service is not running. Enable Minis under Settings → Accessibility.",
-+                e.message ?: "Accessibility service is not running. Enable Mines under Settings → Accessibility.",
-                 exit = 77)
-         } catch (e: Throwable) {
-             AppLogger.warning(TAG, "uncaught: ${e.javaClass.simpleName} ${e.message}")
-@@ -243,7 +243,7 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
-                 val svc = MinisAccessibilityService.getInstance()
-                 val data = JSONObject()
-                     .put("running", svc != null)
--                    .put("serviceName", MinisAccessibilityService.SERVICE_ID)
-+                    .put("serviceName", MinisAccessibilityService.serviceId(context))
-                     .put("capabilities", JSONArray().apply {
-                         put("retrieveWindowContent"); put("performGestures"); put("watchEvents")
-                     })
-@@ -267,7 +267,7 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
-                             "Allow it via App info → ⋮ → Allow restricted settings first.\n",
-                     )
-                 else
--                    NativeOffloadResult(77, "✗ Accessibility service is not running — go to Settings → Accessibility → Minis to enable\n")
-+                    NativeOffloadResult(77, "✗ Accessibility service is not running — go to Settings → Accessibility → Mines to enable\n")
-             }
-             else -> NativeOffloadResult(2, "$TOOL service: unknown action\n$SERVICE_HELP")
-         }
-@@ -1198,7 +1198,7 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
- 
-     private fun svcOrThrow(): MinisAccessibilityService =
-         MinisAccessibilityService.getInstance()
--            ?: throw NotRunning("Accessibility service is not running. Enable Minis under Settings → Accessibility.")
-+            ?: throw NotRunning("Accessibility service is not running. Enable Mines under Settings → Accessibility.")
- 
-     private fun ok(args: OffloadArgs, data: Any): NativeOffloadResult {
-         val body = JSONObject().put("ok", true).put("data", data).toString()
-diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AlarmOffloadHandler.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AlarmOffloadHandler.kt
-index 079a607..0848008 100644
---- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AlarmOffloadHandler.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AlarmOffloadHandler.kt
-@@ -57,7 +57,7 @@ class AlarmOffloadHandler(private val context: Context) : NativeOffloadHandler {
-         } catch (e: SecurityException) {
-             AppLogger.warning(TAG, "SecurityException: ${e.message}")
-             val body = JSONObject().put("error", "exact_alarm_denied")
--                .put("message", "Exact alarms are blocked. On Android 14+ the user must grant 'Alarms & reminders' in Settings; on Xiaomi/Huawei/Oppo/OnePlus/Vivo, also enable autostart and disable battery optimization for Minis. Underlying: ${e.message}")
-+                .put("message", "Exact alarms are blocked. On Android 14+ the user must grant 'Alarms & reminders' in Settings; on Xiaomi/Huawei/Oppo/OnePlus/Vivo, also enable autostart and disable battery optimization for Mines. Underlying: ${e.message}")
-                 .toString()
-             NativeOffloadResult(77, OffloadOutput.formatBody(body, args) + "\n")
-         } catch (e: Throwable) {
-@@ -254,7 +254,7 @@ class AlarmOffloadHandler(private val context: Context) : NativeOffloadHandler {
-             AppLogger.info(TAG, "open: launched system Clock SHOW_ALARMS")
-             val data = JSONObject()
-                 .put("opened", true)
--                .put("hint", "System Clock launched. Tell the user to view, edit, or cancel alarms in the Clock app's Alarms tab (or Timers tab for timers). Minis cannot enumerate or cancel alarms programmatically — Android's Clock API is fire-and-forget.")
-+                .put("hint", "System Clock launched. Tell the user to view, edit, or cancel alarms in the Clock app's Alarms tab (or Timers tab for timers). Mines cannot enumerate or cancel alarms programmatically — Android's Clock API is fire-and-forget.")
-             emitEnvelope("open", data, args)
-         } catch (e: ActivityNotFoundException) {
-             val body = JSONObject().put("error", "no_clock_app")
-@@ -357,7 +357,7 @@ class AlarmOffloadHandler(private val context: Context) : NativeOffloadHandler {
-             put("minute", minute)
-             put("repeat", mode.name)
-             put("view_url", VIEW_URL)
--            put("hint", "Alarm saved to the system Clock app. Open the Clock app, or $VIEW_URL inside Minis, to view or cancel.")
-+            put("hint", "Alarm saved to the system Clock app. Open the Clock app, or $VIEW_URL inside Mines, to view or cancel.")
-         }
-     }
- 
-@@ -371,7 +371,7 @@ class AlarmOffloadHandler(private val context: Context) : NativeOffloadHandler {
-             put("duration_seconds", durationSec)
-             put("fires_at", formatIso(firesAt))
-             put("view_url", VIEW_URL)
--            put("hint", "Timer started in the system Clock app. Open the Clock app's Timer tab, or $VIEW_URL inside Minis, to view or stop.")
-+            put("hint", "Timer started in the system Clock app. Open the Clock app's Timer tab, or $VIEW_URL inside Mines, to view or stop.")
-         }
-     }
- 
-@@ -389,7 +389,7 @@ class AlarmOffloadHandler(private val context: Context) : NativeOffloadHandler {
-         if (needsHint && (action == "set" || action == "timer")) {
-             data.put(
-                 "oem_hint",
--                "${OsCompat.oemLabel()} aggressively kills background alarms. Please enable Autostart and disable battery optimization for Minis in system settings to keep this alarm reliable.",
-+                "${OsCompat.oemLabel()} aggressively kills background alarms. Please enable Autostart and disable battery optimization for Mines in system settings to keep this alarm reliable.",
-             )
-         }
-         val envelope = JSONObject()
-diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/CalendarOffloadHandler.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/CalendarOffloadHandler.kt
-index a690bc7..7157637 100644
---- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/CalendarOffloadHandler.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/CalendarOffloadHandler.kt
-@@ -105,7 +105,7 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
-                     OffloadPermissionManager.SettingsGateRequest(
-                         id = settingsId,
-                         title = "Calendar permission needed",
--                        message = "Minis needs $humanLabel permission to $humanLabel your calendar. Open Settings to allow it.",
-+                        message = "Mines needs $humanLabel permission to $humanLabel your calendar. Open Settings to allow it.",
-                         settingsAction = android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                         requiresPackageUri = true,
-                         positiveLabel = "Open Settings",
-diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ClipboardOffloadHandler.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ClipboardOffloadHandler.kt
-index baca745..1e3bbeb 100644
---- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ClipboardOffloadHandler.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ClipboardOffloadHandler.kt
-@@ -112,7 +112,7 @@ class ClipboardOffloadHandler(private val context: Context) : NativeOffloadHandl
-         if (!isAppForeground() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-             return backgroundError(args)
-         }
--        val label = args.get("label") ?: "Minis"
-+        val label = args.get("label") ?: "Mines"
-         cm.setPrimaryClip(ClipData.newPlainText(label, text))
-         return NativeOffloadResult(
-             0,
-@@ -199,7 +199,7 @@ class ClipboardOffloadHandler(private val context: Context) : NativeOffloadHandl
-         1,
-         OffloadOutput.formatBody(
-             JSONObject().put("error", "clipboard_requires_foreground")
--                .put("message", "Android 10+ blocks clipboard access when the app is not in the foreground. Ask the user to bring Minis to the foreground and retry.")
-+                .put("message", "Android 10+ blocks clipboard access when the app is not in the foreground. Ask the user to bring Mines to the foreground and retry.")
-                 .toString(),
-             args,
-         ) + "\n",
-diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ConfigOffloadHandler.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ConfigOffloadHandler.kt
-index 513c8e8..a4475c3 100644
---- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ConfigOffloadHandler.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ConfigOffloadHandler.kt
-@@ -46,7 +46,7 @@ class ConfigOffloadHandler : NativeOffloadHandler {
-         const val EXIT_PERMISSION_DENIED = 126
- 
-         const val HELP_TEXT =
--            "minis-config - read or change Minis app settings (logged + revertable)\n" +
-+            "minis-config - read or change Mines app settings (logged + revertable)\n" +
-                 "\n" +
-                 "USAGE:\n" +
-                 "  minis-config <subcommand> [args]\n" +
-diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ContactsOffloadHandler.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ContactsOffloadHandler.kt
-index 73d7e1f..2a599c3 100644
---- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ContactsOffloadHandler.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ContactsOffloadHandler.kt
-@@ -109,9 +109,9 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
-                         id = if (needsWrite) "CONTACTS_RW" else Manifest.permission.READ_CONTACTS,
-                         title = "Contacts permission needed",
-                         message = if (needsWrite) {
--                            "Minis needs read + write contacts permission to delete entries. Open Settings to allow it."
-+                            "Mines needs read + write contacts permission to delete entries. Open Settings to allow it."
-                         } else {
--                            "Minis needs contacts permission to read your address book. Open Settings to allow it."
-+                            "Mines needs contacts permission to read your address book. Open Settings to allow it."
-                         },
-                         settingsAction = android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                         requiresPackageUri = true,
-diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/LocationOffloadHandler.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/LocationOffloadHandler.kt
-index 8ac3953..1f51f44 100644
---- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/LocationOffloadHandler.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/LocationOffloadHandler.kt
-@@ -131,7 +131,7 @@ class LocationOffloadHandler(private val context: Context) : NativeOffloadHandle
-                         OffloadPermissionManager.SettingsGateRequest(
-                             id = Manifest.permission.ACCESS_FINE_LOCATION,
-                             title = "Location permission needed",
--                            message = "Minis needs location permission to get your current location. Open Settings to allow it.",
-+                            message = "Mines needs location permission to get your current location. Open Settings to allow it.",
-                             settingsAction = android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                             requiresPackageUri = true,
-                             positiveLabel = "Open Settings",
-@@ -206,7 +206,7 @@ class LocationOffloadHandler(private val context: Context) : NativeOffloadHandle
-             Build.MANUFACTURER.equals("OnePlus", ignoreCase = true) ||
-             Build.MANUFACTURER.equals("Vivo", ignoreCase = true)
-         ) {
--            " On ${OsCompat.oemLabel()} devices, disable battery optimization and enable autostart for Minis so background location stays active."
-+            " On ${OsCompat.oemLabel()} devices, disable battery optimization and enable autostart for Mines so background location stays active."
-         } else ""
-         val body = JSONObject()
-             .put("error", "location_unavailable_stale")
-diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/NotificationOffloadHandler.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/NotificationOffloadHandler.kt
-index 4c2b82f..f0b92fd 100644
---- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/NotificationOffloadHandler.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/NotificationOffloadHandler.kt
-@@ -136,7 +136,7 @@ class NotificationOffloadHandler(private val context: Context) : NativeOffloadHa
-                         OffloadPermissionManager.SettingsGateRequest(
-                             id = Manifest.permission.POST_NOTIFICATIONS,
-                             title = "Notifications are off",
--                            message = "Minis needs notification permission to send notifications. Open Settings to allow it.",
-+                            message = "Mines needs notification permission to send notifications. Open Settings to allow it.",
-                             settingsAction = Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                             requiresPackageUri = true,
-                             positiveLabel = "Open Settings",
-@@ -195,7 +195,7 @@ class NotificationOffloadHandler(private val context: Context) : NativeOffloadHa
-         val id = UUID.randomUUID().toString()
-         val notifId = id.hashCode() and 0x7FFFFFFF
-         val n = NotificationCompat.Builder(context, CHANNEL_ID)
--            .setSmallIcon(R.mipmap.ic_launcher)
-+            .setSmallIcon(R.drawable.ic_launcher_monochrome)
-             .setContentTitle(title)
-             .setContentText(body)
-             .setAutoCancel(true)
-@@ -221,7 +221,7 @@ class NotificationOffloadHandler(private val context: Context) : NativeOffloadHa
-         }
-         AppLogger.info(TAG, "send (immediate): id=$id title='$title'")
-         val oemHint = if (OsCompat.isHuawei || OsCompat.isXiaomi) {
--            "On ${OsCompat.oemLabel()}, banner notifications may be disabled by default — the user can enable them in Settings → Notifications for Minis."
-+            "On ${OsCompat.oemLabel()}, banner notifications may be disabled by default — the user can enable them in Settings → Notifications for Mines."
-         } else null
-         val data = JSONObject()
-             .put("id", id)
-@@ -454,7 +454,7 @@ class NotificationOffloadHandler(private val context: Context) : NativeOffloadHa
-                     OffloadPermissionManager.SettingsGateRequest(
-                         id = "notification_access",
-                         title = "Notification access needed",
--                        message = "Minis needs Notification access to read the status-bar notifications. Open Settings and enable \"Minis\" under Notification access.",
-+                        message = "Mines needs Notification access to read the status-bar notifications. Open Settings and enable \"Mines\" under Notification access.",
-                         settingsAction = MinisNotificationListenerService.SETTINGS_ACTION,
-                         requiresPackageUri = false,
-                         positiveLabel = "Open Settings",
-diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/PhotosOffloadHandler.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/PhotosOffloadHandler.kt
-index 9d21de1..05afce7 100644
---- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/PhotosOffloadHandler.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/PhotosOffloadHandler.kt
-@@ -242,7 +242,7 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler
-                     OffloadPermissionManager.SettingsGateRequest(
-                         id = "photos_media",
-                         title = "Photos permission needed",
--                        message = "Minis needs media permission to read your photo library. Open Settings to allow it.",
-+                        message = "Mines needs media permission to read your photo library. Open Settings to allow it.",
-                         settingsAction = android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                         requiresPackageUri = true,
-                         positiveLabel = "Open Settings",
-@@ -305,7 +305,7 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler
-                     OffloadPermissionManager.SettingsGateRequest(
-                         id = "ACCESS_MEDIA_LOCATION",
-                         title = "Photo location needed",
--                        message = "Minis needs photo-location permission to read GPS EXIF for the `near` query. Open Settings to allow it.",
-+                        message = "Mines needs photo-location permission to read GPS EXIF for the `near` query. Open Settings to allow it.",
-                         settingsAction = android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                         requiresPackageUri = true,
-                         positiveLabel = "Open Settings",
-diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ShizukuOffloadHandler.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ShizukuOffloadHandler.kt
-index 0a8c80a..12fc9be 100644
---- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ShizukuOffloadHandler.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ShizukuOffloadHandler.kt
-@@ -76,7 +76,7 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
-             ShizukuManager.State.NOT_RUNNING ->
-                 return errEnvelope("SERVICE_NOT_RUNNING", "Shizuku service is not running. Start it via adb or root, then retry.", args)
-             ShizukuManager.State.NEED_PERMISSION ->
--                return errEnvelope("PERMISSION_DENIED", "Minis is not authorized for Shizuku. Grant permission in Settings → Permissions → Shizuku.", args)
-+                return errEnvelope("PERMISSION_DENIED", "Mines is not authorized for Shizuku. Grant permission in Settings → Permissions → Shizuku.", args)
-             ShizukuManager.State.READY -> { /* fall through */ }
-         }
- 
-diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/SpeechOffloadHandler.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/SpeechOffloadHandler.kt
-index f221b6c..248fc92 100644
---- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/SpeechOffloadHandler.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/SpeechOffloadHandler.kt
-@@ -265,7 +265,7 @@ class SpeechOffloadHandler(private val context: Context) : NativeOffloadHandler
-                     OffloadPermissionManager.SettingsGateRequest(
-                         id = Manifest.permission.RECORD_AUDIO,
-                         title = "Microphone permission needed",
--                        message = "Minis needs microphone permission to transcribe speech. Open Settings to allow it.",
-+                        message = "Mines needs microphone permission to transcribe speech. Open Settings to allow it.",
-                         settingsAction = android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                         requiresPackageUri = true,
-                         positiveLabel = "Open Settings",
-diff --git a/src/android/app/src/main/java/com/openminis/app/scheduled/ScheduledAgentRunner.kt b/src/android/app/src/main/java/com/openminis/app/scheduled/ScheduledAgentRunner.kt
-index cf26728..d5ec586 100644
---- a/src/android/app/src/main/java/com/openminis/app/scheduled/ScheduledAgentRunner.kt
-+++ b/src/android/app/src/main/java/com/openminis/app/scheduled/ScheduledAgentRunner.kt
-@@ -457,7 +457,7 @@ object ScheduledAgentRunner {
-             openIntent,
-             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-         )
--        val title = "Minis: ${task.label.ifBlank { "Scheduled task" }}"
-+        val title = "Mines: ${task.label.ifBlank { "Scheduled task" }}"
-         val notification = NotificationCompat.Builder(context, ScheduledTaskManager.CHANNEL_ID)
-             .setSmallIcon(android.R.drawable.ic_menu_recent_history)
-             .setContentTitle(title)
