@@ -1,3 +1,355 @@
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PluginsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PluginsScreen.kt
+new file mode 100644
+index 0000000..7f6d0f7
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PluginsScreen.kt
+@@ -0,0 +1,132 @@
++package com.openminis.app.ui.plus
++
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.outlined.Refresh
++import androidx.compose.material3.Button
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.Switch
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.produceState
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.platform.LocalLifecycleOwner
++import androidx.compose.ui.unit.dp
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.repeatOnLifecycle
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++import org.json.JSONObject
++import java.io.File
++
++private data class PluginRow(val pkg: String, val enabled: Boolean, val ok: Boolean?, val reason: String, val tools: List<String>)
++
++/**
++ * dsh plugin center. The work happens in the sandbox (`minis-dsh`), shown in
++ * the terminal so the user sees progress; this page lists what is installed
++ * and which tools each plugin adds, read from the files minis-dsh keeps.
++ */
++@Composable
++fun PluginsScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit) {
++    val context = LocalContext.current
++    var input by remember { mutableStateOf("") }
++    var tick by remember { mutableIntStateOf(0) }
++    // Re-read whenever the page comes back (e.g. returning from the terminal).
++    val owner = LocalLifecycleOwner.current
++    LaunchedEffect(owner) { owner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) { tick++ } }
++    val rows by produceState(initialValue = emptyList<PluginRow>(), tick) {
++        value = withContext(Dispatchers.IO) { readPlugins(context) }
++    }
++
++    PlusPage("插件", onBack) {
++        Text(
++            "可以装 DeepSeek Harness（dsh）的插件。它们加的工具会出现在 Minis 的 MCP 里，全部插件共用一个进程，用到时才启动。",
++            style = MaterialTheme.typography.bodyMedium,
++            color = MaterialTheme.colorScheme.onSurfaceVariant,
++            modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
++        )
++        PlusSection("安装", footer = "填 npm 包名，比如 @zhaoolee/dsh-notes；或 github:用户/仓库。第一次会自动装 Node.js。") {
++            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                OutlinedTextField(input, { input = it.trim() }, label = { Text("插件名或链接") }, singleLine = true,
++                    modifier = Modifier.fillMaxWidth())
++                Button(
++                    enabled = input.isNotBlank() && input.none { it == ' ' || it == ';' || it == '&' || it == '|' || it == '`' || it == '$' },
++                    onClick = { onOpenTerminal("minis-dsh add ${normalize(input)}"); input = "" },
++                    modifier = Modifier.fillMaxWidth(),
++                ) { Text("安装") }
++            }
++        }
++        PlusSection(if (rows.isEmpty()) "已安装" else "已安装 · ${rows.size}") {
++            if (rows.isEmpty()) Text("还没有插件", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(16.dp))
++            rows.forEachIndexed { i, r ->
++                Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
++                    Box(Modifier.size(9.dp).background(
++                        when { !r.enabled -> Color.Gray; r.ok == true -> Color(0xFF34C759); r.ok == false -> Color(0xFFFF3B30); else -> Color(0xFFFFCC00) },
++                        CircleShape))
++                    Spacer(Modifier.width(10.dp))
++                    Column(Modifier.weight(1f)) {
++                        Text(r.pkg, style = MaterialTheme.typography.bodyLarge)
++                        Text(
++                            when {
++                                !r.enabled -> "已停用"
++                                r.ok == true -> if (r.tools.isEmpty()) "已加载（只加提示词）" else "工具：" + r.tools.joinToString("、")
++                                r.ok == false -> "用不了：${r.reason}"
++                                else -> "未检查"
++                            },
++                            style = MaterialTheme.typography.bodySmall,
++                            color = MaterialTheme.colorScheme.onSurfaceVariant,
++                        )
++                    }
++                    Switch(r.enabled, onCheckedChange = { on -> onOpenTerminal("minis-dsh ${if (on) "on" else "off"} ${r.pkg} && minis-dsh list") })
++                    TextButton(onClick = { onOpenTerminal("minis-dsh remove ${r.pkg}") }) { Text("卸载", color = Color(0xFFFF3B30)) }
++                }
++                if (i < rows.lastIndex) PlusDivider()
++            }
++            if (rows.isNotEmpty()) {
++                PlusDivider()
++                ActionRow(Icons.Outlined.Refresh, "重新检查") { onOpenTerminal("minis-dsh list") }
++            }
++        }
++    }
++}
++
++private fun normalize(s: String): String {
++    val gh = Regex("^https?://github\\.com/([^/]+)/([^/#?]+)").find(s)
++    return if (gh != null) "github:${gh.groupValues[1]}/${gh.groupValues[2].removeSuffix(".git")}" else s
++}
++
++private fun readPlugins(context: android.content.Context): List<PluginRow> = runCatching {
++    val root = com.openminis.app.sandbox.RootfsManager.getInstance(context).rootfsDir
++    val home = File(root, "root/.minis-dsh")
++    val state = JSONObject(File(home, "plugins.json").readText())
++    val status = runCatching { JSONObject(File(home, "status.json").readText()) }.getOrNull()
++    val arr = state.optJSONArray("plugins") ?: return@runCatching emptyList()
++    (0 until arr.length()).map { i ->
++        val p = arr.getJSONObject(i)
++        val pkg = p.optString("package")
++        val st = status?.optJSONObject(pkg)
++        val tools = st?.optJSONArray("tools")?.let { t -> (0 until t.length()).map { t.getString(it) } } ?: emptyList()
++        PluginRow(pkg, p.optBoolean("enabled", true), st?.optBoolean("ok"), st?.optString("reason") ?: "", tools)
++    }
++}.getOrDefault(emptyList())
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
+new file mode 100644
+index 0000000..7826c33
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
+@@ -0,0 +1,208 @@
++package com.openminis.app.ui.plus
++
++import android.graphics.BitmapFactory
++import androidx.compose.animation.core.LinearEasing
++import androidx.compose.animation.core.RepeatMode
++import androidx.compose.animation.core.animateFloat
++import androidx.compose.animation.core.infiniteRepeatable
++import androidx.compose.animation.core.rememberInfiniteTransition
++import androidx.compose.animation.core.tween
++import androidx.compose.foundation.Canvas
++import androidx.compose.foundation.Image
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.ColumnScope
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.foundation.verticalScroll
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.automirrored.filled.ArrowBack
++import androidx.compose.material3.ExperimentalMaterial3Api
++import androidx.compose.material3.Icon
++import androidx.compose.material3.IconButton
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Scaffold
++import androidx.compose.material3.Text
++import androidx.compose.material3.TopAppBar
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.produceState
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Brush
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.ImageBitmap
++import androidx.compose.ui.graphics.asImageBitmap
++import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
++import androidx.compose.ui.graphics.nativeCanvas
++import androidx.compose.ui.layout.ContentScale
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.Dp
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import com.openminis.app.plus.PetPainter
++import com.openminis.app.plus.PlusPrefs
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++import java.io.File
++import kotlin.math.sin
++
++/** Lets screens outside the NavHost lambda (the conversation list) open Plus pages. */
++object PlusNav {
++    @Volatile var navigate: ((String) -> Unit)? = null
++    fun go(route: String) { navigate?.invoke(route) }
++}
++
++object PlusRoutes {
++    const val WORK = "plus_work_location"
++    const val CONNECTIONS = "plus_connections"
++    const val PERSONALIZE = "plus_personalize"
++    const val VOICE = "plus_voice_live"
++    const val SANDBOX = "plus_sandbox"
++    const val PLUGINS = "plus_plugins"
++    const val MIGRATE = "plus_migrate"
++    const val SERVER = "plus_server/{id}"
++    fun server(id: String) = "plus_server/$id"
++}
++
++/** Built-in wallpapers: soft gradients, look good under both light and dark bubbles. */
++data class WallpaperPreset(val id: String, val name: String, val colors: List<Color>)
++
++val wallpaperPresets = listOf(
++    WallpaperPreset("aurora", "极光", listOf(Color(0xFF0F2027), Color(0xFF203A43), Color(0xFF2C5364), Color(0xFF3FA08F))),
++    WallpaperPreset("sunset", "晚霞", listOf(Color(0xFFFFB199), Color(0xFFFF6F91), Color(0xFF845EC2))),
++    WallpaperPreset("ocean", "深海", listOf(Color(0xFF1A2980), Color(0xFF26D0CE))),
++    WallpaperPreset("mint", "薄荷", listOf(Color(0xFFE0F7EF), Color(0xFFB8F2E6), Color(0xFFAED9E0))),
++    WallpaperPreset("peach", "蜜桃", listOf(Color(0xFFFFF1EB), Color(0xFFFFD6C9), Color(0xFFF7B7A3))),
++    WallpaperPreset("night", "星夜", listOf(Color(0xFF141E30), Color(0xFF243B55))),
++    WallpaperPreset("lavender", "薰衣草", listOf(Color(0xFFE6DEFF), Color(0xFFC3B1E1), Color(0xFF9D8EC7))),
++    WallpaperPreset("forest", "森林", listOf(Color(0xFF134E5E), Color(0xFF71B280))),
++)
++
++fun wallpaperFile(context: android.content.Context) = File(context.filesDir, "plus_wallpaper.jpg")
++
++/** Loads the custom wallpaper image, downsampled to screen size. */
++@Composable
++fun rememberWallpaperBitmap(spec: String): ImageBitmap? {
++    val context = LocalContext.current
++    val bmp by produceState<ImageBitmap?>(initialValue = null, spec) {
++        value = if (!spec.startsWith("file:")) null else withContext(Dispatchers.IO) {
++            runCatching {
++                val f = wallpaperFile(context)
++                if (!f.exists()) return@runCatching null
++                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
++                BitmapFactory.decodeFile(f.absolutePath, bounds)
++                val target = maxOf(context.resources.displayMetrics.heightPixels, 1)
++                var sample = 1
++                while (bounds.outHeight / (sample * 2) >= target) sample *= 2
++                BitmapFactory.decodeFile(f.absolutePath, BitmapFactory.Options().apply { inSampleSize = sample })
++                    ?.asImageBitmap()
++            }.getOrNull()
++        }
++    }
++    return bmp
++}
++
++/** Chat background. Draws nothing when no wallpaper is chosen. */
++@Composable
++fun ChatWallpaperLayer(modifier: Modifier = Modifier) {
++    val context = LocalContext.current
++    PlusPrefs.init(context)
++    val st by PlusPrefs.state.collectAsState()
++    val spec = st.wallpaper
++    if (spec.isEmpty()) return
++    val dark = MaterialTheme.colorScheme.background.let { (it.red + it.green + it.blue) / 3f < 0.5f }
++    Box(modifier) {
++        if (spec.startsWith("preset:")) {
++            val p = wallpaperPresets.firstOrNull { it.id == spec.removePrefix("preset:") }
++            if (p != null) Box(Modifier.fillMaxSize().background(Brush.linearGradient(p.colors)))
++        } else {
++            val bmp = rememberWallpaperBitmap(spec)
++            if (bmp != null) Image(bmp, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
++        }
++        // Dim layer keeps message text readable.
++        Box(
++            Modifier.fillMaxSize().background(
++                (if (dark) Color.Black else Color.White).copy(alpha = st.wallpaperDim.coerceIn(0f, 0.85f))
++            )
++        )
++    }
++}
++
++/** The avatar, animated (breathing + blinking). */
++@Composable
++fun PetAvatar(size: Dp, style: String? = null, color: Int? = null, animated: Boolean = true) {
++    val context = LocalContext.current
++    PlusPrefs.init(context)
++    val st by PlusPrefs.state.collectAsState()
++    val s = style ?: st.petStyle
++    val c = color ?: st.petColor
++    val t = if (animated) {
++        val inf = rememberInfiniteTransition(label = "pet")
++        inf.animateFloat(0f, 4f, infiniteRepeatable(tween(4000, easing = LinearEasing), RepeatMode.Restart), label = "t").value
++    } else 0f
++    Canvas(Modifier.size(size)) {
++        val blink = if (t > 3.85f) 1f else 0f
++        val bob = sin(t * Math.PI.toFloat()) * 0.025f
++        drawIntoCanvas { canvas ->
++            PetPainter.draw(canvas.nativeCanvas, this.size.width, this.size.height, s, c, blink, bob, 0.6f)
++        }
++    }
++}
++
++@OptIn(ExperimentalMaterial3Api::class)
++@Composable
++fun PlusPage(title: String, onBack: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
++    Scaffold(
++        topBar = {
++            TopAppBar(
++                title = { Text(title) },
++                navigationIcon = {
++                    IconButton(onClick = onBack) {
++                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
++                    }
++                },
++            )
++        },
++    ) { padding ->
++        Column(
++            Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState())
++                .padding(bottom = 32.dp),
++            content = content,
++        )
++    }
++}
++
++@Composable
++fun PlusSection(title: String?, footer: String? = null, content: @Composable ColumnScope.() -> Unit) {
++    Column(Modifier.fillMaxWidth().padding(top = 18.dp)) {
++        if (title != null) Text(
++            title,
++            style = MaterialTheme.typography.labelSmall,
++            color = MaterialTheme.colorScheme.onSurfaceVariant,
++            fontWeight = FontWeight.Medium,
++            letterSpacing = 0.5.sp,
++            modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp),
++        )
++        Column(
++            Modifier.fillMaxWidth().padding(horizontal = 16.dp)
++                .clip(RoundedCornerShape(12.dp))
++                .background(MaterialTheme.colorScheme.surfaceContainerLow),
++            content = content,
++        )
++        if (footer != null) Text(
++            footer,
++            style = MaterialTheme.typography.bodySmall,
++            color = MaterialTheme.colorScheme.onSurfaceVariant,
++            modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp),
++            lineHeight = 16.sp,
++        )
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxScreen.kt
 new file mode 100644
 index 0000000..8592139
@@ -1103,8 +1455,73 @@ index ce5246e..87c4132 100644
                  }
              }
  
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/settings/AboutScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/settings/AboutScreen.kt
+index ab206b2..aa38f1d 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/settings/AboutScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/settings/AboutScreen.kt
+@@ -15,6 +15,7 @@ import androidx.compose.foundation.shape.CircleShape
+ import androidx.compose.foundation.text.selection.SelectionContainer
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.outlined.Code
++import androidx.compose.material.icons.outlined.Gavel
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
+@@ -99,6 +100,15 @@ fun AboutScreen(onBack: () -> Unit) {
+                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                 )
+             }
++            // Mines: attribution — this app continues OpenMinis development.
++            Text(
++                stringResource(R.string.about_mines_attribution),
++                style = MaterialTheme.typography.titleSmall,
++                fontWeight = FontWeight.SemiBold,
++                color = MaterialTheme.colorScheme.primary,
++                textAlign = TextAlign.Center,
++                modifier = Modifier.padding(horizontal = 24.dp),
++            )
+             Text(
+                 stringResource(R.string.about_minis_tagline),
+                 style = MaterialTheme.typography.bodyMedium,
+@@ -112,13 +122,24 @@ fun AboutScreen(onBack: () -> Unit) {
+             SettingsRow(
+                 icon = Icons.Outlined.Code,
+                 iconColor = tileBlue,
+-                title = stringResource(R.string.about_github_repository),
++                title = stringResource(R.string.about_openminis_source),
++                subtitle = OPENMINIS_REPO_URL.removePrefix("https://"),
+                 // Settings → ABOUT siblings (Privacy Policy / Submit GitHub
+                 // Issues) all use openExternalUrl directly. The
+                 // LocalInAppBrowserLauncher ambient defaults to a no-op when
+                 // no InAppBrowserHost is in the tree above this screen — and
+                 // nothing wraps Settings, so the row used to be a dead tap.
+-                onClick = { openExternalUrl(context, "https://github.com/OpenMinis/OpenMinis") },
++                onClick = { openExternalUrl(context, OPENMINIS_REPO_URL) },
++                trailing = { ExternalLinkIcon() },
++            )
++            // Mines keeps the original OpenMinis GPL-3.0 LICENSE and
++            // copyright notices unchanged.
++            SettingsRow(
++                icon = Icons.Outlined.Gavel,
++                iconColor = tileBlue,
++                title = stringResource(R.string.about_license_title),
++                subtitle = stringResource(R.string.about_license_subtitle),
++                onClick = { openExternalUrl(context, "$OPENMINIS_REPO_URL/blob/main/LICENSE") },
+                 trailing = { ExternalLinkIcon() },
+                 showDivider = false,
+             )
+@@ -133,6 +154,9 @@ fun AboutScreen(onBack: () -> Unit) {
+     }
+ }
+ 
++/** Upstream project Mines continues. */
++private const val OPENMINIS_REPO_URL = "https://github.com/OpenMinis/OpenMinis"
++
+ @Composable
+ private fun ExternalLinkIcon() {
+     Text(
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt
-index d97d5af..5ced635 100644
+index d97d5af..cbf8bf3 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt
 @@ -37,6 +37,11 @@ import androidx.compose.material.icons.outlined.FrontHand
@@ -1128,7 +1545,7 @@ index d97d5af..5ced635 100644
  ) {
      val context = LocalContext.current
      var showFeedbackSheet by remember { mutableStateOf(false) }
-@@ -136,6 +143,56 @@ fun SettingsScreen(
+@@ -136,6 +143,63 @@ fun SettingsScreen(
                  .padding(padding)
                  .verticalScroll(rememberScrollState()),
          ) {
@@ -1178,6 +1595,13 @@ index d97d5af..5ced635 100644
 +                    title = "壁纸与形象",
 +                    subtitle = "聊天壁纸、虚拟形象、桌宠",
 +                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.PERSONALIZE) },
++                )
++                SettingsItem(
++                    icon = Icons.Outlined.Backup,
++                    iconColor = Color(0xFF8E8E93),
++                    title = "从旧版迁移",
++                    subtitle = "搬来旧版 Mines 的供应商、技能和其他内容",
++                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.MIGRATE) },
 +                    showDivider = false,
 +                )
 +            }
@@ -1185,220 +1609,3 @@ index d97d5af..5ced635 100644
              // -- LLM Providers --
              SettingsSection(
                  title = stringResource(R.string.settings_section_llm_providers),
-diff --git a/src/android/app/src/main/res/values-de/strings.xml b/src/android/app/src/main/res/values-de/strings.xml
-index 0365a16..79f9db4 100644
---- a/src/android/app/src/main/res/values-de/strings.xml
-+++ b/src/android/app/src/main/res/values-de/strings.xml
-@@ -1,6 +1,6 @@
- <?xml version="1.0" encoding="utf-8"?>
- <resources>
--    <string name="app_name">Minis</string>
-+    <string name="app_name">Mines</string>
-     <string name="new_chat">Neuer Chat</string>
-     <string name="settings">Einstellungen</string>
-     <string name="providers">KI-Anbieter</string>
-diff --git a/src/android/app/src/main/res/values-es/strings.xml b/src/android/app/src/main/res/values-es/strings.xml
-index b5aebef..3daa042 100644
---- a/src/android/app/src/main/res/values-es/strings.xml
-+++ b/src/android/app/src/main/res/values-es/strings.xml
-@@ -1,6 +1,6 @@
- <?xml version="1.0" encoding="utf-8"?>
- <resources>
--    <string name="app_name">Minis</string>
-+    <string name="app_name">Mines</string>
-     <string name="new_chat">Nuevo chat</string>
-     <string name="settings">Ajustes</string>
-     <string name="providers">Proveedores</string>
-diff --git a/src/android/app/src/main/res/values-fil/strings.xml b/src/android/app/src/main/res/values-fil/strings.xml
-index 78f6955..f0e4e0d 100644
---- a/src/android/app/src/main/res/values-fil/strings.xml
-+++ b/src/android/app/src/main/res/values-fil/strings.xml
-@@ -1,6 +1,6 @@
- <?xml version="1.0" encoding="utf-8"?>
- <resources>
--    <string name="app_name">Minis</string>
-+    <string name="app_name">Mines</string>
-     <string name="new_chat">Bagong Chat</string>
-     <string name="settings">Mga Setting</string>
-     <string name="providers">Mga Provider</string>
-diff --git a/src/android/app/src/main/res/values-fr/strings.xml b/src/android/app/src/main/res/values-fr/strings.xml
-index 3135e72..9ddbaee 100644
---- a/src/android/app/src/main/res/values-fr/strings.xml
-+++ b/src/android/app/src/main/res/values-fr/strings.xml
-@@ -1,6 +1,6 @@
- <?xml version="1.0" encoding="utf-8"?>
- <resources>
--    <string name="app_name">Minis</string>
-+    <string name="app_name">Mines</string>
-     <string name="new_chat">Nouvelle conversation</string>
-     <string name="settings">Réglages</string>
-     <string name="providers">Fournisseurs AI</string>
-diff --git a/src/android/app/src/main/res/values-hr/strings.xml b/src/android/app/src/main/res/values-hr/strings.xml
-index 86aa739..ec85ab2 100644
---- a/src/android/app/src/main/res/values-hr/strings.xml
-+++ b/src/android/app/src/main/res/values-hr/strings.xml
-@@ -1,6 +1,6 @@
- <?xml version="1.0" encoding="utf-8"?>
- <resources>
--    <string name="app_name">Minis</string>
-+    <string name="app_name">Mines</string>
-     <string name="new_chat">Novi razgovor</string>
-     <string name="settings">Postavke</string>
-     <string name="providers">Pružatelji</string>
-diff --git a/src/android/app/src/main/res/values-in/strings.xml b/src/android/app/src/main/res/values-in/strings.xml
-index bbe6577..944f344 100644
---- a/src/android/app/src/main/res/values-in/strings.xml
-+++ b/src/android/app/src/main/res/values-in/strings.xml
-@@ -5,7 +5,7 @@
-      directory is never consulted and the app would silently fall back
-      to English. -->
- <resources>
--    <string name="app_name">Minis</string>
-+    <string name="app_name">Mines</string>
-     <string name="new_chat">Obrolan Baru</string>
-     <string name="settings">Pengaturan</string>
-     <string name="providers">Penyedia</string>
-diff --git a/src/android/app/src/main/res/values-ja/strings.xml b/src/android/app/src/main/res/values-ja/strings.xml
-index aefd2fe..70a136f 100644
---- a/src/android/app/src/main/res/values-ja/strings.xml
-+++ b/src/android/app/src/main/res/values-ja/strings.xml
-@@ -1,6 +1,6 @@
- <?xml version="1.0" encoding="utf-8"?>
- <resources>
--    <string name="app_name">Minis</string>
-+    <string name="app_name">Mines</string>
-     <string name="new_chat">新しいチャット</string>
-     <string name="settings">設定</string>
-     <string name="providers">AIプロバイダー</string>
-diff --git a/src/android/app/src/main/res/values-ko/strings.xml b/src/android/app/src/main/res/values-ko/strings.xml
-index 3ecb2ad..2124769 100644
---- a/src/android/app/src/main/res/values-ko/strings.xml
-+++ b/src/android/app/src/main/res/values-ko/strings.xml
-@@ -1,6 +1,6 @@
- <?xml version="1.0" encoding="utf-8"?>
- <resources>
--    <string name="app_name">Minis</string>
-+    <string name="app_name">Mines</string>
-     <string name="new_chat">새 채팅</string>
-     <string name="settings">설정</string>
-     <string name="providers">AI 공급자</string>
-diff --git a/src/android/app/src/main/res/values-ms/strings.xml b/src/android/app/src/main/res/values-ms/strings.xml
-index daec398..8c0bb98 100644
---- a/src/android/app/src/main/res/values-ms/strings.xml
-+++ b/src/android/app/src/main/res/values-ms/strings.xml
-@@ -1,6 +1,6 @@
- <?xml version="1.0" encoding="utf-8"?>
- <resources>
--    <string name="app_name">Minis</string>
-+    <string name="app_name">Mines</string>
-     <string name="new_chat">Sembang Baharu</string>
-     <string name="settings">Tetapan</string>
-     <string name="providers">Pembekal</string>
-diff --git a/src/android/app/src/main/res/values-pl/strings.xml b/src/android/app/src/main/res/values-pl/strings.xml
-index b801460..dad8402 100644
---- a/src/android/app/src/main/res/values-pl/strings.xml
-+++ b/src/android/app/src/main/res/values-pl/strings.xml
-@@ -1,6 +1,6 @@
- <?xml version="1.0" encoding="utf-8"?>
- <resources>
--    <string name="app_name">Minis</string>
-+    <string name="app_name">Mines</string>
-     <string name="new_chat">Nowy czat</string>
-     <string name="settings">Ustawienia</string>
-     <string name="providers">Dostawcy</string>
-diff --git a/src/android/app/src/main/res/values-pt-rBR/strings.xml b/src/android/app/src/main/res/values-pt-rBR/strings.xml
-index 49f0ce4..abe9f59 100644
---- a/src/android/app/src/main/res/values-pt-rBR/strings.xml
-+++ b/src/android/app/src/main/res/values-pt-rBR/strings.xml
-@@ -1,6 +1,6 @@
- <?xml version="1.0" encoding="utf-8"?>
- <resources>
--    <string name="app_name">Minis</string>
-+    <string name="app_name">Mines</string>
-     <string name="new_chat">Nova conversa</string>
-     <string name="settings">Configurações</string>
-     <string name="providers">Provedores</string>
-diff --git a/src/android/app/src/main/res/values-ro/strings.xml b/src/android/app/src/main/res/values-ro/strings.xml
-index 390c84a..25d4b6f 100644
---- a/src/android/app/src/main/res/values-ro/strings.xml
-+++ b/src/android/app/src/main/res/values-ro/strings.xml
-@@ -1,6 +1,6 @@
- <?xml version="1.0" encoding="utf-8"?>
- <resources>
--    <string name="app_name">Minis</string>
-+    <string name="app_name">Mines</string>
-     <string name="new_chat">Conversație nouă</string>
-     <string name="settings">Setări</string>
-     <string name="providers">Furnizori</string>
-diff --git a/src/android/app/src/main/res/values-ru/strings.xml b/src/android/app/src/main/res/values-ru/strings.xml
-index b680246..2e5d41d 100644
---- a/src/android/app/src/main/res/values-ru/strings.xml
-+++ b/src/android/app/src/main/res/values-ru/strings.xml
-@@ -1,6 +1,6 @@
- <?xml version="1.0" encoding="utf-8"?>
- <resources>
--    <string name="app_name">Minis</string>
-+    <string name="app_name">Mines</string>
-     <string name="new_chat">Новый чат</string>
-     <string name="settings">Настройки</string>
-     <string name="providers">Провайдеры</string>
-diff --git a/src/android/app/src/main/res/values-th/strings.xml b/src/android/app/src/main/res/values-th/strings.xml
-index 13fefee..1aae680 100644
---- a/src/android/app/src/main/res/values-th/strings.xml
-+++ b/src/android/app/src/main/res/values-th/strings.xml
-@@ -1,6 +1,6 @@
- <?xml version="1.0" encoding="utf-8"?>
- <resources>
--    <string name="app_name">Minis</string>
-+    <string name="app_name">Mines</string>
-     <string name="new_chat">แชทใหม่</string>
-     <string name="settings">การตั้งค่า</string>
-     <string name="providers">ผู้ให้บริการ</string>
-diff --git a/src/android/app/src/main/res/values-tr/strings.xml b/src/android/app/src/main/res/values-tr/strings.xml
-index b7c54d6..6ad4e5c 100644
---- a/src/android/app/src/main/res/values-tr/strings.xml
-+++ b/src/android/app/src/main/res/values-tr/strings.xml
-@@ -1,6 +1,6 @@
- <?xml version="1.0" encoding="utf-8"?>
- <resources>
--    <string name="app_name">Minis</string>
-+    <string name="app_name">Mines</string>
-     <string name="new_chat">Yeni Sohbet</string>
-     <string name="settings">Ayarlar</string>
-     <string name="providers">Sağlayıcılar</string>
-diff --git a/src/android/app/src/main/res/values-zh-rTW/strings.xml b/src/android/app/src/main/res/values-zh-rTW/strings.xml
-index 4df0eb6..c5ee80c 100644
---- a/src/android/app/src/main/res/values-zh-rTW/strings.xml
-+++ b/src/android/app/src/main/res/values-zh-rTW/strings.xml
-@@ -1,6 +1,6 @@
- <?xml version="1.0" encoding="utf-8"?>
- <resources>
--    <string name="app_name">Minis</string>
-+    <string name="app_name">Mines</string>
-     <string name="new_chat">新增對話</string>
-     <string name="settings">設定</string>
-     <string name="providers">供應商</string>
-diff --git a/src/android/app/src/main/res/values-zh/strings.xml b/src/android/app/src/main/res/values-zh/strings.xml
-index 67c9056..d7bc06a 100644
---- a/src/android/app/src/main/res/values-zh/strings.xml
-+++ b/src/android/app/src/main/res/values-zh/strings.xml
-@@ -1,6 +1,6 @@
- <?xml version="1.0" encoding="utf-8"?>
- <resources>
--    <string name="app_name">Minis</string>
-+    <string name="app_name">Mines</string>
-     <string name="new_chat">新对话</string>
-     <string name="settings">设置</string>
-     <string name="providers">AI 服务商</string>
-diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
-index 74183d5..08eef60 100644
---- a/src/android/app/src/main/res/values/strings.xml
-+++ b/src/android/app/src/main/res/values/strings.xml
-@@ -1,6 +1,6 @@
- <?xml version="1.0" encoding="utf-8"?>
- <resources>
--    <string name="app_name">Minis</string>
-+    <string name="app_name">Mines</string>
-     <string name="new_chat">New Chat</string>
-     <string name="settings">Settings</string>
-     <string name="providers">Providers</string>
