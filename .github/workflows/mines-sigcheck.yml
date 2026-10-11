@@ -1,0 +1,39 @@
+name: Mines signature check
+on:
+  push:
+    branches: [hark-sigcheck]
+permissions:
+  contents: write
+  actions: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Collect APKs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          R="${{ github.repository }}"
+          mkdir -p apks
+          for t in build-2 build-7; do gh release download "$t" -R "$R" -D "apks/release-$t" -p '*.apk' || echo "no release $t"; done
+          for id in $(cat hark-build/sigcheck-runs.txt 2>/dev/null); do gh run download "$id" -R "$R" -n minis-apk -D "apks/run-$id" || echo "no artifact for run $id"; done
+          find apks -type f
+      - name: Inspect certificates
+        run: |
+          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          {
+            echo "checked: $(date -u)"
+            echo "fixed keystore hark-build/mines-debug.keystore:"
+            keytool -list -v -keystore hark-build/mines-debug.keystore -storepass android | grep -E 'SHA256'
+            for f in $(find apks -name '*.apk' | sort); do
+              echo "== $f"
+              "$BT/aapt2" dump badging "$f" | head -1
+              "$BT/apksigner" verify --print-certs "$f" | grep -E 'SHA-256|DN' || echo "apksigner failed"
+            done
+          } | tee hark-build/sigcheck-result.txt
+          git config user.name sigcheck
+          git config user.email sigcheck@users.noreply.github.com
+          git add hark-build/sigcheck-result.txt
+          git commit -m "sigcheck result [skip ci]"
+          git push
