@@ -1,0 +1,1755 @@
+diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
+index 50369d8..3fca9d3 100644
+--- a/src/android/app/build.gradle.kts
++++ b/src/android/app/build.gradle.kts
+@@ -33,7 +33,9 @@ android {
+     compileSdk = 36
+ 
+     defaultConfig {
+-        applicationId = "com.openminis.app"
++        // Minis Plus: own package so it installs beside the official Minis
++        // (different signing key can never update it in place).
++        applicationId = "com.openminis.app.plus"
+         minSdk = 26
+         targetSdk = 35
+         versionCode = 28
+diff --git a/src/android/app/src/main/AndroidManifest.xml b/src/android/app/src/main/AndroidManifest.xml
+index 06f6a6f..f4731a2 100644
+--- a/src/android/app/src/main/AndroidManifest.xml
++++ b/src/android/app/src/main/AndroidManifest.xml
+@@ -9,6 +9,7 @@
+     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
++    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+     <!-- T-android-fgs-timeout-crash: switched from dataSync to mediaPlayback.
+          dataSync has a hard 6h/24h cumulative cap on Android 14+, after
+          which the system throws ForegroundServiceDidNotStopInTimeException
+@@ -479,6 +480,14 @@
+         <!-- T-android-fgs-timeout-crash: type=mediaPlayback to escape the
+              dataSync 6h cap. See FOREGROUND_SERVICE_MEDIA_PLAYBACK
+              permission comment above. -->
++        <service
++            android:name=".plus.DeskPetService"
++            android:exported="false"
++            android:foregroundServiceType="specialUse">
++            <property
++                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
++                android:value="Desk pet: an animated companion overlay the user turned on" />
++        </service>
+         <service
+             android:name=".service.AgentForegroundService"
+             android:exported="false"
+diff --git a/src/android/app/src/main/assets/default_mount/etc/ssh/ssh_config.d/minis.conf b/src/android/app/src/main/assets/default_mount/etc/ssh/ssh_config.d/minis.conf
+new file mode 100644
+index 0000000..7a1629e
+--- /dev/null
++++ b/src/android/app/src/main/assets/default_mount/etc/ssh/ssh_config.d/minis.conf
+@@ -0,0 +1,10 @@
++# Minis defaults for ssh from the phone sandbox (mobile networks drop idle
++# TCP and change address often). Override per host in ~/.ssh/config.
++Host *
++    ServerAliveInterval 15
++    ServerAliveCountMax 4
++    TCPKeepAlive yes
++    ConnectTimeout 20
++    ConnectionAttempts 3
++    StrictHostKeyChecking accept-new
++    IPQoS none
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-vps b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-vps
+new file mode 100755
+index 0000000..b8b02c5
+--- /dev/null
++++ b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-vps
+@@ -0,0 +1,97 @@
++#!/bin/sh
++# minis-vps: use a VPS as Minis' back-end processor, over plain ssh.
++#
++# Modelled on nanoMuse's `nanomuse-pc ... --on <device>` (run on the computer,
++# get the answer back on the phone), minus the relay: the phone dials the VPS
++# directly, so nothing has to listen on the phone and no account is needed.
++#
++#   minis-vps setup user@host [port]   make a key, install it on the VPS (asks the password once)
++#   minis-vps run  <command...>        run a command on the VPS, stream output back
++#   minis-vps bg   <name> <command...> start a long job on the VPS that survives disconnects
++#   minis-vps logs <name>              tail a background job's log
++#   minis-vps put  <local> [remote]    copy a file/dir to the VPS
++#   minis-vps get  <remote> [local]    copy a file/dir back
++#   minis-vps shell                    interactive login
++#   minis-vps status                   quick health: uptime, memory, disk, public IP
++#   minis-vps servers                  list the servers Minis Plus is using, fastest first
++#
++# Minis Plus: servers added under 设置 → 工作位置 arrive as MINIS_VPS_SERVERS
++# (user@host:port,… ordered by latency). Every command tries them in order and
++# moves to the next one when a server can't be reached.
++set -e
++CONF="$HOME/.config/minis-vps"
++KEY="$HOME/.ssh/minis_vps_ed25519"
++mkdir -p "$HOME/.ssh" "$(dirname "$CONF")"; chmod 700 "$HOME/.ssh"
++
++need_ssh() {
++    command -v ssh >/dev/null 2>&1 && return
++    echo "installing openssh-client…" >&2
++    apk add --no-cache openssh-client rsync >/dev/null
++}
++set_target() { VPS_TARGET="${1%:*}"; VPS_PORT="${1##*:}"; }
++load() {
++    SERVERS=""
++    if [ -n "$MINIS_VPS_SERVERS" ] && [ "$MINIS_VPS_SERVERS" != none ]; then
++        SERVERS=$(printf '%s' "$MINIS_VPS_SERVERS" | tr ',' ' ')
++    elif [ -f "$CONF" ]; then
++        . "$CONF"; SERVERS="$VPS_TARGET:$VPS_PORT"
++    else
++        echo "minis-vps: no server. Add one in 设置 → 工作位置, or run: minis-vps setup user@host [port]" >&2; exit 2
++    fi
++    set_target "${SERVERS%% *}"
++}
++SSH_OPTS="-o BatchMode=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new"
++# Try each server in order; ssh exits 255 only when it couldn't connect.
++s() {
++    for srv in $SERVERS; do
++        set_target "$srv"
++        if ssh $SSH_OPTS -i "$KEY" -p "$VPS_PORT" "$VPS_TARGET" "$@"; then return 0; else rc=$?; fi
++        [ "$rc" -ne 255 ] && return "$rc"
++        echo "minis-vps: $VPS_TARGET:$VPS_PORT 连不上，换下一台…" >&2
++    done
++    echo "minis-vps: 所有服务器都连不上" >&2
++    return 255
++}
++# Ship a command to the VPS without any quoting layer: base64 it locally, decode
++# and run it remotely. Quotes, ;, $, newlines all arrive exactly as typed.
++b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
++# One argument = a shell script ("cd app && make"). Several = an argv, each
++# word single-quoted so `minis-vps run echo "it's"` prints it's.
++script() {
++    if [ $# -eq 1 ]; then printf '%s' "$1"; return; fi
++    for w; do printf "'%s' " "$(printf '%s' "$w" | sed "s/'/'\\\\''/g")"; done
++}
++valid_name() { case "$1" in ''|*[!A-Za-z0-9._-]*) echo "minis-vps: job name must be letters, digits, . _ -" >&2; exit 2;; esac; }
++
++cmd="${1:-help}"; [ $# -gt 0 ] && shift
++case "$cmd" in
++setup)
++    need_ssh
++    [ -n "$1" ] || { echo "usage: minis-vps setup user@host [port]" >&2; exit 2; }
++    printf 'VPS_TARGET=%s\nVPS_PORT=%s\n' "$1" "${2:-22}" > "$CONF"
++    . "$CONF"; SERVERS="$VPS_TARGET:$VPS_PORT"
++    [ -f "$KEY" ] || ssh-keygen -q -t ed25519 -N '' -C "minis@phone" -f "$KEY"
++    echo "Installing the key on $VPS_TARGET (enter the VPS password once)…"
++    echo "Note: the VPS host key is trusted on first connect (accept-new). Do this on a network you trust." >&2
++    # The key travels on stdin, never inside the remote command string.
++    ssh -o StrictHostKeyChecking=accept-new -p "$VPS_PORT" "$VPS_TARGET" \
++        'umask 077; mkdir -p ~/.ssh ~/minis-jobs; k=$(cat); touch ~/.ssh/authorized_keys; grep -qxF "$k" ~/.ssh/authorized_keys || printf "%s\n" "$k" >> ~/.ssh/authorized_keys' < "$KEY.pub"
++    s 'echo ok: $(hostname)'
++    ;;
++run)    need_ssh; load; s "sh -c \"\$(echo $(b64 "$(script "$@")") | base64 -d)\"" ;;
++bg)
++    need_ssh; load
++    name="$1"; shift; valid_name "$name"
++    s "mkdir -p ~/minis-jobs; cd ~; echo $(b64 "$(script "$@")") | base64 -d > ~/minis-jobs/$name.sh; nohup sh ~/minis-jobs/$name.sh > ~/minis-jobs/$name.log 2>&1 < /dev/null & echo \$! > ~/minis-jobs/$name.pid; echo started $name pid \$(cat ~/minis-jobs/$name.pid) on \$(hostname)"
++    mkdir -p "$HOME/.config/minis-vps-jobs"; printf '%s:%s\n' "$VPS_TARGET" "$VPS_PORT" > "$HOME/.config/minis-vps-jobs/$name"
++    ;;
++logs)   need_ssh; load; valid_name "$1"
++        [ -f "$HOME/.config/minis-vps-jobs/$1" ] && SERVERS=$(cat "$HOME/.config/minis-vps-jobs/$1")
++        s "tail -n ${2:-100} ~/minis-jobs/$1.log" ;;
++put)    need_ssh; load; rsync -az -e "ssh $SSH_OPTS -i $KEY -p $VPS_PORT" "$1" "$VPS_TARGET:${2:-~/}" ;;
++get)    need_ssh; load; rsync -az -e "ssh $SSH_OPTS -i $KEY -p $VPS_PORT" "$VPS_TARGET:$1" "${2:-.}" ;;
++shell)  need_ssh; load; ssh -t -i "$KEY" -p "$VPS_PORT" -o ServerAliveInterval=15 "$VPS_TARGET" ;;
++status) need_ssh; load; s 'uptime; free -m | sed -n 2p; df -h / | tail -1; curl -s --max-time 5 https://ipinfo.io/ip; echo' ;;
++servers) load; for srv in $SERVERS; do echo "$srv"; done ;;
++*)      sed -n '2,23p' "$0" ;;
++esac
+diff --git a/src/android/app/src/main/java/com/openminis/app/MinisApp.kt b/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
+index d1f65a5..45b805a 100644
+--- a/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
++++ b/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
+@@ -692,6 +692,11 @@ class MinisApp : Application(), ImageLoaderFactory {
+             com.openminis.app.sandbox.offload.ConfigOffloadHandler(),
+         )
+         NativeOffloadServer.register("minis-browser-use", BrowserUseOffloadHandler(this))
++        // [T-muse-hub] Minis as a device on the nanoMuse hub: push-based
++        // task exchange with Muse instead of a shared page + get_chat polling.
++        NativeOffloadServer.register("minis-muse", com.openminis.app.hub.MuseHubOffloadHandler())
++        runCatching { com.openminis.app.hub.MuseHubClient.start(this) }
++            .onFailure { com.openminis.app.logging.AppLogger.warning("MuseHub", "start failed: ${it.message}") }
+         // T188: minis-sessions-cli — agent-side query of chat history.
+         // Registers next to the other minis-* tools so PRootKernel.
+         // installHandlerStubs() picks it up on the next rootfs boot
+diff --git a/src/android/app/src/main/java/com/openminis/app/accessibility/MinisAccessibilityService.kt b/src/android/app/src/main/java/com/openminis/app/accessibility/MinisAccessibilityService.kt
+index 03aaf0f..def9c81 100644
+--- a/src/android/app/src/main/java/com/openminis/app/accessibility/MinisAccessibilityService.kt
++++ b/src/android/app/src/main/java/com/openminis/app/accessibility/MinisAccessibilityService.kt
+@@ -29,7 +29,8 @@ class MinisAccessibilityService : AccessibilityService() {
+ 
+     companion object {
+         private const val TAG = "MinisA11y"
+-        const val SERVICE_ID = "com.openminis.app/.accessibility.MinisAccessibilityService"
++        fun serviceId(context: android.content.Context): String =
++            "${context.packageName}/com.openminis.app.accessibility.MinisAccessibilityService"
+         private const val EVENT_RING_CAP = 1024
+ 
+         @Volatile
+diff --git a/src/android/app/src/main/java/com/openminis/app/hub/MuseHubClient.kt b/src/android/app/src/main/java/com/openminis/app/hub/MuseHubClient.kt
+new file mode 100644
+index 0000000..b0cc48c
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/hub/MuseHubClient.kt
+@@ -0,0 +1,212 @@
++package com.openminis.app.hub
++
++import android.content.Context
++import android.content.Intent
++import android.net.Uri
++import com.openminis.app.MinisApp
++import com.openminis.app.logging.AppLogger
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.launch
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.Response
++import okhttp3.WebSocket
++import okhttp3.WebSocketListener
++import org.json.JSONArray
++import org.json.JSONObject
++import java.util.UUID
++import java.util.concurrent.ConcurrentHashMap
++import java.util.concurrent.LinkedBlockingQueue
++import java.util.concurrent.TimeUnit
++
++/**
++ * [T-muse-hub] Minis as a real device on the nanoMuse hub (`/v1/hub`).
++ *
++ * Replaces the shared-workspace page + `get_chat` polling: one outbound
++ * WebSocket, frames are pushed both ways, no polling, no SSL retries on a
++ * page.
++ *
++ *  - Muse → Minis: `call task {text, conversation?}` runs a real Minis agent
++ *    turn (HeadlessChatRunner) in a side chat "From <device>", and the final
++ *    answer goes back as `result {text}`. `open {url|package}` launches an app
++ *    or page here. `info` answers what this device is.
++ *  - Minis → Muse: the `minis-muse` CLI (MuseHubOffloadHandler) sends
++ *    `call task` / `open` / `notify` to another device and blocks until the
++ *    `result` frame arrives.
++ *
++ * Configured with two Minis env vars (Settings → Environment variables), so no
++ * secret is in code: MUSE_HUB_URL (e.g. wss://relay.example/v1/hub) and
++ * MUSE_HUB_KEY (the account's nm_… device key). Optional MUSE_HUB_NAME.
++ */
++object MuseHubClient {
++    private const val TAG = "MuseHub"
++    private const val TASK_TIMEOUT_MS = 20 * 60_000L
++
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++    private val http = OkHttpClient.Builder()
++        .pingInterval(25, TimeUnit.SECONDS)      // keeps NAT/relay from idling us out
++        .readTimeout(0, TimeUnit.MILLISECONDS)
++        .retryOnConnectionFailure(true)
++        .build()
++
++    @Volatile private var ws: WebSocket? = null
++    @Volatile private var app: Context? = null
++    @Volatile var connected = false; private set
++    @Volatile var devices: JSONArray = JSONArray(); private set
++    @Volatile private var backoffMs = 2_000L
++
++    /** call id → queue that receives the matching result/error frame. */
++    private val pending = ConcurrentHashMap<String, LinkedBlockingQueue<JSONObject>>()
++
++    fun start(context: Context) {
++        app = context.applicationContext
++        connect()
++    }
++
++    private fun env(key: String): String? =
++        runCatching { (app as MinisApp).envVarRepository.getValue(key) }.getOrNull()?.trim()?.takeIf { it.isNotEmpty() }
++
++    private fun deviceId(): String {
++        val p = app!!.getSharedPreferences("muse_hub", Context.MODE_PRIVATE)
++        return p.getString("device_id", null) ?: ("minis-" + UUID.randomUUID().toString().take(8)).also {
++            p.edit().putString("device_id", it).apply()
++        }
++    }
++
++    fun connect() {
++        val url = env("MUSE_HUB_URL"); val key = env("MUSE_HUB_KEY")
++        if (url == null || key == null) {
++            AppLogger.info(TAG, "not configured (set MUSE_HUB_URL and MUSE_HUB_KEY)")
++            return
++        }
++        if (ws != null) return
++        val req = Request.Builder().url(url).header("Authorization", "Bearer $key").build()
++        ws = http.newWebSocket(req, object : WebSocketListener() {
++            override fun onOpen(webSocket: WebSocket, response: Response) {
++                val hello = JSONObject()
++                    .put("type", "hello").put("key", key)
++                    .put("device", JSONObject()
++                        .put("id", deviceId())
++                        .put("name", env("MUSE_HUB_NAME") ?: "Minis")
++                        .put("kind", "phone").put("os", "android").put("version", "openminis")
++                        .put("actions", JSONArray(listOf("info", "task", "open"))))
++                webSocket.send(hello.toString())
++            }
++            override fun onMessage(webSocket: WebSocket, text: String) {
++                runCatching { onFrame(webSocket, JSONObject(text)) }
++                    .onFailure { AppLogger.warning(TAG, "bad frame: ${it.message}") }
++            }
++            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = dropped("closed $code $reason")
++            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) = dropped("failure ${t.message}")
++        })
++    }
++
++    private fun dropped(why: String) {
++        AppLogger.warning(TAG, "disconnected: $why; retry in ${backoffMs / 1000}s")
++        connected = false; ws = null
++        // Fail every waiting CLI call now instead of letting it hang.
++        pending.values.forEach { it.offer(JSONObject().put("type", "error").put("code", "disconnected").put("message", why)) }
++        val wait = backoffMs
++        backoffMs = (backoffMs * 2).coerceAtMost(60_000L)
++        scope.launch { kotlinx.coroutines.delay(wait); connect() }
++    }
++
++    private fun onFrame(sock: WebSocket, f: JSONObject) {
++        when (f.optString("type")) {
++            "welcome" -> {
++                connected = true; backoffMs = 2_000L
++                devices = f.optJSONArray("devices") ?: JSONArray()
++                AppLogger.info(TAG, "connected as ${f.optString("device_id")}, ${devices.length()} device(s)")
++            }
++            "devices" -> devices = f.optJSONArray("devices") ?: JSONArray()
++            "result", "error" -> f.optString("id").takeIf { it.isNotEmpty() }?.let { pending[it]?.offer(f) }
++            "event" -> Unit // progress on our own call; the CLI only needs the result
++            "call" -> scope.launch { serve(sock, f) }
++        }
++    }
++
++    // ---- Muse → Minis --------------------------------------------------------
++
++    private suspend fun serve(sock: WebSocket, call: JSONObject) {
++        val id = call.optString("id")
++        val args = call.optJSONObject("args") ?: JSONObject()
++        val from = call.optJSONObject("from")?.optString("name") ?: "Muse"
++        fun ok(body: JSONObject) { sock.send(JSONObject().put("type", "result").put("id", id).put("ok", true).put("body", body).toString()) }
++        fun err(code: String, msg: String) { sock.send(JSONObject().put("type", "result").put("id", id).put("ok", false).put("error", code).put("message", msg).toString()) }
++        try {
++            when (call.optString("action")) {
++                "info" -> ok(JSONObject().put("name", env("MUSE_HUB_NAME") ?: "Minis").put("kind", "phone").put("app", "openminis"))
++                "task" -> {
++                    val text = args.optString("text").takeIf { it.isNotBlank() } ?: return err("bad_args", "task needs text")
++                    val conv = args.optString("conversation").ifBlank { "from:$from" }
++                    val sessionId = sessionFor(conv)
++                    val r = com.openminis.app.debug.HeadlessChatRunner.prompt(
++                        context = app!!, sessionId = sessionId,
++                        text = "[来自 $from 的任务]\n$text",
++                        wait = true, timeoutMs = TASK_TIMEOUT_MS,
++                    )
++                    if (r.timedOut) err("timeout", "Minis did not finish within ${TASK_TIMEOUT_MS / 60000} min")
++                    else ok(JSONObject().put("text", r.responseText ?: "").put("conversation", conv))
++                }
++                "open" -> {
++                    val ctx = app!!
++                    val intent = when {
++                        args.optString("url").isNotBlank() -> Intent(Intent.ACTION_VIEW, Uri.parse(args.optString("url")))
++                        args.optString("package").isNotBlank() ->
++                            ctx.packageManager.getLaunchIntentForPackage(args.optString("package"))
++                                ?: return err("not_found", "app not installed")
++                        else -> return err("bad_args", "open needs url or package")
++                    }
++                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
++                    ctx.startActivity(intent)
++                    ok(JSONObject().put("opened", true))
++                }
++                else -> err("unknown_call", "Minis does not do ${call.optString("action")}")
++            }
++        } catch (t: Throwable) {
++            AppLogger.warning(TAG, "serve failed: ${t.message}")
++            err("failed", t.message ?: t.javaClass.simpleName)
++        }
++    }
++
++    /** One Minis chat per remote conversation, kept across restarts. */
++    private suspend fun sessionFor(conv: String): String {
++        val p = app!!.getSharedPreferences("muse_hub_sessions", Context.MODE_PRIVATE)
++        p.getString(conv, null)?.let { id ->
++            if ((app as MinisApp).chatRepository.getSession(id) != null) return id
++        }
++        val id = com.openminis.app.debug.HeadlessChatRunner.ensureSession(app!!)
++        p.edit().putString(conv, id).apply()
++        return id
++    }
++
++    // ---- Minis → Muse --------------------------------------------------------
++
++    /** Resolve a device by id or (case-insensitive) name, skipping ourselves and browser tabs. */
++    fun resolve(target: String): String? {
++        val me = runCatching { deviceId() }.getOrNull()
++        for (i in 0 until devices.length()) {
++            val d = devices.getJSONObject(i)
++            if (d.optString("id") == me || d.optString("kind") == "web") continue
++            if (d.optString("id") == target || d.optString("name").equals(target, ignoreCase = true)) return d.optString("id")
++        }
++        return null
++    }
++
++    /** Send a call and block for its result. Called from the offload thread. */
++    fun call(to: String, action: String, args: JSONObject, timeoutMs: Long): JSONObject {
++        val sock = ws ?: return JSONObject().put("ok", false).put("error", "disconnected").put("message", "not connected to the hub")
++        val id = "minis-" + UUID.randomUUID().toString()
++        val q = LinkedBlockingQueue<JSONObject>(1)
++        pending[id] = q
++        try {
++            sock.send(JSONObject().put("type", "call").put("id", id).put("to", to).put("action", action).put("args", args).toString())
++            val f = q.poll(timeoutMs, TimeUnit.MILLISECONDS)
++                ?: return JSONObject().put("ok", false).put("error", "timeout").put("message", "no answer in ${timeoutMs / 1000}s")
++            if (f.optString("type") == "error") return JSONObject().put("ok", false).put("error", f.optString("code")).put("message", f.optString("message"))
++            return f
++        } finally { pending.remove(id) }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/hub/MuseHubOffloadHandler.kt b/src/android/app/src/main/java/com/openminis/app/hub/MuseHubOffloadHandler.kt
+new file mode 100644
+index 0000000..d2f3b7f
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/hub/MuseHubOffloadHandler.kt
+@@ -0,0 +1,51 @@
++package com.openminis.app.hub
++
++import com.openminis.app.sandbox.NativeOffloadHandler
++import com.openminis.app.sandbox.NativeOffloadRequest
++import com.openminis.app.sandbox.NativeOffloadResult
++import org.json.JSONObject
++
++/**
++ * [T-muse-hub] `minis-muse` — the agent's side of the hub.
++ *
++ *   minis-muse status                      connected? which devices are online
++ *   minis-muse ask <device> <text…>        give that device's Muse a whole task, wait for its answer
++ *   minis-muse open <device> <url|pkg>     open a page or an app on that device
++ *   minis-muse notify <device> <text…>     show a notification there
++ *   minis-muse reconnect
++ */
++class MuseHubOffloadHandler : NativeOffloadHandler {
++    override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
++        val a = request.argv.drop(1)
++        val usage = "usage: minis-muse status | ask <device> <text> | open <device> <url|package> | notify <device> <text> | reconnect\n"
++        if (a.isEmpty()) return NativeOffloadResult(2, usage)
++        return when (a[0]) {
++            "status" -> {
++                val sb = StringBuilder("hub: ${if (MuseHubClient.connected) "connected" else "NOT connected"}\n")
++                val d = MuseHubClient.devices
++                for (i in 0 until d.length()) {
++                    val o = d.getJSONObject(i)
++                    sb.append("- ${o.optString("name")} (${o.optString("kind")}, id ${o.optString("id")}) ${if (o.optBoolean("online")) "online" else "offline"}\n")
++                }
++                NativeOffloadResult(0, sb.toString())
++            }
++            "reconnect" -> { MuseHubClient.connect(); NativeOffloadResult(0, "reconnecting\n") }
++            "ask", "open", "notify" -> {
++                if (a.size < 3) return NativeOffloadResult(2, usage)
++                val to = MuseHubClient.resolve(a[1]) ?: return NativeOffloadResult(3, "no online device named '${a[1]}' (try: minis-muse status)\n")
++                val rest = a.drop(2).joinToString(" ")
++                val (action, args, timeout) = when (a[0]) {
++                    "ask" -> Triple("task", JSONObject().put("text", rest).put("conversation", "minis").put("language", "zh-CN"), 20 * 60_000L)
++                    "open" -> Triple("open", if (rest.contains("://")) JSONObject().put("url", rest) else JSONObject().put("package", rest), 60_000L)
++                    else -> Triple("notify", JSONObject().put("title", "Minis").put("text", rest), 30_000L)
++                }
++                val r = MuseHubClient.call(to, action, args, timeout)
++                if (r.optBoolean("ok")) {
++                    val body = r.optJSONObject("body")
++                    NativeOffloadResult(0, (body?.optString("text")?.takeIf { it.isNotEmpty() } ?: body?.toString() ?: "ok") + "\n")
++                } else NativeOffloadResult(1, "failed: ${r.optString("error")} ${r.optString("message")}\n")
++            }
++            else -> NativeOffloadResult(2, usage)
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt b/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt
+new file mode 100644
+index 0000000..8f87354
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt
+@@ -0,0 +1,230 @@
++package com.openminis.app.plus
++
++import android.annotation.SuppressLint
++import android.app.Notification
++import android.app.NotificationChannel
++import android.app.NotificationManager
++import android.app.PendingIntent
++import android.app.Service
++import android.content.Context
++import android.content.Intent
++import android.content.pm.ServiceInfo
++import android.graphics.Canvas
++import android.graphics.Color
++import android.graphics.Paint
++import android.graphics.PixelFormat
++import android.graphics.RectF
++import android.os.Build
++import android.os.IBinder
++import android.provider.Settings
++import android.view.GestureDetector
++import android.view.Gravity
++import android.view.MotionEvent
++import android.view.View
++import android.view.WindowManager
++import com.openminis.app.MainActivity
++import com.openminis.app.R
++import kotlin.math.abs
++import kotlin.math.sin
++
++/**
++ * Desk pet: the Minis Plus avatar floating over other apps.
++ * Drag to move, tap to say something, double-tap to open Minis,
++ * long-press to tuck it away. Needs "display over other apps".
++ */
++class DeskPetService : Service() {
++
++    companion object {
++        private const val CHANNEL = "minis_plus_pet"
++        private const val NOTIF_ID = 7301
++        const val ACTION_STOP = "com.openminis.app.plus.PET_STOP"
++
++        fun canShow(context: Context) = Settings.canDrawOverlays(context)
++
++        fun start(context: Context) {
++            if (!canShow(context)) return
++            val i = Intent(context, DeskPetService::class.java)
++            runCatching {
++                context.startForegroundService(i)
++            }
++        }
++
++        fun stop(context: Context) {
++            context.stopService(Intent(context, DeskPetService::class.java))
++        }
++    }
++
++    private var wm: WindowManager? = null
++    private var petView: PetView? = null
++
++    override fun onBind(intent: Intent?): IBinder? = null
++
++    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
++        if (intent?.action == ACTION_STOP) {
++            PlusPrefs.update(this) { it.copy(petEnabled = false) }
++            stopSelf()
++            return START_NOT_STICKY
++        }
++        goForeground()
++        if (petView == null && canShow(this)) addPet()
++        return START_STICKY
++    }
++
++    private fun goForeground() {
++        val nm = getSystemService(NotificationManager::class.java)
++        if (nm.getNotificationChannel(CHANNEL) == null) {
++            nm.createNotificationChannel(
++                NotificationChannel(CHANNEL, "桌宠", NotificationManager.IMPORTANCE_MIN).apply {
++                    setShowBadge(false)
++                }
++            )
++        }
++        val open = PendingIntent.getActivity(
++            this, 0, Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
++            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
++        )
++        val stop = PendingIntent.getService(
++            this, 1, Intent(this, DeskPetService::class.java).setAction(ACTION_STOP),
++            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
++        )
++        val n: Notification = Notification.Builder(this, CHANNEL)
++            .setSmallIcon(R.mipmap.ic_launcher)
++            .setContentTitle("Minis 桌宠在桌面上")
++            .setContentText("双击它打开 Minis，长按收起")
++            .setContentIntent(open)
++            .addAction(Notification.Action.Builder(null as android.graphics.drawable.Icon?, "收起桌宠", stop).build())
++            .setOngoing(true)
++            .build()
++        if (Build.VERSION.SDK_INT >= 34) {
++            startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
++        } else {
++            startForeground(NOTIF_ID, n)
++        }
++    }
++
++    @SuppressLint("ClickableViewAccessibility")
++    private fun addPet() {
++        PlusPrefs.init(this)
++        val manager = getSystemService(WINDOW_SERVICE) as WindowManager
++        wm = manager
++        val density = resources.displayMetrics.density
++        val sizePx = (96 * density).toInt()
++        val lp = WindowManager.LayoutParams(
++            (sizePx * 2.2f).toInt(), (sizePx * 1.6f).toInt(),
++            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
++            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
++                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
++            PixelFormat.TRANSLUCENT,
++        ).apply {
++            gravity = Gravity.TOP or Gravity.START
++            x = resources.displayMetrics.widthPixels - (sizePx * 2.2f).toInt()
++            y = (resources.displayMetrics.heightPixels * 0.55f).toInt()
++        }
++        val view = PetView(this)
++        petView = view
++
++        var downX = 0f; var downY = 0f; var startX = 0; var startY = 0; var dragging = false
++        val gestures = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
++            override fun onSingleTapConfirmed(e: MotionEvent): Boolean { view.say(); return true }
++            override fun onDoubleTap(e: MotionEvent): Boolean {
++                startActivity(Intent(this@DeskPetService, MainActivity::class.java)
++                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT))
++                return true
++            }
++            override fun onLongPress(e: MotionEvent) {
++                if (!dragging) {
++                    PlusPrefs.update(this@DeskPetService) { it.copy(petEnabled = false) }
++                    stopSelf()
++                }
++            }
++        })
++        view.setOnTouchListener { _, ev ->
++            gestures.onTouchEvent(ev)
++            when (ev.actionMasked) {
++                MotionEvent.ACTION_DOWN -> {
++                    downX = ev.rawX; downY = ev.rawY; startX = lp.x; startY = lp.y; dragging = false
++                }
++                MotionEvent.ACTION_MOVE -> {
++                    val dx = ev.rawX - downX; val dy = ev.rawY - downY
++                    if (dragging || abs(dx) > 12 * density || abs(dy) > 12 * density) {
++                        dragging = true
++                        view.held = true
++                        lp.x = (startX + dx).toInt(); lp.y = (startY + dy).toInt()
++                        runCatching { manager.updateViewLayout(view, lp) }
++                    }
++                }
++                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> { view.held = false }
++            }
++            true
++        }
++        runCatching { manager.addView(view, lp) }.onFailure { stopSelf() }
++    }
++
++    override fun onDestroy() {
++        petView?.let { v -> runCatching { wm?.removeView(v) } }
++        petView = null
++        super.onDestroy()
++    }
++
++    private class PetView(context: Context) : View(context) {
++        private val lines = listOf(
++            "我在这儿陪你～", "今天也要加油！", "有事双击我", "累了就休息一下",
++            "服务器我盯着呢", "喝口水吧", "要我帮你做点什么？", "摸摸头 (•ᴗ•)",
++        )
++        private var bubble: String? = null
++        private var bubbleUntil = 0L
++        private var lastIdx = -1
++        var held = false
++        private val start = System.currentTimeMillis()
++        private val bubblePaint = Paint(Paint.ANTI_ALIAS_FLAG)
++        private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
++            color = Color.parseColor("#222222")
++            textSize = 13f * context.resources.displayMetrics.scaledDensity
++        }
++
++        fun say() {
++            var i: Int
++            do { i = lines.indices.random() } while (i == lastIdx && lines.size > 1)
++            lastIdx = i
++            bubble = lines[i]
++            bubbleUntil = System.currentTimeMillis() + 3000
++            invalidate()
++        }
++
++        override fun onDraw(canvas: Canvas) {
++            super.onDraw(canvas)
++            val st = PlusPrefs.state.value
++            val t = (System.currentTimeMillis() - start) / 1000f
++            val petSize = height / 1.6f
++            val left = width - petSize
++            val topY = height - petSize
++            val blinkCycle = t % 4f
++            val blink = if (blinkCycle > 3.85f) 1f else 0f
++            val bob = if (held) -0.04f else sin(t * 2.4f) * 0.025f
++            canvas.save()
++            canvas.translate(left, topY)
++            PetPainter.draw(canvas, petSize, petSize, st.petStyle, st.petColor,
++                blink = blink, bob = bob, happy = if (bubble != null) 1f else 0.5f)
++            canvas.restore()
++
++            val b = bubble
++            if (b != null) {
++                if (System.currentTimeMillis() > bubbleUntil) bubble = null
++                else {
++                    val pad = 10f * resources.displayMetrics.density
++                    val tw = textPaint.measureText(b)
++                    val bw = tw + pad * 2
++                    val bh = textPaint.textSize + pad * 1.6f
++                    val bx = (width - petSize * 0.6f - bw).coerceAtLeast(0f)
++                    val by = (topY - bh * 0.2f).coerceAtLeast(0f)
++                    bubblePaint.color = Color.argb(70, 0, 0, 0)
++                    canvas.drawRoundRect(RectF(bx + 2, by + 3, bx + bw + 2, by + bh + 3), bh / 2, bh / 2, bubblePaint)
++                    bubblePaint.color = Color.WHITE
++                    canvas.drawRoundRect(RectF(bx, by, bx + bw, by + bh), bh / 2, bh / 2, bubblePaint)
++                    canvas.drawText(b, bx + pad, by + bh / 2 + textPaint.textSize / 3f, textPaint)
++                }
++            }
++            postInvalidateDelayed(33)
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PetPainter.kt b/src/android/app/src/main/java/com/openminis/app/plus/PetPainter.kt
+new file mode 100644
+index 0000000..c154112
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/PetPainter.kt
+@@ -0,0 +1,173 @@
++package com.openminis.app.plus
++
++import android.graphics.Canvas
++import android.graphics.Color
++import android.graphics.Paint
++import android.graphics.Path
++import android.graphics.RectF
++
++/**
++ * Draws the Minis Plus avatar with plain android.graphics so the same
++ * character renders in Compose (Today card, settings) and in the desk-pet
++ * overlay window. Vector-drawn: crisp at any size, no image assets.
++ */
++object PetPainter {
++    val styles = listOf("penguin" to "小企鹅", "cat" to "小猫", "ghost" to "小幽灵")
++    val colors = listOf(
++        0xFF5B8DEF.toInt(), 0xFFFF8A65.toInt(), 0xFF66BB6A.toInt(),
++        0xFFAB47BC.toInt(), 0xFF26C6DA.toInt(), 0xFF455A64.toInt(),
++    )
++
++    private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
++    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
++        style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND
++    }
++
++    /**
++     * @param blink 0 = eyes open, 1 = closed
++     * @param bob vertical offset as a fraction of size (-0.05..0.05)
++     * @param happy 0..1 how big the smile is
++     */
++    fun draw(c: Canvas, w: Float, h: Float, style: String, color: Int,
++             blink: Float = 0f, bob: Float = 0f, happy: Float = 0.5f) {
++        val s = minOf(w, h)
++        val cx = w / 2f
++        val top = (h - s) / 2f + bob * s
++        when (style) {
++            "cat" -> drawCat(c, cx, top, s, color, blink, happy)
++            "ghost" -> drawGhost(c, cx, top, s, color, blink, happy)
++            else -> drawPenguin(c, cx, top, s, color, blink, happy)
++        }
++    }
++
++    private fun shadow(c: Canvas, cx: Float, top: Float, s: Float) {
++        fill.color = Color.argb(40, 0, 0, 0)
++        c.drawOval(RectF(cx - s * 0.28f, top + s * 0.9f, cx + s * 0.28f, top + s * 0.97f), fill)
++    }
++
++    private fun eyes(c: Canvas, cx: Float, y: Float, s: Float, gap: Float, r: Float, blink: Float, light: Boolean = false) {
++        val open = 1f - blink.coerceIn(0f, 1f)
++        for (dx in floatArrayOf(-gap, gap)) {
++            if (open < 0.15f) {
++                stroke.color = Color.parseColor("#222222"); stroke.strokeWidth = s * 0.025f
++                c.drawLine(cx + dx - r, y, cx + dx + r, y, stroke)
++            } else {
++                fill.color = if (light) Color.WHITE else Color.parseColor("#222222")
++                c.drawOval(RectF(cx + dx - r, y - r * open * 1.2f, cx + dx + r, y + r * open * 1.2f), fill)
++                fill.color = if (light) Color.parseColor("#222222") else Color.WHITE
++                val hr = r * 0.38f
++                c.drawCircle(cx + dx + r * 0.3f, y - r * 0.35f * open, hr, fill)
++            }
++        }
++    }
++
++    private fun smile(c: Canvas, cx: Float, y: Float, s: Float, happy: Float, col: Int) {
++        stroke.color = col; stroke.strokeWidth = s * 0.022f
++        val wdt = s * 0.07f
++        val p = Path().apply {
++            moveTo(cx - wdt, y)
++            quadTo(cx, y + s * (0.02f + 0.05f * happy), cx + wdt, y)
++        }
++        c.drawPath(p, stroke)
++    }
++
++    private fun cheeks(c: Canvas, cx: Float, y: Float, s: Float, gap: Float) {
++        fill.color = Color.argb(90, 255, 120, 140)
++        c.drawOval(RectF(cx - gap - s * 0.05f, y - s * 0.025f, cx - gap + s * 0.05f, y + s * 0.025f), fill)
++        c.drawOval(RectF(cx + gap - s * 0.05f, y - s * 0.025f, cx + gap + s * 0.05f, y + s * 0.025f), fill)
++    }
++
++    private fun drawPenguin(c: Canvas, cx: Float, top: Float, s: Float, color: Int, blink: Float, happy: Float) {
++        shadow(c, cx, top, s)
++        // feet
++        fill.color = Color.parseColor("#FFB74D")
++        c.drawOval(RectF(cx - s * 0.22f, top + s * 0.84f, cx - s * 0.04f, top + s * 0.93f), fill)
++        c.drawOval(RectF(cx + s * 0.04f, top + s * 0.84f, cx + s * 0.22f, top + s * 0.93f), fill)
++        // flippers
++        fill.color = darker(color)
++        c.drawOval(RectF(cx - s * 0.38f, top + s * 0.42f, cx - s * 0.22f, top + s * 0.72f), fill)
++        c.drawOval(RectF(cx + s * 0.22f, top + s * 0.42f, cx + s * 0.38f, top + s * 0.72f), fill)
++        // body
++        fill.color = color
++        c.drawOval(RectF(cx - s * 0.3f, top + s * 0.1f, cx + s * 0.3f, top + s * 0.9f), fill)
++        // belly / face
++        fill.color = Color.WHITE
++        c.drawOval(RectF(cx - s * 0.22f, top + s * 0.26f, cx + s * 0.22f, top + s * 0.86f), fill)
++        eyes(c, cx, top + s * 0.38f, s, s * 0.09f, s * 0.045f, blink)
++        cheeks(c, cx, top + s * 0.47f, s, s * 0.15f)
++        // beak
++        fill.color = Color.parseColor("#FFA726")
++        val beak = Path().apply {
++            moveTo(cx - s * 0.05f, top + s * 0.45f)
++            lineTo(cx + s * 0.05f, top + s * 0.45f)
++            lineTo(cx, top + s * 0.5f + s * 0.02f * happy)
++            close()
++        }
++        c.drawPath(beak, fill)
++    }
++
++    private fun drawCat(c: Canvas, cx: Float, top: Float, s: Float, color: Int, blink: Float, happy: Float) {
++        shadow(c, cx, top, s)
++        fill.color = color
++        // tail
++        stroke.color = color; stroke.strokeWidth = s * 0.07f
++        val tail = Path().apply {
++            moveTo(cx + s * 0.22f, top + s * 0.8f)
++            quadTo(cx + s * 0.45f, top + s * 0.75f, cx + s * 0.4f, top + s * 0.5f)
++        }
++        c.drawPath(tail, stroke)
++        // body
++        c.drawOval(RectF(cx - s * 0.26f, top + s * 0.5f, cx + s * 0.26f, top + s * 0.92f), fill)
++        // ears
++        val ears = Path().apply {
++            moveTo(cx - s * 0.3f, top + s * 0.3f); lineTo(cx - s * 0.26f, top + s * 0.06f); lineTo(cx - s * 0.08f, top + s * 0.18f); close()
++            moveTo(cx + s * 0.3f, top + s * 0.3f); lineTo(cx + s * 0.26f, top + s * 0.06f); lineTo(cx + s * 0.08f, top + s * 0.18f); close()
++        }
++        c.drawPath(ears, fill)
++        // head
++        c.drawOval(RectF(cx - s * 0.33f, top + s * 0.13f, cx + s * 0.33f, top + s * 0.62f), fill)
++        // muzzle
++        fill.color = Color.argb(230, 255, 255, 255)
++        c.drawOval(RectF(cx - s * 0.13f, top + s * 0.4f, cx + s * 0.13f, top + s * 0.57f), fill)
++        eyes(c, cx, top + s * 0.34f, s, s * 0.12f, s * 0.045f, blink)
++        cheeks(c, cx, top + s * 0.46f, s, s * 0.19f)
++        fill.color = Color.parseColor("#F06292")
++        c.drawCircle(cx, top + s * 0.44f, s * 0.022f, fill)
++        smile(c, cx, top + s * 0.48f, s, happy, Color.parseColor("#444444"))
++        // whiskers
++        stroke.color = Color.argb(140, 60, 60, 60); stroke.strokeWidth = s * 0.01f
++        for (dy in floatArrayOf(-0.015f, 0.02f)) {
++            c.drawLine(cx - s * 0.15f, top + s * (0.47f + dy), cx - s * 0.3f, top + s * (0.45f + dy * 2), stroke)
++            c.drawLine(cx + s * 0.15f, top + s * (0.47f + dy), cx + s * 0.3f, top + s * (0.45f + dy * 2), stroke)
++        }
++    }
++
++    private fun drawGhost(c: Canvas, cx: Float, top: Float, s: Float, color: Int, blink: Float, happy: Float) {
++        shadow(c, cx, top, s)
++        fill.color = lighter(color)
++        val body = Path().apply {
++            moveTo(cx - s * 0.3f, top + s * 0.85f)
++            lineTo(cx - s * 0.3f, top + s * 0.42f)
++            cubicTo(cx - s * 0.3f, top + s * 0.05f, cx + s * 0.3f, top + s * 0.05f, cx + s * 0.3f, top + s * 0.42f)
++            lineTo(cx + s * 0.3f, top + s * 0.85f)
++            val step = s * 0.6f / 4f
++            for (i in 0 until 4) {
++                val x0 = cx + s * 0.3f - step * i
++                quadTo(x0 - step / 2f, top + s * (if (i % 2 == 0) 0.76f else 0.94f), x0 - step, top + s * 0.85f)
++            }
++            close()
++        }
++        c.drawPath(body, fill)
++        eyes(c, cx, top + s * 0.38f, s, s * 0.1f, s * 0.05f, blink)
++        cheeks(c, cx, top + s * 0.48f, s, s * 0.17f)
++        smile(c, cx, top + s * 0.49f, s, happy, Color.parseColor("#333333"))
++    }
++
++    private fun darker(c: Int): Int = Color.rgb(
++        (Color.red(c) * 0.75f).toInt(), (Color.green(c) * 0.75f).toInt(), (Color.blue(c) * 0.75f).toInt())
++
++    private fun lighter(c: Int): Int = Color.rgb(
++        Color.red(c) + (255 - Color.red(c)) * 6 / 10,
++        Color.green(c) + (255 - Color.green(c)) * 6 / 10,
++        Color.blue(c) + (255 - Color.blue(c)) * 6 / 10)
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusPrefs.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusPrefs.kt
+new file mode 100644
+index 0000000..eb8de5a
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/PlusPrefs.kt
+@@ -0,0 +1,126 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import android.content.SharedPreferences
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import org.json.JSONArray
++import org.json.JSONObject
++import java.util.UUID
++
++/** One VPS the user added. No server is pre-filled. */
++data class VpsServer(
++    val id: String = UUID.randomUUID().toString(),
++    val name: String,
++    val host: String,
++    val port: Int = 22,
++    val user: String = "root",
++    val enabled: Boolean = true,
++    /** Last measured TCP connect latency in ms, -1 = unknown, -2 = unreachable. */
++    val lastLatencyMs: Int = -1,
++    val lastCheckedAt: Long = 0L,
++) {
++    val target: String get() = "$user@$host"
++}
++
++data class PlusState(
++    val workMode: String = MODE_LOCAL,
++    val servers: List<VpsServer> = emptyList(),
++    val wallpaper: String = "",          // "", "preset:<id>", "file:<version>"
++    val wallpaperDim: Float = 0.25f,
++    val petEnabled: Boolean = false,
++    val petStyle: String = "penguin",    // penguin | cat | ghost
++    val petColor: Int = 0xFF5B8DEF.toInt(),
++    val todayCollapsed: Boolean = false,
++    val autoFallback: Boolean = true,
++) {
++    val isVps: Boolean get() = workMode == MODE_VPS
++    val onlineServers: List<VpsServer> get() = servers.filter { it.enabled && it.lastLatencyMs >= 0 }
++
++    companion object {
++        const val MODE_LOCAL = "local"
++        const val MODE_VPS = "vps"
++    }
++}
++
++/**
++ * Minis Plus settings: work mode, VPS list, wallpaper, avatar / desk pet.
++ * Plain SharedPreferences (none of this is secret — SSH keys live in the
++ * sandbox, account secrets live in [PlusVault]). Exposed as a process-wide
++ * StateFlow so every screen updates live.
++ */
++object PlusPrefs {
++    private const val FILE = "minis_plus"
++    private val _state = MutableStateFlow(PlusState())
++    val state: StateFlow<PlusState> = _state.asStateFlow()
++    @Volatile private var prefs: SharedPreferences? = null
++
++    fun init(context: Context) {
++        if (prefs != null) return
++        synchronized(this) {
++            if (prefs != null) return
++            val p = context.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
++            prefs = p
++            _state.value = read(p)
++        }
++    }
++
++    private fun read(p: SharedPreferences): PlusState {
++        val servers = runCatching {
++            val arr = JSONArray(p.getString("servers", "[]"))
++            (0 until arr.length()).map { i ->
++                val o = arr.getJSONObject(i)
++                VpsServer(
++                    id = o.optString("id", UUID.randomUUID().toString()),
++                    name = o.optString("name"),
++                    host = o.optString("host"),
++                    port = o.optInt("port", 22),
++                    user = o.optString("user", "root"),
++                    enabled = o.optBoolean("enabled", true),
++                    lastLatencyMs = o.optInt("lat", -1),
++                    lastCheckedAt = o.optLong("checked", 0L),
++                )
++            }
++        }.getOrDefault(emptyList())
++        return PlusState(
++            workMode = p.getString("workMode", PlusState.MODE_LOCAL) ?: PlusState.MODE_LOCAL,
++            servers = servers,
++            wallpaper = p.getString("wallpaper", "") ?: "",
++            wallpaperDim = p.getFloat("wallpaperDim", 0.25f),
++            petEnabled = p.getBoolean("petEnabled", false),
++            petStyle = p.getString("petStyle", "penguin") ?: "penguin",
++            petColor = p.getInt("petColor", 0xFF5B8DEF.toInt()),
++            todayCollapsed = p.getBoolean("todayCollapsed", false),
++            autoFallback = p.getBoolean("autoFallback", true),
++        )
++    }
++
++    fun update(context: Context, block: (PlusState) -> PlusState) {
++        init(context)
++        val next = synchronized(this) {
++            val n = block(_state.value)
++            _state.value = n
++            n
++        }
++        val arr = JSONArray()
++        next.servers.forEach { s ->
++            arr.put(JSONObject().apply {
++                put("id", s.id); put("name", s.name); put("host", s.host)
++                put("port", s.port); put("user", s.user); put("enabled", s.enabled)
++                put("lat", s.lastLatencyMs); put("checked", s.lastCheckedAt)
++            })
++        }
++        prefs?.edit()
++            ?.putString("workMode", next.workMode)
++            ?.putString("servers", arr.toString())
++            ?.putString("wallpaper", next.wallpaper)
++            ?.putFloat("wallpaperDim", next.wallpaperDim)
++            ?.putBoolean("petEnabled", next.petEnabled)
++            ?.putString("petStyle", next.petStyle)
++            ?.putInt("petColor", next.petColor)
++            ?.putBoolean("todayCollapsed", next.todayCollapsed)
++            ?.putBoolean("autoFallback", next.autoFallback)
++            ?.apply()
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt
+new file mode 100644
+index 0000000..afa140b
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt
+@@ -0,0 +1,133 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import android.content.SharedPreferences
++import com.openminis.app.MinisApp
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import org.json.JSONArray
++import org.json.JSONObject
++
++/** A service the Connections page knows how to hold a credential for. */
++data class ConnectionKind(
++    val id: String,
++    val name: String,
++    val desc: String,
++    val color: Long,
++    val letter: String,
++    val accountLabel: String,
++    val secretLabel: String,
++    /** Env var the secret is exposed as (masked in transcripts by Minis' redactor). */
++    val envKey: String?,
++)
++
++data class ConnectionEntry(
++    val kindId: String,
++    val account: String,
++    val shareWithAi: Boolean,
++    val updatedAt: Long,
++)
++
++/**
++ * Account / credential vault behind the Connections page.
++ * Secrets are stored in Minis' existing AES-256-GCM EncryptedSharedPreferences
++ * (Android Keystore). The AI never reads the vault: when "交给 AI 使用" is on,
++ * the secret is injected into the sandbox as an env var, and Minis' env-var
++ * redactor masks the value in anything the model sees.
++ */
++object PlusVault {
++    val kinds: List<ConnectionKind> = listOf(
++        ConnectionKind("gemini", "Gemini", "实时语音、看图、长文本", 0xFF4285F4, "G", "备注", "API Key", "GEMINI_API_KEY"),
++        ConnectionKind("openai", "OpenAI", "GPT 模型与语音", 0xFF10A37F, "O", "备注", "API Key", "OPENAI_API_KEY"),
++        ConnectionKind("anthropic", "Claude", "Anthropic API", 0xFFD97757, "C", "备注", "API Key", "ANTHROPIC_API_KEY"),
++        ConnectionKind("github", "GitHub", "仓库、Actions、Release", 0xFF24292F, "GH", "用户名", "Token", "GITHUB_TOKEN"),
++        ConnectionKind("google", "Google", "Gmail、日历、云盘", 0xFFEA4335, "Go", "邮箱", "密码 / 应用专用密码", null),
++        ConnectionKind("cloudflare", "Cloudflare", "域名、DNS、Workers", 0xFFF38020, "CF", "邮箱", "API Token", "CLOUDFLARE_API_TOKEN"),
++        ConnectionKind("telegram", "Telegram Bot", "消息推送与机器人", 0xFF229ED9, "TG", "Bot 名称", "Bot Token", "TELEGRAM_BOT_TOKEN"),
++        ConnectionKind("okx", "OKX", "行情与交易（只读建议）", 0xFF000000, "OK", "API Key", "Secret", null),
++        ConnectionKind("binance", "Binance", "行情与交易（只读建议）", 0xFFF0B90B, "B", "API Key", "Secret", null),
++        ConnectionKind("custom", "其他账号", "任何网站的账号密码", 0xFF8E8E93, "+", "账号", "密码", null),
++    )
++
++    private const val META = "plus_vault_meta"
++    private const val SECRETS = "plus_vault_secrets"
++    private val _entries = MutableStateFlow<Map<String, ConnectionEntry>>(emptyMap())
++    val entries: StateFlow<Map<String, ConnectionEntry>> = _entries.asStateFlow()
++    @Volatile private var meta: SharedPreferences? = null
++    @Volatile private var secrets: SharedPreferences? = null
++
++    fun init(context: Context) {
++        if (meta != null) return
++        synchronized(this) {
++            if (meta != null) return
++            val ctx = context.applicationContext
++            val m = ctx.getSharedPreferences(META, Context.MODE_PRIVATE)
++            secrets = runCatching {
++                com.openminis.app.util.EncryptedPrefsFactory.safeCreate(ctx, SECRETS)
++            }.getOrNull()
++            meta = m
++            _entries.value = runCatching {
++                val arr = JSONArray(m.getString("entries", "[]"))
++                (0 until arr.length()).associate { i ->
++                    val o = arr.getJSONObject(i)
++                    val e = ConnectionEntry(o.getString("kind"), o.optString("account"),
++                        o.optBoolean("share", false), o.optLong("updated"))
++                    e.kindId to e
++                }
++            }.getOrDefault(emptyMap())
++        }
++    }
++
++    fun hasSecret(kindId: String): Boolean = secrets?.contains(kindId) == true
++
++    /** Masked preview only — the UI never shows the full secret. */
++    fun preview(kindId: String): String {
++        val s = secrets?.getString(kindId, null) ?: return ""
++        return if (s.length <= 4) "••••" else "••••" + s.takeLast(4)
++    }
++
++    fun save(context: Context, kind: ConnectionKind, account: String, secret: String?, share: Boolean) {
++        init(context)
++        if (secret != null && secret.isNotEmpty()) secrets?.edit()?.putString(kind.id, secret)?.apply()
++        val e = ConnectionEntry(kind.id, account.trim(), share, System.currentTimeMillis())
++        _entries.value = _entries.value + (kind.id to e)
++        persist()
++        syncEnv(context, kind, share)
++    }
++
++    fun remove(context: Context, kind: ConnectionKind) {
++        init(context)
++        secrets?.edit()?.remove(kind.id)?.apply()
++        _entries.value = _entries.value - kind.id
++        persist()
++        syncEnv(context, kind, false)
++    }
++
++    private fun persist() {
++        val arr = JSONArray()
++        _entries.value.values.forEach { e ->
++            arr.put(JSONObject().apply {
++                put("kind", e.kindId); put("account", e.account)
++                put("share", e.shareWithAi); put("updated", e.updatedAt)
++            })
++        }
++        meta?.edit()?.putString("entries", arr.toString())?.apply()
++    }
++
++    private fun syncEnv(context: Context, kind: ConnectionKind, share: Boolean) {
++        val key = kind.envKey ?: return
++        val app = context.applicationContext as? MinisApp ?: return
++        runCatching {
++            val repo = app.envVarRepository
++            val existing = repo.entries.value.firstOrNull { it.key == key }
++            val secret = secrets?.getString(kind.id, null)
++            if (share && secret != null) {
++                if (existing == null) repo.add(key, secret, "来自 账号连接 · ${kind.name}")
++                else repo.update(existing.id, key, secret, "来自 账号连接 · ${kind.name}")
++            } else if (existing != null && existing.note.startsWith("来自 账号连接")) {
++                repo.delete(existing.id)
++            }
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt
+new file mode 100644
+index 0000000..215306f
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt
+@@ -0,0 +1,117 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import android.util.Log
++import com.openminis.app.MinisApp
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.async
++import kotlinx.coroutines.awaitAll
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.isActive
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import java.net.InetSocketAddress
++import java.net.Socket
++
++/**
++ * Health checks for the user's VPS list, and the bridge into the sandbox.
++ *
++ * Every check opens a TCP connection to the SSH port and reads the server
++ * banner, so "online" means sshd is really answering (not just a ping).
++ * The ordered list of healthy servers is published to the sandbox as env
++ * vars, which `minis-vps` reads: it tries servers in order (lowest latency
++ * first) and moves to the next one when a connection fails. When every
++ * server is down and auto-fallback is on, the effective mode drops to local.
++ */
++object PlusVps {
++    private const val TAG = "PlusVps"
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++    private var monitor: Job? = null
++
++    /** Returns latency in ms, or -2 when unreachable / not an SSH server. */
++    suspend fun probe(server: VpsServer, timeoutMs: Int = 5000): Int = withContext(Dispatchers.IO) {
++        val start = System.nanoTime()
++        try {
++            Socket().use { sock ->
++                sock.connect(InetSocketAddress(server.host, server.port), timeoutMs)
++                val connectMs = ((System.nanoTime() - start) / 1_000_000).toInt()
++                sock.soTimeout = timeoutMs
++                val buf = ByteArray(64)
++                val n = sock.getInputStream().read(buf)
++                val banner = if (n > 0) String(buf, 0, n) else ""
++                if (banner.startsWith("SSH-")) connectMs else -2
++            }
++        } catch (e: Exception) {
++            Log.d(TAG, "probe ${server.host}:${server.port} failed: ${e.message}")
++            -2
++        }
++    }
++
++    suspend fun probeAll(context: Context) {
++        PlusPrefs.init(context)
++        val servers = PlusPrefs.state.value.servers
++        if (servers.isEmpty()) { syncToSandbox(context); return }
++        val results = withContext(Dispatchers.IO) {
++            servers.map { s -> async { s.id to (if (s.enabled) probe(s) else -1) } }.awaitAll()
++        }.toMap()
++        val now = System.currentTimeMillis()
++        PlusPrefs.update(context) { st ->
++            st.copy(servers = st.servers.map { s ->
++                val r = results[s.id] ?: return@map s
++                s.copy(lastLatencyMs = r, lastCheckedAt = now)
++            })
++        }
++        syncToSandbox(context)
++    }
++
++    /** Servers in the order minis-vps should try them. */
++    fun orderedTargets(st: PlusState): List<VpsServer> {
++        val enabled = st.servers.filter { it.enabled }
++        val online = enabled.filter { it.lastLatencyMs >= 0 }.sortedBy { it.lastLatencyMs }
++        val unknown = enabled.filter { it.lastLatencyMs == -1 }
++        return online + unknown
++    }
++
++    fun effectiveMode(st: PlusState): String {
++        if (!st.isVps) return PlusState.MODE_LOCAL
++        if (st.autoFallback && orderedTargets(st).isEmpty()) return PlusState.MODE_LOCAL
++        return PlusState.MODE_VPS
++    }
++
++    /** Publish work mode + server list into the sandbox environment. */
++    fun syncToSandbox(context: Context) {
++        val st = PlusPrefs.state.value
++        val list = orderedTargets(st).joinToString(",") { "${it.user}@${it.host}:${it.port}" }
++        val mode = effectiveMode(st)
++        val app = context.applicationContext as? MinisApp ?: return
++        runCatching {
++            val repo = app.envVarRepository
++            fun put(key: String, value: String, note: String) {
++                val existing = repo.entries.value.firstOrNull { it.key == key }
++                if (existing == null) repo.add(key, value, note)
++                else if (repo.getValue(key) != value) repo.update(existing.id, key, value, note)
++            }
++            put("MINIS_WORK_MODE", mode,
++                "Minis Plus 工作位置: local=手机沙箱, vps=把重任务交给 VPS（用 minis-vps run/bg 执行）")
++            put("MINIS_VPS_SERVERS", list.ifEmpty { "none" },
++                "Minis Plus 服务器列表，按延迟排序；minis-vps 自动选第一个可用的，断开切下一台")
++        }.onFailure { Log.w(TAG, "env sync failed: ${it.message}") }
++    }
++
++    /** Re-check servers every 90 s while VPS mode is on. */
++    fun startMonitor(context: Context) {
++        val appCtx = context.applicationContext
++        PlusPrefs.init(appCtx)
++        if (monitor?.isActive == true) return
++        monitor = scope.launch {
++            delay(3000)
++            while (isActive) {
++                if (PlusPrefs.state.value.isVps) runCatching { probeAll(appCtx) }
++                delay(90_000)
++            }
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/GlobalShellThrottle.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/GlobalShellThrottle.kt
+index d30794c..e7a3a6a 100644
+--- a/src/android/app/src/main/java/com/openminis/app/sandbox/GlobalShellThrottle.kt
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/GlobalShellThrottle.kt
+@@ -51,8 +51,14 @@ import kotlinx.coroutines.withTimeoutOrNull
+ object GlobalShellThrottle {
+     private const val TAG = "GlobalShellThrottle"
+ 
+-    /** Live Minis child processes the gate admits up to. */
+-    const val PROCESS_BUDGET = 16
++    /** Budget on a device that enforces the 32-process phantom limit. */
++    const val DEFAULT_PROCESS_BUDGET = 16
++
++    /**
++     * Live Minis child processes the gate admits up to. Raised by
++     * [PhantomProcessGuard] when the phantom-process killer is off.
++     */
++    val PROCESS_BUDGET: Int get() = PhantomProcessGuard.budget
+ 
+     /**
+      * What a command is assumed to cost before its processes show up in
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/NetIfacePublisher.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/NetIfacePublisher.kt
+new file mode 100644
+index 0000000..eae9a02
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/NetIfacePublisher.kt
+@@ -0,0 +1,103 @@
++package com.openminis.app.sandbox
++
++import android.content.Context
++import android.net.ConnectivityManager
++import android.net.LinkProperties
++import android.net.Network
++import android.util.Log
++import java.io.File
++import java.net.Inet4Address
++import java.net.Inet6Address
++
++/**
++ * [T-android-fake-netlink-real-ifaces] Publishes the device's real network
++ * interfaces to the sandbox.
++ *
++ * The guest cannot open a NETLINK_ROUTE socket (SELinux), so proot's
++ * `--fake-netlink` answers interface dumps itself. On its own it only knows
++ * loopback, so `ip addr`, Go's net.Interfaces(), Node's os.networkInterfaces()
++ * and friends saw a machine with no network ("没有 IP"). The app CAN ask
++ * ConnectivityManager, so it writes the active network's addresses to a small
++ * file that proot re-reads on every dump:
++ *
++ *     <ifname> <4|6> <address> <prefixlen>
++ *
++ * Only true addresses are written, so a guest that binds one gets a socket the
++ * kernel accepts. The default-network callback keeps the file current across
++ * Wi-Fi / mobile / VPN switches without restarting any shell.
++ */
++object NetIfacePublisher {
++    private const val TAG = "NetIfacePublisher"
++    const val ENV_KEY = "PROOT_FAKE_NETLINK_IFACES"
++
++    @Volatile private var callbackRegistered = false
++
++    private fun file(context: Context): File = File(PRootKernel.getProotTmpDir(context), "netifs")
++
++    /** Call from boot, before any shell spawns. Idempotent. */
++    fun start(context: Context) {
++        val app = context.applicationContext
++        val target = file(app)
++        PRootKernel.customEnvironment[ENV_KEY] = target.absolutePath
++
++        val cm = app.getSystemService(ConnectivityManager::class.java) ?: return
++        runCatching { write(target, cm.getLinkProperties(cm.activeNetwork)) }
++            .onFailure { Log.w(TAG, "initial snapshot failed: ${it.message}") }
++
++        if (callbackRegistered) return
++        runCatching {
++            cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
++                // linkAddresses can still be empty at onAvailable (VPN, dual
++                // stack coming up), so every event re-reads the current
++                // LinkProperties; writing the same content twice is harmless.
++                override fun onAvailable(network: Network) {
++                    write(target, cm.getLinkProperties(network))
++                }
++
++                override fun onCapabilitiesChanged(network: Network, caps: android.net.NetworkCapabilities) {
++                    write(target, cm.getLinkProperties(network))
++                }
++
++                override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
++                    write(target, lp)
++                }
++
++                override fun onLost(network: Network) {
++                    write(target, null)
++                }
++            })
++            callbackRegistered = true
++        }.onFailure { Log.w(TAG, "registerDefaultNetworkCallback failed: ${it.message}") }
++    }
++
++    @Synchronized
++    private fun write(target: File, lp: LinkProperties?) {
++        val sb = StringBuilder()
++        val seen = HashSet<String>()
++        if (lp != null) {
++            val name = lp.interfaceName?.takeIf { it.isNotBlank() && it.length < 16 } ?: "net0"
++            for (la in lp.linkAddresses) {
++                val addr = la.address
++                val family = when (addr) {
++                    is Inet4Address -> 4
++                    is Inet6Address -> 6
++                    else -> continue
++                }
++                val host = addr.hostAddress?.substringBefore('%') ?: continue
++                if (!seen.add(host)) continue
++                sb.append(name).append(' ').append(family).append(' ')
++                    .append(host).append(' ').append(la.prefixLength).append('\n')
++            }
++        }
++        runCatching {
++            target.parentFile?.mkdirs()
++            val tmp = File(target.parentFile, "netifs.tmp")
++            tmp.writeText(sb.toString())
++            if (!tmp.renameTo(target)) {
++                target.writeText(sb.toString())
++                tmp.delete()
++            }
++            Log.i(TAG, "published ${sb.lines().count { it.isNotBlank() }} address(es)")
++        }.onFailure { Log.w(TAG, "write failed: ${it.message}") }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/PRootKernel.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/PRootKernel.kt
+index 1310ec6..2b0dae1 100644
+--- a/src/android/app/src/main/java/com/openminis/app/sandbox/PRootKernel.kt
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/PRootKernel.kt
+@@ -209,6 +209,13 @@ object PRootKernel {
+         // proxy toggles without a restart.
+         customEnvironment.putAll(systemProxyEnv(context))
+ 
++        // [T-android-fake-netlink-real-ifaces] Let proot's fake netlink report
++        // the phone's real interfaces instead of loopback only.
++        NetIfacePublisher.start(context)
++
++        // [T-android-phantom-budget] Size the shell throttle to the device.
++        PhantomProcessGuard.refresh(context)
++
+         // Register global bind mounts so direct file I/O tools (file_read, file_edit)
+         // can resolve /var/minis/{memory,skills,shared}/... (idempotent).
+         registerGlobalBindMounts(context)
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/PhantomProcessGuard.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/PhantomProcessGuard.kt
+new file mode 100644
+index 0000000..5a069c4
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/PhantomProcessGuard.kt
+@@ -0,0 +1,66 @@
++package com.openminis.app.sandbox
++
++import android.content.Context
++import android.os.Build
++import android.provider.Settings
++import android.util.Log
++
++/**
++ * [T-android-phantom-budget] Sizes [GlobalShellThrottle]'s process budget to
++ * what the device actually enforces.
++ *
++ * The throttle exists because Android 12+ SIGKILLs an app's "phantom"
++ * (child) processes beyond 32, which is what tears down PRoot shells
++ * mid-command. Its budget of 16 is right for a stock phone, but it is also
++ * why a fast phone feels slow: commands queue behind each other even when the
++ * CPU is idle. When the killer is not in force (Android 11 and below, or the
++ * user turned it off with Developer options → "Disable child process
++ * restrictions", or Shizuku/adb ran
++ * `settings put global settings_enable_monitor_phantom_procs false`), the
++ * budget is raised so parallel work actually runs in parallel.
++ */
++object PhantomProcessGuard {
++    private const val TAG = "PhantomProcessGuard"
++    const val RELAXED_BUDGET = 64
++    private const val FLAG = "settings_enable_monitor_phantom_procs"
++
++    @Volatile
++    var budget: Int = GlobalShellThrottle.DEFAULT_PROCESS_BUDGET
++        private set
++
++    /** True when the phantom-process killer cannot fire on this device. */
++    fun killerDisabled(context: Context): Boolean {
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
++        val v = runCatching { Settings.Global.getString(context.contentResolver, FLAG) }.getOrNull()
++        if (v.equals("false", ignoreCase = true)) return true
++        // The other switch: `device_config put activity_manager
++        // max_phantom_processes <big>`. DeviceConfig is a system API, so read
++        // it reflectively; on builds where the app may not read it this
++        // returns null and we stay at the safe budget.
++        val max = maxPhantomProcesses()
++        return max != null && max >= RELAXED_BUDGET * 2
++    }
++
++    private fun maxPhantomProcesses(): Int? = runCatching {
++        val cls = Class.forName("android.provider.DeviceConfig")
++        val m = cls.getMethod("getInt", String::class.java, String::class.java, Int::class.javaPrimitiveType)
++        (m.invoke(null, "activity_manager", "max_phantom_processes", -1) as Int).takeIf { it > 0 }
++    }.getOrNull()
++
++    fun refresh(context: Context) {
++        val relaxed = killerDisabled(context)
++        budget = if (relaxed) RELAXED_BUDGET else GlobalShellThrottle.DEFAULT_PROCESS_BUDGET
++        Log.i(TAG, "phantom killer ${if (relaxed) "off" else "on"} -> process budget $budget")
++    }
++
++    /**
++     * Shell commands that switch the killer off; run them through Shizuku
++     * (`android-shizuku-cli`) or `adb shell`. Kept here so the agent and the
++     * UI quote the same thing.
++     */
++    val DISABLE_COMMANDS = listOf(
++        "settings put global $FLAG false",
++        "device_config set_sync_disabled_for_tests persistent",
++        "device_config put activity_manager max_phantom_processes 2147483647",
++    )
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/ShellTimeoutPolicy.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/ShellTimeoutPolicy.kt
+index e9aac6e..8ffdc40 100644
+--- a/src/android/app/src/main/java/com/openminis/app/sandbox/ShellTimeoutPolicy.kt
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/ShellTimeoutPolicy.kt
+@@ -50,7 +50,6 @@ object ShellTimeoutPolicy {
+     private val networkPrefixes = setOf(
+         "ping", "dig", "nslookup", "host", "traceroute",
+         "curl", "wget", "http",
+-        "ssh", "scp", "rsync",
+     )
+ 
+     /** Install commands — any of these (possibly with subcommand) triggers. */
+@@ -75,6 +74,10 @@ object ShellTimeoutPolicy {
+     /** Long-running / daemon drivers. */
+     private val longRunningPrefixes = setOf(
+         "watch",
++        // [T-android-ssh-timeout] Remote sessions: a deploy or a tail over ssh
++        // routinely outlives the 3-minute network bucket it used to share
++        // with curl, and being SIGKILLed mid-transfer is worse than waiting.
++        "ssh ", "scp ", "sftp ", "rsync ", "sshpass ", "autossh ", "mosh ", "minis-muse ",
+         "node --watch", "npm run dev", "npm run start", "npm start",
+         "python -m http.server",
+         "serve", "http-server",
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt
+index 0ff6192..5a6e608 100644
+--- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt
+@@ -243,7 +243,7 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
+                 val svc = MinisAccessibilityService.getInstance()
+                 val data = JSONObject()
+                     .put("running", svc != null)
+-                    .put("serviceName", MinisAccessibilityService.SERVICE_ID)
++                    .put("serviceName", MinisAccessibilityService.serviceId(context))
+                     .put("capabilities", JSONArray().apply {
+                         put("retrieveWindowContent"); put("performGestures"); put("watchEvents")
+                     })
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt
+index f410899..e44d214 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt
+@@ -4146,6 +4146,7 @@ fun ChatScreen(
+                 // initial list measure, or per-row composition.
+                 val perfFirstLayoutFired = remember(sessionId) { java.util.concurrent.atomic.AtomicBoolean(false) }
+                 Box {
++                com.openminis.app.ui.plus.ChatWallpaperLayer(Modifier.matchParentSize())
+                 AlwaysStretchOverscrollBox { sharedEffect ->
+                 LazyColumn(
+                     state = listState,
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt b/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
+index 9dd250d..4c53c6e 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
+@@ -515,6 +515,10 @@ fun AppNavigation(
+         quickActionStart != null -> quickActionStart
+         else -> Routes.SESSION_LIST
+     }
++    androidx.compose.runtime.DisposableEffect(navController) {
++        com.openminis.app.ui.plus.PlusNav.navigate = { route -> navController.safeNavigate(route) }
++        onDispose { com.openminis.app.ui.plus.PlusNav.navigate = null }
++    }
+     NavHost(
+         navController = navController,
+         startDestination = startDestination,
+@@ -608,8 +612,22 @@ fun AppNavigation(
+             )
+         }
+ 
++        composable(com.openminis.app.ui.plus.PlusRoutes.WORK) {
++            com.openminis.app.ui.plus.WorkLocationScreen(
++                onBack = { navController.safePopBackStack() },
++                onOpenTerminal = { cmd -> navController.safeNavigate(Routes.terminal(cmd)) },
++            )
++        }
++        composable(com.openminis.app.ui.plus.PlusRoutes.CONNECTIONS) {
++            com.openminis.app.ui.plus.ConnectionsScreen(onBack = { navController.safePopBackStack() })
++        }
++        composable(com.openminis.app.ui.plus.PlusRoutes.PERSONALIZE) {
++            com.openminis.app.ui.plus.PersonalizeScreen(onBack = { navController.safePopBackStack() })
++        }
++
+         composable(Routes.SETTINGS) {
+             SettingsScreen(
++                onPlusClick = { route -> navController.safeNavigate(route) },
+                 onBack = { navController.safePopBackStack() },
+                 onProvidersClick = { navController.safeNavigate(Routes.PROVIDER_LIST) },
+                 onModelGroupsClick = { navController.safeNavigate(Routes.MODEL_GROUPS) },
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
+new file mode 100644
+index 0000000..e7fb1d3
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
+@@ -0,0 +1,168 @@
++package com.openminis.app.ui.plus
++
++import androidx.compose.foundation.background
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
++import androidx.compose.material.icons.outlined.Lock
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.Icon
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.Switch
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.input.PasswordVisualTransformation
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import com.openminis.app.plus.ConnectionKind
++import com.openminis.app.plus.PlusVault
++
++@Composable
++fun ConnectionsScreen(onBack: () -> Unit) {
++    val context = LocalContext.current
++    PlusVault.init(context)
++    val entries by PlusVault.entries.collectAsState()
++    var open by remember { mutableStateOf<ConnectionKind?>(null) }
++
++    PlusPage("账号连接", onBack) {
++        Row(
++            Modifier.fillMaxWidth().padding(horizontal = 20.dp).padding(top = 12.dp),
++            verticalAlignment = Alignment.CenterVertically,
++        ) {
++            Icon(Icons.Outlined.Lock, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
++            Spacer(Modifier.width(8.dp))
++            Text(
++                "密钥加密存在这台手机里。AI 只能用，看不到明文。",
++                style = MaterialTheme.typography.bodyMedium,
++                color = MaterialTheme.colorScheme.onSurfaceVariant,
++            )
++        }
++        val connected = PlusVault.kinds.filter { entries.containsKey(it.id) }
++        val available = PlusVault.kinds.filterNot { entries.containsKey(it.id) }
++        if (connected.isNotEmpty()) {
++            PlusSection("已连接 · ${connected.size}") {
++                connected.forEachIndexed { i, k ->
++                    val e = entries[k.id]
++                    ConnectionRow(k, sub = buildString {
++                        append(e?.account?.ifBlank { null } ?: "已保存")
++                        val pv = PlusVault.preview(k.id)
++                        if (pv.isNotEmpty()) append(" · ").append(pv)
++                        if (e?.shareWithAi == true && k.envKey != null) append(" · AI 可用")
++                    }, connected = true) { open = k }
++                    if (i < connected.lastIndex) PlusDivider()
++                }
++            }
++        }
++        PlusSection("可以连接") {
++            available.forEachIndexed { i, k ->
++                ConnectionRow(k, sub = k.desc, connected = false) { open = k }
++                if (i < available.lastIndex) PlusDivider()
++            }
++        }
++    }
++
++    open?.let { k -> ConnectionDialog(k, onDismiss = { open = null }) }
++}
++
++@Composable
++private fun ConnectionRow(k: ConnectionKind, sub: String, connected: Boolean, onClick: () -> Unit) {
++    Row(
++        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 12.dp),
++        verticalAlignment = Alignment.CenterVertically,
++    ) {
++        Box(
++            Modifier.size(38.dp).background(Color(k.color), RoundedCornerShape(10.dp)),
++            contentAlignment = Alignment.Center,
++        ) {
++            Text(k.letter, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp)
++        }
++        Spacer(Modifier.width(14.dp))
++        Column(Modifier.weight(1f)) {
++            Text(k.name, style = MaterialTheme.typography.bodyLarge)
++            Text(sub, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
++        }
++        if (connected) {
++            Text("已连接", color = Color(0xFF34C759), style = MaterialTheme.typography.labelMedium)
++        } else {
++            Text("连接", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelLarge)
++        }
++        Icon(
++            Icons.AutoMirrored.Filled.KeyboardArrowRight, null,
++            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
++        )
++    }
++}
++
++@Composable
++private fun ConnectionDialog(k: ConnectionKind, onDismiss: () -> Unit) {
++    val context = LocalContext.current
++    val existing = PlusVault.entries.value[k.id]
++    var account by remember { mutableStateOf(existing?.account ?: "") }
++    var secret by remember { mutableStateOf("") }
++    var share by remember { mutableStateOf(existing?.shareWithAi ?: (k.envKey != null)) }
++    val hasSaved = PlusVault.hasSecret(k.id)
++    AlertDialog(
++        onDismissRequest = onDismiss,
++        title = { Text(k.name) },
++        text = {
++            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
++                OutlinedTextField(account, { account = it }, label = { Text(k.accountLabel) }, singleLine = true)
++                OutlinedTextField(
++                    secret, { secret = it },
++                    label = { Text(if (hasSaved) "${k.secretLabel}（留空=不改）" else k.secretLabel) },
++                    singleLine = true,
++                    visualTransformation = PasswordVisualTransformation(),
++                )
++                if (k.envKey != null) {
++                    Row(verticalAlignment = Alignment.CenterVertically) {
++                        Column(Modifier.weight(1f)) {
++                            Text("交给 AI 使用")
++                            Text(
++                                "以 ${k.envKey} 提供给沙箱，聊天里自动打码",
++                                style = MaterialTheme.typography.bodySmall,
++                                color = MaterialTheme.colorScheme.onSurfaceVariant,
++                            )
++                        }
++                        Switch(share, onCheckedChange = { share = it })
++                    }
++                }
++            }
++        },
++        confirmButton = {
++            TextButton(
++                enabled = secret.isNotEmpty() || hasSaved || account.isNotBlank(),
++                onClick = { PlusVault.save(context, k, account, secret.ifEmpty { null }, share); onDismiss() },
++            ) { Text("保存") }
++        },
++        dismissButton = {
++            Row {
++                if (existing != null) TextButton(onClick = { PlusVault.remove(context, k); onDismiss() }) {
++                    Text("断开", color = Color(0xFFFF3B30))
++                }
++                TextButton(onClick = onDismiss) { Text("取消") }
++            }
++        },
++    )
++}
