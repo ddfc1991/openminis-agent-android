@@ -1,0 +1,1492 @@
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
+new file mode 100644
+index 0000000..862d521
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
+@@ -0,0 +1,705 @@
++package com.openminis.app.ui.plus
++
++import android.Manifest
++import android.content.ClipData
++import android.content.ClipboardManager
++import android.content.Context
++import android.content.Intent
++import android.content.pm.PackageManager
++import android.provider.Settings
++import android.widget.Toast
++import androidx.activity.compose.BackHandler
++import androidx.activity.compose.rememberLauncherForActivityResult
++import androidx.activity.result.contract.ActivityResultContracts
++import androidx.compose.foundation.BorderStroke
++import androidx.compose.foundation.Image
++import androidx.compose.foundation.background
++import androidx.compose.foundation.border
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.horizontalScroll
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
++import androidx.compose.material.icons.outlined.Add
++import androidx.compose.material.icons.outlined.ContentPaste
++import androidx.compose.material.icons.outlined.Language
++import androidx.compose.material.icons.outlined.Lock
++import androidx.compose.material.icons.outlined.StarBorder
++import androidx.compose.material.icons.filled.Star
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.Button
++import androidx.compose.material3.ButtonDefaults
++import androidx.compose.material3.FilledTonalButton
++import androidx.compose.material3.Icon
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedButton
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.Switch
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.saveable.rememberSaveable
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.platform.LocalLifecycleOwner
++import androidx.compose.ui.res.painterResource
++import androidx.compose.ui.text.font.FontFamily
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.input.PasswordVisualTransformation
++import androidx.compose.ui.unit.Dp
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.LifecycleEventObserver
++import com.openminis.app.browser.GoogleAuthRouter
++import com.openminis.app.plus.ConnMethod
++import com.openminis.app.plus.ConnectionKind
++import com.openminis.app.plus.PermLevel
++import com.openminis.app.plus.PlusConnect
++import com.openminis.app.plus.PlusVault
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import java.text.SimpleDateFormat
++import java.util.Date
++import java.util.Locale
++
++private val Green = Color(0xFF34C759)
++private val Red = Color(0xFFFF3B30)
++
++/** Which full-screen web page the Connections flow is showing. */
++private data class WebReq(val kindId: String, val url: String, val detect: Boolean, val title: String)
++
++@Composable
++fun ConnectionsScreen(onBack: () -> Unit) {
++    val context = LocalContext.current
++    PlusVault.init(context)
++    val entries by PlusVault.entries.collectAsState()
++    var detailId by rememberSaveable { mutableStateOf<String?>(null) }
++    var autoStart by rememberSaveable { mutableStateOf(false) }
++    var web by remember { mutableStateOf<WebReq?>(null) }
++    var addSite by remember { mutableStateOf(false) }
++
++    fun startWeb(k: ConnectionKind) {
++        val url = k.loginUrl ?: return
++        PlusConnect.restoreCookies(k)
++        web = WebReq(k.id, url, detect = true, title = "登录 ${k.name}")
++    }
++
++    fun connect(k: ConnectionKind) {
++        when (k.method) {
++            ConnMethod.WEB -> startWeb(k)
++            else -> { autoStart = true; detailId = k.id }
++        }
++    }
++
++    /** Another account of an already connected service. */
++    fun addAccount(base: ConnectionKind) {
++        val k = PlusVault.kind(PlusVault.newAccountId(base.id)) ?: return
++        if (k.method == ConnMethod.WEB) {
++            // One cookie jar per site: park the current account's session, then sign in fresh.
++            PlusVault.defaultAccount(base.id)?.let { cur ->
++                PlusVault.kind(cur)?.let { ck ->
++                    PlusConnect.snapshotCookies(ck, listOfNotNull(ck.loginUrl, ck.panelUrl))
++                    PlusConnect.clearCookies(ck)
++                }
++            }
++            web = WebReq(k.id, k.loginUrl ?: return, detect = true, title = "添加 ${base.name} 账号")
++        } else connect(k)
++    }
++
++    val w = web
++    if (w != null) {
++        val k = PlusVault.kind(w.kindId)
++        BackHandler { web = null }
++        if (k != null) WebLoginScreen(
++            kind = k, url = w.url, title = w.title, detect = w.detect,
++            onDone = { account, urls ->
++                PlusConnect.snapshotCookies(k, urls)
++                if (w.detect) {
++                    PlusVault.save(context, k, account.ifBlank { PlusVault.entries.value[k.id]?.account?.ifBlank { null } ?: if (k.id.startsWith("site:")) "网页登录" else "" }, null,
++                        share = PlusVault.entries.value[k.id]?.shareWithAi ?: false,
++                        via = if (PlusVault.entries.value[k.id]?.via == "oauth") "oauth" else "web")
++                    // The shared cookie jar now holds this account, so it is the default one.
++                    if (k.method == ConnMethod.WEB) PlusVault.setDefault(context, k.id, swapCookies = false)
++                    Toast.makeText(context, "已连接 ${k.name}", Toast.LENGTH_SHORT).show()
++                    detailId = k.id
++                }
++                web = null
++            },
++            onClose = { web = null },
++        )
++        return
++    }
++
++    val d = detailId?.let { PlusVault.kind(it) }
++    if (d != null) {
++        BackHandler { detailId = null; autoStart = false }
++        ConnectionDetailScreen(
++            kind = d,
++            autoStart = autoStart,
++            onBack = { detailId = null; autoStart = false },
++            onWeb = { url, detect, title -> web = WebReq(d.id, url, detect, title) },
++        )
++        return
++    }
++
++    PlusPage("账号连接", onBack) {
++        Row(
++            Modifier.fillMaxWidth().padding(horizontal = 20.dp).padding(top = 12.dp),
++            verticalAlignment = Alignment.CenterVertically,
++        ) {
++            Icon(Icons.Outlined.Lock, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
++            Spacer(Modifier.width(8.dp))
++            Text(
++                "点「连接」会打开官方登录页，登录好自动回来。密钥和登录状态加密存在这台手机里。",
++                style = MaterialTheme.typography.bodyMedium,
++                color = MaterialTheme.colorScheme.onSurfaceVariant,
++            )
++        }
++        val bases = entries.keys.map { PlusVault.baseId(it) }.distinct().sorted().mapNotNull { PlusVault.kind(it) }
++        if (bases.isNotEmpty()) {
++            PlusSection("已连接 · ${entries.size} 个账号", footer = "每个服务可以连多个账号。点 ☆ 设为默认账号：AI 不指定账号时用默认的。") {
++                bases.forEachIndexed { i, base ->
++                    val ids = PlusVault.accountsOf(base.id)
++                    val def = PlusVault.defaultAccount(base.id)
++                    Row(
++                        Modifier.fillMaxWidth().heightIn(min = 64.dp).padding(start = 14.dp, end = 8.dp, top = 10.dp),
++                        verticalAlignment = Alignment.CenterVertically,
++                    ) {
++                        BrandIcon(base)
++                        Spacer(Modifier.width(14.dp))
++                        Text(base.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
++                        TextButton(onClick = { addAccount(base) }, modifier = Modifier.heightIn(min = 44.dp)) {
++                            Icon(Icons.Outlined.Add, null, modifier = Modifier.size(20.dp))
++                            Spacer(Modifier.width(4.dp))
++                            Text("添加账号", fontSize = 16.sp)
++                        }
++                    }
++                    ids.forEach { id ->
++                        val e = entries[id]
++                        val isDef = id == def
++                        Row(
++                            Modifier.fillMaxWidth().heightIn(min = 56.dp).clickable { detailId = id }
++                                .padding(start = 58.dp, end = 8.dp),
++                            verticalAlignment = Alignment.CenterVertically,
++                        ) {
++                            androidx.compose.material3.IconButton(onClick = { if (!isDef) PlusVault.setDefault(context, id) }) {
++                                Icon(if (isDef) Icons.Filled.Star else Icons.Outlined.StarBorder,
++                                    contentDescription = if (isDef) "默认账号" else "设为默认",
++                                    tint = if (isDef) Color(0xFFFFB300) else MaterialTheme.colorScheme.onSurfaceVariant)
++                            }
++                            Column(Modifier.weight(1f)) {
++                                Text(e?.account?.takeIf { it.isNotBlank() } ?: "账号 ${id.substringAfter('#', "1")}",
++                                    style = MaterialTheme.typography.bodyLarge)
++                                Text(if (isDef) "已连接 · 默认" else "已连接", style = MaterialTheme.typography.bodyMedium, color = Green)
++                            }
++                            Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
++                        }
++                    }
++                    if (i < bases.lastIndex) PlusDivider()
++                }
++            }
++        }
++        PlusVault.groups.forEach { g ->
++            val connectedBases = entries.keys.map { PlusVault.baseId(it) }.toSet()
++            val list = PlusVault.kindsIn(g).filterNot { it.id in connectedBases }
++            if (list.isEmpty()) return@forEach
++            PlusSection(g) {
++                list.forEachIndexed { i, k ->
++                    ConnectionRow(k, sub = k.desc, connected = false, onConnect = { connect(k) }) { detailId = k.id }
++                    if (i < list.lastIndex) PlusDivider()
++                }
++            }
++        }
++        PlusSection(PlusVault.G_OTHER, footer = "任何网站都行，比如服务器面板：输入网址，在 Mines 浏览器里登录一次，AI 的浏览器也就能用这个登录。") {
++            Row(
++                Modifier.fillMaxWidth().heightIn(min = 64.dp).clickable { addSite = true }.padding(horizontal = 14.dp, vertical = 12.dp),
++                verticalAlignment = Alignment.CenterVertically,
++            ) {
++                Box(Modifier.size(44.dp).clip(RoundedCornerShape(12.dp)).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)),
++                    contentAlignment = Alignment.Center) {
++                    Icon(Icons.Outlined.Add, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(26.dp))
++                }
++                Spacer(Modifier.width(14.dp))
++                Text("添加网站登录", style = MaterialTheme.typography.titleMedium)
++            }
++        }
++    }
++
++    if (addSite) {
++        var url by remember { mutableStateOf("") }
++        AlertDialog(
++            onDismissRequest = { addSite = false },
++            title = { Text("其他网站") },
++            text = {
++                OutlinedTextField(url, { url = it }, label = { Text("网址，例如 panel.example.com") }, singleLine = true,
++                    textStyle = MaterialTheme.typography.titleMedium)
++            },
++            confirmButton = {
++                Button(enabled = url.isNotBlank(), onClick = {
++                    val full = url.trim().let { if (it.startsWith("http")) it else "https://$it" }
++                    val host = PlusConnect.hostOf(full)
++                    if (host.isNotEmpty()) {
++                        val k = PlusVault.siteKind(host, full)
++                        PlusVault.setExtra(k.id, "url", full)
++                        addSite = false
++                        // No sign-in rule for an arbitrary site: the page's 我已登录 button saves it.
++                        web = WebReq(k.id, full, detect = true, title = "登录 $host")
++                    }
++                }) { Text("打开登录页") }
++            },
++            dismissButton = { TextButton(onClick = { addSite = false }) { Text("取消") } },
++        )
++    }
++
++}
++
++@Composable
++fun BrandIcon(kind: ConnectionKind, size: Dp = 44.dp) {
++    Box(
++        Modifier.size(size).clip(RoundedCornerShape(size * 0.27f)).background(Color.White)
++            .border(BorderStroke(1.dp, Color(0x1F000000)), RoundedCornerShape(size * 0.27f)),
++        contentAlignment = Alignment.Center,
++    ) {
++        if (kind.icon != 0) Image(painterResource(kind.icon), contentDescription = kind.name, modifier = Modifier.size(size * 0.62f))
++        else Icon(Icons.Outlined.Language, contentDescription = kind.name, tint = Color(0xFF5B6B7F), modifier = Modifier.size(size * 0.62f))
++    }
++}
++
++@Composable
++private fun ConnectionRow(k: ConnectionKind, sub: String, connected: Boolean, onConnect: () -> Unit, onClick: () -> Unit) {
++    Row(
++        Modifier.fillMaxWidth().heightIn(min = 68.dp).clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 10.dp),
++        verticalAlignment = Alignment.CenterVertically,
++    ) {
++        BrandIcon(k)
++        Spacer(Modifier.width(14.dp))
++        Column(Modifier.weight(1f)) {
++            Text(k.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Medium)
++            Text(sub, style = MaterialTheme.typography.bodyMedium, color = if (connected) Green else MaterialTheme.colorScheme.onSurfaceVariant,
++                maxLines = 2)
++        }
++        Spacer(Modifier.width(8.dp))
++        if (connected) {
++            Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
++        } else {
++            FilledTonalButton(onClick = onConnect, modifier = Modifier.heightIn(min = 44.dp)) {
++                Text("连接", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
++            }
++        }
++    }
++}
++
++private fun openExternal(context: Context, url: String) = GoogleAuthRouter.openInCustomTab(context, url)
++
++@Composable
++private fun ConnectionDetailScreen(
++    kind: ConnectionKind,
++    autoStart: Boolean,
++    onBack: () -> Unit,
++    onWeb: (url: String, detect: Boolean, title: String) -> Unit,
++) {
++    val context = LocalContext.current
++    val entries by PlusVault.entries.collectAsState()
++    val permVersion by PlusVault.permVersion.collectAsState()
++    val entry = entries[kind.id]
++    val scope = rememberCoroutineScope()
++
++    // Resume counter: drives the clipboard check and the accessibility check after returning from another app.
++    var resumes by remember { mutableIntStateOf(0) }
++    val owner = LocalLifecycleOwner.current
++    DisposableEffect(owner) {
++        val obs = LifecycleEventObserver { _, e -> if (e == Lifecycle.Event.ON_RESUME) resumes++ }
++        owner.lifecycle.addObserver(obs)
++        onDispose { owner.lifecycle.removeObserver(obs) }
++    }
++
++    PlusPage(kind.name, onBack) {
++        // ---- header ----
++        Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 16.dp), verticalAlignment = Alignment.CenterVertically) {
++            BrandIcon(kind, 64.dp)
++            Spacer(Modifier.width(16.dp))
++            Column(Modifier.weight(1f)) {
++                Text(kind.name, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
++                Text(
++                    if (entry != null) "已连接" + (entry.account.takeIf { it.isNotBlank() }?.let { " · $it" } ?: "") else kind.desc,
++                    style = MaterialTheme.typography.bodyLarge,
++                    color = if (entry != null) Green else MaterialTheme.colorScheme.onSurfaceVariant,
++                )
++            }
++            if (entry != null) {
++                OutlinedButton(
++                    onClick = {
++                        if (kind.method == ConnMethod.WEB && PlusVault.defaultAccount(PlusVault.baseId(kind.id)) == kind.id) PlusConnect.clearCookies(kind)
++                        PlusConnect.setKeepAlive(context, kind.id, false)
++                        PlusVault.remove(context, kind)
++                        Toast.makeText(context, "已断开 ${kind.name}", Toast.LENGTH_SHORT).show()
++                    },
++                    border = BorderStroke(1.dp, Red),
++                    modifier = Modifier.heightIn(min = 44.dp),
++                ) { Text("断开", color = Red, fontSize = 16.sp) }
++            }
++        }
++
++        val siblings = PlusVault.accountsOf(PlusVault.baseId(kind.id))
++        if (entry != null && siblings.size > 1) {
++            val isDef = PlusVault.defaultAccount(PlusVault.baseId(kind.id)) == kind.id
++            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
++                Icon(if (isDef) Icons.Filled.Star else Icons.Outlined.StarBorder, null,
++                    tint = if (isDef) Color(0xFFFFB300) else MaterialTheme.colorScheme.onSurfaceVariant)
++                Spacer(Modifier.width(8.dp))
++                Text(if (isDef) "默认账号：AI 不指定账号时用它" else "不是默认账号", style = MaterialTheme.typography.bodyLarge,
++                    modifier = Modifier.weight(1f))
++                if (!isDef) TextButton(onClick = { PlusVault.setDefault(context, kind.id) }) { Text("设为默认", fontSize = 16.sp) }
++            }
++        }
++
++        // ---- how to connect ----
++        when (kind.method) {
++            ConnMethod.WEB -> PlusSection(null, footer = "在 Mines 自带的浏览器里登录官方网页，登录成功会自动关闭。AI 的浏览器工具共用这个登录。") {
++                BigAction(if (entry == null) "连接（打开 ${kind.name} 登录页）" else "重新登录") {
++                    if (entry != null && PlusVault.defaultAccount(PlusVault.baseId(kind.id)) != kind.id) PlusVault.setDefault(context, kind.id)
++                    PlusConnect.restoreCookies(kind)
++                    onWeb(kind.loginUrl ?: "", true, "登录 ${kind.name}")
++                }
++                LaunchedEffect(Unit) { if (autoStart && entry == null) onWeb(kind.loginUrl ?: "", true, "登录 ${kind.name}") }
++            }
++            ConnMethod.GOOGLE -> PlusSection(null,
++                footer = "Google 不允许在 App 内嵌网页里登录，所以这里用 Chrome 打开官方登录页。让 AI 读写邮件请连接「Gmail」，看日历请连接「Google 日历」。") {
++                BigAction("在 Chrome 里登录 Google") { openExternal(context, kind.loginUrl ?: "https://accounts.google.com/") }
++                if (entry == null) SecondaryAction("我已经登录好了") {
++                    PlusVault.save(context, kind, "Chrome 已登录", null, share = false, via = "chrome")
++                }
++            }
++            ConnMethod.GITHUB, ConnMethod.MICROSOFT -> DeviceFlowBlock(kind, autoStart && entry == null, onWeb)
++            ConnMethod.KEY -> KeyBlock(kind, resumes, autoStart && entry == null)
++            ConnMethod.CALENDAR -> CalendarBlock(kind)
++            ConnMethod.A11Y -> A11yBlock(kind, resumes)
++        }
++        if (kind.alsoKey && kind.method == ConnMethod.WEB) {
++            PlusSection("也可以只用 ${kind.keyLabel}", footer = "用 ${kind.keyLabel} 时，AI 在沙箱里通过 ${kind.envKey} 调 API，不需要邮箱。") {
++                KeyBlockBody(kind, resumes, false)
++            }
++        }
++
++        // ---- AI access ----
++        val secretEnv = kind.envKey != null && PlusVault.hasSecret(kind.id)
++        if (entry != null && secretEnv) {
++            PlusSection(null) {
++                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
++                    Column(Modifier.weight(1f)) {
++                        Text("交给 AI 使用", style = MaterialTheme.typography.titleMedium)
++                        Text("以 ${kind.envKey} 提供给沙箱，聊天里自动打码", style = MaterialTheme.typography.bodyMedium,
++                            color = MaterialTheme.colorScheme.onSurfaceVariant)
++                    }
++                    Switch(entry.shareWithAi, onCheckedChange = { PlusVault.setShare(context, kind, it) })
++                }
++            }
++        }
++
++        // ---- panel links + keep-alive ----
++        if (kind.panelUrl != null && entry != null) {
++            PlusSection("控制台") {
++                BigAction("打开${if (kind.id == "wispbyte") "面板" else "控制台"}") { onWeb(kind.panelUrl, false, kind.name) }
++                if (kind.id == "wispbyte") {
++                    SecondaryAction("创建服务器") { onWeb("https://wispbyte.com/client/create", false, "创建服务器") }
++                    var on by remember { mutableStateOf(PlusConnect.keepAliveOn(context, kind.id)) }
++                    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
++                        Column(Modifier.weight(1f)) {
++                            Text("保活", style = MaterialTheme.typography.titleMedium)
++                            val last = PlusVault.extra(kind.id, "keepalive_last")?.toLongOrNull()
++                            Text(
++                                "免费服务器两周不登录会被归档。打开后每 10 天在后台用已保存的登录打开一次面板；登录失效会发通知提醒你。" +
++                                    (last?.let { "\n上次：" + SimpleDateFormat("M月d日 HH:mm", Locale.CHINA).format(Date(it)) } ?: ""),
++                                style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
++                            )
++                        }
++                        Switch(on, onCheckedChange = {
++                            on = it
++                            PlusConnect.setKeepAlive(context, kind.id, it)
++                            if (it) PlusConnect.runKeepAlive(context, kind.id) {}
++                        })
++                    }
++                }
++            }
++        }
++
++        // ---- permissions ----
++        val caps = PlusVault.capabilities(kind.profile)
++        listOf("读取权限", "写入和删除权限", "Background actions").forEachIndexed { sec, title ->
++            val rows = caps.filter { it.section == sec }
++            if (rows.isEmpty()) return@forEachIndexed
++            PlusSection(title, footer = if (sec == 1) "「询问」会在 AI 动手前弹出确认卡片，你点同意它才做。支付和交易永远要问你。" else null) {
++                rows.forEachIndexed { i, cap ->
++                    @Suppress("UNUSED_EXPRESSION") permVersion
++                    val cur = PlusVault.level(kind, cap)
++                    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp)) {
++                        Text(cap.label + if (cap.locked) "（固定）" else "", style = MaterialTheme.typography.titleMedium)
++                        Spacer(Modifier.height(8.dp))
++                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                            PermLevel.entries.forEach { lv ->
++                                val sel = cur == lv
++                                val color = when (lv) { PermLevel.ALLOW -> Green; PermLevel.ASK -> Color(0xFFFF9500); PermLevel.DENY -> Red }
++                                Box(
++                                    Modifier.weight(1f).heightIn(min = 46.dp).clip(RoundedCornerShape(12.dp))
++                                        .background(if (sel) color.copy(alpha = 0.16f) else MaterialTheme.colorScheme.surface)
++                                        .border(BorderStroke(if (sel) 2.dp else 1.dp, if (sel) color else MaterialTheme.colorScheme.outlineVariant), RoundedCornerShape(12.dp))
++                                        .clickable(enabled = !cap.locked) { PlusVault.setLevel(kind, cap, lv) },
++                                    contentAlignment = Alignment.Center,
++                                ) {
++                                    Text(lv.label, fontSize = 16.sp, fontWeight = if (sel) FontWeight.Bold else FontWeight.Normal,
++                                        color = if (sel) color else if (cap.locked) MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
++                                        else MaterialTheme.colorScheme.onSurface)
++                                }
++                            }
++                        }
++                    }
++                    if (i < rows.lastIndex) PlusDivider()
++                }
++            }
++        }
++    }
++}
++
++@Composable
++private fun BigAction(text: String, onClick: () -> Unit) {
++    Button(
++        onClick = onClick,
++        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp).heightIn(min = 56.dp),
++        shape = RoundedCornerShape(14.dp),
++    ) { Text(text, fontSize = 18.sp, fontWeight = FontWeight.SemiBold) }
++}
++
++@Composable
++private fun SecondaryAction(text: String, onClick: () -> Unit) {
++    OutlinedButton(
++        onClick = onClick,
++        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp).padding(bottom = 10.dp).heightIn(min = 52.dp),
++        shape = RoundedCornerShape(14.dp),
++    ) { Text(text, fontSize = 17.sp) }
++}
++
++/** GitHub / Microsoft: OAuth device flow with the code shown big, copied, and the official page opened. */
++@Composable
++private fun DeviceFlowBlock(kind: ConnectionKind, autoStart: Boolean, onWeb: (String, Boolean, String) -> Unit) {
++    val context = LocalContext.current
++    val scope = rememberCoroutineScope()
++    var code by remember { mutableStateOf<PlusConnect.DeviceCode?>(null) }
++    var status by remember { mutableStateOf("") }
++    var busy by remember { mutableStateOf(false) }
++
++    fun start() {
++        if (busy) return
++        busy = true; status = "正在向 ${kind.name} 申请授权码…"
++        scope.launch {
++            val dc = withContext(Dispatchers.IO) { runCatching { PlusConnect.startDevice(kind.id) } }
++            dc.onFailure { status = "申请失败：${it.message}"; busy = false }
++            val c = dc.getOrNull() ?: return@launch
++            code = c
++            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
++            cm.setPrimaryClip(ClipData.newPlainText("授权码", c.userCode))
++            status = "授权码已复制。在打开的页面粘贴它，点授权。"
++            delay(1200)
++            openExternal(context, c.verifyUrl)
++            var interval = c.interval.coerceAtLeast(5)
++            val until = System.currentTimeMillis() + c.expiresIn * 1000L
++            while (System.currentTimeMillis() < until) {
++                delay(interval * 1000L)
++                when (val r = withContext(Dispatchers.IO) { PlusConnect.pollDevice(kind.id, c) }) {
++                    is PlusConnect.PollResult.Done -> {
++                        val who = withContext(Dispatchers.IO) { PlusConnect.whoAmI(kind.id, r.token) }
++                        PlusConnect.saveOAuth(context, kind, r, who)
++                        status = "已连接" + if (who.isNotBlank()) " · $who" else ""
++                        code = null; busy = false
++                        Toast.makeText(context, "已连接 ${kind.name}", Toast.LENGTH_SHORT).show()
++                        return@launch
++                    }
++                    PlusConnect.PollResult.SlowDown -> interval += 5
++                    PlusConnect.PollResult.Pending -> Unit
++                    is PlusConnect.PollResult.Failed -> { status = "没有授权：${r.message}"; code = null; busy = false; return@launch }
++                }
++            }
++            status = "授权码过期了，再点一次「一键授权」。"; code = null; busy = false
++        }
++    }
++    LaunchedEffect(Unit) { if (autoStart) start() }
++
++    PlusSection(null, footer = if (kind.method == ConnMethod.GITHUB)
++        "授权后 AI 可以用 GITHUB_TOKEN 操作你的仓库（推送、删除等会先问你）。" else
++        "授权后 AI 用 Microsoft Graph 读写 Outlook 邮件和日历。若公司账号被管理员禁止，可以改用下面的网页登录。") {
++        val c = code
++        if (c != null) {
++            Column(Modifier.fillMaxWidth().padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
++                Text("你的授权码", style = MaterialTheme.typography.titleMedium)
++                Spacer(Modifier.height(8.dp))
++                Text(c.userCode, fontSize = 40.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace, letterSpacing = 4.sp,
++                    color = MaterialTheme.colorScheme.primary)
++                Spacer(Modifier.height(8.dp))
++                Text(status, style = MaterialTheme.typography.bodyLarge)
++            }
++            SecondaryAction("再打开授权页") { openExternal(context, c.verifyUrl) }
++        } else {
++            BigAction(if (PlusVault.entries.value.containsKey(kind.id)) "重新授权" else "一键授权") { start() }
++            if (status.isNotEmpty()) Text(status, style = MaterialTheme.typography.bodyLarge,
++                modifier = Modifier.padding(horizontal = 16.dp).padding(bottom = 10.dp))
++        }
++        if (kind.loginUrl != null) SecondaryAction(if (kind.method == ConnMethod.GITHUB) "也在 Mines 浏览器里登录 GitHub 网页" else "网页登录 Outlook") {
++            onWeb(kind.loginUrl, true, "登录 ${kind.name}")
++        }
++    }
++}
++
++@Composable
++private fun KeyBlock(kind: ConnectionKind, resumes: Int, autoStart: Boolean) {
++    PlusSection(null, footer = "点「去获取密钥」会打开官方页面。复制密钥后回到这里，Mines 会自动发现剪贴板里的密钥。") {
++        KeyBlockBody(kind, resumes, autoStart)
++    }
++}
++
++@Composable
++private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean) {
++    val context = LocalContext.current
++    val existing = PlusVault.entries.value[kind.id]
++    var found by remember { mutableStateOf<String?>(null) }
++    var manual by remember { mutableStateOf("") }
++    var account by remember { mutableStateOf(existing?.account ?: "") }
++    var model by remember { mutableStateOf(PlusVault.extra(kind.id, "model") ?: com.openminis.app.plus.GeminiLive.DEFAULT_MODEL) }
++    var voice by remember { mutableStateOf(PlusVault.extra(kind.id, "voice") ?: "Puck") }
++    val needsAccount = kind.id == "gmail"
++
++    LaunchedEffect(resumes) {
++        // Clipboard reads need window focus on Android 10+: try twice shortly after resuming.
++        repeat(2) {
++            delay(if (it == 0) 450 else 1200)
++            val k = PlusConnect.keyOnClipboard(context, kind)
++            if (k != null && k != PlusVault.secret(kind.id)) { found = k; return@LaunchedEffect }
++        }
++    }
++    LaunchedEffect(Unit) { if (autoStart && kind.keyUrl != null && kind.method == ConnMethod.KEY) { delay(300); openExternal(context, kind.keyUrl) } }
++
++    fun save(secret: String) {
++        if (kind.id == "gemini") { PlusVault.setExtra(kind.id, "model", model); PlusVault.setExtra(kind.id, "voice", voice) }
++        PlusVault.save(context, kind, account.ifBlank { existing?.account ?: "" }, secret,
++            share = existing?.shareWithAi ?: (kind.envKey != null), via = "key")
++        found = null; manual = ""
++        Toast.makeText(context, "已连接 ${kind.name}", Toast.LENGTH_SHORT).show()
++    }
++
++    Column(Modifier.fillMaxWidth()) {
++        if (kind.keyUrl != null) BigAction("去获取${kind.keyLabel}") { openExternal(context, kind.keyUrl) }
++        val f = found
++        if (f != null) {
++            Column(
++                Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 6.dp).clip(RoundedCornerShape(14.dp))
++                    .background(Green.copy(alpha = 0.12f)).border(BorderStroke(2.dp, Green), RoundedCornerShape(14.dp)).padding(14.dp),
++            ) {
++                Row(verticalAlignment = Alignment.CenterVertically) {
++                    Icon(Icons.Outlined.ContentPaste, null, tint = Green)
++                    Spacer(Modifier.width(8.dp))
++                    Text("剪贴板里有 ${kind.name} 的${kind.keyLabel}", style = MaterialTheme.typography.titleMedium)
++                }
++                Text("••••" + f.takeLast(4), style = MaterialTheme.typography.bodyLarge, modifier = Modifier.padding(vertical = 6.dp))
++                Button(
++                    onClick = { if (!needsAccount || account.isNotBlank()) save(f) else Toast.makeText(context, "先填上你的 Gmail 地址", Toast.LENGTH_SHORT).show() },
++                    colors = ButtonDefaults.buttonColors(containerColor = Green),
++                    modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
++                ) { Text("一键填入并连接", fontSize = 18.sp, fontWeight = FontWeight.SemiBold) }
++            }
++        }
++        if (needsAccount) OutlinedTextField(account, { account = it }, label = { Text("Gmail 地址") }, singleLine = true,
++            textStyle = MaterialTheme.typography.titleMedium,
++            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp))
++        OutlinedTextField(
++            manual, { manual = it },
++            label = { Text(if (PlusVault.hasSecret(kind.id)) "或手动粘贴（已保存 ${PlusVault.preview(kind.id)}）" else "或手动粘贴${kind.keyLabel}") },
++            singleLine = true, visualTransformation = PasswordVisualTransformation(),
++            textStyle = MaterialTheme.typography.titleMedium,
++            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp),
++        )
++        if (kind.id == "gemini") {
++            OutlinedTextField(model, { model = it }, label = { Text("实时语音模型") }, singleLine = true,
++                modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp))
++            Row(
++                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 14.dp, vertical = 4.dp),
++                horizontalArrangement = Arrangement.spacedBy(6.dp),
++            ) {
++                com.openminis.app.plus.GeminiLive.voices.forEach { v ->
++                    androidx.compose.material3.FilterChip(selected = voice == v, onClick = {
++                        voice = v; PlusVault.setExtra(kind.id, "voice", v)
++                    }, label = { Text(v) })
++                }
++            }
++        }
++        if (manual.isNotBlank()) Button(
++            onClick = { if (!needsAccount || account.isNotBlank()) save(manual.trim()) else Toast.makeText(context, "先填上你的 Gmail 地址", Toast.LENGTH_SHORT).show() },
++            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp).heightIn(min = 52.dp),
++        ) { Text("保存并连接", fontSize = 17.sp) }
++        Spacer(Modifier.height(6.dp))
++    }
++}
++
++@Composable
++private fun CalendarBlock(kind: ConnectionKind) {
++    val context = LocalContext.current
++    val perms = arrayOf(Manifest.permission.READ_CALENDAR, Manifest.permission.WRITE_CALENDAR)
++    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { res ->
++        if (res[Manifest.permission.READ_CALENDAR] == true) {
++            PlusVault.save(context, kind, "手机日历（含已同步的 Google 日历）", null, share = false, via = "app")
++            Toast.makeText(context, "已连接 ${kind.name}", Toast.LENGTH_SHORT).show()
++        } else Toast.makeText(context, "没有日历权限", Toast.LENGTH_SHORT).show()
++    }
++    PlusSection(null, footer = "Google 日历会同步到手机日历。允许后 AI 用 android-calendar 查看和新建日程（新建、修改会先问你）。") {
++        BigAction("允许读取日历") {
++            if (perms.all { context.checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) {
++                PlusVault.save(context, kind, "手机日历（含已同步的 Google 日历）", null, share = false, via = "app")
++            } else launcher.launch(perms)
++        }
++    }
++}
++
++@Composable
++private fun A11yBlock(kind: ConnectionKind, resumes: Int) {
++    val context = LocalContext.current
++    fun enabled(): Boolean = runCatching {
++        Settings.Secure.getString(context.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
++            ?.contains(context.packageName) == true
++    }.getOrDefault(false)
++    LaunchedEffect(resumes) {
++        if (enabled() && !PlusVault.entries.value.containsKey(kind.id)) {
++            PlusVault.save(context, kind, "通过无障碍操作", null, share = false, via = "app")
++        }
++    }
++    PlusSection(null, footer = "微信没有手机网页版，只能扫码登录电脑版。Mines 改为通过无障碍服务帮你在微信里点按、读消息（发消息会先问你）。") {
++        BigAction(if (enabled()) "无障碍已打开" else "打开 Mines 无障碍服务") {
++            runCatching { context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
++        }
++    }
++}
++
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/MigrateScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/MigrateScreen.kt
+new file mode 100644
+index 0000000..9625470
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/MigrateScreen.kt
+@@ -0,0 +1,372 @@
++package com.openminis.app.ui.plus
++
++import android.content.Context
++import android.content.Intent
++import android.content.pm.ApplicationInfo
++import android.net.Uri
++import androidx.activity.compose.rememberLauncherForActivityResult
++import androidx.activity.result.contract.ActivityResultContracts
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.outlined.FileOpen
++import androidx.compose.material.icons.outlined.OpenInNew
++import androidx.compose.material.icons.outlined.RestartAlt
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.Button
++import androidx.compose.material3.LinearProgressIndicator
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.input.PasswordVisualTransformation
++import androidx.compose.ui.unit.dp
++import com.openminis.app.MinisApp
++import com.openminis.app.backup.BackupCategory
++import com.openminis.app.backup.BackupImporter
++import com.openminis.app.backup.BackupManifest
++import com.openminis.app.backup.BackupPackageReader
++import com.openminis.app.backup.BackupZip
++import com.openminis.app.data.db.AppDatabase
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import java.io.File
++
++/**
++ * Move data from the earlier Mines install (package com.openminis.mines) into
++ * this one, which installs beside it because the earlier APK was signed with
++ * a throwaway key.
++ *
++ * Why it goes through a backup file and not a raw copy of the old data dir:
++ *  - the earlier build is a release (non-debuggable) APK, so `run-as` refuses
++ *    it even from the Shizuku shell uid, and the shell uid cannot read
++ *    /data/data of another app;
++ *  - provider API keys are sealed with the old app's own Android Keystore
++ *    key, which never leaves that app, so copied files would arrive without
++ *    usable keys anyway.
++ * The old app's own backup export decrypts them and writes a portable
++ * package, which this app's existing importer reads. Nothing here writes to
++ * or deletes anything belonging to the old app.
++ *
++ * Providers and skills are imported first and verified; everything else in
++ * the package follows on a best-effort basis.
++ */
++object MinesMigration {
++    const val OLD_PACKAGE = "com.openminis.mines"
++    private const val PREFS = "mines_migration"
++
++    fun oldInstalled(ctx: Context): Boolean =
++        ctx.packageName != OLD_PACKAGE && runCatching {
++            ctx.packageManager.getApplicationInfo(OLD_PACKAGE, 0); true
++        }.getOrDefault(false)
++
++    fun oldDebuggable(ctx: Context): Boolean = runCatching {
++        (ctx.packageManager.getApplicationInfo(OLD_PACKAGE, 0).flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
++    }.getOrDefault(false)
++
++    private fun prefs(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++    fun shouldPrompt(ctx: Context): Boolean = oldInstalled(ctx) && !prefs(ctx).getBoolean("prompted", false)
++    fun markPrompted(ctx: Context) { prefs(ctx).edit().putBoolean("prompted", true).apply() }
++    fun markDone(ctx: Context, summary: String) {
++        prefs(ctx).edit().putBoolean("prompted", true).putString("last_summary", summary).apply()
++    }
++    fun lastSummary(ctx: Context): String? = prefs(ctx).getString("last_summary", null)
++
++    fun openOldApp(ctx: Context): Boolean {
++        val i = ctx.packageManager.getLaunchIntentForPackage(OLD_PACKAGE) ?: return false
++        ctx.startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
++        return true
++    }
++
++    private fun skillsDir(ctx: Context) = File(ctx.filesDir, "minis-global/skills")
++    fun skillNames(ctx: Context): Set<String> =
++        skillsDir(ctx).listFiles()?.filter { it.isDirectory && !it.name.startsWith(".") }?.map { it.name }?.toSet()
++            ?: emptySet()
++
++    fun providerCount(ctx: Context): Int =
++        (ctx.applicationContext as? MinisApp)?.providerRepositoryOrNull?.instances?.size ?: 0
++
++    class Picked(val extracted: File, val manifest: BackupManifest) {
++        val categories: Set<BackupCategory> =
++            manifest.categories.keys.mapNotNull(BackupCategory::fromKey).toSet()
++        val encrypted: Boolean get() = manifest.encryption != null
++        val providersInPackage: Int get() = manifest.categories[BackupCategory.PROVIDERS.key]?.entries ?: 0
++        val skillsInPackage: Int get() = manifest.categories[BackupCategory.SKILLS.key]?.entries ?: 0
++        val hasKeys: Boolean? get() = manifest.categories[BackupCategory.PROVIDERS.key]?.includesCredentials
++    }
++
++    /** Copy the picked file to cache, unzip it and read its manifest. Off the main thread. */
++    fun pick(ctx: Context, uri: Uri): Picked {
++        val zip = File(ctx.cacheDir, "mines-migrate.minisbak")
++        ctx.contentResolver.openInputStream(uri)?.use { inp -> zip.outputStream().use { inp.copyTo(it) } }
++            ?: throw IllegalStateException("打不开这个文件")
++        val out = File(ctx.cacheDir, "mines-migrate").apply { deleteRecursively(); mkdirs() }
++        try {
++            BackupZip.extract(zip, out)
++        } finally {
++            zip.delete()
++        }
++        val root = BackupZip.packageRoot(out)
++        val manifest = BackupPackageReader(root).readManifest()
++        return Picked(out, manifest)
++    }
++
++    data class Result(
++        val providersNew: Int,
++        val providersExisting: Int,
++        val providersUnreadable: Int,
++        val keysRestored: Int,
++        val keysKept: Int,
++        val providersNow: Int,
++        val skillsInPackage: Int,
++        val skillsVerified: Int,
++        val skillsNew: Int,
++        val others: List<String>,
++        val problems: List<String>,
++    ) {
++        val providersMigrated: Int get() = providersNew + providersExisting
++        fun headline(): String = "已迁移 $providersMigrated 个供应商、$skillsVerified 个技能"
++    }
++
++    suspend fun run(
++        ctx: Context,
++        picked: Picked,
++        passphrase: String?,
++        onStatus: (String) -> Unit,
++    ): Result = withContext(Dispatchers.IO) {
++        val importer = BackupImporter(ctx, AppDatabase.getInstance(ctx))
++        val problems = mutableListOf<String>()
++        val skillsBefore = skillNames(ctx)
++
++        // Phase 1: providers + skills, the two things that matter most.
++        val first = setOf(BackupCategory.PROVIDERS, BackupCategory.SKILLS).intersect(picked.categories)
++        if (first.isEmpty()) problems += "备份里没有供应商和技能"
++        var pr: BackupImporter.CategoryReport? = null
++        if (first.isNotEmpty()) {
++            onStatus("正在迁移供应商和技能…")
++            val r1 = importer.import(
++                picked.extracted,
++                BackupImporter.Options(categories = first, passphrase = passphrase),
++                onProgress = { onStatus(it) },
++            )
++            pr = r1.categories.firstOrNull { it.category == BackupCategory.PROVIDERS.key }
++            r1.categories.forEach { c -> c.failed?.let { problems += "${c.category}: $it" } }
++            if (r1.integrityFailed.isNotEmpty()) problems += "${r1.integrityFailed.size} 个文件校验失败"
++        }
++        // Verify against what is actually on the device now.
++        val skillsAfter = skillNames(ctx)
++        val skillsNew = (skillsAfter - skillsBefore).size
++        val skillsVerified = if (picked.skillsInPackage > 0) minOf(picked.skillsInPackage, skillsAfter.size) else skillsNew
++        if (picked.skillsInPackage > skillsAfter.size) {
++            problems += "备份里有 ${picked.skillsInPackage} 个技能，本机只找到 ${skillsAfter.size} 个"
++        }
++
++        // Phase 2: everything else, best effort.
++        val rest = picked.categories - first
++        val others = mutableListOf<String>()
++        if (rest.isNotEmpty()) {
++            onStatus("正在迁移其余内容…")
++            runCatching {
++                importer.import(
++                    picked.extracted,
++                    BackupImporter.Options(categories = rest, passphrase = passphrase),
++                    onProgress = { onStatus(it) },
++                )
++            }.onSuccess { r2 ->
++                r2.categories.forEach { c ->
++                    if (c.failed != null) problems += "${c.category}: ${c.failed}"
++                    else others += "${categoryName(c.category)} ${c.imported + c.updated}"
++                }
++            }.onFailure { problems += "其余内容：${it.message}" }
++        }
++        picked.extracted.deleteRecursively()
++
++        Result(
++            providersNew = pr?.imported ?: 0,
++            providersExisting = pr?.skipped ?: 0,
++            providersUnreadable = pr?.unreadable ?: 0,
++            keysRestored = pr?.credentialsRestored ?: 0,
++            keysKept = pr?.credentialsKept ?: 0,
++            providersNow = providerCount(ctx),
++            skillsInPackage = picked.skillsInPackage,
++            skillsVerified = skillsVerified,
++            skillsNew = skillsNew,
++            others = others,
++            problems = problems,
++        )
++    }
++
++    private fun categoryName(key: String) = when (key) {
++        BackupCategory.CHATS.key -> "对话"
++        BackupCategory.MEMORY.key -> "记忆"
++        BackupCategory.MCP_SERVERS.key -> "MCP"
++        BackupCategory.SHARED_FILES.key -> "共享文件"
++        BackupCategory.ENVIRONMENT_VARIABLES.key -> "环境变量"
++        BackupCategory.VOICE_CORRECTIONS.key -> "语音纠错"
++        else -> key
++    }
++
++    /** Relaunch so every repository re-reads what was restored. */
++    fun restart(ctx: Context) {
++        val i = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName) ?: return
++        ctx.startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
++        android.os.Process.killProcess(android.os.Process.myPid())
++    }
++}
++
++@Composable
++fun MigrateScreen(onBack: () -> Unit) {
++    val context = LocalContext.current
++    val scope = rememberCoroutineScope()
++    val oldInstalled = remember { MinesMigration.oldInstalled(context) }
++    var picked by remember { mutableStateOf<MinesMigration.Picked?>(null) }
++    var passphrase by remember { mutableStateOf("") }
++    var busy by remember { mutableStateOf(false) }
++    var status by remember { mutableStateOf<String?>(null) }
++    var error by remember { mutableStateOf<String?>(null) }
++    var result by remember { mutableStateOf<MinesMigration.Result?>(null) }
++    val last = remember { MinesMigration.lastSummary(context) }
++
++    val pickLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
++        if (uri == null) return@rememberLauncherForActivityResult
++        busy = true; error = null; result = null; status = "正在读取备份…"
++        scope.launch {
++            try {
++                picked = withContext(Dispatchers.IO) { MinesMigration.pick(context, uri) }
++            } catch (e: Exception) {
++                error = "这个文件读不了：${e.message ?: "格式不对"}"
++            } finally {
++                busy = false; status = null
++            }
++        }
++    }
++
++    PlusPage("从旧版迁移", onBack) {
++        Text(
++            "把旧版 Mines 的供应商（地址、密钥、模型）和技能搬到这里，其余内容尽量一起带上。旧版的数据只读不改，迁完两个可以并存。",
++            style = MaterialTheme.typography.bodyMedium,
++            color = MaterialTheme.colorScheme.onSurfaceVariant,
++            modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
++        )
++        if (last != null && result == null) {
++            Text("上次：$last", style = MaterialTheme.typography.bodySmall,
++                color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(horizontal = 20.dp))
++        }
++
++        PlusSection(
++            "第一步 · 在旧版导出",
++            footer = "在旧版里：设置 → 备份 → 勾选「供应商」「技能」（其余随意）→ 导出，建议设一个密码，存到「下载」。" +
++                if (oldInstalled) "" else "\n没检测到旧版 Mines；如果已有备份文件，直接做第二步。",
++        ) {
++            ActionRow(Icons.Outlined.OpenInNew, if (oldInstalled) "打开旧版 Mines" else "旧版未安装") {
++                if (!MinesMigration.openOldApp(context)) error = "打不开旧版 Mines"
++            }
++        }
++
++        PlusSection("第二步 · 选择备份文件", footer = "支持 Minis / Mines 的 .minisbak 备份。") {
++            ActionRow(Icons.Outlined.FileOpen, picked?.let { "已选：${it.manifest.deviceName} · ${it.manifest.createdAt.take(16)}" } ?: "选择备份文件") {
++                if (!busy) pickLauncher.launch(arrayOf("*/*"))
++            }
++        }
++
++        picked?.let { p ->
++            PlusSection(
++                "第三步 · 导入",
++                footer = buildString {
++                    append("备份里有 ${p.providersInPackage} 个供应商、${p.skillsInPackage} 个技能。")
++                    if (p.hasKeys == false) append("\n注意：这个备份没带 API 密钥，导出时请勾上含密钥的选项。")
++                },
++            ) {
++                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                    if (p.encrypted) {
++                        OutlinedTextField(
++                            passphrase, { passphrase = it }, label = { Text("备份密码") }, singleLine = true,
++                            visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(),
++                        )
++                    }
++                    Button(
++                        enabled = !busy && (!p.encrypted || passphrase.isNotEmpty()),
++                        modifier = Modifier.fillMaxWidth(),
++                        onClick = {
++                            busy = true; error = null
++                            scope.launch {
++                                try {
++                                    val r = MinesMigration.run(context, p, passphrase.ifEmpty { null }) { status = it }
++                                    result = r
++                                    picked = null
++                                    MinesMigration.markDone(context, r.headline())
++                                } catch (e: Exception) {
++                                    error = "导入失败：${e.message ?: e.javaClass.simpleName}"
++                                } finally {
++                                    busy = false; status = null
++                                }
++                            }
++                        },
++                    ) { Text("开始迁移") }
++                }
++            }
++        }
++
++        if (busy) {
++            Column(Modifier.padding(horizontal = 20.dp, vertical = 12.dp)) {
++                LinearProgressIndicator(Modifier.fillMaxWidth())
++                status?.let { Text(it, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 6.dp)) }
++            }
++        }
++        error?.let {
++            Text(it, color = Color(0xFFFF3B30), style = MaterialTheme.typography.bodyMedium,
++                modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp))
++        }
++
++        result?.let { r ->
++            PlusSection("结果", footer = "重启后新数据全部生效。") {
++                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
++                    Text(r.headline(), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
++                    Text("供应商：新增 ${r.providersNew}，已存在 ${r.providersExisting}，本机现有 ${r.providersNow} 个；密钥写入 ${r.keysRestored} 个" +
++                        if (r.keysKept > 0) "（保留本机已有 ${r.keysKept} 个）" else "",
++                        style = MaterialTheme.typography.bodySmall)
++                    Text("技能：备份 ${r.skillsInPackage} 个，本机确认 ${r.skillsVerified} 个（新增 ${r.skillsNew}）",
++                        style = MaterialTheme.typography.bodySmall)
++                    if (r.providersUnreadable > 0) Text("${r.providersUnreadable} 个供应商读不了，已跳过",
++                        style = MaterialTheme.typography.bodySmall, color = Color(0xFFFF9500))
++                    if (r.others.isNotEmpty()) Text("其余：" + r.others.joinToString("、"), style = MaterialTheme.typography.bodySmall)
++                    r.problems.forEach { Text("⚠ $it", style = MaterialTheme.typography.bodySmall, color = Color(0xFFFF9500)) }
++                }
++                PlusDivider()
++                ActionRow(Icons.Outlined.RestartAlt, "立即重启 Mines") { MinesMigration.restart(context) }
++            }
++        }
++    }
++}
++
++/** One-time prompt on first launch when the earlier Mines is installed beside this one. */
++@Composable
++fun MinesMigrationPrompt(onOpen: () -> Unit) {
++    val context = LocalContext.current
++    var show by remember { mutableStateOf(MinesMigration.shouldPrompt(context)) }
++    if (!show) return
++    AlertDialog(
++        onDismissRequest = { MinesMigration.markPrompted(context); show = false },
++        title = { Text("从旧版迁移？") },
++        text = { Text("检测到旧版 Mines。要把它的供应商、技能和其他内容搬过来吗？旧版数据不会被改动。以后也可以在 设置 → Mines → 从旧版迁移 里做。") },
++        confirmButton = {
++            TextButton(onClick = { MinesMigration.markPrompted(context); show = false; onOpen() }) { Text("去迁移") }
++        },
++        dismissButton = {
++            TextButton(onClick = { MinesMigration.markPrompted(context); show = false }) { Text("以后再说") }
++        },
++    )
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PersonalizeScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PersonalizeScreen.kt
+new file mode 100644
+index 0000000..34a2b67
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PersonalizeScreen.kt
+@@ -0,0 +1,259 @@
++package com.openminis.app.ui.plus
++
++import android.content.Intent
++import android.net.Uri
++import android.provider.Settings
++import android.widget.Toast
++import androidx.activity.compose.rememberLauncherForActivityResult
++import androidx.activity.result.contract.ActivityResultContracts
++import androidx.compose.foundation.BorderStroke
++import androidx.compose.foundation.Image
++import androidx.compose.foundation.background
++import androidx.compose.foundation.border
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.horizontalScroll
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.outlined.Image
++import androidx.compose.material.icons.outlined.NotInterested
++import androidx.compose.material3.Icon
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Slider
++import androidx.compose.material3.Switch
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Brush
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.layout.ContentScale
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.platform.LocalLifecycleOwner
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.LifecycleEventObserver
++import com.openminis.app.plus.DeskPetService
++import com.openminis.app.plus.PlusPrefs
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++
++@Composable
++fun PersonalizeScreen(onBack: () -> Unit) {
++    val context = LocalContext.current
++    PlusPrefs.init(context)
++    val st by PlusPrefs.state.collectAsState()
++    val scope = rememberCoroutineScope()
++    var wantPet by remember { mutableStateOf(false) }
++
++    val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
++        if (uri != null) scope.launch {
++            val ok = withContext(Dispatchers.IO) {
++                runCatching {
++                    context.contentResolver.openInputStream(uri)?.use { input ->
++                        wallpaperFile(context).outputStream().use { input.copyTo(it) }
++                    } != null
++                }.getOrDefault(false)
++            }
++            if (ok) PlusPrefs.update(context) { it.copy(wallpaper = "file:${System.currentTimeMillis()}") }
++            else Toast.makeText(context, "图片读取失败", Toast.LENGTH_SHORT).show()
++        }
++    }
++
++    // Coming back from the overlay-permission screen: start the pet if granted.
++    val owner = LocalLifecycleOwner.current
++    DisposableEffect(owner) {
++        val obs = LifecycleEventObserver { _, e ->
++            if (e == Lifecycle.Event.ON_RESUME && wantPet && DeskPetService.canShow(context)) {
++                wantPet = false
++                PlusPrefs.update(context) { it.copy(petEnabled = true) }
++                DeskPetService.start(context)
++            }
++        }
++        owner.lifecycle.addObserver(obs)
++        onDispose { owner.lifecycle.removeObserver(obs) }
++    }
++
++    PlusPage("壁纸与形象", onBack) {
++        // ---- Wallpaper ----
++        PlusSection("聊天壁纸") {
++            // live preview
++            Box(
++                Modifier.fillMaxWidth().height(150.dp).padding(12.dp).clip(RoundedCornerShape(12.dp))
++                    .background(MaterialTheme.colorScheme.background),
++            ) {
++                ChatWallpaperLayer(Modifier.fillMaxSize())
++                Column(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                    Bubble("今天帮我看看服务器", mine = true)
++                    Bubble("好的，两台都在线，延迟 38 ms", mine = false)
++                }
++            }
++            Row(
++                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 4.dp),
++                horizontalArrangement = Arrangement.spacedBy(10.dp),
++            ) {
++                Swatch("不用", selected = st.wallpaper.isEmpty(), onClick = {
++                    PlusPrefs.update(context) { it.copy(wallpaper = "") }
++                }) {
++                    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceVariant), contentAlignment = Alignment.Center) {
++                        Icon(Icons.Outlined.NotInterested, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
++                    }
++                }
++                Swatch("相册", selected = st.wallpaper.startsWith("file:"), onClick = { picker.launch("image/*") }) {
++                    val bmp = rememberWallpaperBitmap(st.wallpaper)
++                    if (bmp != null) Image(bmp, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
++                    else Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceVariant), contentAlignment = Alignment.Center) {
++                        Icon(Icons.Outlined.Image, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
++                    }
++                }
++                wallpaperPresets.forEach { p ->
++                    Swatch(p.name, selected = st.wallpaper == "preset:${p.id}", onClick = {
++                        PlusPrefs.update(context) { it.copy(wallpaper = "preset:${p.id}") }
++                    }) {
++                        Box(Modifier.fillMaxSize().background(Brush.linearGradient(p.colors)))
++                    }
++                }
++            }
++            if (st.wallpaper.isNotEmpty()) {
++                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
++                    Text("壁纸透明度 ${(st.wallpaperAlpha * 100).toInt()}%", style = MaterialTheme.typography.bodyMedium,
++                        modifier = Modifier.width(132.dp))
++                    Slider(
++                        value = st.wallpaperAlpha, valueRange = 0f..1f,
++                        onValueChange = { v -> PlusPrefs.update(context) { it.copy(wallpaperAlpha = v) } },
++                        modifier = Modifier.weight(1f),
++                    )
++                }
++                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
++                    Column(Modifier.weight(1f)) {
++                        Text("首页也用这张壁纸", style = MaterialTheme.typography.bodyLarge)
++                        Text("对话列表背后也显示", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
++                    }
++                    Switch(st.wallpaperOnHome, onCheckedChange = { on -> PlusPrefs.update(context) { it.copy(wallpaperOnHome = on) } })
++                }
++                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
++                    Text("遮罩", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.width(132.dp))
++                    Spacer(Modifier.width(12.dp))
++                    Slider(
++                        value = st.wallpaperDim, valueRange = 0f..0.8f,
++                        onValueChange = { v -> PlusPrefs.update(context) { it.copy(wallpaperDim = v) } },
++                        modifier = Modifier.weight(1f),
++                    )
++                }
++            }
++            Spacer(Modifier.height(8.dp))
++        }
++
++        // ---- Avatar ----
++        PlusSection("我的形象", footer = "形象会出现在首页卡片和桌宠上。点首页卡片上的头像、或长按桌宠，随时能换。也可以用相册里的图片或动图（GIF / 动态 WebP）。") {
++            Box(Modifier.fillMaxWidth().padding(top = 16.dp), contentAlignment = Alignment.Center) {
++                PetAvatar(size = 160.dp, face = st.petStyle == com.openminis.app.plus.Avatars.CUSTOM, animated = true)
++            }
++            Text(
++                com.openminis.app.plus.Avatars.name(st.petStyle),
++                style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold,
++                modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
++                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
++            )
++            AvatarGrid()
++            Text("边框颜色", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(start = 16.dp, top = 4.dp))
++            Row(
++                Modifier.fillMaxWidth().padding(vertical = 12.dp),
++                horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterHorizontally),
++            ) {
++                com.openminis.app.plus.Avatars.colors.forEach { c ->
++                    val sel = st.petColor == c
++                    Box(
++                        Modifier.size(if (sel) 38.dp else 32.dp).clip(CircleShape).background(Color(c))
++                            .border(BorderStroke(if (sel) 3.dp else 1.dp, if (sel) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.outlineVariant), CircleShape)
++                            .clickable { PlusPrefs.update(context) { it.copy(petColor = c) } }
++                    )
++                }
++            }
++        }
++
++        // ---- Desk pet ----
++        PlusSection("桌宠", footer = "打开后它会浮在所有应用上面。拖动它换位置，点一下说话，双击打开 Mines，长按换形象或收起。") {
++            Row(
++                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
++                verticalAlignment = Alignment.CenterVertically,
++            ) {
++                Column(Modifier.weight(1f)) {
++                    Text("显示桌宠", fontWeight = FontWeight.Medium)
++                    if (!DeskPetService.canShow(context)) Text(
++                        "需要允许“显示在其他应用上层”",
++                        style = MaterialTheme.typography.bodySmall,
++                        color = MaterialTheme.colorScheme.onSurfaceVariant,
++                    )
++                }
++                Switch(st.petEnabled, onCheckedChange = { on ->
++                    if (!on) {
++                        PlusPrefs.update(context) { it.copy(petEnabled = false) }
++                        DeskPetService.stop(context)
++                    } else if (DeskPetService.canShow(context)) {
++                        PlusPrefs.update(context) { it.copy(petEnabled = true) }
++                        DeskPetService.start(context)
++                    } else {
++                        wantPet = true
++                        runCatching {
++                            context.startActivity(
++                                Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:${context.packageName}"))
++                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
++                            )
++                        }
++                    }
++                })
++            }
++        }
++    }
++}
++
++@Composable
++private fun Bubble(text: String, mine: Boolean) {
++    Row(Modifier.fillMaxWidth(), horizontalArrangement = if (mine) Arrangement.End else Arrangement.Start) {
++        Text(
++            text,
++            style = MaterialTheme.typography.bodySmall,
++            color = if (mine) Color.White else MaterialTheme.colorScheme.onSurface,
++            modifier = Modifier.clip(RoundedCornerShape(14.dp))
++                .background(if (mine) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceContainerHigh)
++                .padding(horizontal = 10.dp, vertical = 6.dp),
++        )
++    }
++}
++
++@Composable
++private fun Swatch(label: String, selected: Boolean, onClick: () -> Unit, content: @Composable () -> Unit) {
++    Column(horizontalAlignment = Alignment.CenterHorizontally) {
++        Box(
++            Modifier.size(width = 56.dp, height = 84.dp).clip(RoundedCornerShape(10.dp))
++                .border(BorderStroke(if (selected) 3.dp else 1.dp,
++                    if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant),
++                    RoundedCornerShape(10.dp))
++                .clickable(onClick = onClick),
++        ) { content() }
++        Text(label, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(top = 4.dp))
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PluginsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PluginsScreen.kt
+new file mode 100644
+index 0000000..08a3e9b
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PluginsScreen.kt
+@@ -0,0 +1,132 @@
++package com.openminis.app.ui.plus
++
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.outlined.Refresh
++import androidx.compose.material3.Button
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.Switch
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.produceState
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.platform.LocalLifecycleOwner
++import androidx.compose.ui.unit.dp
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.repeatOnLifecycle
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++import org.json.JSONObject
++import java.io.File
++
++private data class PluginRow(val pkg: String, val enabled: Boolean, val ok: Boolean?, val reason: String, val tools: List<String>)
++
++/**
++ * dsh plugin center. The work happens in the sandbox (`minis-dsh`), shown in
++ * the terminal so the user sees progress; this page lists what is installed
++ * and which tools each plugin adds, read from the files minis-dsh keeps.
++ */
++@Composable
++fun PluginsScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit) {
++    val context = LocalContext.current
++    var input by remember { mutableStateOf("") }
++    var tick by remember { mutableIntStateOf(0) }
++    // Re-read whenever the page comes back (e.g. returning from the terminal).
++    val owner = LocalLifecycleOwner.current
++    LaunchedEffect(owner) { owner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) { tick++ } }
++    val rows by produceState(initialValue = emptyList<PluginRow>(), tick) {
++        value = withContext(Dispatchers.IO) { readPlugins(context) }
++    }
++
++    PlusPage("插件", onBack) {
++        Text(
++            "可以装 DeepSeek Harness（dsh）的插件。它们加的工具会出现在 Mines 的 MCP 里，全部插件共用一个进程，用到时才启动。",
++            style = MaterialTheme.typography.bodyMedium,
++            color = MaterialTheme.colorScheme.onSurfaceVariant,
++            modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
++        )
++        PlusSection("安装", footer = "填 npm 包名，比如 @zhaoolee/dsh-notes；或 github:用户/仓库。第一次会自动装 Node.js。") {
++            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                OutlinedTextField(input, { input = it.trim() }, label = { Text("插件名或链接") }, singleLine = true,
++                    modifier = Modifier.fillMaxWidth())
++                Button(
++                    enabled = input.isNotBlank() && input.none { it == ' ' || it == ';' || it == '&' || it == '|' || it == '`' || it == '$' },
++                    onClick = { onOpenTerminal("minis-dsh add ${normalize(input)}"); input = "" },
++                    modifier = Modifier.fillMaxWidth(),
++                ) { Text("安装") }
++            }
++        }
++        PlusSection(if (rows.isEmpty()) "已安装" else "已安装 · ${rows.size}") {
++            if (rows.isEmpty()) Text("还没有插件", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(16.dp))
++            rows.forEachIndexed { i, r ->
++                Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
++                    Box(Modifier.size(9.dp).background(
++                        when { !r.enabled -> Color.Gray; r.ok == true -> Color(0xFF34C759); r.ok == false -> Color(0xFFFF3B30); else -> Color(0xFFFFCC00) },
++                        CircleShape))
++                    Spacer(Modifier.width(10.dp))
++                    Column(Modifier.weight(1f)) {
++                        Text(r.pkg, style = MaterialTheme.typography.bodyLarge)
++                        Text(
++                            when {
++                                !r.enabled -> "已停用"
++                                r.ok == true -> if (r.tools.isEmpty()) "已加载（只加提示词）" else "工具：" + r.tools.joinToString("、")
++                                r.ok == false -> "用不了：${r.reason}"
++                                else -> "未检查"
++                            },
++                            style = MaterialTheme.typography.bodySmall,
++                            color = MaterialTheme.colorScheme.onSurfaceVariant,
++                        )
++                    }
++                    Switch(r.enabled, onCheckedChange = { on -> onOpenTerminal("minis-dsh ${if (on) "on" else "off"} ${r.pkg} && minis-dsh list") })
++                    TextButton(onClick = { onOpenTerminal("minis-dsh remove ${r.pkg}") }) { Text("卸载", color = Color(0xFFFF3B30)) }
++                }
++                if (i < rows.lastIndex) PlusDivider()
++            }
++            if (rows.isNotEmpty()) {
++                PlusDivider()
++                ActionRow(Icons.Outlined.Refresh, "重新检查") { onOpenTerminal("minis-dsh list") }
++            }
++        }
++    }
++}
++
++private fun normalize(s: String): String {
++    val gh = Regex("^https?://github\\.com/([^/]+)/([^/#?]+)").find(s)
++    return if (gh != null) "github:${gh.groupValues[1]}/${gh.groupValues[2].removeSuffix(".git")}" else s
++}
++
++private fun readPlugins(context: android.content.Context): List<PluginRow> = runCatching {
++    val root = com.openminis.app.sandbox.RootfsManager.getInstance(context).rootfsDir
++    val home = File(root, "root/.minis-dsh")
++    val state = JSONObject(File(home, "plugins.json").readText())
++    val status = runCatching { JSONObject(File(home, "status.json").readText()) }.getOrNull()
++    val arr = state.optJSONArray("plugins") ?: return@runCatching emptyList()
++    (0 until arr.length()).map { i ->
++        val p = arr.getJSONObject(i)
++        val pkg = p.optString("package")
++        val st = status?.optJSONObject(pkg)
++        val tools = st?.optJSONArray("tools")?.let { t -> (0 until t.length()).map { t.getString(it) } } ?: emptyList()
++        PluginRow(pkg, p.optBoolean("enabled", true), st?.optBoolean("ok"), st?.optString("reason") ?: "", tools)
++    }
++}.getOrDefault(emptyList())
