@@ -1,0 +1,87 @@
+name: Build Minis APK (OpenMinis + patches)
+
+on:
+  workflow_dispatch:
+  push:
+    paths: ["patches/**", ".github/workflows/build.yml"]
+
+env:
+  UPSTREAM: https://github.com/OpenMinis/OpenMinis
+  UPSTREAM_REF: b4c0661          # the commit the patches were written and compiled against
+  NDK_R28: 28.0.12433566
+  NDK_AGP: 27.0.12077973         # the version Gradle asks for at configure time
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch OpenMinis at the pinned commit
+        run: |
+          git clone "$UPSTREAM" om
+          cd om
+          git checkout "$UPSTREAM_REF"
+          git submodule update --init deps/proot
+
+      - name: Apply patches
+        run: |
+          cd om
+          git apply --whitespace=nowarn ../patches/minis-app-fixes.patch
+          (cd deps/proot && git apply --whitespace=nowarn ../../../patches/proot-real-ifaces.patch)
+          git -C . status --short
+
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "21" }
+
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.25.x", cache: false }
+
+      - name: Android NDKs
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$NDK_R28" "ndk;$NDK_AGP" "platforms;android-36" "build-tools;36.0.0" >/dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_R28" >> "$GITHUB_ENV"
+
+      - name: gomobile
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+          "$HOME/go/bin/gomobile" init
+
+      - name: Native deps (proot, rootfs, rclone)
+        run: |
+          cd om
+          ./deps/build_proot.sh
+          ./scripts/prepare_android_sandbox.sh
+          ./deps/build_rclone_android.sh
+          mkdir -p src/android/app/libs
+          cp deps/build/rclone/rclone.aar src/android/app/libs/
+
+      - name: Assemble APK
+        run: |
+          cd om/src/android
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleRelease
+          mkdir -p ../../../out
+          find app/build/outputs/apk -name '*.apk' -exec cp {} ../../../out/ \;
+          ls -la ../../../out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: minis-apk
+          path: out/*.apk
+          retention-days: 14
+
+      - name: Publish as a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="build-${{ github.run_number }}"
+          gh release create "$tag" out/*.apk --repo "${{ github.repository }}" --title "Minis build ${{ github.run_number }}" --notes "OpenMinis b4c0661 + patches" --prerelease
