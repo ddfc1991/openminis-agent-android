@@ -1,0 +1,1811 @@
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
+new file mode 100644
+index 0000000..6fc7973
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
+@@ -0,0 +1,228 @@
++package com.openminis.app.ui.plus
++
++import android.graphics.BitmapFactory
++import androidx.compose.animation.core.LinearEasing
++import androidx.compose.animation.core.RepeatMode
++import androidx.compose.animation.core.animateFloat
++import androidx.compose.animation.core.infiniteRepeatable
++import androidx.compose.animation.core.rememberInfiniteTransition
++import androidx.compose.animation.core.tween
++import androidx.compose.foundation.Canvas
++import androidx.compose.foundation.Image
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.ColumnScope
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.foundation.verticalScroll
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.automirrored.filled.ArrowBack
++import androidx.compose.material3.ExperimentalMaterial3Api
++import androidx.compose.material3.Icon
++import androidx.compose.material3.IconButton
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Scaffold
++import androidx.compose.material3.Text
++import androidx.compose.material3.TopAppBar
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.produceState
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Brush
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.ImageBitmap
++import androidx.compose.ui.graphics.asImageBitmap
++import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
++import androidx.compose.ui.graphics.nativeCanvas
++import androidx.compose.ui.layout.ContentScale
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.Dp
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import com.openminis.app.plus.PlusPrefs
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++import java.io.File
++import kotlin.math.sin
++
++/** Lets screens outside the NavHost lambda (the conversation list) open Plus pages. */
++object PlusNav {
++    @Volatile var navigate: ((String) -> Unit)? = null
++    /** Route asked for while no screen was up (e.g. from the desk pet); opened on next start. */
++    @Volatile var pending: String? = null
++    fun go(route: String) { navigate?.invoke(route) ?: run { pending = route } }
++}
++
++object PlusRoutes {
++    const val WORK = "plus_work_location"
++    const val CONNECTIONS = "plus_connections"
++    const val PERSONALIZE = "plus_personalize"
++    const val VOICE = "plus_voice_live"
++    const val SANDBOX = "plus_sandbox"
++    const val PLUGINS = "plus_plugins"
++    const val MIGRATE = "plus_migrate"
++    const val SERVER = "plus_server/{id}"
++    fun server(id: String) = "plus_server/$id"
++}
++
++/** Built-in wallpapers: soft gradients, look good under both light and dark bubbles. */
++data class WallpaperPreset(val id: String, val name: String, val colors: List<Color>)
++
++val wallpaperPresets = listOf(
++    WallpaperPreset("aurora", "极光", listOf(Color(0xFF0F2027), Color(0xFF203A43), Color(0xFF2C5364), Color(0xFF3FA08F))),
++    WallpaperPreset("sunset", "晚霞", listOf(Color(0xFFFFB199), Color(0xFFFF6F91), Color(0xFF845EC2))),
++    WallpaperPreset("ocean", "深海", listOf(Color(0xFF1A2980), Color(0xFF26D0CE))),
++    WallpaperPreset("mint", "薄荷", listOf(Color(0xFFE0F7EF), Color(0xFFB8F2E6), Color(0xFFAED9E0))),
++    WallpaperPreset("peach", "蜜桃", listOf(Color(0xFFFFF1EB), Color(0xFFFFD6C9), Color(0xFFF7B7A3))),
++    WallpaperPreset("night", "星夜", listOf(Color(0xFF141E30), Color(0xFF243B55))),
++    WallpaperPreset("lavender", "薰衣草", listOf(Color(0xFFE6DEFF), Color(0xFFC3B1E1), Color(0xFF9D8EC7))),
++    WallpaperPreset("forest", "森林", listOf(Color(0xFF134E5E), Color(0xFF71B280))),
++)
++
++fun wallpaperFile(context: android.content.Context) = File(context.filesDir, "plus_wallpaper.jpg")
++
++/** Loads the custom wallpaper image, downsampled to screen size. */
++@Composable
++fun rememberWallpaperBitmap(spec: String): ImageBitmap? {
++    val context = LocalContext.current
++    val bmp by produceState<ImageBitmap?>(initialValue = null, spec) {
++        value = if (!spec.startsWith("file:")) null else withContext(Dispatchers.IO) {
++            runCatching {
++                val f = wallpaperFile(context)
++                if (!f.exists()) return@runCatching null
++                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
++                BitmapFactory.decodeFile(f.absolutePath, bounds)
++                val target = maxOf(context.resources.displayMetrics.heightPixels, 1)
++                var sample = 1
++                while (bounds.outHeight / (sample * 2) >= target) sample *= 2
++                BitmapFactory.decodeFile(f.absolutePath, BitmapFactory.Options().apply { inSampleSize = sample })
++                    ?.asImageBitmap()
++            }.getOrNull()
++        }
++    }
++    return bmp
++}
++
++/** Chat background. Draws nothing when no wallpaper is chosen. */
++@Composable
++fun ChatWallpaperLayer(modifier: Modifier = Modifier, home: Boolean = false) {
++    val context = LocalContext.current
++    PlusPrefs.init(context)
++    val st by PlusPrefs.state.collectAsState()
++    val spec = st.wallpaper
++    if (spec.isEmpty() || (home && !st.wallpaperOnHome)) return
++    val dark = MaterialTheme.colorScheme.background.let { (it.red + it.green + it.blue) / 3f < 0.5f }
++    Box(modifier) {
++        if (spec.startsWith("preset:")) {
++            val p = wallpaperPresets.firstOrNull { it.id == spec.removePrefix("preset:") }
++            if (p != null) Box(Modifier.fillMaxSize().background(Brush.linearGradient(p.colors.map { it.copy(alpha = st.wallpaperAlpha.coerceIn(0f, 1f)) })))
++        } else {
++            val bmp = rememberWallpaperBitmap(spec)
++            if (bmp != null) Image(bmp, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop, alpha = st.wallpaperAlpha.coerceIn(0f, 1f))
++        }
++        // Dim layer keeps message text readable.
++        Box(
++            Modifier.fillMaxSize().background(
++                (if (dark) Color.Black else Color.White).copy(alpha = st.wallpaperDim.coerceIn(0f, 0.85f))
++            )
++        )
++    }
++}
++
++/** True when a wallpaper is drawn on this screen (bars then go translucent). */
++@Composable
++fun wallpaperOn(home: Boolean = false): Boolean {
++    val context = LocalContext.current
++    PlusPrefs.init(context)
++    val st by PlusPrefs.state.collectAsState()
++    return st.wallpaper.isNotEmpty() && (!home || st.wallpaperOnHome)
++}
++
++/**
++ * The avatar: round head crop by default ([face] = false shows the full-body
++ * character). Uses the same renderer as the desk pet, so custom GIF / animated
++ * WebP pictures animate here too.
++ */
++@Composable
++fun PetAvatar(
++    size: Dp,
++    style: String? = null,
++    color: Int? = null,
++    animated: Boolean = true,
++    face: Boolean = true,
++    crop: com.openminis.app.plus.AvatarCrop? = null,
++    noBg: Boolean? = null,
++    version: Long? = null,
++) {
++    val context = LocalContext.current
++    PlusPrefs.init(context)
++    val st by PlusPrefs.state.collectAsState()
++    androidx.compose.ui.viewinterop.AndroidView(
++        factory = { com.openminis.app.plus.AvatarView(it) },
++        update = { v ->
++            v.style = style; v.face = face; v.bob = animated && !face
++            v.showRing = face; v.crop = crop; v.noBg = noBg; v.version = version
++            v.tag = st // re-run update (and redraw) whenever prefs change
++            v.invalidate()
++        },
++        modifier = Modifier.size(size),
++    )
++}
++
++@OptIn(ExperimentalMaterial3Api::class)
++@Composable
++fun PlusPage(title: String, onBack: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
++    Scaffold(
++        topBar = {
++            TopAppBar(
++                title = { Text(title) },
++                navigationIcon = {
++                    IconButton(onClick = onBack) {
++                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
++                    }
++                },
++            )
++        },
++    ) { padding ->
++        Column(
++            Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState())
++                .padding(bottom = 32.dp),
++            content = content,
++        )
++    }
++}
++
++@Composable
++fun PlusSection(title: String?, footer: String? = null, content: @Composable ColumnScope.() -> Unit) {
++    Column(Modifier.fillMaxWidth().padding(top = 18.dp)) {
++        if (title != null) Text(
++            title,
++            style = MaterialTheme.typography.labelSmall,
++            color = MaterialTheme.colorScheme.onSurfaceVariant,
++            fontWeight = FontWeight.Medium,
++            letterSpacing = 0.5.sp,
++            modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp),
++        )
++        Column(
++            Modifier.fillMaxWidth().padding(horizontal = 16.dp)
++                .clip(RoundedCornerShape(12.dp))
++                .background(MaterialTheme.colorScheme.surfaceContainerLow),
++            content = content,
++        )
++        if (footer != null) Text(
++            footer,
++            style = MaterialTheme.typography.bodySmall,
++            color = MaterialTheme.colorScheme.onSurfaceVariant,
++            modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp),
++            lineHeight = 16.sp,
++        )
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxScreen.kt
+new file mode 100644
+index 0000000..8592139
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxScreen.kt
+@@ -0,0 +1,193 @@
++package com.openminis.app.ui.plus
++
++import android.app.ActivityManager
++import android.content.Intent
++import android.net.Uri
++import android.os.PowerManager
++import android.provider.Settings
++import android.widget.Toast
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.outlined.CleaningServices
++import androidx.compose.material3.Button
++import androidx.compose.material3.LinearProgressIndicator
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedButton
++import androidx.compose.material3.Switch
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.platform.LocalLifecycleOwner
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.repeatOnLifecycle
++import com.openminis.app.offload.ShizukuManager
++import com.openminis.app.plus.PlusPrefs
++import com.openminis.app.plus.SandboxCare
++import com.openminis.app.plus.SandboxProc
++import com.openminis.app.sandbox.PhantomProcessGuard
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++
++/** Sandbox monitor: memory, running processes, one-tap cleanup, anti-kill. */
++@Composable
++fun SandboxScreen(onBack: () -> Unit) {
++    val context = LocalContext.current
++    PlusPrefs.init(context)
++    val st by PlusPrefs.state.collectAsState()
++    val scope = rememberCoroutineScope()
++    var procs by remember { mutableStateOf(emptyList<SandboxProc>()) }
++    var availMb by remember { mutableStateOf(0L) }
++    var totalMb by remember { mutableStateOf(1L) }
++    var tick by remember { mutableIntStateOf(0) }
++    val shizuku by ShizukuManager.snapshot.collectAsState()
++    val owner = LocalLifecycleOwner.current
++
++    LaunchedEffect(owner) {
++        owner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
++            while (true) {
++                val (list, mem) = withContext(Dispatchers.IO) {
++                    val am = context.getSystemService(ActivityManager::class.java)
++                    val mi = ActivityManager.MemoryInfo().also { am.getMemoryInfo(it) }
++                    SandboxCare.list() to mi
++                }
++                procs = list; availMb = mem.availMem / 1048576; totalMb = mem.totalMem / 1048576
++                tick++
++                delay(3000)
++            }
++        }
++    }
++
++    PlusPage("沙箱与防杀", onBack) {
++        val sandboxMb = procs.sumOf { it.rssKb } / 1024
++        val usedFrac = 1f - availMb.toFloat() / totalMb
++        // ---- Memory ----
++        Column(
++            Modifier.fillMaxWidth().padding(16.dp).clip(RoundedCornerShape(16.dp))
++                .background(MaterialTheme.colorScheme.surfaceContainerLow).padding(16.dp),
++        ) {
++            Text("沙箱正在用 $sandboxMb MB", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
++            Spacer(Modifier.height(4.dp))
++            Text("手机还剩 ${availMb / 1024.0}".take(9) + " GB 可用 · ${procs.size} 个进程",
++                style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
++            Spacer(Modifier.height(10.dp))
++            LinearProgressIndicator(
++                progress = { usedFrac.coerceIn(0f, 1f) },
++                modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)),
++                color = if (usedFrac > 0.85f) Color(0xFFFF3B30) else MaterialTheme.colorScheme.primary,
++            )
++            Spacer(Modifier.height(12.dp))
++            Button(onClick = {
++                scope.launch {
++                    val n = withContext(Dispatchers.IO) { SandboxCare.cleanHeavy() }
++                    Toast.makeText(context, if (n == 0) "没有要清理的" else "关掉了 $n 个占内存的进程", Toast.LENGTH_SHORT).show()
++                }
++            }, modifier = Modifier.fillMaxWidth()) {
++                androidx.compose.material3.Icon(Icons.Outlined.CleaningServices, null)
++                Spacer(Modifier.width(8.dp))
++                Text("一键清理")
++            }
++        }
++
++        PlusSection(null, footer = "浏览器、Node、Python 这类进程闲置 10 分钟（没用 CPU）就自动关掉。") {
++            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
++                Text("自动清理闲置进程", Modifier.weight(1f))
++                Switch(st.autoClean, onCheckedChange = { on -> PlusPrefs.update(context) { it.copy(autoClean = on) } })
++            }
++        }
++
++        // ---- Processes ----
++        PlusSection("正在运行") {
++            if (procs.isEmpty()) Text("沙箱现在很干净", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(16.dp))
++            procs.take(15).forEachIndexed { i, p ->
++                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
++                    Column(Modifier.weight(1f)) {
++                        Text(p.name, style = MaterialTheme.typography.bodyLarge, maxLines = 1)
++                        Text("${p.rssKb / 1024} MB · pid ${p.pid}", style = MaterialTheme.typography.bodySmall,
++                            color = MaterialTheme.colorScheme.onSurfaceVariant)
++                    }
++                    TextButton(onClick = { SandboxCare.kill(p.pid); procs = procs.filterNot { it.pid == p.pid } }) {
++                        Text("关闭", color = Color(0xFFFF3B30))
++                    }
++                }
++                if (i < minOf(procs.size, 15) - 1) PlusDivider()
++            }
++        }
++
++        // ---- Anti-kill ----
++        val pm = context.getSystemService(PowerManager::class.java)
++        val batteryOk = remember(tick) { pm.isIgnoringBatteryOptimizations(context.packageName) }
++        val killerOff = remember(tick) { PhantomProcessGuard.killerDisabled(context) }
++        PlusSection("防止被安卓杀掉", footer = "安卓 12 起，系统会杀掉超过 32 个的子进程，沙箱命令跑到一半就断。关掉这个限制需要 Shizuku（免 root）。") {
++            CheckRow("电池优化已关闭", batteryOk, "去关闭") {
++                runCatching {
++                    context.startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
++                        Uri.parse("package:${context.packageName}")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
++                }
++            }
++            PlusDivider()
++            val label = when (shizuku.state) {
++                ShizukuManager.State.NOT_INSTALLED -> "安装 Shizuku"
++                ShizukuManager.State.NOT_RUNNING -> "打开 Shizuku"
++                ShizukuManager.State.NEED_PERMISSION -> "授权"
++                ShizukuManager.State.READY -> "一键关闭"
++            }
++            CheckRow("子进程限制已关闭", killerOff, label) {
++                when (shizuku.state) {
++                    ShizukuManager.State.NOT_INSTALLED -> ShizukuManager.openInstallPage(context)
++                    ShizukuManager.State.NOT_RUNNING -> ShizukuManager.openShizukuApp(context)
++                    ShizukuManager.State.NEED_PERMISSION -> ShizukuManager.requestPermission()
++                    ShizukuManager.State.READY -> scope.launch {
++                        val ok = withContext(Dispatchers.IO) {
++                            PhantomProcessGuard.DISABLE_COMMANDS.map { cmd ->
++                                ShizukuManager.runProcess(arrayOf("sh", "-c", cmd), timeoutMs = 8000).exitCode == 0
++                            }.all { it }
++                        }
++                        PhantomProcessGuard.refresh(context)
++                        Toast.makeText(context, if (ok) "已关闭，沙箱可以并行跑更多命令了" else "没完全成功，请重启 Shizuku 后再试", Toast.LENGTH_LONG).show()
++                        tick++
++                    }
++                }
++            }
++            PlusDivider()
++            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
++                Text("同时最多跑 ${PhantomProcessGuard.budget} 个沙箱命令", Modifier.weight(1f),
++                    style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
++            }
++        }
++    }
++}
++
++@Composable
++private fun CheckRow(title: String, ok: Boolean, action: String, onAction: () -> Unit) {
++    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
++        Box(Modifier.width(22.dp)) { Text(if (ok) "✓" else "!", color = if (ok) Color(0xFF34C759) else Color(0xFFFF9500), fontWeight = FontWeight.Bold) }
++        Text(title, Modifier.weight(1f))
++        if (!ok) OutlinedButton(onClick = onAction) { Text(action) }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt
+new file mode 100644
+index 0000000..615bf73
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt
+@@ -0,0 +1,168 @@
++package com.openminis.app.ui.plus
++
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.Button
++import androidx.compose.material3.CircularProgressIndicator
++import androidx.compose.material3.LinearProgressIndicator
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedButton
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.platform.LocalLifecycleOwner
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.repeatOnLifecycle
++import com.openminis.app.plus.PlusPrefs
++import com.openminis.app.plus.VpsServer
++import com.openminis.app.sandbox.FreshProcessShell
++import kotlinx.coroutines.delay
++
++data class ServerStats(
++    val host: String, val uptime: String, val cpuPct: Float, val cores: Int, val load: String,
++    val memUsedMb: Long, val memTotalMb: Long, val diskUsedGb: Float, val diskTotalGb: Float,
++    val rxKbs: Float, val txKbs: Float,
++)
++
++private const val PROBE = """
++hostname; nproc; cat /proc/loadavg; uptime -p 2>/dev/null || uptime
++grep -E '^(MemTotal|MemAvailable):' /proc/meminfo
++df -kP / | tail -1
++head -1 /proc/stat; awk 'NR>2{rx+=${'$'}2;tx+=${'$'}10}END{print "NET",rx,tx}' /proc/net/dev
++sleep 1
++head -1 /proc/stat; awk 'NR>2{rx+=${'$'}2;tx+=${'$'}10}END{print "NET",rx,tx}' /proc/net/dev
++"""
++
++internal fun parseStats(out: String): ServerStats? = runCatching {
++    val lines = out.lines().map { it.trim() }.filter { it.isNotEmpty() }
++    val host = lines[0]
++    val cores = lines[1].toInt()
++    val load = lines[2].split(' ').take(3).joinToString(" ")
++    val uptime = lines[3].removePrefix("up ")
++    fun kb(key: String) = lines.first { it.startsWith(key) }.split(Regex("\\s+"))[1].toLong()
++    val memTotal = kb("MemTotal:"); val memAvail = kb("MemAvailable:")
++    val df = lines.first { it.endsWith(" /") }.split(Regex("\\s+"))
++    val cpu = lines.filter { it.startsWith("cpu ") }
++    val net = lines.filter { it.startsWith("NET") }
++    fun cpuVals(l: String) = l.split(Regex("\\s+")).drop(1).map { it.toLong() }
++    val a = cpuVals(cpu[0]); val b = cpuVals(cpu[1])
++    val idleA = a[3] + a.getOrElse(4) { 0 }; val idleB = b[3] + b.getOrElse(4) { 0 }
++    val dt = (b.sum() - a.sum()).coerceAtLeast(1)
++    val cpuPct = 100f * (dt - (idleB - idleA)) / dt
++    val n0 = net[0].split(' '); val n1 = net[1].split(' ')
++    ServerStats(
++        host, uptime, cpuPct.coerceIn(0f, 100f), cores, load,
++        (memTotal - memAvail) / 1024, memTotal / 1024,
++        df[2].toLong() / 1048576f, df[1].toLong() / 1048576f,
++        (n1[1].toDouble() - n0[1].toDouble()).toFloat() / 1024f,
++        (n1[2].toDouble() - n0[2].toDouble()).toFloat() / 1024f,
++    )
++}.getOrNull()
++
++/** Live status of one server, ServerBox-style. Runs `minis-vps` in the sandbox. */
++@Composable
++fun ServerDetailScreen(serverId: String, onBack: () -> Unit, onOpenTerminal: (String) -> Unit) {
++    val context = LocalContext.current
++    PlusPrefs.init(context)
++    val st by PlusPrefs.state.collectAsState()
++    val server: VpsServer? = st.servers.firstOrNull { it.id == serverId }
++    var stats by remember { mutableStateOf<ServerStats?>(null) }
++    var error by remember { mutableStateOf<String?>(null) }
++    var loading by remember { mutableStateOf(true) }
++    val owner = LocalLifecycleOwner.current
++
++    if (server != null) LaunchedEffect(owner, serverId) {
++        val shell = FreshProcessShell(context, "plus-server-monitor", emptyMap())
++        owner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
++            while (true) {
++                val (out, code) = runCatching {
++                    shell.execute("minis-vps run \"\$(cat <<'EOF'\n$PROBE\nEOF\n)\"", 30_000,
++                        mapOf("MINIS_VPS_SERVERS" to "${server.user}@${server.host}:${server.port}"))
++                }.getOrElse { (it.message ?: "沙箱没准备好") to -1 }
++                val parsed = if (code == 0) parseStats(out) else null
++                if (parsed != null) { stats = parsed; error = null }
++                else error = when {
++                    out.contains("Permission denied") -> "还没授权：点下面“授权”，输一次密码"
++                    out.contains("连不上") || code == 255 -> "连不上这台服务器"
++                    else -> out.lines().lastOrNull { it.isNotBlank() }?.take(160) ?: "读取失败（$code）"
++                }
++                loading = false
++                delay(5000)
++            }
++        }
++    }
++
++    PlusPage(server?.name?.ifBlank { server.host } ?: "服务器", onBack) {
++        if (server == null) { Text("这台服务器已删除", Modifier.padding(20.dp)); return@PlusPage }
++        Text("${server.target}:${server.port}", color = MaterialTheme.colorScheme.onSurfaceVariant,
++            modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp))
++        val s = stats
++        if (loading && s == null) {
++            Row(Modifier.padding(20.dp)) { CircularProgressIndicator(); Spacer(Modifier.padding(8.dp)); Text("正在读取…") }
++        }
++        error?.let { e ->
++            Text(e, color = Color(0xFFFF3B30), modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp))
++        }
++        if (s != null) {
++            Column(Modifier.padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
++                Meter("CPU · ${s.cores} 核", "%.0f%%".format(s.cpuPct), s.cpuPct / 100f, "负载 ${s.load}")
++                Meter("内存", "${s.memUsedMb} / ${s.memTotalMb} MB", s.memUsedMb.toFloat() / s.memTotalMb, null)
++                Meter("硬盘", "%.1f / %.1f GB".format(s.diskUsedGb, s.diskTotalGb), s.diskUsedGb / s.diskTotalGb, null)
++                Meter("网速", "↓ %s  ↑ %s".format(rate(s.rxKbs), rate(s.txKbs)), null, "已运行 ${s.uptime} · ${s.host}")
++            }
++        }
++        PlusSection("操作") {
++            Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                Button(onClick = { onOpenTerminal("MINIS_VPS_SERVERS=${server.user}@${server.host}:${server.port} minis-vps shell") },
++                    modifier = Modifier.weight(1f)) { Text("终端") }
++                OutlinedButton(onClick = { onOpenTerminal("minis-vps setup ${server.target} ${server.port}") },
++                    modifier = Modifier.weight(1f)) { Text("授权") }
++            }
++        }
++    }
++}
++
++private fun rate(kbs: Float) = if (kbs >= 1024) "%.1f MB/s".format(kbs / 1024) else "%.0f KB/s".format(kbs)
++
++@Composable
++private fun Meter(title: String, value: String, frac: Float?, sub: String?) {
++    Column(
++        Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp))
++            .background(MaterialTheme.colorScheme.surfaceContainerLow).padding(14.dp),
++    ) {
++        Row {
++            Text(title, Modifier.weight(1f), color = MaterialTheme.colorScheme.onSurfaceVariant)
++            Text(value, fontWeight = FontWeight.SemiBold)
++        }
++        if (frac != null) {
++            Spacer(Modifier.height(8.dp))
++            LinearProgressIndicator(
++                progress = { frac.coerceIn(0f, 1f) },
++                modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
++                color = if (frac > 0.85f) Color(0xFFFF3B30) else MaterialTheme.colorScheme.primary,
++            )
++        }
++        if (sub != null) {
++            Spacer(Modifier.height(6.dp))
++            Text(sub, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
+new file mode 100644
+index 0000000..9bd7854
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
+@@ -0,0 +1,164 @@
++package com.openminis.app.ui.plus
++
++import androidx.compose.animation.AnimatedVisibility
++import androidx.compose.foundation.background
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.outlined.ExpandLess
++import androidx.compose.material.icons.outlined.ExpandMore
++import androidx.compose.material.icons.outlined.Mic
++import androidx.compose.material3.Icon
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Brush
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import com.openminis.app.plus.PlusPrefs
++import com.openminis.app.plus.PlusState
++import com.openminis.app.plus.PlusVault
++import com.openminis.app.plus.PlusVps
++import java.text.SimpleDateFormat
++import java.util.Calendar
++import java.util.Locale
++
++/**
++ * "Today" header on the conversation list: greeting with the avatar, and
++ * one-tap chips for where work runs, servers, and connected accounts.
++ */
++@Composable
++fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier) {
++    val context = LocalContext.current
++    PlusPrefs.init(context)
++    PlusVault.init(context)
++    val st by PlusPrefs.state.collectAsState()
++    val vault by PlusVault.entries.collectAsState()
++    LaunchedEffect(Unit) {
++        PlusVps.startMonitor(context)
++        com.openminis.app.plus.SandboxCare.startAuto(context)
++        if (PlusPrefs.state.value.petEnabled && com.openminis.app.plus.DeskPetService.canShow(context)) {
++            com.openminis.app.plus.DeskPetService.start(context)
++        }
++    }
++
++    var switcher by androidx.compose.runtime.saveable.rememberSaveable { androidx.compose.runtime.mutableStateOf(false) }
++    if (switcher) AvatarSwitcherSheet(onDismiss = { switcher = false })
++    LaunchedEffect(Unit) { com.openminis.app.plus.PlusConnect.rearm(context) }
++
++    val cal = Calendar.getInstance()
++    val hour = cal.get(Calendar.HOUR_OF_DAY)
++    val greet = when (hour) {
++        in 5..10 -> "早上好"
++        in 11..12 -> "中午好"
++        in 13..17 -> "下午好"
++        in 18..22 -> "晚上好"
++        else -> "夜深了，早点休息"
++    }
++    val date = SimpleDateFormat("M月d日 EEEE", Locale.CHINA).format(cal.time)
++    val primary = MaterialTheme.colorScheme.primary
++
++    Column(
++        modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)
++            .clip(RoundedCornerShape(20.dp))
++            .background(
++                Brush.linearGradient(
++                    listOf(primary.copy(alpha = 0.16f), MaterialTheme.colorScheme.surfaceContainerLow)
++                )
++            ),
++    ) {
++        Row(
++            Modifier.fillMaxWidth()
++                .clickable { PlusPrefs.update(context) { it.copy(todayCollapsed = !it.todayCollapsed) } }
++                .padding(start = 12.dp, end = 12.dp, top = 10.dp, bottom = if (st.todayCollapsed) 10.dp else 4.dp),
++            verticalAlignment = Alignment.CenterVertically,
++        ) {
++            Box(Modifier.clickable { switcher = true }) {
++                PetAvatar(size = if (st.todayCollapsed) 40.dp else 60.dp)
++            }
++            Spacer(Modifier.width(10.dp))
++            Column(Modifier.weight(1f)) {
++                Text(greet, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
++                Text(date, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
++            }
++            androidx.compose.material3.FilledTonalIconButton(onClick = { onOpen(PlusRoutes.VOICE) }) {
++                Icon(Icons.Outlined.Mic, contentDescription = "实时语音")
++            }
++            Icon(
++                if (st.todayCollapsed) Icons.Outlined.ExpandMore else Icons.Outlined.ExpandLess,
++                contentDescription = if (st.todayCollapsed) "展开" else "收起",
++                tint = MaterialTheme.colorScheme.onSurfaceVariant,
++            )
++        }
++        AnimatedVisibility(!st.todayCollapsed) {
++            Row(
++                Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, bottom = 12.dp),
++                horizontalArrangement = Arrangement.spacedBy(8.dp),
++            ) {
++                val eff = PlusVps.effectiveMode(st)
++                val online = st.onlineServers.size
++                Chip(
++                    Modifier.weight(1f), "工作位置",
++                    when {
++                        !st.isVps -> "本机"
++                        eff == PlusState.MODE_LOCAL -> "已回本机"
++                        else -> "VPS"
++                    },
++                    dot = when {
++                        !st.isVps -> Color(0xFF007AFF)
++                        eff == PlusState.MODE_LOCAL -> Color(0xFFFF9500)
++                        else -> Color(0xFF34C759)
++                    },
++                ) { onOpen(PlusRoutes.WORK) }
++                Chip(
++                    Modifier.weight(1f), "服务器",
++                    if (st.servers.isEmpty()) "未添加" else "$online/${st.servers.size} 在线",
++                    dot = if (st.servers.isEmpty()) Color.Gray else if (online > 0) Color(0xFF34C759) else Color(0xFFFF3B30),
++                ) { onOpen(PlusRoutes.WORK) }
++                Chip(
++                    Modifier.weight(1f), "账号",
++                    if (vault.isEmpty()) "去连接" else "${vault.size} 个已连接",
++                    dot = if (vault.isEmpty()) Color.Gray else Color(0xFF34C759),
++                ) { onOpen(PlusRoutes.CONNECTIONS) }
++            }
++        }
++    }
++}
++
++@Composable
++private fun Chip(modifier: Modifier, label: String, value: String, dot: Color, onClick: () -> Unit) {
++    Column(
++        modifier.clip(RoundedCornerShape(12.dp))
++            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.7f))
++            .clickable(onClick = onClick)
++            .padding(horizontal = 10.dp, vertical = 8.dp),
++    ) {
++        Text(label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
++        Spacer(Modifier.height(2.dp))
++        Row(verticalAlignment = Alignment.CenterVertically) {
++            Box(Modifier.size(7.dp).background(dot, CircleShape))
++            Spacer(Modifier.width(5.dp))
++            Text(value, style = MaterialTheme.typography.labelLarge, maxLines = 1)
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
+new file mode 100644
+index 0000000..38a175e
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
+@@ -0,0 +1,216 @@
++package com.openminis.app.ui.plus
++
++import android.Manifest
++import android.content.pm.PackageManager
++import android.view.WindowManager
++import androidx.activity.compose.rememberLauncherForActivityResult
++import androidx.activity.result.contract.ActivityResultContracts
++import androidx.compose.animation.core.animateFloatAsState
++import androidx.compose.foundation.Canvas
++import androidx.compose.foundation.background
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.items
++import androidx.compose.foundation.lazy.rememberLazyListState
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.automirrored.filled.ArrowBack
++import androidx.compose.material.icons.filled.CallEnd
++import androidx.compose.material.icons.filled.Mic
++import androidx.compose.material.icons.filled.MicOff
++import androidx.compose.material3.Button
++import androidx.compose.material3.ExperimentalMaterial3Api
++import androidx.compose.material3.Icon
++import androidx.compose.material3.IconButton
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Scaffold
++import androidx.compose.material3.Text
++import androidx.compose.material3.TopAppBar
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Brush
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.style.TextAlign
++import androidx.compose.ui.unit.dp
++import androidx.core.content.ContextCompat
++import com.openminis.app.plus.GeminiLive
++import com.openminis.app.plus.PlusVault
++
++/**
++ * Full-screen live voice call with Gemini. Needs a Gemini key saved under
++ * 账号连接; talks back instantly and can be interrupted mid-sentence.
++ */
++@OptIn(ExperimentalMaterial3Api::class)
++@Composable
++fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
++    val context = LocalContext.current
++    PlusVault.init(context)
++    val key = remember { PlusVault.secret("gemini") }
++    var hasMic by remember {
++        mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
++    }
++    val askMic = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { hasMic = it }
++    val live = remember(key) {
++        key?.let { GeminiLive(it, PlusVault.extra("gemini", "model") ?: GeminiLive.DEFAULT_MODEL,
++            PlusVault.extra("gemini", "voice") ?: "Puck") }
++    }
++
++    // Keep the screen on during a call; hang up when leaving.
++    DisposableEffect(Unit) {
++        val act = context as? android.app.Activity
++        act?.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
++        onDispose {
++            act?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
++            live?.stop()
++        }
++    }
++    LaunchedEffect(live, hasMic) {
++        if (live != null && hasMic) live.start()
++        else if (live != null && !hasMic) askMic.launch(Manifest.permission.RECORD_AUDIO)
++    }
++
++    Scaffold(
++        containerColor = Color(0xFF0E1320),
++        topBar = {
++            TopAppBar(
++                title = { Text("实时语音", color = Color.White) },
++                navigationIcon = {
++                    IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回", tint = Color.White) }
++                },
++                colors = androidx.compose.material3.TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
++            )
++        },
++    ) { pad ->
++        Column(Modifier.fillMaxSize().padding(pad), horizontalAlignment = Alignment.CenterHorizontally) {
++            if (live == null) {
++                Spacer(Modifier.height(80.dp))
++                PetAvatar(size = 120.dp)
++                Spacer(Modifier.height(24.dp))
++                Text("先填一个 Gemini API Key", color = Color.White, style = MaterialTheme.typography.titleMedium)
++                Spacer(Modifier.height(16.dp))
++                Button(onClick = onOpenConnections) { Text("去 账号连接 填写") }
++                return@Column
++            }
++            val phase by live.phase.collectAsState()
++            val level by live.level.collectAsState()
++            val muted by live.muted.collectAsState()
++            val error by live.error.collectAsState()
++            val lines by live.lines.collectAsState()
++
++            Spacer(Modifier.height(24.dp))
++            Orb(phase, level)
++            Spacer(Modifier.height(16.dp))
++            Text(
++                when (phase) {
++                    GeminiLive.Phase.IDLE -> "准备中"
++                    GeminiLive.Phase.CONNECTING -> "正在连接…"
++                    GeminiLive.Phase.LISTENING -> if (muted) "已静音" else "我在听，直接说"
++                    GeminiLive.Phase.SPEAKING -> "说话中（随时打断我）"
++                    GeminiLive.Phase.ERROR -> error ?: "出错了"
++                },
++                color = if (phase == GeminiLive.Phase.ERROR) Color(0xFFFF6B6B) else Color.White,
++                style = MaterialTheme.typography.titleMedium,
++                textAlign = TextAlign.Center,
++                modifier = Modifier.padding(horizontal = 24.dp),
++            )
++            if (phase == GeminiLive.Phase.ERROR) {
++                Spacer(Modifier.height(12.dp))
++                Button(onClick = { live.start() }) { Text("重新连接") }
++            }
++
++            val listState = rememberLazyListState()
++            LaunchedEffect(lines.size, lines.lastOrNull()?.text?.length) {
++                if (lines.isNotEmpty()) listState.animateScrollToItem(lines.lastIndex)
++            }
++            LazyColumn(
++                state = listState,
++                modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
++                verticalArrangement = Arrangement.spacedBy(8.dp),
++            ) {
++                items(lines) { l ->
++                    Row(Modifier.fillMaxWidth(), horizontalArrangement = if (l.user) Arrangement.End else Arrangement.Start) {
++                        Text(
++                            l.text,
++                            color = Color.White,
++                            style = MaterialTheme.typography.bodyLarge,
++                            modifier = Modifier.clip(RoundedCornerShape(16.dp))
++                                .background(if (l.user) Color(0xFF3A5BD9) else Color(0x33FFFFFF))
++                                .padding(horizontal = 12.dp, vertical = 8.dp),
++                        )
++                    }
++                }
++            }
++
++            Row(
++                Modifier.fillMaxWidth().padding(bottom = 36.dp),
++                horizontalArrangement = Arrangement.SpaceEvenly,
++                verticalAlignment = Alignment.CenterVertically,
++            ) {
++                RoundButton(if (muted) Icons.Filled.MicOff else Icons.Filled.Mic,
++                    if (muted) "取消静音" else "静音", if (muted) Color(0xFFFF9500) else Color(0x33FFFFFF)) {
++                    live.setMuted(!muted)
++                }
++                RoundButton(Icons.Filled.CallEnd, "挂断", Color(0xFFFF3B30)) { live.stop(); onBack() }
++            }
++        }
++    }
++}
++
++@Composable
++private fun Orb(phase: GeminiLive.Phase, level: Float) {
++    val target = when (phase) {
++        GeminiLive.Phase.SPEAKING -> 1.15f
++        GeminiLive.Phase.LISTENING -> 1f + level * 0.35f
++        else -> 0.9f
++    }
++    val scale by animateFloatAsState(target, label = "orb")
++    Box(Modifier.size(220.dp), contentAlignment = Alignment.Center) {
++        Canvas(Modifier.fillMaxSize()) {
++            val r = size.minDimension / 2f * 0.8f * scale
++            drawCircle(
++                Brush.radialGradient(
++                    listOf(
++                        if (phase == GeminiLive.Phase.SPEAKING) Color(0xFF8E7CFF) else Color(0xFF4FA3FF),
++                        Color(0x004FA3FF),
++                    ),
++                    center = center, radius = r * 1.25f,
++                ),
++                radius = r * 1.25f,
++            )
++        }
++        PetAvatar(size = 120.dp)
++    }
++}
++
++@Composable
++private fun RoundButton(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, bg: Color, onClick: () -> Unit) {
++    Column(horizontalAlignment = Alignment.CenterHorizontally) {
++        Box(
++            Modifier.size(68.dp).clip(CircleShape).background(bg).clickable(onClick = onClick),
++            contentAlignment = Alignment.Center,
++        ) { Icon(icon, label, tint = Color.White, modifier = Modifier.size(30.dp)) }
++        Spacer(Modifier.height(6.dp))
++        Text(label, color = Color.White, style = MaterialTheme.typography.labelMedium)
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
+new file mode 100644
+index 0000000..10a588d
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
+@@ -0,0 +1,197 @@
++package com.openminis.app.ui.plus
++
++import android.annotation.SuppressLint
++import android.graphics.Bitmap
++import android.webkit.CookieManager
++import android.webkit.WebChromeClient
++import android.webkit.WebResourceRequest
++import android.webkit.WebView
++import android.webkit.WebViewClient
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.navigationBarsPadding
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.Close
++import androidx.compose.material3.Button
++import androidx.compose.material3.ExperimentalMaterial3Api
++import androidx.compose.material3.Icon
++import androidx.compose.material3.IconButton
++import androidx.compose.material3.LinearProgressIndicator
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Scaffold
++import androidx.compose.material3.Surface
++import androidx.compose.material3.Text
++import androidx.compose.material3.TopAppBar
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import androidx.compose.ui.viewinterop.AndroidView
++import com.openminis.app.browser.GoogleAuthRouter
++import com.openminis.app.plus.ConnectionKind
++import com.openminis.app.plus.MINES_MOBILE_UA
++import com.openminis.app.plus.PlusConnect
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.suspendCancellableCoroutine
++import kotlin.coroutines.resume
++
++/**
++ * Full-screen in-app browser on a service's official login page.
++ * Uses the app-wide WebView cookie store, so the AI's browser tool shares the
++ * sign-in. Detects success from cookies / URL / a JS probe and closes itself;
++ * a big "我已登录好了" button is always there as a fallback.
++ */
++@OptIn(ExperimentalMaterial3Api::class)
++@SuppressLint("SetJavaScriptEnabled")
++@Composable
++fun WebLoginScreen(
++    kind: ConnectionKind,
++    url: String,
++    title: String,
++    detect: Boolean,
++    onDone: (account: String, urls: Set<String>) -> Unit,
++    onClose: () -> Unit,
++) {
++    val context = LocalContext.current
++    var progress by remember { mutableIntStateOf(0) }
++    var current by remember { mutableStateOf(url) }
++    val visited = remember { mutableSetOf(url) }
++    var webView by remember { mutableStateOf<WebView?>(null) }
++    var finished by remember { mutableStateOf(false) }
++    val scope = androidx.compose.runtime.rememberCoroutineScope()
++
++    suspend fun eval(js: String): String {
++        val wv = webView ?: return ""
++        return suspendCancellableCoroutine { cont ->
++            runCatching {
++                wv.evaluateJavascript("(function(){try{return String($js)}catch(e){return ''}})()") { r ->
++                    val v = r?.trim('"')?.takeUnless { it == "null" || it == "undefined" }.orEmpty()
++                    if (cont.isActive) cont.resume(v)
++                }
++            }.onFailure { if (cont.isActive) cont.resume("") }
++        }
++    }
++
++    suspend fun finish() {
++        if (finished) return
++        finished = true
++        val account = kind.accountJs?.let { eval(it) }.orEmpty()
++        CookieManager.getInstance().flush()
++        onDone(account, visited.toSet())
++    }
++
++    // Poll for "signed in": two positive checks in a row, so a page that briefly
++    // shows the dashboard before a client-side redirect to /login does not count.
++    if (detect && (kind.doneCookies.isNotEmpty() || kind.doneUrl != null || kind.doneJs != null)) {
++        LaunchedEffect(kind.id) {
++            var hits = 0
++            delay(1500)
++            while (!finished) {
++                val u = current
++                val cm = CookieManager.getInstance()
++                val cookieHit = kind.doneCookies.isNotEmpty() && visited.any { v ->
++                    val c = cm.getCookie(v).orEmpty()
++                    kind.doneCookies.any { name -> c.contains(if (name.contains('=')) name else "$name=") }
++                }
++                val urlHit = kind.doneUrl?.matches(u) == true
++                val jsHit = kind.doneJs?.let { eval(it).isNotBlank() } == true
++                hits = if (cookieHit || urlHit || jsHit) hits + 1 else 0
++                if (hits >= 2) { finish(); break }
++                delay(1500)
++            }
++        }
++    }
++
++    DisposableEffect(Unit) {
++        onDispose { runCatching { webView?.stopLoading(); webView?.destroy() } }
++    }
++
++    Scaffold(
++        topBar = {
++            TopAppBar(
++                title = {
++                    Column {
++                        Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold)
++                        Text(PlusConnect.hostOf(current), style = MaterialTheme.typography.bodySmall,
++                            color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
++                    }
++                },
++                navigationIcon = {
++                    IconButton(onClick = onClose) { Icon(Icons.Filled.Close, contentDescription = "关闭") }
++                },
++            )
++        },
++        bottomBar = {
++            Surface(tonalElevation = 3.dp) {
++                Button(
++                    onClick = { if (detect) scope.launch { finish() } else onClose() },
++                    modifier = Modifier.fillMaxWidth().navigationBarsPadding().padding(12.dp).heightIn(min = 56.dp),
++                    shape = RoundedCornerShape(14.dp),
++                ) { Text(if (detect) "我已登录好了" else "完成", fontSize = 18.sp, fontWeight = FontWeight.SemiBold) }
++            }
++        },
++    ) { padding ->
++        Box(Modifier.fillMaxSize().padding(padding)) {
++            AndroidView(
++                modifier = Modifier.fillMaxSize(),
++                factory = { ctx ->
++                    WebView(ctx).apply {
++                        settings.javaScriptEnabled = true
++                        settings.domStorageEnabled = true
++                        settings.databaseEnabled = true
++                        settings.loadWithOverviewMode = true
++                        settings.useWideViewPort = true
++                        settings.setSupportMultipleWindows(false)
++                        settings.javaScriptCanOpenWindowsAutomatically = true
++                        settings.userAgentString = MINES_MOBILE_UA
++                        CookieManager.getInstance().setAcceptCookie(true)
++                        CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
++                        webChromeClient = object : WebChromeClient() {
++                            override fun onProgressChanged(view: WebView, newProgress: Int) { progress = newProgress }
++                        }
++                        webViewClient = object : WebViewClient() {
++                            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
++                                val u = request.url.toString()
++                                // Google blocks sign-in inside WebViews; hand that hop to Chrome.
++                                if (GoogleAuthRouter.shouldRouteExternally(u)) {
++                                    GoogleAuthRouter.openInCustomTab(ctx, u); return true
++                                }
++                                if (!u.startsWith("http")) return true // app deep links (weixin://, etc.)
++                                return false
++                            }
++                            override fun onPageStarted(view: WebView, u: String, favicon: Bitmap?) {
++                                current = u; visited.add(u)
++                            }
++                            override fun onPageFinished(view: WebView, u: String) {
++                                current = u; visited.add(u)
++                                CookieManager.getInstance().flush()
++                            }
++                        }
++                        loadUrl(url)
++                        webView = this
++                    }
++                },
++            )
++            if (progress in 1..99) LinearProgressIndicator(
++                progress = { progress / 100f }, modifier = Modifier.fillMaxWidth(),
++            )
++        }
++    }
++}
++
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt
+new file mode 100644
+index 0000000..0f4905e
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt
+@@ -0,0 +1,308 @@
++package com.openminis.app.ui.plus
++
++import androidx.compose.foundation.BorderStroke
++import androidx.compose.foundation.background
++import androidx.compose.foundation.border
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.foundation.text.KeyboardOptions
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.outlined.Add
++import androidx.compose.material.icons.outlined.Cloud
++import androidx.compose.material.icons.outlined.PhoneAndroid
++import androidx.compose.material.icons.outlined.Refresh
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.CircularProgressIndicator
++import androidx.compose.material3.Icon
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.Switch
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.vector.ImageVector
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.input.KeyboardType
++import androidx.compose.ui.unit.dp
++import com.openminis.app.plus.PlusPrefs
++import com.openminis.app.plus.PlusState
++import com.openminis.app.plus.PlusVps
++import com.openminis.app.plus.VpsServer
++import kotlinx.coroutines.launch
++
++private val Green = Color(0xFF34C759)
++private val Red = Color(0xFFFF3B30)
++
++@Composable
++fun WorkLocationScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onOpenServer: (String) -> Unit = {}) {
++    val context = LocalContext.current
++    PlusPrefs.init(context)
++    val st by PlusPrefs.state.collectAsState()
++    val scope = rememberCoroutineScope()
++    var checking by remember { mutableStateOf(false) }
++    var editing by remember { mutableStateOf<VpsServer?>(null) }
++    var adding by remember { mutableStateOf(false) }
++
++    fun check() {
++        if (checking) return
++        checking = true
++        scope.launch { runCatching { PlusVps.probeAll(context) }; checking = false }
++    }
++    LaunchedEffect(Unit) { if (st.servers.isNotEmpty()) check() }
++
++    PlusPage("工作位置", onBack) {
++        val effective = PlusVps.effectiveMode(st)
++        val best = PlusVps.orderedTargets(st).firstOrNull()
++        // -- Mode picker --
++        Row(
++            Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(top = 16.dp),
++            horizontalArrangement = Arrangement.spacedBy(12.dp),
++        ) {
++            ModeCard(
++                Modifier.weight(1f), Icons.Outlined.PhoneAndroid, "本机", "在手机沙箱里干活",
++                selected = !st.isVps,
++            ) {
++                PlusPrefs.update(context) { it.copy(workMode = PlusState.MODE_LOCAL) }
++                PlusVps.syncToSandbox(context)
++            }
++            ModeCard(
++                Modifier.weight(1f), Icons.Outlined.Cloud, "VPS", "重活交给服务器",
++                selected = st.isVps,
++            ) {
++                PlusPrefs.update(context) { it.copy(workMode = PlusState.MODE_VPS) }
++                check()
++            }
++        }
++        Text(
++            when {
++                !st.isVps -> "现在：在本机运行"
++                effective == PlusState.MODE_LOCAL -> "现在：服务器都连不上，已自动回到本机"
++                best != null && best.lastLatencyMs >= 0 -> "现在：用 ${best.name.ifBlank { best.host }}（${best.lastLatencyMs} ms）"
++                else -> "现在：VPS 模式，正在检测服务器"
++            },
++            style = MaterialTheme.typography.bodyMedium,
++            color = if (st.isVps && effective == PlusState.MODE_LOCAL) Red else MaterialTheme.colorScheme.onSurfaceVariant,
++            modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp),
++        )
++
++        PlusSection(
++            "服务器",
++            footer = "可以加多台。每 90 秒检测一次，自动用延迟最低的那台；正在用的断了就换下一台。点服务器看 CPU、内存、硬盘、网速；新服务器先在里面点“授权”，输一次密码，以后免密。",
++        ) {
++            if (st.servers.isEmpty()) {
++                Text(
++                    "还没有服务器",
++                    color = MaterialTheme.colorScheme.onSurfaceVariant,
++                    modifier = Modifier.padding(16.dp),
++                )
++            }
++            st.servers.forEach { s ->
++                ServerRow(
++                    s,
++                    onClick = { onOpenServer(s.id) },
++                    onEdit = { editing = s },
++                    onToggle = { on ->
++                        PlusPrefs.update(context) { cur ->
++                            cur.copy(servers = cur.servers.map { if (it.id == s.id) it.copy(enabled = on) else it })
++                        }
++                        PlusVps.syncToSandbox(context)
++                    },
++                    onAuthorize = { onOpenTerminal("minis-vps setup ${s.target} ${s.port}") },
++                )
++                PlusDivider()
++            }
++            ActionRow(Icons.Outlined.Add, "添加服务器") { adding = true }
++            PlusDivider()
++            Row(
++                Modifier.fillMaxWidth().clickable { check() }.padding(horizontal = 16.dp, vertical = 14.dp),
++                verticalAlignment = Alignment.CenterVertically,
++            ) {
++                if (checking) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
++                else Icon(Icons.Outlined.Refresh, null, tint = MaterialTheme.colorScheme.primary)
++                Spacer(Modifier.width(12.dp))
++                Text(if (checking) "检测中…" else "立即检测", color = MaterialTheme.colorScheme.primary)
++            }
++        }
++
++        PlusSection("连接", footer = "所有服务器都连不上时，自动回到本机继续，不会卡住。") {
++            Row(
++                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
++                verticalAlignment = Alignment.CenterVertically,
++            ) {
++                Text("断线自动回本机", Modifier.weight(1f))
++                Switch(st.autoFallback, onCheckedChange = { on ->
++                    PlusPrefs.update(context) { it.copy(autoFallback = on) }
++                    PlusVps.syncToSandbox(context)
++                })
++            }
++        }
++    }
++
++    if (adding || editing != null) {
++        ServerDialog(
++            initial = editing,
++            onDismiss = { adding = false; editing = null },
++            onSave = { srv ->
++                PlusPrefs.update(context) { cur ->
++                    val exists = cur.servers.any { it.id == srv.id }
++                    cur.copy(servers = if (exists) cur.servers.map { if (it.id == srv.id) srv else it } else cur.servers + srv)
++                }
++                adding = false; editing = null
++                check()
++            },
++            onDelete = { srv ->
++                PlusPrefs.update(context) { cur -> cur.copy(servers = cur.servers.filterNot { it.id == srv.id }) }
++                editing = null
++                PlusVps.syncToSandbox(context)
++            },
++        )
++    }
++}
++
++@Composable
++private fun ModeCard(
++    modifier: Modifier, icon: ImageVector, title: String, sub: String,
++    selected: Boolean, onClick: () -> Unit,
++) {
++    val primary = MaterialTheme.colorScheme.primary
++    Column(
++        modifier
++            .clip(RoundedCornerShape(16.dp))
++            .background(if (selected) primary.copy(alpha = 0.12f) else MaterialTheme.colorScheme.surfaceContainerLow)
++            .border(
++                BorderStroke(if (selected) 2.dp else 1.dp, if (selected) primary else MaterialTheme.colorScheme.outlineVariant),
++                RoundedCornerShape(16.dp),
++            )
++            .clickable(onClick = onClick)
++            .padding(16.dp),
++    ) {
++        Box(
++            Modifier.size(40.dp).background(if (selected) primary else MaterialTheme.colorScheme.surfaceVariant, CircleShape),
++            contentAlignment = Alignment.Center,
++        ) {
++            Icon(icon, null, tint = if (selected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant)
++        }
++        Spacer(Modifier.height(10.dp))
++        Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
++        Text(sub, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
++    }
++}
++
++@Composable
++private fun ServerRow(s: VpsServer, onClick: () -> Unit, onEdit: () -> Unit, onToggle: (Boolean) -> Unit, onAuthorize: () -> Unit) {
++    Row(
++        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 12.dp),
++        verticalAlignment = Alignment.CenterVertically,
++    ) {
++        val dot = when {
++            !s.enabled -> Color.Gray
++            s.lastLatencyMs >= 0 -> Green
++            s.lastLatencyMs == -2 -> Red
++            else -> Color(0xFFFFCC00)
++        }
++        Box(Modifier.size(10.dp).background(dot, CircleShape))
++        Spacer(Modifier.width(12.dp))
++        Column(Modifier.weight(1f)) {
++            Text(s.name.ifBlank { s.host }, style = MaterialTheme.typography.bodyLarge)
++            Text(
++                "${s.target}:${s.port} · " + when {
++                    !s.enabled -> "已停用"
++                    s.lastLatencyMs >= 0 -> "${s.lastLatencyMs} ms"
++                    s.lastLatencyMs == -2 -> "连不上"
++                    else -> "未检测"
++                },
++                style = MaterialTheme.typography.bodySmall,
++                color = MaterialTheme.colorScheme.onSurfaceVariant,
++            )
++        }
++        TextButton(onClick = onEdit) { Text("编辑") }
++        Switch(s.enabled, onCheckedChange = onToggle)
++    }
++}
++
++@Composable
++internal fun ActionRow(icon: ImageVector, title: String, onClick: () -> Unit) {
++    Row(
++        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 14.dp),
++        verticalAlignment = Alignment.CenterVertically,
++    ) {
++        Icon(icon, null, tint = MaterialTheme.colorScheme.primary)
++        Spacer(Modifier.width(12.dp))
++        Text(title, color = MaterialTheme.colorScheme.primary)
++    }
++}
++
++@Composable
++internal fun PlusDivider() {
++    Box(
++        Modifier.fillMaxWidth().padding(start = 16.dp).height(0.5.dp)
++            .background(MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
++    )
++}
++
++@Composable
++private fun ServerDialog(
++    initial: VpsServer?, onDismiss: () -> Unit,
++    onSave: (VpsServer) -> Unit, onDelete: (VpsServer) -> Unit,
++) {
++    var name by remember { mutableStateOf(initial?.name ?: "") }
++    var host by remember { mutableStateOf(initial?.host ?: "") }
++    var port by remember { mutableStateOf((initial?.port ?: 22).toString()) }
++    var user by remember { mutableStateOf(initial?.user ?: "root") }
++    val valid = host.isNotBlank() && !host.contains(' ') && (port.toIntOrNull() ?: 0) in 1..65535 &&
++        user.isNotBlank() && user.all { it.isLetterOrDigit() || it in "._-" }
++    AlertDialog(
++        onDismissRequest = onDismiss,
++        title = { Text(if (initial == null) "添加服务器" else "编辑服务器") },
++        text = {
++            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                OutlinedTextField(name, { name = it }, label = { Text("名字（随便起）") }, singleLine = true)
++                OutlinedTextField(host, { host = it.trim() }, label = { Text("地址 / IP") }, singleLine = true,
++                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri))
++                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                    OutlinedTextField(user, { user = it.trim() }, label = { Text("用户") }, singleLine = true,
++                        modifier = Modifier.weight(1f))
++                    OutlinedTextField(port, { port = it.filter(Char::isDigit).take(5) }, label = { Text("端口") },
++                        singleLine = true, modifier = Modifier.weight(0.7f),
++                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
++                }
++            }
++        },
++        confirmButton = {
++            TextButton(enabled = valid, onClick = {
++                val base = initial ?: VpsServer(name = "", host = "")
++                onSave(base.copy(name = name.trim(), host = host, port = port.toInt(), user = user,
++                    lastLatencyMs = if (initial?.host == host && initial.port == port.toInt()) base.lastLatencyMs else -1))
++            }) { Text("保存") }
++        },
++        dismissButton = {
++            Row {
++                if (initial != null) TextButton(onClick = { onDelete(initial) }) { Text("删除", color = Red) }
++                TextButton(onClick = onDismiss) { Text("取消") }
++            }
++        },
++    )
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/sandbox/FilePreviewScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/sandbox/FilePreviewScreen.kt
+index 332d5c0..d3a3dbe 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/sandbox/FilePreviewScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/sandbox/FilePreviewScreen.kt
+@@ -1352,7 +1352,7 @@ private suspend fun saveImageToGallery(context: Context, src: File): Boolean =
+                     put(MediaStore.Images.Media.MIME_TYPE, mime)
+                     put(
+                         MediaStore.Images.Media.RELATIVE_PATH,
+-                        Environment.DIRECTORY_PICTURES + "/Minis",
++                        Environment.DIRECTORY_PICTURES + "/Mines",
+                     )
+                     put(MediaStore.Images.Media.IS_PENDING, 1)
+                 }
+@@ -1370,7 +1370,7 @@ private suspend fun saveImageToGallery(context: Context, src: File): Boolean =
+                 val dir = Environment.getExternalStoragePublicDirectory(
+                     Environment.DIRECTORY_PICTURES,
+                 )
+-                val minisDir = File(dir, "Minis").also { it.mkdirs() }
++                val minisDir = File(dir, "Mines").also { it.mkdirs() }
+                 val dest = File(minisDir, filename)
+                 src.inputStream().use { input ->
+                     dest.outputStream().use { input.copyTo(it) }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
+index ce5246e..b056b04 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
+@@ -821,7 +821,9 @@ fun SessionListScreen(
+             .map { list -> list.count { it.enabled } }
+     }.collectAsState(initial = 0)
+ 
++    val minesHomeWallpaper = com.openminis.app.ui.plus.wallpaperOn(home = true)
+     Scaffold(
++        containerColor = MaterialTheme.colorScheme.background,
+         topBar = {
+             TopAppBar(
+                 title = {
+@@ -953,10 +955,16 @@ fun SessionListScreen(
+                         }
+                     }
+                 },
++                colors = androidx.compose.material3.TopAppBarDefaults.topAppBarColors(
++                    containerColor = MaterialTheme.colorScheme.surface.copy(alpha = if (minesHomeWallpaper) 0.6f else 1f),
++                    scrolledContainerColor = MaterialTheme.colorScheme.surface.copy(alpha = if (minesHomeWallpaper) 0.6f else 1f),
++                ),
+             )
+         },
+         // No default FAB — we draw dual FABs manually at bottom
+     ) { padding ->
++        // [Mines] Optional wallpaper behind the conversation list too.
++        com.openminis.app.ui.plus.ChatWallpaperLayer(Modifier.fillMaxSize(), home = true)
+         Box(
+             modifier = Modifier
+                 .fillMaxSize()
+@@ -1009,11 +1017,17 @@ fun SessionListScreen(
+                         )
+                     }
+                 } else {
++                    androidx.compose.foundation.layout.Column(Modifier.fillMaxSize()) {
++                    if (!isSelecting) {
++                        com.openminis.app.ui.plus.TodayCard(
++                            onOpen = { route -> com.openminis.app.ui.plus.PlusNav.go(route) },
++                        )
++                    }
+                     LazyColumn(
+                         // [T-android-newchat-list-autoscroll] Hoisted state so
+                         // the new-session autoscroll effect above can drive it.
+                         state = listState,
+-                        modifier = Modifier.fillMaxSize(),
++                        modifier = Modifier.fillMaxWidth().weight(1f),
+                         // Leave space for bottom FAB row
+                         contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 96.dp),
+                     ) {
+@@ -1210,6 +1224,7 @@ fun SessionListScreen(
+                             renderSessionRows(periodSessions)
+                         }
+                     }
++                    } // Plus: Today card column
+                 }
+             }
+ 
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/settings/AboutScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/settings/AboutScreen.kt
+index ab206b2..aa38f1d 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/settings/AboutScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/settings/AboutScreen.kt
+@@ -15,6 +15,7 @@ import androidx.compose.foundation.shape.CircleShape
+ import androidx.compose.foundation.text.selection.SelectionContainer
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.outlined.Code
++import androidx.compose.material.icons.outlined.Gavel
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
+@@ -99,6 +100,15 @@ fun AboutScreen(onBack: () -> Unit) {
+                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                 )
+             }
++            // Mines: attribution — this app continues OpenMinis development.
++            Text(
++                stringResource(R.string.about_mines_attribution),
++                style = MaterialTheme.typography.titleSmall,
++                fontWeight = FontWeight.SemiBold,
++                color = MaterialTheme.colorScheme.primary,
++                textAlign = TextAlign.Center,
++                modifier = Modifier.padding(horizontal = 24.dp),
++            )
+             Text(
+                 stringResource(R.string.about_minis_tagline),
+                 style = MaterialTheme.typography.bodyMedium,
+@@ -112,13 +122,24 @@ fun AboutScreen(onBack: () -> Unit) {
+             SettingsRow(
+                 icon = Icons.Outlined.Code,
+                 iconColor = tileBlue,
+-                title = stringResource(R.string.about_github_repository),
++                title = stringResource(R.string.about_openminis_source),
++                subtitle = OPENMINIS_REPO_URL.removePrefix("https://"),
+                 // Settings → ABOUT siblings (Privacy Policy / Submit GitHub
+                 // Issues) all use openExternalUrl directly. The
+                 // LocalInAppBrowserLauncher ambient defaults to a no-op when
+                 // no InAppBrowserHost is in the tree above this screen — and
+                 // nothing wraps Settings, so the row used to be a dead tap.
+-                onClick = { openExternalUrl(context, "https://github.com/OpenMinis/OpenMinis") },
++                onClick = { openExternalUrl(context, OPENMINIS_REPO_URL) },
++                trailing = { ExternalLinkIcon() },
++            )
++            // Mines keeps the original OpenMinis GPL-3.0 LICENSE and
++            // copyright notices unchanged.
++            SettingsRow(
++                icon = Icons.Outlined.Gavel,
++                iconColor = tileBlue,
++                title = stringResource(R.string.about_license_title),
++                subtitle = stringResource(R.string.about_license_subtitle),
++                onClick = { openExternalUrl(context, "$OPENMINIS_REPO_URL/blob/main/LICENSE") },
+                 trailing = { ExternalLinkIcon() },
+                 showDivider = false,
+             )
+@@ -133,6 +154,9 @@ fun AboutScreen(onBack: () -> Unit) {
+     }
+ }
+ 
++/** Upstream project Mines continues. */
++private const val OPENMINIS_REPO_URL = "https://github.com/OpenMinis/OpenMinis"
++
+ @Composable
+ private fun ExternalLinkIcon() {
+     Text(
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt
+index d97d5af..ab4786b 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt
+@@ -37,6 +37,11 @@ import androidx.compose.material.icons.outlined.FrontHand
+ import androidx.compose.material.icons.outlined.Info
+ import androidx.compose.material.icons.outlined.Inventory2
+ import androidx.compose.material.icons.outlined.Lock
++import androidx.compose.material.icons.outlined.Cloud
++import androidx.compose.material.icons.outlined.Key
++import androidx.compose.material.icons.outlined.Memory
++import androidx.compose.material.icons.outlined.Mic
++import androidx.compose.material.icons.outlined.Wallpaper
+ import androidx.compose.material.icons.outlined.Palette
+ import androidx.compose.material.icons.outlined.Groups
+ import androidx.compose.material.icons.outlined.Handyman
+@@ -112,6 +117,8 @@ fun SettingsScreen(
+     // About row below still has a TODO onClick in HEAD; future settings-bucket
+     // work will wire this through.
+     onAboutClick: () -> Unit = {},
++    /** Minis Plus pages (work location, connections, wallpaper & avatar). */
++    onPlusClick: (String) -> Unit = {},
+ ) {
+     val context = LocalContext.current
+     var showFeedbackSheet by remember { mutableStateOf(false) }
+@@ -136,6 +143,63 @@ fun SettingsScreen(
+                 .padding(padding)
+                 .verticalScroll(rememberScrollState()),
+         ) {
++            // -- Minis Plus --
++            SettingsSection(
++                title = "Mines",
++                footer = "工作位置决定任务在手机还是服务器上跑；账号密钥加密保存，AI 看不到明文。",
++            ) {
++                SettingsItem(
++                    icon = Icons.Outlined.Cloud,
++                    iconColor = Color(0xFF34C759),
++                    title = "工作位置",
++                    subtitle = "本机 / 多台 VPS，自动选最快的",
++                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.WORK) },
++                )
++                SettingsItem(
++                    icon = Icons.Outlined.Mic,
++                    iconColor = Color(0xFF5856D6),
++                    title = "实时语音",
++                    subtitle = "像打电话一样和 Mines 说话，可随时打断",
++                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.VOICE) },
++                )
++                SettingsItem(
++                    icon = Icons.Outlined.Key,
++                    iconColor = Color(0xFFFF9500),
++                    title = "账号连接",
++                    subtitle = "Gemini、GitHub、Google 等账号和密钥",
++                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.CONNECTIONS) },
++                )
++                SettingsItem(
++                    icon = Icons.Outlined.Memory,
++                    iconColor = Color(0xFF007AFF),
++                    title = "沙箱与防杀",
++                    subtitle = "看内存、一键清理、防止被系统杀掉",
++                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.SANDBOX) },
++                )
++                SettingsItem(
++                    icon = Icons.Outlined.Extension,
++                    iconColor = Color(0xFF30B0C7),
++                    title = "插件",
++                    subtitle = "安装 dsh 插件，给 AI 加新工具",
++                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.PLUGINS) },
++                )
++                SettingsItem(
++                    icon = Icons.Outlined.Wallpaper,
++                    iconColor = Color(0xFFAF52DE),
++                    title = "壁纸与形象",
++                    subtitle = "聊天壁纸、虚拟形象、桌宠",
++                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.PERSONALIZE) },
++                )
++                SettingsItem(
++                    icon = Icons.Outlined.Backup,
++                    iconColor = Color(0xFF8E8E93),
++                    title = "从旧版迁移",
++                    subtitle = "搬来旧版 Mines 的供应商、技能和其他内容",
++                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.MIGRATE) },
++                    showDivider = false,
++                )
++            }
++
+             // -- LLM Providers --
+             SettingsSection(
+                 title = stringResource(R.string.settings_section_llm_providers),
+@@ -503,7 +567,7 @@ private fun buildFeedbackMailto(): String {
+ 
+         Screenshot (optional): Please attach a screenshot if relevant.
+     """.trimIndent()
+-    val subject = java.net.URLEncoder.encode("Minis Feedback", "UTF-8")
++    val subject = java.net.URLEncoder.encode("Mines Feedback", "UTF-8")
+     val encodedBody = java.net.URLEncoder.encode(body, "UTF-8")
+     return "mailto:dev@openminis.app?subject=$subject&body=$encodedBody"
+ }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/settings/ShizukuPermissionScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/settings/ShizukuPermissionScreen.kt
+index c982778..ab305e6 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/settings/ShizukuPermissionScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/settings/ShizukuPermissionScreen.kt
+@@ -42,7 +42,7 @@ import com.openminis.app.offload.ShizukuManager
+  *                        suits them; Sui is the rooted-user option.
+  *   NOT_RUNNING       → "Open Manager App and press Start" — launches the
+  *                        installed manager.
+- *   NEED_PERMISSION   → "Authorize Minis" CTA → triggers system dialog.
++ *   NEED_PERMISSION   → "Authorize Mines" CTA → triggers system dialog.
+  *   READY             → green status row with version + uid.
+  *
+  * [T-android-sui-support] (GH#110 / GH#97) Sui is a Magisk/KernelSU module
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/settings/SoulSettingsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/settings/SoulSettingsScreen.kt
+index 0a58336..74aa26c 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/settings/SoulSettingsScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/settings/SoulSettingsScreen.kt
+@@ -304,7 +304,7 @@ fun SoulSettingsScreen(onBack: () -> Unit) {
+                 }
+                 Column(modifier = Modifier.padding(start = 4.dp)) {
+                     Text(
+-                        text = name.ifBlank { "Minis" },
++                        text = name.ifBlank { "Mines" },
+                         fontSize = 17.sp,
+                         fontWeight = FontWeight.SemiBold,
+                         color = MaterialTheme.colorScheme.onSurface,
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/terminal/canvas/TerminalNativeView.kt b/src/android/app/src/main/java/com/openminis/app/ui/terminal/canvas/TerminalNativeView.kt
+index a903d1d..74f033c 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/terminal/canvas/TerminalNativeView.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/terminal/canvas/TerminalNativeView.kt
+@@ -282,7 +282,7 @@ class TerminalNativeView @JvmOverloads constructor(
+                             val text = em.getSelectedText(sel[0], sel[1], sel[2], sel[3])
+                             if (text.isNotEmpty()) {
+                                 val cb = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+-                                cb.setPrimaryClip(ClipData.newPlainText("Minis Shell", text))
++                                cb.setPrimaryClip(ClipData.newPlainText("Mines Shell", text))
+                             }
+                         }
+                         mode.finish()
+diff --git a/src/android/app/src/main/java/com/openminis/app/webapp/WebAppActivity.kt b/src/android/app/src/main/java/com/openminis/app/webapp/WebAppActivity.kt
+index 90a02a6..bb2cb10 100644
+--- a/src/android/app/src/main/java/com/openminis/app/webapp/WebAppActivity.kt
++++ b/src/android/app/src/main/java/com/openminis/app/webapp/WebAppActivity.kt
+@@ -205,7 +205,7 @@ class WebAppActivity : ComponentActivity() {
+ 
+     /**
+      * T-pwa-3: replaces the prior toast-and-finish with an inline error
+-     * screen offering an "Open in Minis" escape hatch.
++     * screen offering an "Open in Mines" escape hatch.
+      */
+     @OptIn(ExperimentalMaterial3Api::class)
+     private fun renderSourceMissing(sourceSessionId: String?) {
