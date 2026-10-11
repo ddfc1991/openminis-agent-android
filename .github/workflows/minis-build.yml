@@ -1,4 +1,4 @@
-name: Build Minis APK (OpenMinis + patches)
+name: Build Mines APK (continued development of OpenMinis)
 
 on:
   workflow_dispatch:
@@ -10,9 +10,18 @@ env:
   UPSTREAM_REF: b4c0661          # the commit the patches were written and compiled against
   NDK_R28: 28.0.12433566
   NDK_AGP: 27.0.12077973         # the version Gradle asks for at configure time
+  MINES_PACKAGE: com.openminis.mines.plus
+  # SHA-256 of the fixed Mines signing cert (hark-build/mines-debug.keystore).
+  MINES_CERT_SHA256: 001814fb258110b003c851aeeac930fd3d803224eb9acdcab0a383edcb740e2b
 
 permissions:
   contents: write
+
+# Queue builds instead of running them side by side; a newer push replaces a
+# queued (not a running) one.
+concurrency:
+  group: mines-build
+  cancel-in-progress: false
 
 jobs:
   apk:
@@ -66,6 +75,10 @@ jobs:
       - name: Assemble APK
         run: |
           # Fixed signing key so each new build installs over the last one.
+          # build.gradle.kts reads MINES_KEYSTORE explicitly; the copy into
+          # ~/.android alone was not picked up on the runner (build-12 came
+          # out signed with a random key).
+          export MINES_KEYSTORE="$GITHUB_WORKSPACE/hark-build/mines-debug.keystore"
           mkdir -p ~/.android && cp hark-build/mines-debug.keystore ~/.android/debug.keystore
           cd om/src/android
           echo "sdk.dir=$ANDROID_HOME" > local.properties
@@ -75,9 +88,23 @@ jobs:
           find app/build/outputs/apk -name '*.apk' -exec cp {} ../../../out/ \;
           ls -la ../../../out
 
+      - name: Verify package and signing certificate
+        run: |
+          BT="$ANDROID_HOME/build-tools/36.0.0"
+          for f in out/*.apk; do
+            pkg=$("$BT/aapt2" dump badging "$f" | sed -n "s/^package: name='\([^']*\)'.*/\1/p")
+            cert=$("$BT/apksigner" verify --print-certs "$f" | sed -n 's/.*certificate SHA-256 digest: //p' | head -1)
+            echo "$f package=$pkg cert=$cert"
+            [ "$pkg" = "$MINES_PACKAGE" ] || { echo "::error::wrong package $pkg"; exit 1; }
+            [ "$cert" = "$MINES_CERT_SHA256" ] || { echo "::error::APK not signed with the fixed Mines key ($cert)"; exit 1; }
+          done
+          mv out/app-release.apk out/mines-${{ github.run_number }}.apk 2>/dev/null || true
+          ls -la out
+
       - uses: actions/upload-artifact@v4
         with:
-          name: minis-apk
+          # Mines — continued development of OpenMinis (https://github.com/OpenMinis/OpenMinis)
+          name: mines-apk
           path: out/*.apk
           retention-days: 14
 
@@ -86,4 +113,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="build-${{ github.run_number }}"
-          gh release create "$tag" out/*.apk --repo "${{ github.repository }}" --title "Minis build ${{ github.run_number }}" --notes "Mines (OpenMinis b4c0661 + patches)" --prerelease
+          gh release create "$tag" out/*.apk --repo "${{ github.repository }}" --title "Mines build ${{ github.run_number }}" --notes "Mines — continued development of OpenMinis (https://github.com/OpenMinis/OpenMinis). Upstream commit b4c0661 + Mines patches. GPL-3.0; original OpenMinis LICENSE and copyright notices retained. Package $MINES_PACKAGE, signed with the fixed Mines key (cert SHA-256 $MINES_CERT_SHA256), so later builds install in place." --prerelease
