@@ -178,8 +178,12 @@ def fill_edit(idx, value, clear=True):
     type_text(value); time.sleep(0.6)
 
 
+SCREEN = [1080, 1920]
+
+
 def scroll_down():
-    sh("input swipe 540 1700 540 600 300"); time.sleep(1.2)
+    w, h = SCREEN
+    sh(f"input swipe {w//2} {int(h*0.8)} {w//2} {int(h*0.3)} 300"); time.sleep(1.2)
 
 
 def tap_any(labels, wait=2.5, exact=False):
@@ -201,18 +205,15 @@ def setup_provider():
             tap_text("API Key", exact=True, wait=3); root = snap("auth-picked")
     e = edits(dump())
     print("  edit texts:", [n.get("text") for _, _, n in e], flush=True)
-    # label, key, base url (order on the configure page)
+    # label, key, base url (order on the configure page): URL first, the IME then hides less
     if len(e) >= 3:
+        fill_edit(2, "http://10.0.2.2:8088")
+        sh("input keyevent KEYCODE_BACK"); time.sleep(1)
         fill_edit(1, "sk-smoke-000000000000000000000000")
-        fill_edit(2, "http://10.0.2.2:8088/v1")
-    elif len(e) == 2:
-        fill_edit(1, "sk-smoke-000000000000000000000000")
-        scroll_down(); e2 = edits(dump())
-        if len(e2) >= 2: fill_edit(len(e2) - 1, "http://10.0.2.2:8088/v1")
     sh("input keyevent KEYCODE_BACK"); time.sleep(1)
     root = snap("provider-filled")
-    for _ in range(3):
-        if tap_any(["Save Provider", "Save API Key", "Save", "保存"], wait=4):
+    for _ in range(4):
+        if tap_any(["Add Provider", "Save Provider", "Save API Key"], wait=5, exact=True):
             break
         scroll_down()
     root = snap("provider-saved")
@@ -249,12 +250,62 @@ def setup_provider():
     check("home list (TodayCard) shown")
 
 
+def toggle_near(label):
+    root = dump()
+    p = find(root, label)
+    if not p:
+        print(f"  (toggle label not found: {label})", flush=True); return False
+    best = None
+    for t, d, x, y, n in nodes(root):
+        if n.get("checkable") == "true":
+            dist = abs(y - p[1])
+            if best is None or dist < best[0]: best = (dist, x, y, n.get("checked"))
+    if not best or best[0] > 200:
+        sh(f"input tap {p[0]} {p[1]}"); time.sleep(2); return True
+    print(f"  toggle {label}: was checked={best[3]}", flush=True)
+    if best[3] != "true":
+        sh(f"input tap {best[1]} {best[2]}"); time.sleep(2)
+    return True
+
+
+def user_like_state():
+    """Wallpaper on home + glass + desk pet on, like the user's phone, then cold start."""
+    for _ in range(2):
+        if tap_any(["Settings", "设置"], wait=3, exact=True): break
+    snap("settings")
+    for _ in range(6):
+        if tap_any(["壁纸与形象"], wait=4): break
+        scroll_down()
+    snap("personalize")
+    tap_any(["极光"], wait=2, exact=True)
+    for _ in range(3):
+        if toggle_near("首页也用这张壁纸"): break
+        scroll_down()
+    for _ in range(6):
+        if find(dump(), "显示桌宠"):
+            toggle_near("显示桌宠"); break
+        scroll_down()
+    snap("personalize-done")
+    check("personalize toggles")
+    for _ in range(3):
+        sh("input keyevent KEYCODE_BACK"); time.sleep(2)
+    snap("home-with-wallpaper")
+    check("home with wallpaper + pet")
+    sh(f"am force-stop {PKG}"); time.sleep(2)
+    relaunch(); snap("cold-launch-user-state"); check("cold launch with wallpaper + pet + chats")
+    time.sleep(10); snap("cold-launch-user-state-10s"); check("10 s after cold launch (user state)")
+    dump_fatal()
+
+
 def dump_fatal():
     out = adb("logcat", "-d", "-v", "threadtime", "-b", "crash", timeout=60)
     print("---- crash buffer ----\n" + out[-15000:], flush=True)
 
 
 def main():
+    m = re.search(r"(\d+)x(\d+)", sh("wm size"))
+    if m: SCREEN[0], SCREEN[1] = int(m.group(1)), int(m.group(2))
+    print("screen", SCREEN, flush=True)
     sh("settings put global window_animation_scale 0; settings put global transition_animation_scale 0; settings put global animator_duration_scale 0")
     adb("logcat", "-c")
     lc = subprocess.Popen(f"adb logcat -v threadtime > {OUT}/logcat.txt", shell=True)
@@ -273,6 +324,7 @@ def main():
         sh(f"am force-stop {PKG}"); time.sleep(2)
         relaunch(); snap("relaunch-with-home"); check("cold launch with chats (home list)")
         dump_fatal()
+        user_like_state()
 
     # Home Today card → 工作位置
     if not tap_text("工作位置", wait=6):
