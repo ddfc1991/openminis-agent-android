@@ -1,0 +1,3076 @@
+diff --git a/src/android/app/src/main/assets/default_mount/etc/minis/net.env b/src/android/app/src/main/assets/default_mount/etc/minis/net.env
+new file mode 100644
+index 0000000..f201b2f
+--- /dev/null
++++ b/src/android/app/src/main/assets/default_mount/etc/minis/net.env
+@@ -0,0 +1,16 @@
++# [Mines-net-26] Network settings Mines puts into every sandbox process.
++# Read by the app at boot (PRootKernel → SandboxNet) and by the CI sandbox test,
++# so both run with exactly the same values. KEY=VALUE, no quotes, no spaces.
++# The CA lines are only applied when /etc/ssl/minis-ca.pem was built.
++SSL_CERT_FILE=/etc/ssl/minis-ca.pem
++REQUESTS_CA_BUNDLE=/etc/ssl/minis-ca.pem
++PIP_CERT=/etc/ssl/minis-ca.pem
++CURL_CA_BUNDLE=/etc/ssl/minis-ca.pem
++NODE_EXTRA_CA_CERTS=/etc/ssl/minis-ca.pem
++GIT_SSL_CAINFO=/etc/ssl/minis-ca.pem
++PIP_TIMEOUT=20
++PIP_RETRIES=3
++PIP_DISABLE_PIP_VERSION_CHECK=1
++npm_config_fetch_timeout=60000
++npm_config_fetch_retries=3
++npm_config_fetch_retry_maxtimeout=60000
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/apk b/src/android/app/src/main/assets/default_mount/usr/local/bin/apk
+new file mode 100755
+index 0000000..67a132b
+--- /dev/null
++++ b/src/android/app/src/main/assets/default_mount/usr/local/bin/apk
+@@ -0,0 +1,38 @@
++#!/bin/sh
++# [Mines-net-26] apk with a stall guard and automatic mirror switch.
++#
++# Downloads that stop moving for $MINIS_APK_STALL seconds (default 60) are
++# stopped instead of hanging forever (apk itself has no network timeout). On a
++# stall or a network error the fastest working mirror is picked again
++# (minis-mirror auto apk) and the command is retried once. Everything that does
++# not touch the network goes straight to the real apk.
++REAL=/sbin/apk
++net=0
++for a in "$@"; do
++    case $a in
++        -*) ;;
++        add|update|upgrade|fix|fetch|cache) net=1; break ;;
++        *) break ;;
++    esac
++done
++[ "$net" = 1 ] && [ "${MINIS_GUARD:-1}" != 0 ] || exec "$REAL" "$@"
++. /usr/local/lib/minis-net/common.sh
++minis_check_proxy
++minis_mirrors_once apk pip npm
++STALL=${MINIS_APK_STALL:-60}
++log=$(mktemp)
++trap 'rm -f "$log"' EXIT
++minis_run_logged "$log" minis-guard apk "$STALL" "${MINIS_APK_TOTAL:-0}" -- "$REAL" "$@"
++rc=$?
++[ "$rc" = 0 ] && exit 0
++if [ "$rc" = 124 ] || grep -qiE 'network error|temporary error|timed out|timeout|unable to (fetch|connect)|connection (refused|reset)|could not resolve|DNS lookup|Permission denied|certificate|SSL|No such host|Broken pipe|bad gateway|I/O error' "$log"; then
++    echo "↻ 软件源连不上或卡住了，正在重新测速换源…" >&2
++    if minis-mirror auto apk >&2; then
++        [ "$1" = update ] || "$REAL" update -q >/dev/null 2>&1
++        minis_run_logged "$log" minis-guard apk "$STALL" "${MINIS_APK_TOTAL:-0}" -- "$REAL" "$@"
++        rc=$?
++        [ "$rc" = 0 ] && exit 0
++    fi
++    echo "✗ apk 下载失败（退出码 $rc）。运行 minis-doctor 看是网络、代理还是软件源的问题。" >&2
++fi
++exit "$rc"
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-devkit b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-devkit
+new file mode 100755
+index 0000000..e54cedc
+--- /dev/null
++++ b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-devkit
+@@ -0,0 +1,42 @@
++#!/bin/sh
++# [Mines-net-26] minis-devkit — one-tap developer toolkit for the sandbox.
++#
++#   minis-devkit install [--no-java]   gcc/g++/make (build-base), python3 + pip, nodejs + npm,
++#                                      git, openjdk17-jdk — picks fast mirrors first, every
++#                                      download has a stall guard, then checks each tool works
++#   minis-devkit check                 what is installed now
++#   minis-devkit vps-command           the command that installs the same kit on a Linux server
++PKGS="build-base python3 py3-pip nodejs npm git openjdk17-jdk"
++
++check() {
++    local miss="" v
++    for t in "gcc --version" "g++ --version" "make --version" "python3 --version" "pip --version" "node --version" "npm --version" "git --version" "java -version"; do
++        set -- $t
++        if v=$($t 2>&1 | head -1) && command -v "$1" >/dev/null 2>&1; then echo "  ✓ $1  $v"; else echo "  ✗ $1 没装好"; miss="$miss $1"; fi
++    done
++    if command -v gcc >/dev/null 2>&1; then
++        d=$(mktemp -d); printf '#include <stdio.h>\nint main(void){puts("ok");return 0;}\n' > "$d/h.c"
++        if gcc "$d/h.c" -o "$d/h" 2>/dev/null && [ "$("$d/h")" = ok ]; then echo "  ✓ C 编译运行正常"; else echo "  ✗ gcc 编译测试失败"; miss="$miss gcc-test"; fi
++        rm -rf "$d"
++    fi
++    MISSING=$miss
++}
++
++case ${1:-install} in
++    install)
++        pk=$PKGS; [ "$2" = "--no-java" ] && pk=$(echo "$PKGS" | sed 's/ openjdk17-jdk//')
++        echo "① 选最快的软件源…"
++        minis-mirror auto apk pip npm || echo "  （测速有失败，继续用现有软件源）"
++        echo "② 更新软件包列表…"
++        apk update || { echo "✗ 软件包列表下载失败。运行 minis-doctor 看原因。"; echo "MINES_DEVKIT_FAIL"; exit 1; }
++        echo "③ 安装：$pk（约 300–400 MB，按网速几分钟到十几分钟）"
++        apk add $pk || { echo "✗ 安装没完成。运行 minis-doctor 看原因；也可以改在 VPS 上装。"; echo "MINES_DEVKIT_FAIL"; exit 1; }
++        echo "④ 检查…"
++        check
++        if [ -n "$MISSING" ]; then echo "✗ 这些没装好：$MISSING"; echo "MINES_DEVKIT_FAIL"; exit 1; fi
++        echo "✓ 开发工具包装好了"; echo "MINES_DEVKIT_OK" ;;
++    check) check; [ -z "$MISSING" ] ;;
++    vps-command)
++        echo 'set -e; if command -v apt-get >/dev/null 2>&1; then S=""; [ "$(id -u)" = 0 ] || S=sudo; $S env DEBIAN_FRONTEND=noninteractive apt-get update -q && $S env DEBIAN_FRONTEND=noninteractive apt-get install -y -q build-essential python3 python3-pip nodejs npm git openjdk-17-jdk-headless; elif command -v dnf >/dev/null 2>&1; then dnf install -y gcc gcc-c++ make python3 python3-pip nodejs npm git java-17-openjdk-devel; elif command -v yum >/dev/null 2>&1; then yum install -y gcc gcc-c++ make python3 python3-pip nodejs npm git java-17-openjdk-devel; elif command -v apk >/dev/null 2>&1; then apk add build-base python3 py3-pip nodejs npm git openjdk17-jdk; else echo "unknown distro"; exit 2; fi; gcc --version | head -1; python3 --version; node --version; git --version; java -version 2>&1 | head -1; echo MINES_DEVKIT_OK' ;;
++    *) sed -n '2,9p' "$0"; exit 2 ;;
++esac
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-doctor b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-doctor
+new file mode 100755
+index 0000000..94e75e8
+--- /dev/null
++++ b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-doctor
+@@ -0,0 +1,142 @@
++#!/bin/sh
++# [Mines-net-26] minis-doctor — why can't the sandbox install anything?
++#
++#   minis-doctor           full check (about 30 s), ends with what to fix
++#   minis-doctor --short   only the summary lines
++#
++# Checks: clock, proxy env (and whether the proxy answers), DNS (incl. Clash
++# fake-ip answers), IPv4 / IPv6 reachability, every package mirror, TLS to
++# pypi.org and files.pythonhosted.org (direct and through the proxy), CA
++# bundle, disk space, and what the phone reports (VPN covering Mines or not).
++. /usr/local/lib/minis-net/common.sh
++T=${MINIS_DOCTOR_TIMEOUT:-8}
++SHORT=0; [ "$1" = "--short" ] && SHORT=1
++problems=""; fixes=""
++bad() { problems="$problems
++✗ $1"; [ -n "$2" ] && fixes="$fixes
++→ $2"; say "  ✗ $1"; }
++ok() { say "  ✓ $1"; }
++say() { [ "$SHORT" = 1 ] || echo "$@"; }
++hdr() { say ""; say "【$1】"; }
++
++get() {   # get <url> [noproxy] → 0 when an HTTP answer came back; error text in $GET_ERR
++    local out
++    if [ "$2" = noproxy ]; then
++        out=$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY timeout $((T + 2)) wget -q -T "$T" -O /dev/null "$1" 2>&1)
++    else
++        out=$(timeout $((T + 2)) wget -q -T "$T" -O /dev/null "$1" 2>&1)
++    fi
++    local rc=$?
++    GET_ERR=$(echo "$out" | grep -v '^$' | tail -1 | cut -c1-120)
++    [ $rc = 143 ] || [ $rc = 124 ] && GET_ERR="${T} 秒没有响应（卡住）"
++    case $out in *"404"*|*"403"*|*"302"*|*"301"*) return 0;; esac
++    return $rc
++}
++
++say "Mines 沙箱网络体检  $(date '+%Y-%m-%d %H:%M:%S %Z')"
++[ -f /etc/alpine-release ] && say "Alpine $(cat /etc/alpine-release)，$(uname -m)"
++
++hdr "手机网络"
++if [ -f /etc/minis/net.state ]; then
++    vpn=$(sed -n 's/^vpn=//p' /etc/minis/net.state); tr_=$(sed -n 's/^transport=//p' /etc/minis/net.state)
++    dns=$(sed -n 's/^dns=//p' /etc/minis/net.state); src=$(sed -n 's/^proxy_source=//p' /etc/minis/net.state)
++    say "  网络：${tr_:-未知}；VPN 是否覆盖 Mines：$( [ "$vpn" = 1 ] && echo 是 || echo 否)；系统 DNS：${dns:-未知}"
++    [ -n "$src" ] && say "  沙箱代理来源：$src"
++else
++    say "  （没有手机网络信息，App 还没写入）"
++fi
++
++hdr "时间"
++now=$(date +%s)
++hd=$(timeout $((T + 2)) wget -S -q -T "$T" -O /dev/null http://mirrors.aliyun.com/ 2>&1 | sed -n 's/^ *[Dd]ate: //p' | head -1)
++if [ -n "$hd" ]; then
++    srv=$(date -d "$hd" +%s 2>/dev/null || date -D '%a, %d %b %Y %H:%M:%S GMT' -d "$hd" +%s 2>/dev/null)
++    # busybox parses the GMT string as local time; correct by the TZ offset.
++    off=$(date +%z); sign=${off%????}; hh=${off#?}; hh=${hh%??}; mm=${off#???}
++    [ -n "$srv" ] && [ -n "$hh" ] && { hh=${hh#0}; mm=${mm#0}; corr=$(( ${hh:-0} * 3600 + ${mm:-0} * 60 )); [ "$sign" = "-" ] && corr=$((-corr)); srv=$((srv + corr)); }
++    if [ -n "$srv" ]; then
++        d=$((now - srv)); [ $d -lt 0 ] && d=$((-d))
++        if [ $d -gt 300 ]; then bad "时钟差了 ${d} 秒（证书校验会失败）" "在手机 设置 → 日期和时间 打开「自动设置」"; else ok "时钟准确（误差 ${d} 秒）"; fi
++    else say "  · 无法解析服务器时间：$hd"; fi
++else
++    say "  · 拿不到服务器时间（网络不通时正常）"
++fi
++
++hdr "代理"
++p=$(minis_proxy_url)
++if [ -n "$p" ]; then
++    hp=$(minis_hostport "$p"); h=${hp%:*}; port=${hp##*:}; [ "$port" = "$hp" ] && port=80
++    say "  http(s)_proxy = $(echo "$p" | sed 's#//[^@/]*@#//***@#')   no_proxy = ${no_proxy:-${NO_PROXY:-（无）}}"
++    if minis_tcp_ok "$h" "$port"; then ok "代理 $hp 能连上"; PROXY_UP=1
++    else bad "代理 $hp 连不上——所有走代理的下载都会失败" "设置 → 模型路由与分流 里修好或关掉代理；或 设置 → 沙箱与防杀 → 沙箱代理 选「不用代理」"; PROXY_UP=0; fi
++else
++    say "  · 沙箱没设代理（直连）"; PROXY_UP=0
++fi
++
++hdr "DNS"
++say "  resolv.conf：$(grep '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ' ')"
++v6any=0
++for h in mirrors.aliyun.com dl-cdn.alpinelinux.org pypi.org files.pythonhosted.org; do
++    r=$(timeout $((T + 2)) nslookup "$h" 2>&1)
++    a=$(echo "$r" | sed -n '/^Name:/,$ s/^Address[^:]*: *//p' | grep -v ':' | head -2 | tr '\n' ' ')
++    aaaa=$(echo "$r" | sed -n '/^Name:/,$ s/^Address[^:]*: *//p' | grep ':' | head -1)
++    [ -n "$aaaa" ] && v6any=1
++    if [ -z "$a$aaaa" ]; then bad "解析不了 $h" "DNS 不通：设置 → 沙箱（Rootfs）→ 容器 DNS 改成 223.5.5.5 / 119.29.29.29"
++    else
++        case $a in 198.18.*|198.19.*) bad "$h 解析到 $a（Clash/代理软件的 fake-ip）" "VPN 没有接管 Mines 的流量却用了它的 DNS：在代理软件的「分应用代理」里加上 Mines，或把容器 DNS 改成 223.5.5.5";;
++            *) ok "$h → ${a}${aaaa:+ / $aaaa}";; esac
++    fi
++done
++
++hdr "IPv4 / IPv6"
++if minis_tcp_ok 223.5.5.5 53 || minis_tcp_ok 114.114.114.114 53; then ok "IPv4 能出网"; else bad "IPv4 连不上外网" "检查手机网络/飞行模式"; fi
++if ip -6 addr 2>/dev/null | grep -q 'scope global'; then
++    if minis_tcp_ok 2400:3200::1 53 || minis_tcp_ok 2402:4e00:: 53; then ok "IPv6 可用"
++    else bad "手机有 IPv6 地址但连不出去" "部分程序会先试 IPv6 而卡住；在 设置 → 沙箱 把容器 DNS 设为只返回 IPv4 的服务器，或关掉手机的 IPv6"; fi
++else say "  · 没有 IPv6 地址（只用 IPv4，正常）"; fi
++
++hdr "软件源"
++minis-mirror show apk 2>/dev/null | sed 's/^/  现在用：/'
++minis-mirror show pip 2>/dev/null | sed 's/^/  现在用：/'
++pr=$(MINIS_PROBE_TIMEOUT=$T minis-mirror probe apk 2>/dev/null; MINIS_PROBE_TIMEOUT=$T minis-mirror probe pip 2>/dev/null; MINIS_PROBE_TIMEOUT=$T minis-mirror probe npm 2>/dev/null)
++say "$pr" | sed 's/^/  /'
++for k in apk pip npm; do
++    echo "$pr" | grep "^$k " | grep -qv '✗' || bad "$k：所有软件源都连不上" "先修上面的网络/代理问题，再运行 minis-mirror auto"
++done
++cur=$(minis-mirror show apk | awk '{print $3}')
++if [ -n "$cur" ] && echo "$pr" | grep "^apk " | grep '✗' | grep -qF "$cur"; then
++    bad "正在用的 apk 软件源连不上：$cur" "运行 minis-mirror auto（apk 失败时也会自动换）"
++fi
++
++hdr "证书 / TLS"
++if [ -s /etc/ssl/minis-ca.pem ]; then ok "CA 证书库：/etc/ssl/minis-ca.pem（$(grep -c 'BEGIN CERT' /etc/ssl/minis-ca.pem) 个根证书）"
++else say "  · 用系统自带证书库 /etc/ssl/certs/ca-certificates.crt（$(grep -c 'BEGIN CERT' /etc/ssl/certs/ca-certificates.crt 2>/dev/null) 个）"; fi
++for u in https://pypi.org/simple/pip/ https://files.pythonhosted.org/packages/py2.py3/s/six/six-1.16.0-py2.py3-none-any.whl https://mirrors.aliyun.com/pypi/simple/pip/; do
++    h=$(host_of() { echo "$1" | sed -e 's#^[a-z]*://##' -e 's#/.*##'; }; host_of "$u")
++    if get "$u" noproxy; then ok "直连 $h：TLS 正常"; D=1; else say "  · 直连 $h：$GET_ERR"; D=0; fi
++    if [ -n "$p" ] && [ "${PROXY_UP:-0}" = 1 ]; then
++        if get "$u"; then ok "经代理 $h：TLS 正常"; X=1; else say "  · 经代理 $h：$GET_ERR"; X=0; fi
++    else X=$D; fi
++    if [ $D = 0 ] && [ $X = 0 ]; then
++        case $h in *aliyun*) bad "连不上 $h（国内源）" "网络本身有问题，看上面的 DNS / IPv4";;
++            *) bad "$h 直连和代理都不通（境外源，国内常见：被重置或限速）" "用国内镜像：minis-mirror auto pip（已自动做）；需要官方源就在 模型路由与分流 填一个能用的代理";; esac
++    fi
++done
++
++hdr "磁盘"
++free=$(df -k / 2>/dev/null | tail -1 | awk '{print $(NF-2)}')
++if [ -n "$free" ]; then
++    if [ "$free" -lt 1048576 ]; then bad "沙箱剩余空间只有 $((free / 1024)) MB" "清理手机存储；开发工具包需要约 1 GB"; else ok "剩余 $((free / 1024 / 1024)) GB"; fi
++fi
++
++echo ""
++if [ -z "$problems" ]; then
++    echo "结论：没发现网络问题。apk / pip 失败时会自动换源重试；还不行把上面的输出发给我。"
++    echo "MINES_DOCTOR_OK"
++else
++    echo "结论：发现这些问题：$problems"
++    echo ""
++    echo "怎么修：$(echo "$fixes" | awk '!seen[$0]++')"
++    echo "MINES_DOCTOR_PROBLEMS"
++fi
++exit 0
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-guard b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-guard
+new file mode 100755
+index 0000000..bcd46a7
+--- /dev/null
++++ b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-guard
+@@ -0,0 +1,102 @@
++#!/bin/sh
++# [Mines-net-26] minis-guard — run a command and stop it when it stalls.
++#
++#   minis-guard <label> <stall-seconds> <total-seconds|0> -- command [args...]
++#
++# "Stalled" means: neither the command nor any of its child processes used CPU
++# or read/wrote a single byte (files or sockets) for <stall-seconds>. That is
++# what a hung download looks like (apk/pip/npm waiting on a mirror that stopped
++# sending), while a slow-but-moving download or a long compile keeps going.
++# Exit code 124 = stopped because it stalled or ran past <total-seconds>.
++# Set MINIS_GUARD=0 to turn the guard off.
++
++label=$1; stall=$2; total=$3
++shift 3 2>/dev/null || { echo "usage: minis-guard <label> <stall> <total> -- cmd..." >&2; exit 2; }
++[ "$1" = "--" ] && shift
++[ $# -gt 0 ] || exit 2
++if [ "${MINIS_GUARD:-1}" = "0" ]; then exec "$@"; fi
++# Without /proc the guard can't see progress; never kill blind.
++[ -r /proc/self/stat ] || exec "$@"
++
++# Children of $1 (direct), read from /proc without forking.
++children() {
++    for d in /proc/[0-9]*; do
++        read -r s < "$d/stat" 2>/dev/null || continue
++        rest=${s##*) }
++        set -- $rest
++        echo "$2 ${d#/proc/}"
++    done
++}
++
++# All descendants of $1 (including $1).
++tree() {
++    want=" $1 "
++    all=$(children)
++    changed=1
++    while [ $changed = 1 ]; do
++        changed=0
++        while read -r pp p; do
++            case "$want" in *" $pp "*) case "$want" in *" $p "*) ;; *) want="$want$p "; changed=1;; esac;; esac
++        done <<EOF
++$all
++EOF
++    done
++    echo $want
++}
++
++# A number that grows whenever the process tree does anything.
++progress() {
++    sum=0
++    for p in $(tree "$1"); do
++        if read -r s < "/proc/$p/stat" 2>/dev/null; then
++            rest=${s##*) }
++            set -- $rest
++            # after "comm)": $1=state … $12=utime $13=stime
++            eval "sum=\$((sum + \${12:-0} + \${13:-0}))"
++        fi
++        if [ -r "/proc/$p/io" ]; then
++            while read -r k v; do
++                case $k in rchar:|wchar:) sum=$((sum + v));; esac
++            done < "/proc/$p/io"
++        fi
++    done
++    echo $sum
++}
++
++kill_tree() {
++    pids=$(tree "$1")
++    kill -TERM $pids 2>/dev/null
++    sleep 1
++    kill -KILL $pids 2>/dev/null
++}
++
++# Keep the caller's stdin (a background job would otherwise get /dev/null).
++exec 3<&0
++"$@" <&3 &
++pid=$!
++exec 3<&-
++trap 'kill_tree $pid; exit 130' INT TERM HUP
++
++last=""; idle=0; elapsed=0; why=""
++while kill -0 "$pid" 2>/dev/null; do
++    sleep 3
++    elapsed=$((elapsed + 3))
++    kill -0 "$pid" 2>/dev/null || break
++    cur=$(progress "$pid")
++    if [ "$cur" = "$last" ]; then idle=$((idle + 3)); else idle=0; last=$cur; fi
++    if [ "$idle" -ge "$stall" ]; then why="stall"; break; fi
++    if [ "$total" -gt 0 ] && [ "$elapsed" -ge "$total" ]; then why="total"; break; fi
++done
++
++if [ -n "$why" ]; then
++    kill_tree "$pid"
++    wait "$pid" 2>/dev/null
++    if [ "$why" = stall ]; then
++        echo "minis-guard: $label 已经 ${stall} 秒没有任何进展（下载卡住），已停止" >&2
++    else
++        echo "minis-guard: $label 超过 ${total} 秒没完成，已停止" >&2
++    fi
++    exit 124
++fi
++wait "$pid"
++exit $?
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-mirror b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-mirror
+new file mode 100755
+index 0000000..bbf212e
+--- /dev/null
++++ b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-mirror
+@@ -0,0 +1,304 @@
++#!/bin/sh
++# [Mines-net-26] minis-mirror — pick the fastest package mirrors for the sandbox.
++#
++#   minis-mirror auto [apk|pip|npm|go|cargo|all] [--quiet]   test and switch to the fastest
++#   minis-mirror auto-if-changed [kinds…]                    same, only when never probed, the
++#                                                            network changed or the last probe is
++#                                                            older than $MINIS_MIRROR_MAX_AGE s (6 h)
++#   minis-mirror probe [kind|all]                            test only, print the table
++#   minis-mirror set <kind> <url>                            use this mirror
++#   minis-mirror add <kind> <url>                            add your own mirror to the candidates
++#   minis-mirror show [kind]                                 what is in use now
++#
++# Writes /etc/apk/repositories (for this Alpine version), /etc/pip.conf (the
++# file pip actually reads), /root/.npmrc, ~/.config/go/env and
++# ~/.cargo/config.toml. Each candidate is fetched with a short timeout (64 KB,
++# through the same proxy settings apk/pip/npm will use); the fastest that
++# answered correctly wins.
++
++STATE_DIR=/etc/minis
++STATE=$STATE_DIR/mirrors.state
++CUSTOM=$STATE_DIR/mirrors.custom
++PROBE_TIMEOUT=${MINIS_PROBE_TIMEOUT:-6}
++QUIET=0
++mkdir -p "$STATE_DIR" 2>/dev/null
++
++alpine_ver() {
++    v=$(cut -d. -f1,2 /etc/alpine-release 2>/dev/null)
++    echo "v${v:-3.21}"
++}
++alpine_arch() { /sbin/apk --print-arch 2>/dev/null || uname -m; }
++
++candidates() {
++    case $1 in
++        apk) printf '%s\n' https://dl-cdn.alpinelinux.org/alpine/ https://mirrors.aliyun.com/alpine/ \
++                 https://mirrors.tuna.tsinghua.edu.cn/alpine/ https://mirrors.ustc.edu.cn/alpine/ ;;
++        pip) printf '%s\n' https://pypi.org/simple/ https://mirrors.aliyun.com/pypi/simple/ \
++                 https://pypi.tuna.tsinghua.edu.cn/simple/ https://mirrors.ustc.edu.cn/pypi/simple/ ;;
++        npm) printf '%s\n' https://registry.npmjs.org/ https://registry.npmmirror.com/ ;;
++        go) printf '%s\n' https://proxy.golang.org https://goproxy.cn ;;
++        cargo) printf '%s\n' https://index.crates.io/ https://rsproxy.cn/index/ ;;
++    esac
++    [ -f "$CUSTOM" ] && sed -n "s/^$1[[:space:]]\{1,\}//p" "$CUSTOM"
++}
++
++name_of() {
++    case $1 in
++        "") echo "未设置" ;;
++        *dl-cdn.alpinelinux.org*|*pypi.org*|*registry.npmjs.org*|*proxy.golang.org*|*index.crates.io*) echo "官方" ;;
++        *aliyun*) echo "阿里云" ;;
++        *tuna.tsinghua*) echo "清华 TUNA" ;;
++        *ustc.edu.cn*) echo "中科大 USTC" ;;
++        *npmmirror*) echo "npmmirror（淘宝）" ;;
++        *goproxy.cn*) echo "goproxy.cn（七牛）" ;;
++        *rsproxy.cn*) echo "rsproxy（字节）" ;;
++        *) echo "自定义" ;;
++    esac
++}
++
++# URL fetched to test a candidate.
++probe_url() {
++    case $1 in
++        apk) echo "${2%/}/$(alpine_ver)/main/$(alpine_arch)/APKINDEX.tar.gz" ;;
++        pip) echo "${2%/}/pip/" ;;
++        npm) echo "${2%/}/is-number/latest" ;;
++        go) echo "${2%/}/github.com/google/uuid/@v/list" ;;
++        cargo) echo "${2%/}/config.json" ;;
++    esac
++}
++
++now_cs() {
++    if [ -r /proc/uptime ] && read -r up _ < /proc/uptime; then up=${up%.*}${up#*.}; echo "$up" | sed 's/^0*//;s/^$/0/'
++    else echo $(( $(date +%s) * 100 )); fi
++}
++
++# fetch <url> <outfile>: 64 KB at most, short timeout, through the proxy env.
++fetch() {
++    if command -v curl >/dev/null 2>&1; then
++        curl -fsS -L --connect-timeout 4 -m "$PROBE_TIMEOUT" -r 0-65535 -o "$2" "$1" 2>/dev/null
++    else
++        # busybox wget treats "206 Partial Content" as an error, so cut the stream instead of asking for a range.
++        timeout "$PROBE_TIMEOUT" wget -q -T 4 -O - "$1" 2>/dev/null | head -c 65536 > "$2"
++        [ -s "$2" ]
++    fi
++}
++
++# probe_one <kind> <base> → "<ms> <base>" or "- <base>"
++probe_one() {
++    local tmp t0 t1 ms
++    tmp=$(mktemp)
++    t0=$(now_cs)
++    if fetch "$(probe_url "$1" "$2")" "$tmp" && [ -s "$tmp" ] && valid "$1" "$tmp"; then
++        t1=$(now_cs)
++        ms=$(( (t1 - t0) * 10 ))
++        [ "$ms" -lt 1 ] && ms=1
++        # PyPI downloads come from a second host; it has to work too.
++        if [ "$1" = pip ] && case $2 in *pypi.org*) true;; *) false;; esac; then
++            fetch https://files.pythonhosted.org/packages/py2.py3/s/six/six-1.16.0-py2.py3-none-any.whl "$tmp" || { rm -f "$tmp"; echo "- $2"; return; }
++        fi
++        echo "$ms $2"
++    else
++        echo "- $2"
++    fi
++    rm -f "$tmp"
++}
++
++valid() {
++    case $1 in
++        apk) head -c 2 "$2" | od -An -tx1 | grep -q '1f 8b' ;;          # gzip
++        pip) grep -qi '<a ' "$2" ;;
++        npm) grep -q '"version"' "$2" ;;
++        go) grep -q '^v[0-9]' "$2" ;;
++        cargo) grep -q '"dl"' "$2" ;;
++        *) true ;;
++    esac
++}
++
++# probe <kind> → sorted lines "<ms> <url>" (fastest first, failures last as "- url")
++probe() {
++    local dir i b
++    dir=$(mktemp -d)
++    i=0
++    for b in $(candidates "$1"); do
++        i=$((i + 1))
++        probe_one "$1" "$b" > "$dir/$i" &
++    done
++    wait
++    cat "$dir"/* 2>/dev/null | grep -v '^-' | sort -n
++    cat "$dir"/* 2>/dev/null | grep '^-'
++    rm -rf "$dir"
++}
++
++host_of() { echo "$1" | sed -e 's#^[a-z+]*://##' -e 's#[/:].*##'; }
++
++write_apk() {
++    local f=/etc/apk/repositories ver base
++    [ -f "$f" ] && [ ! -f "$f.minis-bak" ] && cp "$f" "$f.minis-bak"
++    ver=$(alpine_ver)
++    base=${1%/}
++    {
++        echo "$base/$ver/main"
++        echo "$base/$ver/community"
++        # keep the user's own extra lines (edge/testing, local repos…)
++        [ -f "$f" ] && grep -v -E '/v[0-9]+\.[0-9]+/(main|community)/?$' "$f" | grep -v '^[[:space:]]*$'
++        true
++    } > "$f.new" && mv "$f.new" "$f"
++}
++
++write_pip() {
++    local host=$(host_of "$1") fb=$2 fbhost
++    {
++        echo "# written by minis-mirror ($(name_of "$1"))"
++        echo "[global]"
++        echo "index-url = $1"
++        if [ -n "$fb" ] && [ "$fb" != "$1" ]; then
++            fbhost=$(host_of "$fb")
++            echo "# fallback index (second fastest when this was written; pip asks it too)"
++            echo "extra-index-url = $fb"
++        fi
++        echo "timeout = 20"
++        echo "retries = 3"
++        echo "break-system-packages = true"
++        [ -s /etc/ssl/minis-ca.pem ] && echo "cert = /etc/ssl/minis-ca.pem"
++    } > /etc/pip.conf.new && mv /etc/pip.conf.new /etc/pip.conf
++    # Old builds wrote here, which pip never reads; keep it identical so nothing disagrees.
++    mkdir -p /etc/pip && cp /etc/pip.conf /etc/pip/pip.conf 2>/dev/null
++}
++
++set_kv() {   # set_kv <file> <key> <value> <sep>
++    local f=$1 k=$2 v=$3 sep=$4
++    mkdir -p "$(dirname "$f")"; touch "$f"
++    grep -v "^$k$sep" "$f" > "$f.new"; echo "$k$sep$v" >> "$f.new"; mv "$f.new" "$f"
++}
++
++write_npm() {
++    local f=/root/.npmrc
++    set_kv "$f" registry "$1" =
++    grep -q '^fetch-timeout=' "$f" 2>/dev/null || echo "fetch-timeout=60000" >> "$f"
++    grep -q '^fetch-retries=' "$f" 2>/dev/null || echo "fetch-retries=3" >> "$f"
++    grep -q '^fetch-retry-maxtimeout=' "$f" 2>/dev/null || echo "fetch-retry-maxtimeout=60000" >> "$f"
++}
++
++write_go() { set_kv /root/.config/go/env GOPROXY "${1%/},direct" =; }
++
++write_cargo() {
++    local f=/root/.cargo/config.toml
++    mkdir -p /root/.cargo
++    if [ -f "$f" ] && ! grep -q 'minis-mirror' "$f"; then
++        echo "  cargo: ~/.cargo/config.toml 是你自己写的，没有改动" >&2; return 0
++    fi
++    case $1 in
++        *index.crates.io*) rm -f "$f" ;;
++        *) printf '# written by minis-mirror\n[source.crates-io]\nreplace-with = "minis-mirror"\n\n[source.minis-mirror]\nregistry = "sparse+%s"\n\n[net]\nretry = 3\n' "$1" > "$f" ;;
++    esac
++}
++
++current() {
++    case $1 in
++        apk) sed -n 's#/v[0-9.]*/main/*$#/#p' /etc/apk/repositories 2>/dev/null | head -1 ;;
++        pip) sed -n 's/^index-url *= *//p' /etc/pip.conf 2>/dev/null | head -1 ;;
++        npm) sed -n 's/^registry=//p' /root/.npmrc 2>/dev/null | head -1 ;;
++        go) sed -n 's/^GOPROXY=\([^,]*\).*/\1/p' /root/.config/go/env 2>/dev/null | head -1 ;;
++        cargo) sed -n 's/^registry = "sparse+\(.*\)"/\1/p' /root/.cargo/config.toml 2>/dev/null | head -1 ;;
++    esac
++}
++
++save_state() {
++    touch "$STATE"; grep -v "^$1=" "$STATE" > "$STATE.new"; echo "$1=$2 $3 $(date +%s)" >> "$STATE.new"; mv "$STATE.new" "$STATE"
++}
++
++say() { [ "$QUIET" = 1 ] || echo "$@"; }
++
++auto_one() {
++    local k=$1 res best ms url second
++    case " ${MINIS_MIRROR_SKIP:-} " in *" $k "*) echo "· $k：你在 设置 → 镜像 里固定了软件源，不改动"; return 0;; esac
++    res=$(probe "$k")
++    best=$(echo "$res" | grep -v '^-' | head -1)
++    second=$(echo "$res" | grep -v '^-' | sed -n 2p); second=${second#* }
++    if [ "${MINIS_MIRROR_VERBOSE:-0}" = 1 ] || [ "$QUIET" = 0 ]; then
++        echo "$res" | while read -r ms u; do
++            [ -z "$u" ] && continue
++            if [ "$ms" = "-" ]; then say "  $k  ✗ $(name_of "$u")  $u  （连不上/超时）"; else say "  $k  ${ms}ms  $(name_of "$u")  $u"; fi
++        done
++    fi
++    if [ -z "$best" ]; then
++        echo "✗ $k：所有软件源都连不上（${PROBE_TIMEOUT} 秒超时）。保留原来的：$(current "$k")。运行 minis-doctor 看原因。" >&2
++        return 1
++    fi
++    ms=${best%% *}; url=${best#* }
++    case $k in
++        apk) write_apk "$url" ;;
++        pip) write_pip "$url" "$second" ;;
++        npm) write_npm "$url" ;;
++        go) write_go "$url" ;;
++        cargo) write_cargo "$url" ;;
++    esac
++    save_state "$k" "$url" "$ms"
++    [ -n "$NET_SIG" ] && { touch "$STATE"; grep -v '^netsig=' "$STATE" > "$STATE.new"; echo "netsig=$NET_SIG" >> "$STATE.new"; mv "$STATE.new" "$STATE"; }
++    echo "✓ $k → $(name_of "$url")（${ms}ms）$url"
++}
++
++kinds_of() {
++    case ${1:-all} in
++        all) echo "apk pip npm go cargo" ;;
++        apk|pip|npm|go|cargo) echo "$1" ;;
++        *) echo "未知类型：$1（apk / pip / npm / go / cargo / all）" >&2; exit 2 ;;
++    esac
++}
++
++# Network signature the app writes on every network change (Wi-Fi ↔ mobile, VPN on/off).
++NET_SIG=$(sed -n 's/^sig=//p' /etc/minis/net.state 2>/dev/null | head -1)
++
++cmd=${1:-show}; shift 2>/dev/null
++for a in "$@"; do [ "$a" = "--quiet" ] && QUIET=1; done
++arg=$(for a in "$@"; do case $a in --*) ;; *) echo "$a"; break;; esac; done)
++
++case $cmd in
++    auto)
++        fails=0
++        for k in $(kinds_of "$arg"); do auto_one "$k" || fails=$((fails + 1)); done
++        echo "MINES_MIRROR apk=$(name_of "$(current apk)") pip=$(name_of "$(current pip)") npm=$(name_of "$(current npm)")"
++        [ "$fails" = 0 ] ;;
++    auto-if-changed)
++        kinds=$(for a in "$@"; do case $a in --*) ;; *) echo "$a";; esac; done)
++        [ -n "$kinds" ] || kinds="apk pip npm"
++        need=0
++        [ -s "$STATE" ] || need=1
++        old=$(sed -n 's/^netsig=//p' "$STATE" 2>/dev/null | tail -1)
++        [ -n "$NET_SIG" ] && [ "$old" != "$NET_SIG" ] && need=1
++        now=$(date +%s)
++        for k in $kinds; do
++            t=$(sed -n "s/^$k=.* \([0-9]*\)\$/\1/p" "$STATE" 2>/dev/null | tail -1)
++            if [ -z "$t" ] || [ $(( now - t )) -gt "${MINIS_MIRROR_MAX_AGE:-21600}" ]; then need=1; fi
++        done
++        if [ "$need" = 0 ]; then echo "软件源不用重测（网络没变，上次测速还新）"; exit 0; fi
++        fails=0
++        for k in $kinds; do kinds_of "$k" >/dev/null; auto_one "$k" || fails=$((fails + 1)); done
++        [ "$fails" = 0 ] ;;
++    probe)
++        for k in $(kinds_of "$arg"); do
++            probe "$k" | while read -r ms u; do
++                [ -z "$u" ] && continue
++                if [ "$ms" = "-" ]; then echo "$k  ✗      $(name_of "$u")  $u"; else echo "$k  ${ms}ms  $(name_of "$u")  $u"; fi
++            done
++        done ;;
++    set)
++        k=$1; url=$2
++        [ -n "$url" ] || { echo "用法：minis-mirror set <apk|pip|npm|go|cargo> <url>" >&2; exit 2; }
++        case $k in apk) write_apk "$url";; pip) write_pip "$url";; npm) write_npm "$url";; go) write_go "$url";; cargo) write_cargo "$url";; *) kinds_of "$k" >/dev/null;; esac
++        save_state "$k" "$url" "-"
++        echo "✓ $k → $(name_of "$url") $url" ;;
++    add)
++        k=$1; url=$2
++        [ -n "$url" ] || { echo "用法：minis-mirror add <apk|pip|npm|go|cargo> <url>" >&2; exit 2; }
++        kinds_of "$k" >/dev/null
++        touch "$CUSTOM"; grep -v "^$k[[:space:]]*$url\$" "$CUSTOM" > "$CUSTOM.new"; echo "$k $url" >> "$CUSTOM.new"; mv "$CUSTOM.new" "$CUSTOM"
++        echo "已加入候选：$k $url（运行 minis-mirror auto $k 测速）" ;;
++    show)
++        for k in $(kinds_of "$arg"); do
++            u=$(current "$k")
++            if [ -n "$u" ]; then echo "$k  $(name_of "$u")  $u"; else echo "$k  （默认/未设置）"; fi
++        done ;;
++    -h|--help|help) sed -n '2,15p' "$0" ;;
++    *) echo "未知命令：$cmd（auto / probe / set / add / show）" >&2; exit 2 ;;
++esac
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/pip b/src/android/app/src/main/assets/default_mount/usr/local/bin/pip
+new file mode 100755
+index 0000000..8f76498
+--- /dev/null
++++ b/src/android/app/src/main/assets/default_mount/usr/local/bin/pip
+@@ -0,0 +1,43 @@
++#!/bin/sh
++# [Mines-net-26] pip with a stall guard and automatic mirror switch.
++# Same idea as the apk wrapper: a download that stops moving is stopped, an
++# SSL / proxy / timeout error re-picks the fastest pip mirror and retries once.
++REAL=
++for c in /usr/bin/pip3 /usr/bin/pip; do [ -x "$c" ] && { REAL=$c; break; }; done
++if [ -z "$REAL" ]; then
++    if command -v python3 >/dev/null 2>&1 && python3 -c 'import pip' 2>/dev/null; then
++        set -- -m pip "$@"; REAL=python3
++    else
++        echo "pip 还没装：运行 apk add py3-pip（或 设置 → 沙箱与防杀 → 开发工具包 一键装好）" >&2
++        exit 127
++    fi
++fi
++net=0
++for a in "$@"; do
++    case $a in
++        -m|pip) ;;
++        -*) ;;
++        install|download|wheel|index|search) net=1; break ;;
++        *) break ;;
++    esac
++done
++[ "$net" = 1 ] && [ "${MINIS_GUARD:-1}" != 0 ] || exec "$REAL" "$@"
++. /usr/local/lib/minis-net/common.sh
++minis_check_proxy
++minis_mirrors_once pip
++STALL=${MINIS_PIP_STALL:-120}
++log=$(mktemp)
++trap 'rm -f "$log"' EXIT
++minis_run_logged "$log" minis-guard pip "$STALL" 0 -- "$REAL" "$@"
++rc=$?
++[ "$rc" = 0 ] && exit 0
++if [ "$rc" = 124 ] || grep -qE 'SSLError|SSL:|CERTIFICATE_VERIFY_FAILED|ProxyError|ConnectTimeout|ReadTimeout|timed out|Max retries exceeded|Could not fetch URL|Temporary failure in name resolution|Name or service not known|NewConnectionError|ConnectionResetError|RemoteDisconnected|IncompleteRead|No matching distribution found' "$log"; then
++    echo "↻ pip 软件源连不上或卡住了，正在重新测速换源…" >&2
++    if minis-mirror auto pip >&2; then
++        minis_run_logged "$log" minis-guard pip "$STALL" 0 -- "$REAL" "$@"
++        rc=$?
++        [ "$rc" = 0 ] && exit 0
++    fi
++    echo "✗ pip 下载失败（退出码 $rc）。运行 minis-doctor 看是网络、代理、证书还是软件源的问题。" >&2
++fi
++exit "$rc"
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/pip3 b/src/android/app/src/main/assets/default_mount/usr/local/bin/pip3
+new file mode 100755
+index 0000000..8f76498
+--- /dev/null
++++ b/src/android/app/src/main/assets/default_mount/usr/local/bin/pip3
+@@ -0,0 +1,43 @@
++#!/bin/sh
++# [Mines-net-26] pip with a stall guard and automatic mirror switch.
++# Same idea as the apk wrapper: a download that stops moving is stopped, an
++# SSL / proxy / timeout error re-picks the fastest pip mirror and retries once.
++REAL=
++for c in /usr/bin/pip3 /usr/bin/pip; do [ -x "$c" ] && { REAL=$c; break; }; done
++if [ -z "$REAL" ]; then
++    if command -v python3 >/dev/null 2>&1 && python3 -c 'import pip' 2>/dev/null; then
++        set -- -m pip "$@"; REAL=python3
++    else
++        echo "pip 还没装：运行 apk add py3-pip（或 设置 → 沙箱与防杀 → 开发工具包 一键装好）" >&2
++        exit 127
++    fi
++fi
++net=0
++for a in "$@"; do
++    case $a in
++        -m|pip) ;;
++        -*) ;;
++        install|download|wheel|index|search) net=1; break ;;
++        *) break ;;
++    esac
++done
++[ "$net" = 1 ] && [ "${MINIS_GUARD:-1}" != 0 ] || exec "$REAL" "$@"
++. /usr/local/lib/minis-net/common.sh
++minis_check_proxy
++minis_mirrors_once pip
++STALL=${MINIS_PIP_STALL:-120}
++log=$(mktemp)
++trap 'rm -f "$log"' EXIT
++minis_run_logged "$log" minis-guard pip "$STALL" 0 -- "$REAL" "$@"
++rc=$?
++[ "$rc" = 0 ] && exit 0
++if [ "$rc" = 124 ] || grep -qE 'SSLError|SSL:|CERTIFICATE_VERIFY_FAILED|ProxyError|ConnectTimeout|ReadTimeout|timed out|Max retries exceeded|Could not fetch URL|Temporary failure in name resolution|Name or service not known|NewConnectionError|ConnectionResetError|RemoteDisconnected|IncompleteRead|No matching distribution found' "$log"; then
++    echo "↻ pip 软件源连不上或卡住了，正在重新测速换源…" >&2
++    if minis-mirror auto pip >&2; then
++        minis_run_logged "$log" minis-guard pip "$STALL" 0 -- "$REAL" "$@"
++        rc=$?
++        [ "$rc" = 0 ] && exit 0
++    fi
++    echo "✗ pip 下载失败（退出码 $rc）。运行 minis-doctor 看是网络、代理、证书还是软件源的问题。" >&2
++fi
++exit "$rc"
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-net/common.sh b/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-net/common.sh
+new file mode 100644
+index 0000000..17549b2
+--- /dev/null
++++ b/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-net/common.sh
+@@ -0,0 +1,48 @@
++# [Mines-net-26] Shared helpers for the apk/pip wrappers, minis-doctor and minis-devkit.
++# Sourced, not executed.
++
++# host:port out of a proxy URL (drops scheme, user:pass@ and path).
++minis_hostport() {
++    echo "$1" | sed -e 's#^[a-zA-Z0-9+.-]*://##' -e 's#^[^@/]*@##' -e 's#/.*$##'
++}
++
++# minis_tcp_ok <host> <port>: something accepts a TCP connection within ~3 s.
++minis_tcp_ok() {
++    local h=$1 p=$2
++    h=${h#[}; h=${h%]}
++    timeout 4 nc -w 3 "$h" "$p" </dev/null >/dev/null 2>&1
++}
++
++minis_proxy_url() { echo "${https_proxy:-${HTTPS_PROXY:-${http_proxy:-${HTTP_PROXY:-}}}}"; }
++
++# If the exported proxy does not even accept TCP, drop it for this command
++# instead of sending every download into a dead port.
++minis_check_proxy() {
++    local p hp h port
++    p=$(minis_proxy_url)
++    [ -n "$p" ] || return 0
++    hp=$(minis_hostport "$p"); h=${hp%:*}; port=${hp##*:}
++    [ "$port" = "$hp" ] && port=80
++    if ! minis_tcp_ok "$h" "$port"; then
++        echo "⚠ 代理 $h:$port 连不上，这次直连（设置 → 模型路由与分流 里检查代理，或在 设置 → 沙箱与防杀 把沙箱代理设为「不用代理」）" >&2
++        unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
++        export MINES_PROXY_DROPPED=1
++    fi
++}
++
++# First use: pick mirrors once before the first download.
++minis_mirrors_once() {
++    [ -s /etc/minis/mirrors.state ] && return 0
++    echo "首次使用：正在测速选择软件源…" >&2
++    minis-mirror auto "$@" >&2 || true
++}
++
++# run_logged <logfile> <cmd...>: run, show output, keep a copy, return the real exit code.
++minis_run_logged() {
++    local log=$1 rcf rc
++    shift
++    rcf=$(mktemp)
++    { "$@"; echo $? > "$rcf"; } 2>&1 | tee "$log"
++    rc=$(cat "$rcf" 2>/dev/null); rm -f "$rcf"
++    return "${rc:-1}"
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt b/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt
+index 38cc618..c926424 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt
+@@ -109,8 +109,19 @@ class DeskPetService : Service() {
+ 
+     private val density get() = resources.displayMetrics.density
+     private fun dp(v: Int) = (v * density).toInt()
+-    private val screenW get() = resources.displayMetrics.widthPixels
+-    private val screenH get() = resources.displayMetrics.heightPixels
++    // [Mines-pet-26] Real window size (follows rotation / foldables), and the area
++    // outside status bar, navigation bar and display cutout.
++    private val screenW: Int get() = if (Build.VERSION.SDK_INT >= 30) runCatching { wm!!.currentWindowMetrics.bounds.width() }.getOrDefault(resources.displayMetrics.widthPixels) else resources.displayMetrics.widthPixels
++    private val screenH: Int get() = if (Build.VERSION.SDK_INT >= 30) runCatching { wm!!.currentWindowMetrics.bounds.height() }.getOrDefault(resources.displayMetrics.heightPixels) else resources.displayMetrics.heightPixels
++    private fun safe(): android.graphics.Rect {
++        val r = android.graphics.Rect(0, dp(24), screenW, screenH - dp(24))
++        if (Build.VERSION.SDK_INT >= 30) runCatching {
++            val m = wm!!.currentWindowMetrics
++            val ins = m.windowInsets.getInsetsIgnoringVisibility(android.view.WindowInsets.Type.systemBars() or android.view.WindowInsets.Type.displayCutout())
++            r.set(ins.left, ins.top, m.bounds.width() - ins.right, m.bounds.height() - ins.bottom)
++        }
++        return r
++    }
+     private val st get() = PlusPrefs.state.value
+ 
+     override fun onBind(intent: Intent?): IBinder? = null
+@@ -162,8 +173,38 @@ class DeskPetService : Service() {
+         else startForeground(NOTIF_ID, n)
+     }
+ 
+-    private fun petPx() = dp(st.petSizeDp.coerceIn(56, 180))
+-    private fun windowPx() = (petPx() * 1.3f).toInt()
++    /**
++     * [Mines-pet-26] Size follows the screen: the slider's default (96) is 16 % of
++     * the shorter side (≈ 60–70 dp on a phone, was a 125 dp window); 56…180 on the
++     * slider = ~9 %…30 %. The window is the sprite plus a little headroom for
++     * jumps — no big transparent rectangle around it to catch touches.
++     */
++    private fun petPx(): Int {
++        val minDim = min(screenW, screenH)
++        val frac = 0.16f * (st.petSizeDp.coerceIn(56, 180) / 96f)
++        return (minDim * frac).toInt().coerceIn(dp(40), (minDim * 0.32f).toInt().coerceAtLeast(dp(40)))
++    }
++    private fun windowW() = petPx()
++    private fun windowH() = (petPx() * 1.16f).toInt()
++
++    /** Keep the pet inside the safe area (half-tucked at the side edges is allowed). */
++    private fun clampIntoSafe() {
++        val lp = petLp ?: return; val v = petView ?: return
++        val r = safe()
++        val minX = if (tucked) r.left - lp.width / 2 else r.left - dp(6)
++        val maxX = if (tucked) r.right - lp.width / 2 else r.right - lp.width + dp(6)
++        lp.x = lp.x.coerceIn(minX, max(minX, maxX))
++        lp.y = lp.y.coerceIn(r.top, max(r.top, r.bottom - lp.height))
++        v.edge = when { lp.x <= r.left + dp(2) -> -1; lp.x >= r.right - lp.width - dp(2) -> 1; else -> 0 }
++        Overlays.update(wm, v, lp); moveBubble()
++    }
++
++    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
++        super.onConfigurationChanged(newConfig)
++        applySize()
++        clampIntoSafe()
++        if (st.petEdgeSnap && !tucked) snapToEdge()
++    }
+ 
+     private fun baseFlags(): Int {
+         var f = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+@@ -176,15 +217,15 @@ class DeskPetService : Service() {
+         val lp = petLp ?: return; val v = petView ?: return
+         lp.flags = baseFlags()
+         v.alpha = if (st.petPassThrough) 0.55f else 1f
+-        runCatching { wm?.updateViewLayout(v, lp) }
++        Overlays.update(wm, v, lp)
+     }
+ 
+     private fun applySize() {
+         val lp = petLp ?: return; val v = petView ?: return
+-        val w = windowPx()
+-        lp.width = w; lp.height = w
++        val w = windowW()
++        lp.width = w; lp.height = windowH()
+         lp.x = lp.x.coerceIn(-w / 2, screenW - w / 2)
+-        runCatching { wm?.updateViewLayout(v, lp) }
++        Overlays.update(wm, v, lp)
+     }
+ 
+     @SuppressLint("ClickableViewAccessibility")
+@@ -192,13 +233,13 @@ class DeskPetService : Service() {
+         PlusPrefs.init(this)
+         val manager = getSystemService(WINDOW_SERVICE) as WindowManager
+         wm = manager
+-        val w = windowPx()
++        val w = windowW()
+         val lp = WindowManager.LayoutParams(
+-            w, w, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, baseFlags(), PixelFormat.TRANSLUCENT,
++            w, windowH(), WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, baseFlags(), PixelFormat.TRANSLUCENT,
+         ).apply {
+             gravity = Gravity.TOP or Gravity.START
+-            x = screenW - w
+-            y = (screenH * 0.55f).toInt()
++            x = safe().right - w + dp(6)
++            y = (screenH * 0.62f).toInt()
+         }
+         petLp = lp
+         val view = PetView(this)
+@@ -210,7 +251,8 @@ class DeskPetService : Service() {
+         val gestures = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+             override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+                 if (tucked) { untuck(); return true }
+-                if (st.petPanel) togglePanel() else view.say(PetView.LINES.random())
++                view.react(PetView.Mode.JUMP, 650)
++                if (st.petPanel) togglePanel() else say(PetView.LINES.random())
+                 return true
+             }
+             override fun onDoubleTap(e: MotionEvent): Boolean {
+@@ -241,23 +283,63 @@ class DeskPetService : Service() {
+                         val vx = (ev.rawX - lastMoveX) / max(1L, now - lastMoveT)
+                         lastMoveX = ev.rawX; lastMoveT = now
+                         view.drag(vx)
+-                        lp.x = (startX + dx).toInt(); lp.y = (startY + dy).toInt().coerceIn(0, screenH - lp.height)
+-                        runCatching { manager.updateViewLayout(view, lp) }
++                        lp.x = (startX + dx).toInt(); lp.y = (startY + dy).toInt().coerceIn(safe().top, max(safe().top, safe().bottom - lp.height))
++                        Overlays.update(manager, view, lp)
+                         moveBubble()
+                     }
+                 }
+                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+-                    if (dragging) { view.release(); snapToEdge() }
++                    if (dragging) {
++                        view.release(); snapToEdge()
++                        // [Mines-pet-26] After a move nothing may stay behind at the old spot.
++                        if (Overlays.audit().isNotEmpty()) Overlays.repair()
++                    }
+                     dragging = false
+                 }
+             }
+             true
+         }
+-        runCatching { manager.addView(view, lp) }.onFailure { stopSelf(); return }
++        if (!Overlays.add(manager, "pet", view, lp)) { stopSelf(); return }
+         view.react(PetView.Mode.WAVE, 1800)
+         scheduleTuck()
+         watchEvents()
+         walkLoop()
++        idleLoop()
++    }
++
++    /**
++     * [Mines-pet-26] Life when nobody touches it: fades to see-through after
++     * 15 s, now and then stretches / yawns / looks around / spins, and when
++     * half-hidden at the edge it peeks out and slides back.
++     */
++    private fun idleLoop() = scope.launch {
++        var nextAct = System.currentTimeMillis() + 20_000L
++        var nextPeek = System.currentTimeMillis() + 30_000L
++        while (isActive) {
++            delay(2500)
++            val v = petView ?: continue; val lp = petLp ?: continue
++            val now = System.currentTimeMillis()
++            val idle = now - lastTouch > 15_000 && panel == null && switcher == null && !v.held
++            if (idle && fadeJob?.isActive != true) {
++                val target = if (st.petPassThrough) 0.4f else if (v.busy) 0.75f else 0.55f
++                if (abs(v.alpha - target) > 0.02f) v.animate().alpha(target).setDuration(600).start()
++            }
++            if (v.sleeping || st.petPassThrough || panel != null) continue
++            if (tucked && now > nextPeek) {
++                nextPeek = now + (25_000L..50_000L).random()
++                val r = safe(); val w = lp.width
++                val home = lp.x
++                val out = if (home < (r.left + r.right) / 2) home + (w * 0.35f).toInt() else home - (w * 0.35f).toInt()
++                v.react(PetView.Mode.PEEK, 2200)
++                animateX(out) { scope.launch { delay(1400); if (tucked) animateX(home) } }
++                continue
++            }
++            if (now > nextAct && !v.busy) {
++                nextAct = now + (22_000L..45_000L).random()
++                val m = listOf(PetView.Mode.STRETCH, PetView.Mode.YAWN, PetView.Mode.LOOK, PetView.Mode.LOOK, PetView.Mode.SPIN, PetView.Mode.JUMP).random()
++                v.react(m, when (m) { PetView.Mode.STRETCH -> 1600; PetView.Mode.YAWN -> 1800; PetView.Mode.LOOK -> 2600; PetView.Mode.SPIN -> 900; else -> 650 })
++            }
++        }
+     }
+ 
+     // ---- staying out of the way --------------------------------------
+@@ -281,9 +363,12 @@ class DeskPetService : Service() {
+         val lp = petLp ?: return; val v = petView ?: return
+         if (!st.petEdgeSnap) { scheduleTuck(); return }
+         val w = lp.width
+-        val target = if (lp.x + w / 2 < screenW / 2) -dp(6) else screenW - w + dp(6)
++        val r = safe()
++        val left = lp.x + w / 2 < (r.left + r.right) / 2
++        val target = if (left) r.left - dp(4) else r.right - w + dp(4)
+         animateX(target) { scheduleTuck() }
+-        v.facingLeft = target > screenW / 2
++        v.facingLeft = !left
++        v.edge = if (left) -1 else 1
+     }
+ 
+     private fun animateX(target: Int, end: () -> Unit = {}) {
+@@ -291,7 +376,7 @@ class DeskPetService : Service() {
+         snapAnim?.cancel()
+         snapAnim = ValueAnimator.ofInt(lp.x, target).apply {
+             duration = 260; interpolator = DecelerateInterpolator()
+-            addUpdateListener { a -> lp.x = a.animatedValue as Int; runCatching { wm?.updateViewLayout(v, lp) }; moveBubble() }
++            addUpdateListener { a -> lp.x = a.animatedValue as Int; Overlays.update(wm, v, lp); moveBubble() }
+             addListener(object : android.animation.AnimatorListenerAdapter() {
+                 override fun onAnimationEnd(animation: android.animation.Animator) { end() }
+             })
+@@ -307,9 +392,10 @@ class DeskPetService : Service() {
+             if (panel != null || bubble != null) return@launch
+             val lp = petLp ?: return@launch
+             val w = lp.width
++            val r = safe()
+             when {
+-                lp.x <= 0 -> { tucked = true; animateX(-w / 2) }
+-                lp.x >= screenW - w -> { tucked = true; animateX(screenW - w / 2) }
++                lp.x <= r.left -> { tucked = true; animateX(r.left - w / 2) }
++                lp.x >= r.right - w -> { tucked = true; animateX(r.right - w / 2) }
+             }
+             petView?.animate()?.alpha(0.8f)?.setDuration(200)?.start()
+         }
+@@ -319,7 +405,8 @@ class DeskPetService : Service() {
+         val lp = petLp ?: return
+         tucked = false
+         val w = lp.width
+-        animateX(if (lp.x < screenW / 2) -dp(6) else screenW - w + dp(6)) { scheduleTuck() }
++        val r = safe()
++        animateX(if (lp.x < (r.left + r.right) / 2) r.left - dp(4) else r.right - w + dp(4)) { scheduleTuck() }
+         petView?.react(PetView.Mode.WAVE, 1200)
+         restore()
+     }
+@@ -332,11 +419,12 @@ class DeskPetService : Service() {
+             if (!st.petWalk || st.petPassThrough || tucked || panel != null || v.sleeping) continue
+             if (System.currentTimeMillis() - lastTouch < 20_000) continue
+             val from = lp.y
+-            val to = (from + (if ((0..1).random() == 0) -1 else 1) * dp((60..160).random())).coerceIn(dp(80), screenH - lp.height - dp(80))
++            val r = safe()
++            val to = (from + (if ((0..1).random() == 0) -1 else 1) * dp((60..160).random())).coerceIn(r.top + dp(40), max(r.top + dp(40), r.bottom - lp.height - dp(40)))
+             v.walking = true
+             val a = ValueAnimator.ofInt(from, to).apply {
+                 duration = (abs(to - from) * 9L).coerceIn(800L, 2600L)
+-                addUpdateListener { lp.y = it.animatedValue as Int; runCatching { wm?.updateViewLayout(v, lp) } }
++                addUpdateListener { lp.y = it.animatedValue as Int; Overlays.update(wm, v, lp) }
+                 start()
+             }
+             delay(a.duration + 50)
+@@ -350,12 +438,22 @@ class DeskPetService : Service() {
+     private fun watchEvents() {
+         scope.launch {
+             MinesJobs.finished.collect { j ->
+-                if (j.ok) { petView?.react(PetView.Mode.HAPPY, 2500); say("✓ " + j.successText) }
++                if (j.silent) return@collect
++                if (j.ok) { petView?.react(PetView.Mode.CELEBRATE, 2600); say("✓ " + j.successText) }
+                 else { petView?.react(PetView.Mode.SAD, 2500); say("✗ ${j.title}：${j.reason}") }
+             }
+         }
+-        scope.launch { MinesJobs.jobs.collect { petView?.thinking = it.any { j -> j.running } } }
++        scope.launch { MinesJobs.jobs.collect { petView?.thinking = it.any { j -> j.running && !j.silent } } }
+         scope.launch { PetBus.talking.collect { petView?.talking = it } }
++        // [Mines-pet-26] Typing pose while the agent works; celebrate when a task ends.
++        scope.launch { com.openminis.app.service.SessionActivityTracker.activeSessions.collect { petView?.typing = it.isNotEmpty() } }
++        scope.launch {
++            var first = true
++            com.openminis.app.service.SessionActivityTracker.lastTaskFinishedAtMs.collect { t ->
++                if (first) { first = false; return@collect }
++                if (t != null) { petView?.react(PetView.Mode.CELEBRATE, 2600); restore() }
++            }
++        }
+         scope.launch {
+             PetBus.wake.collectLatest { t ->
+                 if (t == 0L) return@collectLatest
+@@ -383,7 +481,7 @@ class DeskPetService : Service() {
+                 PixelFormat.TRANSLUCENT,
+             ).apply { gravity = Gravity.TOP or Gravity.START; x = lp0.x; y = lp0.y - dp(44) }
+             bubbleLp = lp; bubble = v
+-            runCatching { manager.addView(v, lp) }.onFailure { bubble = null }
++            if (!Overlays.add(manager, "pet-bubble", v, lp)) bubble = null
+         }
+         tv.text = text
+         tv.contentDescription = "桌宠：$text"
+@@ -399,11 +497,11 @@ class DeskPetService : Service() {
+         val bw = tv.measuredWidth
+         lp.x = if (p.x + p.width / 2 > screenW / 2) (p.x - bw + p.width / 3).coerceAtLeast(dp(4)) else (p.x + p.width * 2 / 3).coerceAtMost(screenW - bw - dp(4))
+         lp.y = (p.y - dp(30)).coerceAtLeast(dp(24))
+-        runCatching { wm?.updateViewLayout(tv, lp) }
++        Overlays.update(wm, tv, lp)
+     }
+ 
+     private fun hideBubble() {
+-        bubble?.let { v -> runCatching { wm?.removeView(v) } }
++        bubble?.let { v -> Overlays.remove(wm, v) }
+         bubble = null; bubbleLp = null
+         scheduleTuck()
+     }
+@@ -411,7 +509,7 @@ class DeskPetService : Service() {
+     // ---- status panel ---------------------------------------------------
+ 
+     private fun closePanel() {
+-        panel?.let { v -> runCatching { wm?.removeView(v) } }
++        panel?.let { v -> Overlays.remove(wm, v) }
+         panel = null
+     }
+ 
+@@ -491,7 +589,7 @@ class DeskPetService : Service() {
+         }
+         root.setOnTouchListener { _, ev -> if (ev.actionMasked == MotionEvent.ACTION_OUTSIDE) { closePanel(); true } else false }
+         panel = root
+-        runCatching { manager.addView(root, lp) }.onFailure { panel = null; return }
++        if (!Overlays.add(manager, "pet-panel", root, lp)) { panel = null; return }
+         hideJob?.cancel()
+         scope.launch {
+             val items = Balances.refresh(this@DeskPetService)
+@@ -544,7 +642,7 @@ class DeskPetService : Service() {
+             text = "换个形象"; textSize = 20f; setTextColor(Color.parseColor("#2B2522"))
+             setTypeface(typeface, android.graphics.Typeface.BOLD)
+         })
+-        fun close() { switcher?.let { v -> runCatching { manager.removeView(v) } }; switcher = null }
++        fun close() { switcher?.let { v -> Overlays.remove(manager, v) }; switcher = null }
+         val grid = android.widget.GridLayout(this).apply { columnCount = 4; setPadding(0, dp(10), 0, dp(6)) }
+         val choices = Avatars.builtins.map { it.id to it.name } +
+             (if (Avatars.hasCustom(this)) listOf(Avatars.CUSTOM to "我的") else emptyList())
+@@ -605,14 +703,16 @@ class DeskPetService : Service() {
+         ).apply { gravity = Gravity.CENTER }
+         panelV.setOnTouchListener { _, ev -> if (ev.actionMasked == MotionEvent.ACTION_OUTSIDE) { close(); true } else false }
+         switcher = panelV
+-        runCatching { manager.addView(panelV, lp) }.onFailure { switcher = null }
++        if (!Overlays.add(manager, "pet-switcher", panelV, lp)) switcher = null
+     }
+ 
+     override fun onDestroy() {
+         scope.cancel()
+         snapAnim?.cancel()
+-        listOf(switcher, panel, bubble, petView).forEach { v -> v?.let { runCatching { wm?.removeView(it) } } }
++        listOf(switcher, panel, bubble, petView).forEach { v -> v?.let { Overlays.remove(wm, it) } }
+         switcher = null; panel = null; bubble = null; petView = null
++        // [Mines-pet-26] Nothing of the pet may stay behind on screen.
++        listOf("pet", "pet-bubble", "pet-panel", "pet-switcher").forEach { Overlays.removeAll(it) }
+         super.onDestroy()
+     }
+ 
+@@ -624,7 +724,7 @@ class DeskPetService : Service() {
+      * (squash / stretch and lean with the finger's speed).
+      */
+     class PetView(context: Context) : View(context) {
+-        enum class Mode { IDLE, WAVE, HAPPY, SAD }
++        enum class Mode { IDLE, WAVE, HAPPY, SAD, JUMP, STRETCH, YAWN, LOOK, SPIN, CELEBRATE, PEEK }
+         companion object {
+             val LINES = listOf("我在这儿陪你～", "今天也要加油！", "有事双击我", "长按我可以换形象", "服务器我盯着呢", "喝口水吧", "摸摸头 (•ᴗ•)")
+             private const val SLEEP_AFTER_MS = 180_000L
+@@ -646,9 +746,15 @@ class DeskPetService : Service() {
+         @Volatile var thinking = false
+         @Volatile var talking = false
+         @Volatile var walking = false
++        /** [Mines-pet-26] The agent is working: typing pose. */
++        @Volatile var typing = false
++        /** Edge it sits against: -1 left, 1 right, 0 free (sitting pose). */
++        @Volatile var edge = 0
+         var facingLeft = true
+         private var dragVx = 0f
+-        private var held = false
++        var held = false
++            private set
++        val busy: Boolean get() = held || walking || talking || typing || thinking || mode != Mode.IDLE
+         private var releaseAt = 0L
+         private var line: String? = null
+         private var lineUntil = 0L
+@@ -656,6 +762,9 @@ class DeskPetService : Service() {
+         private val zPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#7A8CA8"); isFakeBoldText = true }
+         private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#D97757") }
+         private val shadow = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(40, 0, 0, 0) }
++        private val confetti = Paint(Paint.ANTI_ALIAS_FLAG)
++        private val kbPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(200, 60, 52, 48) }
++        private val CONFETTI = intArrayOf(Color.parseColor("#D97757"), Color.parseColor("#F4C542"), Color.parseColor("#5AC8FA"), Color.parseColor("#34C759"), Color.parseColor("#AF52DE"))
+         private val bubblePaint = Paint(Paint.ANTI_ALIAS_FLAG)
+         private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+             color = Color.parseColor("#222222"); textSize = 12f * context.resources.displayMetrics.scaledDensity
+@@ -677,9 +786,10 @@ class DeskPetService : Service() {
+             if (now > modeUntil && mode != Mode.IDLE) mode = Mode.IDLE
+             val t = (now - start) / 1000f
+             val mt = (now - modeStart) / 1000f
+-            val pet = width / 1.3f
++            val pet = min(width.toFloat(), height / 1.16f)
+             val left = (width - pet) / 2f
+-            val top = height - pet - pet * 0.06f
++            val top = height - pet - pet * 0.03f
++            var dy = 0f
+             val sleep = sleeping
+ 
+             var bob = sin(t * (if (sleep) 0.9f else 1.6f)) * (if (sleep) 0.03f else 0.04f)
+@@ -702,15 +812,46 @@ class DeskPetService : Service() {
+                 mode == Mode.WAVE -> { rot = sin(mt * 12f) * 10f; expression = Avatars.HAPPY }
+                 mode == Mode.HAPPY -> { bob = -abs(sin(mt * 9f)) * 0.12f; expression = Avatars.LAUGH }
+                 mode == Mode.SAD -> { sway = sin(mt * 30f) * 0.03f; rot = -6f; expression = Avatars.NEUTRAL }
++                mode == Mode.JUMP -> {
++                    val k = (mt / 0.65f).coerceIn(0f, 1f)
++                    dy = -sin(k * Math.PI.toFloat()) * pet * 0.14f
++                    if (k < 0.15f || k > 0.85f) { sy = 0.9f; sx = 1.06f }
++                    expression = Avatars.LAUGH
++                }
++                mode == Mode.STRETCH -> {
++                    val k = sin((mt / 1.6f).coerceIn(0f, 1f) * Math.PI.toFloat())
++                    sy = 1f + 0.12f * k; sx = 1f - 0.05f * k; expression = Avatars.HAPPY
++                }
++                mode == Mode.YAWN -> {
++                    val k = sin((mt / 1.8f).coerceIn(0f, 1f) * Math.PI.toFloat())
++                    sy = 1f + 0.05f * k; rot = (if (facingLeft) -4f else 4f) * k
++                    expression = if (k > 0.4f) Avatars.LAUGH else Avatars.NEUTRAL
++                }
++                mode == Mode.LOOK -> {
++                    sway = sin(mt * 2.6f) * 0.05f; rot = sin(mt * 2.6f) * 7f
++                    facingLeft = sin(mt * 2.6f) < 0f
++                }
++                mode == Mode.SPIN -> {
++                    val k = (mt / 0.9f).coerceIn(0f, 1f)
++                    sx = kotlin.math.cos(k * 2f * Math.PI.toFloat()).let { if (abs(it) < 0.08f) 0.08f * kotlin.math.sign(it + 0.0001f) else it }
++                    expression = Avatars.HAPPY
++                }
++                mode == Mode.CELEBRATE -> {
++                    dy = -abs(sin(mt * 7f)) * pet * 0.1f; rot = sin(mt * 7f) * 6f; expression = Avatars.LAUGH
++                }
++                mode == Mode.PEEK -> { rot = if (edge < 0) 12f else -12f; sway = sin(mt * 3f) * 0.02f; expression = Avatars.HAPPY }
+                 talking -> { expression = if (((t * 6f).toInt() % 2) == 0) Avatars.HAPPY else Avatars.LAUGH; bob = sin(t * 8f) * 0.02f }
+                 walking -> { bob = -abs(sin(t * 10f)) * 0.07f; rot = if (facingLeft) -5f else 5f; expression = Avatars.HAPPY }
++                typing -> { bob = sin(t * 14f) * 0.012f; sy *= 0.97f; expression = if (((t * 0.7f).toInt() % 2) == 0) Avatars.NEUTRAL else Avatars.HAPPY }
+                 thinking -> { sway = sin(t * 2.2f) * 0.04f; rot = sin(t * 2.2f) * 4f }
+                 sleep -> { rot = if (facingLeft) -10f else 10f }
+                 line != null && now < lineUntil -> expression = Avatars.HAPPY
++                edge != 0 -> { rot = edge * 5f; sy *= 0.96f }   // sitting, leaning on the edge
+             }
+             // ground shadow
+-            canvas.drawOval(RectF(left + pet * 0.2f, height - pet * 0.1f, left + pet * 0.8f, height - pet * 0.02f), shadow)
++            canvas.drawOval(RectF(left + pet * 0.2f, height - pet * 0.08f, left + pet * 0.8f, height - pet * 0.01f), shadow)
+             canvas.save()
++            canvas.translate(0f, dy)
+             canvas.rotate(rot, left + pet / 2f, top + pet)
+             canvas.scale(sx, sy, left + pet / 2f, top + pet)
+             canvas.translate(left, top)
+@@ -729,6 +870,22 @@ class DeskPetService : Service() {
+                     zPaint.textSize = pet * (0.12f + 0.06f * i)
+                     canvas.drawText("z", left + pet * (0.72f + 0.1f * i), top + pet * (0.3f - 0.25f * k), zPaint)
+                 }
++            } else if (mode == Mode.CELEBRATE) {
++                // confetti
++                for (i in 0 until 10) {
++                    val k = ((mt * 0.8f + i * 0.13f) % 1f)
++                    confetti.color = CONFETTI[i % CONFETTI.size]
++                    val cx = left + pet * (0.08f + 0.84f * ((i * 37 % 10) / 10f))
++                    canvas.drawCircle(cx, top + pet * (0.05f + 0.6f * k), pet * 0.025f, confetti)
++                }
++            } else if (typing && !talking && mode == Mode.IDLE && !held) {
++                // little keyboard + keys lighting up
++                val kb = RectF(left + pet * 0.22f, top + pet * 0.86f, left + pet * 0.78f, top + pet * 0.97f)
++                canvas.drawRoundRect(kb, pet * 0.03f, pet * 0.03f, kbPaint)
++                for (i in 0 until 4) {
++                    dotPaint.alpha = if (((t * 8f).toInt() % 4) == i) 255 else 70
++                    canvas.drawCircle(kb.left + kb.width() * (0.2f + 0.2f * i), kb.centerY(), pet * 0.02f, dotPaint)
++                }
+             } else if (thinking && !talking && mode == Mode.IDLE && !held) {
+                 for (i in 0 until 3) {
+                     dotPaint.alpha = if (((t * 3f).toInt() % 3) == i) 255 else 90
+@@ -748,7 +905,7 @@ class DeskPetService : Service() {
+                     canvas.drawText(l, bx + pad, bh / 2 + textPaint.textSize / 3f, textPaint)
+                 }
+             }
+-            val busy = held || walking || talking || mode != Mode.IDLE || now - releaseAt < 450 || line != null
++            val busy = held || walking || talking || typing || mode != Mode.IDLE || now - releaseAt < 450 || line != null
+             // ~30 fps while something moves, ~12 fps idle, ~6 fps asleep (battery).
+             postInvalidateDelayed(if (busy) 33 else if (sleep) 160 else 80)
+         }
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/DshWidgets.kt b/src/android/app/src/main/java/com/openminis/app/plus/DshWidgets.kt
+index 6cdcdd4..6ce047c 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/DshWidgets.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/DshWidgets.kt
+@@ -37,6 +37,7 @@ import java.io.File
+ import java.net.HttpURLConnection
+ import java.net.URL
+ import kotlin.math.abs
++import kotlin.math.max
+ 
+ /**
+  * [Mines-dsh-ui] Host for dsh Web UI / widget plugins (e.g. dsh-whale-widget).
+@@ -188,39 +189,77 @@ class PluginWidgetService : Service() {
+         else startForeground(NOTIF_ID, n)
+     }
+ 
+-    @SuppressLint("SetJavaScriptEnabled", "ClickableViewAccessibility")
++    /**
++     * [Mines-pet-26] The overlay window is only as big as what the widget
++     * actually draws. build-25 used a fixed 300×380 dp window with a
++     * transparent WebView: the empty part (and the 「⋯ 挂件」 handle at its
++     * top) stayed on screen and swallowed every touch there, which looked like
++     * a leftover box after the pet was dragged away. Now the page reports the
++     * bounding box of its visible elements once a second; the WebView keeps
++     * its layout size but is shifted inside a window cut to that box, and with
++     * nothing visible the window turns GONE + NOT_TOUCHABLE.
++     */
++    @SuppressLint("SetJavaScriptEnabled", "ClickableViewAccessibility", "JavascriptInterface")
+     private fun addWindow() {
+         val manager = getSystemService(WINDOW_SERVICE) as WindowManager
+         wm = manager
+         val d = resources.displayMetrics.density
+-        val w = (300 * d).toInt(); val h = (380 * d).toInt()
++        val pageW = (300 * d).toInt(); val pageH = (380 * d).toInt()
++        val handleH = (18 * d).toInt()
+         val lp = WindowManager.LayoutParams(
+-            w, h, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
++            (64 * d).toInt(), (64 * d).toInt(), WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+             PixelFormat.TRANSLUCENT,
+         ).apply {
+             gravity = Gravity.TOP or Gravity.START
+-            x = resources.displayMetrics.widthPixels - w
+-            y = (resources.displayMetrics.heightPixels * 0.35f).toInt()
++            x = resources.displayMetrics.widthPixels - (120 * d).toInt()
++            y = (resources.displayMetrics.heightPixels * 0.3f).toInt()
+         }
+-        val frame = FrameLayout(this)
++        val frame = FrameLayout(this).apply { clipChildren = true; clipToPadding = true }
+         val wv = WebView(this).apply {
+             setBackgroundColor(Color.TRANSPARENT)
+             settings.javaScriptEnabled = true
+             settings.domStorageEnabled = true
+             settings.mediaPlaybackRequiresUserGesture = false
+-            webViewClient = WebViewClient()
+             webChromeClient = WebChromeClient()
+-            loadUrl(DshWebHost.URL_INDEX)
+         }
+         web = wv
+-        frame.addView(wv, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
++        // The WebView keeps a fixed layout size; only the window around it changes.
++        frame.addView(wv, FrameLayout.LayoutParams(pageW, pageH).apply { topMargin = handleH })
+         val handle = TextView(this).apply {
+-            text = "⋯ 挂件"; textSize = 11f; setTextColor(Color.WHITE); gravity = Gravity.CENTER
+-            setBackgroundColor(Color.argb(110, 0, 0, 0))
++            text = "⋯"; textSize = 12f; setTextColor(Color.WHITE); gravity = Gravity.CENTER
++            background = android.graphics.drawable.GradientDrawable().apply { cornerRadius = 9 * d; setColor(Color.argb(120, 0, 0, 0)) }
+             contentDescription = "插件挂件：拖动移动，长按关闭"
+         }
+-        frame.addView(handle, FrameLayout.LayoutParams((90 * d).toInt(), (22 * d).toInt(), Gravity.TOP or Gravity.CENTER_HORIZONTAL))
++        frame.addView(handle, FrameLayout.LayoutParams((36 * d).toInt(), handleH, Gravity.TOP or Gravity.START))
++        val main = android.os.Handler(mainLooper)
++        var lastBox = ""
++        fun applyBox(l: Float, t: Float, r: Float, b: Float) {
++            val visible = r > l + 2 && b > t + 2
++            if (!visible) { Overlays.setHidden(manager, frame, lp, true); return }
++            val pad = (4 * d).toInt()
++            val left = ((l * d).toInt() - pad).coerceIn(0, pageW); val top = ((t * d).toInt() - pad).coerceIn(0, pageH)
++            val right = ((r * d).toInt() + pad).coerceIn(left + 1, pageW); val bottom = ((b * d).toInt() + pad).coerceIn(top + 1, pageH)
++            val key = "$left,$top,$right,$bottom"
++            if (frame.visibility != android.view.View.VISIBLE) Overlays.setHidden(manager, frame, lp, false)
++            if (key == lastBox) return
++            // keep the visible content where it is on screen while the window is re-cut
++            val oldLeft = lastBox.split(',').getOrNull(0)?.toIntOrNull() ?: left
++            val oldTop = lastBox.split(',').getOrNull(1)?.toIntOrNull() ?: top
++            lastBox = key
++            wv.translationX = -left.toFloat(); wv.translationY = -top.toFloat()
++            lp.width = max(right - left, (36 * d).toInt()); lp.height = bottom - top + handleH
++            lp.x += left - oldLeft; lp.y += top - oldTop
++            Overlays.update(manager, frame, lp)
++        }
++        wv.addJavascriptInterface(object {
++            @android.webkit.JavascriptInterface
++            fun bounds(l: Float, t: Float, r: Float, b: Float) { main.post { applyBox(l, t, r, b) } }
++        }, "MinesWidget")
++        wv.webViewClient = object : WebViewClient() {
++            override fun onPageFinished(view: WebView?, url: String?) { view?.evaluateJavascript(MEASURE_JS, null) }
++        }
++        wv.loadUrl(DshWebHost.URL_INDEX)
+         var downX = 0f; var downY = 0f; var sx = 0; var sy = 0; var downAt = 0L; var moved = false
+         handle.setOnTouchListener { _, ev ->
+             when (ev.actionMasked) {
+@@ -229,7 +268,7 @@ class PluginWidgetService : Service() {
+                     val dx = ev.rawX - downX; val dy = ev.rawY - downY
+                     if (moved || abs(dx) > 10 * d || abs(dy) > 10 * d) {
+                         moved = true; lp.x = (sx + dx).toInt(); lp.y = (sy + dy).toInt()
+-                        runCatching { manager.updateViewLayout(frame, lp) }
++                        Overlays.update(manager, frame, lp)
+                     }
+                 }
+                 MotionEvent.ACTION_UP -> if (!moved && System.currentTimeMillis() - downAt > 600) stopSelf()
+@@ -237,13 +276,30 @@ class PluginWidgetService : Service() {
+             true
+         }
+         root = frame
+-        runCatching { manager.addView(frame, lp) }.onFailure { root = null; stopSelf() }
++        // Hidden (GONE + NOT_TOUCHABLE) until the page reports something visible.
++        frame.visibility = android.view.View.GONE
++        if (!Overlays.add(manager, "dsh-widget", frame, lp)) { root = null; stopSelf() }
+     }
+ 
+     override fun onDestroy() {
+         running = false
+         runCatching { web?.destroy() }; web = null
+-        root?.let { v -> runCatching { wm?.removeView(v) } }; root = null
++        root?.let { v -> Overlays.remove(wm, v) }; root = null
++        Overlays.removeAll("dsh-widget")
+         super.onDestroy()
+     }
++
+ }
++
++/** Union of the visible elements' boxes (CSS px), reported once a second. */
++private const val MEASURE_JS = """(function(){if(window.__minesMeasure)return;window.__minesMeasure=1;
++function m(){var L=1e9,T=1e9,R=-1,B=-1,W=innerWidth,H=innerHeight;var a=document.body?document.body.getElementsByTagName('*'):[];
++for(var i=0;i<a.length;i++){var e=a[i];var tg=e.tagName;if(tg=='SCRIPT'||tg=='STYLE'||tg=='TEXTAREA'&&e.id=='mines-composer')continue;
++var cs=getComputedStyle(e);if(cs.display=='none'||cs.visibility=='hidden'||parseFloat(cs.opacity)<0.05)continue;
++var leaf=!e.children.length||tg=='svg'||tg=='CANVAS'||tg=='IMG'||tg=='VIDEO'||tg=='BUTTON';
++var bg=cs.backgroundColor&&cs.backgroundColor!='rgba(0, 0, 0, 0)'&&cs.backgroundColor!='transparent'||cs.backgroundImage!='none';
++if(!leaf&&!bg)continue;var r=e.getBoundingClientRect();if(r.width<2||r.height<2)continue;
++if(r.right<=0||r.bottom<=0||r.left>=W||r.top>=H)continue;
++L=Math.min(L,Math.max(0,r.left));T=Math.min(T,Math.max(0,r.top));R=Math.max(R,Math.min(W,r.right));B=Math.max(B,Math.min(H,r.bottom));}
++try{MinesWidget.bounds(L,T,R,B)}catch(x){}}
++m();setInterval(m,1000);})();"""
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt b/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
+index 3709a25..bcf7390 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
+@@ -65,8 +65,9 @@ class GeminiLive(
+             "再用 phone_do 一次执行多步（如 \"tap 3; type 5 你好; key enter\"），打开应用用 phone_open_app。" +
+             "每步做完告诉用户结果。付款、转账、下单、发送消息之前，必须先用一句话口头确认，用户明确说确认后才带 confirmed=true 执行。"
+         private const val TAG = "GeminiLive"
+-        private const val URL =
++        const val WS_URL =
+             "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
++        /** Checked against ai.google.dev/gemini-api/docs/live-api/get-started-websocket (2026-09-15). */
+         const val DEFAULT_MODEL = "gemini-3.8-live"
+         const val DEFAULT_PROMPT =
+             "你是 Mines，用户的私人助手。用户视力不好，请用简短、口语化的中文回答，一次只说一件事。"
+@@ -88,9 +89,21 @@ class GeminiLive(
+     val level: StateFlow<Float> = _level.asStateFlow()
+     private val _muted = MutableStateFlow(false)
+     val muted: StateFlow<Boolean> = _muted.asStateFlow()
++    /** [Mines-voice-26] Which way the call reaches Gemini (shown on screen). */
++    private val _route = MutableStateFlow("")
++    val route: StateFlow<String> = _route.asStateFlow()
++    /** [Mines-voice-26] The live model really in use (may differ from the setting). */
++    private val _modelInUse = MutableStateFlow(model)
++    val modelInUse: StateFlow<String> = _modelInUse.asStateFlow()
++    @Volatile private var routeSel: GeminiRoute.Route? = null
++    @Volatile private var modelChecked = false
++    /** Off as soon as the cloned voice fails: Gemini's own audio plays again. */
++    @Volatile private var cloneOk = cloneVoice != null
+ 
+     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+-    private val client = OkHttpClient.Builder()
++    private fun wsClient(): OkHttpClient = OkHttpClient.Builder()
++        .proxy(routeSel?.proxy ?: java.net.Proxy.NO_PROXY)
++        .connectTimeout(10, TimeUnit.SECONDS)
+         .pingInterval(20, TimeUnit.SECONDS)
+         .readTimeout(0, TimeUnit.MILLISECONDS)
+         .build()
+@@ -108,6 +121,7 @@ class GeminiLive(
+     // good session, the pending retry, and Gemini's session-resumption handle
+     // so a reconnect continues the same conversation instead of starting over.
+     @Volatile private var retries = 0
++    @Volatile private var modelSwitchTried = false
+     private var retryJob: Job? = null
+     @Volatile private var resumeHandle: String? = null
+     private val maxRetries = 8
+@@ -120,7 +134,7 @@ class GeminiLive(
+     private var speakJob: Job? = null
+ 
+     private fun queueSpeech(frag: String, flush: Boolean = false) {
+-        if (cloneVoice == null) return
++        if (cloneVoice == null || !cloneOk) return
+         synchronized(pendingText) {
+             pendingText.append(frag)
+             while (true) {
+@@ -157,7 +171,13 @@ class GeminiLive(
+                         lastAudioAt = System.currentTimeMillis()
+                         track?.write(b, 0, n)
+                     }
+-                }.onFailure { e -> Log.w(TAG, "clone tts: ${e.message}"); _error.value = "自定义声音出错：${e.message}" }
++                }.onFailure { e ->
++                    // [Mines-voice-26] Never leave the call silent: back to Gemini's own voice.
++                    Log.w(TAG, "clone tts: ${e.message}")
++                    cloneOk = false
++                    dropSpeech()
++                    _error.value = "自定义声音出错，已改回 Gemini 声音：${e.message}"
++                }
+                 if (queued.get() <= 0) {
+                     kotlinx.coroutines.delay(500)
+                     if (queued.get() <= 0 && _phase.value == Phase.SPEAKING) _phase.value = Phase.LISTENING
+@@ -172,6 +192,7 @@ class GeminiLive(
+         retries = 0
+         retryJob?.cancel()
+         _error.value = null
++        routeSel = null
+         connect()
+     }
+ 
+@@ -187,8 +208,39 @@ class GeminiLive(
+         _phase.value = Phase.CONNECTING
+         setupDone = false
+         runCatching { ws?.cancel() }
+-        val req = Request.Builder().url("$URL?key=$apiKey").build()
+-        ws = client.newWebSocket(req, object : WebSocketListener() {
++        if (routeSel == null) {
++            // [Mines-voice-26] Find a route that really reaches Gemini (and the live models) first.
++            scope.launch {
++                val pick = GeminiRoute.pick(appContext, apiKey) { step -> _error.value = step }
++                if (stopped) return@launch
++                if (pick.keyProblem != null) {
++                    _error.value = "Gemini 拒绝了这个 API Key：${pick.keyProblem}\n请在 账号连接 → Gemini 重新填写"
++                    _phase.value = Phase.ERROR; return@launch
++                }
++                val r = pick.route
++                if (r == null) {
++                    _route.value = ""
++                    _error.value = "连不上 Gemini（国内/香港直连会被拦）：\n" + pick.report.joinToString("\n") +
++                        "\n→ 在 设置 → 模型路由与分流 填一个美国等地区出口的代理，或打开覆盖 Mines 的 VPN，再点 重新连接"
++                    _phase.value = Phase.ERROR; return@launch
++                }
++                routeSel = r
++                _route.value = r.label
++                val use = GeminiRoute.chooseModel(model, pick.models)
++                modelChecked = pick.models.isNotEmpty()
++                _modelInUse.value = use
++                _error.value = if (use != model) "模型 $model 不可用，已改用 $use" else null
++                openSocket()
++            }
++            return
++        }
++        openSocket()
++    }
++
++    private fun openSocket() {
++        setupDone = false
++        val req = Request.Builder().url("$WS_URL?key=$apiKey").build()
++        ws = wsClient().newWebSocket(req, object : WebSocketListener() {
+             override fun onOpen(webSocket: WebSocket, response: Response) {
+                 webSocket.send(setupMessage().toString())
+             }
+@@ -201,7 +253,9 @@ class GeminiLive(
+             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                 Log.w(TAG, "ws failure", t)
+                 // A socket we already replaced (reconnect / goAway) is not news.
+-                if (webSocket === ws) onClosed(-1, t.message ?: "网络错误")
++                // [Mines-voice-26] Keep the real reason: HTTP status of a refused handshake, socket error.
++                val why = (response?.let { "HTTP ${it.code} ${it.message} " } ?: "") + GeminiRoute.shortErr(t)
++                if (webSocket === ws) onClosed(-1, why)
+             }
+         })
+     }
+@@ -214,9 +268,22 @@ class GeminiLive(
+             legacySetup = true
+             connect(); return
+         }
++        // [Mines-voice-26] A model the server doesn't take: re-read the list once and switch.
++        if (!setupDone && (reason.contains("not found", true) || reason.contains("not supported", true) && reason.contains("model", true)) && !modelSwitchTried) {
++            modelSwitchTried = true
++            scope.launch {
++                val r = routeSel ?: return@launch
++                val p = GeminiRoute.probe(r, apiKey)
++                val use = GeminiRoute.chooseModel(GeminiLive.DEFAULT_MODEL, p.models.filter { it != _modelInUse.value })
++                _error.value = "服务器说：$reason → 改用 $use"
++                _modelInUse.value = use
++                if (!stopped) openSocket()
++            }
++            return
++        }
+         val keyProblem = reason.contains("API key", true) || code == 1008 && reason.contains("key", true)
+         if (keyProblem) {
+-            _error.value = "Gemini API Key 不对，请在 账号连接 里重新填写"
++            _error.value = "Gemini API Key 不对（服务器：$reason），请在 账号连接 里重新填写"
+             _phase.value = Phase.ERROR
+             return
+         }
+@@ -227,7 +294,9 @@ class GeminiLive(
+         if (retries < maxRetries) {
+             retries++
+             val wait = (1000L shl (retries - 1).coerceAtMost(5)).coerceAtMost(20_000L)
+-            _error.value = "网络断了，正在自动重连（第 $retries 次）…"
++            _error.value = "连接断了，正在自动重连（第 $retries 次）…\n原因：" + reason.ifBlank { "代码 $code" } + (if (_route.value.isNotBlank()) "（线路：${_route.value}）" else "")
++            // After two failures in a row on the same route, look for another route.
++            if (retries >= 2 && !setupDone) routeSel = null
+             _phase.value = Phase.CONNECTING
+             retryJob?.cancel()
+             retryJob = scope.launch {
+@@ -236,6 +305,7 @@ class GeminiLive(
+             }
+             return
+         }
++        modelSwitchTried = false
+         _error.value = when {
+             reason.isNotBlank() -> "连接断开：$reason（已自动重试 $maxRetries 次）"
+             else -> "连接断开（$code），已自动重试 $maxRetries 次"
+@@ -244,7 +314,7 @@ class GeminiLive(
+     }
+ 
+     private fun setupMessage(): JSONObject {
+-        val setup = JSONObject().put("model", "models/$model")
++        val setup = JSONObject().put("model", "models/${_modelInUse.value}")
+         val speech = JSONObject().put("voiceConfig",
+             JSONObject().put("prebuiltVoiceConfig", JSONObject().put("voiceName", voice)))
+         if (legacySetup) {
+@@ -340,7 +410,7 @@ class GeminiLive(
+         if (parts != null) for (i in 0 until parts.length()) {
+             val inline = parts.getJSONObject(i).optJSONObject("inlineData") ?: continue
+             if (!inline.optString("mimeType").startsWith("audio/")) continue
+-            if (cloneVoice != null) continue // muted: the cloned voice speaks the transcript
++            if (cloneOk) continue // the cloned voice speaks the transcript instead (falls back on failure)
+             val pcm = Base64.decode(inline.optString("data"), Base64.DEFAULT)
+             _phase.value = Phase.SPEAKING
+             lastAudioAt = System.currentTimeMillis()
+@@ -348,7 +418,7 @@ class GeminiLive(
+         }
+         if (sc.optBoolean("turnComplete")) {
+             queueSpeech("", flush = true)
+-            if (cloneVoice != null) return
++            if (cloneOk) return
+             scope.launch {
+                 kotlinx.coroutines.delay(600)
+                 if (System.currentTimeMillis() - lastAudioAt > 500 && _phase.value == Phase.SPEAKING) _phase.value = Phase.LISTENING
+@@ -391,10 +461,19 @@ class GeminiLive(
+                 t.play()
+             }
+ 
++        // [Mines-voice-26] The wake-word listener lets go of the mic when the call opens;
++        // wait for it so the call doesn't record silence.
++        val until = System.currentTimeMillis() + 2500
++        while (PetBus.wakeMicHeld.value && System.currentTimeMillis() < until) Thread.sleep(100)
+         val inMin = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+         val rec = AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, 16000,
+             AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(inMin, 3200) * 2)
+         record = rec
++        if (rec.state != AudioRecord.STATE_INITIALIZED) {
++            _error.value = "麦克风打不开（可能被别的应用占用），点 测试语音 看看"
++            _phase.value = Phase.ERROR
++            return
++        }
+         if (AcousticEchoCanceler.isAvailable()) aec = AcousticEchoCanceler.create(rec.audioSessionId)?.apply { enabled = true }
+         if (NoiseSuppressor.isAvailable()) ns = NoiseSuppressor.create(rec.audioSessionId)?.apply { enabled = true }
+         rec.startRecording()
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/GeminiRoute.kt b/src/android/app/src/main/java/com/openminis/app/plus/GeminiRoute.kt
+new file mode 100644
+index 0000000..4c2dc20
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/GeminiRoute.kt
+@@ -0,0 +1,230 @@
++package com.openminis.app.plus
++
++import android.annotation.SuppressLint
++import android.content.Context
++import android.media.AudioFormat
++import android.media.AudioRecord
++import android.media.AudioTrack
++import android.media.MediaRecorder
++import android.util.Log
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.Response
++import okhttp3.WebSocket
++import okhttp3.WebSocketListener
++import org.json.JSONArray
++import org.json.JSONObject
++import java.net.InetSocketAddress
++import java.net.Proxy
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.TimeUnit
++import kotlin.math.sqrt
++
++/**
++ * [Mines-voice-26] How the live call reaches Gemini, and which live model to use.
++ *
++ * Gemini is not reachable from mainland China and refuses Hong Kong
++ * ("User location is not supported"). build-25 always opened the WebSocket
++ * directly (or through whatever the app's ProxySelector said), so from the
++ * user's network the call never connected and the screen only said
++ * "网络断了，正在自动重连". Now every call first probes the REST models list
++ * through each possible route — direct, the 分流 proxy, each configured
++ * upstream (e.g. a US exit), the system proxy, then proxy ports of VPN apps
++ * found on the phone — takes the first route that really answers, shows it on
++ * screen, and reads the list of models that support bidiGenerateContent so a
++ * stale model id falls back to a valid live model.
++ */
++object GeminiRoute {
++    private const val TAG = "GeminiRoute"
++    const val MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000&key="
++
++    data class Route(val label: String, val proxy: Proxy)
++    data class Probe(val route: Route, val ok: Boolean, val note: String, val models: List<String> = emptyList(), val keyProblem: Boolean = false)
++
++    @Volatile private var lastGood: String? = null
++
++    /** The Gemini key: default account under 账号连接 → Gemini, else the plain entry. */
++    fun apiKey(): String? = runCatching { PlusVault.defaultAccount("gemini")?.let { PlusVault.secret(it) } }.getOrNull()
++        ?.takeIf { it.isNotBlank() } ?: PlusVault.secret("gemini")?.takeIf { it.isNotBlank() }
++
++    fun client(route: Route, readMs: Long = 12_000): OkHttpClient = OkHttpClient.Builder()
++        .proxy(route.proxy)
++        .connectTimeout(7, TimeUnit.SECONDS)
++        .readTimeout(readMs, TimeUnit.MILLISECONDS)
++        .callTimeout(if (readMs == 0L) 0 else readMs + 8000, TimeUnit.MILLISECONDS)
++        .build()
++
++    /** Candidate routes, best guess first. Blocking (resolves proxy hosts); IO thread. */
++    fun routes(context: Context?, withDetect: Boolean): List<Route> {
++        val out = ArrayList<Route>()
++        out += Route("直连", Proxy.NO_PROXY)
++        if (SplitProxy.active && SplitProxy.settings.value.hasUpstream)
++            out += Route("分流代理（127.0.0.1:${SplitProxy.PORT}）", Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", SplitProxy.PORT)))
++        SplitProxy.settings.value.all.forEach { u ->
++            runCatching {
++                out += Route("代理 ${u.label.ifBlank { u.host }}:${u.port}",
++                    Proxy(if (u.type == "socks5") Proxy.Type.SOCKS else Proxy.Type.HTTP, InetSocketAddress(u.host, u.port)))
++            }
++        }
++        runCatching {
++            val cm = context?.getSystemService(android.net.ConnectivityManager::class.java)
++            val pi = cm?.defaultProxy
++            if (pi != null && !pi.host.isNullOrBlank() && pi.port > 0 && !(pi.host == "127.0.0.1" && pi.port == SplitProxy.PORT))
++                out += Route("系统代理 ${pi.host}:${pi.port}", Proxy(Proxy.Type.HTTP, InetSocketAddress(pi.host, pi.port)))
++        }
++        if (withDetect && context != null) runCatching {
++            SplitProxy.detect(context).forEach { f ->
++                val u = f.upstream
++                out += Route("${f.source} ${u.host}:${u.port}", Proxy(if (u.type == "socks5") Proxy.Type.SOCKS else Proxy.Type.HTTP, InetSocketAddress(u.host, u.port)))
++            }
++        }
++        val dedup = out.distinctBy { it.proxy.toString() }
++        val lg = lastGood
++        return if (lg == null) dedup else dedup.sortedBy { if (it.label == lg) 0 else 1 }
++    }
++
++    fun probe(route: Route, key: String): Probe = runCatching {
++        client(route, 10_000).newCall(Request.Builder().url(MODELS_URL + key).build()).execute().use { r -> fromResponse(route, r) }
++    }.getOrElse { e -> Probe(route, false, shortErr(e)) }
++
++    private fun fromResponse(route: Route, r: Response): Probe {
++        val body = r.body?.string().orEmpty()
++        if (r.isSuccessful) {
++            val models = runCatching {
++                val a = JSONObject(body).optJSONArray("models") ?: JSONArray()
++                (0 until a.length()).mapNotNull { i ->
++                    val m = a.getJSONObject(i)
++                    val methods = m.optJSONArray("supportedGenerationMethods")
++                    val bidi = methods != null && (0 until methods.length()).any { methods.optString(it) == "bidiGenerateContent" }
++                    if (bidi) m.optString("name").removePrefix("models/") else null
++                }
++            }.getOrDefault(emptyList())
++            return Probe(route, true, "通（${r.code}）", models)
++        }
++        val msg = runCatching { JSONObject(body).optJSONObject("error")?.optString("message") }.getOrNull()?.takeIf { it.isNotBlank() } ?: body.take(160)
++        val keyBad = msg.contains("API key", true) || msg.contains("API_KEY", true) || r.code == 401 ||
++            (r.code == 403 && msg.contains("permission", true) && !msg.contains("location", true))
++        val region = msg.contains("location is not supported", true) || msg.contains("not available in your country", true)
++        return Probe(route, false, when {
++            region -> "这个出口所在地区不支持 Gemini（${r.code}）"
++            keyBad -> "API Key 被拒：$msg"
++            else -> "HTTP ${r.code}：$msg"
++        }, keyProblem = keyBad)
++    }
++
++    fun shortErr(e: Throwable): String {
++        val m = e.message.orEmpty()
++        return when {
++            e is java.net.SocketTimeoutException || m.contains("timeout", true) -> "超时"
++            e is java.net.UnknownHostException -> "域名解析失败"
++            m.contains("refused", true) -> "连接被拒绝"
++            m.contains("reset", true) -> "连接被重置"
++            e is javax.net.ssl.SSLException -> "TLS 失败：${m.take(60)}"
++            else -> (e.javaClass.simpleName + " " + m).take(80)
++        }
++    }
++
++    data class Pick(val route: Route?, val models: List<String>, val report: List<String>, val keyProblem: String? = null)
++
++    /** Tries the routes in order; the VPN-app scan only runs when the quick ones all fail. */
++    fun pick(context: Context?, key: String, onStep: (String) -> Unit = {}): Pick {
++        val report = ArrayList<String>()
++        val tried = HashSet<String>()
++        for (pass in 0..1) {
++            for (r in routes(context, withDetect = pass == 1)) {
++                if (!tried.add(r.proxy.toString())) continue
++                onStep("正在试：${r.label}…")
++                val p = probe(r, key)
++                report += "${if (p.ok) "✓" else "✗"} ${r.label}：${p.note}"
++                if (p.keyProblem) return Pick(null, emptyList(), report, p.note)
++                if (p.ok) { lastGood = r.label; return Pick(r, p.models, report) }
++            }
++        }
++        return Pick(null, emptyList(), report)
++    }
++
++    /** The model to use: the configured one when the server lists it, else a valid live model. */
++    fun chooseModel(wanted: String, live: List<String>): String {
++        if (live.isEmpty() || wanted in live) return wanted
++        return live.firstOrNull { it == GeminiLive.DEFAULT_MODEL }
++            ?: live.filter { it.contains("live") }.maxByOrNull { it }
++            ?: live.first()
++    }
++
++    /**
++     * 「测试语音」: key, every route, model list, a real Live setup handshake,
++     * microphone and speaker. Blocking (≈10–30 s); IO thread. One line per check.
++     */
++    @SuppressLint("MissingPermission")
++    fun diagnose(context: Context, wantedModel: String): List<String> {
++        val out = ArrayList<String>()
++        val key = apiKey()
++        if (key == null) { out += "✗ 没有 Gemini API Key：账号连接 → Gemini 里填写"; return out }
++        out += "✓ API Key：…${key.takeLast(4)}"
++        val pick = pick(context, key)
++        out += pick.report
++        if (pick.keyProblem != null) { out += "→ 去 账号连接 → Gemini 换一个有效的 Key"; return out }
++        val route = pick.route
++        if (route == null) {
++            out += "✗ 所有线路都连不上 Gemini（国内和香港直连都不行）"
++            out += "→ 在 设置 → 模型路由与分流 填一个美国/日本/新加坡出口的代理（HTTP 或 SOCKS5），或打开能覆盖 Mines 的 VPN"
++        } else {
++            out += "✓ 通话将走：${route.label}"
++            val model = chooseModel(wantedModel, pick.models)
++            if (pick.models.isNotEmpty()) out += "· 这个 Key 能用的实时模型：" + pick.models.take(6).joinToString("、")
++            out += if (model == wantedModel) "✓ 模型 $model 可用" else "⚠ 模型 $wantedModel 不在列表里，通话会改用 $model"
++            out += liveHandshake(route, key, model)
++        }
++        // microphone
++        if (androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
++            out += "✗ 没有麦克风权限：打开实时语音时允许麦克风"
++        } else runCatching {
++            val wait = System.currentTimeMillis() + 2500
++            while (PetBus.wakeMicHeld.value && System.currentTimeMillis() < wait) Thread.sleep(100)
++            val min = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
++            val rec = AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, 16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(min, 3200) * 2)
++            if (rec.state != AudioRecord.STATE_INITIALIZED) { rec.release(); out += "✗ 麦克风打不开（被别的应用占用？）"; return@runCatching }
++            rec.startRecording()
++            val buf = ShortArray(1600); var peak = 0.0; val until = System.currentTimeMillis() + 1200
++            while (System.currentTimeMillis() < until) {
++                val n = rec.read(buf, 0, buf.size)
++                if (n > 0) { var s = 0.0; for (i in 0 until n) s += buf[i] * buf[i].toDouble(); peak = maxOf(peak, sqrt(s / n)) }
++            }
++            rec.stop(); rec.release()
++            out += if (peak > 1) "✓ 麦克风正常（音量 ${peak.toInt()}）" else "⚠ 麦克风打开了但没有声音（被占用或静音）"
++        }.onFailure { out += "✗ 麦克风出错：${it.message}" }
++        runCatching {
++            val t = AudioTrack.getMinBufferSize(24000, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
++            out += if (t > 0) "✓ 扬声器输出（24 kHz）可用" else "✗ 扬声器输出初始化失败"
++        }
++        if (PlusVault.extra("gemini", "voice_user") == "1") out += "· 声音：${PlusVault.extra("gemini", "voice")}"
++        if (VoiceClone.speaker(context) != null) out += "· 开着自定义声音（硅基流动）；它出错时会自动改回 Gemini 声音"
++        return out
++    }
++
++    /** Opens a Live WebSocket, sends setup, waits for setupComplete (or the server's reason). */
++    fun liveHandshake(route: Route, key: String, model: String): String {
++        val done = CountDownLatch(1)
++        var result = "✗ Live 握手超时（10 秒没有 setupComplete）"
++        val ws = client(route, 0).newWebSocket(Request.Builder().url(GeminiLive.WS_URL + "?key=" + key).build(), object : WebSocketListener() {
++            override fun onOpen(webSocket: WebSocket, response: Response) {
++                webSocket.send(JSONObject().put("setup", JSONObject().put("model", "models/$model")
++                    .put("responseModalities", JSONArray().put("AUDIO"))).toString())
++            }
++            override fun onMessage(webSocket: WebSocket, text: String) {
++                if (text.contains("setupComplete")) { result = "✓ Live 实时通道握手成功（$model）"; done.countDown() }
++            }
++            override fun onMessage(webSocket: WebSocket, bytes: okio.ByteString) = onMessage(webSocket, bytes.utf8())
++            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
++                result = "✗ 服务器关闭了连接（$code）：${reason.ifBlank { "没有说明" }}"; done.countDown()
++            }
++            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
++                result = "✗ Live 连接失败：" + (response?.let { "HTTP ${it.code} ${it.message} " } ?: "") + shortErr(t); done.countDown()
++            }
++        })
++        done.await(10, TimeUnit.SECONDS)
++        runCatching { ws.close(1000, "test") }
++        Log.i(TAG, "handshake: $result")
++        return result
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MinesJobs.kt b/src/android/app/src/main/java/com/openminis/app/plus/MinesJobs.kt
+index f57f98a..0544098 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/MinesJobs.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/MinesJobs.kt
+@@ -55,6 +55,8 @@ object MinesJobs {
+         val startedAt: Long = System.currentTimeMillis(),
+         val finishedAt: Long = 0L,
+         val timeoutMs: Long = 900_000L,
++        /** [Mines-net-26] Housekeeping job: no pill, no popup, no notification. */
++        val silent: Boolean = false,
+     ) {
+         val ok: Boolean get() = exit == 0
+         val lastLine: String get() = lines.lastOrNull().orEmpty()
+@@ -70,7 +72,7 @@ object MinesJobs {
+     private val callbacks = HashMap<Long, (Int) -> Unit>()
+     @Volatile var appInForeground: Boolean = true
+ 
+-    val running: List<Job> get() = _jobs.value.filter { it.running }
++    val running: List<Job> get() = _jobs.value.filter { it.running && !it.silent }
+ 
+     /** "安装 X" → "已安装 X" etc. */
+     fun successFor(title: String): String = when {
+@@ -89,11 +91,12 @@ object MinesJobs {
+     fun run(
+         context: Context, title: String, command: String,
+         successText: String = successFor(title), timeoutMs: Long = 900_000L,
++        silent: Boolean = false,
+         onDone: (Int) -> Unit = {},
+     ): Long {
+         _jobs.value.firstOrNull { it.running && it.command == command }?.let { return it.id }
+         val app = context.applicationContext
+-        val job = Job(ids.getAndIncrement(), title, command, successText, timeoutMs = timeoutMs)
++        val job = Job(ids.getAndIncrement(), title, command, successText, timeoutMs = timeoutMs, silent = silent)
+         synchronized(callbacks) { callbacks[job.id] = onDone }
+         _jobs.value = (_jobs.value.filter { it.running || System.currentTimeMillis() - it.finishedAt < 120_000 } + job)
+         notifyRunning(app)
+@@ -103,7 +106,7 @@ object MinesJobs {
+ 
+     fun retry(context: Context, job: Job) {
+         val cb = synchronized(callbacks) { callbacks[job.id] } ?: {}
+-        run(context, job.title, job.command, job.successText, job.timeoutMs, cb)
++        run(context, job.title, job.command, job.successText, job.timeoutMs, job.silent, cb)
+     }
+ 
+     private fun update(id: Long, block: (Job) -> Job) {
+@@ -127,7 +130,7 @@ object MinesJobs {
+         withContext(Dispatchers.Main) { runCatching { cb?.invoke(code) } }
+         _finished.tryEmit(done)
+         notifyRunning(app)
+-        if (!appInForeground) notifyFinished(app, done)
++        if (!appInForeground && !done.silent) notifyFinished(app, done)
+     }
+ 
+     /** Runs one sandbox command; the time limit kills PRoot (and with it every process inside). */
+@@ -169,6 +172,8 @@ object MinesJobs {
+         val text = job.lines.joinToString("\n")
+         return when {
+             code == 124 -> "超时了"
++            text.contains("MINES_DEVKIT_FAIL") || text.contains("minis-guard") ->
++                job.lines.lastOrNull { it.startsWith("✗") }?.take(90) ?: "下载卡住或连不上（已自动换源重试过），运行「网络体检」看原因"
+             Regex("ETIMEDOUT|ECONNRESET|EAI_AGAIN|ENOTFOUND|network|socket hang up", RegexOption.IGNORE_CASE).containsMatchIn(text) ->
+                 "网络连不上（检查代理或换个 npm 镜像）"
+             Regex("E404|404 Not Found|is not in this registry", RegexOption.IGNORE_CASE).containsMatchIn(text) -> "找不到这个包"
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Overlays.kt b/src/android/app/src/main/java/com/openminis/app/plus/Overlays.kt
+new file mode 100644
+index 0000000..6e29e13
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/Overlays.kt
+@@ -0,0 +1,107 @@
++package com.openminis.app.plus
++
++import android.util.Log
++import android.view.View
++import android.view.WindowManager
++
++/**
++ * [Mines-pet-26] Every floating window Mines puts on the screen (desk pet,
++ * its bubble / panel / switcher, the plugin-widget overlay) goes through
++ * here, so one set of rules holds for all of them:
++ *
++ *  - a window that shows nothing (GONE / INVISIBLE / fully transparent)
++ *    never takes touches: FLAG_NOT_TOUCHABLE is forced on;
++ *  - hiding a window = GONE + NOT_TOUCHABLE, never "invisible but there";
++ *  - [audit] lists leftovers: windows still registered whose view is no
++ *    longer attached, or that are hidden yet touchable. The desk pet runs
++ *    it after every drag and on destroy and removes what it finds.
++ *
++ * build-25 bug this guards against: the widget overlay was a fixed
++ * 300×380 dp window with a transparent WebView; after the pet moved away
++ * the window (with its 「⋯ 挂件」 handle) stayed where it was and its empty
++ * area swallowed every touch.
++ *
++ * CI checks that no other file calls WindowManager.addView directly.
++ */
++object Overlays {
++    private const val TAG = "Overlays"
++
++    private class Entry(val owner: String, val view: View, val lp: WindowManager.LayoutParams, val wm: WindowManager)
++    private val live = ArrayList<Entry>()
++
++    private fun harden(view: View, lp: WindowManager.LayoutParams) {
++        val showsNothing = view.visibility != View.VISIBLE || view.alpha <= 0.01f
++        lp.flags = if (showsNothing) lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
++        else lp.flags
++    }
++
++    @Synchronized
++    fun add(wm: WindowManager, owner: String, view: View, lp: WindowManager.LayoutParams): Boolean {
++        harden(view, lp)
++        return runCatching { wm.addView(view, lp) }.onSuccess { live += Entry(owner, view, lp, wm) }
++            .onFailure { Log.w(TAG, "add $owner failed: ${it.message}") }.isSuccess
++    }
++
++    @Synchronized
++    fun update(wm: WindowManager?, view: View?, lp: WindowManager.LayoutParams?) {
++        if (wm == null || view == null || lp == null) return
++        harden(view, lp)
++        runCatching { wm.updateViewLayout(view, lp) }
++    }
++
++    @Synchronized
++    fun remove(wm: WindowManager?, view: View?) {
++        if (view == null) return
++        live.removeAll { it.view === view }
++        runCatching { (wm ?: return).removeViewImmediate(view) }.onFailure { runCatching { wm?.removeView(view) } }
++    }
++
++    /** Hide without removing: GONE and NOT_TOUCHABLE; show restores the caller's flags. */
++    @Synchronized
++    fun setHidden(wm: WindowManager?, view: View?, lp: WindowManager.LayoutParams?, hidden: Boolean, touchableWhenShown: Boolean = true) {
++        if (wm == null || view == null || lp == null) return
++        view.visibility = if (hidden) View.GONE else View.VISIBLE
++        lp.flags = if (hidden || !touchableWhenShown) lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
++        else lp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
++        runCatching { wm.updateViewLayout(view, lp) }
++    }
++
++    /** Problems found, one line each (empty = clean). */
++    @Synchronized
++    fun audit(): List<String> = live.mapNotNull { e ->
++        val touchable = e.lp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE == 0
++        when {
++            !e.view.isAttachedToWindow -> "${e.owner}: registered but not attached (leftover)"
++            touchable && (e.view.visibility != View.VISIBLE || e.view.alpha <= 0.01f) -> "${e.owner}: hidden but takes touches"
++            touchable && (e.lp.width == 0 || e.lp.height == 0) -> "${e.owner}: zero-size touchable window"
++            else -> null
++        }
++    }
++
++    /** Fix what [audit] finds: drop dead entries, make hidden ones untouchable. */
++    @Synchronized
++    fun repair(): Int {
++        var n = 0
++        val it = live.iterator()
++        while (it.hasNext()) {
++            val e = it.next()
++            if (!e.view.isAttachedToWindow) { it.remove(); n++; continue }
++            val touchable = e.lp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE == 0
++            if (touchable && (e.view.visibility != View.VISIBLE || e.view.alpha <= 0.01f)) {
++                e.lp.flags = e.lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
++                runCatching { e.wm.updateViewLayout(e.view, e.lp) }; n++
++            }
++        }
++        if (n > 0) Log.w(TAG, "repaired $n overlay window(s)")
++        return n
++    }
++
++    @Synchronized
++    fun removeAll(owner: String) {
++        live.filter { it.owner == owner }.forEach { e -> runCatching { e.wm.removeViewImmediate(e.view) } }
++        live.removeAll { it.owner == owner }
++    }
++
++    @Synchronized
++    fun count(owner: String? = null): Int = live.count { owner == null || it.owner == owner }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PetStatus.kt b/src/android/app/src/main/java/com/openminis/app/plus/PetStatus.kt
+index 0379cab..9ae2a7f 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/PetStatus.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/PetStatus.kt
+@@ -18,6 +18,8 @@ object PetBus {
+     val inCall = MutableStateFlow(false)
+     /** The wake word was heard (pet waves, then the voice screen opens). */
+     val wake = MutableStateFlow(0L)
++    /** [Mines-voice-26] The wake-word listener currently holds the microphone. */
++    val wakeMicHeld = MutableStateFlow(false)
+ }
+ 
+ /**
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SandboxNet.kt b/src/android/app/src/main/java/com/openminis/app/plus/SandboxNet.kt
+new file mode 100644
+index 0000000..b54b096
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/SandboxNet.kt
+@@ -0,0 +1,271 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import android.content.SharedPreferences
++import android.net.ConnectivityManager
++import android.net.NetworkCapabilities
++import android.util.Log
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.launch
++import java.io.File
++import java.net.Inet6Address
++import java.net.InetSocketAddress
++import java.net.Proxy
++import java.net.Socket
++
++/**
++ * [Mines-net-26] Sandbox networking: which proxy the sandbox gets, the CA
++ * bundle, package-mirror auto-selection, the phone-side facts minis-doctor
++ * prints, and the one-tap developer toolkit.
++ *
++ * Root cause this fixes (build-21…25): with 分流代理 on, every sandbox process
++ * got http(s)_proxy=127.0.0.1:7899 — even when that port was not listening —
++ * and the proxy's 自动 mode decided "direct" from a bare TCP connect. From
++ * mainland China dl-cdn.alpinelinux.org / pypi.org / files.pythonhosted.org
++ * accept TCP and then stall or reset TLS, so 自动 picked 直连 for exactly the
++ * hosts that need a proxy, and the tunnel had no timeout: apk (which has no
++ * network timeout of its own) waited forever, pip ended in SSL errors. The
++ * fresh Mines rootfs also never got a domestic mirror (the old app's rootfs
++ * had one picked on its first boot; upstream skips the switch whenever the
++ * official CDN answers its HEAD test first, and wrote pip's mirror to
++ * /etc/pip/pip.conf, a file pip never reads).
++ */
++object SandboxNet {
++    private const val TAG = "SandboxNet"
++    private const val FILE = "mines_sandbox_net"
++    const val CA_PATH = "/etc/ssl/minis-ca.pem"
++
++    enum class ProxyMode(val label: String) { AUTO("自动"), OFF("不用代理") }
++
++    /** Domestic mirrors and CN sites: never through a proxy. */
++    val DIRECT_SUFFIXES = listOf(
++        ".aliyun.com", ".aliyuncs.com", ".alicdn.com", ".tsinghua.edu.cn", ".ustc.edu.cn", ".npmmirror.com",
++        ".huaweicloud.com", ".tencent.com", ".tencentyun.com", ".goproxy.cn", ".rsproxy.cn", ".cn",
++    )
++
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++    @Volatile private var prefs: SharedPreferences? = null
++    private val _mode = MutableStateFlow(ProxyMode.AUTO)
++    val mode: StateFlow<ProxyMode> = _mode.asStateFlow()
++    private val _status = MutableStateFlow("")
++    /** One line: where sandbox traffic goes now (shown under the toggle). */
++    val status: StateFlow<String> = _status.asStateFlow()
++    @Volatile private var proxySource = "none"
++    @Volatile private var mirrorJob: Job? = null
++    @Volatile private var lastMirrorKick = 0L
++
++    fun init(context: Context) {
++        if (prefs != null) return
++        val p = context.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
++        prefs = p
++        _mode.value = runCatching { ProxyMode.valueOf(p.getString("proxy_mode", "AUTO")!!) }.getOrDefault(ProxyMode.AUTO)
++    }
++
++    fun setMode(context: Context, m: ProxyMode) {
++        init(context)
++        _mode.value = m
++        prefs?.edit()?.putString("proxy_mode", m.name)?.apply()
++        scope.launch { runCatching { com.openminis.app.sandbox.ExecutionCoordinator.broadcastProxyChange() } }
++    }
++
++    fun noProxy(): String = (listOf("localhost", "127.0.0.1", "::1") + DIRECT_SUFFIXES).joinToString(",")
++
++    /** Does anything accept a TCP connection at host:port within [ms]? */
++    fun reachable(host: String, port: Int, ms: Int = 1200): Boolean = runCatching {
++        Socket(Proxy.NO_PROXY).use { it.connect(InetSocketAddress(host, port), ms) }
++        true
++    }.getOrDefault(false)
++
++    private fun block(url: String): Map<String, String> {
++        val np = if (url.isNotEmpty()) noProxy() else ""
++        return linkedMapOf(
++            "http_proxy" to url, "https_proxy" to url, "HTTP_PROXY" to url, "HTTPS_PROXY" to url,
++            "no_proxy" to np, "NO_PROXY" to np, "MINES_PROXY_SOURCE" to proxySource,
++        )
++    }
++
++    /**
++     * The proxy env block for every sandbox process (PRootKernel.systemProxyEnv).
++     * A proxy is exported only after it answered: the split proxy only while
++     * its port is really listening, the system proxy only after a TCP check.
++     * Blocking for at most ~1.2 s; called on IO threads.
++     */
++    fun proxyEnv(context: Context, systemProxyUri: String): Map<String, String> {
++        init(context)
++        if (_mode.value == ProxyMode.OFF) {
++            proxySource = "off"; _status.value = "沙箱不用代理，全部直连（软件源自动选国内镜像）"
++            return block("")
++        }
++        SplitProxy.sandboxEnv()?.let { env ->
++            proxySource = "split"
++            val up = SplitProxy.settings.value.hasUpstream
++            _status.value = if (up) "走分流代理 127.0.0.1:${SplitProxy.PORT}（国内源直连，境外源走你的代理；代理坏了自动直连）"
++            else "走分流代理 127.0.0.1:${SplitProxy.PORT}，但没填代理服务器：境外源会直连"
++            return env + ("MINES_PROXY_SOURCE" to proxySource) + ("no_proxy" to noProxy()) + ("NO_PROXY" to noProxy())
++        }
++        if (SplitProxy.settings.value.enabled && SplitProxy.settings.value.forSandbox && !SplitProxy.running.value) {
++            Log.w(TAG, "split proxy is on but not listening — not exporting it")
++        }
++        if (systemProxyUri.isNotEmpty()) {
++            val hp = systemProxyUri.substringAfter("://").substringAfter('@').substringBefore('/')
++            val host = hp.substringBeforeLast(':').removePrefix("[").removeSuffix("]")
++            val port = hp.substringAfterLast(':').toIntOrNull() ?: 80
++            return if (reachable(host, port)) {
++                proxySource = "system"; _status.value = "走系统代理 $hp（国内源直连）"
++                block(systemProxyUri)
++            } else {
++                proxySource = "system-dead"; _status.value = "系统代理 $hp 连不上，沙箱已改为直连"
++                Log.w(TAG, "system proxy $hp unreachable — sandbox goes direct")
++                block("")
++            }
++        }
++        proxySource = "none"; _status.value = "直连（没有可用的代理；软件源自动选最快的）"
++        return block("")
++    }
++
++    /**
++     * Boot step (after the default_mount overlay): builds /etc/ssl/minis-ca.pem
++     * (Mozilla bundle fetched at build time + the rootfs bundle + anything in
++     * /usr/local/share/ca-certificates) and returns the env from
++     * /etc/minis/net.env. CA variables are dropped when no bundle was built.
++     */
++    fun prepareRootfs(context: Context, rootfs: File): Map<String, String> {
++        init(context)
++        val out = linkedMapOf<String, String>()
++        var caOk = false
++        runCatching {
++            val sb = StringBuilder()
++            File(rootfs, "etc/ssl/minis-mozilla.pem").takeIf { it.isFile }?.let { sb.append(it.readText()).append('\n') }
++            File(rootfs, "etc/ssl/certs/ca-certificates.crt").takeIf { it.isFile }?.let { sb.append(it.readText()).append('\n') }
++            File(rootfs, "usr/local/share/ca-certificates").listFiles()?.filter { it.name.endsWith(".crt") || it.name.endsWith(".pem") }
++                ?.forEach { sb.append(it.readText()).append('\n') }
++            if (sb.contains("BEGIN CERTIFICATE")) {
++                val f = File(rootfs, CA_PATH.removePrefix("/"))
++                val text = sb.toString()
++                if (!f.isFile || f.length() != text.toByteArray().size.toLong()) {
++                    f.parentFile?.mkdirs(); f.writeText(text)
++                }
++                caOk = true
++            }
++        }.onFailure { Log.w(TAG, "CA bundle: ${it.message}") }
++        runCatching {
++            File(rootfs, "etc/minis/net.env").takeIf { it.isFile }?.readLines()?.forEach { line ->
++                val l = line.trim()
++                if (l.isEmpty() || l.startsWith("#") || !l.contains('=')) return@forEach
++                val k = l.substringBefore('=').trim(); val v = l.substringAfter('=').trim()
++                if (!caOk && v == CA_PATH) return@forEach
++                out[k] = v
++            }
++        }
++        writeNetState(context, rootfs)
++        return out
++    }
++
++    /** Phone-side facts for minis-doctor + the signature minis-mirror re-probes on. */
++    fun writeNetState(context: Context, rootfs: File? = null) {
++        runCatching {
++            val root = rootfs ?: File(context.applicationContext.filesDir, "alpine-rootfs")
++            if (!root.isDirectory) return
++            val cm = context.getSystemService(ConnectivityManager::class.java) ?: return
++            val net = cm.activeNetwork
++            val caps = net?.let { cm.getNetworkCapabilities(it) }
++            val lp = net?.let { cm.getLinkProperties(it) }
++            val vpn = caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
++            val transport = when {
++                caps == null -> "无网络"
++                vpn -> "VPN"
++                caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "Wi-Fi"
++                caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "移动数据"
++                caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "有线"
++                else -> "其它"
++            }
++            val dns = lp?.dnsServers?.mapNotNull { it.hostAddress }?.joinToString(" ").orEmpty()
++            val v6 = lp?.linkAddresses?.any { it.address is Inet6Address && !it.address.isLinkLocalAddress } == true
++            val sig = "$transport|$vpn|${lp?.interfaceName}|$dns|${SplitProxy.settings.value.enabled}|${_mode.value}".hashCode().toUInt().toString(16)
++            val text = "vpn=${if (vpn) 1 else 0}\ntransport=$transport\ndns=$dns\nipv6=${if (v6) 1 else 0}\nproxy_source=$proxySource\nsig=$sig\nupdated=${System.currentTimeMillis() / 1000}\n"
++            val f = File(root, "etc/minis/net.state")
++            f.parentFile?.mkdirs()
++            val tmp = File(f.parentFile, "net.state.tmp"); tmp.writeText(text)
++            if (!tmp.renameTo(f)) { f.writeText(text); tmp.delete() }
++        }.onFailure { Log.w(TAG, "net.state: ${it.message}") }
++    }
++
++    /** Categories the user pinned in Settings → mirrors (left alone by minis-mirror). */
++    private fun pinned(context: Context): String = runCatching {
++        val vm = com.openminis.app.ui.sandbox.MirrorSpeedTestViewModel
++        vm.ensureLoaded(context)
++        buildList {
++            if (vm.isActive(com.openminis.app.ui.sandbox.MirrorCategory.ALPINE)) add("apk")
++            if (vm.isActive(com.openminis.app.ui.sandbox.MirrorCategory.PIP)) add("pip")
++            if (vm.isActive(com.openminis.app.ui.sandbox.MirrorCategory.NPM)) add("npm")
++        }.joinToString(" ")
++    }.getOrDefault("")
++
++    /**
++     * Network changed / boot: re-probe mirrors from inside the sandbox (the
++     * real path apk and pip will use) when the network signature changed.
++     * Silent background job, debounced, at most every 2 minutes.
++     */
++    fun kickMirrors(context: Context, delayMs: Long = 15_000) {
++        val app = context.applicationContext
++        if (System.currentTimeMillis() - lastMirrorKick < 120_000 && mirrorJob?.isActive == true) return
++        mirrorJob?.cancel()
++        mirrorJob = scope.launch {
++            delay(delayMs)
++            writeNetState(app)
++            lastMirrorKick = System.currentTimeMillis()
++            val skip = pinned(app)
++            val cmd = (if (skip.isNotEmpty()) "MINIS_MIRROR_SKIP='$skip' " else "") + "minis-mirror auto-if-changed apk pip npm --quiet"
++            MinesJobs.run(app, "选择软件源", cmd, successText = "软件源已选好", timeoutMs = 120_000, silent = true)
++        }
++    }
++
++    // ── one-tap actions (Settings → 沙箱与防杀) ─────────────────────────
++
++    fun runDoctor(context: Context, onDone: (Int) -> Unit = {}): Long =
++        MinesJobs.run(context, "网络体检", "minis-doctor", successText = "体检完成", timeoutMs = 240_000, onDone = onDone)
++
++    fun reselectMirrors(context: Context): Long {
++        val skip = pinned(context)
++        return MinesJobs.run(context, "切换软件源",
++            (if (skip.isNotEmpty()) "MINIS_MIRROR_SKIP='$skip' " else "") + "minis-mirror auto apk pip npm",
++            successText = "已换到最快的软件源", timeoutMs = 180_000)
++    }
++
++    fun installDevKit(context: Context, withJava: Boolean = true, onDone: (Int) -> Unit = {}): Long =
++        MinesJobs.run(context, "安装 开发工具包", "minis-devkit install" + if (withJava) "" else " --no-java",
++            successText = "开发工具包装好了（gcc、Python、Node、Git、Java）", timeoutMs = 45 * 60_000L, onDone = onDone)
++
++    /** Same kit on a VPS (in-app SSH, no sandbox ssh needed). Blocking; IO thread. */
++    fun installDevKitOnVps(context: Context, server: VpsServer): Pair<Boolean, String> = runCatching {
++        val script = DEVKIT_VPS
++        val (r, _) = VpsSsh.run(context, server, "sh -c '" + script.replace("'", "'\\''") + "' 2>&1 | tail -n 40", timeoutMs = 40 * 60_000L, attempts = 1)
++        (r.exit == 0 && r.output.contains("MINES_DEVKIT_OK")) to r.output.trim().lines().takeLast(12).joinToString("\n")
++    }.getOrElse { false to (VpsSsh.reason(it)) }
++
++    /** Kept identical to `minis-devkit vps-command`. */
++    private const val DEVKIT_VPS = "set -e; if command -v apt-get >/dev/null 2>&1; then S=\"\"; [ \"\$(id -u)\" = 0 ] || S=sudo; \$S env DEBIAN_FRONTEND=noninteractive apt-get update -q && \$S env DEBIAN_FRONTEND=noninteractive apt-get install -y -q build-essential python3 python3-pip nodejs npm git openjdk-17-jdk-headless; elif command -v dnf >/dev/null 2>&1; then dnf install -y gcc gcc-c++ make python3 python3-pip nodejs npm git java-17-openjdk-devel; elif command -v yum >/dev/null 2>&1; then yum install -y gcc gcc-c++ make python3 python3-pip nodejs npm git java-17-openjdk-devel; elif command -v apk >/dev/null 2>&1; then apk add build-base python3 py3-pip nodejs npm git openjdk17-jdk; else echo \"unknown distro\"; exit 2; fi; gcc --version | head -1; python3 --version; node --version; git --version; java -version 2>&1 | head -1; echo MINES_DEVKIT_OK"
++
++    /** Current mirrors as "apk 阿里云 · pip 清华 · npm npmmirror" (reads the rootfs). */
++    fun mirrorSummary(context: Context): String = runCatching {
++        val root = File(context.applicationContext.filesDir, "alpine-rootfs")
++        val repo = File(root, "etc/apk/repositories").takeIf { it.isFile }?.readLines()?.firstOrNull { it.contains("/main") }.orEmpty()
++        val pip = File(root, "etc/pip.conf").takeIf { it.isFile }?.readLines()?.firstOrNull { it.startsWith("index-url") }?.substringAfter('=')?.trim().orEmpty()
++        val npm = File(root, "root/.npmrc").takeIf { it.isFile }?.readLines()?.firstOrNull { it.startsWith("registry=") }?.substringAfter('=').orEmpty()
++        fun name(u: String) = when {
++            u.isBlank() -> "默认"
++            "dl-cdn.alpinelinux" in u || "pypi.org" in u || "registry.npmjs" in u -> "官方"
++            "aliyun" in u -> "阿里云"; "tuna" in u -> "清华"; "ustc" in u -> "中科大"; "npmmirror" in u -> "npmmirror"
++            else -> "自定义"
++        }
++        "apk ${name(repo)} · pip ${name(pip)} · npm ${name(npm)}"
++    }.getOrDefault("")
++
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt b/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt
+index 1f24f28..2897258 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt
+@@ -167,17 +167,63 @@ object SplitProxy {
+ 
+     // ── routing decisions ──────────────────────────────────────────────
+ 
+-    fun ruleFor(host: String): Mode {
++    fun ruleFor(host: String): Mode = userRuleFor(host) ?: when {
++        builtinDirect(host) -> Mode.DIRECT
++        else -> _settings.value.defaultMode
++    }
++
++    private fun matches(h: String, pattern: String): Boolean {
++        val p = pattern.lowercase().trim().removePrefix("*")
++        return if (p.startsWith(".")) h.endsWith(p) || h == p.removePrefix(".") else h == p || h.endsWith(".$p")
++    }
++
++    /** The user's own rule for this host (longest match), or null. */
++    private fun userRuleFor(host: String): Mode? {
+         val h = host.lowercase().trimEnd('.')
+         var best: Rule? = null
+         for (r in _settings.value.rules) {
+-            val p = r.pattern.lowercase().trim().removePrefix("*")
+-            val match = if (p.startsWith(".")) h.endsWith(p) || h == p.removePrefix(".") else h == p || h.endsWith(".$p")
+-            if (match && (best == null || p.length > best.pattern.length)) best = r
++            if (matches(h, r.pattern) && (best == null || r.pattern.length > best.pattern.length)) best = r
+         }
+-        return best?.mode ?: _settings.value.defaultMode
++        return best?.mode
++    }
++
++    // [Mines-net-26] Built-in routing for package sources, below the user's rules.
++    /** Domestic mirrors / CN sites: always direct. */
++    private fun builtinDirect(host: String): Boolean {
++        val h = host.lowercase().trimEnd('.')
++        return SandboxNet.DIRECT_SUFFIXES.any { matches(h, it) }
++    }
++
++    /**
++     * Foreign package/code hosts that accept TCP from mainland China and then
++     * stall or reset TLS. In 自动 they go through a healthy proxy when one is
++     * configured instead of being judged by a TCP connect.
++     */
++    private val FOREIGN_DEV = listOf(
++        "pypi.org", "pythonhosted.org", "alpinelinux.org", "npmjs.org", "npmjs.com", "yarnpkg.com", "nodejs.org",
++        "github.com", "githubusercontent.com", "githubassets.com", "ghcr.io", "docker.io", "docker.com",
++        "crates.io", "golang.org", "go.dev", "rustup.rs", "rust-lang.org", "huggingface.co", "gradle.org", "maven.org",
++        "googleapis.com", "google.com", "gstatic.com",
++    )
++    private fun builtinForeign(host: String): Boolean {
++        val h = host.lowercase().trimEnd('.')
++        return FOREIGN_DEV.any { matches(h, it) }
+     }
+ 
++    /**
++     * 自动: is the direct path really usable? For 443 a full TLS handshake
++     * (with SNI and certificate check), because a bare TCP connect succeeds
++     * even where the TLS handshake is reset or stalls.
++     */
++    private fun directUsable(host: String, port: Int): Boolean = runCatching {
++        val raw = direct(host, port, 2500)
++        if (port != 443) { raw.close(); return@runCatching true }
++        raw.soTimeout = 4000
++        val f = javax.net.ssl.SSLSocketFactory.getDefault() as javax.net.ssl.SSLSocketFactory
++        (f.createSocket(raw, host, port, true) as javax.net.ssl.SSLSocket).use { it.startHandshake() }
++        true
++    }.getOrDefault(false)
++
+     private fun isLocal(host: String): Boolean {
+         val h = host.lowercase()
+         if (h == "localhost" || h == "127.0.0.1" || h == "::1" || h.endsWith(".local")) return true
+@@ -209,6 +255,8 @@ object SplitProxy {
+     fun sandboxEnv(): Map<String, String>? {
+         val s = _settings.value
+         if (!s.enabled || !s.forSandbox) return null
++        // [Mines-net-26] Never point the sandbox at a port nobody listens on.
++        if (!_running.value || server?.isClosed != false) return null
+         val url = "http://127.0.0.1:$PORT"
+         return linkedMapOf(
+             "http_proxy" to url, "https_proxy" to url, "HTTP_PROXY" to url, "HTTPS_PROXY" to url,
+@@ -276,6 +324,7 @@ object SplitProxy {
+ 
+     /** One upstream: open a tunnel to a well-known HTTPS host through it. */
+     fun check(u: Upstream, target: String = "www.gstatic.com"): Health {
++        // (a tunnel to www.gstatic.com:443 proves the proxy really forwards to the outside)
+         val t0 = System.currentTimeMillis()
+         return runCatching {
+             viaUpstream(u, target, 443, tunnel = true, timeout = 5000).close()
+@@ -294,19 +343,23 @@ object SplitProxy {
+         _current.value = pick.key
+     }
+ 
+-    /** The upstream to use now: the current healthy one, else the primary. */
++    /**
++     * [Mines-net-26] The upstream to use now, or null when every configured
++     * proxy is known to be down: traffic then goes direct instead of into a
++     * dead proxy. Unchecked proxies count as usable until the first check.
++     */
+     private fun activeUpstream(s: Settings): Upstream? {
+         val ups = s.all
+         if (ups.isEmpty()) return null
+-        if (!s.autoSwitch) return ups.first()
++        val h = _health.value
++        fun alive(u: Upstream) = h[u.key]?.ok != false
++        if (!s.autoSwitch) return ups.first().takeIf { alive(it) }
+         val key = _current.value
+-        return ups.firstOrNull { it.key == key } ?: ups.first()
++        return ups.firstOrNull { it.key == key && alive(it) } ?: ups.firstOrNull { alive(it) }
+     }
+ 
+     /** Marks a failed upstream and moves to the next one right away. */
+     private fun markFailed(u: Upstream, e: Throwable) {
+-        val s = _settings.value
+-        if (!s.autoSwitch || s.all.size < 2) return
+         _health.value = _health.value + (u.key to Health(false, null, System.currentTimeMillis(), e.message))
+         pickCurrent()
+     }
+@@ -418,10 +471,10 @@ object SplitProxy {
+                     val u = runCatching { URI(target) }.getOrNull() ?: return
+                     (u.host ?: return) to (if (u.port > 0) u.port else 80)
+                 }
+-                val upstream = open(host, port, method.equals("CONNECT", true)) ?: run {
++                val leg = open(host, port, method.equals("CONNECT", true)) ?: run {
+                     c.getOutputStream().write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n".toByteArray()); return
+                 }
+-                upstream.use { up ->
++                leg.sock.use { up ->
+                     val uo = up.getOutputStream()
+                     if (method.equals("CONNECT", true)) {
+                         c.getOutputStream().write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray())
+@@ -435,12 +488,22 @@ object SplitProxy {
+                         uo.write(rewritten.toByteArray(Charsets.ISO_8859_1))
+                     }
+                     uo.flush()
+-                    up.soTimeout = 0; c.soTimeout = 0
+-                    val t = Thread({ pipe(up.getInputStream(), c.getOutputStream()); runCatching { c.shutdownOutput() } }, "split-proxy-down")
++                    // [Mines-net-26] No more endless tunnels: both legs read with a
++                    // short timeout and the tunnel closes after IDLE_MS without a byte
++                    // in either direction, so a stalled download ends with an error.
++                    up.soTimeout = 15_000; c.soTimeout = 15_000
++                    val act = Activity()
++                    val t = Thread({ pipe(up.getInputStream(), c.getOutputStream(), act, act.down); runCatching { c.shutdownOutput() } }, "split-proxy-down")
+                     t.isDaemon = true; t.start()
+-                    pipe(inp, uo)
++                    pipe(inp, uo, act, act.up)
+                     runCatching { up.shutdownOutput() }
+-                    t.join(120_000)
++                    t.join(IDLE_MS)
++                    // 自动 picked direct but almost nothing came back (reset / stalled
++                    // TLS): use the proxy for this host next time.
++                    if (leg.autoDirect && act.up.get() > 0 && (act.down.get() < 1024 || act.idled)) {
++                        autoCache[host] = true to System.currentTimeMillis()
++                        record(host, "自动→直连不通，下次走代理")
++                    }
+                 }
+             }
+         }
+@@ -449,45 +512,81 @@ object SplitProxy {
+     private val tags = java.util.Collections.synchronizedMap(java.util.WeakHashMap<Socket, String>())
+     private fun Socket.getTag(): String? = tags[this]
+ 
+-    private fun pipe(i: InputStream, o: OutputStream) {
++    private const val IDLE_MS = 180_000L
++
++    private class Activity {
++        @Volatile var last = System.currentTimeMillis()
++        @Volatile var idled = false
++        val up = java.util.concurrent.atomic.AtomicLong()
++        val down = java.util.concurrent.atomic.AtomicLong()
++    }
++
++    private fun pipe(i: InputStream, o: OutputStream, act: Activity, counter: java.util.concurrent.atomic.AtomicLong) {
+         val b = ByteArray(16 * 1024)
+-        try { while (true) { val n = i.read(b); if (n < 0) break; o.write(b, 0, n); o.flush() } } catch (_: IOException) {}
++        try {
++            while (true) {
++                val n = try { i.read(b) } catch (_: java.net.SocketTimeoutException) {
++                    if (System.currentTimeMillis() - act.last > IDLE_MS) { act.idled = true; break } else continue
++                }
++                if (n < 0) break
++                o.write(b, 0, n); o.flush()
++                act.last = System.currentTimeMillis(); counter.addAndGet(n.toLong())
++            }
++        } catch (_: IOException) {}
+     }
+ 
+     /** Opens the outbound leg according to the rules. */
+-    private fun open(host: String, port: Int, tunnel: Boolean): Socket? {
++    private class Leg(val sock: Socket, val autoDirect: Boolean)
++
++    private fun open(host: String, port: Int, tunnel: Boolean): Leg? {
+         val s = _settings.value
+         val mode = if (isLocal(host)) Mode.DIRECT else ruleFor(host)
++        // [Mines-net-26] Only a proxy that is alive counts; a dead one means direct.
++        val alive = activeUpstream(s)
++        var autoDirect = false
+         val useProxy = when (mode) {
+             Mode.DIRECT -> false
+-            Mode.PROXY -> s.hasUpstream
+-            Mode.AUTO -> {
+-                val cached = autoCache[host]?.takeIf { System.currentTimeMillis() - it.second < AUTO_TTL_MS }
+-                if (cached != null) cached.first && s.hasUpstream
+-                else {
+-                    val d = runCatching { direct(host, port, 2500) }.getOrNull()
+-                    if (d != null) { autoCache[host] = false to System.currentTimeMillis(); record(host, "自动→直连"); return d }
+-                    autoCache[host] = true to System.currentTimeMillis()
+-                    s.hasUpstream
++            Mode.PROXY -> alive != null
++            Mode.AUTO -> when {
++                alive == null -> false
++                builtinForeign(host) -> true
++                else -> {
++                    val cached = autoCache[host]?.takeIf { System.currentTimeMillis() - it.second < AUTO_TTL_MS }
++                    if (cached != null) cached.first
++                    else {
++                        val ok = directUsable(host, port)
++                        autoCache[host] = !ok to System.currentTimeMillis()
++                        !ok
++                    }
+                 }
+             }
+         }
++        if (mode == Mode.AUTO && !useProxy) autoDirect = alive != null
+         return runCatching {
+             if (!useProxy) {
+-                record(host, if (mode == Mode.PROXY) "代理（未设置服务器，改直连）" else "${mode.label}→直连")
+-                direct(host, port, 10_000)
++                record(host, when {
++                    mode == Mode.DIRECT -> "直连"
++                    !s.hasUpstream -> "${mode.label}→直连（未设置代理服务器）"
++                    alive == null -> "${mode.label}→直连（代理连不上）"
++                    else -> "${mode.label}→直连"
++                })
++                Leg(direct(host, port, 10_000), autoDirect)
+             } else {
+-                val u = activeUpstream(s) ?: return@runCatching direct(host, port, 10_000)
++                val u = alive ?: return@runCatching Leg(direct(host, port, 10_000), false)
+                 record(host, "${mode.label}→代理 ${u.host}:${u.port}")
+                 try {
+-                    viaUpstream(u, host, port, tunnel)
++                    Leg(viaUpstream(u, host, port, tunnel), false)
+                 } catch (e: Exception) {
+-                    // Fail over to the next healthy proxy for this request too.
++                    // Fail over to the next healthy proxy, or direct when none is left.
+                     markFailed(u, e)
+                     val next = activeUpstream(_settings.value)
+-                    if (next == null || next.key == u.key) throw e
+-                    record(host, "${mode.label}→备用代理 ${next.host}:${next.port}")
+-                    viaUpstream(next, host, port, tunnel)
++                    if (next == null || next.key == u.key) {
++                        record(host, "${mode.label}→代理 ${u.host}:${u.port} 失败，改直连")
++                        Leg(direct(host, port, 10_000), false)
++                    } else {
++                        record(host, "${mode.label}→备用代理 ${next.host}:${next.port}")
++                        Leg(viaUpstream(next, host, port, tunnel), false)
++                    }
+                 }
+             }
+         }.getOrNull()
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/WakeWordService.kt b/src/android/app/src/main/java/com/openminis/app/plus/WakeWordService.kt
+index 316e083..768d78e 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/WakeWordService.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/WakeWordService.kt
+@@ -128,6 +128,7 @@ class WakeWordService : Service() {
+                 val buf = ByteArray(3200)
+                 try {
+                     rec.startRecording()
++                    PetBus.wakeMicHeld.value = true
+                     while (scope.isActive && !PetBus.inCall.value) {
+                         val n = rec.read(buf, 0, buf.size)
+                         if (n <= 0) { delay(50); continue }
+@@ -147,6 +148,7 @@ class WakeWordService : Service() {
+                     }
+                 } finally {
+                     runCatching { rec.stop() }; rec.release(); recognizer.close()
++                    PetBus.wakeMicHeld.value = false
+                 }
+                 delay(800)
+             }
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/NetIfacePublisher.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/NetIfacePublisher.kt
+index eae9a02..a65e54e 100644
+--- a/src/android/app/src/main/java/com/openminis/app/sandbox/NetIfacePublisher.kt
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/NetIfacePublisher.kt
+@@ -6,6 +6,7 @@ import android.net.LinkProperties
+ import android.net.Network
+ import android.util.Log
+ import java.io.File
++import kotlinx.coroutines.launch
+ import java.net.Inet4Address
+ import java.net.Inet6Address
+ 
+@@ -52,6 +53,15 @@ object NetIfacePublisher {
+                 // LinkProperties; writing the same content twice is harmless.
+                 override fun onAvailable(network: Network) {
+                     write(target, cm.getLinkProperties(network))
++                    // [Mines-net-26] New network (Wi-Fi ↔ mobile, VPN on/off): refresh
++                    // what minis-doctor reports, re-check the proxy, re-pick mirrors.
++                    runCatching {
++                        com.openminis.app.plus.SandboxNet.writeNetState(app)
++                        com.openminis.app.plus.SandboxNet.kickMirrors(app)
++                        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
++                            runCatching { ExecutionCoordinator.broadcastProxyChange() }
++                        }
++                    }
+                 }
+ 
+                 override fun onCapabilitiesChanged(network: Network, caps: android.net.NetworkCapabilities) {
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/PRootKernel.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/PRootKernel.kt
+index 75b0cf3..6a06549 100644
+--- a/src/android/app/src/main/java/com/openminis/app/sandbox/PRootKernel.kt
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/PRootKernel.kt
+@@ -209,6 +209,12 @@ object PRootKernel {
+         // proxy toggles without a restart.
+         customEnvironment.putAll(systemProxyEnv(context))
+ 
++        // [Mines-net-26] CA bundle + timeouts (etc/minis/net.env), phone network facts
++        // for minis-doctor, and a background mirror pick from inside the sandbox.
++        runCatching { customEnvironment.putAll(com.openminis.app.plus.SandboxNet.prepareRootfs(context, rootfsManager.rootfsDir)) }
++            .onFailure { Log.w(TAG, "SandboxNet.prepareRootfs failed: ${it.message}") }
++        runCatching { com.openminis.app.plus.SandboxNet.kickMirrors(context, 8_000) }
++
+         // [T-android-fake-netlink-real-ifaces] Let proot's fake netlink report
+         // the phone's real interfaces instead of loopback only.
+         NetIfacePublisher.start(context)
+@@ -631,8 +637,9 @@ object PRootKernel {
+      *   proxy unset → values are empty, tools fall back to direct connection
+      */
+     fun systemProxyEnv(context: Context): Map<String, String> {
+-        // [Mines] The split proxy (分流), when on, takes over the sandbox's proxy.
+-        com.openminis.app.plus.SplitProxy.sandboxEnv()?.let { return it }
++        // [Mines-net-26] SandboxNet decides: 分流代理 (only while it listens), the
++        // system proxy (only after a TCP health check), or direct; plus the
++        // user's 沙箱代理 toggle. CN mirrors are always in no_proxy.
+         val proxyUri = try {
+             val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+             val info = cm?.defaultProxy
+@@ -646,14 +653,17 @@ object PRootKernel {
+             ""
+         }
+ 
+-        val out = linkedMapOf<String, String>()
+-        for (key in PROXY_KEYS) {
+-            out[key] = when (key) {
+-                "no_proxy", "NO_PROXY" -> if (proxyUri.isNotEmpty()) PROXY_NO_PROXY else ""
+-                else -> proxyUri
++        return runCatching { com.openminis.app.plus.SandboxNet.proxyEnv(context, proxyUri) }.getOrElse {
++            Log.w(TAG, "SandboxNet.proxyEnv failed: ${it.message}")
++            val out = linkedMapOf<String, String>()
++            for (key in PROXY_KEYS) {
++                out[key] = when (key) {
++                    "no_proxy", "NO_PROXY" -> if (proxyUri.isNotEmpty()) PROXY_NO_PROXY else ""
++                    else -> proxyUri
++                }
+             }
++            out
+         }
+-        return out
+     }
+ 
+     /**
+diff --git a/src/android/app/src/main/java/com/openminis/app/tools/AgentTools.kt b/src/android/app/src/main/java/com/openminis/app/tools/AgentTools.kt
+index 50b27f6..95382d5 100644
+--- a/src/android/app/src/main/java/com/openminis/app/tools/AgentTools.kt
++++ b/src/android/app/src/main/java/com/openminis/app/tools/AgentTools.kt
+@@ -118,7 +118,12 @@ object AgentTools {
+         description = "Execute a command in an isolated Linux process (Alpine Linux via PRoot). " +
+             "The command runs via /bin/sh -c with stdout and stderr merged. " +
+             "Each invocation spawns a fresh process — there is no shared terminal session. " +
+-            "Default timeout is 15 minutes.",
++            "Default timeout is 15 minutes. " +
++            // [Mines-net-26]
++            "Package installs: apk and pip are wrapped (stalled downloads are stopped, the fastest mirror is re-picked and the command retried once). " +
++            "If an install still fails (hangs, SSL/certificate errors, proxy errors, 'unable to fetch'), run `minis-doctor` FIRST and follow its 怎么修 lines instead of guessing; " +
++            "`minis-mirror auto` re-picks mirrors (apk/pip/npm), `minis-devkit install` installs gcc/g++/make, python3+pip, nodejs/npm, git and openjdk17 in one go. " +
++            "Never set http_proxy/https_proxy yourself; Mines exports a working proxy (or none).",
+         parameters = mapOf(
+             "tool_title" to AgentToolParam("string", "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Install Python data analysis packages', 'List files in home directory'). Use the same language as the user."),
+             "command" to AgentToolParam("string", "The shell command to execute. Supports multi-line commands directly — no special escaping needed. Keep under 1000 chars; for longer scripts, write to a file with file_write first, then run it."),
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesJobsHost.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesJobsHost.kt
+index f0ebc2d..0304392 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesJobsHost.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesJobsHost.kt
+@@ -69,11 +69,11 @@ fun MinesJobsHost() {
+         onDispose { owner.lifecycle.removeObserver(obs) }
+     }
+     val jobs by MinesJobs.jobs.collectAsState()
+-    val running = jobs.filter { it.running }
++    val running = jobs.filter { it.running && !it.silent }
+     var expanded by remember { mutableStateOf(false) }
+     var toast by remember { mutableStateOf<MinesJobs.Job?>(null) }
+     var details by remember { mutableStateOf(false) }
+-    LaunchedEffect(Unit) { MinesJobs.finished.collect { toast = it; details = false } }
++    LaunchedEffect(Unit) { MinesJobs.finished.collect { if (!it.silent) { toast = it; details = false } } }
+     LaunchedEffect(toast, details) {
+         val t = toast ?: return@LaunchedEffect
+         if (details) return@LaunchedEffect
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt
+index 2a608b2..2f21e6a 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt
+@@ -151,7 +151,7 @@ private fun SplitProxySection() {
+         }
+     }
+     ProxyAutoSection()
+-    PlusSection("没写规则的网站", footer = "自动 = 先直连，连不上再走代理，并记住 30 分钟。") {
++    PlusSection("没写规则的网站", footer = "自动 = 国内网站和国内软件源直连；pypi、npm、GitHub、Alpine 这类境外源有可用代理时直接走代理；其它网站先试直连（含 TLS 握手），不通再走代理，记住 30 分钟。代理连不上时一律直连，不会卡在坏代理上。") {
+         Row(Modifier.padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+             SplitProxy.Mode.entries.forEach { m ->
+                 FilterChip(selected = s.defaultMode == m, onClick = { SplitProxy.update(ctx) { it.copy(defaultMode = m) } }, label = { Text(m.label) })
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxNetSection.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxNetSection.kt
+new file mode 100644
+index 0000000..ff83ed6
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxNetSection.kt
+@@ -0,0 +1,132 @@
++package com.openminis.app.ui.plus
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.verticalScroll
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.outlined.Build
++import androidx.compose.material.icons.outlined.HealthAndSafety
++import androidx.compose.material.icons.outlined.Speed
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.FilterChip
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.text.font.FontFamily
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import androidx.compose.ui.platform.LocalContext
++import com.openminis.app.plus.MinesJobs
++import com.openminis.app.plus.PlusPrefs
++import com.openminis.app.plus.SandboxNet
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++
++/**
++ * [Mines-net-26] 沙箱网络与开发工具: proxy toggle with the live decision,
++ * current mirrors + re-pick, 网络体检 (minis-doctor, full report in a dialog),
++ * and the one-tap 开发工具包 with a VPS fallback when the phone can't do it.
++ */
++@Composable
++fun SandboxNetSection() {
++    val ctx = LocalContext.current
++    val scope = rememberCoroutineScope()
++    SandboxNet.init(ctx)
++    val mode by SandboxNet.mode.collectAsState()
++    val status by SandboxNet.status.collectAsState()
++    val jobs by MinesJobs.jobs.collectAsState()
++    var mirrors by remember { mutableStateOf("") }
++    var doctorId by remember { mutableStateOf(-1L) }
++    var devkitId by remember { mutableStateOf(-1L) }
++    var report by remember { mutableStateOf<String?>(null) }
++    var offerVps by remember { mutableStateOf(false) }
++    var vpsResult by remember { mutableStateOf<String?>(null) }
++    var vpsBusy by remember { mutableStateOf(false) }
++    LaunchedEffect(jobs) {
++        mirrors = withContext(Dispatchers.IO) { SandboxNet.mirrorSummary(ctx) }
++        jobs.firstOrNull { it.id == doctorId && !it.running }?.let { j ->
++            report = j.lines.filter { it != "MINES_DOCTOR_OK" && it != "MINES_DOCTOR_PROBLEMS" }.joinToString("\n"); doctorId = -1
++        }
++        jobs.firstOrNull { it.id == devkitId && !it.running }?.let { j ->
++            devkitId = -1
++            if (!j.ok && PlusPrefs.state.value.servers.any { it.enabled }) offerVps = true
++        }
++    }
++
++    PlusSection("沙箱网络", footer = status.ifBlank { null }) {
++        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically,
++            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++            Text("沙箱代理", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
++            SandboxNet.ProxyMode.entries.forEach { m ->
++                FilterChip(selected = mode == m, onClick = { SandboxNet.setMode(ctx, m) }, label = { Text(m.label) })
++            }
++        }
++        PlusDivider()
++        ActionRow(Icons.Outlined.Speed, "软件源：" + mirrors.ifBlank { "还没选" } + "　· 重新测速") { SandboxNet.reselectMirrors(ctx) }
++        PlusDivider()
++        ActionRow(Icons.Outlined.HealthAndSafety, if (doctorId >= 0) "网络体检中…" else "网络体检（装不上东西时点这里）") {
++            if (doctorId < 0) doctorId = SandboxNet.runDoctor(ctx)
++        }
++    }
++    PlusSection("开发工具包", footer = "一键装 gcc / g++ / make、Python + pip、Node + npm、Git、Java 17（约 300–400 MB）。在后台装，装完弹窗告诉你；手机上装不了时可以改在 VPS 上装。") {
++        ActionRow(Icons.Outlined.Build, if (devkitId >= 0) "正在安装开发工具包…" else "一键安装开发工具包") {
++            if (devkitId < 0) devkitId = SandboxNet.installDevKit(ctx)
++        }
++    }
++
++    report?.let { r ->
++        AlertDialog(
++            onDismissRequest = { report = null },
++            title = { Text("网络体检结果") },
++            text = {
++                Column(Modifier.heightIn(max = 460.dp).verticalScroll(rememberScrollState())) {
++                    Text(r, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
++                }
++            },
++            confirmButton = { TextButton(onClick = { report = null }) { Text("好") } },
++            dismissButton = { TextButton(onClick = { report = null; SandboxNet.reselectMirrors(ctx) }) { Text("重新选软件源") } },
++        )
++    }
++    if (offerVps) {
++        val server = PlusPrefs.state.value.servers.firstOrNull { it.enabled && it.lastLatencyMs >= 0 } ?: PlusPrefs.state.value.servers.firstOrNull { it.enabled }
++        AlertDialog(
++            onDismissRequest = { offerVps = false },
++            title = { Text("手机上没装好") },
++            text = { Text("要改在服务器「${server?.name ?: "VPS"}」上安装同样的工具吗？以后编译类任务可以在 工作位置 选 VPS 来跑。") },
++            confirmButton = {
++                TextButton(enabled = server != null && !vpsBusy, onClick = {
++                    val srv = server ?: return@TextButton
++                    offerVps = false; vpsBusy = true
++                    scope.launch {
++                        val (ok, out) = withContext(Dispatchers.IO) { SandboxNet.installDevKitOnVps(ctx, srv) }
++                        vpsBusy = false
++                        vpsResult = (if (ok) "✓ 已在 ${srv.name} 上装好\n\n" else "✗ 在 ${srv.name} 上也没装好\n\n") + out
++                    }
++                }) { Text("在 VPS 上装") }
++            },
++            dismissButton = { TextButton(onClick = { offerVps = false }) { Text("不用") } },
++        )
++    }
++    if (vpsBusy) Text("正在服务器上安装开发工具包（可能要几分钟）…", modifier = Modifier.padding(16.dp), style = MaterialTheme.typography.bodyMedium)
++    vpsResult?.let { r ->
++        AlertDialog(onDismissRequest = { vpsResult = null }, title = { Text("VPS 安装结果") },
++            text = { Column(Modifier.heightIn(max = 400.dp).verticalScroll(rememberScrollState())) { Text(r, fontFamily = FontFamily.Monospace, fontSize = 12.sp) } },
++            confirmButton = { TextButton(onClick = { vpsResult = null }) { Text("好") } })
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxScreen.kt
+index 8592139..b1b0b86 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxScreen.kt
+@@ -114,6 +114,8 @@ fun SandboxScreen(onBack: () -> Unit) {
+             }
+         }
+ 
++        SandboxNetSection()
++
+         PlusSection(null, footer = "浏览器、Node、Python 这类进程闲置 10 分钟（没用 CPU）就自动关掉。") {
+             Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                 Text("自动清理闲置进程", Modifier.weight(1f))
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
+index 606e3a5..99d4264 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
+@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.Spacer
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.heightIn
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.layout.size
+ import androidx.compose.foundation.lazy.LazyColumn
+@@ -45,6 +46,7 @@ import androidx.compose.runtime.DisposableEffect
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.collectAsState
+ import androidx.compose.runtime.getValue
++import kotlinx.coroutines.launch
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.setValue
+@@ -69,7 +71,21 @@ import com.openminis.app.plus.PlusVault
+ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+     val context = LocalContext.current
+     PlusVault.init(context)
+-    val key = remember { PlusVault.secret("gemini") }
++    // [Mines-voice-26] Default account under 账号连接 → Gemini first, then the plain entry.
++    val key = remember { com.openminis.app.plus.GeminiRoute.apiKey() }
++    var diag by remember { mutableStateOf<List<String>?>(null) }
++    var diagBusy by remember { mutableStateOf(false) }
++    val diagScope = androidx.compose.runtime.rememberCoroutineScope()
++    fun runDiag() {
++        if (diagBusy) return
++        diagBusy = true
++        diagScope.launch {
++            val r = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
++                com.openminis.app.plus.GeminiRoute.diagnose(context.applicationContext, PlusVault.extra("gemini", "model") ?: GeminiLive.DEFAULT_MODEL)
++            }
++            diagBusy = false; diag = r
++        }
++    }
+     var hasMic by remember {
+         mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
+     }
+@@ -116,6 +132,19 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+         else if (live != null && !hasMic) askMic.launch(Manifest.permission.RECORD_AUDIO)
+     }
+ 
++    diag?.let { d ->
++        androidx.compose.material3.AlertDialog(
++            onDismissRequest = { diag = null },
++            title = { Text("语音测试结果") },
++            text = {
++                Column(Modifier.heightIn(max = 460.dp).verticalScroll(androidx.compose.foundation.rememberScrollState())) {
++                    d.forEach { Text(it, fontSize = 14.sp, modifier = Modifier.padding(vertical = 2.dp)) }
++                }
++            },
++            confirmButton = { androidx.compose.material3.TextButton(onClick = { diag = null; live?.start() }) { Text("重新连接") } },
++            dismissButton = { androidx.compose.material3.TextButton(onClick = { diag = null }) { Text("关闭") } },
++        )
++    }
+     if (showSettings) VoiceSettingsSheet(onDismiss = { showSettings = false }, onChanged = { live?.stop(); settingsVersion++ })
+     Scaffold(
+         containerColor = Color(0xFF0E1320),
+@@ -126,6 +155,9 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+                     IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回", tint = Color.White) }
+                 },
+                 actions = {
++                    androidx.compose.material3.TextButton(onClick = { runDiag() }) {
++                        Text(if (diagBusy) "测试中…" else "测试语音", color = Color.White)
++                    }
+                     IconButton(onClick = { showSettings = true }) {
+                         Icon(Icons.Filled.Settings, "语音设置", tint = Color.White)
+                     }
+@@ -149,6 +181,8 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+             val muted by live.muted.collectAsState()
+             val error by live.error.collectAsState()
+             val lines by live.lines.collectAsState()
++            val route by live.route.collectAsState()
++            val modelInUse by live.modelInUse.collectAsState()
+ 
+             Spacer(Modifier.height(24.dp))
+             Orb(phase, level)
+@@ -166,9 +200,23 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+                 textAlign = TextAlign.Center,
+                 modifier = Modifier.padding(horizontal = 24.dp),
+             )
++            // [Mines-voice-26] Connection status: route + model, always visible.
++            Text(
++                (if (route.isNotBlank()) "线路：$route" else if (phase == GeminiLive.Phase.CONNECTING) "正在找能连上 Gemini 的线路…" else "线路：未连接") +
++                    "  ·  模型：$modelInUse",
++                color = Color(0xFFB8C2D6), fontSize = 13.sp, textAlign = TextAlign.Center,
++                modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp),
++            )
++            if (phase != GeminiLive.Phase.ERROR && phase != GeminiLive.Phase.CONNECTING && !error.isNullOrBlank()) {
++                Text(error ?: "", color = Color(0xFFFFC46B), fontSize = 13.sp, textAlign = TextAlign.Center,
++                    modifier = Modifier.padding(horizontal = 24.dp))
++            }
+             if (phase == GeminiLive.Phase.ERROR) {
+                 Spacer(Modifier.height(12.dp))
+-                Button(onClick = { live.start() }) { Text("重新连接") }
++                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
++                    Button(onClick = { live.start() }) { Text("重新连接") }
++                    androidx.compose.material3.OutlinedButton(onClick = { runDiag() }) { Text(if (diagBusy) "测试中…" else "测试语音", color = Color.White) }
++                }
+             }
+ 
+             val listState = rememberLazyListState()
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/sandbox/MirrorSettingsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/sandbox/MirrorSettingsScreen.kt
+index bbe31aa..f51134f 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/sandbox/MirrorSettingsScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/sandbox/MirrorSettingsScreen.kt
+@@ -85,7 +85,8 @@ enum class MirrorCategory(
+     val configPath: String,
+ ) {
+     ALPINE("alpine", "Alpine APK", "etc/apk/repositories"),
+-    PIP("pip", "Python pip", "etc/pip/pip.conf"),
++    // [Mines-net-26] pip reads /etc/pip.conf (and /etc/xdg/pip/pip.conf), never /etc/pip/pip.conf.
++    PIP("pip", "Python pip", "etc/pip.conf"),
+     NPM("npm", "Node.js npm", "root/.npmrc");
+ 
+     val icon: ImageVector
+@@ -393,8 +394,11 @@ object MirrorSpeedTestViewModel {
+         val p = prefs(context)
+         if (!p.getBoolean("rootfs.freshInstall", false)) return
+         p.edit().remove("rootfs.freshInstall").apply()
+-        Log.i(TAG, "Fresh rootfs detected — running auto mirror detection")
+-
++        Log.i(TAG, "Fresh rootfs detected — mirrors are picked by minis-mirror inside the sandbox")
++        // [Mines-net-26] Mines picks mirrors from inside the sandbox (SandboxNet.kickMirrors →
++        // minis-mirror), which tests the path apk/pip really use. The old app-side HEAD test
++        // kept the official CDN whenever it answered first, even where downloads then stall.
++        if (true) return
+         scope.launch {
+             // Reuse the normal test flow, then await its completion via currentJob.
+             runAllTests(context)
+@@ -452,8 +456,10 @@ object MirrorSpeedTestViewModel {
+                 break-system-packages = true
+                 index-url = ${mirror.baseURL}
+                 trusted-host = $host
++                timeout = 20
++                retries = 3
+ 
+-                """.trimIndent()
++                """.trimIndent() + (if (File(dataDir, "etc/ssl/minis-ca.pem").isFile) "cert = /etc/ssl/minis-ca.pem\n" else "")
+             }
+             MirrorCategory.NPM -> "registry=${mirror.baseURL}\n"
+         }

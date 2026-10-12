@@ -59,6 +59,45 @@ jobs:
           done
           echo "::error::DSH self-test failed"; exit 1
 
+      - name: Overlay window audit (no leftover / touch-eating floating windows)
+        # [Mines-pet-26] Every floating window must go through plus/Overlays.kt, which forces
+        # NOT_TOUCHABLE on windows that show nothing and tracks them for cleanup.
+        run: |
+          cd om/src/android/app/src/main/java/com/openminis/app
+          if grep -rnE '(manager|wm|windowManager)\??\.addView\(' --include=*.kt plus ui | grep -v 'plus/Overlays.kt'; then
+            echo "::error::floating window added without Overlays.add"; exit 1; fi
+          grep -q 'Overlays.removeAll("dsh-widget")' plus/DshWidgets.kt || { echo "::error::widget overlay cleanup missing"; exit 1; }
+          grep -q 'Overlays.removeAll(it)' plus/DeskPetService.kt || { echo "::error::pet overlay cleanup missing"; exit 1; }
+          echo "overlay audit ok"
+
+      - name: Fresh Mozilla CA bundle for the sandbox
+        # [Mines-net-26] Shipped as /etc/ssl/minis-mozilla.pem; SandboxNet merges it with the
+        # rootfs bundle into /etc/ssl/minis-ca.pem (SSL_CERT_FILE / REQUESTS_CA_BUNDLE / PIP_CERT).
+        run: |
+          d=om/src/android/app/src/main/assets/default_mount/etc/ssl
+          mkdir -p "$d"
+          curl -fsSL --retry 3 https://curl.se/ca/cacert.pem -o "$d/minis-mozilla.pem"
+          n=$(grep -c 'BEGIN CERTIFICATE' "$d/minis-mozilla.pem"); echo "certs: $n"
+          [ "$n" -gt 100 ] || { echo "::error::CA bundle download looks wrong"; exit 1; }
+
+      - uses: docker/setup-qemu-action@v3
+        with: { platforms: arm64 }
+
+      - name: Sandbox network self-test (app rootfs + app env; blocks the build)
+        # [Mines-net-26] Boots the same Alpine minirootfs the APK ships (aarch64 via qemu)
+        # with the app's overlay/env/mirror logic and runs apk add gcc, pip download
+        # requests, a stalled-mirror recovery, a dead-proxy run and minis-doctor.
+        run: |
+          ver=$(sed -n 's/^ALPINE_RELEASE="\(.*\)"/\1/p' om/scripts/prepare_android_sandbox.sh); mv=${ver%.*}
+          echo "Alpine $ver"
+          curl -fsSL --retry 3 -o rootfs.tgz "https://dl-cdn.alpinelinux.org/alpine/v$mv/releases/aarch64/alpine-minirootfs-$ver-aarch64.tar.gz"
+          docker import --platform linux/arm64 rootfs.tgz mines-rootfs:test
+          timeout 2400 docker run --rm --platform linux/arm64 \
+            -v "$PWD/om/src/android/app/src/main/assets/default_mount:/mnt/dm:ro" \
+            -v "$PWD/hark-build/sandbox-net-selftest.sh:/selftest.sh:ro" \
+            mines-rootfs:test /bin/sh /selftest.sh 2>&1 | tee sandbox-net.txt
+          grep -q SANDBOX_NET_SELFTEST_OK sandbox-net.txt || { echo "::error::sandbox network self-test failed"; exit 1; }
+
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: "21" }
 
