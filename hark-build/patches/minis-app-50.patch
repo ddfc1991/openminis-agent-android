@@ -1,0 +1,3275 @@
+diff --git a/src/android/app/src/main/AndroidManifest.xml b/src/android/app/src/main/AndroidManifest.xml
+index 65a055c..86531b5 100644
+--- a/src/android/app/src/main/AndroidManifest.xml
++++ b/src/android/app/src/main/AndroidManifest.xml
+@@ -108,10 +108,22 @@
+          is normal-protection and isn't actually granted; AXManager only
+          checks that we *requested* it. -->
+     <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
++    <!-- [Mines-launch-29] The agent opens apps by package or name
++         (android-a11y-cli open, voice phone_open_app). Under Android 11+
++         package visibility getLaunchIntentForPackage() returned null for every
++         third-party app, so `open` failed for all of them. Sideloaded build,
++         so the broad permission is fine; the LAUNCHER <queries> entry below
++         covers it as well. -->
++    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" tools:ignore="QueryAllPackagesPermission" />
+ 
+     <!-- Package visibility for speech recognition services + Custom Tabs
+          (Android 11+ scoped queries). -->
+     <queries>
++        <!-- [Mines-launch-29] every launchable app -->
++        <intent>
++            <action android:name="android.intent.action.MAIN" />
++            <category android:name="android.intent.category.LAUNCHER" />
++        </intent>
+         <!-- Mines: launch the earlier Mines install for data migration. -->
+         <package android:name="com.openminis.mines" />
+         <intent>
+@@ -590,6 +602,11 @@
+ 
+         <!-- FileProvider for sharing exported JSON (provider config, etc.)
+              to other apps. Paths exposed are under app-scoped cache. -->
++        <!-- [Mines-selftest-29] adb-only (uid 2000/0, checked in code) hook for the CI smoke test. -->
++        <provider
++            android:name="com.openminis.app.plus.SelfTestProvider"
++            android:authorities="${applicationId}.selftest"
++            android:exported="true" />
+         <provider
+             android:name="androidx.core.content.FileProvider"
+             android:authorities="${applicationId}.fileprovider"
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/am b/src/android/app/src/main/assets/default_mount/usr/local/bin/am
+new file mode 100755
+index 0000000..ef7b6c9
+--- /dev/null
++++ b/src/android/app/src/main/assets/default_mount/usr/local/bin/am
+@@ -0,0 +1,4 @@
++#!/bin/sh
++# [Mines-shizuku-29] Android's am, run through Shizuku (shell uid). If Shizuku
++# is not authorized yet, android-shizuku-cli shows its one-tap allow dialog.
++exec android-shizuku-cli rawexec am "$@"
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/apk b/src/android/app/src/main/assets/default_mount/usr/local/bin/apk
+index a1ffb21..b4f7a5d 100755
+--- a/src/android/app/src/main/assets/default_mount/usr/local/bin/apk
++++ b/src/android/app/src/main/assets/default_mount/usr/local/bin/apk
+@@ -18,13 +18,61 @@ done
+ [ "$net" = 1 ] && [ "${MINIS_GUARD:-1}" != 0 ] || exec "$REAL" "$@"
+ . /usr/local/lib/minis-net/common.sh
+ minis_check_proxy
++# [Mines-apk-29] huaweicloud's Alpine mirror stalls for minutes on many
++# networks (tuna/aliyun are ~40x faster): never keep it.
++grep -q huaweicloud /etc/apk/repositories 2>/dev/null && mines-mirror auto apk >&2
+ minis_mirrors_once apk pip npm
++
++# [Mines-apk-29] Self-heal helpers.
++#  - a name that failed to install can stay in /etc/apk/world and then every
++#    later apk add/upgrade fails with "unable to select packages": drop it;
++#  - after `apk cache clean` a stale index makes apk read missing files:
++#    retry once with --no-cache;
++#  - `apk info` can say INSTALLED while the files are gone (interrupted
++#    extraction): after add, check the files and reinstall when missing.
++heal_world() {
++    local names n
++    names=$(sed -n 's/^ *\([A-Za-z0-9._+-][A-Za-z0-9._+-]*\) (no such package).*/\1/p; s/^ *\([A-Za-z0-9._+-][A-Za-z0-9._+-]*\)[<>=~].*(no such package).*/\1/p' "$1" | sort -u)
++    [ -n "$names" ] || return 1
++    cp /etc/apk/world /etc/apk/world.minis-bak 2>/dev/null
++    for n in $names; do
++        grep -qx "$n" /etc/apk/world 2>/dev/null || continue
++        sed -i "/^$n\$/d" /etc/apk/world
++        echo "↻ 从 /etc/apk/world 删掉装不上的「$n」（它让 apk 每次都失败）" >&2
++    done
++    return 0
++}
++verify_added() {
++    local a f miss
++    for a in "$@"; do
++        case $a in -*|add|*=*|*'>'*|*'<'*|*~*) continue ;; esac
++        miss=0
++        for f in $("$REAL" info -L -q "$a" 2>/dev/null | head -40); do
++            [ -e "/$f" ] || { miss=1; break; }
++        done
++        if [ "$miss" = 1 ]; then
++            echo "↻ $a 显示已安装但文件缺失，正在重装…" >&2
++            "$REAL" fix -r "$a" >&2 || "$REAL" add --no-cache --force-overwrite "$a" >&2
++        fi
++    done
++}
+ STALL=${MINIS_APK_STALL:-60}
+ log=$(mktemp)
+ trap 'rm -f "$log"' EXIT
+ minis_run_logged "$log" mines-guard apk "$STALL" "${MINIS_APK_TOTAL:-0}" -- "$REAL" "$@"
+ rc=$?
+-[ "$rc" = 0 ] && exit 0
++[ "$rc" = 0 ] && { [ "$1" = add ] && verify_added "$@"; exit 0; }
++if grep -q "unable to select packages" "$log" && heal_world "$log"; then
++    minis_run_logged "$log" mines-guard apk "$STALL" "${MINIS_APK_TOTAL:-0}" -- "$REAL" "$@"
++    rc=$?
++    [ "$rc" = 0 ] && { [ "$1" = add ] && verify_added "$@"; exit 0; }
++fi
++if grep -qiE 'No such file or directory|unable to read database|BAD signature|UNTRUSTED signature|bad archive' "$log" && ! echo " $* " | grep -q -- ' --no-cache '; then
++    echo "↻ 本地缓存的索引坏了，用 --no-cache 重试…" >&2
++    minis_run_logged "$log" mines-guard apk "$STALL" "${MINIS_APK_TOTAL:-0}" -- "$REAL" --no-cache "$@"
++    rc=$?
++    [ "$rc" = 0 ] && { [ "$1" = add ] && verify_added "$@"; exit 0; }
++fi
+ if [ "$rc" = 124 ] || grep -qiE 'network error|temporary error|timed out|timeout|unable to (fetch|connect)|connection (refused|reset)|could not resolve|DNS lookup|Permission denied|certificate|SSL|No such host|Broken pipe|bad gateway|I/O error' "$log"; then
+     echo "↻ 软件源连不上或卡住了，正在重新测速换源…" >&2
+     if mines-mirror auto apk >&2; then
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/cmd b/src/android/app/src/main/assets/default_mount/usr/local/bin/cmd
+new file mode 100755
+index 0000000..e825056
+--- /dev/null
++++ b/src/android/app/src/main/assets/default_mount/usr/local/bin/cmd
+@@ -0,0 +1,4 @@
++#!/bin/sh
++# [Mines-shizuku-29] Android's cmd, run through Shizuku (shell uid). If Shizuku
++# is not authorized yet, android-shizuku-cli shows its one-tap allow dialog.
++exec android-shizuku-cli rawexec cmd "$@"
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/dumpsys b/src/android/app/src/main/assets/default_mount/usr/local/bin/dumpsys
+new file mode 100755
+index 0000000..a4eacf8
+--- /dev/null
++++ b/src/android/app/src/main/assets/default_mount/usr/local/bin/dumpsys
+@@ -0,0 +1,4 @@
++#!/bin/sh
++# [Mines-shizuku-29] Android's dumpsys, run through Shizuku (shell uid). If Shizuku
++# is not authorized yet, android-shizuku-cli shows its one-tap allow dialog.
++exec android-shizuku-cli rawexec dumpsys "$@"
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/input b/src/android/app/src/main/assets/default_mount/usr/local/bin/input
+new file mode 100755
+index 0000000..685ad3e
+--- /dev/null
++++ b/src/android/app/src/main/assets/default_mount/usr/local/bin/input
+@@ -0,0 +1,4 @@
++#!/bin/sh
++# [Mines-shizuku-29] Android's input, run through Shizuku (shell uid). If Shizuku
++# is not authorized yet, android-shizuku-cli shows its one-tap allow dialog.
++exec android-shizuku-cli rawexec input "$@"
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/mines-doctor b/src/android/app/src/main/assets/default_mount/usr/local/bin/mines-doctor
+index 374c013..d4155af 100755
+--- a/src/android/app/src/main/assets/default_mount/usr/local/bin/mines-doctor
++++ b/src/android/app/src/main/assets/default_mount/usr/local/bin/mines-doctor
+@@ -1,7 +1,12 @@
+ #!/bin/sh
+ # [Mines-net-26] mines-doctor — why can't the sandbox install anything?
+ #
+-#   mines-doctor           full check (about 30 s), ends with what to fix
++#   mines-doctor           full check, ends with what to fix. [Mines-29] Every
++#                          section runs in parallel with its own timeout, and
++#                          the whole run returns within MINES_DOCTOR_DEADLINE
++#                          (default 20 s) with whatever finished, marking the
++#                          rest 「超时未完成」 — it used to run each probe one
++#                          after another (minutes on a bad network).
+ #   mines-doctor --short   only the summary lines
+ #
+ # Checks: clock, proxy env (and whether the proxy answers), DNS (incl. Clash
+@@ -9,12 +14,15 @@
+ # pypi.org and files.pythonhosted.org (direct and through the proxy), CA
+ # bundle, disk space, and what the phone reports (VPN covering Mines or not).
+ . /usr/local/lib/minis-net/common.sh
+-T=${MINIS_DOCTOR_TIMEOUT:-8}
++T=${MINIS_DOCTOR_TIMEOUT:-5}
++DEADLINE=${MINES_DOCTOR_DEADLINE:-20}
++MDIR=$(mktemp -d)
++trap 'rm -rf "$MDIR"' EXIT
++SEC=0
+ SHORT=0; [ "$1" = "--short" ] && SHORT=1
+-problems=""; fixes=""
+-bad() { problems="$problems
+-✗ $1"; [ -n "$2" ] && fixes="$fixes
+-→ $2"; say "  ✗ $1"; }
++# Each section writes its lines to $MDIR/<n>.out and its problems/fixes to
++# $MDIR/<n>.bad / $MDIR/<n>.fix ($SEC is the section number inside the subshell).
++bad() { echo "✗ $1" >> "$MDIR/$SEC.bad"; [ -n "$2" ] && echo "→ $2" >> "$MDIR/$SEC.fix"; say "  ✗ $1"; }
+ ok() { say "  ✓ $1"; }
+ say() { [ "$SHORT" = 1 ] || echo "$@"; }
+ hdr() { say ""; say "【$1】"; }
+@@ -36,99 +44,149 @@ get() {   # get <url> [noproxy] → 0 when an HTTP answer came back; error text
+ say "Mines 沙箱网络体检  $(date '+%Y-%m-%d %H:%M:%S %Z')"
+ [ -f /etc/alpine-release ] && say "Alpine $(cat /etc/alpine-release)，$(uname -m)"
+ 
+-hdr "手机网络"
+-if [ -f /etc/minis/net.state ]; then
+-    vpn=$(sed -n 's/^vpn=//p' /etc/minis/net.state); tr_=$(sed -n 's/^transport=//p' /etc/minis/net.state)
+-    dns=$(sed -n 's/^dns=//p' /etc/minis/net.state); src=$(sed -n 's/^proxy_source=//p' /etc/minis/net.state)
+-    say "  网络：${tr_:-未知}；VPN 是否覆盖 Mines：$( [ "$vpn" = 1 ] && echo 是 || echo 否)；系统 DNS：${dns:-未知}"
+-    [ -n "$src" ] && say "  沙箱代理来源：$src"
+-else
+-    say "  （没有手机网络信息，App 还没写入）"
+-fi
+-
+-hdr "时间"
+-now=$(date +%s)
+-hd=$(timeout $((T + 2)) wget -S -q -T "$T" -O /dev/null http://mirrors.aliyun.com/ 2>&1 | sed -n 's/^ *[Dd]ate: //p' | head -1)
+-if [ -n "$hd" ]; then
+-    srv=$(date -d "$hd" +%s 2>/dev/null || date -D '%a, %d %b %Y %H:%M:%S GMT' -d "$hd" +%s 2>/dev/null)
+-    # busybox parses the GMT string as local time; correct by the TZ offset.
+-    off=$(date +%z); sign=${off%????}; hh=${off#?}; hh=${hh%??}; mm=${off#???}
+-    [ -n "$srv" ] && [ -n "$hh" ] && { hh=${hh#0}; mm=${mm#0}; corr=$(( ${hh:-0} * 3600 + ${mm:-0} * 60 )); [ "$sign" = "-" ] && corr=$((-corr)); srv=$((srv + corr)); }
+-    if [ -n "$srv" ]; then
+-        d=$((now - srv)); [ $d -lt 0 ] && d=$((-d))
+-        if [ $d -gt 300 ]; then bad "时钟差了 ${d} 秒（证书校验会失败）" "在手机 设置 → 日期和时间 打开「自动设置」"; else ok "时钟准确（误差 ${d} 秒）"; fi
+-    else say "  · 无法解析服务器时间：$hd"; fi
+-else
+-    say "  · 拿不到服务器时间（网络不通时正常）"
+-fi
++sec1() {
++    hdr "手机网络"
++    if [ -f /etc/minis/net.state ]; then
++        vpn=$(sed -n 's/^vpn=//p' /etc/minis/net.state); tr_=$(sed -n 's/^transport=//p' /etc/minis/net.state)
++        dns=$(sed -n 's/^dns=//p' /etc/minis/net.state); src=$(sed -n 's/^proxy_source=//p' /etc/minis/net.state)
++        say "  网络：${tr_:-未知}；VPN 是否覆盖 Mines：$( [ "$vpn" = 1 ] && echo 是 || echo 否)；系统 DNS：${dns:-未知}"
++        [ -n "$src" ] && say "  沙箱代理来源：$src"
++    else
++        say "  （没有手机网络信息，App 还没写入）"
++    fi
++}
+ 
+-hdr "代理"
+-p=$(minis_proxy_url)
+-if [ -n "$p" ]; then
+-    hp=$(minis_hostport "$p"); h=${hp%:*}; port=${hp##*:}; [ "$port" = "$hp" ] && port=80
+-    say "  http(s)_proxy = $(echo "$p" | sed 's#//[^@/]*@#//***@#')   no_proxy = ${no_proxy:-${NO_PROXY:-（无）}}"
+-    if minis_tcp_ok "$h" "$port"; then ok "代理 $hp 能连上"; PROXY_UP=1
+-    else bad "代理 $hp 连不上——所有走代理的下载都会失败" "设置 → 模型路由与分流 里修好或关掉代理；或 设置 → 沙箱与防杀 → 沙箱代理 选「不用代理」"; PROXY_UP=0; fi
+-else
+-    say "  · 沙箱没设代理（直连）"; PROXY_UP=0
+-fi
++sec2() {
++    hdr "时间"
++    now=$(date +%s)
++    hd=$(timeout $((T + 2)) wget -S -q -T "$T" -O /dev/null http://mirrors.aliyun.com/ 2>&1 | sed -n 's/^ *[Dd]ate: //p' | head -1)
++    if [ -n "$hd" ]; then
++        srv=$(date -d "$hd" +%s 2>/dev/null || date -D '%a, %d %b %Y %H:%M:%S GMT' -d "$hd" +%s 2>/dev/null)
++        # busybox parses the GMT string as local time; correct by the TZ offset.
++        off=$(date +%z); sign=${off%????}; hh=${off#?}; hh=${hh%??}; mm=${off#???}
++        [ -n "$srv" ] && [ -n "$hh" ] && { hh=${hh#0}; mm=${mm#0}; corr=$(( ${hh:-0} * 3600 + ${mm:-0} * 60 )); [ "$sign" = "-" ] && corr=$((-corr)); srv=$((srv + corr)); }
++        if [ -n "$srv" ]; then
++            d=$((now - srv)); [ $d -lt 0 ] && d=$((-d))
++            if [ $d -gt 300 ]; then bad "时钟差了 ${d} 秒（证书校验会失败）" "在手机 设置 → 日期和时间 打开「自动设置」"; else ok "时钟准确（误差 ${d} 秒）"; fi
++        else say "  · 无法解析服务器时间：$hd"; fi
++    else
++        say "  · 拿不到服务器时间（网络不通时正常）"
++    fi
++}
+ 
+-hdr "DNS"
+-say "  resolv.conf：$(grep '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ' ')"
+-v6any=0
+-for h in mirrors.aliyun.com dl-cdn.alpinelinux.org pypi.org files.pythonhosted.org; do
+-    r=$(timeout $((T + 2)) nslookup "$h" 2>&1)
+-    a=$(echo "$r" | sed -n '/^Name:/,$ s/^Address[^:]*: *//p' | grep -v ':' | head -2 | tr '\n' ' ')
+-    aaaa=$(echo "$r" | sed -n '/^Name:/,$ s/^Address[^:]*: *//p' | grep ':' | head -1)
+-    [ -n "$aaaa" ] && v6any=1
+-    if [ -z "$a$aaaa" ]; then bad "解析不了 $h" "DNS 不通：设置 → 沙箱（Rootfs）→ 容器 DNS 改成 223.5.5.5 / 119.29.29.29"
++sec3() {
++    hdr "代理"
++    p=$(minis_proxy_url)
++    if [ -n "$p" ]; then
++        hp=$(minis_hostport "$p"); h=${hp%:*}; port=${hp##*:}; [ "$port" = "$hp" ] && port=80
++        say "  http(s)_proxy = $(echo "$p" | sed 's#//[^@/]*@#//***@#')   no_proxy = ${no_proxy:-${NO_PROXY:-（无）}}"
++        if minis_tcp_ok "$h" "$port"; then ok "代理 $hp 能连上"; PROXY_UP=1
++        else bad "代理 $hp 连不上——所有走代理的下载都会失败" "设置 → 模型路由与分流 里修好或关掉代理；或 设置 → 沙箱与防杀 → 沙箱代理 选「不用代理」"; PROXY_UP=0; fi
+     else
+-        case $a in 198.18.*|198.19.*) bad "$h 解析到 $a（Clash/代理软件的 fake-ip）" "VPN 没有接管 Mines 的流量却用了它的 DNS：在代理软件的「分应用代理」里加上 Mines，或把容器 DNS 改成 223.5.5.5";;
+-            *) ok "$h → ${a}${aaaa:+ / $aaaa}";; esac
++        say "  · 沙箱没设代理（直连）"; PROXY_UP=0
+     fi
+-done
++}
+ 
+-hdr "IPv4 / IPv6"
+-if minis_tcp_ok 223.5.5.5 53 || minis_tcp_ok 114.114.114.114 53; then ok "IPv4 能出网"; else bad "IPv4 连不上外网" "检查手机网络/飞行模式"; fi
+-if ip -6 addr 2>/dev/null | grep -q 'scope global'; then
+-    if minis_tcp_ok 2400:3200::1 53 || minis_tcp_ok 2402:4e00:: 53; then ok "IPv6 可用"
+-    else bad "手机有 IPv6 地址但连不出去" "部分程序会先试 IPv6 而卡住；在 设置 → 沙箱 把容器 DNS 设为只返回 IPv4 的服务器，或关掉手机的 IPv6"; fi
+-else say "  · 没有 IPv6 地址（只用 IPv4，正常）"; fi
++sec4() {
++    hdr "DNS"
++    say "  resolv.conf：$(grep '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ' ')"
++    v6any=0
++    for h in mirrors.aliyun.com dl-cdn.alpinelinux.org pypi.org files.pythonhosted.org; do
++        r=$(timeout $((T + 2)) nslookup "$h" 2>&1)
++        a=$(echo "$r" | sed -n '/^Name:/,$ s/^Address[^:]*: *//p' | grep -v ':' | head -2 | tr '\n' ' ')
++        aaaa=$(echo "$r" | sed -n '/^Name:/,$ s/^Address[^:]*: *//p' | grep ':' | head -1)
++        [ -n "$aaaa" ] && v6any=1
++        if [ -z "$a$aaaa" ]; then bad "解析不了 $h" "DNS 不通：设置 → 沙箱（Rootfs）→ 容器 DNS 改成 223.5.5.5 / 119.29.29.29"
++        else
++            case $a in 198.18.*|198.19.*) bad "$h 解析到 $a（Clash/代理软件的 fake-ip）" "VPN 没有接管 Mines 的流量却用了它的 DNS：在代理软件的「分应用代理」里加上 Mines，或把容器 DNS 改成 223.5.5.5";;
++                *) ok "$h → ${a}${aaaa:+ / $aaaa}";; esac
++        fi
++    done
++}
+ 
+-hdr "软件源"
+-mines-mirror show apk 2>/dev/null | sed 's/^/  现在用：/'
+-mines-mirror show pip 2>/dev/null | sed 's/^/  现在用：/'
+-pr=$(MINIS_PROBE_TIMEOUT=$T mines-mirror probe apk 2>/dev/null; MINIS_PROBE_TIMEOUT=$T mines-mirror probe pip 2>/dev/null; MINIS_PROBE_TIMEOUT=$T mines-mirror probe npm 2>/dev/null)
+-say "$pr" | sed 's/^/  /'
+-for k in apk pip npm; do
+-    echo "$pr" | grep "^$k " | grep -qv '✗' || bad "$k：所有软件源都连不上" "先修上面的网络/代理问题，再运行 mines-mirror auto"
+-done
+-cur=$(mines-mirror show apk | awk '{print $3}')
+-if [ -n "$cur" ] && echo "$pr" | grep "^apk " | grep '✗' | grep -qF "$cur"; then
+-    bad "正在用的 apk 软件源连不上：$cur" "运行 mines-mirror auto（apk 失败时也会自动换）"
+-fi
++sec5() {
++    hdr "IPv4 / IPv6"
++    if minis_tcp_ok 223.5.5.5 53 || minis_tcp_ok 114.114.114.114 53; then ok "IPv4 能出网"; else bad "IPv4 连不上外网" "检查手机网络/飞行模式"; fi
++    if ip -6 addr 2>/dev/null | grep -q 'scope global'; then
++        if minis_tcp_ok 2400:3200::1 53 || minis_tcp_ok 2402:4e00:: 53; then ok "IPv6 可用"
++        else bad "手机有 IPv6 地址但连不出去" "部分程序会先试 IPv6 而卡住；在 设置 → 沙箱 把容器 DNS 设为只返回 IPv4 的服务器，或关掉手机的 IPv6"; fi
++    else say "  · 没有 IPv6 地址（只用 IPv4，正常）"; fi
++}
+ 
+-hdr "证书 / TLS"
+-if [ -s /etc/ssl/minis-ca.pem ]; then ok "CA 证书库：/etc/ssl/minis-ca.pem（$(grep -c 'BEGIN CERT' /etc/ssl/minis-ca.pem) 个根证书）"
+-else say "  · 用系统自带证书库 /etc/ssl/certs/ca-certificates.crt（$(grep -c 'BEGIN CERT' /etc/ssl/certs/ca-certificates.crt 2>/dev/null) 个）"; fi
+-for u in https://pypi.org/simple/pip/ https://files.pythonhosted.org/packages/py2.py3/s/six/six-1.16.0-py2.py3-none-any.whl https://mirrors.aliyun.com/pypi/simple/pip/; do
+-    h=$(host_of() { echo "$1" | sed -e 's#^[a-z]*://##' -e 's#/.*##'; }; host_of "$u")
+-    if get "$u" noproxy; then ok "直连 $h：TLS 正常"; D=1; else say "  · 直连 $h：$GET_ERR"; D=0; fi
+-    if [ -n "$p" ] && [ "${PROXY_UP:-0}" = 1 ]; then
+-        if get "$u"; then ok "经代理 $h：TLS 正常"; X=1; else say "  · 经代理 $h：$GET_ERR"; X=0; fi
+-    else X=$D; fi
+-    if [ $D = 0 ] && [ $X = 0 ]; then
+-        case $h in *aliyun*) bad "连不上 $h（国内源）" "网络本身有问题，看上面的 DNS / IPv4";;
+-            *) bad "$h 直连和代理都不通（境外源，国内常见：被重置或限速）" "用国内镜像：mines-mirror auto pip（已自动做）；需要官方源就在 模型路由与分流 填一个能用的代理";; esac
++sec6() {
++    hdr "软件源"
++    mines-mirror show apk 2>/dev/null | sed 's/^/  现在用：/'
++    mines-mirror show pip 2>/dev/null | sed 's/^/  现在用：/'
++    pr=$(MINIS_PROBE_TIMEOUT=$T mines-mirror probe apk 2>/dev/null; MINIS_PROBE_TIMEOUT=$T mines-mirror probe pip 2>/dev/null; MINIS_PROBE_TIMEOUT=$T mines-mirror probe npm 2>/dev/null)
++    say "$pr" | sed 's/^/  /'
++    for k in apk pip npm; do
++        echo "$pr" | grep "^$k " | grep -qv '✗' || bad "$k：所有软件源都连不上" "先修上面的网络/代理问题，再运行 mines-mirror auto"
++    done
++    cur=$(mines-mirror show apk | awk '{print $3}')
++    if [ -n "$cur" ] && echo "$pr" | grep "^apk " | grep '✗' | grep -qF "$cur"; then
++        bad "正在用的 apk 软件源连不上：$cur" "运行 mines-mirror auto（apk 失败时也会自动换）"
+     fi
+-done
++}
+ 
+-hdr "磁盘"
+-free=$(df -k / 2>/dev/null | tail -1 | awk '{print $(NF-2)}')
+-if [ -n "$free" ]; then
+-    if [ "$free" -lt 1048576 ]; then bad "沙箱剩余空间只有 $((free / 1024)) MB" "清理手机存储；开发工具包需要约 1 GB"; else ok "剩余 $((free / 1024 / 1024)) GB"; fi
+-fi
++sec7() {
++    hdr "证书 / TLS"
++    if [ -s /etc/ssl/minis-ca.pem ]; then ok "CA 证书库：/etc/ssl/minis-ca.pem（$(grep -c 'BEGIN CERT' /etc/ssl/minis-ca.pem) 个根证书）"
++    else say "  · 用系统自带证书库 /etc/ssl/certs/ca-certificates.crt（$(grep -c 'BEGIN CERT' /etc/ssl/certs/ca-certificates.crt 2>/dev/null) 个）"; fi
++    k=0
++    for u in https://pypi.org/simple/pip/ https://files.pythonhosted.org/packages/py2.py3/s/six/six-1.16.0-py2.py3-none-any.whl https://mirrors.aliyun.com/pypi/simple/pip/; do
++      k=$((k + 1))
++      ( h=$(host_of() { echo "$1" | sed -e 's#^[a-z]*://##' -e 's#/.*##'; }; host_of "$u")
++        if get "$u" noproxy; then ok "直连 $h：TLS 正常"; D=1; else say "  · 直连 $h：$GET_ERR"; D=0; fi
++        if [ -n "$p" ] && [ "${PROXY_UP:-0}" = 1 ]; then
++            if get "$u"; then ok "经代理 $h：TLS 正常"; X=1; else say "  · 经代理 $h：$GET_ERR"; X=0; fi
++        else X=$D; fi
++        if [ $D = 0 ] && [ $X = 0 ]; then
++            case $h in *aliyun*) bad "连不上 $h（国内源）" "网络本身有问题，看上面的 DNS / IPv4";;
++                *) bad "$h 直连和代理都不通（境外源，国内常见：被重置或限速）" "用国内镜像：mines-mirror auto pip（已自动做）；需要官方源就在 模型路由与分流 填一个能用的代理";; esac
++        fi ) > "$MDIR/tls.$k" 2>&1 &
++    done
++    wait
++    cat "$MDIR"/tls.* 2>/dev/null
++}
+ 
++sec8() {
++    hdr "磁盘"
++    free=$(df -k / 2>/dev/null | tail -1 | awk '{print $(NF-2)}')
++    if [ -n "$free" ]; then
++        if [ "$free" -lt 1048576 ]; then bad "沙箱剩余空间只有 $((free / 1024)) MB" "清理手机存储；开发工具包需要约 1 GB"; else ok "剩余 $((free / 1024 / 1024)) GB"; fi
++    fi
++}
++
++# The proxy answer is needed by the TLS section: measure it first (≤ 4 s).
++p=$(minis_proxy_url); PROXY_UP=0
++if [ -n "$p" ]; then hp=$(minis_hostport "$p"); h=${hp%:*}; port=${hp##*:}; [ "$port" = "$hp" ] && port=80
++    minis_tcp_ok "$h" "$port" && PROXY_UP=1; fi
++NSEC=8
++i=1; pids=""
++while [ $i -le $NSEC ]; do
++    ( SEC=$i; sec$i > "$MDIR/$i.out" 2>&1; : > "$MDIR/$i.done" ) &
++    pids="$pids $!"
++    i=$((i + 1))
++done
++start=$(date +%s)
++while :; do
++    n=$(ls "$MDIR"/*.done 2>/dev/null | wc -l)
++    [ "$n" -ge $NSEC ] && break
++    [ $(( $(date +%s) - start )) -ge "$DEADLINE" ] && break
++    sleep 1
++done
++for pid in $pids; do pkill -P "$pid" 2>/dev/null; kill "$pid" 2>/dev/null; done
++problems=""; fixes=""
++i=1
++while [ $i -le $NSEC ]; do
++    cat "$MDIR/$i.out" 2>/dev/null
++    [ -f "$MDIR/$i.done" ] || { say "  … 这一项 ${DEADLINE} 秒内没做完（网络很慢或卡住），已跳过"; echo "✗ 第 $i 项检查超时（网络卡住）" >> "$MDIR/$i.bad"; }
++    [ -f "$MDIR/$i.bad" ] && problems="$problems
++$(cat "$MDIR/$i.bad")"
++    [ -f "$MDIR/$i.fix" ] && fixes="$fixes
++$(cat "$MDIR/$i.fix")"
++    i=$((i + 1))
++done
+ echo ""
+ if [ -z "$problems" ]; then
+     echo "结论：没发现网络问题。apk / pip 失败时会自动换源重试；还不行把上面的输出发给我。"
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-dsh b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-dsh
+index 9aa6aa1..0f916dc 100644
+--- a/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-dsh
++++ b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-dsh
+@@ -168,7 +168,14 @@ remove|rm)
+     echo "已卸载 $name"
+     ;;
+ off|on)
+-    need_node; set_state "$cmd" "$1"; echo "$1: $cmd" ;;
++    need_node; set_state "$cmd" "$1"
++    # [Mines-dsh-29] `off` used to only edit plugins.json: the running widget
++    # host (minis-dsh web) and the app's floating widget kept going. Stop the
++    # host so it reloads without the plugin, refresh status.json (the app's
++    # widget window watches it and closes when no enabled widget is left).
++    pkill -f "socket.mjs --web" 2>/dev/null || true
++    check >/dev/null 2>&1 || true
++    echo "$1: $cmd" ;;
+ list|ls)
+     need_node
+     check
+@@ -298,8 +305,11 @@ mcp-add)
+     need_node
+     name="$1"; pkg="$2"; shift 2
+     [ -f "$SERVERS" ] || { mkdir -p "$(dirname "$SERVERS")"; echo '{"mcpServers":{}}' > "$SERVERS"; }
+-    echo "预先下载 $pkg …" >&2
+-    npm cache add "$pkg" >/dev/null 2>&1 || true
++    echo "预先安装 $pkg …" >&2
++    # [Mines-mcp-29] Install globally so the server starts as `node <bin>`
++    # without npx asking the registry on every cold start (minis-mcp-cli
++    # resolves `npx -y <pkg>` to the global install when it exists).
++    timeout 600 npm install -g --no-audit --no-fund "$pkg" >/dev/null 2>&1 || npm cache add "$pkg" >/dev/null 2>&1 || true
+     SERVERS="$SERVERS" NAME="$name" PKG="$pkg" ARGS="$*" node --input-type=module -e '
+       import fs from "node:fs"
+       const f = process.env.SERVERS
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-mcp-cli b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-mcp-cli
+index 3769f83..d9f72cf 100644
+--- a/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-mcp-cli
++++ b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-mcp-cli
+@@ -31,11 +31,24 @@ if ! command -v python3 > /dev/null 2>&1; then
+   apk add --quiet python3 py3-pip >> "$LOG" 2>&1
+ fi
+ 
+-# Ensure httpx is importable (used by the HTTP transport).
+-if ! python3 -c "import httpx" 2>/dev/null; then
+-  _log "Installing httpx..."
+-  pip install --quiet httpx >> "$LOG" 2>&1 || \
+-    pip install --quiet --break-system-packages httpx >> "$LOG" 2>&1
++# [Mines-mcp-29] The lib dir is read-only, so python could never cache its
++# bytecode and recompiled every module on every call (slow under PRoot). Keep
++# the cache under /root instead.
++export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-/root/.cache/minis-mcp-pyc}"
++
++# httpx is only needed for HTTP servers and is imported lazily now. Check it
++# once (stamp file) instead of starting a second python on every call; prefer
++# Alpine's py3-httpx (no pip / PyPI needed).
++STAMP=/root/.cache/minis-mcp-httpx.ok
++if [ ! -f "$STAMP" ]; then
++  if python3 -c "import httpx" 2>/dev/null; then
++    mkdir -p /root/.cache 2>/dev/null; : > "$STAMP" 2>/dev/null
++  else
++    _log "Installing httpx..."
++    apk add --quiet py3-httpx >> "$LOG" 2>&1 || pip install --quiet httpx >> "$LOG" 2>&1 || \
++        pip install --quiet --break-system-packages httpx >> "$LOG" 2>&1
++    python3 -c "import httpx" 2>/dev/null && { mkdir -p /root/.cache; : > "$STAMP"; }
++  fi
+ fi
+ 
+ exec python3 /usr/local/lib/minis-mcp-cli/main.py "$@"
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/monkey b/src/android/app/src/main/assets/default_mount/usr/local/bin/monkey
+new file mode 100755
+index 0000000..5725055
+--- /dev/null
++++ b/src/android/app/src/main/assets/default_mount/usr/local/bin/monkey
+@@ -0,0 +1,4 @@
++#!/bin/sh
++# [Mines-shizuku-29] Android's monkey, run through Shizuku (shell uid). If Shizuku
++# is not authorized yet, android-shizuku-cli shows its one-tap allow dialog.
++exec android-shizuku-cli rawexec monkey "$@"
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/pm b/src/android/app/src/main/assets/default_mount/usr/local/bin/pm
+new file mode 100755
+index 0000000..1489e68
+--- /dev/null
++++ b/src/android/app/src/main/assets/default_mount/usr/local/bin/pm
+@@ -0,0 +1,4 @@
++#!/bin/sh
++# [Mines-shizuku-29] Android's pm, run through Shizuku (shell uid). If Shizuku
++# is not authorized yet, android-shizuku-cli shows its one-tap allow dialog.
++exec android-shizuku-cli rawexec pm "$@"
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/settings b/src/android/app/src/main/assets/default_mount/usr/local/bin/settings
+new file mode 100755
+index 0000000..253aa25
+--- /dev/null
++++ b/src/android/app/src/main/assets/default_mount/usr/local/bin/settings
+@@ -0,0 +1,4 @@
++#!/bin/sh
++# [Mines-shizuku-29] Android's settings, run through Shizuku (shell uid). If Shizuku
++# is not authorized yet, android-shizuku-cli shows its one-tap allow dialog.
++exec android-shizuku-cli rawexec settings "$@"
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/wm b/src/android/app/src/main/assets/default_mount/usr/local/bin/wm
+new file mode 100755
+index 0000000..679db62
+--- /dev/null
++++ b/src/android/app/src/main/assets/default_mount/usr/local/bin/wm
+@@ -0,0 +1,4 @@
++#!/bin/sh
++# [Mines-shizuku-29] Android's wm, run through Shizuku (shell uid). If Shizuku
++# is not authorized yet, android-shizuku-cli shows its one-tap allow dialog.
++exec android-shizuku-cli rawexec wm "$@"
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/daemon.py b/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/daemon.py
+index 6b3a7db..e84ad6a 100644
+--- a/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/daemon.py
++++ b/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/daemon.py
+@@ -34,7 +34,10 @@ import time
+ import sys
+ sys.path.insert(0, "/usr/local/lib/minis-mcp-cli")
+ 
+-from transport.http import HTTPTransport, MCPError, expand_env  # noqa: E402
++# [Mines-mcp-29] no httpx at import time: HTTPTransport is imported lazily by
++# MCPHTTPSession, so a daemon serving only STDIO servers starts fast.
++from transport.errors import MCPError, expand_env  # noqa: E402
++from utils import launch  # noqa: E402
+ from utils import config  # noqa: E402
+ from utils import deps  # noqa: E402
+ 
+@@ -72,22 +75,26 @@ class MCPServerProcess:
+         for k, v in (self.cfg.get("env") or {}).items():
+             env[k] = expand_env(v)
+         deps.ensure_command(command)
++        # [Mines-mcp-29] npx → installed global bin when present; stderr kept.
++        self._installed = launch.installed(command, args)
++        command, args = launch.resolve(command, args)
++        self._errf = launch.open_stderr(self.name)
+         try:
+             self.proc = subprocess.Popen(
+                 [command] + list(args),
+                 stdin=subprocess.PIPE,
+                 stdout=subprocess.PIPE,
+-                stderr=subprocess.DEVNULL,
++                stderr=self._errf,
+                 env=env,
+                 text=True,
+                 bufsize=1,
+                 start_new_session=True,  # detach from the daemon's process group
+             )
+         except FileNotFoundError:
+-            raise MCPError("CONNECTION_ERROR", "command not found: %s" % command)
++            raise MCPError("CONNECTION_ERROR", "command not found: %s (自动安装也没装上，看 /var/minis/mcp-servers/mcp-cli.log)" % command)
+         except OSError as exc:
+             raise MCPError("CONNECTION_ERROR", str(exc))
+-        log.info("[%s] spawned pid=%s", self.name, self.proc.pid)
++        log.info("[%s] spawned pid=%s: %s %s", self.name, self.proc.pid, command, " ".join(args)[:200])
+         self._handshake()
+         log.info("[%s] initialized", self.name)
+ 
+@@ -130,7 +137,9 @@ class MCPServerProcess:
+         if t.is_alive():
+             raise MCPError("TIMEOUT", "[%s] no reply after %ss" % (self.name, timeout))
+         if "msg" not in result_box:
+-            raise MCPError("STDIO_CRASH", "[%s] process exited before replying" % self.name)
++            rc = self.proc.poll() if self.proc else None
++            raise MCPError("STDIO_CRASH", "[%s] process exited before replying (rc=%s): %s"
++                           % (self.name, rc, launch.explain(self.name, self.cfg)))
+         return result_box["msg"]
+ 
+     def _rpc(self, method, params=None, timeout=RPC_TIMEOUT):
+@@ -147,6 +156,9 @@ class MCPServerProcess:
+         # seconds plus a warning for any invalid value (which we log rather
+         # than silently swallow). Default is DEFAULT_STARTUP_TIMEOUT.
+         timeout, warning = config.resolve_startup_timeout(self.cfg)
++        if not any(k in self.cfg for k in config.STARTUP_TIMEOUT_KEYS):
++            # [Mines-mcp-29] cold npx/uvx needs to download first.
++            timeout = max(timeout, 60 if getattr(self, "_installed", True) else 180)
+         if warning:
+             log.warning("[%s] %s", self.name, warning)
+         try:
+@@ -158,10 +170,11 @@ class MCPServerProcess:
+         except MCPError as exc:
+             if exc.code == "TIMEOUT":
+                 raise MCPError("TIMEOUT", (
+-                    "[%s] initialization timed out after %ss. This server may "
++                    "[%s] initialization timed out after %ss. Reason: %s. This server may "
+                     "still be starting. Set mcpServers.%s.startupTimeoutSeconds "
+-                    "to e.g. %d for slow-starting servers."
+-                    % (self.name, timeout, self.name, max(timeout * 2, 120)))
++                    "to e.g. %d for slow-starting servers, or run `minis-mcp-cli doctor %s`."
++                    % (self.name, timeout, launch.explain(self.name, self.cfg), self.name,
++                       max(timeout * 2, 120), self.name))
+                 )
+             raise
+         self._send("notifications/initialized", notify=True)
+@@ -202,6 +215,11 @@ class MCPServerProcess:
+                 self.proc.wait(timeout=5)
+             except subprocess.TimeoutExpired:
+                 self.proc.kill()
++        try:
++            if getattr(self, "_errf", None) not in (None, subprocess.DEVNULL):
++                self._errf.close()
++        except OSError:
++            pass
+         log.info("[%s] stopped", self.name)
+ 
+ 
+@@ -213,6 +231,7 @@ class MCPHTTPSession:
+ 
+     def __init__(self, name, cfg):
+         self.name = name
++        from transport.http import HTTPTransport  # lazy: pulls in httpx
+         self._transport = HTTPTransport(cfg, name)
+         self._lock = threading.Lock()
+         self.last_activity = time.time()
+@@ -261,6 +280,7 @@ class MCPPool:
+         # evicted. Starts True because a fresh pool has never been populated,
+         # so its emptiness is not a transition worth reporting.
+         self._was_empty = True
++        self._creating = {}
+ 
+     def _make_session(self, name, cfg):
+         if config.is_stdio(cfg):
+@@ -290,13 +310,28 @@ class MCPPool:
+             return session
+         return MCPHTTPSession(name, cfg)
+ 
+-    def get(self, name):
++    def _name_lock(self, name):
+         with self._lock:
+-            session = self._pool.get(name)
+-            if session is not None and not session.is_alive():
++            lk = self._creating.get(name)
++            if lk is None:
++                lk = self._creating[name] = threading.Lock()
++            return lk
++
++    def get(self, name):
++        # [Mines-mcp-29] The pool lock used to be held across _make_session(),
++        # i.e. across a whole cold start (npx download + node boot + initialize,
++        # up to the startup timeout). Every other server's request queued
++        # behind it, so asking six servers at once timed all six out. Now only
++        # the server being started waits for its own start.
++        with self._name_lock(name):
++            with self._lock:
++                session = self._pool.get(name)
++                dead = session is not None and not session.is_alive()
++                if dead:
++                    del self._pool[name]
++            if dead:
+                 log.warning("[%s] process died, evicting", name)
+                 session.stop()
+-                del self._pool[name]
+                 session = None
+             if session is None:
+                 cfg = config.get_server(name)
+@@ -306,7 +341,9 @@ class MCPPool:
+                     raise MCPError("DISABLED", "server '%s' is disabled" % name)
+                 log.info("[%s] creating new session", name)
+                 session = self._make_session(name, cfg)
+-                self._pool[name] = session
++                with self._lock:
++                    self._pool[name] = session
++        with self._lock:
+             self._was_empty = False
+         # [T-mcp-daemon-idle-selfkill] Outside the lock: the pool now holds a
+         # live session, so cancel any pending exit grace. This is THE fix — the
+@@ -320,7 +357,8 @@ class MCPPool:
+             try:
+                 return fn(session)
+             except MCPError as exc:
+-                if exc.code in ("STDIO_CRASH", "TIMEOUT") and attempt == 0:
++                if exc.code in ("STDIO_CRASH", "TIMEOUT") and attempt == 0 \
++                        and "initialization timed out" not in (exc.message or ""):
+                     log.warning("[%s] %s, retrying", name, exc.code)
+                     self.evict(name)
+                     continue
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/main.py b/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/main.py
+index dd02e10..9a95f9f 100644
+--- a/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/main.py
++++ b/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/main.py
+@@ -36,7 +36,7 @@ import time
+ 
+ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+ 
+-from transport.http import MCPError  # noqa: E402
++from transport.errors import MCPError  # noqa: E402
+ from utils import config  # noqa: E402
+ 
+ LOG_PATH = "/var/minis/mcp-servers/mcp-cli.log"
+@@ -45,7 +45,10 @@ PID_FILE = "/tmp/minis-mcp-daemon.pid"
+ PORT_FILE = "/tmp/minis-mcp-daemon.port"  # daemon publishes its 127.0.0.1 port here
+ LOCK_FILE = "/tmp/minis-mcp-daemon.lock"  # cold-start fork guard (one winner forks)
+ CONN_TIMEOUT = 310.0  # socket recv timeout, slightly above the 300s RPC timeout
+-LOCK_STALE_SECONDS = 12.0  # reclaim a cold-start lock older than this (crashed start)
++LOCK_STALE_SECONDS = 40.0
++# [Mines-mcp-29] was a fixed 8 s: python + imports under PRoot on a phone can
++# take longer than that, and then every call failed with "daemon not running".
++DAEMON_START_WAIT = float(os.environ.get("MINIS_MCP_DAEMON_WAIT", "30"))  # reclaim a cold-start lock older than this (crashed start)
+ 
+ 
+ def _log(msg):
+@@ -101,17 +104,51 @@ def daemon_alive():
+         return False
+ 
+ 
+-def _wait_for_port(deadline):
++def _wait_for_port(deadline, child=None):
+     """Block until the daemon publishes its port file, or the deadline passes.
+-    Returns True if the port appeared."""
++    Returns True if the port appeared. With `child`, stop early when that
++    forked child already died (its reason is in the daemon log)."""
+     while time.time() < deadline:
+         if os.path.exists(PORT_FILE):
+             time.sleep(0.05)  # let bind()+listen()+port publish settle
+             return True
++        if child is not None:
++            try:
++                done, _ = os.waitpid(child, os.WNOHANG)
++            except OSError:
++                done = 0
++            if done:
++                # The forking child exits right after setsid() only on error.
++                time.sleep(0.2)
++                if os.path.exists(PORT_FILE):
++                    return True
++                if not daemon_alive_pid():
++                    return False
+         time.sleep(0.1)
+     return False
+ 
+ 
++def daemon_alive_pid():
++    try:
++        with open(PID_FILE, "r", encoding="utf-8") as f:
++            os.kill(int(f.read().strip()), 0)
++        return True
++    except (ValueError, OSError):
++        return False
++
++
++def _daemon_log_tail():
++    out = []
++    for p in (LOG_PATH, "/var/minis/mcp-servers/mcp-daemon.log"):
++        try:
++            with open(p, "r", encoding="utf-8", errors="replace") as f:
++                rows = [r.strip() for r in f.read()[-3000:].splitlines() if r.strip()]
++            out += rows[-2:]
++        except OSError:
++            pass
++    return " | ".join(out)[-500:] or "no log"
++
++
+ def _acquire_cold_start_lock():
+     """Atomically claim the right to fork the daemon. Returns the lock fd on
+     success, or None if another caller already holds it (this caller should just
+@@ -156,16 +193,16 @@ def maybe_start_daemon():
+     lock_fd = _acquire_cold_start_lock()
+     if lock_fd is None:
+         # Another caller is forking the daemon; just wait for its port file.
+-        if not _wait_for_port(time.time() + 8):
+-            _log("waited for peer-started daemon but no port within 8s")
++        if not _wait_for_port(time.time() + DAEMON_START_WAIT):
++            _log("waited for peer-started daemon but no port within %ss" % DAEMON_START_WAIT)
+         return
+ 
+     pid = os.fork()
+     if pid > 0:
+         # Winner parent: wait for our child's daemon to publish, then release the
+         # lock so future cold-starts (after this daemon exits) can fork again.
+-        if not _wait_for_port(time.time() + 8):
+-            _log("daemon did not start within 8s; running without daemon")
++        if not _wait_for_port(time.time() + DAEMON_START_WAIT, child=pid):
++            _log("daemon did not start within %ss: %s" % (DAEMON_START_WAIT, _daemon_log_tail()))
+         os.close(lock_fd)
+         try:
+             os.unlink(LOCK_FILE)
+@@ -262,6 +299,9 @@ def call_daemon(request, pretty):
+     if not resp.get("ok") and resp.get("code") == "NO_DAEMON":
+         time.sleep(0.5)
+         resp = send_to_daemon(request)
++    if not resp.get("ok") and resp.get("code") == "NO_DAEMON":
++        resp["error"] = ("MCP 后台进程没起来（等了 %ss）。原因线索：%s。运行 `minis-mcp-cli doctor` 逐个检查。"
++                         % (int(DAEMON_START_WAIT), _daemon_log_tail()))
+     if not resp.get("ok"):
+         _fail(resp.get("error", "daemon error"), resp.get("code", "MCP_ERROR"),
+               request.get("server"), pretty)
+@@ -582,6 +622,12 @@ Commands:
+   enable <server>                       Enable a server.
+   disable <server>                      Disable a server.
+   shutdown                              Stop the background daemon.
++  doctor [server...] [--timeout N]      Start every enabled server in parallel (own
++                                        process, not the daemon), time its
++                                        initialize and say why one fails
++                                        (missing command, npm download, crash +
++                                        stderr, timeout). Always returns within
++                                        N+5 s (default 60).
+ 
+ Global flags:
+   --pretty                              Pretty-print JSON output.
+@@ -663,6 +709,9 @@ def main():
+             cmd_set_enabled(rest, pretty, False)
+         elif cmd == "shutdown":
+             cmd_shutdown(rest, pretty)
++        elif cmd in ("doctor", "check"):
++            from utils import doctor
++            doctor.run(rest, pretty, _emit)
+         else:
+             # Keep the JSON error on stdout for programmatic callers; add a
+             # human hint on stderr pointing at --help.
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/transport/errors.py b/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/transport/errors.py
+new file mode 100644
+index 0000000..e531fe3
+--- /dev/null
++++ b/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/transport/errors.py
+@@ -0,0 +1,31 @@
++"""errors.py — MCPError + env expansion, shared by every transport.
++
++[Mines-mcp-29] Split out of transport/http.py so the daemon and the STDIO path
++no longer import httpx (and its anyio/h11/certifi/ssl tree) just to get an
++exception class. Under PRoot on a phone that import alone took seconds and
++counted against the CLI's daemon cold-start wait.
++"""
++
++import os
++import re
++
++# $VAR and $$VAR both expand from the process env; the UI picker emits $$VAR to
++# make a reference visually explicit. The optional second `$` is consumed in the
++# same match (no double-expansion), so $$VAR / $${VAR} resolve identically to
++# $VAR / ${VAR}.
++_ENV_RE = re.compile(r"\$\$?\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
++
++
++class MCPError(Exception):
++    def __init__(self, code, message):
++        super().__init__(message)
++        self.code = code
++        self.message = message
++
++
++def expand_env(value):
++    """Replace $VAR / ${VAR} / $$VAR / $${VAR} with the environment value (empty
++    if unset)."""
++    if not isinstance(value, str):
++        return value
++    return _ENV_RE.sub(lambda m: os.environ.get(m.group(1), ""), value)
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/transport/http.py b/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/transport/http.py
+index ae86e72..d3a9a7e 100644
+--- a/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/transport/http.py
++++ b/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/transport/http.py
+@@ -23,26 +23,7 @@ except ImportError:  # pragma: no cover - the sh wrapper installs httpx first
+ 
+ TIMEOUT_SECONDS = 300  # 5 min
+ 
+-# $VAR and $$VAR both expand from the process env; the UI picker emits $$VAR to
+-# make a reference visually explicit. The optional second `$` is consumed in the
+-# same match (no double-expansion), so $$VAR / $${VAR} resolve identically to
+-# $VAR / ${VAR}.
+-_ENV_RE = re.compile(r"\$\$?\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
+-
+-
+-class MCPError(Exception):
+-    def __init__(self, code, message):
+-        super().__init__(message)
+-        self.code = code
+-        self.message = message
+-
+-
+-def expand_env(value):
+-    """Replace $VAR / ${VAR} / $$VAR / $${VAR} with the environment value (empty
+-    if unset)."""
+-    if not isinstance(value, str):
+-        return value
+-    return _ENV_RE.sub(lambda m: os.environ.get(m.group(1), ""), value)
++from transport.errors import MCPError, expand_env, _ENV_RE  # noqa: E402,F401 (re-exported)
+ 
+ 
+ def _expand_headers(headers):
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/transport/stdio.py b/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/transport/stdio.py
+index fdaa9f7..f513c47 100644
+--- a/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/transport/stdio.py
++++ b/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/transport/stdio.py
+@@ -14,7 +14,7 @@ import os
+ import subprocess
+ import threading
+ 
+-from transport.http import MCPError, expand_env  # reuse error type + expander
++from transport.errors import MCPError, expand_env  # reuse error type + expander
+ from utils import deps
+ 
+ TIMEOUT_SECONDS = 300  # 5 min
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/utils/doctor.py b/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/utils/doctor.py
+new file mode 100644
+index 0000000..bf60f96
+--- /dev/null
++++ b/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/utils/doctor.py
+@@ -0,0 +1,128 @@
++"""doctor.py — `minis-mcp-cli doctor`: why does an MCP server not answer?
++
++[Mines-mcp-29] Starts each enabled server in its own process (not through the
++daemon, so one stuck server can't hide the others), all in parallel, sends
++`initialize`, and reports per server: ok + milliseconds, or the reason
++(command missing, npm download failing, crashed + its stderr, timed out).
++Bounded: returns within --timeout + 5 s whatever happens.
++"""
++
++import json
++import os
++import shutil
++import subprocess
++import sys
++import threading
++import time
++
++from utils import config, launch
++from transport.errors import expand_env
++
++
++def _check_stdio(name, cfg, timeout, out):
++    t0 = time.time()
++    command = cfg.get("command", "")
++    args = cfg.get("args") or []
++    row = {"server": name, "type": "stdio", "installed": launch.installed(command, args)}
++    if not shutil.which(os.path.basename(command)) and not os.path.exists(command):
++        row.update(ok=False, reason="命令不存在：%s（第一次调用时会自动装 nodejs/npm；也可运行 apk add nodejs npm）" % command)
++        out[name] = row
++        return
++    cmd, argv = launch.resolve(command, args)
++    row["launch"] = (cmd + " " + " ".join(argv))[:200]
++    env = dict(os.environ)
++    for k, v in (cfg.get("env") or {}).items():
++        env[k] = expand_env(v)
++    errf = launch.open_stderr(name)
++    try:
++        p = subprocess.Popen([cmd] + argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
++                             stderr=errf, env=env, text=True, bufsize=1, start_new_session=True)
++    except OSError as exc:
++        row.update(ok=False, reason="启动失败：%s" % exc)
++        out[name] = row
++        return
++    box = {}
++
++    def reader():
++        try:
++            for raw in p.stdout:
++                try:
++                    msg = json.loads(raw.strip() or "null")
++                except ValueError:
++                    continue
++                if isinstance(msg, dict) and msg.get("id") == 1:
++                    box["msg"] = msg
++                    return
++        except (OSError, ValueError):
++            pass
++
++    try:
++        p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
++            "protocolVersion": "2025-06-18", "capabilities": {},
++            "clientInfo": {"name": "minis-mcp-doctor", "version": "1"}}}) + "\n")
++        p.stdin.flush()
++    except OSError:
++        pass
++    th = threading.Thread(target=reader, daemon=True)
++    th.start()
++    th.join(timeout)
++    ms = int((time.time() - t0) * 1000)
++    if "msg" in box:
++        info = (box["msg"].get("result") or {}).get("serverInfo") or {}
++        row.update(ok=True, ms=ms, reason="正常（%s %s）" % (info.get("name", ""), info.get("version", "")))
++    elif p.poll() is not None:
++        row.update(ok=False, ms=ms, reason="进程退出了（rc=%s）：%s" % (p.returncode, launch.explain(name, cfg)))
++    else:
++        row.update(ok=False, ms=ms, reason="%s 秒内没有应答：%s" % (timeout, launch.explain(name, cfg)))
++    try:
++        p.kill()
++    except OSError:
++        pass
++    out[name] = row
++
++
++def _check_http(name, cfg, timeout, out):
++    t0 = time.time()
++    row = {"server": name, "type": "http", "url": cfg.get("url")}
++    try:
++        from transport.http import HTTPTransport
++        HTTPTransport(cfg, name).ping()
++        row.update(ok=True, ms=int((time.time() - t0) * 1000), reason="正常")
++    except Exception as exc:  # noqa: BLE001
++        row.update(ok=False, ms=int((time.time() - t0) * 1000), reason=str(getattr(exc, "message", exc))[:300])
++    out[name] = row
++
++
++def run(args, pretty, emit):
++    timeout = 60
++    if "--timeout" in args:
++        i = args.index("--timeout")
++        try:
++            timeout = max(3, min(600, int(args[i + 1])))
++        except (IndexError, ValueError):
++            pass
++        del args[i:i + 2]
++    servers = config.get_servers()
++    names = [a for a in args if not a.startswith("-")] or [n for n, c in servers.items() if c.get("enabled", True)]
++    out = {}
++    threads = []
++    for n in names:
++        cfg = servers.get(n)
++        if cfg is None:
++            out[n] = {"server": n, "ok": False, "reason": "没有这个服务器"}
++            continue
++        fn = _check_stdio if config.is_stdio(cfg) else _check_http
++        t = threading.Thread(target=fn, args=(n, cfg, timeout, out), daemon=True)
++        t.start()
++        threads.append((n, t))
++    deadline = time.time() + timeout + 5
++    for n, t in threads:
++        t.join(max(0.1, deadline - time.time()))
++        if n not in out:
++            out[n] = {"server": n, "ok": False, "reason": "检查本身超时"}
++    rows = [out[n] for n in names if n in out]
++    if not pretty:
++        for r in rows:
++            sys.stderr.write("%s %-10s %s%s\n" % ("✓" if r.get("ok") else "✗", r["server"], r.get("reason", ""),
++                                                  (" (%d ms)" % r["ms"]) if "ms" in r else ""))
++    emit({"servers": rows, "ok": all(r.get("ok") for r in rows)}, pretty)
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/utils/launch.py b/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/utils/launch.py
+new file mode 100644
+index 0000000..fdf6bff
+--- /dev/null
++++ b/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/utils/launch.py
+@@ -0,0 +1,176 @@
++"""launch.py — how a STDIO MCP server is actually started (Mines build-29).
++
++[Mines-mcp-29] Why: on the phone every curated server (memory, thinking,
++files, context7, weread) is `npx -y <pkg>`. npx re-resolves the package against
++the npm registry on every cold start and node itself starts slowly under PRoot,
++so a first call easily needs 20-90 s; the old 60 s default (and any 8 s caller
++timeout) failed all of them at once, with the child's stderr thrown away so the
++error never said why.
++
++ * resolve(): `npx -y pkg args` → `node <global-install>/bin.js args` when the
++   package is installed globally (no registry round-trip, starts offline);
++   otherwise npx with --prefer-offline, and a background `npm i -g pkg` so the
++   next start is the fast path.
++ * stderr goes to /var/minis/mcp-servers/logs/<name>.err; tail() returns its
++   last lines for error messages.
++ * default_startup(): 180 s for npx/uvx servers that are not yet installed,
++   60 s otherwise; an explicit startupTimeoutSeconds always wins.
++"""
++
++import json
++import os
++import shutil
++import subprocess
++
++LOG_DIR = "/var/minis/mcp-servers/logs"
++GLOBAL_ROOTS = ("/usr/local/lib/node_modules", "/usr/lib/node_modules", "/root/.npm-global/lib/node_modules")
++
++
++def _pkg_name(spec):
++    if spec.startswith("@"):
++        rest = spec[1:]
++        return "@" + rest.split("@", 1)[0]
++    return spec.split("@", 1)[0]
++
++
++def _global_bin(name):
++    roots = list(GLOBAL_ROOTS)
++    prefix = os.environ.get("NPM_CONFIG_PREFIX") or os.environ.get("npm_config_prefix")
++    if prefix:
++        roots.insert(0, os.path.join(prefix, "lib", "node_modules"))
++    for root in roots:
++        pj = os.path.join(root, name, "package.json")
++        try:
++            with open(pj, "r", encoding="utf-8") as f:
++                meta = json.load(f)
++        except (OSError, ValueError):
++            continue
++        b = meta.get("bin")
++        if isinstance(b, str):
++            rel = b
++        elif isinstance(b, dict) and b:
++            short = name.split("/")[-1]
++            rel = b.get(short) or b.get(name) or list(b.values())[0]
++        else:
++            continue
++        path = os.path.normpath(os.path.join(root, name, rel))
++        if os.path.exists(path):
++            return path
++    return None
++
++
++def split_npx(command, args):
++    """(flags, spec, rest) for an npx command line, or None."""
++    if os.path.basename(command or "") != "npx":
++        return None
++    a = list(args or [])
++    flags = []
++    while a and a[0].startswith("-"):
++        flags.append(a.pop(0))
++    if not a:
++        return None
++    return flags, a[0], a[1:]
++
++
++def installed(command, args):
++    """True when the server can start without fetching anything."""
++    n = split_npx(command, args)
++    if n is None:
++        return os.path.basename(command or "") not in ("uvx",)
++    return _global_bin(_pkg_name(n[1])) is not None
++
++
++def resolve(command, args):
++    n = split_npx(command, args)
++    if n is None:
++        return command, list(args or [])
++    flags, spec, rest = n
++    path = _global_bin(_pkg_name(spec))
++    node = shutil.which("node")
++    if path and node:
++        return node, [path] + rest
++    extra = [] if "--prefer-offline" in flags else ["--prefer-offline"]
++    if not any(f in ("-y", "--yes") for f in flags):
++        extra.append("-y")
++    background_install(spec)
++    return command, flags + extra + [spec] + rest
++
++
++def background_install(spec):
++    """Detached `npm i -g <spec>` so the next start skips npx (best effort)."""
++    npm = shutil.which("npm")
++    if not npm:
++        return
++    try:
++        os.makedirs(LOG_DIR, exist_ok=True)
++        marker = os.path.join(LOG_DIR, ".installing-" + spec.replace("/", "_"))
++        if os.path.exists(marker):
++            return
++        open(marker, "w").close()
++        logf = open(os.path.join(LOG_DIR, "npm-install.log"), "a")
++        subprocess.Popen(
++            ["sh", "-c", 'npm install -g --no-audit --no-fund "$1"; rm -f "$2"', "sh", spec, marker],
++            stdin=subprocess.DEVNULL, stdout=logf, stderr=logf, start_new_session=True,
++        )
++    except OSError:
++        pass
++
++
++def default_startup(cfg):
++    if not installed(cfg.get("command", ""), cfg.get("args") or []):
++        return 180
++    return 60
++
++
++def stderr_path(name):
++    try:
++        os.makedirs(LOG_DIR, exist_ok=True)
++    except OSError:
++        pass
++    return os.path.join(LOG_DIR, "%s.err" % name.replace("/", "_"))
++
++
++def open_stderr(name):
++    """Fresh stderr file for this start (old one kept as .err.1)."""
++    p = stderr_path(name)
++    try:
++        if os.path.exists(p):
++            os.replace(p, p + ".1")
++        return open(p, "w")
++    except OSError:
++        return subprocess.DEVNULL
++
++
++def tail(name, lines=4):
++    try:
++        with open(stderr_path(name), "r", encoding="utf-8", errors="replace") as f:
++            data = f.read()[-4000:]
++    except OSError:
++        return ""
++    rows = [r.strip() for r in data.splitlines() if r.strip()]
++    return " | ".join(rows[-lines:])[:600]
++
++
++def explain(name, cfg):
++    """One line: the likeliest reason a server did not answer, from its stderr."""
++    t = tail(name)
++    low = t.lower()
++    if "enotfound" in low or "eai_again" in low or "getaddrinfo" in low:
++        why = "npm 下载不了包（DNS/网络）。运行 mines-doctor 查网络，或在 设置 → 沙箱 换 npm 源"
++    elif "etimedout" in low or "econnreset" in low or "socket hang up" in low or "network" in low:
++        why = "npm 下载包时网络超时/被重置。运行 mines-doctor"
++    elif "e404" in low or "404 not found" in low:
++        why = "npm 上没有这个包名"
++    elif "cannot find module" in low or "err_module_not_found" in low:
++        why = "包装坏了（缺文件），删掉后重新安装"
++    elif "eacces" in low or "permission denied" in low:
++        why = "没有权限"
++    elif "cookie" in low or "token" in low or "unauthor" in low or "api key" in low:
++        why = "缺少登录信息（Cookie/令牌），在 MCP 页填写"
++    elif t:
++        why = "服务器启动出错"
++    elif not installed(cfg.get("command", ""), cfg.get("args") or []):
++        why = "第一次启动要先从 npm 下载包，还没下载完（后台在装，稍后再试）"
++    else:
++        why = "进程没有输出任何错误"
++    return why + ((" — stderr: " + t) if t else "")
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/AppLauncher.kt b/src/android/app/src/main/java/com/openminis/app/plus/AppLauncher.kt
+new file mode 100644
+index 0000000..a6197c4
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/AppLauncher.kt
+@@ -0,0 +1,242 @@
++package com.openminis.app.plus
++
++import android.app.ActivityManager
++import android.app.NotificationChannel
++import android.app.NotificationManager
++import android.app.PendingIntent
++import android.content.ComponentName
++import android.content.Context
++import android.content.Intent
++import android.graphics.PixelFormat
++import android.os.Build
++import android.os.Handler
++import android.os.Looper
++import android.provider.Settings
++import android.util.Log
++import android.view.Gravity
++import android.view.View
++import android.view.WindowManager
++import androidx.core.app.NotificationCompat
++import com.openminis.app.accessibility.MinisAccessibilityService
++import com.openminis.app.offload.ShizukuManager
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.TimeUnit
++
++/**
++ * [Mines-launch-29] Open another app from the agent, honestly.
++ *
++ * build-28 bug: `android-a11y-cli open <pkg>` (and `do "open <pkg>"`) failed
++ * for every third-party app on the realme (Android 16). Two causes in code:
++ *  1. Package visibility. targetSdk 35 and the manifest had no
++ *     `<queries>` entry for launcher activities and no QUERY_ALL_PACKAGES, so
++ *     `getLaunchIntentForPackage("com.tencent.mm")` returned null for every
++ *     app the system didn't make visible — the open failed before trying.
++ *     (Manifest now declares both.)
++ *  2. Background activity launch (BAL) limits on Android 14–16. The open ran
++ *     from the app process with Mines in the background; `startActivity`
++ *     does not throw when BAL blocks it, so a launch that never happened was
++ *     reported as "打开了". Since Android 15, holding SYSTEM_ALERT_WINDOW only
++ *     exempts an app that currently has a visible overlay window.
++ *
++ * Order now (first that is allowed wins), then verify the app reached the
++ * foreground:
++ *   a. accessibility service context (a system-bound a11y service is BAL-exempt),
++ *   b. Shizuku `am start -n` (shell uid may start activities from background),
++ *   c. a 1-px overlay window held during the start (BAL "visible window"
++ *      exemption; needs 悬浮窗 permission),
++ *   d. plain start when Mines itself is in the foreground,
++ *   e. a notification 「点这里打开 X」 (one tap for the user) — reported as
++ *      not opened, never as success.
++ */
++object AppLauncher {
++    private const val TAG = "AppLauncher"
++    private const val CHANNEL = "mines_open_app"
++
++    data class Outcome(val ok: Boolean, val message: String, val pkg: String? = null, val via: String = "")
++
++    /** Package name or app label → launchable package (null = not found). */
++    fun resolve(context: Context, query: String): String? {
++        val q = query.trim()
++        if (q.isEmpty()) return null
++        val pm = context.packageManager
++        if (runCatching { pm.getLaunchIntentForPackage(q) }.getOrNull() != null) return q
++        val apps = runCatching {
++            pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
++        }.getOrDefault(emptyList())
++        fun label(r: android.content.pm.ResolveInfo) = runCatching { r.loadLabel(pm).toString() }.getOrDefault("")
++        return (apps.firstOrNull { it.activityInfo.packageName.equals(q, true) }
++            ?: apps.firstOrNull { label(it).equals(q, true) }
++            ?: apps.firstOrNull { label(it).contains(q, true) })?.activityInfo?.packageName
++    }
++
++    fun label(context: Context, pkg: String): String = runCatching {
++        val pm = context.packageManager
++        pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
++    }.getOrDefault(pkg)
++
++    /** Blocking (waits for the foreground check); not on the main thread. */
++    fun open(context: Context, query: String): Outcome {
++        val app = context.applicationContext
++        val pkg = resolve(app, query) ?: return Outcome(false,
++            "找不到「$query」：没有这个包名，也没有叫这个名字的应用（已安装的应用都能看到）。")
++        val intent = app.packageManager.getLaunchIntentForPackage(pkg)
++            ?: return Outcome(false, "「${label(app, pkg)}」没有可以打开的主界面（$pkg）", pkg)
++        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
++        val name = label(app, pkg)
++        val tried = ArrayList<String>()
++
++        fun verified(via: String): Outcome? {
++            when (waitForeground(app, pkg, 2500)) {
++                true -> return Outcome(true, "打开了「$name」（$pkg，经 $via）", pkg, via)
++                null -> return Outcome(true, "已请求打开「$name」（经 $via）。没开无障碍/Shizuku，无法确认它真的到了前台。", pkg, via)
++                false -> tried += "$via：系统没让它到前台"
++            }
++            return null
++        }
++
++        MinisAccessibilityService.getInstance()?.let { svc ->
++            val ok = onMain { runCatching { svc.startActivity(Intent(intent)) }.isSuccess } == true
++            if (ok) verified("无障碍")?.let { return it } else tried += "无障碍：启动失败"
++        }
++        if (runCatching { ShizukuManager.refresh(); ShizukuManager.isReady() }.getOrDefault(false)) {
++            val comp = intent.component?.flattenToShortString()
++            val argv = if (comp != null) arrayOf("am", "start", "-n", comp, "-a", Intent.ACTION_MAIN, "-c", Intent.CATEGORY_LAUNCHER)
++            else arrayOf("monkey", "-p", pkg, "-c", Intent.CATEGORY_LAUNCHER, "1")
++            val r = ShizukuManager.runProcess(argv, timeoutMs = 8_000)
++            if (r.exitCode == 0 && !r.combined.contains("Error", true)) verified("Shizuku")?.let { return it }
++            else tried += "Shizuku：${r.combined.lines().lastOrNull { it.isNotBlank() }?.take(80) ?: "exit ${r.exitCode}"}"
++        } else {
++            val st = runCatching { ShizukuManager.snapshot.value.state }.getOrNull()
++            if (st == ShizukuManager.State.NEED_PERMISSION) tried += "Shizuku：还没授权给 Mines"
++        }
++        if (Settings.canDrawOverlays(app)) {
++            val ok = withVisibleWindow(app) { runCatching { app.startActivity(Intent(intent)) }.isSuccess } == true
++            if (ok) verified("悬浮窗")?.let { return it } else tried += "悬浮窗：启动失败"
++        } else tried += "悬浮窗权限没开"
++        if (isForeground(app)) {
++            runCatching { app.startActivity(Intent(intent)) }
++            verified("前台")?.let { return it }
++        }
++        postTapToOpen(app, intent, name)
++        return Outcome(false, "没能直接打开「$name」：安卓不允许后台应用直接打开别的应用。" +
++            "已发一条通知「点这里打开 $name」。要让 AI 以后能直接打开：打开 Mines 的无障碍服务，或给 Mines 悬浮窗权限，或授权 Shizuku。" +
++            "（试过：${tried.joinToString("；")}）", pkg, "notification")
++    }
++
++    // ── helpers ─────────────────────────────────────────────────────────
++
++    private fun <T> onMain(block: () -> T): T? {
++        if (Looper.myLooper() == Looper.getMainLooper()) return runCatching(block).getOrNull()
++        val latch = CountDownLatch(1)
++        var out: T? = null
++        Handler(Looper.getMainLooper()).post { try { out = runCatching(block).getOrNull() } finally { latch.countDown() } }
++        latch.await(3, TimeUnit.SECONDS)
++        return out
++    }
++
++    /**
++     * Run [block] while Mines shows a 1×1 px, nearly transparent overlay
++     * window (BAL "app has a visible window" exemption on Android 14–16).
++     * The window is removed 1.5 s later. Through [Overlays] like every other
++     * floating window.
++     */
++    fun <T> withVisibleWindow(context: Context, focusable: Boolean = false, holdMs: Long = 1500, block: (View) -> T): T? {
++        val wm = context.getSystemService(WindowManager::class.java) ?: return null
++        val type = if (Build.VERSION.SDK_INT >= 26) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
++        else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
++        var flags = WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
++        if (!focusable) flags = flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
++        val lp = WindowManager.LayoutParams(1, 1, type, flags, PixelFormat.TRANSLUCENT).apply {
++            gravity = Gravity.TOP or Gravity.START; x = 0; y = 0
++        }
++        val shown = CountDownLatch(1)
++        var view: View? = null
++        val added = onMain {
++            val v = View(context).apply { setBackgroundColor(0x05000000) ; alpha = 0.05f }
++            view = v
++            v.viewTreeObserver.addOnWindowAttachListener(object : android.view.ViewTreeObserver.OnWindowAttachListener {
++                override fun onWindowAttached() { v.post { shown.countDown() } }
++                override fun onWindowDetached() {}
++            })
++            Overlays.add(wm, "launch-helper", v, lp)
++        }
++        if (added != true) return null
++        shown.await(800, TimeUnit.MILLISECONDS)
++        Thread.sleep(120)
++        return try {
++            view?.let { v -> onMain { block(v) } }
++        } finally {
++            Handler(Looper.getMainLooper()).postDelayed({ Overlays.remove(wm, view) }, holdMs)
++        }
++    }
++
++    fun isForeground(context: Context): Boolean = runCatching {
++        val am = context.getSystemService(ActivityManager::class.java)
++        am.runningAppProcesses.orEmpty().any { it.pid == android.os.Process.myPid() &&
++            it.importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND }
++    }.getOrDefault(false)
++
++    /** Foreground package as seen by accessibility (null = cannot tell). */
++    fun foregroundPackage(): String? = runCatching {
++        val svc = MinisAccessibilityService.getInstance() ?: return null
++        svc.windows?.firstOrNull { it.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION && it.isActive }
++            ?.root?.packageName?.toString() ?: svc.rootInActiveWindow?.packageName?.toString()
++    }.getOrNull()
++
++    private fun foregroundViaShizuku(): String? = runCatching {
++        if (!ShizukuManager.isReady()) return null
++        val r = ShizukuManager.runProcess(arrayOf("sh", "-c", "dumpsys activity activities | grep -E 'mResumedActivity|topResumedActivity' | head -1"), timeoutMs = 4000)
++        Regex("u0 ([a-zA-Z0-9_.]+)/").find(r.stdout)?.groupValues?.get(1)
++    }.getOrNull()
++
++    /**
++     * True once [pkg] is in front. When nothing can tell us (no a11y, no
++     * Shizuku) we fall back to "Mines left the foreground" after a start
++     * request, which is the best a plain app can see.
++     */
++    fun waitForeground(context: Context, pkg: String, ms: Long): Boolean? {
++        val until = System.currentTimeMillis() + ms
++        val canSee = MinisAccessibilityService.getInstance() != null || ShizukuManager.isReady()
++        val wasFg = isForeground(context)
++        if (!canSee && !wasFg) return null
++        while (System.currentTimeMillis() < until) {
++            Thread.sleep(250)
++            if (canSee) {
++                val fg = foregroundPackage() ?: foregroundViaShizuku()
++                if (fg == pkg) return true
++            } else if (!isForeground(context)) return true
++        }
++        return false
++    }
++
++    /** Start any activity intent from the background (a11y → 悬浮窗 → foreground). */
++    fun startFromBackground(context: Context, intent: Intent): Boolean {
++        val app = context.applicationContext
++        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
++        MinisAccessibilityService.getInstance()?.let { svc ->
++            if (onMain { runCatching { svc.startActivity(Intent(intent)) }.isSuccess } == true) return true
++        }
++        if (Settings.canDrawOverlays(app)) {
++            if (withVisibleWindow(app) { runCatching { app.startActivity(Intent(intent)) }.isSuccess } == true) return true
++        }
++        if (isForeground(app)) return runCatching { app.startActivity(Intent(intent)) }.isSuccess
++        return false
++    }
++
++    fun postTapToOpen(context: Context, intent: Intent, name: String) = runCatching {
++        val nm = context.getSystemService(NotificationManager::class.java)
++        if (Build.VERSION.SDK_INT >= 26 && nm.getNotificationChannel(CHANNEL) == null)
++            nm.createNotificationChannel(NotificationChannel(CHANNEL, "AI 打开应用", NotificationManager.IMPORTANCE_HIGH))
++        val pi = PendingIntent.getActivity(context, name.hashCode(), intent,
++            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
++        val n = NotificationCompat.Builder(context, CHANNEL)
++            .setSmallIcon(android.R.drawable.ic_menu_send)
++            .setContentTitle("点这里打开「$name」")
++            .setContentText("AI 想打开这里，安卓需要你点一下")
++            .setPriority(NotificationCompat.PRIORITY_HIGH)
++            .setAutoCancel(true)
++            .setContentIntent(pi)
++            .build()
++        nm.notify(0x4D0E + (name.hashCode() and 0xff), n)
++    }.onFailure { Log.w(TAG, "notify failed: ${it.message}") }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt b/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt
+index c926424..afc2dcd 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt
+@@ -267,7 +267,14 @@ class DeskPetService : Service() {
+             lastTouch = System.currentTimeMillis()
+             view.wakeUp()
+             restore()
+-            gestures.onTouchEvent(ev)
++            // [Mines-pet-29] Single taps were being lost: the pet's window
++            // moves under a still finger (untuck/restore on touch, walking,
++            // snap/peek animations), so the view-local x/y of the touch
++            // changed and GestureDetector read it as a drag past its slop.
++            // Feed it screen coordinates; only a real finger move counts.
++            val gev = MotionEvent.obtain(ev).apply { setLocation(ev.rawX, ev.rawY) }
++            gestures.onTouchEvent(gev)
++            gev.recycle()
+             when (ev.actionMasked) {
+                 MotionEvent.ACTION_DOWN -> {
+                     snapAnim?.cancel(); hideJob?.cancel()
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/DshWidgets.kt b/src/android/app/src/main/java/com/openminis/app/plus/DshWidgets.kt
+index 6ce047c..a6f5350 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/DshWidgets.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/DshWidgets.kt
+@@ -168,9 +168,52 @@ class PluginWidgetService : Service() {
+         goForeground()
+         if (root == null && canShow(this)) addWindow()
+         running = true
++        watch()
+         return START_STICKY
+     }
+ 
++    // [Mines-dsh-29] `minis-dsh off <widget>` must really make the widget go
++    // away: it used to only edit plugins.json while this window and the web
++    // host kept running. Every 3 s: when no enabled widget plugin is left
++    // (status.json from the socket's check, plugins.json enabled flags) the
++    // window closes; when the set changed the page reloads.
++    private val watchHandler = android.os.Handler(android.os.Looper.getMainLooper())
++    private var lastSet: Set<String>? = null
++    private var watching = false
++    private var emptyReads = 0
++    /** null = can't tell (stale/missing status) → leave the window alone. */
++    private fun enabledWidgets(): Set<String>? = runCatching {
++        if (!DshWebHost.statusFresh(this)) return@runCatching null
++        val home = java.io.File(com.openminis.app.sandbox.RootfsManager.getInstance(this).rootfsDir, "root/.minis-dsh")
++        val off = runCatching {
++            val arr = org.json.JSONObject(java.io.File(home, "plugins.json").readText()).optJSONArray("plugins") ?: org.json.JSONArray()
++            (0 until arr.length()).map { arr.getJSONObject(it) }.filter { !it.optBoolean("enabled", true) }.map { it.optString("package") }.toSet()
++        }.getOrDefault(emptySet())
++        DshWebHost.widgetPlugins(this).filter { it !in off }.toSet()
++    }.getOrNull()
++    private fun watch() {
++        if (watching) return
++        watching = true
++        val tick = object : Runnable {
++            override fun run() {
++                if (!running) { watching = false; return }
++                Thread {
++                    val now = enabledWidgets()
++                    watchHandler.post {
++                        if (now == null) return@post
++                        val prev = lastSet
++                        lastSet = now
++                        emptyReads = if (now.isEmpty()) emptyReads + 1 else 0
++                        if (emptyReads >= 2) { Log.i("PluginWidget", "no enabled widget left → closing"); stopSelf(); return@post }
++                        if (prev != null && prev != now) runCatching { web?.reload() }
++                    }
++                }.start()
++                watchHandler.postDelayed(this, 3000)
++            }
++        }
++        watchHandler.postDelayed(tick, 3000)
++    }
++
+     private fun goForeground() {
+         val nm = getSystemService(NotificationManager::class.java)
+         if (nm.getNotificationChannel(CHANNEL) == null) {
+@@ -283,6 +326,7 @@ class PluginWidgetService : Service() {
+ 
+     override fun onDestroy() {
+         running = false
++        watchHandler.removeCallbacksAndMessages(null)
+         runCatching { web?.destroy() }; web = null
+         root?.let { v -> Overlays.remove(wm, v) }; root = null
+         Overlays.removeAll("dsh-widget")
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt b/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
+index eb04c55..ac97c14 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
+@@ -69,6 +69,8 @@ class GeminiLive(
+             "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+         /** Checked against ai.google.dev/gemini-api/docs/live-api/get-started-websocket (2026-09-15). */
+         const val DEFAULT_MODEL = "gemini-3.8-live"
++        /** [Mines-voice-29] Full passes over every route before falling back to 普通语音模式. */
++        const val MAX_ROUNDS = 3
+         const val DEFAULT_PROMPT =
+             "你是 ${com.openminis.app.ui.brand.Brand.NAME}，用户的私人助手。用户视力不好，请用简短、口语化的中文回答，一次只说一件事。"
+         val voices = listOf("Puck", "Charon", "Kore", "Fenrir", "Aoede", "Leda", "Orus", "Zephyr")
+@@ -96,6 +98,15 @@ class GeminiLive(
+     private val _modelInUse = MutableStateFlow(model)
+     val modelInUse: StateFlow<String> = _modelInUse.asStateFlow()
+     @Volatile private var routeSel: GeminiRoute.Route? = null
++    // [Mines-voice-29] Route failover state for this call.
++    private val badRoutes = java.util.concurrent.ConcurrentHashMap<String, String>()
++    @Volatile private var rounds = 0
++    @Volatile private var setupAt = 0L
++    @Volatile private var sameRouteDrops = 0
++    private val _allFailed = MutableStateFlow(false)
++    /** True after every route failed [MAX_ROUNDS] rounds: UI offers 普通语音模式. */
++    val allFailed: StateFlow<Boolean> = _allFailed.asStateFlow()
++    private var netCb: android.net.ConnectivityManager.NetworkCallback? = null
+     @Volatile private var modelChecked = false
+     /** Off as soon as the cloned voice fails: Gemini's own audio plays again. */
+     @Volatile private var cloneOk = cloneVoice != null
+@@ -193,9 +204,61 @@ class GeminiLive(
+         retryJob?.cancel()
+         _error.value = null
+         routeSel = null
++        badRoutes.clear(); rounds = 0; sameRouteDrops = 0
++        _allFailed.value = false
+         connect()
+     }
+ 
++    private fun isSocketLevel(reason: String) = listOf("Socket closed", "reset", "EOF", "refused", "超时", "timeout",
++        "Broken pipe", "被重置", "被拒绝", "SocketException", "Connection", "unexpected end").any { reason.contains(it, true) }
++
++    /** [Mines-voice-29] Give up on Live for now; say why in one line; retry when the network changes. */
++    private fun giveUp(tried: List<GeminiRoute.Tried>, report: List<String>) {
++        _route.value = ""
++        _allFailed.value = true
++        _error.value = GeminiRoute.plainSummary(tried) + "。\n可以先用「普通语音模式」（本机识别 + 你平时的聊天模型 + 朗读），网络变化时会自动再试 Gemini。" +
++            "\n（详细：" + report.takeLast(6).joinToString("；") + "）"
++        _phase.value = Phase.ERROR
++        watchNetwork()
++    }
++
++    private fun watchNetwork() {
++        val ctx = appContext ?: return
++        if (netCb != null) return
++        val cm = ctx.getSystemService(android.net.ConnectivityManager::class.java) ?: return
++        var last = 0L
++        val cb = object : android.net.ConnectivityManager.NetworkCallback() {
++            override fun onAvailable(network: android.net.Network) = kick()
++            override fun onCapabilitiesChanged(network: android.net.Network, caps: android.net.NetworkCapabilities) = kick()
++            private fun kick() {
++                val now = System.currentTimeMillis()
++                if (now - last < 15_000) return
++                last = now
++                scope.launch {
++                    kotlinx.coroutines.delay(4000)
++                    if (stopped || !_allFailed.value) return@launch
++                    val k = apiKey
++                    val p = GeminiRoute.pick(appContext, k, model)
++                    if (p.route != null && !stopped && _allFailed.value) {
++                        _allFailed.value = false
++                        badRoutes.clear(); rounds = 0
++                        routeSel = p.route; _route.value = p.route.label
++                        _modelInUse.value = p.model ?: _modelInUse.value
++                        _error.value = "网络变了，Gemini 又能连上了（${p.route.label}）"
++                        openSocket()
++                    }
++                }
++            }
++        }
++        runCatching { cm.registerDefaultNetworkCallback(cb); netCb = cb }
++    }
++
++    private fun unwatchNetwork() {
++        val cb = netCb ?: return
++        netCb = null
++        runCatching { appContext?.getSystemService(android.net.ConnectivityManager::class.java)?.unregisterNetworkCallback(cb) }
++    }
++
+     fun setMuted(m: Boolean) { _muted.value = m }
+ 
+     fun sendText(text: String) {
+@@ -207,11 +270,20 @@ class GeminiLive(
+     private fun connect() {
+         _phase.value = Phase.CONNECTING
+         setupDone = false
+-        runCatching { ws?.cancel() }
++        // [Mines-voice-29] ROOT CAUSE of the build-28 「连接断了…原因：SocketException
++        // Socket closed（线路：代理 Clash:7890）」: connect() cancelled the old
++        // socket while `ws` still pointed at it (the new one is only assigned
++        // after the async route pick). OkHttp then reported the cancel as
++        // onFailure("Socket closed") on a socket that still counted as current,
++        // which started another reconnect — every 重新连接 / settings change /
++        // 测试语音 → 重新连接 during a live call produced it. Detach first.
++        val old = ws
++        ws = null
++        runCatching { old?.cancel() }
+         if (routeSel == null) {
+-            // [Mines-voice-26] Find a route that really reaches Gemini (and the live models) first.
++            // [Mines-voice-26/29] Find a route that really reaches Gemini: port, HTTPS and a Live handshake.
+             scope.launch {
+-                val pick = GeminiRoute.pick(appContext, apiKey) { step -> _error.value = step }
++                val pick = GeminiRoute.pick(appContext, apiKey, model, badRoutes.keys.toSet()) { step -> _error.value = step }
+                 if (stopped) return@launch
+                 if (pick.keyProblem != null) {
+                     _error.value = "Gemini 拒绝了这个 API Key：${pick.keyProblem}\n请在 账号连接 → Gemini 重新填写"
+@@ -219,14 +291,20 @@ class GeminiLive(
+                 }
+                 val r = pick.route
+                 if (r == null) {
+-                    _route.value = ""
+-                    _error.value = "连不上 Gemini（国内/香港直连会被拦）：\n" + pick.report.joinToString("\n") +
+-                        "\n→ 在 设置 → 模型路由与分流 填一个美国等地区出口的代理，或打开覆盖 Mines 的 VPN，再点 重新连接"
+-                    _phase.value = Phase.ERROR; return@launch
++                    rounds++
++                    if (rounds < MAX_ROUNDS) {
++                        badRoutes.clear()
++                        _error.value = "所有线路都没连上（第 $rounds 轮），3 秒后再试一轮…\n" + pick.report.takeLast(4).joinToString("\n")
++                        retryJob?.cancel()
++                        retryJob = scope.launch { kotlinx.coroutines.delay(3000); if (!stopped) connect() }
++                        return@launch
++                    }
++                    giveUp(pick.tried, pick.report)
++                    return@launch
+                 }
+                 routeSel = r
+                 _route.value = r.label
+-                val use = GeminiRoute.chooseModel(model, pick.models)
++                val use = pick.model ?: GeminiRoute.chooseModel(model, pick.models)
+                 modelChecked = pick.models.isNotEmpty()
+                 _modelInUse.value = use
+                 _error.value = if (use != model) "模型 $model 不可用，已改用 $use" else null
+@@ -287,30 +365,34 @@ class GeminiLive(
+             _phase.value = Phase.ERROR
+             return
+         }
+-        // [Mines-voice-reconnect] Network drops, server goAway and idle
+-        // timeouts reconnect by themselves with backoff (1, 2, 4 … 20 s) and
+-        // resume the session; the 重新连接 button only appears after
+-        // [maxRetries] failed attempts in a row.
+-        if (retries < maxRetries) {
+-            retries++
+-            val wait = (1000L shl (retries - 1).coerceAtMost(5)).coerceAtMost(20_000L)
+-            _error.value = "连接断了，正在自动重连（第 $retries 次）…\n原因：" + reason.ifBlank { "代码 $code" } + (if (_route.value.isNotBlank()) "（线路：${_route.value}）" else "")
+-            // After two failures in a row on the same route, look for another route.
+-            if (retries >= 2 && !setupDone) routeSel = null
++        // [Mines-voice-29] Route failover. A socket that dies before setup, or
++        // dies with a socket-level error within 30 s of setup, marks its route
++        // bad for this call and the next route is tried at once (instead of
++        // reconnecting the same dead proxy with backoff). An established
++        // session that drops later reconnects on the same route once (with
++        // session resumption); if that fails too, it fails over.
++        val label = routeSel?.label
++        val age = if (setupAt > 0) System.currentTimeMillis() - setupAt else 0L
++        val failOver = !setupDone || (isSocketLevel(reason) && age < 30_000) || sameRouteDrops >= 1
++        if (failOver) {
++            if (label != null) badRoutes[label] = reason.ifBlank { "代码 $code" }
++            routeSel = null
++            sameRouteDrops = 0
+             _phase.value = Phase.CONNECTING
++            _error.value = "线路「${label ?: "?"}」不通：" + reason.ifBlank { "代码 $code" } + "\n正在换下一条线路…"
+             retryJob?.cancel()
+-            retryJob = scope.launch {
+-                kotlinx.coroutines.delay(wait)
+-                if (!stopped) connect()
+-            }
++            retryJob = scope.launch { kotlinx.coroutines.delay(400); if (!stopped) connect() }
+             return
+         }
+-        modelSwitchTried = false
+-        _error.value = when {
+-            reason.isNotBlank() -> "连接断开：$reason（已自动重试 $maxRetries 次）"
+-            else -> "连接断开（$code），已自动重试 $maxRetries 次"
++        sameRouteDrops++
++        retries++
++        _phase.value = Phase.CONNECTING
++        _error.value = "连接断了，正在重连（线路：${label ?: "?"}）…\n原因：" + reason.ifBlank { "代码 $code" }
++        retryJob?.cancel()
++        retryJob = scope.launch {
++            kotlinx.coroutines.delay(1000)
++            if (!stopped) connect()
+         }
+-        _phase.value = Phase.ERROR
+     }
+ 
+     private fun setupMessage(): JSONObject {
+@@ -389,6 +471,9 @@ class GeminiLive(
+         }
+         if (msg.has("setupComplete")) {
+             setupDone = true
++            setupAt = System.currentTimeMillis()
++            rounds = 0; sameRouteDrops = 0
++            _allFailed.value = false
+             retries = 0
+             _error.value = null
+             startAudio()
+@@ -512,8 +597,10 @@ class GeminiLive(
+         speakJob?.cancel(); speakJob = null
+         retryJob?.cancel()
+         stopAudio()
+-        runCatching { ws?.close(1000, "bye") }
++        val w = ws
+         ws = null
++        runCatching { w?.close(1000, "bye") }
++        unwatchNetwork()
+         _phase.value = Phase.IDLE
+     }
+ }
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/GeminiRoute.kt b/src/android/app/src/main/java/com/openminis/app/plus/GeminiRoute.kt
+index 4c2dc20..0b6fd13 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/GeminiRoute.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/GeminiRoute.kt
+@@ -54,10 +54,14 @@ object GeminiRoute {
+         .callTimeout(if (readMs == 0L) 0 else readMs + 8000, TimeUnit.MILLISECONDS)
+         .build()
+ 
+-    /** Candidate routes, best guess first. Blocking (resolves proxy hosts); IO thread. */
++    /**
++     * Candidate routes in the order voice should try them (Mines build-29):
++     * working proxies first (分流代理, saved upstreams, the system proxy),
++     * then VPN-app ports detected on the phone, then direct. The last route
++     * that worked moves to the front. Blocking (resolves proxy hosts); IO.
++     */
+     fun routes(context: Context?, withDetect: Boolean): List<Route> {
+         val out = ArrayList<Route>()
+-        out += Route("直连", Proxy.NO_PROXY)
+         if (SplitProxy.active && SplitProxy.settings.value.hasUpstream)
+             out += Route("分流代理（127.0.0.1:${SplitProxy.PORT}）", Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", SplitProxy.PORT)))
+         SplitProxy.settings.value.all.forEach { u ->
+@@ -78,11 +82,24 @@ object GeminiRoute {
+                 out += Route("${f.source} ${u.host}:${u.port}", Proxy(if (u.type == "socks5") Proxy.Type.SOCKS else Proxy.Type.HTTP, InetSocketAddress(u.host, u.port)))
+             }
+         }
++        out += Route("直连", Proxy.NO_PROXY)
+         val dedup = out.distinctBy { it.proxy.toString() }
+         val lg = lastGood
+         return if (lg == null) dedup else dedup.sortedBy { if (it.label == lg) 0 else 1 }
+     }
+ 
++    /** [Mines-voice-29] Is something listening on the proxy port at all (≤ 800 ms)? */
++    fun proxyPortUp(route: Route): Boolean {
++        val a = route.proxy.address() as? InetSocketAddress ?: return true
++        return runCatching {
++            java.net.Socket().use { it.connect(InetSocketAddress(a.hostString, a.port), 800) }; true
++        }.getOrDefault(false)
++    }
++
++    /** What went wrong on a route, for the one plain line shown at the end. */
++    enum class Fail { NONE, PROXY_DOWN, BLOCKED, REGION, KEY, LIVE }
++    data class Tried(val route: Route, val fail: Fail, val note: String)
++
+     fun probe(route: Route, key: String): Probe = runCatching {
+         client(route, 10_000).newCall(Request.Builder().url(MODELS_URL + key).build()).execute().use { r -> fromResponse(route, r) }
+     }.getOrElse { e -> Probe(route, false, shortErr(e)) }
+@@ -124,23 +141,59 @@ object GeminiRoute {
+         }
+     }
+ 
+-    data class Pick(val route: Route?, val models: List<String>, val report: List<String>, val keyProblem: String? = null)
++    data class Pick(val route: Route?, val models: List<String>, val report: List<String>, val keyProblem: String? = null,
++                    val model: String? = null, val tried: List<Tried> = emptyList())
+ 
+-    /** Tries the routes in order; the VPN-app scan only runs when the quick ones all fail. */
+-    fun pick(context: Context?, key: String, onStep: (String) -> Unit = {}): Pick {
++    /**
++     * [Mines-voice-29] Tries the routes in order, each with a REAL check of
++     * what the call needs: proxy port up → models list over HTTPS → a Live
++     * WebSocket setup handshake (the same wss URL, proxy and setup as the
++     * call). The REST check alone passed on proxies that then closed the
++     * WebSocket. [exclude] = route labels that already failed this call.
++     */
++    fun pick(context: Context?, key: String, wantedModel: String = GeminiLive.DEFAULT_MODEL,
++             exclude: Set<String> = emptySet(), onStep: (String) -> Unit = {}): Pick {
+         val report = ArrayList<String>()
+-        val tried = HashSet<String>()
+-        for (pass in 0..1) {
+-            for (r in routes(context, withDetect = pass == 1)) {
+-                if (!tried.add(r.proxy.toString())) continue
+-                onStep("正在试：${r.label}…")
+-                val p = probe(r, key)
+-                report += "${if (p.ok) "✓" else "✗"} ${r.label}：${p.note}"
+-                if (p.keyProblem) return Pick(null, emptyList(), report, p.note)
+-                if (p.ok) { lastGood = r.label; return Pick(r, p.models, report) }
++        val tried = ArrayList<Tried>()
++        val seen = HashSet<String>()
++        for (r in routes(context, withDetect = true)) {
++            if (!seen.add(r.proxy.toString())) continue
++            if (r.label in exclude) { report += "✗ ${r.label}：这次通话里已经断过，跳过"; continue }
++            onStep("正在试：${r.label}…")
++            if (r.proxy != Proxy.NO_PROXY && !proxyPortUp(r)) {
++                report += "✗ ${r.label}：端口没开（代理软件没在运行）"
++                tried += Tried(r, Fail.PROXY_DOWN, "端口没开"); continue
+             }
++            val p = probe(r, key)
++            if (p.keyProblem) { report += "✗ ${r.label}：${p.note}"; return Pick(null, emptyList(), report, p.note, tried = tried) }
++            if (!p.ok) {
++                report += "✗ ${r.label}：${p.note}"
++                tried += Tried(r, if (p.note.contains("地区")) Fail.REGION else Fail.BLOCKED, p.note); continue
++            }
++            val model = chooseModel(wantedModel, p.models)
++            onStep("正在试：${r.label}（实时通道握手）…")
++            val hs = liveHandshake(r, key, model)
++            report += "${if (hs.startsWith("✓")) "✓" else "✗"} ${r.label}：HTTPS ${p.note}；${hs.removePrefix("✓ ").removePrefix("✗ ")}"
++            if (hs.startsWith("✓")) { lastGood = r.label; return Pick(r, p.models, report, model = model, tried = tried + Tried(r, Fail.NONE, "ok")) }
++            tried += Tried(r, Fail.LIVE, hs.removePrefix("✗ "))
+         }
+-        return Pick(null, emptyList(), report)
++        return Pick(null, emptyList(), report, tried = tried)
++    }
++
++    /** [Mines-voice-29] One plain sentence for "nothing works", e.g. 「代理 Clash 没在工作，Google 直连也连不上」. */
++    fun plainSummary(tried: List<Tried>): String {
++        val parts = ArrayList<String>()
++        val proxies = tried.filter { it.route.proxy != Proxy.NO_PROXY }
++        val down = proxies.filter { it.fail == Fail.PROXY_DOWN }.map { it.route.label }
++        if (down.isNotEmpty()) parts += down.joinToString("、") { it.removePrefix("代理 ") } + " 没在工作（代理软件没开？）"
++        val region = proxies.filter { it.fail == Fail.REGION }
++        if (region.isNotEmpty()) parts += region.joinToString("、") { it.route.label } + " 的出口地区不支持 Gemini"
++        val blocked = proxies.filter { it.fail == Fail.BLOCKED || it.fail == Fail.LIVE }
++        if (blocked.isNotEmpty()) parts += blocked.joinToString("、") { it.route.label } + " 连不上 Google 实时通道"
++        val direct = tried.firstOrNull { it.route.proxy == Proxy.NO_PROXY }
++        if (direct != null && direct.fail != Fail.NONE) parts += "Google 直连" + (if (proxies.isEmpty()) "" else "也") + "连不上"
++        if (proxies.isEmpty()) parts += "没有可用的代理/VPN"
++        return parts.joinToString("，").ifBlank { "所有线路都连不上 Gemini" }
+     }
+ 
+     /** The model to use: the configured one when the server lists it, else a valid live model. */
+@@ -161,19 +214,20 @@ object GeminiRoute {
+         val key = apiKey()
+         if (key == null) { out += "✗ 没有 Gemini API Key：账号连接 → Gemini 里填写"; return out }
+         out += "✓ API Key：…${key.takeLast(4)}"
+-        val pick = pick(context, key)
++        // [Mines-voice-29] Same selection as the call: proxy port check, HTTPS, Live handshake per route.
++        val pick = pick(context, key, wantedModel)
+         out += pick.report
+         if (pick.keyProblem != null) { out += "→ 去 账号连接 → Gemini 换一个有效的 Key"; return out }
+         val route = pick.route
+         if (route == null) {
+-            out += "✗ 所有线路都连不上 Gemini（国内和香港直连都不行）"
++            out += "✗ " + plainSummary(pick.tried)
+             out += "→ 在 设置 → 模型路由与分流 填一个美国/日本/新加坡出口的代理（HTTP 或 SOCKS5），或打开能覆盖 Mines 的 VPN"
+         } else {
+             out += "✓ 通话将走：${route.label}"
+-            val model = chooseModel(wantedModel, pick.models)
++            val model = pick.model ?: chooseModel(wantedModel, pick.models)
+             if (pick.models.isNotEmpty()) out += "· 这个 Key 能用的实时模型：" + pick.models.take(6).joinToString("、")
+             out += if (model == wantedModel) "✓ 模型 $model 可用" else "⚠ 模型 $wantedModel 不在列表里，通话会改用 $model"
+-            out += liveHandshake(route, key, model)
++            out += "✓ Live 实时通道握手成功（$model，同一条线路）"
+         }
+         // microphone
+         if (androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Listen.kt b/src/android/app/src/main/java/com/openminis/app/plus/Listen.kt
+new file mode 100644
+index 0000000..34dede8
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/Listen.kt
+@@ -0,0 +1,175 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import android.content.Intent
++import android.os.Build
++import android.os.Bundle
++import android.os.Handler
++import android.os.Looper
++import android.speech.RecognitionListener
++import android.speech.RecognizerIntent
++import android.speech.SpeechRecognizer
++import android.util.Log
++import com.openminis.app.speech.OfflineAsrEngine
++import com.openminis.app.speech.RecognitionError
++import com.openminis.app.speech.SpeechRecognitionEngine
++import java.util.Locale
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.TimeUnit
++import java.util.concurrent.atomic.AtomicReference
++
++/**
++ * [Mines-stt-29] One utterance → text, with fallbacks. Used by
++ * `android-speech listen` and by 普通语音模式 (voice chat without Google).
++ *
++ * build-28 bug (realme UI 16): `android-speech listen` returned "Client error"
++ * while `status` said available. The handler always created the ON-DEVICE
++ * recognizer on Android 12+ (`createOnDeviceSpeechRecognizer`). On ROMs whose
++ * recognition service has no on-device model (realme / ColorOS ship one only
++ * for some languages, or none), creation succeeds but `startListening`
++ * answers ERROR_CLIENT (5) or LANGUAGE_NOT_SUPPORTED/UNAVAILABLE (12/13) at
++ * once — and there was no second attempt. Order now:
++ *   1. the regular system recognizer (the ROM's / Google's service),
++ *   2. the on-device recognizer,
++ *   3. Vosk offline (model already downloaded, or downloaded now: ~42 MB once),
++ * each tried only after the previous one failed for a reason that another
++ * engine could fix (not "no speech").
++ */
++object Listen {
++    private const val TAG = "MinesListen"
++
++    data class Result(val text: String?, val engine: String, val error: String? = null, val tried: List<String> = emptyList())
++
++    /** Blocking; never call on the main thread. */
++    fun once(context: Context, maxSec: Int = 15, language: String? = null, allowDownload: Boolean = true): Result {
++        val app = context.applicationContext
++        val tried = ArrayList<String>()
++        val systemOk = runCatching { SpeechRecognizer.isRecognitionAvailable(app) }.getOrDefault(false)
++        if (systemOk) {
++            val r = system(app, onDevice = false, maxSec = maxSec, language = language)
++            tried += "系统识别：" + (r.error ?: "OK")
++            if (r.text != null || r.error == NO_SPEECH) return r.copy(tried = tried)
++        } else tried += "系统识别：这台手机没有可用的识别服务"
++        if (Build.VERSION.SDK_INT >= 31 && runCatching { SpeechRecognizer.isOnDeviceRecognitionAvailable(app) }.getOrDefault(false)) {
++            val r = system(app, onDevice = true, maxSec = maxSec, language = language)
++            tried += "本机识别：" + (r.error ?: "OK")
++            if (r.text != null || r.error == NO_SPEECH) return r.copy(tried = tried)
++        }
++        val zh = language == null || !language.startsWith("en")
++        val model = if (zh) OfflineAsrEngine.MODEL_ZH else OfflineAsrEngine.MODEL_EN
++        if (!OfflineAsrEngine.modelReady(app, model)) {
++            if (!allowDownload) {
++                tried += "离线识别：语音包没下载"
++                return Result(null, "none", "没有能用的语音识别：" + tried.joinToString("；"), tried)
++            }
++            tried += "离线识别：正在下载语音包（约 42 MB，只下载一次）"
++            if (!OfflineAsrEngine.ensureModel(app, model)) {
++                return Result(null, "none", "没有能用的语音识别，离线语音包也下载失败：" + tried.joinToString("；"), tried)
++            }
++        }
++        val r = vosk(app, maxSec, if (zh) Locale.CHINA else Locale.US)
++        tried += "离线识别：" + (r.error ?: "OK")
++        return r.copy(tried = tried)
++    }
++
++    const val NO_SPEECH = "没听到说话"
++
++    private fun system(app: Context, onDevice: Boolean, maxSec: Int, language: String?): Result {
++        val engine = if (onDevice) "on-device" else "system"
++        val latch = CountDownLatch(1)
++        val out = AtomicReference(Result(null, engine, "没有结果"))
++        val main = Handler(Looper.getMainLooper())
++        val ref = AtomicReference<SpeechRecognizer?>(null)
++        main.post {
++            val rec = runCatching {
++                if (onDevice && Build.VERSION.SDK_INT >= 31) SpeechRecognizer.createOnDeviceSpeechRecognizer(app)
++                else SpeechRecognizer.createSpeechRecognizer(app)
++            }.getOrElse { e -> out.set(Result(null, engine, "建不了识别器：${e.message}")); latch.countDown(); return@post }
++            ref.set(rec)
++            rec.setRecognitionListener(object : RecognitionListener {
++                override fun onResults(results: Bundle?) {
++                    val t = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
++                    out.set(if (t.isNullOrBlank()) Result(null, engine, NO_SPEECH) else Result(t, engine))
++                    latch.countDown()
++                }
++                override fun onError(error: Int) {
++                    out.set(Result(null, engine, if (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) NO_SPEECH else describe(error)))
++                    latch.countDown()
++                }
++                override fun onReadyForSpeech(params: Bundle?) {}
++                override fun onBeginningOfSpeech() {}
++                override fun onRmsChanged(rmsdB: Float) {}
++                override fun onBufferReceived(buffer: ByteArray?) {}
++                override fun onEndOfSpeech() {}
++                override fun onPartialResults(partialResults: Bundle?) {}
++                override fun onEvent(eventType: Int, params: Bundle?) {}
++            })
++            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
++                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
++                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
++                putExtra(RecognizerIntent.EXTRA_LANGUAGE, language ?: Locale.getDefault().toLanguageTag())
++                putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, app.packageName)
++            }
++            runCatching { rec.startListening(intent) }.onFailure { e ->
++                out.set(Result(null, engine, "开始识别失败：${e.message}")); latch.countDown()
++            }
++        }
++        if (!latch.await(maxSec + 8L, TimeUnit.SECONDS)) out.set(Result(null, engine, "识别超时"))
++        main.post { runCatching { ref.getAndSet(null)?.destroy() } }
++        Log.i(TAG, "$engine → ${out.get().error ?: "ok"}")
++        return out.get()
++    }
++
++    fun describe(error: Int): String = when (error) {
++        SpeechRecognizer.ERROR_AUDIO -> "录音出错"
++        SpeechRecognizer.ERROR_CLIENT -> "Client error（识别服务拒绝了请求，常见于没有本机语音模型的手机）"
++        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "没有麦克风权限"
++        SpeechRecognizer.ERROR_NETWORK -> "网络错误"
++        SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "网络超时"
++        SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "识别服务正忙"
++        SpeechRecognizer.ERROR_SERVER -> "识别服务器出错"
++        12 -> "不支持这个语言"
++        13 -> "这个语言的识别包不可用"
++        10 -> "请求太多"
++        11 -> "识别服务断开"
++        else -> "错误码 $error"
++    }
++
++    /** Vosk until ~1.2 s of quiet after speech, or [maxSec]. */
++    private fun vosk(app: Context, maxSec: Int, locale: Locale): Result {
++        val eng = OfflineAsrEngine(app)
++        val acc = StringBuilder()
++        val err = AtomicReference<String?>(null)
++        var floor = Float.MAX_VALUE
++        var spokeAt = 0L
++        var quietSince = 0L
++        val start = System.currentTimeMillis()
++        val ended = CountDownLatch(1)
++        eng.start(locale, object : SpeechRecognitionEngine.Listener {
++            override fun onPartial(text: String) {}
++            override fun onFinal(text: String) {
++                synchronized(acc) { if (text.isNotBlank()) { if (acc.isNotEmpty()) acc.append(' '); acc.append(text.trim()) } }
++            }
++            override fun onError(error: RecognitionError, message: String?) { err.set(message ?: error.name); ended.countDown() }
++            override fun onRmsDb(rms: Float) {
++                val now = System.currentTimeMillis()
++                if (now - start < 400) { floor = minOf(floor, rms); return }
++                if (floor == Float.MAX_VALUE) floor = rms
++                if (rms > floor + 12) { spokeAt = now; quietSince = 0L }
++                else if (spokeAt > 0 && quietSince == 0L) quietSince = now
++                if ((spokeAt > 0 && quietSince > 0 && now - quietSince > 1200) || now - start > maxSec * 1000L ||
++                    (spokeAt == 0L && now - start > 6000)) ended.countDown()
++            }
++        })
++        ended.await(maxSec + 5L, TimeUnit.SECONDS)
++        eng.stop()
++        Thread.sleep(700)
++        eng.cancel()
++        val t = synchronized(acc) { acc.toString().trim() }
++        return when {
++            t.isNotEmpty() -> Result(t, "vosk")
++            err.get() != null -> Result(null, "vosk", err.get())
++            else -> Result(null, "vosk", NO_SPEECH)
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlainVoice.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlainVoice.kt
+new file mode 100644
+index 0000000..a4d7a81
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/PlainVoice.kt
+@@ -0,0 +1,145 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import android.speech.tts.TextToSpeech
++import android.speech.tts.UtteranceProgressListener
++import com.openminis.app.MinisApp
++import com.openminis.app.debug.HeadlessChatRunner
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.isActive
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import java.util.Locale
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.TimeUnit
++
++/**
++ * [Mines-voice-29] 普通语音模式: voice chat that needs no Google.
++ *
++ * listen (system recognizer → on-device → Vosk offline, see [Listen]) →
++ * the user's normal chat model in a regular Mines chat session (so DeepSeek
++ * etc. reached directly, tools included) → read the reply aloud with the
++ * system TTS → listen again. Offered by the Live screen when every Gemini
++ * route failed.
++ */
++class PlainVoice(private val context: Context) {
++    enum class Phase { IDLE, LISTENING, THINKING, SPEAKING, ERROR }
++
++    private val _phase = MutableStateFlow(Phase.IDLE)
++    val phase: StateFlow<Phase> = _phase.asStateFlow()
++    private val _status = MutableStateFlow<String?>(null)
++    val status: StateFlow<String?> = _status.asStateFlow()
++    private val _lines = MutableStateFlow<List<GeminiLive.Line>>(emptyList())
++    val lines: StateFlow<List<GeminiLive.Line>> = _lines.asStateFlow()
++
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++    private var job: Job? = null
++    private var tts: TextToSpeech? = null
++    @Volatile private var ttsReady = false
++    private var sessionId: String? = null
++
++    fun start() {
++        if (job?.isActive == true) return
++        initTts()
++        job = scope.launch { loop() }
++    }
++
++    fun stop() {
++        job?.cancel(); job = null
++        runCatching { tts?.stop(); tts?.shutdown() }
++        tts = null; ttsReady = false
++        _phase.value = Phase.IDLE
++    }
++
++    private fun initTts() {
++        if (tts != null) return
++        val latch = CountDownLatch(1)
++        tts = TextToSpeech(context.applicationContext) { st ->
++            ttsReady = st == TextToSpeech.SUCCESS
++            if (ttsReady) runCatching { tts?.language = Locale.SIMPLIFIED_CHINESE }
++            latch.countDown()
++        }
++        scope.launch { latch.await(5, TimeUnit.SECONDS) }
++    }
++
++    private suspend fun ensureSession(): String? {
++        sessionId?.let { return it }
++        val app = context.applicationContext as? MinisApp ?: return null
++        val model = app.providerRepository.lastUsedVisibleEntry()?.baseModel?.id
++            ?: app.providerRepository.allVisibleEntries().firstOrNull()?.baseModel?.id ?: return null
++        val s = app.chatRepository.createSession(modelId = model, title = "语音对话")
++        runCatching { app.chatRepository.dao.updateSource(s.id, "voice") }
++        sessionId = s.id
++        return s.id
++    }
++
++    private suspend fun loop() {
++        var misses = 0
++        while (currentCoroutineContextActive()) {
++            _phase.value = Phase.LISTENING
++            _status.value = "请说话…"
++            val heard = withContext(Dispatchers.IO) { Listen.once(context, maxSec = 20) }
++            if (heard.text.isNullOrBlank()) {
++                if (heard.error == Listen.NO_SPEECH) {
++                    misses++
++                    if (misses >= 3) { _status.value = "好像没人说话，已暂停。点「继续」再聊。"; _phase.value = Phase.IDLE; return }
++                    continue
++                }
++                _status.value = "听不了：${heard.error}"
++                _phase.value = Phase.ERROR
++                return
++            }
++            misses = 0
++            add(true, heard.text)
++            _phase.value = Phase.THINKING
++            _status.value = "正在想…"
++            val sid = ensureSession()
++            if (sid == null) { _status.value = "没有可用的聊天模型：先在 设置 → 模型 里添加一个"; _phase.value = Phase.ERROR; return }
++            val r = runCatching {
++                HeadlessChatRunner.prompt(context, sid,
++                    heard.text + "\n（这是语音对话：请用简短口语回答，不要用 Markdown、表格或代码块。）",
++                    wait = true, timeoutMs = 120_000)
++            }.getOrNull()
++            val reply = r?.responseText?.takeIf { it.isNotBlank() && r.status != "Error" && r.status != "Rejected" }
++            if (reply == null) {
++                _status.value = "模型没有回答（${r?.status ?: "出错"}${r?.responseText?.let { "：" + it.take(80) } ?: ""}）"
++                _phase.value = Phase.ERROR
++                return
++            }
++            add(false, reply)
++            _phase.value = Phase.SPEAKING
++            _status.value = null
++            speak(clean(reply))
++            delay(250)
++        }
++    }
++
++    private suspend fun currentCoroutineContextActive(): Boolean = kotlinx.coroutines.currentCoroutineContext().isActive
++
++    private fun clean(t: String) = t.replace(Regex("```[\\s\\S]*?```"), "（代码略）")
++        .replace(Regex("[*#>`|_]+"), "").replace(Regex("\\[(.*?)]\\(.*?\\)"), "$1").take(1500)
++
++    private fun speak(text: String) {
++        val t = tts ?: return
++        if (!ttsReady) return
++        val done = CountDownLatch(1)
++        t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
++            override fun onStart(utteranceId: String?) {}
++            override fun onDone(utteranceId: String?) { done.countDown() }
++            @Deprecated("Deprecated in Java") override fun onError(utteranceId: String?) { done.countDown() }
++        })
++        t.speak(text, TextToSpeech.QUEUE_FLUSH, null, "mines-plain")
++        done.await((text.length / 3L + 10).coerceAtMost(180), TimeUnit.SECONDS)
++    }
++
++    private fun add(user: Boolean, text: String) {
++        _lines.value = (_lines.value + GeminiLive.Line(user, text)).takeLast(40)
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
+new file mode 100644
+index 0000000..0912e7d
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
+@@ -0,0 +1,84 @@
++package com.openminis.app.plus
++
++import android.content.ContentProvider
++import android.content.ContentValues
++import android.database.Cursor
++import android.net.Uri
++import android.os.Binder
++import android.os.Bundle
++import android.os.Process
++import com.openminis.app.offload.OffloadPermissionManager
++import com.openminis.app.sandbox.NativeOffloadRequest
++import com.openminis.app.sandbox.NativeOffloadServer
++import java.util.concurrent.Callable
++import java.util.concurrent.Executors
++import java.util.concurrent.TimeUnit
++
++/**
++ * [Mines-selftest-29] Lets the CI emulator smoke test run the same offload
++ * commands the agent runs (android-a11y-cli open, android-device storage,
++ * android-speech, android-clipboard, android-location …) without the arm64
++ * sandbox, which can't boot on the x86_64 emulator:
++ *
++ *   adb shell content call --uri content://com.openminis.mines.plus.selftest \
++ *       --method offload --arg 'android-device storage'
++ *
++ * Only the adb shell (uid 2000) and root may call it; anything else gets a
++ * SecurityException. It adds no capability an app could use.
++ */
++class SelfTestProvider : ContentProvider() {
++    override fun onCreate() = true
++
++    override fun call(method: String, arg: String?, extras: Bundle?): Bundle {
++        val uid = Binder.getCallingUid()
++        if (uid != 2000 && uid != 0) throw SecurityException("self-test is adb-only")
++        val out = Bundle()
++        when (method) {
++            "allow" -> {
++                // grant the agent gate for one offload tool (BYPASS), e.g. a11y_cli
++                OffloadPermissionManager.setLevel(arg ?: "", OffloadPermissionManager.PermissionLevel.BYPASS)
++                out.putString("result", "ok")
++            }
++            "offload" -> {
++                val argv = split(arg ?: "")
++                val h = NativeOffloadServer.handlerFor(argv.firstOrNull() ?: "")
++                if (h == null) { out.putInt("exit", 127); out.putString("result", "no handler"); return out }
++                val timeout = extras?.getLong("timeoutMs", 40_000L) ?: 40_000L
++                val ex = Executors.newSingleThreadExecutor()
++                val t0 = System.currentTimeMillis()
++                try {
++                    val r = ex.submit(Callable { h.handle(NativeOffloadRequest(Process.myPid(), argv, emptyMap(), "/", null)) })
++                        .get(timeout, TimeUnit.MILLISECONDS)
++                    out.putInt("exit", r.exitCode); out.putString("result", r.output)
++                } catch (e: java.util.concurrent.TimeoutException) {
++                    out.putInt("exit", 124); out.putString("result", "TIMEOUT after ${timeout} ms")
++                } catch (e: Throwable) {
++                    out.putInt("exit", 1); out.putString("result", "${e.javaClass.simpleName}: ${e.message}")
++                } finally { ex.shutdownNow() }
++                out.putLong("ms", System.currentTimeMillis() - t0)
++            }
++            else -> out.putString("result", "unknown method")
++        }
++        return out
++    }
++
++    private fun split(s: String): List<String> {
++        val out = ArrayList<String>(); val cur = StringBuilder(); var q: Char? = null; var any = false
++        for (c in s) {
++            when {
++                q != null -> if (c == q) q = null else cur.append(c)
++                c == '"' || c == '\'' -> { q = c; any = true }
++                c == ' ' -> { if (cur.isNotEmpty() || any) { out += cur.toString(); cur.clear(); any = false } }
++                else -> cur.append(c)
++            }
++        }
++        if (cur.isNotEmpty() || any) out += cur.toString()
++        return out
++    }
++
++    override fun query(uri: Uri, p: Array<out String>?, s: String?, a: Array<out String>?, o: String?): Cursor? = null
++    override fun getType(uri: Uri): String? = null
++    override fun insert(uri: Uri, values: ContentValues?): Uri? = null
++    override fun delete(uri: Uri, s: String?, a: Array<out String>?) = 0
++    override fun update(uri: Uri, v: ContentValues?, s: String?, a: Array<out String>?) = 0
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ShizukuAsk.kt b/src/android/app/src/main/java/com/openminis/app/plus/ShizukuAsk.kt
+new file mode 100644
+index 0000000..a27218c
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/ShizukuAsk.kt
+@@ -0,0 +1,60 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import com.openminis.app.offload.ShizukuManager
++import rikka.shizuku.Shizuku
++
++/**
++ * [Mines-shizuku-29] "Shizuku not authorized → pm/am/monkey all fail".
++ *
++ * Before: every privileged command answered PERMISSION_DENIED "grant it in
++ * Settings → Permissions → Shizuku" and stopped — a multi-step trip for a
++ * partially sighted user. Now the command itself asks: Shizuku's own
++ * 「允许 Mines 使用 Shizuku？」 dialog is shown (started by the Shizuku server,
++ * so it appears even while Mines is in the background) and the command waits
++ * up to [waitMs] for the tap. When the user once chose 「拒绝且不再询问」
++ * Shizuku won't show the dialog again; then its manager app is opened on the
++ * 授权应用 list instead and the error says so.
++ */
++object ShizukuAsk {
++    /** True when the allow dialog was shown. */
++    fun request(context: Context): Boolean {
++        ShizukuManager.refresh()
++        if (ShizukuManager.snapshot.value.state != ShizukuManager.State.NEED_PERMISSION) return false
++        val permanentlyDenied = runCatching { Shizuku.shouldShowRequestPermissionRationale() }.getOrDefault(false)
++        if (permanentlyDenied) {
++            runCatching { ShizukuManager.openShizukuApp(context.applicationContext) }
++            return false
++        }
++        return ShizukuManager.requestPermission()
++    }
++
++    fun permanentlyDenied(): Boolean = runCatching { Shizuku.shouldShowRequestPermissionRationale() }.getOrDefault(false)
++
++    /** Ask and block until granted / denied / [waitMs]. Not on the main thread. */
++    fun requestAndWait(context: Context, waitMs: Long = 30_000): Boolean {
++        if (ShizukuManager.isReady()) return true
++        if (!request(context)) return false
++        val until = System.currentTimeMillis() + waitMs
++        while (System.currentTimeMillis() < until) {
++            Thread.sleep(400)
++            ShizukuManager.refresh()
++            if (ShizukuManager.isReady()) return true
++            if (permanentlyDenied()) return false
++        }
++        return false
++    }
++
++    /** One line for errors and the settings screen. */
++    fun statusLine(): String {
++        ShizukuManager.refresh()
++        return when (ShizukuManager.snapshot.value.state) {
++            ShizukuManager.State.READY -> "Shizuku：已授权，可用"
++            ShizukuManager.State.NEED_PERMISSION -> if (permanentlyDenied())
++                "Shizuku：在运行，但 Mines 被设为「拒绝」——打开 Shizuku → 授权应用 → 打开 Mines"
++            else "Shizuku：在运行，还没授权给 Mines（点「授权」，在弹框里点允许）"
++            ShizukuManager.State.NOT_RUNNING -> "Shizuku：已安装但没启动（打开 Shizuku，用无线调试启动）"
++            ShizukuManager.State.NOT_INSTALLED -> "Shizuku：没安装"
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/NativeOffload.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/NativeOffload.kt
+index 02fe55f..9307a21 100644
+--- a/src/android/app/src/main/java/com/openminis/app/sandbox/NativeOffload.kt
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/NativeOffload.kt
+@@ -108,6 +108,9 @@ object NativeOffloadServer {
+ 
+     val registeredHandlers: Set<String> get() = handlers.keys.toSet()
+ 
++    /** [Mines-selftest-29] Same dispatch as the guest socket, for the shell-only self-test provider. */
++    fun handlerFor(name: String): NativeOffloadHandler? = handlers[name]
++
+     fun register(name: String, handler: NativeOffloadHandler) {
+         require(name.isNotEmpty())
+         handlers[name] = handler
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt
+index d589efc..7b85754 100644
+--- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt
+@@ -145,7 +145,8 @@ First-run: enable "Mines" under Settings → Accessibility, then `service ping`.
+         // Served by the accessibility service when it runs, otherwise by
+         // Shizuku (uiautomator + input) — so phone control works even when
+         // Android greys out the accessibility toggle for a sideloaded APK.
+-        if (FastUi.handles(args) && (MinisAccessibilityService.getInstance() != null || FastUi.shizukuReady())) {
++        if (FastUi.handles(args) && (MinisAccessibilityService.getInstance() != null || FastUi.shizukuReady() ||
++                args.positional.firstOrNull() in setOf("open", "launch", "shade"))) {
+             com.openminis.app.service.SessionActivityTracker.updateToolStatus("a11y_cli: ${args.positional.joinToString(" ").take(60)}")
+             return FastUi(context).handle(args)
+         }
+@@ -588,6 +589,17 @@ First-run: enable "Mines" under Settings → Accessibility, then `service ping`.
+             ?: return NativeOffloadResult(2, "$TOOL tap xy: missing <x>\n")
+         val y = args.positional.getOrNull(3)?.toIntOrNull()
+             ?: return NativeOffloadResult(2, "$TOOL tap xy: missing <y>\n")
++        // [Mines-shade-29] Status-bar icons are not buttons: a tap there does
++        // nothing on Android. What the agent wants is the shade.
++        val sbH = context.resources.getIdentifier("status_bar_height", "dimen", "android")
++            .takeIf { it > 0 }?.let { context.resources.getDimensionPixelSize(it) } ?: 80
++        val shadeOpen = runCatching { svc.windows.any { w -> w.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_SYSTEM &&
++            android.graphics.Rect().also { r -> w.getBoundsInScreen(r) }.height() > sbH * 4 } }.getOrDefault(false)
++        if (y in 0..sbH && !shadeOpen && !args.hasFlag("raw")) {
++            if (svc.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS))
++                return ok(args, JSONObject().put("x", x).put("y", y).put("action", "open_notification_shade")
++                    .put("note", "tap on the status bar → opened the notification shade (use --raw to really tap)"))
++        }
+         return tapXYRaw(svc, x, y, args)
+     }
+ 
+@@ -834,6 +846,19 @@ First-run: enable "Mines" under Settings → Accessibility, then `service ping`.
+         val x2 = args.positional.getOrNull(4)?.toIntOrNull() ?: return NativeOffloadResult(2, "$TOOL gesture swipe: missing <x2>\n")
+         val y2 = args.positional.getOrNull(5)?.toIntOrNull() ?: return NativeOffloadResult(2, "$TOOL gesture swipe: missing <y2>\n")
+         val duration = args.getLong("duration") ?: 300L
++        // [Mines-shade-29] A downward swipe that starts in the status bar is
++        // the "pull down the shade" gesture; injected gestures from the very
++        // top edge are not delivered to SystemUI on some ROMs (realme), so do
++        // what the user meant with the global action.
++        val sbH = context.resources.getIdentifier("status_bar_height", "dimen", "android")
++            .takeIf { it > 0 }?.let { context.resources.getDimensionPixelSize(it) } ?: 80
++        if (y1 <= sbH * 2 && y2 - y1 > sbH * 2) {
++            val qs = y1 <= sbH * 2 && args.hasFlag("qs")
++            if (svc.performGlobalAction(if (qs) android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_QUICK_SETTINGS
++                    else android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS))
++                return ok(args, JSONObject().put("shade", if (qs) "quick_settings" else "notifications")
++                    .put("note", "swipe from the status bar mapped to the notification shade"))
++        }
+         val path = Path().apply { moveTo(x1.toFloat(), y1.toFloat()); lineTo(x2.toFloat(), y2.toFloat()) }
+         return if (svc.dispatchSimpleGesture(path, 0L, duration))
+             ok(args, JSONObject().put("from", JSONArray().put(x1).put(y1)).put("to", JSONArray().put(x2).put(y2)))
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ClipboardOffloadHandler.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ClipboardOffloadHandler.kt
+index 1e3bbeb..4ab177d 100644
+--- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ClipboardOffloadHandler.kt
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ClipboardOffloadHandler.kt
+@@ -82,10 +82,16 @@ class ClipboardOffloadHandler(private val context: Context) : NativeOffloadHandl
+     // ── Subcommands ──────────────────────────────────────────────────────────
+ 
+     private fun doGet(cm: ClipboardManager, args: OffloadArgs): NativeOffloadResult {
++        var clip: android.content.ClipData? = null
+         if (!isAppForeground() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+-            return backgroundError(args)
+-        }
+-        val clip = cm.primaryClip
++            // [Mines-clip-29] Android 10+ only lets the app whose window has
++            // input focus (or the keyboard) read the clipboard. With 悬浮窗
++            // permission Mines briefly adds a 1-px focusable overlay window,
++            // reads while it holds focus, and removes it (≈0.3 s; the current
++            // app's keyboard may blink).
++            clip = readViaFocusWindow(cm)
++            if (clip == null) return backgroundError(args)
++        } else clip = cm.primaryClip
+         if (clip == null || clip.itemCount == 0) {
+             return NativeOffloadResult(0, "")
+         }
+@@ -143,10 +149,16 @@ class ClipboardOffloadHandler(private val context: Context) : NativeOffloadHandl
+      *     so prompts can detect platform difference)
+      */
+     private fun doStatus(cm: ClipboardManager, args: OffloadArgs): NativeOffloadResult {
++        var clip: android.content.ClipData? = null
+         if (!isAppForeground() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+-            return backgroundError(args)
+-        }
+-        val clip = cm.primaryClip
++            // [Mines-clip-29] Android 10+ only lets the app whose window has
++            // input focus (or the keyboard) read the clipboard. With 悬浮窗
++            // permission Mines briefly adds a 1-px focusable overlay window,
++            // reads while it holds focus, and removes it (≈0.3 s; the current
++            // app's keyboard may blink).
++            clip = readViaFocusWindow(cm)
++            if (clip == null) return backgroundError(args)
++        } else clip = cm.primaryClip
+         val description = cm.primaryClipDescription
+         val itemCount = clip?.itemCount ?: 0
+         val mimeTypes = JSONArray()
+@@ -195,11 +207,32 @@ class ClipboardOffloadHandler(private val context: Context) : NativeOffloadHandl
+         }
+     }
+ 
++    private fun readViaFocusWindow(cm: ClipboardManager): android.content.ClipData? {
++        if (!android.provider.Settings.canDrawOverlays(context)) return null
++        val main = android.os.Handler(android.os.Looper.getMainLooper())
++        val got = java.util.concurrent.atomic.AtomicReference<android.content.ClipData?>(null)
++        val done = java.util.concurrent.CountDownLatch(1)
++        com.openminis.app.plus.AppLauncher.withVisibleWindow(context, focusable = true, holdMs = 900) { v ->
++            fun attempt(n: Int) {
++                if (v.hasWindowFocus() || n >= 10) {
++                    runCatching { got.set(cm.primaryClip) }
++                    done.countDown()
++                } else main.postDelayed({ attempt(n + 1) }, 60)
++            }
++            attempt(0)
++        }
++        done.await(1500, java.util.concurrent.TimeUnit.MILLISECONDS)
++        return got.get()
++    }
++
+     private fun backgroundError(args: OffloadArgs) = NativeOffloadResult(
+         1,
+         OffloadOutput.formatBody(
+             JSONObject().put("error", "clipboard_requires_foreground")
+-                .put("message", "Android 10+ blocks clipboard access when the app is not in the foreground. Ask the user to bring Mines to the foreground and retry.")
++                .put("message", "Android 10+ blocks clipboard access when the app is not in the foreground. " +
++                    (if (android.provider.Settings.canDrawOverlays(context)) "The focus-window workaround did not get focus this time (a full-screen app or the lock screen may hold it); retry, or bring Mines to the front."
++                    else "Grant Mines 悬浮窗 (display over other apps) so it can read the clipboard from the background, or bring Mines to the front.") +
++                    " 安卓 10 起只有前台应用能读剪贴板。")
+                 .toString(),
+             args,
+         ) + "\n",
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/DeviceOffloadHandler.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/DeviceOffloadHandler.kt
+index 3246499..ce1d582 100644
+--- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/DeviceOffloadHandler.kt
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/DeviceOffloadHandler.kt
+@@ -33,11 +33,11 @@ class DeviceOffloadHandler(private val context: Context) : NativeOffloadHandler
+             val out = when (sub) {
+                 "info" -> deviceInfo().toString(2)
+                 "battery" -> batteryInfo().toString(2)
+-                "storage" -> storageInfo().toString(2)
++                "storage" -> bounded { storageInfo() }.toString(2)
+                 "all" -> JSONObject()
+                     .put("device", deviceInfo())
+                     .put("battery", batteryInfo())
+-                    .put("storage", storageInfo())
++                    .put("storage", bounded { storageInfo() })
+                     .toString(2)
+                 else -> return NativeOffloadResult(2, "android-device: unknown subcommand '$sub'\n$HELP")
+             }
+@@ -49,6 +49,16 @@ class DeviceOffloadHandler(private val context: Context) : NativeOffloadHandler
+         }
+     }
+ 
++    /** [Mines-storage-29] Never hang: give up after 6 s with what is known. */
++    private fun bounded(f: () -> JSONObject): JSONObject {
++        val ex = java.util.concurrent.Executors.newSingleThreadExecutor()
++        return try {
++            ex.submit(java.util.concurrent.Callable { f() }).get(6, java.util.concurrent.TimeUnit.SECONDS)
++        } catch (e: java.util.concurrent.TimeoutException) {
++            JSONObject().put("error", "timeout").put("message", "storage stats took longer than 6 s")
++        } finally { ex.shutdownNow() }
++    }
++
+     private fun String?.orFallback(alt: String): String =
+         this?.takeIf { it.isNotBlank() && it != "unknown" } ?: alt
+ 
+@@ -131,8 +141,29 @@ class DeviceOffloadHandler(private val context: Context) : NativeOffloadHandler
+         } catch (e: Throwable) {
+             json.put("error", e.message ?: "StatFs unavailable")
+         }
+-        json.put("app_data_mb", String.format("%.1f", dirSize(context.filesDir) / 1e6))
+-            .put("app_cache_mb", String.format("%.1f", dirSize(context.cacheDir) / 1e6))
++        // [Mines-storage-29] `android-device storage` hung on the phone: it
++        // walked context.filesDir file by file, and filesDir holds the whole
++        // Alpine sandbox (node_modules, dev tools: hundreds of thousands of
++        // files) — minutes under load. Ask the system for the app's own sizes
++        // instead (StorageStatsManager, answered from installd quotas in
++        // milliseconds, no permission needed for our own package), and keep
++        // the walk only as a time-boxed fallback.
++        val stats = runCatching {
++            val ssm = context.getSystemService(android.app.usage.StorageStatsManager::class.java)
++            val st = ssm.queryStatsForPackage(android.os.storage.StorageManager.UUID_DEFAULT, context.packageName, android.os.Process.myUserHandle())
++            st
++        }.getOrNull()
++        if (stats != null) {
++            json.put("app_data_mb", String.format("%.1f", stats.dataBytes / 1e6))
++                .put("app_cache_mb", String.format("%.1f", stats.cacheBytes / 1e6))
++                .put("app_code_mb", String.format("%.1f", stats.appBytes / 1e6))
++        } else {
++            val budget = System.currentTimeMillis() + 3000
++            val data = boundedSize(context.filesDir, budget)
++            val cache = boundedSize(context.cacheDir, budget)
++            json.put("app_data_mb", if (data < 0) "unknown (sandbox too large to count in 3 s)" else String.format("%.1f", data / 1e6))
++                .put("app_cache_mb", if (cache < 0) "unknown" else String.format("%.1f", cache / 1e6))
++        }
+         return json
+     }
+ 
+@@ -147,6 +178,21 @@ class DeviceOffloadHandler(private val context: Context) : NativeOffloadHandler
+      * space from a figure several times the truth is worse than one with no
+      * figure at all.
+      */
++    /** Size without following links; -1 when [deadline] passes first. */
++    private fun boundedSize(dir: File, deadline: Long): Long {
++        var total = 0L
++        val stack = ArrayDeque<File>(); stack.add(dir)
++        while (stack.isNotEmpty()) {
++            if (System.currentTimeMillis() > deadline) return -1
++            val f = stack.removeLast()
++            val p = f.toPath()
++            if (java.nio.file.Files.isSymbolicLink(p)) continue
++            if (f.isDirectory) f.listFiles()?.let { stack.addAll(it) } else total += f.length()
++        }
++        return total
++    }
++
++    @Suppress("unused")
+     private fun dirSize(dir: File): Long =
+         com.openminis.app.data.session.SessionStorage.directorySize(dir)
+ 
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/FastUi.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/FastUi.kt
+index e0174e6..433f376 100644
+--- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/FastUi.kt
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/FastUi.kt
+@@ -60,9 +60,11 @@ internal class FastUi(private val context: Context) {
+   ui list [--all]          numbered list of what is on screen (alias: list)
+   tap <n>                  tap item n of the last list (tap "文本" also works inside do)
+   type <n> <text>          focus item n and type text
+-  key back|home|recents|enter|notifications
++  key back|home|recents|enter|notifications|quicksettings
++  open <包名或应用名>       open an app (verified: says whether it really came to the front)
++  shade open|qs|close      pull down the notification shade / quick settings, or close it
+   do "<step>; <step>; …"   run several steps in ONE call, then print a fresh list
+-       steps: tap N | tap "文本" | type N 文本 | key K | scroll down|up [N] | wait MS | open <包名> | list
++       steps: tap N | tap "文本" | type N 文本 | key K | scroll down|up [N] | wait MS | open <包名/应用名> | shade open|qs|close | list
+ Backend: accessibility when enabled, otherwise Shizuku (uiautomator + input).
+ """
+ 
+@@ -73,6 +75,9 @@ Backend: accessibility when enabled, otherwise Shizuku (uiautomator + input).
+                 "ui" -> p.getOrNull(1) == "list"
+                 "tap" -> p.getOrNull(1)?.toIntOrNull() != null
+                 "key" -> true
++                // [Mines-launch-29] top-level open/launch and the shade work
++                // without a UI backend too (see AppLauncher / shade()).
++                "open", "launch", "shade" -> true
+                 else -> false
+             }
+         }
+@@ -130,23 +135,27 @@ Backend: accessibility when enabled, otherwise Shizuku (uiautomator + input).
+ 
+     /** Open an app by its name as shown on the launcher (or a package name). */
+     fun voiceOpenApp(name: String): String {
+-        val q = name.trim()
+-        val pm = context.packageManager
+-        val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+-        val apps = runCatching { pm.queryIntentActivities(intent, 0) }.getOrDefault(emptyList())
+-        val pkg = apps.firstOrNull { it.loadLabel(pm).toString().equals(q, true) }?.activityInfo?.packageName
+-            ?: apps.firstOrNull { it.loadLabel(pm).toString().contains(q, true) }?.activityInfo?.packageName
+-            ?: apps.firstOrNull { it.activityInfo.packageName.equals(q, true) }?.activityInfo?.packageName
+-            ?: return "没找到叫「$q」的应用"
++        val r = com.openminis.app.plus.AppLauncher.open(context, name)
+         val be = backend()
+-        val r = open(be ?: Backend.A11Y, pkg)
+-        if (r.first && be != null) settle(be)
+-        return r.second + (if (be != null) "\n" + list(be, false) else "")
++        if (r.ok && be != null) { ensureListener(); settle(be) }
++        return r.message + (if (r.ok && be != null) "\n" + list(be, false) else "")
+     }
+ 
+     fun handle(args: OffloadArgs): NativeOffloadResult {
+-        val be = backend() ?: return NativeOffloadResult(77,
+-            "无障碍服务没开，Shizuku 也没就绪。二选一：设置 → 无障碍 → Mines 打开；或安装并启动 Shizuku 后在 Mines 权限页授权。\n")
++        val p0 = args.positional
++        if (p0.firstOrNull() == "open" || p0.firstOrNull() == "launch") {
++            val q = p0.drop(1).joinToString(" ")
++            if (q.isBlank()) return NativeOffloadResult(2, "用法：open <包名或应用名>\n")
++            val r = com.openminis.app.plus.AppLauncher.open(context, q)
++            val be0 = backend()
++            val tail = if (r.ok && be0 != null) { ensureListener(); settle(be0); "\n" + list(be0, false) } else "\n"
++            return NativeOffloadResult(if (r.ok) 0 else 1, r.message + tail)
++        }
++        if (p0.firstOrNull() == "shade") {
++            val r = shade(p0.getOrNull(1) ?: "open")
++            return NativeOffloadResult(if (r.first) 0 else 1, r.second + "\n")
++        }
++        val be = backend() ?: return NativeOffloadResult(77, noBackendHelp())
+         ensureListener()
+         val p = args.positional
+         return try {
+@@ -229,7 +238,8 @@ Backend: accessibility when enabled, otherwise Shizuku (uiautomator + input).
+             "scroll", "swipe" -> scroll(be, rest)
+             "wait", "sleep" -> { Thread.sleep((rest.toLongOrNull() ?: 500L).coerceIn(0L, 10_000L)); return true to "等了 ${rest.ifBlank { "500" }} ms" }
+             "open", "launch" -> open(be, rest)
+-            else -> return false to "不认识的步骤（可用：tap/type/key/scroll/wait/open/list）"
++            "shade" -> shade(rest.ifBlank { "open" })
++            else -> return false to "不认识的步骤（可用：tap/type/key/scroll/wait/open/shade/list）"
+         }
+         if (r.first) settle(be)
+         return r
+@@ -382,7 +392,7 @@ Backend: accessibility when enabled, otherwise Shizuku (uiautomator + input).
+         if (be == Backend.A11Y && node != null) {
+             runCatching { node.refresh() }
+             var cur: AccessibilityNodeInfo? = node; var hops = 0
+-            while (cur != null && !cur.isClickable && hops < 3) { cur = cur.parent; hops++ }
++            while (cur != null && !cur.isClickable && hops < 6) { cur = cur.parent; hops++ }
+             if (cur != null && cur.isClickable && cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true to "点了「${el.label}」"
+         }
+         val ok = tapXY(be, el.bounds.centerX(), el.bounds.centerY())
+@@ -427,12 +437,14 @@ Backend: accessibility when enabled, otherwise Shizuku (uiautomator + input).
+             "home", "主页" -> AccessibilityService.GLOBAL_ACTION_HOME
+             "recents" -> AccessibilityService.GLOBAL_ACTION_RECENTS
+             "notifications" -> AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS
++            "quicksettings", "qs" -> AccessibilityService.GLOBAL_ACTION_QUICK_SETTINGS
+             else -> null
+         }
+         if (global != null && svc != null && be == Backend.A11Y) return svc.performGlobalAction(global) to "按了 $k"
+         val code = when (k) {
+             "back", "返回" -> "4"; "home", "主页" -> "3"; "recents" -> "187"; "enter", "回车", "search" -> "66"
+-            "notifications" -> "83"; "delete", "del" -> "67"; else -> k.toIntOrNull()?.toString()
++            "notifications" -> return shade("open"); "quicksettings", "qs" -> return shade("qs")
++            "delete", "del" -> "67"; else -> k.toIntOrNull()?.toString()
+         } ?: return false to "不认识的按键 $k"
+         if (code == "66" && svc != null && Build.VERSION.SDK_INT >= 30) {
+             val f = svc.rootNodes().firstNotNullOfOrNull { it.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) }
+@@ -461,15 +473,59 @@ Backend: accessibility when enabled, otherwise Shizuku (uiautomator + input).
+         return true to "向${if (dir == "up") "上" else "下"}滑了 $times 次"
+     }
+ 
++    @Suppress("UNUSED_PARAMETER")
+     private fun open(be: Backend, pkg: String): Pair<Boolean, String> {
+-        val p = pkg.trim()
+-        val intent = context.packageManager.getLaunchIntentForPackage(p)
+-        if (intent != null) {
+-            val ok = runCatching { context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }.isSuccess
+-            if (ok) return true to "打开了 $p"
++        val r = com.openminis.app.plus.AppLauncher.open(context, unquote(pkg))
++        return r.ok to r.message
++    }
++
++    /**
++     * [Mines-shade-29] Notification shade / quick settings. Tapping status-bar
++     * icons does nothing on Android and a swipe from the very top edge is
++     * often not delivered to a11y gestures (realme), so use the global
++     * actions; Shizuku falls back to `cmd statusbar`.
++     */
++    private fun shade(what: String): Pair<Boolean, String> {
++        val svc = MinisAccessibilityService.getInstance()
++        val w = what.trim().lowercase()
++        val action = when (w) {
++            "open", "notifications", "通知", "down", "" -> AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS
++            "qs", "quicksettings", "quick", "settings", "快捷设置", "控制中心" -> AccessibilityService.GLOBAL_ACTION_QUICK_SETTINGS
++            "close", "collapse", "收起" -> if (Build.VERSION.SDK_INT >= 31) AccessibilityService.GLOBAL_ACTION_DISMISS_NOTIFICATION_SHADE else AccessibilityService.GLOBAL_ACTION_BACK
++            else -> return false to "shade 只认 open / qs / close"
++        }
++        if (svc != null && svc.performGlobalAction(action)) {
++            Thread.sleep(450)
++            return true to when (action) {
++                AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS -> "拉下了通知栏（用 list 看通知，tap N 点通知）"
++                AccessibilityService.GLOBAL_ACTION_QUICK_SETTINGS -> "打开了快捷设置"
++                else -> "收起了通知栏"
++            }
++        }
++        if (shizukuReady()) {
++            val sub = when (action) {
++                AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS -> "expand-notifications"
++                AccessibilityService.GLOBAL_ACTION_QUICK_SETTINGS -> "expand-settings"
++                else -> "collapse"
++            }
++            if (shell("cmd", "statusbar", sub)) { Thread.sleep(450); return true to "通知栏：$sub" }
++        }
++        return false to (if (svc == null) "需要无障碍服务或 Shizuku 才能拉下通知栏" else "系统拒绝了这个操作")
++    }
++
++    private fun noBackendHelp(): String {
++        val st = runCatching { ShizukuManager.refresh(); ShizukuManager.snapshot.value.state }.getOrNull()
++        val shz = when (st) {
++            ShizukuManager.State.NEED_PERMISSION -> {
++                // [Mines-shizuku-29] one tap: Shizuku's own allow dialog.
++                val asked = com.openminis.app.plus.ShizukuAsk.request(context)
++                "Shizuku 在运行但没授权给 Mines" + (if (asked) "——已弹出授权框，点「允许」后重试。" else "——打开 Shizuku → 授权应用 → 打开 Mines。")
++            }
++            ShizukuManager.State.NOT_RUNNING -> "Shizuku 装了但没启动（打开 Shizuku 点启动）"
++            ShizukuManager.State.NOT_INSTALLED -> "没装 Shizuku"
++            else -> "Shizuku 就绪"
+         }
+-        if (shizukuReady() && shell("monkey", "-p", p, "-c", "android.intent.category.LAUNCHER", "1")) return true to "打开了 $p"
+-        return false to "打不开 $p（包名对吗？）"
++        return "手机控制不可用：无障碍服务没开；$shz。\n最简单：设置 → 无障碍 → Mines 打开。\n"
+     }
+ 
+     // ── settle ───────────────────────────────────────────────────────────
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/LocationOffloadHandler.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/LocationOffloadHandler.kt
+index 1f51f44..4ef92fd 100644
+--- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/LocationOffloadHandler.kt
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/LocationOffloadHandler.kt
+@@ -127,7 +127,9 @@ class LocationOffloadHandler(private val context: Context) : NativeOffloadHandle
+                     r = OffloadPermissionManager.AndroidPermissionResult.GRANTED
+                 }
+                 if (r == OffloadPermissionManager.AndroidPermissionResult.DENIED) {
+-                    r = OffloadPermissionManager.requestSettingsGate(
++                    // [Mines-loc-29] bounded: the in-app dialog may never be seen
++                    // while Mines is in the background.
++                    r = kotlinx.coroutines.withTimeoutOrNull(90_000) { OffloadPermissionManager.requestSettingsGate(
+                         OffloadPermissionManager.SettingsGateRequest(
+                             id = Manifest.permission.ACCESS_FINE_LOCATION,
+                             title = "Location permission needed",
+@@ -137,7 +139,7 @@ class LocationOffloadHandler(private val context: Context) : NativeOffloadHandle
+                             positiveLabel = "Open Settings",
+                         ),
+                         check = { hasPermission() },
+-                    )
++                    ) } ?: OffloadPermissionManager.AndroidPermissionResult.TIMEOUT
+                 }
+                 r
+             }
+@@ -170,9 +172,20 @@ class LocationOffloadHandler(private val context: Context) : NativeOffloadHandle
+         } catch (_: Throwable) { false }
+ 
+         if (!locationEnabled || enabled.isEmpty()) {
++            // [Mines-loc-29] Say it plainly and give the user a one-tap way
++            // to the switch: a notification 「点这里打开定位」 always, and with
++            // --open-settings the settings page is opened directly.
++            val settings = android.content.Intent(android.provider.Settings.ACTION_LOCATION_SOURCE_SETTINGS)
++            val opened = args.hasFlag("open-settings") &&
++                com.openminis.app.plus.AppLauncher.startFromBackground(context, settings)
++            if (!opened) com.openminis.app.plus.AppLauncher.postTapToOpen(context, settings, "定位设置")
+             val body = JSONObject()
+                 .put("error", "location_services_disabled")
+-                .put("message", "Location services are off on this device. Ask the user to enable Location in system settings.")
++                .put("message", "定位服务未开（系统「位置信息」总开关关着）。" +
++                    (if (opened) "已打开定位设置页，请打开「位置信息」开关后重试。"
++                    else "已发通知「点这里打开定位设置」；也可以运行 android-location --open-settings 直接打开设置页。") +
++                    " Location services are off.")
++                .put("settings_opened", opened)
+                 .put("enabled_providers", JSONArray(enabled))
+                 .toString()
+             return NativeOffloadResult(1, OffloadOutput.formatBody(body, args) + "\n")
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ShizukuOffloadHandler.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ShizukuOffloadHandler.kt
+index 12fc9be..b22bce7 100644
+--- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ShizukuOffloadHandler.kt
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ShizukuOffloadHandler.kt
+@@ -74,9 +74,18 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
+             ShizukuManager.State.NOT_INSTALLED ->
+                 return errEnvelope("SERVICE_NOT_RUNNING", "Shizuku is not installed. Open Settings → Permissions → Shizuku.", args)
+             ShizukuManager.State.NOT_RUNNING ->
+-                return errEnvelope("SERVICE_NOT_RUNNING", "Shizuku service is not running. Start it via adb or root, then retry.", args)
+-            ShizukuManager.State.NEED_PERMISSION ->
+-                return errEnvelope("PERMISSION_DENIED", "Mines is not authorized for Shizuku. Grant permission in Settings → Permissions → Shizuku.", args)
++                return errEnvelope("SERVICE_NOT_RUNNING", "Shizuku 已安装但没启动：打开 Shizuku 用无线调试启动后重试。(Shizuku service is not running.)", args)
++            ShizukuManager.State.NEED_PERMISSION -> {
++                // [Mines-shizuku-29] Ask right here (Shizuku's own one-tap dialog)
++                // and continue when the user allows, instead of failing.
++                if (!com.openminis.app.plus.ShizukuAsk.requestAndWait(context, 30_000)) {
++                    return errEnvelope("PERMISSION_DENIED",
++                        (if (com.openminis.app.plus.ShizukuAsk.permanentlyDenied())
++                            "Mines 在 Shizuku 里被设成了拒绝：已打开 Shizuku，请在「授权应用」里打开 Mines，然后重试。"
++                        else "已弹出 Shizuku 授权框，但 30 秒内没有点「允许」。点允许后重试。") +
++                            " 不用 Shizuku 的替代：android-a11y-cli（无障碍）可以点屏幕、打开应用。", args)
++                }
++            }
+             ShizukuManager.State.READY -> { /* fall through */ }
+         }
+ 
+@@ -94,6 +103,13 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
+                 "file" -> handleFile(rest, args)
+                 "device" -> handleDevice(rest, args)
+                 "exec" -> handleExec(rest, args)
++                // [Mines-shizuku-29] Plain output for the /usr/local/bin/{pm,am,…}
++                // shims, so `pm list packages` in the sandbox just works.
++                "rawexec" -> {
++                    if (rest.isEmpty()) return NativeOffloadResult(2, "usage: rawexec <cmd> [args]\n")
++                    val r = ShizukuManager.runProcess(rest.toTypedArray(), timeoutMs = 60_000)
++                    NativeOffloadResult(r.exitCode, r.combined.let { if (it.endsWith("\n") || it.isEmpty()) it else it + "\n" })
++                }
+                 else -> NativeOffloadResult(
+                     2,
+                     "android-shizuku-cli: unknown subcommand '$group'.\n" +
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/SpeechOffloadHandler.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/SpeechOffloadHandler.kt
+index 248fc92..9345470 100644
+--- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/SpeechOffloadHandler.kt
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/SpeechOffloadHandler.kt
+@@ -91,7 +91,10 @@ class SpeechOffloadHandler(private val context: Context) : NativeOffloadHandler
+         val hasMic = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+             PackageManager.PERMISSION_GRANTED
+         val body = JSONObject()
+-            .put("available", ok)
++            .put("available", ok || com.openminis.app.speech.OfflineAsrEngine.modelReady(context, com.openminis.app.speech.OfflineAsrEngine.MODEL_ZH))
++            .put("system_recognizer", ok)
++            .put("on_device_recognizer", Build.VERSION.SDK_INT >= 31 && runCatching { SpeechRecognizer.isOnDeviceRecognitionAvailable(context) }.getOrDefault(false))
++            .put("offline_vosk_ready", com.openminis.app.speech.OfflineAsrEngine.modelReady(context, com.openminis.app.speech.OfflineAsrEngine.MODEL_ZH))
+             .put("has_record_audio_permission", hasMic)
+             .toString(2)
+         return NativeOffloadResult(0, OffloadOutput.formatBody(body, args) + "\n")
+@@ -99,7 +102,8 @@ class SpeechOffloadHandler(private val context: Context) : NativeOffloadHandler
+ 
+     private fun cmdTranscribe(args: OffloadArgs): NativeOffloadResult {
+         val available = try { SpeechRecognizer.isRecognitionAvailable(context) } catch (_: Throwable) { false }
+-        if (!available) {
++        // [Mines-stt-29] No system service is no longer fatal: Listen falls back to Vosk offline.
++        if (!available && false) {
+             val body = JSONObject()
+                 .put("error", "recognizer_unavailable")
+                 .put(
+@@ -152,8 +156,23 @@ class SpeechOffloadHandler(private val context: Context) : NativeOffloadHandler
+         val lang = args.get("language")
+         val maxResults = args.getInt("max") ?: 3
+         val durationSec = args.getInt("duration") ?: args.getInt("timeout") ?: 30
+-        val text = recognize(lang, maxResults, durationSec.toLong())
+-        return NativeOffloadResult(0, OffloadOutput.formatBody(text, args) + "\n")
++        // [Mines-stt-29] system → on-device → Vosk offline (see plus/Listen.kt for
++        // the realme "Client error" root cause). `--engine system` keeps the
++        // old single-engine path.
++        if (args.get("engine") == "system") {
++            val text = recognize(lang, maxResults, durationSec.toLong())
++            return NativeOffloadResult(0, OffloadOutput.formatBody(text, args) + "\n")
++        }
++        val r = com.openminis.app.plus.Listen.once(context, durationSec.coerceIn(3, 60), lang,
++            allowDownload = !args.hasFlag("no-download"))
++        val json = JSONObject().put("engine", r.engine).put("tried", JSONArray(r.tried))
++        return if (r.text != null) {
++            NativeOffloadResult(0, OffloadOutput.formatBody(json.put("text", r.text).toString(2), args) + "\n")
++        } else {
++            json.put("error", if (r.error == com.openminis.app.plus.Listen.NO_SPEECH) "no_speech" else "recognition_failed")
++                .put("message", r.error ?: "unknown")
++            NativeOffloadResult(1, OffloadOutput.formatBody(json.toString(2), args) + "\n")
++        }
+     }
+ 
+     /**
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxScreen.kt
+index df461e6..cb28e11 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxScreen.kt
+@@ -165,7 +165,7 @@ fun SandboxScreen(onBack: () -> Unit) {
+                 when (shizuku.state) {
+                     ShizukuManager.State.NOT_INSTALLED -> ShizukuManager.openInstallPage(context)
+                     ShizukuManager.State.NOT_RUNNING -> ShizukuManager.openShizukuApp(context)
+-                    ShizukuManager.State.NEED_PERMISSION -> ShizukuManager.requestPermission()
++                    ShizukuManager.State.NEED_PERMISSION -> { com.openminis.app.plus.ShizukuAsk.request(context) }
+                     ShizukuManager.State.READY -> scope.launch {
+                         val ok = withContext(Dispatchers.IO) {
+                             PhantomProcessGuard.DISABLE_COMMANDS.map { cmd ->
+@@ -179,6 +179,22 @@ fun SandboxScreen(onBack: () -> Unit) {
+                 }
+             }
+             PlusDivider()
++            // [Mines-shizuku-29] Shizuku state in plain words + one button.
++            val shzLine = remember(tick, shizuku.state) { com.openminis.app.plus.ShizukuAsk.statusLine() }
++            CheckRow(shzLine, shizuku.state == ShizukuManager.State.READY, when (shizuku.state) {
++                ShizukuManager.State.NOT_INSTALLED -> "安装"
++                ShizukuManager.State.NOT_RUNNING -> "打开 Shizuku"
++                else -> "授权"
++            }) {
++                when (shizuku.state) {
++                    ShizukuManager.State.NOT_INSTALLED -> ShizukuManager.openInstallPage(context)
++                    ShizukuManager.State.NOT_RUNNING -> ShizukuManager.openShizukuApp(context)
++                    else -> if (!com.openminis.app.plus.ShizukuAsk.request(context))
++                        Toast.makeText(context, "已打开 Shizuku：在「授权应用」里打开 Mines", Toast.LENGTH_LONG).show()
++                }
++                tick++
++            }
++            PlusDivider()
+             Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                 Text("同时最多跑 ${PhantomProcessGuard.budget} 个沙箱命令", Modifier.weight(1f),
+                     style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
+index ff4e8e8..12c4ce0 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
+@@ -1,5 +1,8 @@
+ package com.openminis.app.ui.plus
+ 
++import androidx.compose.ui.unit.sp
++import androidx.compose.ui.semantics.contentDescription
++import androidx.compose.ui.semantics.semantics
+ import com.openminis.app.ui.brand.MinesIcon
+ 
+ import androidx.compose.animation.AnimatedVisibility
+@@ -93,41 +96,54 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier) {
+     var shown by androidx.compose.runtime.saveable.rememberSaveable { androidx.compose.runtime.mutableStateOf(false) }
+     LaunchedEffect(Unit) { shown = true }
+     val appear by androidx.compose.animation.core.animateFloatAsState(if (shown) 1f else 0f, androidx.compose.animation.core.tween(280), label = "appear")
++    // [Mines-compact-29] User (partially sighted, large system font, build-28
++    // screenshot): the greeting card was ~110 dp with a title that wrapped to
++    // two lines, and the three status widgets were ~150 dp tall with 22 sp
++    // bold values that wrapped ("2/2 在 / 线", "18 个已 / 连"). Now: one slim
++    // greeting row (~52 dp: 32 dp avatar, single-line ellipsized title, small
++    // mic) and one slim row of pills (icon + dot + short value, label only in
++    // the accessibility description), every text maxLines = 1 so nothing
++    // wraps up to fontScale 1.3. Sizes are ~60 % of build-28. No intrinsic
++    // measurement any more (the build-28 Glass.kt fix stays in place anyway).
+     Column(
+-        modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)
+-            .graphicsLayer { alpha = appear; translationY = (1f - appear) * 16f },
+-        verticalArrangement = Arrangement.spacedBy(8.dp),
++        modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)
++            .graphicsLayer { alpha = appear; translationY = (1f - appear) * 8f },
++        verticalArrangement = Arrangement.spacedBy(6.dp),
+     ) {
+-        GlassCard(Modifier.fillMaxWidth(), onClick = { PlusPrefs.update(context) { it.copy(todayCollapsed = !it.todayCollapsed) } }) {
++        GlassCard(Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), elevation = 2.dp,
++            onClick = { PlusPrefs.update(context) { it.copy(todayCollapsed = !it.todayCollapsed) } }) {
+             val fill = MaterialTheme.colorScheme.surfaceContainerLow
+             val fg = cardTextColor(fill)
+             val bg = LocalCardSurface.current ?: fill
+             Row(
+-                Modifier.fillMaxWidth().padding(16.dp),
++                Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp),
+                 verticalAlignment = Alignment.CenterVertically,
+             ) {
+-                Box(Modifier.clickable { switcher = true }) {
+-                    PetAvatar(size = if (st.todayCollapsed) 40.dp else 56.dp)
+-                }
+-                Spacer(Modifier.width(16.dp))
++                Box(Modifier.clickable { switcher = true }) { PetAvatar(size = 32.dp) }
++                Spacer(Modifier.width(10.dp))
+                 Column(Modifier.weight(1f)) {
+-                    Text(greet, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = fg)
+-                    Text(date, style = MaterialTheme.typography.bodyMedium, color = readableSecondary(fg, bg))
++                    Text(greet, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, color = fg,
++                        maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
++                    Text(date, style = MaterialTheme.typography.labelSmall, color = readableSecondary(fg, bg),
++                        maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                 }
+-                androidx.compose.material3.FilledTonalIconButton(onClick = { onOpen(PlusRoutes.VOICE) }) {
+-                    MinesIcon(Icons.Outlined.Mic, contentDescription = "实时语音")
++                androidx.compose.material3.FilledTonalIconButton(
++                    onClick = { onOpen(PlusRoutes.VOICE) }, modifier = Modifier.size(36.dp),
++                ) {
++                    MinesIcon(Icons.Outlined.Mic, contentDescription = "实时语音", modifier = Modifier.size(18.dp))
+                 }
++                Spacer(Modifier.width(2.dp))
+                 MinesIcon(
+                     if (st.todayCollapsed) Icons.Outlined.ExpandMore else Icons.Outlined.ExpandLess,
+                     contentDescription = if (st.todayCollapsed) "展开" else "收起",
+-                    tint = readableSecondary(fg, bg),
++                    tint = readableSecondary(fg, bg), modifier = Modifier.size(18.dp),
+                 )
+             }
+         }
+         AnimatedVisibility(!st.todayCollapsed) {
+             Row(
+-                Modifier.fillMaxWidth().height(androidx.compose.foundation.layout.IntrinsicSize.Min),
+-                horizontalArrangement = Arrangement.spacedBy(8.dp),
++                Modifier.fillMaxWidth(),
++                horizontalArrangement = Arrangement.spacedBy(6.dp),
+             ) {
+                 val eff = PlusVps.effectiveMode(st)
+                 val online = st.onlineServers.size
+@@ -135,7 +151,7 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier) {
+                     Modifier.weight(1f), Icons.Outlined.Cloud, "工作位置",
+                     when {
+                         !st.isVps -> "本机"
+-                        eff == PlusState.MODE_LOCAL -> "已回本机"
++                        eff == PlusState.MODE_LOCAL -> "回本机"
+                         else -> "VPS"
+                     },
+                     dot = when {
+@@ -146,12 +162,12 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier) {
+                 ) { onOpen(PlusRoutes.WORK) }
+                 Chip(
+                     Modifier.weight(1f), Icons.Outlined.Dns, "服务器",
+-                    if (st.servers.isEmpty()) "未添加" else "$online/${st.servers.size} 在线",
++                    if (st.servers.isEmpty()) "无" else "$online/${st.servers.size}",
+                     dot = if (st.servers.isEmpty()) Color(0xFF8E8E93) else if (online > 0) Color(0xFF30D158) else Color(0xFFFF453A),
+                 ) { onOpen(PlusRoutes.WORK) }
+                 Chip(
+                     Modifier.weight(1f), Icons.Outlined.Key, "账号",
+-                    if (vault.isEmpty()) "去连接" else "${vault.size} 个已连",
++                    if (vault.isEmpty()) "去连接" else "${vault.size}",
+                     dot = if (vault.isEmpty()) Color(0xFF8E8E93) else Color(0xFF30D158),
+                 ) { onOpen(PlusRoutes.CONNECTIONS) }
+             }
+@@ -161,21 +177,20 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier) {
+ 
+ @Composable
+ private fun Chip(modifier: Modifier, icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, value: String, dot: Color, onClick: () -> Unit) {
+-    // [Mines-a11y-26] label + value both get an explicit, contrast-checked colour
+-    // (build-25's value text inherited a dark grey on a near-black chip).
+-    GlassCard(modifier.fillMaxHeight(), shape = RoundedCornerShape(20.dp), elevation = 4.dp, onClick = onClick) {
++    // [Mines-a11y-26] explicit, contrast-checked colours. [Mines-compact-29] slim
++    // pill: one line, label spoken via the description and shown as a 2-char hint.
++    GlassCard(modifier.semantics(mergeDescendants = true) { contentDescription = "$label：$value" },
++        shape = RoundedCornerShape(14.dp), elevation = 2.dp, onClick = onClick) {
+         val fill = MaterialTheme.colorScheme.surfaceContainerHigh
+         val bg = LocalCardSurface.current ?: fill.compositeOver(MaterialTheme.colorScheme.surface)
+         val fg = cardTextColor(fill)
+-        Column(Modifier.padding(horizontal = 12.dp, vertical = 12.dp)) {
+-            Row(verticalAlignment = Alignment.CenterVertically) {
+-                MinesIcon(icon, null, tint = readableSecondary(fg, bg), modifier = Modifier.size(18.dp))
+-                Spacer(Modifier.width(4.dp))
+-                Box(Modifier.size(8.dp).background(dot, CircleShape))
+-            }
+-            Spacer(Modifier.height(8.dp))
+-            Text(value, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, color = fg, maxLines = 2)
+-            Text(label, style = MaterialTheme.typography.labelLarge, color = readableSecondary(fg, bg))
++        Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
++            MinesIcon(icon, null, tint = readableSecondary(fg, bg), modifier = Modifier.size(14.dp))
++            Spacer(Modifier.width(4.dp))
++            Box(Modifier.size(6.dp).background(dot, CircleShape))
++            Spacer(Modifier.width(5.dp))
++            Text(value, style = MaterialTheme.typography.labelLarge, fontSize = 13.sp, fontWeight = FontWeight.Bold, color = fg,
++                maxLines = 1, softWrap = false, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+         }
+     }
+ }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
+index 98d1d81..b56898d 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
+@@ -147,6 +147,11 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+             dismissButton = { androidx.compose.material3.TextButton(onClick = { diag = null }) { Text("关闭") } },
+         )
+     }
++    // [Mines-voice-29] 普通语音模式 (no Google): local STT → normal chat model → TTS.
++    var plainMode by remember { mutableStateOf(false) }
++    val plain = remember { com.openminis.app.plus.PlainVoice(context.applicationContext) }
++    DisposableEffect(plain) { onDispose { plain.stop() } }
++    fun enterPlain() { live?.stop(); plainMode = true; if (hasMic) plain.start() else askMic.launch(Manifest.permission.RECORD_AUDIO) }
+     if (showSettings) VoiceSettingsSheet(onDismiss = { showSettings = false }, onChanged = { live?.stop(); settingsVersion++ })
+     Scaffold(
+         containerColor = Color(0xFF0E1320),
+@@ -169,6 +174,11 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+         },
+     ) { pad ->
+         Column(Modifier.fillMaxSize().padding(pad), horizontalAlignment = Alignment.CenterHorizontally) {
++            if (plainMode) {
++                PlainVoiceContent(plain, onBackToLive = if (live != null) ({ plain.stop(); plainMode = false; live.start() }) else null,
++                    onHangUp = { plain.stop(); onBack() })
++                return@Column
++            }
+             if (live == null) {
+                 Spacer(Modifier.height(80.dp))
+                 PetAvatar(size = 120.dp)
+@@ -176,6 +186,8 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+                 Text("先填一个 Gemini API Key", color = Color.White, style = MaterialTheme.typography.titleMedium)
+                 Spacer(Modifier.height(16.dp))
+                 Button(onClick = onOpenConnections) { Text("去 账号连接 填写") }
++                Spacer(Modifier.height(12.dp))
++                androidx.compose.material3.OutlinedButton(onClick = { enterPlain() }) { Text("先用普通语音模式（不用 Google）", color = Color.White) }
+                 return@Column
+             }
+             val phase by live.phase.collectAsState()
+@@ -213,6 +225,14 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+                 Text(error ?: "", color = Color(0xFFFFC46B), fontSize = 13.sp, textAlign = TextAlign.Center,
+                     modifier = Modifier.padding(horizontal = 24.dp))
+             }
++            val allFailed by live.allFailed.collectAsState()
++            if (phase == GeminiLive.Phase.ERROR && allFailed) {
++                Spacer(Modifier.height(12.dp))
++                Button(onClick = { enterPlain() },
++                    modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp).height(64.dp)) {
++                    Text("改用普通语音模式（不用 Google）", style = MaterialTheme.typography.titleMedium)
++                }
++            }
+             if (phase == GeminiLive.Phase.ERROR) {
+                 Spacer(Modifier.height(12.dp))
+                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+@@ -342,3 +362,53 @@ private fun RoundButton(icon: androidx.compose.ui.graphics.vector.ImageVector, l
+         Text(label, color = Color.White, style = MaterialTheme.typography.labelMedium)
+     }
+ }
++
++/** [Mines-voice-29] 普通语音模式 screen body. */
++@Composable
++private fun PlainVoiceContent(plain: com.openminis.app.plus.PlainVoice, onBackToLive: (() -> Unit)?, onHangUp: () -> Unit) {
++    val phase by plain.phase.collectAsState()
++    val status by plain.status.collectAsState()
++    val lines by plain.lines.collectAsState()
++    Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
++        Spacer(Modifier.height(24.dp))
++        PetAvatar(size = 96.dp)
++        Spacer(Modifier.height(12.dp))
++        Text("普通语音模式", color = Color.White, style = MaterialTheme.typography.titleMedium)
++        Text("本机识别 → 你平时的聊天模型 → 朗读", color = Color(0xFFB8C2D6), fontSize = 13.sp)
++        Spacer(Modifier.height(8.dp))
++        Text(
++            status ?: when (phase) {
++                com.openminis.app.plus.PlainVoice.Phase.LISTENING -> "我在听"
++                com.openminis.app.plus.PlainVoice.Phase.THINKING -> "正在想…"
++                com.openminis.app.plus.PlainVoice.Phase.SPEAKING -> "正在回答"
++                com.openminis.app.plus.PlainVoice.Phase.ERROR -> "出错了"
++                com.openminis.app.plus.PlainVoice.Phase.IDLE -> "已暂停"
++            },
++            color = if (phase == com.openminis.app.plus.PlainVoice.Phase.ERROR) Color(0xFFFF6B6B) else Color.White,
++            style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center,
++            modifier = Modifier.padding(horizontal = 24.dp),
++        )
++        if (phase == com.openminis.app.plus.PlainVoice.Phase.IDLE || phase == com.openminis.app.plus.PlainVoice.Phase.ERROR) {
++            Spacer(Modifier.height(12.dp))
++            Button(onClick = { plain.start() }, modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp).height(56.dp)) { Text("继续") }
++        }
++        val listState = rememberLazyListState()
++        LaunchedEffect(lines.size) { if (lines.isNotEmpty()) listState.animateScrollToItem(lines.lastIndex) }
++        LazyColumn(state = listState, modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
++            verticalArrangement = Arrangement.spacedBy(8.dp)) {
++            items(lines) { l ->
++                Row(Modifier.fillMaxWidth(), horizontalArrangement = if (l.user) Arrangement.End else Arrangement.Start) {
++                    Text(l.text, color = Color.White, style = MaterialTheme.typography.bodyLarge,
++                        modifier = Modifier.clip(RoundedCornerShape(16.dp))
++                            .background(if (l.user) Color(0xFF3A5BD9) else Color(0x33FFFFFF))
++                            .padding(horizontal = 12.dp, vertical = 8.dp))
++                }
++            }
++        }
++        Row(Modifier.fillMaxWidth().padding(bottom = 36.dp), horizontalArrangement = Arrangement.SpaceEvenly,
++            verticalAlignment = Alignment.CenterVertically) {
++            if (onBackToLive != null) androidx.compose.material3.OutlinedButton(onClick = onBackToLive) { Text("再试 Gemini 实时语音", color = Color.White) }
++            RoundButton(Icons.Filled.CallEnd, "挂断", Color(0xFFFF3B30)) { onHangUp() }
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
+index 2f77fb7..3bbd62f 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
+@@ -1,5 +1,6 @@
+ package com.openminis.app.ui.sessions
+ 
++import androidx.compose.ui.draw.clipToBounds
+ import com.openminis.app.ui.brand.MinesIcon
+ 
+ import android.content.Context
+@@ -1038,7 +1039,21 @@ fun SessionListScreen(
+                     }
+                 } else {
+                     androidx.compose.foundation.layout.Column(Modifier.fillMaxSize()) {
+-                    if (!isSelecting) {
++                    // [Mines-compact-29] The header above the list (Today card,
++                    // update card, gateway cards, filter chips) changes height
++                    // after the list has laid out (fade-in, collapse, chips
++                    // appearing). The list kept its scroll offset, so its first
++                    // conversation started half under the chips (user
++                    // screenshot: first row's title + icon cut off). When the
++                    // header height changes and the list is near the top, snap
++                    // it back to the very top.
++                    var minesHeaderH by androidx.compose.runtime.remember { androidx.compose.runtime.mutableIntStateOf(0) }
++                    androidx.compose.runtime.LaunchedEffect(minesHeaderH) {
++                        if (listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset > 0) listState.scrollToItem(0)
++                    }
++                    if (!isSelecting) androidx.compose.foundation.layout.Column(
++                        Modifier.fillMaxWidth().onSizeChanged { minesHeaderH = it.height },
++                    ) {
+                         com.openminis.app.ui.plus.TodayCard(
+                             onOpen = { route -> com.openminis.app.ui.plus.PlusNav.go(route) },
+                         )
+@@ -1051,9 +1066,9 @@ fun SessionListScreen(
+                         // [T-android-newchat-list-autoscroll] Hoisted state so
+                         // the new-session autoscroll effect above can drive it.
+                         state = listState,
+-                        modifier = Modifier.fillMaxWidth().weight(1f),
+-                        // Leave space for bottom FAB row
+-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 96.dp),
++                        modifier = Modifier.fillMaxWidth().weight(1f).clipToBounds(),
++                        // Leave space for bottom FAB row; [Mines-compact-29] small top gap under the chips
++                        contentPadding = androidx.compose.foundation.layout.PaddingValues(top = 4.dp, bottom = 96.dp),
+                     ) {
+                         // T25: search-active path used to flatten the list and skip
+                         // section headers entirely. Now reuses the same grouped
