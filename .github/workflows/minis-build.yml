@@ -72,6 +72,14 @@ jobs:
           mkdir -p src/android/app/libs
           cp deps/build/rclone/rclone.aar src/android/app/libs/
 
+      - name: Release number
+        run: |
+          # hark-build/RELEASE holds the public build number (build-<n>), so
+          # failed CI runs no longer burn release numbers. Falls back to the
+          # run number when the file is missing.
+          n=$(tr -dc '0-9' < hark-build/RELEASE 2>/dev/null || true)
+          echo "MINES_BUILD_NUMBER=${n:-${{ github.run_number }}}" >> "$GITHUB_ENV"
+
       - name: Assemble APK
         run: |
           # Fixed signing key so each new build installs over the last one.
@@ -98,7 +106,7 @@ jobs:
             [ "$pkg" = "$MINES_PACKAGE" ] || { echo "::error::wrong package $pkg"; exit 1; }
             [ "$cert" = "$MINES_CERT_SHA256" ] || { echo "::error::APK not signed with the fixed Mines key ($cert)"; exit 1; }
           done
-          mv out/app-release.apk out/mines-${{ github.run_number }}.apk 2>/dev/null || true
+          mv out/app-release.apk out/mines-${MINES_BUILD_NUMBER}.apk 2>/dev/null || true
           ls -la out
 
       - uses: actions/upload-artifact@v4
@@ -109,8 +117,12 @@ jobs:
           retention-days: 14
 
       - name: Publish as a release
+        # Only commits marked [release] (or a manual run) publish; other pushes
+        # are compile checks and keep their APK as the run artifact.
+        if: contains(github.event.head_commit.message, '[release]') || github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="build-${{ github.run_number }}"
-          gh release create "$tag" out/*.apk --repo "${{ github.repository }}" --title "Mines build ${{ github.run_number }}" --notes "Mines — continued development of OpenMinis (https://github.com/OpenMinis/OpenMinis). Upstream commit b4c0661 + Mines patches. GPL-3.0; original OpenMinis LICENSE and copyright notices retained. Package $MINES_PACKAGE, signed with the fixed Mines key (cert SHA-256 $MINES_CERT_SHA256), so later builds install in place." --prerelease
+          tag="build-${MINES_BUILD_NUMBER}"
+          gh release delete "$tag" --repo "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$tag" out/*.apk --repo "${{ github.repository }}" --title "Mines build ${MINES_BUILD_NUMBER}" --notes "Mines — continued development of OpenMinis (https://github.com/OpenMinis/OpenMinis). Upstream commit b4c0661 + Mines patches. GPL-3.0; original OpenMinis LICENSE and copyright notices retained. Package $MINES_PACKAGE, signed with the fixed Mines key (cert SHA-256 $MINES_CERT_SHA256), so later builds install in place." --prerelease
