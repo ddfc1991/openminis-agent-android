@@ -112,6 +112,7 @@ def relaunch():
     sh(f"monkey -p {PKG} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1")
     time.sleep(10)
     dismiss_dialogs()
+    if alive(): go_home()
 
 
 def dismiss_dialogs():
@@ -288,8 +289,18 @@ def toggle_near(label):
     return True
 
 
+def go_home():
+    for _ in range(3):
+        root = dump()
+        if find(root, "工作位置", exact=True) or find(root, "Welcome to Mines"): return root
+        sh("input keyevent KEYCODE_BACK"); time.sleep(2.5)
+        if not alive(): return None
+    return dump()
+
+
 def user_like_state():
     """Wallpaper on home + glass + desk pet on, like the user's phone, then cold start."""
+    go_home()
     for _ in range(2):
         if tap_any(["Settings", "设置"], wait=3, exact=True): break
     snap("settings")
