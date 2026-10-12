@@ -1,17 +1,13 @@
 name: VPS screen smoke test (emulator)
 
+# Runs when hark-build/smoke/ changes (workflow_dispatch needs the file on the
+# default branch). hark-build/smoke/target says what to test:
+#   line 1: release tag (build-27) or run:<actions run id> (its mines-apk artifact)
 on:
+  push:
+    branches: [hark-minis-build]
+    paths: ['hark-build/smoke/**', '.github/workflows/vps-smoke.yml']
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "release tag to test (e.g. build-27); ignored when run_id is set"
-        default: "build-27"
-      run_id:
-        description: "Actions run id whose mines-apk artifact to test (optional)"
-        default: ""
-      api:
-        description: "emulator API level"
-        default: "34"
 
 permissions:
   contents: read
@@ -21,6 +17,10 @@ jobs:
   smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        api: [34, 35]
     steps:
       - uses: actions/checkout@v4
       - name: Get APK
@@ -28,11 +28,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p apk
-          if [ -n "${{ inputs.run_id }}" ]; then
-            gh run download "${{ inputs.run_id }}" --repo "${{ github.repository }}" -n mines-apk -D apk
-          else
-            gh release download "${{ inputs.tag }}" --repo "${{ github.repository }}" -p '*.apk' -D apk
-          fi
+          t=$(head -1 hark-build/smoke/target | tr -d ' \r')
+          case "$t" in
+            run:*) gh run download "${t#run:}" --repo "${{ github.repository }}" -n mines-apk -D apk ;;
+            *) gh release download "$t" --repo "${{ github.repository }}" -p '*.apk' -D apk ;;
+          esac
           ls -la apk
           echo "APK=$(ls apk/*.apk | head -1)" >> "$GITHUB_ENV"
       - name: Local sshd for the app to log in to (10.0.2.2:22 from the emulator)
@@ -49,7 +49,7 @@ jobs:
       - name: Emulator + UI drive
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: ${{ inputs.api }}
+          api-level: ${{ matrix.api }}
           target: google_apis
           arch: x86_64
           ram-size: 4096M
@@ -60,5 +60,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: vps-smoke-out
+          name: vps-smoke-out-${{ matrix.api }}
           path: smoke-out
