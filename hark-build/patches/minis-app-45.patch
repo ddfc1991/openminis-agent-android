@@ -1,5 +1,5 @@
 diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
-index 0afbb97..30b4859 100644
+index 0afbb97..565718e 100644
 --- a/src/android/app/build.gradle.kts
 +++ b/src/android/app/build.gradle.kts
 @@ -50,7 +50,7 @@ android {
@@ -11,7 +11,22 @@ index 0afbb97..30b4859 100644
  
          // System prompt prefix required by Anthropic for Claude Code OAuth
          // credentials. Empty in the public mirror (see provider-customization.properties).
-@@ -348,6 +348,11 @@ dependencies {
+@@ -139,6 +139,14 @@ android {
+         }
+     }
+ 
++    // [Mines-vps-ssh] jsch and jspecify both ship this OSGi manifest; it is not
++    // needed at runtime.
++    packaging {
++        resources {
++            excludes += setOf("META-INF/versions/9/OSGI-INF/MANIFEST.MF", "META-INF/versions/9/module-info.class")
++        }
++    }
++
+     compileOptions {
+         sourceCompatibility = JavaVersion.VERSION_17
+         targetCompatibility = JavaVersion.VERSION_17
+@@ -348,6 +356,11 @@ dependencies {
      // Apache-2.0 and downloaded once on first use (see OfflineAsrEngine).
      implementation("com.alphacephei:vosk-android:0.3.47")
  
@@ -52,6 +67,25 @@ index 34e45fc..5ad2731 100644
 +-dontwarn org.slf4j.**
 +-dontwarn org.newsclub.net.unix.**
 +-dontwarn com.sun.jna.platform.**
+diff --git a/src/android/app/src/main/AndroidManifest.xml b/src/android/app/src/main/AndroidManifest.xml
+index 17d2743..a5dc182 100644
+--- a/src/android/app/src/main/AndroidManifest.xml
++++ b/src/android/app/src/main/AndroidManifest.xml
+@@ -490,6 +490,14 @@
+                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                 android:value="Desk pet: an animated companion overlay the user turned on" />
+         </service>
++        <service
++            android:name=".plus.PluginWidgetService"
++            android:exported="false"
++            android:foregroundServiceType="specialUse">
++            <property
++                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
++                android:value="Plugin widget: a floating web widget from a plugin the user installed and opened" />
++        </service>
+         <service
+             android:name=".service.AgentForegroundService"
+             android:exported="false"
 diff --git a/src/android/app/src/main/assets/default_mount/etc/ssh/ssh_config.d/minis.conf b/src/android/app/src/main/assets/default_mount/etc/ssh/ssh_config.d/minis.conf
 index 7a1629e..fd4c2be 100644
 --- a/src/android/app/src/main/assets/default_mount/etc/ssh/ssh_config.d/minis.conf
@@ -901,11 +935,263 @@ index c13b6aa..f84833a 100644
          }
      }
  }
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/DshWidgets.kt b/src/android/app/src/main/java/com/openminis/app/plus/DshWidgets.kt
+new file mode 100644
+index 0000000..962bbb2
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/DshWidgets.kt
+@@ -0,0 +1,219 @@
++package com.openminis.app.plus
++
++import android.annotation.SuppressLint
++import android.app.Notification
++import android.app.NotificationChannel
++import android.app.NotificationManager
++import android.app.PendingIntent
++import android.app.Service
++import android.content.Context
++import android.content.Intent
++import android.content.pm.ServiceInfo
++import android.graphics.Color
++import android.graphics.PixelFormat
++import android.os.Build
++import android.os.IBinder
++import android.provider.Settings
++import android.util.Log
++import android.view.Gravity
++import android.view.MotionEvent
++import android.view.View
++import android.view.WindowManager
++import android.webkit.WebChromeClient
++import android.webkit.WebView
++import android.webkit.WebViewClient
++import android.widget.FrameLayout
++import android.widget.TextView
++import com.openminis.app.R
++import com.openminis.app.sandbox.PRootKernel
++import com.openminis.app.sandbox.RootfsManager
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
++import kotlinx.coroutines.withContext
++import org.json.JSONObject
++import java.io.File
++import java.net.HttpURLConnection
++import java.net.URL
++import kotlin.math.abs
++
++/**
++ * [Mines-dsh-ui] Host for dsh Web UI / widget plugins (e.g. dsh-whale-widget).
++ *
++ * `socket.mjs --web` loads the installed plugins with a `webServer` service,
++ * serves their routes on 127.0.0.1:8791 and renders an index page with the
++ * scripts the plugins inject. [PluginWidgetService] shows that page in a small
++ * transparent floating window, the phone's equivalent of DSH's Web UI corner.
++ */
++object DshWebHost {
++    private const val TAG = "DshWebHost"
++    const val PORT = 8791
++    const val URL_INDEX = "http://127.0.0.1:$PORT/"
++    @Volatile private var process: Process? = null
++    private val lock = Mutex()
++
++    private fun home(context: Context) = File(RootfsManager.getInstance(context).rootfsDir, "root/.minis-dsh")
++
++    /** Installed, enabled plugins that inject a Web UI widget (from status.json). */
++    fun widgetPlugins(context: Context): List<String> = runCatching {
++        val st = JSONObject(File(home(context), "status.json").readText())
++        st.keys().asSequence().filter { k -> st.optJSONObject(k)?.let { it.optBoolean("ok") && it.optBoolean("ui") } == true }.toList()
++    }.getOrDefault(emptyList())
++
++    fun healthy(): Boolean = runCatching {
++        val c = URL("http://127.0.0.1:$PORT/__mines/health").openConnection() as HttpURLConnection
++        c.connectTimeout = 800; c.readTimeout = 1500
++        c.responseCode == 200
++    }.getOrDefault(false)
++
++    fun restart() { process?.destroy(); process = null }
++
++    suspend fun ensure(context: Context): Boolean = withContext(Dispatchers.IO) {
++        lock.withLock {
++            var waited = 0
++            while (!PRootKernel.isBooted && waited < 60_000) { delay(500); waited += 500 }
++            if (!PRootKernel.isBooted) return@withLock false
++            if (healthy()) return@withLock true
++            start(context.applicationContext)
++            var t = 0
++            while (!healthy() && t < 30_000) { delay(500); t += 500 }
++            healthy()
++        }
++    }
++
++    private fun start(context: Context) {
++        process?.let { if (it.isAlive) return; process = null }
++        val cmd = "MINIS_DSH_HOME=/root/.minis-dsh MINIS_DSH_WEB_PORT=$PORT exec node /usr/local/lib/minis-dsh/socket.mjs --web"
++        val pb = ProcessBuilder(PRootKernel.buildProotCommand(cmd)).redirectErrorStream(true)
++        val env = pb.environment()
++        env["PROOT_TMP_DIR"] = PRootKernel.getProotTmpDir(context).absolutePath
++        if (PRootKernel.nativeLibDir.isNotEmpty()) env["LD_LIBRARY_PATH"] = PRootKernel.nativeLibDir
++        if (PRootKernel.prootLoaderPath.isNotEmpty()) env["PROOT_LOADER"] = PRootKernel.prootLoaderPath
++        if (PRootKernel.prootLoader32Path.isNotEmpty()) env["PROOT_LOADER_32"] = PRootKernel.prootLoader32Path
++        for ((k, v) in PRootKernel.customEnvironment) env[k] = v
++        val p = pb.start()
++        process = p
++        Thread({ runCatching { p.inputStream.use { s -> val b = ByteArray(4096); while (s.read(b) >= 0) {} } } }, "dsh-web-drain")
++            .apply { isDaemon = true }.start()
++        Log.i(TAG, "web host started")
++    }
++}
++
++/**
++ * Floating window showing the dsh widget page. Drag the handle to move it,
++ * long-press the handle to close. Uses the same overlay permission as the
++ * desk pet.
++ */
++class PluginWidgetService : Service() {
++    companion object {
++        private const val CHANNEL = "mines_plugin_widget"
++        private const val NOTIF_ID = 4412
++        const val ACTION_STOP = "com.openminis.mines.plugin_widget.STOP"
++
++        fun canShow(context: Context) = Settings.canDrawOverlays(context)
++
++        fun start(context: Context) {
++            val i = Intent(context, PluginWidgetService::class.java)
++            if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(i) else context.startService(i)
++        }
++
++        fun stop(context: Context) {
++            context.startService(Intent(context, PluginWidgetService::class.java).setAction(ACTION_STOP))
++        }
++
++        @Volatile var running = false
++            private set
++    }
++
++    private var wm: WindowManager? = null
++    private var root: View? = null
++    private var web: WebView? = null
++
++    override fun onBind(intent: Intent?): IBinder? = null
++
++    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
++        if (intent?.action == ACTION_STOP) { stopSelf(); return START_NOT_STICKY }
++        goForeground()
++        if (root == null && canShow(this)) addWindow()
++        running = true
++        return START_STICKY
++    }
++
++    private fun goForeground() {
++        val nm = getSystemService(NotificationManager::class.java)
++        if (nm.getNotificationChannel(CHANNEL) == null) {
++            nm.createNotificationChannel(NotificationChannel(CHANNEL, "插件挂件", NotificationManager.IMPORTANCE_MIN))
++        }
++        val stop = PendingIntent.getService(this, 2, Intent(this, PluginWidgetService::class.java).setAction(ACTION_STOP),
++            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
++        val n: Notification = Notification.Builder(this, CHANNEL)
++            .setSmallIcon(R.drawable.ic_launcher_monochrome)
++            .setContentTitle("插件挂件在桌面上")
++            .setContentText("拖动顶部小条移动，长按小条关闭")
++            .addAction(Notification.Action.Builder(null as android.graphics.drawable.Icon?, "关闭挂件", stop).build())
++            .setOngoing(true)
++            .build()
++        if (Build.VERSION.SDK_INT >= 34) startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
++        else startForeground(NOTIF_ID, n)
++    }
++
++    @SuppressLint("SetJavaScriptEnabled", "ClickableViewAccessibility")
++    private fun addWindow() {
++        val manager = getSystemService(WINDOW_SERVICE) as WindowManager
++        wm = manager
++        val d = resources.displayMetrics.density
++        val w = (260 * d).toInt(); val h = (320 * d).toInt()
++        val lp = WindowManager.LayoutParams(
++            w, h, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
++            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
++            PixelFormat.TRANSLUCENT,
++        ).apply {
++            gravity = Gravity.TOP or Gravity.START
++            x = resources.displayMetrics.widthPixels - w
++            y = (resources.displayMetrics.heightPixels * 0.35f).toInt()
++        }
++        val frame = FrameLayout(this)
++        val wv = WebView(this).apply {
++            setBackgroundColor(Color.TRANSPARENT)
++            settings.javaScriptEnabled = true
++            settings.domStorageEnabled = true
++            settings.mediaPlaybackRequiresUserGesture = false
++            webViewClient = WebViewClient()
++            webChromeClient = WebChromeClient()
++            loadUrl(DshWebHost.URL_INDEX)
++        }
++        web = wv
++        frame.addView(wv, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
++        val handle = TextView(this).apply {
++            text = "⋯ 挂件"; textSize = 11f; setTextColor(Color.WHITE); gravity = Gravity.CENTER
++            setBackgroundColor(Color.argb(110, 0, 0, 0))
++            contentDescription = "插件挂件：拖动移动，长按关闭"
++        }
++        frame.addView(handle, FrameLayout.LayoutParams((90 * d).toInt(), (22 * d).toInt(), Gravity.TOP or Gravity.CENTER_HORIZONTAL))
++        var downX = 0f; var downY = 0f; var sx = 0; var sy = 0; var downAt = 0L; var moved = false
++        handle.setOnTouchListener { _, ev ->
++            when (ev.actionMasked) {
++                MotionEvent.ACTION_DOWN -> { downX = ev.rawX; downY = ev.rawY; sx = lp.x; sy = lp.y; downAt = System.currentTimeMillis(); moved = false }
++                MotionEvent.ACTION_MOVE -> {
++                    val dx = ev.rawX - downX; val dy = ev.rawY - downY
++                    if (moved || abs(dx) > 10 * d || abs(dy) > 10 * d) {
++                        moved = true; lp.x = (sx + dx).toInt(); lp.y = (sy + dy).toInt()
++                        runCatching { manager.updateViewLayout(frame, lp) }
++                    }
++                }
++                MotionEvent.ACTION_UP -> if (!moved && System.currentTimeMillis() - downAt > 600) stopSelf()
++            }
++            true
++        }
++        root = frame
++        runCatching { manager.addView(frame, lp) }.onFailure { root = null; stopSelf() }
++    }
++
++    override fun onDestroy() {
++        running = false
++        runCatching { web?.destroy() }; web = null
++        root?.let { v -> runCatching { wm?.removeView(v) } }; root = null
++        super.onDestroy()
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt b/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
-index 63cd207..d82a1c0 100644
+index 63cd207..a6164db 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
-@@ -83,9 +83,18 @@ class GeminiLive(
+@@ -39,10 +39,25 @@ import kotlin.math.sqrt
+ class GeminiLive(
+     private val apiKey: String,
+     private val model: String,
+-    private val voice: String = "Puck",
++    private val voice: String = DEFAULT_VOICE,
+     private val systemPrompt: String = DEFAULT_PROMPT,
++    // [Mines-voice] Playback speed / pitch (AudioTrack PlaybackParams) and
++    // phone control by voice (function calls into the fast UI backend).
++    private val speed: Float = 1f,
++    private val pitch: Float = 1f,
++    private val appContext: android.content.Context? = null,
+ ) {
+     companion object {
++        /** Female by default (user asked, 2026-10-12). */
++        const val DEFAULT_VOICE = "Kore"
++        /** Gemini prebuilt voices with a short Chinese description. */
++        val voiceLabels = linkedMapOf(
++            "Kore" to "女声 · 沉稳", "Aoede" to "女声 · 轻快", "Leda" to "女声 · 年轻", "Zephyr" to "女声 · 明亮",
++            "Puck" to "男声 · 活泼", "Charon" to "男声 · 低沉", "Fenrir" to "男声 · 有力", "Orus" to "男声 · 稳重",
++        )
++        const val PHONE_PROMPT = "你还能直接操作这台手机：先调用 phone_screen 看当前屏幕（编号列表），" +
++            "再用 phone_do 一次执行多步（如 \"tap 3; type 5 你好; key enter\"），打开应用用 phone_open_app。" +
++            "每步做完告诉用户结果。付款、转账、下单、发送消息之前，必须先用一句话口头确认，用户明确说确认后才带 confirmed=true 执行。"
+         private const val TAG = "GeminiLive"
+         private const val URL =
+             "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+@@ -83,9 +98,18 @@ class GeminiLive(
      @Volatile private var legacySetup = false
      @Volatile private var stopped = false
      @Volatile private var lastAudioAt = 0L
@@ -924,7 +1210,7 @@ index 63cd207..d82a1c0 100644
          _error.value = null
          connect()
      }
-@@ -101,6 +110,7 @@ class GeminiLive(
+@@ -101,6 +125,7 @@ class GeminiLive(
      private fun connect() {
          _phase.value = Phase.CONNECTING
          setupDone = false
@@ -932,7 +1218,7 @@ index 63cd207..d82a1c0 100644
          val req = Request.Builder().url("$URL?key=$apiKey").build()
          ws = client.newWebSocket(req, object : WebSocketListener() {
              override fun onOpen(webSocket: WebSocket, response: Response) {
-@@ -110,11 +120,12 @@ class GeminiLive(
+@@ -110,11 +135,12 @@ class GeminiLive(
              override fun onMessage(webSocket: WebSocket, bytes: ByteString) = handle(bytes.utf8())
              override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                  webSocket.close(1000, null)
@@ -947,7 +1233,7 @@ index 63cd207..d82a1c0 100644
              }
          })
      }
-@@ -127,10 +138,31 @@ class GeminiLive(
+@@ -127,10 +153,31 @@ class GeminiLive(
              legacySetup = true
              connect(); return
          }
@@ -982,8 +1268,14 @@ index 63cd207..d82a1c0 100644
          }
          _phase.value = Phase.ERROR
      }
-@@ -150,13 +182,26 @@ class GeminiLive(
-         setup.put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", systemPrompt))))
+@@ -147,16 +194,72 @@ class GeminiLive(
+             setup.put("responseModalities", JSONArray().put("AUDIO"))
+             setup.put("speechConfig", speech)
+         }
+-        setup.put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", systemPrompt))))
++        val prompt = if (appContext != null) systemPrompt + "\n" + PHONE_PROMPT else systemPrompt
++        setup.put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", prompt))))
++        if (appContext != null) setup.put("tools", JSONArray().put(JSONObject().put("functionDeclarations", phoneTools())))
          setup.put("inputAudioTranscription", JSONObject())
          setup.put("outputAudioTranscription", JSONObject())
 +        if (!legacySetup) {
@@ -992,8 +1284,49 @@ index 63cd207..d82a1c0 100644
          return JSONObject().put("setup", setup)
      }
  
++    private fun phoneTools(): JSONArray {
++        fun obj(vararg props: Pair<String, JSONObject>, required: List<String> = emptyList()) = JSONObject()
++            .put("type", "OBJECT")
++            .put("properties", JSONObject().apply { props.forEach { (k, v) -> put(k, v) } })
++            .apply { if (required.isNotEmpty()) put("required", JSONArray(required)) }
++        fun str(d: String) = JSONObject().put("type", "STRING").put("description", d)
++        fun bool(d: String) = JSONObject().put("type", "BOOLEAN").put("description", d)
++        return JSONArray()
++            .put(JSONObject().put("name", "phone_screen").put("description", "读取手机当前屏幕，返回带编号的可操作元素列表"))
++            .put(JSONObject().put("name", "phone_do")
++                .put("description", "在手机上按顺序执行多步操作，最后返回新的屏幕列表。步骤用分号分隔：tap N | tap \"文字\" | type N 文字 | key back/home/enter | scroll down/up [次数] | wait 毫秒 | open 包名")
++                .put("parameters", obj("steps" to str("要执行的步骤"), "confirmed" to bool("付款/下单/发送类操作：用户已口头确认时为 true"), required = listOf("steps"))))
++            .put(JSONObject().put("name", "phone_open_app").put("description", "按名字打开手机上的应用（如 微信、支付宝、美团）")
++                .put("parameters", obj("name" to str("应用名或包名"), required = listOf("name"))))
++    }
++
++    /** Execute the model's phone-control calls and send the results back. */
++    private fun handleToolCall(calls: JSONArray) {
++        val ctx = appContext ?: return
++        scope.launch {
++            val responses = JSONArray()
++            for (i in 0 until calls.length()) {
++                val c = calls.optJSONObject(i) ?: continue
++                val args = c.optJSONObject("args") ?: JSONObject()
++                val ui = com.openminis.app.sandbox.offload.FastUi(ctx)
++                val out = runCatching {
++                    when (c.optString("name")) {
++                        "phone_screen" -> ui.voiceScreen()
++                        "phone_do" -> ui.voiceDo(args.optString("steps"), args.optBoolean("confirmed", false))
++                        "phone_open_app" -> ui.voiceOpenApp(args.optString("name"))
++                        else -> "未知工具"
++                    }
++                }.getOrElse { "出错：${it.message}" }
++                responses.put(JSONObject().put("id", c.optString("id")).put("name", c.optString("name"))
++                    .put("response", JSONObject().put("result", out.take(6000))))
++            }
++            ws?.send(JSONObject().put("toolResponse", JSONObject().put("functionResponses", responses)).toString())
++        }
++    }
++
      private fun handle(text: String) {
          val msg = runCatching { JSONObject(text) }.getOrNull() ?: return
++        msg.optJSONObject("toolCall")?.optJSONArray("functionCalls")?.let { handleToolCall(it); return }
 +        msg.optJSONObject("sessionResumptionUpdate")?.let { u ->
 +            if (u.optBoolean("resumable", true)) u.optString("newHandle").takeIf { it.isNotBlank() }?.let { resumeHandle = it }
 +        }
@@ -1009,7 +1342,21 @@ index 63cd207..d82a1c0 100644
              startAudio()
              _phase.value = Phase.LISTENING
              return
-@@ -256,6 +301,7 @@ class GeminiLive(
+@@ -216,7 +319,12 @@ class GeminiLive(
+                 .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
+             .setBufferSizeInBytes(maxOf(outMin * 4, 24000 * 2))
+             .setTransferMode(AudioTrack.MODE_STREAM)
+-            .build().also { it.play() }
++            .build().also { t ->
++                if (speed != 1f || pitch != 1f) runCatching {
++                    t.playbackParams = android.media.PlaybackParams().setSpeed(speed.coerceIn(0.5f, 2f)).setPitch(pitch.coerceIn(0.5f, 2f))
++                }
++                t.play()
++            }
+ 
+         val inMin = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+         val rec = AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, 16000,
+@@ -256,6 +364,7 @@ class GeminiLive(
  
      fun stop() {
          stopped = true
@@ -1782,10 +2129,10 @@ index 57866d4..d589efc 100644
          // component out of Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES. It
 diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/FastUi.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/FastUi.kt
 new file mode 100644
-index 0000000..7990d2c
+index 0000000..e0174e6
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/FastUi.kt
-@@ -0,0 +1,442 @@
+@@ -0,0 +1,498 @@
 +package com.openminis.app.sandbox.offload
 +
 +import android.accessibilityservice.AccessibilityService
@@ -1874,6 +2221,62 @@ index 0000000..7990d2c
 +        MinisAccessibilityService.getInstance() != null -> Backend.A11Y
 +        shizukuReady() -> Backend.SHIZUKU
 +        else -> null
++    }
++
++    // ── voice call tools ([Mines-voice-phone]) ───────────────────────────
++
++    private val noBackend = "手机控制不可用：请在 设置 → 无障碍 打开 Mines，或启动 Shizuku 并授权给 Mines。"
++    private val sensitive = Regex("支付|付款|转账|确认付款|立即支付|下单|提交订单|购买|发送|发消息|send|pay|transfer|checkout", RegexOption.IGNORE_CASE)
++
++    /** Numbered list of the current screen, for the voice agent. */
++    fun voiceScreen(): String = backend()?.let { ensureListener(); list(it, false) } ?: noBackend
++
++    /**
++     * Run a batch of steps for the voice agent. Steps that would pay, transfer,
++     * order or send something are refused unless [confirmed] (the agent must
++     * ask the user out loud first).
++     */
++    fun voiceDo(script: String, confirmed: Boolean): String {
++        val be = backend() ?: return noBackend
++        ensureListener()
++        if (!confirmed) {
++            val hit = sensitiveStep(be, script)
++            if (hit != null) return "NEEDS_CONFIRMATION: 「$hit」涉及付款/下单/发送。先用一句话向用户确认，用户明确说“确认”后再用 confirmed=true 调用。"
++        }
++        return batch(be, script)
++    }
++
++    private fun sensitiveStep(be: Backend, script: String): String? {
++        if (last.isEmpty()) list(be, false)
++        for (st in splitSteps(script)) {
++            val verb = st.substringBefore(' ').lowercase()
++            val rest = st.substringAfter(' ', "").trim()
++            if (verb in setOf("tap", "click", "点")) {
++                val label = rest.toIntOrNull()?.let { n -> last.firstOrNull { it.n == n }?.label } ?: unquote(rest)
++                if (sensitive.containsMatchIn(label)) return label
++            }
++            if (verb == "key" && rest.lowercase() in setOf("enter", "回车")) {
++                // Enter in a chat box sends the message.
++                if (lastPkg.contains("tencent.mm") || lastPkg.contains("mobileqq") || lastPkg.contains("sms") || lastPkg.contains("messag")) return "回车发送"
++            }
++        }
++        return null
++    }
++
++    /** Open an app by its name as shown on the launcher (or a package name). */
++    fun voiceOpenApp(name: String): String {
++        val q = name.trim()
++        val pm = context.packageManager
++        val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
++        val apps = runCatching { pm.queryIntentActivities(intent, 0) }.getOrDefault(emptyList())
++        val pkg = apps.firstOrNull { it.loadLabel(pm).toString().equals(q, true) }?.activityInfo?.packageName
++            ?: apps.firstOrNull { it.loadLabel(pm).toString().contains(q, true) }?.activityInfo?.packageName
++            ?: apps.firstOrNull { it.activityInfo.packageName.equals(q, true) }?.activityInfo?.packageName
++            ?: return "没找到叫「$q」的应用"
++        val be = backend()
++        val r = open(be ?: Backend.A11Y, pkg)
++        if (r.first && be != null) settle(be)
++        return r.second + (if (be != null) "\n" + list(be, false) else "")
 +    }
 +
 +    fun handle(args: OffloadArgs): NativeOffloadResult {
@@ -2343,7 +2746,7 @@ index 32851a7..db57988 100644
          AvatarTile("相册…", selected = false, onClick = { picker.launch("image/*") }) {
              Box(Modifier.size(84.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)),
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
-index 4395c47..5589aec 100644
+index 4395c47..ae2f08b 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
 @@ -179,7 +179,7 @@ fun ConnectionsScreen(onBack: () -> Unit) {
@@ -2618,6 +3021,15 @@ index 4395c47..5589aec 100644
                  modifier = Modifier.padding(horizontal = 16.dp).padding(bottom = 10.dp))
          }
          if (kind.loginUrl != null) SecondaryAction(if (kind.method == ConnMethod.GITHUB) "也在 Mines 浏览器里登录 GitHub 网页" else "网页登录 Outlook") {
+@@ -591,7 +598,7 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
+     var manual by remember { mutableStateOf("") }
+     var account by remember { mutableStateOf(existing?.account ?: "") }
+     var model by remember { mutableStateOf(PlusVault.extra(kind.id, "model") ?: com.openminis.app.plus.GeminiLive.DEFAULT_MODEL) }
+-    var voice by remember { mutableStateOf(PlusVault.extra(kind.id, "voice") ?: "Puck") }
++    var voice by remember { mutableStateOf(PlusVault.extra(kind.id, "voice") ?: com.openminis.app.plus.GeminiLive.DEFAULT_VOICE) }
+     val needsAccount = kind.id == "gmail"
+ 
+     LaunchedEffect(resumes) {
 @@ -623,24 +630,24 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
                  Row(verticalAlignment = Alignment.CenterVertically) {
                      Icon(Icons.Outlined.ContentPaste, null, tint = Green)
@@ -2649,7 +3061,16 @@ index 4395c47..5589aec 100644
              modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp),
          )
          if (kind.id == "gemini") {
-@@ -659,8 +666,8 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
+@@ -652,15 +659,15 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
+             ) {
+                 com.openminis.app.plus.GeminiLive.voices.forEach { v ->
+                     androidx.compose.material3.FilterChip(selected = voice == v, onClick = {
+-                        voice = v; PlusVault.setExtra(kind.id, "voice", v)
+-                    }, label = { Text(v) })
++                        voice = v; PlusVault.setExtra(kind.id, "voice", v); PlusVault.setExtra(kind.id, "voice_user", "1")
++                    }, label = { Text(v + " " + (com.openminis.app.plus.GeminiLive.voiceLabels[v] ?: "")) })
+                 }
+             }
          }
          if (manual.isNotBlank()) Button(
              onClick = { if (!needsAccount || account.isNotBlank()) save(manual.trim()) else Toast.makeText(context, "先填上你的 Gmail 地址", Toast.LENGTH_SHORT).show() },
@@ -2660,6 +3081,209 @@ index 4395c47..5589aec 100644
          Spacer(Modifier.height(6.dp))
      }
  }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/MarketScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/MarketScreen.kt
+index 0836dbf..849e3da 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/MarketScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/MarketScreen.kt
+@@ -43,6 +43,10 @@ import java.io.File
+ import java.net.HttpURLConnection
+ import java.net.URL
+ import java.net.URLEncoder
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.foundation.background
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.unit.sp
+ 
+ /** 市场: dsh plugins + MCP servers (tab 1) and community skills (tab 2). */
+ @Composable
+@@ -115,10 +119,71 @@ private fun installedMcp(ctx: Context): Set<String> = runCatching {
+ 
+ private fun safeName(s: String) = s.isNotBlank() && s.none { it == ' ' || it == ';' || it == '&' || it == '|' || it == '`' || it == '$' || it == '\'' || it == '"' }
+ 
++private data class NpmInfo(val name: String, val version: String, val description: String, val adds: List<String>, val homepage: String)
++
++/** [Mines-market] npm metadata → what the plugin will add to Mines. */
++private fun npmInfo(name: String): NpmInfo {
++    val j = JSONObject(httpGet("https://registry.npmjs.org/" + name.replace("/", "%2F") + "/latest"))
++    val kw = j.optJSONArray("keywords")?.let { a -> (0 until a.length()).map { a.optString(it).lowercase() } } ?: emptyList()
++    val desc = j.optString("description")
++    val adds = buildList {
++        if (j.optJSONObject("dsh")?.has("bundle") == true || kw.any { it in setOf("widget", "webui", "web-ui", "ui") }) add("界面挂件（桌面悬浮显示）")
++        if (kw.any { it in setOf("llm", "provider", "model", "models", "llm-provider") } || desc.contains("模型") || desc.contains("model", true)) add("模型（出现在模型选择里）")
++        if (isEmpty() || kw.any { it in setOf("tool", "tools", "mcp") }) add("工具 / 提示词（给 AI 用）")
++    }
++    return NpmInfo(j.optString("name", name), j.optString("version"), desc, adds,
++        j.optString("homepage").ifBlank { "https://www.npmjs.com/package/$name" })
++}
++
++@Composable
++private fun TypeBadge(text: String) {
++    val c = when (text) { "MCP" -> Color(0xFF5B8DEF); "技能" -> Color(0xFFAF52DE); else -> Color(0xFFD97757) }
++    Text(text, fontSize = 11.sp, color = c, maxLines = 1,
++        modifier = Modifier.clip(RoundedCornerShape(6.dp)).background(c.copy(alpha = 0.14f)).padding(horizontal = 6.dp, vertical = 1.dp))
++}
++
+ @Composable
+-private fun PluginMarket(onOpenTerminal: (String) -> Unit) {
++private fun IntroDialog(
++    title: String, badge: String, version: String?, desc: String, adds: List<String>, extra: String?,
++    installed: Boolean, busy: Boolean, onInstall: () -> Unit, onUninstall: (() -> Unit)?, onDismiss: () -> Unit,
++) {
++    androidx.compose.material3.AlertDialog(
++        onDismissRequest = onDismiss,
++        title = {
++            Row(verticalAlignment = Alignment.CenterVertically) {
++                TypeBadge(badge); Spacer(Modifier.width(8.dp))
++                Text(title, fontSize = 18.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
++            }
++        },
++        text = {
++            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
++                if (!version.isNullOrBlank()) Text("版本 v$version" + if (installed) " · 已安装" else "", fontSize = 13.sp,
++                    color = MaterialTheme.colorScheme.onSurfaceVariant)
++                Text(desc.ifBlank { "（作者没写简介）" }, fontSize = 15.sp)
++                if (adds.isNotEmpty()) {
++                    Text("装好后会加：", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
++                    adds.forEach { Text("• $it", fontSize = 14.sp) }
++                }
++                if (!extra.isNullOrBlank()) Text(extra, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
++            }
++        },
++        confirmButton = { Button(enabled = !busy, onClick = onInstall) { Text(if (installed) "更新" else "一键安装") } },
++        dismissButton = {
++            Row {
++                if (onUninstall != null) TextButton(enabled = !busy, onClick = onUninstall) { Text("卸载", color = Color(0xFFFF3B30)) }
++                TextButton(onClick = onDismiss) { Text("关闭") }
++            }
++        },
++    )
++}
++
++@Composable
++private fun PluginMarket(@Suppress("UNUSED_PARAMETER") onOpenTerminal: (String) -> Unit) {
+     val ctx = LocalContext.current
+     val scope = rememberCoroutineScope()
++    var intro by remember { mutableStateOf<NpmPkg?>(null) }
++    var introInfo by remember { mutableStateOf<NpmInfo?>(null) }
++    var introMcp by remember { mutableStateOf<McpPick?>(null) }
+     var query by remember { mutableStateOf("") }
+     var results by remember { mutableStateOf<List<NpmPkg>>(emptyList()) }
+     var msg by remember { mutableStateOf("正在加载…") }
+@@ -130,6 +195,35 @@ private fun PluginMarket(onOpenTerminal: (String) -> Unit) {
+     LaunchedEffect(tick) {
+         withContext(Dispatchers.IO) { installed = installedPlugins(ctx); mcp = installedMcp(ctx) }
+     }
++    // [Mines-market] One tap, no terminal: runs in the background with progress.
++    val task = rememberShellTask { tick++; scope.launch { com.openminis.app.plus.DshLlmBridge.ensure(ctx); com.openminis.app.plus.DshWebHost.restart() } }
++    fun installPkg(name: String) { if (safeName(name)) task.run("安装 $name", "minis-dsh add $name@latest") }
++    fun removePkg(name: String) { if (safeName(name)) task.run("卸载 $name", "minis-dsh remove $name") }
++    fun addMcp(m: McpPick) = task.run("添加 ${m.title}", "minis-dsh mcp-add ${m.name} ${m.pkg}${if (m.args.isNotBlank()) " " + m.args else ""}")
++    fun removeMcp(m: McpPick) = task.run("移除 ${m.title}", "minis-dsh mcp-remove ${m.name}")
++    intro?.let { p ->
++        LaunchedEffect(p.name) { introInfo = null; introInfo = withContext(Dispatchers.IO) { runCatching { npmInfo(p.name) }.getOrNull() } }
++        val inst = installed[p.name]
++        val info = introInfo
++        IntroDialog(
++            title = p.name, badge = "DSH插件", version = info?.version ?: p.version,
++            desc = info?.description ?: p.description, adds = info?.adds ?: listOf("正在读取…"),
++            extra = inst?.let { if (it.ok == false) "当前状态：用不了 — ${it.reason}" else "当前状态：已装" } ?: info?.homepage,
++            installed = inst != null, busy = task.state.running,
++            onInstall = { installPkg(p.name); intro = null },
++            onUninstall = if (inst != null) ({ removePkg(p.name); intro = null }) else null,
++            onDismiss = { intro = null },
++        )
++    }
++    introMcp?.let { m ->
++        val has = m.name in mcp
++        IntroDialog(
++            title = m.title, badge = "MCP", version = null, desc = m.note, adds = listOf("MCP 服务 ${m.pkg}（第一次用时自动下载）"),
++            extra = null, installed = has, busy = task.state.running,
++            onInstall = { addMcp(m); introMcp = null }, onUninstall = if (has) ({ removeMcp(m); introMcp = null }) else null,
++            onDismiss = { introMcp = null },
++        )
++    }
+     fun search() = scope.launch {
+         msg = "正在搜索…"
+         runCatching { withContext(Dispatchers.IO) { searchNpm(query.trim()) } }
+@@ -138,7 +232,7 @@ private fun PluginMarket(onOpenTerminal: (String) -> Unit) {
+     }
+     LaunchedEffect(Unit) { search() }
+ 
+-    PlusSection("搜索 dsh 插件", footer = "装好后在「插件」页能看到它加了哪些工具；标红的是 Mines 暂不支持的（需要 dsh 内部服务）。") {
++    PlusSection("搜索 dsh 插件", footer = "点条目看介绍，点「安装」一键装好（不用开终端）。装好后「插件」页显示它加了哪些工具、模型或挂件。") {
+         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+             OutlinedTextField(query, { query = it }, label = { Text("关键词（可空）") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+             Button(onClick = { search() }, modifier = Modifier.fillMaxWidth()) { Text("搜索") }
+@@ -148,14 +242,12 @@ private fun PluginMarket(onOpenTerminal: (String) -> Unit) {
+         curatedMcp.forEachIndexed { i, m ->
+             val has = m.name in mcp
+             MarketRow(
+-                title = m.title, sub = "${m.note} · ${m.pkg}",
++                title = m.title, sub = "${m.note} · ${m.pkg}", badge = "MCP",
+                 status = if (has) "已添加" else null,
+-                primary = if (has) "移除" else "添加",
++                primary = if (has) "移除" else "安装",
+                 primaryDanger = has,
+-                onPrimary = {
+-                    if (has) onOpenTerminal("minis-dsh mcp-remove ${m.name}")
+-                    else onOpenTerminal("minis-dsh mcp-add ${m.name} ${m.pkg}${if (m.args.isNotBlank()) " " + m.args else ""}")
+-                },
++                onPrimary = { if (has) removeMcp(m) else addMcp(m) },
++                onClick = { introMcp = m },
+             )
+             if (i < curatedMcp.lastIndex) PlusDivider()
+         }
+@@ -172,12 +264,13 @@ private fun PluginMarket(onOpenTerminal: (String) -> Unit) {
+                 else -> "已装"
+             }
+             MarketRow(
+-                title = p.name, sub = "${p.description.ifBlank { "（无简介）" }} · v${p.version}",
++                title = p.name, sub = "${p.description.ifBlank { "（无简介）" }} · v${p.version}", badge = "DSH插件",
+                 status = status, statusBad = inst?.ok == false,
+                 primary = if (inst == null) "安装" else "更新",
+-                onPrimary = { if (safeName(p.name)) onOpenTerminal("minis-dsh add ${p.name}@latest") },
++                onPrimary = { installPkg(p.name) },
+                 secondary = if (inst != null) "卸载" else null,
+-                onSecondary = { if (safeName(p.name)) onOpenTerminal("minis-dsh remove ${p.name}") },
++                onSecondary = { removePkg(p.name) },
++                onClick = { intro = p },
+             )
+             if (i < results.lastIndex) PlusDivider()
+         }
+@@ -186,7 +279,7 @@ private fun PluginMarket(onOpenTerminal: (String) -> Unit) {
+ 
+ @Composable
+ private fun MarketRow(
+-    title: String, sub: String, status: String?, statusBad: Boolean = false,
++    title: String, sub: String, status: String?, statusBad: Boolean = false, badge: String? = null,
+     primary: String, onPrimary: () -> Unit, primaryDanger: Boolean = false,
+     secondary: String? = null, onSecondary: () -> Unit = {},
+     onClick: (() -> Unit)? = null,
+@@ -197,9 +290,12 @@ private fun MarketRow(
+         verticalAlignment = Alignment.CenterVertically,
+     ) {
+         Column(Modifier.weight(1f)) {
+-            Text(title, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+-            Text(sub, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 3, overflow = TextOverflow.Ellipsis)
+-            if (status != null) Text(status, style = MaterialTheme.typography.bodyMedium,
++            Row(verticalAlignment = Alignment.CenterVertically) {
++                if (badge != null) { TypeBadge(badge); Spacer(Modifier.width(6.dp)) }
++                Text(title, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
++            }
++            Text(sub, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
++            if (status != null) Text(status, fontSize = 13.sp,
+                 color = if (statusBad) Color(0xFFFF3B30) else Color(0xFF34C759))
+         }
+         Spacer(Modifier.width(8.dp))
+@@ -354,7 +450,7 @@ private fun SkillMarket() {
+             val src = remember(tick, s.name) { SkillMarketData.installedSource(ctx, s.name) }
+             val key = s.repo + "/" + s.dir
+             MarketRow(
+-                title = s.name,
++                title = s.name, badge = "技能",
+                 sub = if (expanded == key) desc.ifBlank { "正在读取简介…" } else "${s.dir.ifBlank { "/" }} · ${s.files.size} 个文件 · 点一下看简介",
+                 status = when (src) { null -> null; "local" -> "已有同名本地技能"; else -> "已安装" },
+                 statusBad = src == "local",
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PersonalizeScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PersonalizeScreen.kt
 index 34a2b67..338a279 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/PersonalizeScreen.kt
@@ -2673,6 +3297,115 @@ index 34a2b67..338a279 100644
              }
              Text(
                  com.openminis.app.plus.Avatars.name(st.petStyle),
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PluginsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PluginsScreen.kt
+index 6345608..c41e55b 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/PluginsScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PluginsScreen.kt
+@@ -44,11 +44,12 @@ import kotlinx.coroutines.withContext
+ import org.json.JSONObject
+ import java.io.File
+ 
+-private data class PluginRow(val pkg: String, val enabled: Boolean, val ok: Boolean?, val reason: String, val tools: List<String>)
++private data class PluginRow(val pkg: String, val enabled: Boolean, val ok: Boolean?, val reason: String, val tools: List<String>,
++    val ui: Boolean = false, val llm: List<String> = emptyList())
+ 
+ /**
+- * dsh plugin center. The work happens in the sandbox (`minis-dsh`), shown in
+- * the terminal so the user sees progress; this page lists what is installed
++ * dsh plugin center. The work happens in the sandbox (`minis-dsh`), run in
++ * the background with a progress dialog; this page lists what is installed
+  * and which tools each plugin adds, read from the files minis-dsh keeps.
+  */
+ @Composable
+@@ -62,13 +63,16 @@ fun PluginsScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onOpenMa
+     // Re-read whenever the page comes back (e.g. returning from the terminal).
+     val owner = LocalLifecycleOwner.current
+     LaunchedEffect(owner) { owner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) { tick++ } }
++    // [Mines-dsh] Installs / removals / checks run in the background with a
++    // progress dialog instead of a pre-filled terminal waiting for Enter.
++    val task = rememberShellTask { tick++ ; scope.launch { com.openminis.app.plus.DshLlmBridge.ensure(context); com.openminis.app.plus.DshWebHost.restart() } }
+     val rows by produceState(initialValue = emptyList<PluginRow>(), tick) {
+         value = withContext(Dispatchers.IO) { readPlugins(context) }
+     }
+ 
+     PlusPage("插件", onBack) {
+         Text(
+-            "可以装 DeepSeek Harness（dsh）的插件。加工具的插件会出现在 Mines 的 MCP 里；提供模型的插件（比如 WorkBuddy）会在模型选择里多出一组模型。",
++            "可以装 DeepSeek Harness（dsh）的插件。加工具的插件会出现在 Mines 的 MCP 里；提供模型的插件（比如 WorkBuddy）会在模型选择里多出一组模型；界面挂件插件（比如小鲸鱼余额）可以显示成桌面悬浮挂件。",
+             style = MaterialTheme.typography.bodyMedium,
+             color = MaterialTheme.colorScheme.onSurfaceVariant,
+             modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
+@@ -126,7 +130,7 @@ fun PluginsScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onOpenMa
+                     modifier = Modifier.fillMaxWidth())
+                 Button(
+                     enabled = input.isNotBlank() && input.none { it == ' ' || it == ';' || it == '&' || it == '|' || it == '`' || it == '$' },
+-                    onClick = { onOpenTerminal("minis-dsh add ${normalize(input)}"); input = "" },
++                    onClick = { task.run("安装 ${normalize(input)}", "minis-dsh add ${normalize(input)}"); input = "" },
+                     modifier = Modifier.fillMaxWidth(),
+                 ) { Text("安装") }
+             }
+@@ -144,7 +148,11 @@ fun PluginsScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onOpenMa
+                         Text(
+                             when {
+                                 !r.enabled -> "已停用"
+-                                r.ok == true -> if (r.tools.isEmpty()) "已加载（只加提示词）" else "工具：" + r.tools.joinToString("、")
++                                r.ok == true -> listOfNotNull(
++                                    r.tools.takeIf { it.isNotEmpty() }?.let { "工具：" + it.joinToString("、") },
++                                    r.llm.takeIf { it.isNotEmpty() }?.let { "模型：" + it.joinToString("、") },
++                                    if (r.ui) "界面挂件" else null,
++                                ).joinToString(" · ").ifEmpty { "已加载（只加提示词）" }
+                                 r.ok == false -> "用不了：${r.reason}"
+                                 else -> "未检查"
+                             },
+@@ -152,14 +160,34 @@ fun PluginsScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onOpenMa
+                             color = MaterialTheme.colorScheme.onSurfaceVariant,
+                         )
+                     }
+-                    Switch(r.enabled, onCheckedChange = { on -> onOpenTerminal("minis-dsh ${if (on) "on" else "off"} ${r.pkg} && minis-dsh list") })
+-                    TextButton(onClick = { onOpenTerminal("minis-dsh remove ${r.pkg}") }) { Text("卸载", color = Color(0xFFFF3B30)) }
++                    Switch(r.enabled, onCheckedChange = { on -> task.run(if (on) "启用 ${r.pkg}" else "停用 ${r.pkg}", "minis-dsh ${if (on) "on" else "off"} ${r.pkg} && minis-dsh list") })
++                    TextButton(onClick = { task.run("卸载 ${r.pkg}", "minis-dsh remove ${r.pkg}") }) { Text("卸载", color = Color(0xFFFF3B30)) }
++                }
++                if (r.ui && r.enabled && r.ok == true) {
++                    // [Mines-dsh-ui] Widget plugins: shown as a floating window.
++                    TextButton(
++                        onClick = {
++                            if (!com.openminis.app.plus.PluginWidgetService.canShow(context)) {
++                                runCatching {
++                                    context.startActivity(android.content.Intent(android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
++                                        android.net.Uri.parse("package:" + context.packageName)).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
++                                }
++                            } else scope.launch {
++                                modelMsg = "正在启动挂件…"
++                                val ok = com.openminis.app.plus.DshWebHost.ensure(context)
++                                modelMsg = if (ok) "" else "挂件服务没起来（点「重新检查」看原因）"
++                                if (ok) com.openminis.app.plus.PluginWidgetService.start(context)
++                            }
++                        },
++                        modifier = Modifier.padding(start = 30.dp),
++                    ) { Text(if (com.openminis.app.plus.PluginWidgetService.running) "挂件已显示（长按挂件顶部小条关闭）" else "显示挂件") }
++                    if (modelMsg.isNotBlank()) Text(modelMsg, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(start = 44.dp))
+                 }
+                 if (i < rows.lastIndex) PlusDivider()
+             }
+             if (rows.isNotEmpty()) {
+                 PlusDivider()
+-                ActionRow(Icons.Outlined.Refresh, "重新检查") { onOpenTerminal("minis-dsh list") }
++                ActionRow(Icons.Outlined.Refresh, "重新检查") { task.run("检查插件", "minis-dsh list") }
+             }
+         }
+     }
+@@ -181,7 +209,9 @@ private fun readPlugins(context: android.content.Context): List<PluginRow> = run
+         val pkg = p.optString("package")
+         val st = status?.optJSONObject(pkg)
+         val tools = st?.optJSONArray("tools")?.let { t -> (0 until t.length()).map { t.getString(it) } } ?: emptyList()
+-        PluginRow(pkg, p.optBoolean("enabled", true), st?.optBoolean("ok"), st?.optString("reason") ?: "", tools)
++        val llm = st?.optJSONArray("llm")?.let { t -> (0 until t.length()).map { t.getString(it) } } ?: emptyList()
++        PluginRow(pkg, p.optBoolean("enabled", true), st?.optBoolean("ok"), st?.optString("reason") ?: "", tools,
++            st?.optBoolean("ui") == true, llm)
+     }
+ }.getOrDefault(emptyList())
+ 
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
 index 9d96640..2a9ca8f 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
@@ -2795,6 +3528,125 @@ index 615bf73..fc63799 100644
  }
  
  private fun rate(kbs: Float) = if (kbs >= 1024) "%.1f MB/s".format(kbs / 1024) else "%.0f KB/s".format(kbs)
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ShellTask.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ShellTask.kt
+new file mode 100644
+index 0000000..8cd6cf7
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ShellTask.kt
+@@ -0,0 +1,113 @@
++package com.openminis.app.ui.plus
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.verticalScroll
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.CircularProgressIndicator
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.font.FontFamily
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++
++/**
++ * [Mines-dsh] Runs a sandbox command in the background with a small progress
++ * dialog — installs, removals and checks no longer open the terminal and wait
++ * for the user to press Enter.
++ */
++class ShellTaskState {
++    var title by mutableStateOf("")
++    var lines by mutableStateOf(listOf<String>())
++    var running by mutableStateOf(false)
++    var exit by mutableStateOf<Int?>(null)
++    var visible by mutableStateOf(false)
++}
++
++class ShellTaskRunner(val state: ShellTaskState, val run: (title: String, command: String) -> Unit)
++
++@Composable
++fun rememberShellTask(onFinished: (Int) -> Unit = {}): ShellTaskRunner {
++    val context = LocalContext.current
++    val scope = rememberCoroutineScope()
++    val state = remember { ShellTaskState() }
++    val runner = remember {
++        ShellTaskRunner(state) { title, command ->
++            if (state.running) return@ShellTaskRunner
++            state.title = title; state.lines = emptyList(); state.exit = null; state.running = true; state.visible = true
++            scope.launch {
++                val code = withContext(Dispatchers.IO) {
++                    runCatching {
++                        var waited = 0
++                        while (!com.openminis.app.sandbox.PRootKernel.isBooted && waited < 60_000) { Thread.sleep(500); waited += 500 }
++                        com.openminis.app.sandbox.ShellExecutor.execute(
++                            context.applicationContext, command, timeout = 900_000L,
++                            environment = mapOf("CI" to "true", "npm_config_yes" to "true"),
++                        ) { line ->
++                            val clean = line.replace(Regex("\u001B\\[[0-9;]*[A-Za-z]"), "").trimEnd()
++                            if (clean.isNotBlank()) state.lines = (state.lines + clean).takeLast(120)
++                        }.let { r ->
++                            if (state.lines.isEmpty() && r.output.isNotBlank()) state.lines = r.output.lines().filter { it.isNotBlank() }.takeLast(120)
++                            r.exitCode
++                        }
++                    }.getOrElse { state.lines = state.lines + "出错：${it.message}"; -1 }
++                }
++                state.exit = code; state.running = false
++                onFinished(code)
++            }
++        }
++    }
++    ShellTaskDialog(state)
++    return runner
++}
++
++@Composable
++fun ShellTaskDialog(state: ShellTaskState) {
++    if (!state.visible) return
++    val scroll = rememberScrollState()
++    LaunchedEffect(state.lines.size) { scroll.animateScrollTo(scroll.maxValue) }
++    AlertDialog(
++        onDismissRequest = { if (!state.running) state.visible = false },
++        title = { Text(state.title, fontSize = 18.sp) },
++        text = {
++            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                Row(verticalAlignment = Alignment.CenterVertically) {
++                    if (state.running) { CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp); Spacer(Modifier.width(8.dp)) }
++                    Text(
++                        when (val e = state.exit) { null -> "进行中，请稍等…"; 0 -> "完成 ✓"; else -> "没成功（退出码 $e），看下面的信息" },
++                        fontSize = 15.sp,
++                        color = when (state.exit) { null -> MaterialTheme.colorScheme.onSurface; 0 -> Color(0xFF34C759); else -> Color(0xFFFF3B30) },
++                    )
++                }
++                Column(Modifier.fillMaxWidth().heightIn(max = 260.dp).verticalScroll(scroll)) {
++                    state.lines.forEach { Text(it, fontSize = 12.sp, fontFamily = FontFamily.Monospace) }
++                }
++            }
++        },
++        confirmButton = {
++            TextButton(enabled = !state.running, onClick = { state.visible = false }) { Text(if (state.running) "进行中" else "好") }
++        },
++    )
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
 index 9bd7854..bbde2db 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
@@ -2809,10 +3661,67 @@ index 9bd7854..bbde2db 100644
              ),
      ) {
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
-index 38a175e..7796ad6 100644
+index 38a175e..cd0b70b 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
-@@ -124,7 +124,7 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+@@ -29,6 +29,8 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
+ import androidx.compose.material.icons.filled.CallEnd
+ import androidx.compose.material.icons.filled.Mic
+ import androidx.compose.material.icons.filled.MicOff
++import androidx.compose.material.icons.filled.Settings
++import androidx.compose.ui.unit.sp
+ import androidx.compose.material3.Button
+ import androidx.compose.material3.ExperimentalMaterial3Api
+ import androidx.compose.material3.Icon
+@@ -71,10 +73,24 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+         mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
+     }
+     val askMic = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { hasMic = it }
+-    val live = remember(key) {
+-        key?.let { GeminiLive(it, PlusVault.extra("gemini", "model") ?: GeminiLive.DEFAULT_MODEL,
+-            PlusVault.extra("gemini", "voice") ?: "Puck") }
++    // [Mines-voice] Voice (female by default), speed, pitch and phone control
++    // are adjustable from the ⚙ sheet; changing them reconnects with the new
++    // settings.
++    var settingsVersion by remember { mutableStateOf(0) }
++    var showSettings by remember { mutableStateOf(false) }
++    val live = remember(key, settingsVersion) {
++        key?.let {
++            val userVoice = PlusVault.extra("gemini", "voice").takeIf { PlusVault.extra("gemini", "voice_user") == "1" }
++            GeminiLive(
++                it, PlusVault.extra("gemini", "model") ?: GeminiLive.DEFAULT_MODEL,
++                userVoice ?: GeminiLive.DEFAULT_VOICE,
++                speed = PlusVault.extra("gemini", "speed")?.toFloatOrNull() ?: 1f,
++                pitch = PlusVault.extra("gemini", "pitch")?.toFloatOrNull() ?: 1f,
++                appContext = if (PlusVault.extra("gemini", "phone") != "0") context.applicationContext else null,
++            )
++        }
+     }
++    DisposableEffect(live) { onDispose { live?.stop() } }
+ 
+     // Keep the screen on during a call; hang up when leaving.
+     DisposableEffect(Unit) {
+@@ -90,6 +106,7 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+         else if (live != null && !hasMic) askMic.launch(Manifest.permission.RECORD_AUDIO)
+     }
+ 
++    if (showSettings) VoiceSettingsSheet(onDismiss = { showSettings = false }, onChanged = { live?.stop(); settingsVersion++ })
+     Scaffold(
+         containerColor = Color(0xFF0E1320),
+         topBar = {
+@@ -98,6 +115,11 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+                 navigationIcon = {
+                     IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回", tint = Color.White) }
+                 },
++                actions = {
++                    IconButton(onClick = { showSettings = true }) {
++                        Icon(Icons.Filled.Settings, "语音设置", tint = Color.White)
++                    }
++                },
+                 colors = androidx.compose.material3.TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
+             )
+         },
+@@ -124,7 +146,7 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
              Text(
                  when (phase) {
                      GeminiLive.Phase.IDLE -> "准备中"
@@ -2821,6 +3730,58 @@ index 38a175e..7796ad6 100644
                      GeminiLive.Phase.LISTENING -> if (muted) "已静音" else "我在听，直接说"
                      GeminiLive.Phase.SPEAKING -> "说话中（随时打断我）"
                      GeminiLive.Phase.ERROR -> error ?: "出错了"
+@@ -177,6 +199,51 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+     }
+ }
+ 
++/** [Mines-voice] Voice choice, speed, pitch, phone control. */
++@OptIn(ExperimentalMaterial3Api::class)
++@Composable
++private fun VoiceSettingsSheet(onDismiss: () -> Unit, onChanged: () -> Unit) {
++    var voice by remember {
++        mutableStateOf(PlusVault.extra("gemini", "voice").takeIf { PlusVault.extra("gemini", "voice_user") == "1" } ?: GeminiLive.DEFAULT_VOICE)
++    }
++    var speed by remember { mutableStateOf(PlusVault.extra("gemini", "speed")?.toFloatOrNull() ?: 1f) }
++    var pitch by remember { mutableStateOf(PlusVault.extra("gemini", "pitch")?.toFloatOrNull() ?: 1f) }
++    var phone by remember { mutableStateOf(PlusVault.extra("gemini", "phone") != "0") }
++    androidx.compose.material3.ModalBottomSheet(onDismissRequest = { onChanged(); onDismiss() }) {
++        Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp).padding(bottom = 28.dp),
++            verticalArrangement = Arrangement.spacedBy(10.dp)) {
++            Text("语音设置", fontSize = 20.sp)
++            Text("声音", fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
++            GeminiLive.voiceLabels.forEach { (id, label) ->
++                Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
++                    .background(if (voice == id) MaterialTheme.colorScheme.primary.copy(alpha = 0.14f) else Color.Transparent)
++                    .clickable { voice = id; PlusVault.setExtra("gemini", "voice", id); PlusVault.setExtra("gemini", "voice_user", "1") }
++                    .padding(horizontal = 12.dp, vertical = 10.dp),
++                    verticalAlignment = Alignment.CenterVertically) {
++                    Text(label, fontSize = 16.sp, modifier = Modifier.weight(1f))
++                    Text(id, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
++                    if (voice == id) Text("  ✓", fontSize = 16.sp, color = MaterialTheme.colorScheme.primary)
++                }
++            }
++            Text("语速 ${"%.1f".format(speed)}×", fontSize = 15.sp)
++            androidx.compose.material3.Slider(speed, { speed = (it * 10).toInt() / 10f; PlusVault.setExtra("gemini", "speed", speed.toString()) },
++                valueRange = 0.7f..1.5f)
++            Text("音调 ${"%.1f".format(pitch)}", fontSize = 15.sp)
++            androidx.compose.material3.Slider(pitch, { pitch = (it * 10).toInt() / 10f; PlusVault.setExtra("gemini", "pitch", pitch.toString()) },
++                valueRange = 0.7f..1.4f)
++            Row(verticalAlignment = Alignment.CenterVertically) {
++                Column(Modifier.weight(1f)) {
++                    Text("通话里可以操作手机", fontSize = 16.sp)
++                    Text("打开应用、点按钮、输入文字；付款和发消息前会先口头问你", fontSize = 13.sp,
++                        color = MaterialTheme.colorScheme.onSurfaceVariant)
++                }
++                androidx.compose.material3.Switch(phone, { phone = it; PlusVault.setExtra("gemini", "phone", if (it) "1" else "0") })
++            }
++            Text("关掉这个面板后会用新设置重新连接。", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
++        }
++    }
++}
++
+ @Composable
+ private fun Orb(phase: GeminiLive.Phase, level: Float) {
+     val target = when (phase) {
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt
 index 6ef293a..760c64a 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt
