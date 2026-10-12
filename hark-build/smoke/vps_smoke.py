@@ -204,17 +204,25 @@ def setup_provider():
         if find(root, "API Key", exact=True):
             tap_text("API Key", exact=True, wait=3); root = snap("auth-picked")
     # fields are found by their placeholder text (indices shift when the IME opens)
+    def ime_shown():
+        return "mInputShown=true" in sh("dumpsys input_method | grep mInputShown")
+
     def type_into(placeholder, value):
         for _ in range(3):
-            p = find(dump(), placeholder, exact=True)
-            if p:
-                sh(f"input tap {p[0]} {p[1]}"); time.sleep(0.8); type_text(value); time.sleep(0.6)
-                sh("input keyevent KEYCODE_BACK"); time.sleep(1); return True
+            root = dump()
+            target = None
+            for n in root.iter("node") if root is not None else []:
+                if n.get("class", "").endswith("EditText"):
+                    if any((c.get("text") == placeholder) for c in n.iter("node")) or n.get("text") == placeholder:
+                        b = list(map(int, re.findall(r"\d+", n.get("bounds", "")))); target = ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2); break
+            if target:
+                sh(f"input tap {target[0]} {target[1]}"); time.sleep(1.0); type_text(value); time.sleep(0.6)
+                if ime_shown(): sh("input keyevent KEYCODE_BACK"); time.sleep(1)
+                return True
             scroll_down()
-        print(f"  (placeholder not found: {placeholder})", flush=True); return False
+        print(f"  (field with placeholder not found: {placeholder})", flush=True); return False
     type_into("sk-...", "sk-smoke-000000000000000000000000")
     type_into("https://api.openai.com", "http://10.0.2.2:8088")
-    sh("input keyevent KEYCODE_BACK"); time.sleep(1)
     root = snap("provider-filled")
     for _ in range(4):
         if tap_any(["Add Provider", "Save Provider", "Save API Key"], wait=5, exact=True):
@@ -294,7 +302,9 @@ def user_like_state():
     for _ in range(4):
         if find(dump(), "相册", exact=True): break
         scroll_down()
-    if tap_any(["相册"], wait=5, exact=True):
+    p = find(dump(), "相册", exact=True)
+    if p:
+        sh(f"input tap {p[0]} {max(0, p[1] - 90)}"); time.sleep(5)
         for _ in range(3):
             root = snap("picker")
             hit = None
