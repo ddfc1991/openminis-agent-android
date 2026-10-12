@@ -1,7 +1,7 @@
 #!/bin/sh
 # [Mines-net-26] CI: boot the app's own Alpine rootfs (aarch64, run under qemu) with
 # the app's default_mount overlay, its env (etc/minis/net.env + CA bundle built the
-# way SandboxNet.prepareRootfs does), and the mirrors/pip.conf minis-mirror writes.
+# way SandboxNet.prepareRootfs does), and the mirrors/pip.conf mines-mirror writes.
 # Then install real packages through the same wrappers the phone uses, and prove
 # that a stalled mirror and a dead proxy no longer hang anything. Exit 1 = build fails.
 set -u
@@ -13,7 +13,7 @@ step "overlay default_mount (RootfsManager.applyDefaultMountOverlay)"
 if ! cp -a /mnt/dm/. / 2>/tmp/cp.err; then
     if grep -v "etc/hostname" /tmp/cp.err | grep -q .; then cat /tmp/cp.err; fail "overlay"; fi
 fi
-[ -f /usr/local/bin/minis-mirror ] && [ -f /etc/minis/net.env ] || fail "overlay incomplete"
+[ -f /usr/local/bin/mines-mirror ] && [ -f /etc/minis/net.env ] || fail "overlay incomplete"
 chmod +x /usr/local/bin/* 2>/dev/null
 [ -s /etc/ssl/minis-mozilla.pem ] || fail "Mozilla CA bundle missing from the APK assets"
 cat /etc/ssl/minis-mozilla.pem /etc/ssl/certs/ca-certificates.crt > /etc/ssl/minis-ca.pem
@@ -22,8 +22,8 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/bi
 printf 'vpn=0\ntransport=CI\ndns=\nipv6=0\nproxy_source=none\nsig=ci-1\n' > /etc/minis/net.state
 cat /etc/alpine-release; command -v apk pip
 
-step "minis-mirror auto apk pip npm"
-minis-mirror auto apk pip npm || fail "no working mirror"
+step "mines-mirror auto apk pip npm"
+mines-mirror auto apk pip npm || fail "no working mirror"
 cat /etc/apk/repositories /etc/pip.conf /root/.npmrc
 
 step "apk update && apk add --no-cache gcc"
@@ -65,12 +65,15 @@ MINIS_PIP_STALL=30 timeout 900 pip download -q -d /tmp/pd2 six; rc=$?
 echo "pip rc=$rc after $(( $(date +%s) - t0 ))s"
 [ "$rc" = 0 ] || fail "pip did not recover from a stalled index (rc=$rc)"
 
-step "minis-doctor (must finish and print a verdict)"
-timeout 300 minis-doctor > /tmp/doctor.txt 2>&1; rc=$?
+step "mines-doctor (must finish and print a verdict)"
+timeout 300 mines-doctor > /tmp/doctor.txt 2>&1; rc=$?
 cat /tmp/doctor.txt
-[ "$rc" = 0 ] || fail "minis-doctor rc=$rc"
-grep -qE 'MINES_DOCTOR_(OK|PROBLEMS)' /tmp/doctor.txt || fail "minis-doctor printed no verdict"
+[ "$rc" = 0 ] || fail "mines-doctor rc=$rc"
+grep -qE 'MINES_DOCTOR_(OK|PROBLEMS)' /tmp/doctor.txt || fail "mines-doctor printed no verdict"
 
-step "minis-devkit check / vps-command"
-minis-devkit vps-command | grep -q MINES_DEVKIT_OK || fail "devkit vps-command"
+step "mines-devkit check / vps-command"
+mines-devkit vps-command | grep -q MINES_DEVKIT_OK || fail "devkit vps-command"
+step "old command names still work (aliases)"
+minis-doctor --short >/dev/null 2>&1 || fail "minis-doctor alias"
+minis-mirror show apk | grep -q apk || fail "minis-mirror alias"
 echo; echo "SANDBOX_NET_SELFTEST_OK"
