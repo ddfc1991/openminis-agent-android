@@ -203,13 +203,17 @@ def setup_provider():
         root = snap("provider-picked")
         if find(root, "API Key", exact=True):
             tap_text("API Key", exact=True, wait=3); root = snap("auth-picked")
-    e = edits(dump())
-    print("  edit texts:", [n.get("text") for _, _, n in e], flush=True)
-    # label, key, base url (order on the configure page): URL first, the IME then hides less
-    if len(e) >= 3:
-        fill_edit(2, "http://10.0.2.2:8088")
-        sh("input keyevent KEYCODE_BACK"); time.sleep(1)
-        fill_edit(1, "sk-smoke-000000000000000000000000")
+    # fields are found by their placeholder text (indices shift when the IME opens)
+    def type_into(placeholder, value):
+        for _ in range(3):
+            p = find(dump(), placeholder, exact=True)
+            if p:
+                sh(f"input tap {p[0]} {p[1]}"); time.sleep(0.8); type_text(value); time.sleep(0.6)
+                sh("input keyevent KEYCODE_BACK"); time.sleep(1); return True
+            scroll_down()
+        print(f"  (placeholder not found: {placeholder})", flush=True); return False
+    type_into("sk-...", "sk-smoke-000000000000000000000000")
+    type_into("https://api.openai.com", "http://10.0.2.2:8088")
     sh("input keyevent KEYCODE_BACK"); time.sleep(1)
     root = snap("provider-filled")
     for _ in range(4):
@@ -223,10 +227,18 @@ def setup_provider():
         sh("input keyevent KEYCODE_BACK"); time.sleep(2); root = dump()
     tap_text("Select Models", wait=10)
     root = snap("models")
+    for _ in range(3):
+        if find(root, "smoke-model"): break
+        if tap_any(["Retry"], wait=8): root = dump()
     if not tap_text("smoke-model", wait=2):
         if tap_any(["Add Model Manually"], wait=3):
             fill_edit(0, "smoke-model", clear=False)
-            tap_any(["Add", "Save", "OK", "添加"], wait=3)
+            sh("input keyevent KEYCODE_BACK"); time.sleep(1)
+            for _ in range(3):
+                if tap_any(["Add Custom Model", "Add Model", "Save", "Add"], wait=4, exact=True): break
+                scroll_down()
+            snap("custom-model-added")
+            tap_text("smoke-model", wait=2)
     root = snap("model-picked")
     tap_any(["Done (1/3)", "Done ("], wait=5)
     root = snap("after-models")
@@ -279,6 +291,9 @@ def user_like_state():
     snap("personalize")
     # Photo wallpaper (the user's phone has one): pick /sdcard/Pictures/smoke-wall.jpg
     picked = False
+    for _ in range(4):
+        if find(dump(), "相册", exact=True): break
+        scroll_down()
     if tap_any(["相册"], wait=5, exact=True):
         for _ in range(3):
             root = snap("picker")
@@ -293,8 +308,9 @@ def user_like_state():
     if not picked:
         tap_any(["极光"], wait=2, exact=True)
     print("photo wallpaper picked:", picked, flush=True)
-    for _ in range(3):
-        if toggle_near("首页也用这张壁纸"): break
+    for _ in range(4):
+        if find(dump(), "首页也用这张壁纸"):
+            toggle_near("首页也用这张壁纸"); break
         scroll_down()
     for _ in range(6):
         if find(dump(), "显示桌宠"):
