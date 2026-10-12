@@ -1669,6 +1669,271 @@ index be32a8f..5c67010 100644
 +        }.onFailure { netCallbackRegistered = false; Log.w(TAG, "network callback: ${it.message}") }
 +    }
  }
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt b/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt
+index f782472..1f24f28 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt
+@@ -57,10 +57,25 @@ object SplitProxy {
+         val rules: List<Rule> = emptyList(),
+         val forSandbox: Boolean = true,
+         val forApp: Boolean = true,
++        // [Mines-proxy-auto] Backup proxies + periodic health checks; when the
++        // current one stops working traffic moves to the next healthy one.
++        val backups: List<Upstream> = emptyList(),
++        val autoSwitch: Boolean = true,
+     ) {
+-        val hasUpstream: Boolean get() = upstreamHost.isNotBlank() && upstreamPort in 1..65535
++        val primary: Upstream? get() = Upstream(upstreamType, upstreamHost.trim(), upstreamPort).takeIf { it.valid }
++        /** Primary first, then backups, no duplicates. */
++        val all: List<Upstream> get() = (listOfNotNull(primary) + backups.filter { it.valid }).distinctBy { it.key }
++        val hasUpstream: Boolean get() = all.isNotEmpty()
+     }
+ 
++    data class Upstream(val type: String, val host: String, val port: Int, val label: String = "") {
++        val valid: Boolean get() = host.isNotBlank() && port in 1..65535
++        val key: String get() = "$type://$host:$port"
++    }
++
++    /** Health of one upstream: latency in ms, or null when the check failed. */
++    data class Health(val ok: Boolean, val ms: Long?, val at: Long, val error: String? = null)
++
+     data class Preset(val name: String, val mode: Mode, val domains: List<String>)
+ 
+     val presets = listOf(
+@@ -78,6 +93,13 @@ object SplitProxy {
+     private val _running = MutableStateFlow(false)
+     val running: StateFlow<Boolean> = _running.asStateFlow()
+ 
++    private val _health = MutableStateFlow<Map<String, Health>>(emptyMap())
++    val health: StateFlow<Map<String, Health>> = _health.asStateFlow()
++    /** Key of the upstream traffic currently goes through (auto-switch). */
++    private val _current = MutableStateFlow<String?>(null)
++    val current: StateFlow<String?> = _current.asStateFlow()
++    @Volatile private var checker: Thread? = null
++
+     @Volatile private var prefs: SharedPreferences? = null
+     @Volatile private var server: ServerSocket? = null
+     private val pool = Executors.newCachedThreadPool { r -> Thread(r, "split-proxy").apply { isDaemon = true } }
+@@ -113,6 +135,11 @@ object SplitProxy {
+             rules = rules,
+             forSandbox = p.getBoolean("sandbox", true),
+             forApp = p.getBoolean("app", true),
++            backups = runCatching {
++                val a = JSONArray(p.getString("backups", "[]"))
++                (0 until a.length()).map { i -> a.getJSONObject(i).let { Upstream(it.optString("t", "http"), it.optString("h"), it.optInt("p"), it.optString("l")) } }
++            }.getOrDefault(emptyList()),
++            autoSwitch = p.getBoolean("autoswitch", true),
+         )
+     }
+ 
+@@ -124,7 +151,10 @@ object SplitProxy {
+         prefs?.edit()
+             ?.putBoolean("enabled", n.enabled)?.putString("utype", n.upstreamType)?.putString("uhost", n.upstreamHost.trim())
+             ?.putInt("uport", n.upstreamPort)?.putString("default", n.defaultMode.name)?.putString("rules", rules.toString())
+-            ?.putBoolean("sandbox", n.forSandbox)?.putBoolean("app", n.forApp)?.apply()
++            ?.putBoolean("sandbox", n.forSandbox)?.putBoolean("app", n.forApp)
++            ?.putString("backups", JSONArray().apply { n.backups.forEach { put(JSONObject().put("t", it.type).put("h", it.host).put("p", it.port).put("l", it.label)) } }.toString())
++            ?.putBoolean("autoswitch", n.autoSwitch)?.apply()
++        _current.value = null
+         autoCache.clear()
+         if (n.enabled) start() else stop()
+     }
+@@ -197,6 +227,7 @@ object SplitProxy {
+             ss.bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), PORT), 64)
+             server = ss
+             _running.value = true
++            startChecker()
+             Thread({
+                 while (!ss.isClosed) {
+                     val c = runCatching { ss.accept() }.getOrNull() ?: break
+@@ -215,6 +246,138 @@ object SplitProxy {
+         runCatching { server?.close() }
+         server = null
+         _running.value = false
++        checker?.interrupt(); checker = null
++    }
++
++    // ── [Mines-proxy-auto] health checks + failover ────────────────────
++
++    private const val CHECK_EVERY_MS = 60_000L
++
++    private fun startChecker() {
++        if (checker?.isAlive == true) return
++        checker = Thread({
++            try {
++                while (!Thread.currentThread().isInterrupted && server != null) {
++                    checkAll()
++                    Thread.sleep(CHECK_EVERY_MS)
++                }
++            } catch (_: InterruptedException) {}
++        }, "split-proxy-health").apply { isDaemon = true; start() }
++    }
++
++    /** Checks every configured upstream once (blocking; call off the main thread). */
++    fun checkAll() {
++        val ups = _settings.value.all
++        val m = HashMap<String, Health>()
++        for (u in ups) m[u.key] = check(u)
++        _health.value = m
++        pickCurrent()
++    }
++
++    /** One upstream: open a tunnel to a well-known HTTPS host through it. */
++    fun check(u: Upstream, target: String = "www.gstatic.com"): Health {
++        val t0 = System.currentTimeMillis()
++        return runCatching {
++            viaUpstream(u, target, 443, tunnel = true, timeout = 5000).close()
++            Health(true, System.currentTimeMillis() - t0, System.currentTimeMillis())
++        }.getOrElse { Health(false, null, System.currentTimeMillis(), it.message ?: it.javaClass.simpleName) }
++    }
++
++    private fun pickCurrent() {
++        val s = _settings.value
++        val ups = s.all
++        if (ups.isEmpty()) { _current.value = null; return }
++        if (!s.autoSwitch) { _current.value = ups.first().key; return }
++        val h = _health.value
++        val pick = ups.firstOrNull { h[it.key]?.ok == true } ?: ups.first()
++        if (_current.value != pick.key) Log.i(TAG, "upstream → ${pick.key}")
++        _current.value = pick.key
++    }
++
++    /** The upstream to use now: the current healthy one, else the primary. */
++    private fun activeUpstream(s: Settings): Upstream? {
++        val ups = s.all
++        if (ups.isEmpty()) return null
++        if (!s.autoSwitch) return ups.first()
++        val key = _current.value
++        return ups.firstOrNull { it.key == key } ?: ups.first()
++    }
++
++    /** Marks a failed upstream and moves to the next one right away. */
++    private fun markFailed(u: Upstream, e: Throwable) {
++        val s = _settings.value
++        if (!s.autoSwitch || s.all.size < 2) return
++        _health.value = _health.value + (u.key to Health(false, null, System.currentTimeMillis(), e.message))
++        pickCurrent()
++    }
++
++    // ── [Mines-proxy-auto] detect proxies on this phone ───────────────
++
++    data class Found(val upstream: Upstream, val source: String)
++
++    private val commonPorts = listOf(
++        7890 to "Clash", 7891 to "Clash", 7897 to "Clash Verge", 10808 to "v2rayNG", 10809 to "v2rayNG",
++        2080 to "sing-box / NekoBox", 1080 to "SOCKS", 12334 to "Hiddify", 9090 to "代理", 8889 to "代理",
++    )
++
++    /**
++     * Finds proxies the user already runs: the system HTTP proxy (Wi-Fi or
++     * VPN app setting) and common local ports of VPN apps (Clash, v2rayNG,
++     * sing-box/NekoBox, Hiddify). Each port is probed for HTTP CONNECT first,
++     * then SOCKS5. Blocking; call off the main thread.
++     */
++    fun detect(context: Context): List<Found> {
++        val out = ArrayList<Found>()
++        runCatching {
++            val cm = context.getSystemService(android.net.ConnectivityManager::class.java)
++            val pi = cm?.defaultProxy ?: cm?.getLinkProperties(cm.activeNetwork)?.httpProxy
++            val h = pi?.host
++            val pp = pi?.port ?: 0
++            if (!h.isNullOrBlank() && pp in 1..65535 && !(isLoopback(h) && pp == PORT)) {
++                out += Found(Upstream("http", h, pp, "系统代理"), "系统代理")
++            }
++        }
++        runCatching {
++            val h = System.getProperty("http.proxyHost"); val p = System.getProperty("http.proxyPort")?.toIntOrNull()
++            if (!h.isNullOrBlank() && p != null && p in 1..65535 && !(isLoopback(h) && p == PORT)) out += Found(Upstream("http", h, p, "系统代理"), "系统代理")
++        }
++        val seen = out.map { it.upstream.host + ":" + it.upstream.port }.toMutableSet()
++        val pool = Executors.newFixedThreadPool(6)
++        try {
++            val futures = commonPorts.distinctBy { it.first }.map { (port, app) ->
++                pool.submit<Found?> { probeLocal(port)?.let { t -> Found(Upstream(t, "127.0.0.1", port, app), app) } }
++            }
++            for (f in futures) runCatching { f.get(4, java.util.concurrent.TimeUnit.SECONDS) }.getOrNull()?.let {
++                if (seen.add(it.upstream.host + ":" + it.upstream.port)) out += it
++            }
++        } finally { pool.shutdownNow() }
++        return out.distinctBy { it.upstream.key }
++    }
++
++    private fun isLoopback(h: String) = h == "127.0.0.1" || h == "localhost" || h == "::1"
++
++    /** "http", "socks5" or null when nothing (usable) listens on 127.0.0.1:[port]. */
++    private fun probeLocal(port: Int): String? {
++        if (port == PORT) return null
++        // HTTP CONNECT
++        runCatching {
++            Socket(Proxy.NO_PROXY).use { s ->
++                s.connect(InetSocketAddress("127.0.0.1", port), 400); s.soTimeout = 1500
++                s.getOutputStream().apply { write("CONNECT www.gstatic.com:443 HTTP/1.1\r\nHost: www.gstatic.com:443\r\n\r\n".toByteArray()); flush() }
++                val b = ByteArray(16); val n = s.getInputStream().read(b)
++                if (n >= 8 && String(b, 0, n, Charsets.ISO_8859_1).startsWith("HTTP/")) return "http"
++            }
++        }
++        // SOCKS5 greeting (no auth)
++        runCatching {
++            Socket(Proxy.NO_PROXY).use { s ->
++                s.connect(InetSocketAddress("127.0.0.1", port), 400); s.soTimeout = 1500
++                s.getOutputStream().apply { write(byteArrayOf(5, 1, 0)); flush() }
++                val b = ByteArray(2); val n = s.getInputStream().read(b)
++                if (n == 2 && b[0] == 5.toByte() && b[1] == 0.toByte()) return "socks5"
++            }
++        }
++        return null
+     }
+ 
+     private fun record(host: String, route: String) {
+@@ -314,8 +477,18 @@ object SplitProxy {
+                 record(host, if (mode == Mode.PROXY) "代理（未设置服务器，改直连）" else "${mode.label}→直连")
+                 direct(host, port, 10_000)
+             } else {
+-                record(host, "${mode.label}→代理")
+-                viaUpstream(s, host, port, tunnel)
++                val u = activeUpstream(s) ?: return@runCatching direct(host, port, 10_000)
++                record(host, "${mode.label}→代理 ${u.host}:${u.port}")
++                try {
++                    viaUpstream(u, host, port, tunnel)
++                } catch (e: Exception) {
++                    // Fail over to the next healthy proxy for this request too.
++                    markFailed(u, e)
++                    val next = activeUpstream(_settings.value)
++                    if (next == null || next.key == u.key) throw e
++                    record(host, "${mode.label}→备用代理 ${next.host}:${next.port}")
++                    viaUpstream(next, host, port, tunnel)
++                }
+             }
+         }.getOrNull()
+     }
+@@ -323,13 +496,14 @@ object SplitProxy {
+     private fun direct(host: String, port: Int, timeout: Int): Socket =
+         Socket(Proxy.NO_PROXY).apply { connect(InetSocketAddress(host, port), timeout) }
+ 
+-    private fun viaUpstream(s: Settings, host: String, port: Int, tunnel: Boolean): Socket {
+-        if (s.upstreamType == "socks5") {
+-            val sock = Socket(Proxy(Proxy.Type.SOCKS, InetSocketAddress(s.upstreamHost, s.upstreamPort)))
+-            sock.connect(InetSocketAddress.createUnresolved(host, port), 10_000)
++    private fun viaUpstream(u: Upstream, host: String, port: Int, tunnel: Boolean, timeout: Int = 10_000): Socket {
++        if (u.type == "socks5") {
++            val sock = Socket(Proxy(Proxy.Type.SOCKS, InetSocketAddress(u.host, u.port)))
++            sock.connect(InetSocketAddress.createUnresolved(host, port), timeout)
+             return sock
+         }
+-        val sock = Socket(Proxy.NO_PROXY).apply { connect(InetSocketAddress(s.upstreamHost, s.upstreamPort), 10_000) }
++        val sock = Socket(Proxy.NO_PROXY).apply { connect(InetSocketAddress(u.host, u.port), timeout) }
++        if (tunnel) sock.soTimeout = timeout
+         if (!tunnel) { tags[sock] = "http-proxy"; return sock }
+         val o = sock.getOutputStream()
+         o.write("CONNECT $host:$port HTTP/1.1\r\nHost: $host:$port\r\n\r\n".toByteArray())
+@@ -337,6 +511,7 @@ object SplitProxy {
+         val head = readHead(sock.getInputStream()) ?: throw IOException("upstream closed")
+         val status = String(head, Charsets.ISO_8859_1).substringBefore("\r\n")
+         if (!status.contains(" 200")) { sock.close(); throw IOException("upstream refused: $status") }
++        sock.soTimeout = 0
+         return sock
+     }
+ }
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/VpsSsh.kt b/src/android/app/src/main/java/com/openminis/app/plus/VpsSsh.kt
 new file mode 100644
 index 0000000..a0f9aaa
@@ -3449,6 +3714,123 @@ index 9d96640..2a9ca8f 100644
              v.tag = st // re-run update (and redraw) whenever prefs change
              v.invalidate()
          },
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt
+index e589479..2a608b2 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt
+@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.width
+ import androidx.compose.foundation.text.KeyboardOptions
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.outlined.Add
++import androidx.compose.material.icons.outlined.Refresh
+ import androidx.compose.material3.Button
+ import androidx.compose.material3.FilterChip
+ import androidx.compose.material3.MaterialTheme
+@@ -149,6 +150,7 @@ private fun SplitProxySection() {
+             }
+         }
+     }
++    ProxyAutoSection()
+     PlusSection("没写规则的网站", footer = "自动 = 先直连，连不上再走代理，并记住 30 分钟。") {
+         Row(Modifier.padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+             SplitProxy.Mode.entries.forEach { m ->
+@@ -199,3 +201,96 @@ private fun SplitProxySection() {
+         }
+     }
+ }
++
++/**
++ * [Mines-proxy-auto] One-tap fill from proxies already running on the phone
++ * (system proxy, Clash / v2rayNG / sing-box / NekoBox / Hiddify ports), backup
++ * proxies with health checks every minute and automatic failover.
++ */
++@Composable
++private fun ProxyAutoSection() {
++    val ctx = LocalContext.current
++    val scope = rememberCoroutineScope()
++    val s by SplitProxy.settings.collectAsState()
++    val health by SplitProxy.health.collectAsState()
++    val current by SplitProxy.current.collectAsState()
++    var found by remember { mutableStateOf<List<SplitProxy.Found>?>(null) }
++    var busy by remember { mutableStateOf(false) }
++    fun recheck() = scope.launch { busy = true; kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { SplitProxy.checkAll() }; busy = false }
++    fun use(u: SplitProxy.Upstream) {
++        SplitProxy.update(ctx) { st ->
++            if (st.primary == null) st.copy(upstreamType = u.type, upstreamHost = u.host, upstreamPort = u.port)
++            else if (st.all.any { it.key == u.key }) st
++            else st.copy(backups = st.backups + u)
++        }
++        recheck()
++    }
++    PlusSection("自动检测代理", footer = "会查系统代理和常见代理软件端口（Clash 7890/7891、v2rayNG 10808/10809、sing-box/NekoBox 2080、1080、Hiddify 12334）。第一个填成主代理，其余加为备用。") {
++        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
++            Button(enabled = !busy, onClick = {
++                scope.launch {
++                    busy = true
++                    found = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { SplitProxy.detect(ctx) }
++                    busy = false
++                }
++            }, modifier = Modifier.fillMaxWidth()) { Text(if (busy) "正在检测…" else "一键检测本机代理") }
++            found?.let { list ->
++                if (list.isEmpty()) Text("没找到正在运行的代理。先打开代理软件（并开启「允许局域网/本地代理」或 HTTP 代理端口），再点一次。",
++                    style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
++                list.forEach { f ->
++                    Row(verticalAlignment = Alignment.CenterVertically) {
++                        Column(Modifier.weight(1f)) {
++                            Text("${f.source} · ${if (f.upstream.type == "socks5") "SOCKS5" else "HTTP"}", style = MaterialTheme.typography.bodyLarge)
++                            Text("${f.upstream.host}:${f.upstream.port}", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
++                        }
++                        val added = s.all.any { it.key == f.upstream.key }
++                        TextButton(enabled = !added, onClick = { use(f.upstream) }) { Text(if (added) "已填入" else "填入") }
++                    }
++                }
++                if (list.size > 1 && list.any { f -> s.all.none { it.key == f.upstream.key } }) {
++                    OutlinedButton(onClick = {
++                        list.forEach { f ->
++                            SplitProxy.update(ctx) { st ->
++                                if (st.primary == null) st.copy(upstreamType = f.upstream.type, upstreamHost = f.upstream.host, upstreamPort = f.upstream.port)
++                                else if (st.all.any { it.key == f.upstream.key }) st else st.copy(backups = st.backups + f.upstream)
++                            }
++                        }
++                        recheck()
++                    }, modifier = Modifier.fillMaxWidth()) { Text("全部填入（第一个当主代理）") }
++                }
++                if (s.rules.none { it.pattern == ".cn" }) {
++                    TextButton(onClick = { SplitProxy.presets.firstOrNull { it.mode == SplitProxy.Mode.DIRECT }?.let { SplitProxy.addPreset(ctx, it) } }) {
++                        Text("同时加上「国内网站直连」规则")
++                    }
++                }
++            }
++        }
++    }
++    if (s.all.isNotEmpty()) PlusSection("代理列表 · 自动切换", footer = "每分钟检查一次（经代理连 www.gstatic.com）。当前代理连不上时自动换到下一个能用的，恢复后再切回主代理。") {
++        SwitchRow("自动切换", null, s.autoSwitch) { on -> SplitProxy.update(ctx) { it.copy(autoSwitch = on) }; recheck() }
++        s.all.forEachIndexed { i, u ->
++            PlusDivider()
++            val h = health[u.key]
++            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
++                Column(Modifier.weight(1f)) {
++                    Text((if (i == 0) "主 · " else "备用 · ") + "${u.host}:${u.port}" + (if (u.key == current) "  ← 正在用" else ""),
++                        style = MaterialTheme.typography.bodyLarge)
++                    Text(
++                        (if (u.type == "socks5") "SOCKS5" else "HTTP") + (if (u.label.isNotBlank()) " · ${u.label}" else "") + " · " + when {
++                            h == null -> "未检查"
++                            h.ok -> "能用 ${h.ms} ms"
++                            else -> "连不上" + (h.error?.let { "（${it.take(40)}）" } ?: "")
++                        },
++                        style = MaterialTheme.typography.bodyMedium,
++                        color = when { h == null -> MaterialTheme.colorScheme.onSurfaceVariant; h.ok -> Color(0xFF34C759); else -> Color(0xFFFF3B30) },
++                    )
++                }
++                if (i > 0) TextButton(onClick = { SplitProxy.update(ctx) { st -> st.copy(backups = st.backups.filter { it.key != u.key }) } }) {
++                    Text("移除", color = Color(0xFFFF3B30))
++                }
++            }
++        }
++        PlusDivider()
++        ActionRow(Icons.Outlined.Refresh, if (busy) "正在检查…" else "立即检查") { recheck() }
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt
 index 615bf73..fc63799 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt
