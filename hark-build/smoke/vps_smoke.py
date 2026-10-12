@@ -20,7 +20,7 @@ crashed = []
 
 
 def adb(*a, check=False, timeout=60):
-    r = subprocess.run(["adb", *a], capture_output=True, text=True, timeout=timeout)
+    r = subprocess.run(["adb", *a], capture_output=True, text=True, errors="replace", timeout=timeout)
     if check and r.returncode:
         raise RuntimeError(r.stderr)
     return r.stdout
@@ -67,7 +67,6 @@ def snap(name):
     global step_no
     step_no += 1
     tag = f"{step_no:02d}-{name}"
-    adb("exec-out", "screencap", "-p", timeout=30)  # warm
     subprocess.run(f"adb exec-out screencap -p > {OUT}/{tag}.png", shell=True)
     root = dump()
     t = texts(root)
@@ -163,11 +162,23 @@ def add_server(name, host, password, port=None):
     time.sleep(3)
 
 
+def dump_fatal():
+    out = adb("logcat", "-d", "-v", "threadtime", "-b", "crash", timeout=60)
+    print("---- crash buffer ----\n" + out[-15000:], flush=True)
+
+
 def main():
     sh("settings put global window_animation_scale 0; settings put global transition_animation_scale 0; settings put global animator_duration_scale 0")
     adb("logcat", "-c")
     lc = subprocess.Popen(f"adb logcat -v threadtime > {OUT}/logcat.txt", shell=True)
-    relaunch()
+    print(sh(f"am start -W -n {PKG}/com.openminis.app.MainActivity", timeout=90), flush=True)
+    time.sleep(12)
+    snap("launch")
+    if not check("cold launch (fresh install)"):
+        dump_fatal()
+        time.sleep(3); print(sh(f"am start -W -n {PKG}/com.openminis.app.MainActivity", timeout=90)); time.sleep(12)
+        snap("launch-2"); check("second launch"); dump_fatal()
+    dismiss_dialogs()
     snap("home")
     check("launch")
 
