@@ -1,0 +1,83 @@
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Avatars.kt b/src/android/app/src/main/java/com/openminis/app/plus/Avatars.kt
+--- a/src/android/app/src/main/java/com/openminis/app/plus/Avatars.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/Avatars.kt
+@@ -190,11 +190,17 @@
+     fun draw(
+         canvas: Canvas, w: Float, h: Float,
+         style: String, face: Boolean, ringColor: Int?, bob: Float = 0f,
++        // [Mines-pet-motion] Lateral sway and a vertical squash, so the desk
++        // pet can breathe, drift and dip instead of only translating. Both
++        // default to "no motion" so every existing caller (the Today card, the
++        // voice screen, the avatar picker) keeps its current still rendering.
++        sway: Float = 0f,
++        squash: Float = 1f,
+         crop: AvatarCrop = AvatarCrop(), version: Long = 0L, noBg: Boolean = false,
+     ) {
+         load(Avatars.normalize(style), version, noBg)
+         val size = minOf(w, h)
+-        val left = (w - size) / 2f
++        val left = (w - size) / 2f + sway * size
+         val top = (h - size) / 2f + bob * size
+         val c = custom
+         if (c != null) {
+@@ -214,6 +220,10 @@
+         }
+         if (face) {
+             val bmp = builtinFace ?: return
++            // Squash about the bottom edge, the way a head tucks rather than
++            // shrinking in place — scaling about the centre reads as a zoom.
++            val drawH = size * squash
++            val rect = RectF(left, top + (size - drawH), left + size, top + size)
+             canvas.save()
+             clip.reset(); clip.addCircle(left + size / 2, top + size / 2, size / 2, Path.Direction.CW)
+             canvas.clipPath(clip)
+@@ -221,7 +231,7 @@
+                 paint.color = (rc and 0x00FFFFFF) or (0x33 shl 24)
+                 canvas.drawCircle(left + size / 2, top + size / 2, size / 2, paint)
+             }
+-            canvas.drawBitmap(bmp, null, RectF(left, top, left + size, top + size), paint)
++            canvas.drawBitmap(bmp, null, rect, paint)
+             canvas.restore()
+             drawRing(canvas, left, top, size, ringColor)
+         } else {
+@@ -260,15 +270,38 @@
+         super.onDraw(canvas)
+         val st = PlusPrefs.state.value
+         val t = (System.currentTimeMillis() - start) / 1000f
++        // [Mines-pet-motion] The old motion was a single 0.02-amplitude sine at
++        // 2.2 rad/s — 2% of the height, which reads as nothing at all, so the
++        // desk pet looked like a static picture. Three composable motions
++        // instead, each on its own frequency so they never lock into one
++        // visible cycle:
++        //   • breathing — a slow vertical bob, 6% of the height
++        //   • sway      — a lateral drift, 2.5% of the width, out of phase
++        //   • blink     — the built-in *_face drawables have no separate eye
++        //                  frames, so "blink" is a brief scale dip on Y,
++        //                  which reads as the character tucking its chin
++        // The custom (GIF / animated WebP) path animates itself through
++        // Animatable and is left alone.
++        val breathing = sin(t * 1.6f) * 0.06f
++        val sway = sin(t * 0.9f + 1.1f) * 0.025f
++        val blink = if (blinkPhase(t)) 0.94f else 1f
+         renderer.draw(
+             canvas, width.toFloat(), height.toFloat(),
+             style ?: st.petStyle, face, if (showRing) st.petColor else null,
+-            bob = if (bob) sin(t * 2.2f) * 0.02f else 0f,
++            bob = if (bob) breathing else 0f,
++            sway = if (bob) sway else 0f,
++            squash = if (bob) blink else 1f,
+             crop = crop ?: AvatarCrop(st.avatarScale, st.avatarOffX, st.avatarOffY),
+             version = version ?: st.avatarVersion,
+             noBg = noBg ?: st.avatarRemoveBg,
+         )
+-        if (bob) postInvalidateDelayed(50)
++        if (bob) postInvalidateDelayed(33)
++    }
++
++    /** True during the ~120 ms dip of a ~4 s blink cycle. */
++    private fun blinkPhase(t: Float): Boolean {
++        val phase = (t * 1000f) % 4000f
++        return phase < 120f
+     }
+ 
+     override fun onDetachedFromWindow() {
