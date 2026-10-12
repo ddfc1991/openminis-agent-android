@@ -1,0 +1,63 @@
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt
+--- a/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt
+@@ -57,14 +57,58 @@
+         val results = withContext(Dispatchers.IO) {
+             servers.map { s -> async { s.id to (if (s.enabled) probe(s) else -1) } }.awaitAll()
+         }.toMap()
++        // [Mines-server-card] A reachable box is worth describing: ask it what
++        // it is and where its traffic leaves, so the 工作位置 card can show
++        // 系统 / 出口 without the user opening a terminal. Runs only for the
++        // server that is actually online, and a failure leaves the previous
++        // values alone rather than blanking them.
++        val facts = HashMap<String, Pair<String, String>>()
++        val best = servers.filter { it.enabled && (results[it.id] ?: -1) >= 0 }
++            .minByOrNull { results[it.id] ?: Int.MAX_VALUE }
++        best?.let { s ->
++            describe(s)?.let { facts[s.id] = it }
++        }
+         val now = System.currentTimeMillis()
+         PlusPrefs.update(context) { st ->
+             st.copy(servers = st.servers.map { s ->
+                 val r = results[s.id] ?: return@map s
+-                s.copy(lastLatencyMs = r, lastCheckedAt = now)
++                val f = facts[s.id]
++                if (f == null) s.copy(lastLatencyMs = r, lastCheckedAt = now)
++                else s.copy(lastLatencyMs = r, lastCheckedAt = now, osLabel = f.first, egressIp = f.second)
+             })
+         }
+         syncToSandbox(context)
++    }
++
++    /**
++     * [Mines-server-card] Ask a reachable server for its OS and egress IP.
++     *
++     * `uname -sr` for the system, and the address the box itself sees as its
++     * outbound one — an echo service reached from the server, not from the
++     * phone, which is the whole point (the phone's own egress is irrelevant
++     * when the work runs there). Both come back in one SSH round trip so a
++     * slow link costs one connection, not two.
++     *
++     * Returns null on any failure; callers keep the last known values.
++     */
++    suspend fun describe(server: VpsServer): Pair<String, String>? = withContext(Dispatchers.IO) {
++        runCatching {
++            val cmd = "uname -sr 2>/dev/null; " +
++                "(curl -fsS --max-time 6 https://api.ipify.org 2>/dev/null || " +
++                " curl -fsS --max-time 6 https://ifconfig.me 2>/dev/null || " +
++                " wget -qO- --timeout=6 https://api.ipify.org 2>/dev/null) | tail -n 1"
++            val out = com.openminis.app.sandbox.ShellExecutor.execute(
++                null,
++                "minis-vps run ${server.id} $cmd",
++                timeout = 25_000L,
++            )
++            if (out.exitCode != 0) return@runCatching null
++            val lines = out.output.lines().map { it.trim() }.filter { it.isNotEmpty() }
++            val os = lines.firstOrNull()?.take(48) ?: return@runCatching null
++            val ip = lines.lastOrNull { it.matches(Regex("^[0-9a-fA-F.:]{7,45}$")) }?.take(45)
++            if (ip.isNullOrEmpty()) return@runCatching null
++            os to ip
++        }.getOrNull()
+     }
+ 
+     /** Servers in the order minis-vps should try them. */
