@@ -95,6 +95,64 @@ def tap_text(label, exact=False, wait=2.5, root=None):
     return True
 
 
+def tap_work(wait=2.5):
+    """Home 工作位置 pill: build-29+ exposes it as content-description "工作位置：<value>"
+    (compact pill, no visible label); older builds show the text 工作位置."""
+    root = dump()
+    if find(root, "工作位置："):
+        return tap_text("工作位置：", wait=wait, root=root)
+    return tap_text("工作位置", wait=wait, root=root)
+
+
+SELFTEST_URI = f"content://com.openminis.mines.plus.selftest"
+selftest_fail = []
+
+
+def selftest(method, arg, timeout=90):
+    out = sh(f"content call --uri {SELFTEST_URI} --method {method} --arg '{arg}'", timeout=timeout)
+    print(f"  selftest {method} {arg!r} -> {out.strip()[:600]}", flush=True)
+    return out
+
+
+def selftests():
+    """build-29+ adb-only SelfTestProvider: app launch from background, storage speed,
+    cold start at fontScale 1.3. Skipped when the provider is absent (older builds)."""
+    probe = selftest("allow", "a11y_cli")
+    if "result=ok" not in probe and "result=ok" not in probe.replace(" ", ""):
+        print("  (selftest provider not available, skipping)", flush=True); return
+    # 1) launch another app while Mines is in the background
+    sh("input keyevent KEYCODE_HOME"); time.sleep(3)
+    sh("am force-stop com.android.settings"); time.sleep(1)
+    out = selftest("offload", "android-a11y-cli open com.android.settings")
+    time.sleep(4)
+    top = sh("dumpsys activity activities | grep -E 'mResumedActivity|topResumedActivity' | head -3")
+    print("  top after open:", top.strip(), flush=True)
+    if "com.android.settings" not in top:
+        selftest_fail.append("open app from background"); snap("selftest-open-failed")
+    else:
+        snap("selftest-open-ok")
+    check("selftest: open app from background")
+    # 2) storage info under 6 s
+    out = selftest("offload", "android-device storage")
+    m = re.search(r"ms=(\d+)", out); ex = re.search(r"exit=(\d+)", out)
+    ms = int(m.group(1)) if m else -1
+    print(f"  storage: exit={ex.group(1) if ex else '?'} ms={ms}", flush=True)
+    if not (ex and ex.group(1) == "0" and 0 <= ms < 6000):
+        selftest_fail.append(f"storage exit={ex.group(1) if ex else '?'} ms={ms}")
+    check("selftest: storage")
+    # 3) cold start at fontScale 1.3 (user runs a large system font)
+    sh("settings put system font_scale 1.3"); time.sleep(2)
+    sh(f"am force-stop {PKG}"); time.sleep(2)
+    relaunch()
+    snap("cold-start-font13")
+    if not check("cold start at fontScale 1.3"):
+        selftest_fail.append("cold start at fontScale 1.3")
+    root = dump()
+    if not (find(root, "工作位置：") or find(root, "工作位置")):
+        print("  (工作位置 pill not visible at fontScale 1.3)", flush=True)
+    sh("settings put system font_scale 1.0"); time.sleep(1)
+
+
 def type_text(s):
     sh("input text " + s.replace(" ", "%s").replace("'", "\\'").replace("&", "\\&"))
 
@@ -292,7 +350,7 @@ def toggle_near(label):
 def go_home():
     for _ in range(3):
         root = dump()
-        if find(root, "工作位置", exact=True) or find(root, "Welcome to Mines"): return root
+        if find(root, "工作位置：") or find(root, "工作位置", exact=True) or find(root, "Welcome to Mines"): return root
         sh("input keyevent KEYCODE_BACK"); time.sleep(2.5)
         if not alive(): return None
     return dump()
@@ -379,32 +437,32 @@ def main():
         user_like_state()
 
     # Home Today card → 工作位置
-    if not tap_text("工作位置", wait=6):
+    if not tap_work(wait=6):
         # Today card may be collapsed: tap the greeting card to expand
         tap_text("好", wait=2)
-        tap_text("工作位置", wait=6)
+        tap_work(wait=6)
     snap("work-location")
     if not check("open 工作位置 from home"):
-        relaunch(); tap_text("工作位置", wait=6)
+        relaunch(); tap_work(wait=6)
 
     # Reachable server (runner sshd), password → key install
     add_server("smoke", SSH_HOST, SSH_PASS)
     time.sleep(20)
     snap("after-add-reachable")
     if not check("add reachable server + authorize"):
-        relaunch(); tap_text("工作位置", wait=6)
+        relaunch(); tap_work(wait=6)
 
     # VPS mode
     tap_text("重活交给服务器", wait=15)
     snap("vps-mode")
     if not check("switch to 服务器 mode"):
-        relaunch(); tap_text("工作位置", wait=6)
+        relaunch(); tap_work(wait=6)
 
     # Server detail (stats over JSch)
     tap_text("smoke", exact=True, wait=20)
     snap("server-detail")
     if not check("open server detail"):
-        relaunch(); tap_text("工作位置", wait=6)
+        relaunch(); tap_work(wait=6)
     else:
         time.sleep(10); snap("server-detail-later"); check("server detail after 30 s")
         sh("input keyevent KEYCODE_BACK"); time.sleep(3)
@@ -426,7 +484,8 @@ def main():
     # Back home, server chip
     sh("input keyevent KEYCODE_BACK"); time.sleep(3)
     snap("home-again")
-    tap_text("服务器", exact=True, wait=8)
+    # build-29+: compact pills, the label lives in the content-description "服务器：1/2"
+    tap_text("服务器：", wait=8) or tap_text("服务器", exact=True, wait=8)
     snap("server-chip")
     check("open 服务器 chip")
     sh("input keyevent KEYCODE_BACK"); time.sleep(2)
@@ -436,7 +495,7 @@ def main():
     relaunch()
     snap("cold-start-vps")
     check("cold start in VPS mode")
-    tap_text("工作位置", wait=10)
+    tap_work(wait=10)
     snap("work-location-cold")
     check("open 工作位置 after cold start")
     time.sleep(30)
@@ -447,6 +506,10 @@ def main():
         snap("test-connection"); check("测试连接")
     # 上次崩溃 page exists (build-28+)
     time.sleep(2)
+    try:
+        selftests()
+    except Exception as e:
+        print("selftests error:", e, flush=True); selftest_fail.append(f"selftests error {e}")
     lc.terminate()
     time.sleep(1)
     log = open(f"{OUT}/logcat.txt", errors="replace").read().splitlines()
@@ -458,11 +521,12 @@ def main():
         print("\n".join(log[max(0, i - 3): i + 60]))
         print("-" * 30)
     print("crashed steps:", crashed)
+    print("selftest failures:", selftest_fail)
     # Mines' own crash log (build-28+), readable through the app's files only for debuggable builds; logcat tag MinesCrash
     for l in log:
         if "MinesCrash" in l:
             print(l)
-    sys.exit(1 if (crashed or fatal) else 0)
+    sys.exit(1 if (crashed or fatal or selftest_fail) else 0)
 
 
 if __name__ == "__main__":
