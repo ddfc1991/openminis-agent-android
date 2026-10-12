@@ -9,7 +9,9 @@ fail() { echo "::error::sandbox net self-test: $*"; exit 1; }
 step() { echo; echo "===== $* ($(date +%T))"; }
 
 step "overlay default_mount (RootfsManager.applyDefaultMountOverlay)"
-cp -a /mnt/dm/. / || fail "overlay"
+# (docker bind-mounts /etc/hostname, so that one file can't be replaced; everything else must be)
+cp -a /mnt/dm/. / 2>/tmp/cp.err || grep -v "etc/hostname" /tmp/cp.err | grep -q . && { cat /tmp/cp.err; fail "overlay"; }
+[ -f /usr/local/bin/minis-mirror ] && [ -f /etc/minis/net.env ] || fail "overlay incomplete"
 chmod +x /usr/local/bin/* 2>/dev/null
 [ -s /etc/ssl/minis-mozilla.pem ] || fail "Mozilla CA bundle missing from the APK assets"
 cat /etc/ssl/minis-mozilla.pem /etc/ssl/certs/ca-certificates.crt > /etc/ssl/minis-ca.pem
