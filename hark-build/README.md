@@ -23,3 +23,10 @@ backup export). Later builds update in place.
 
 ## Sandbox network self-test (since build-26)
 `hark-build/sandbox-net-selftest.sh` boots the APK's own Alpine minirootfs (aarch64 under qemu) with the app's default_mount overlay, `etc/minis/net.env` and CA bundle, and must pass `apk add gcc`, `pip download requests`, a stalled-mirror recovery, a dead-proxy run and `minis-doctor`. A fresh Mozilla CA bundle (curl.se) is fetched at build time into `default_mount/etc/ssl/minis-mozilla.pem`. An overlay audit step fails the build if a floating window is added without `plus/Overlays.kt`.
+
+## Emulator smoke test (since build-28)
+`.github/workflows/vps-smoke.yml` runs on pushes touching `hark-build/smoke/`. `hark-build/smoke/target` names what to test
+(`build-27` = a release tag, or `run:<actions run id>` = that run's `mines-apk` artifact). It boots API 34 + 35 x86_64
+emulators, starts a local sshd and a fake OpenAI endpoint on the runner, drives the real UI with adb/uiautomator
+(onboarding → chat → home Today card → photo wallpaper on home + desk pet → cold start → 工作位置 → servers) and fails
+on any FATAL EXCEPTION of the app in logcat.
