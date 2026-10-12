@@ -1,0 +1,64 @@
+name: VPS screen smoke test (emulator)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "release tag to test (e.g. build-27); ignored when run_id is set"
+        default: "build-27"
+      run_id:
+        description: "Actions run id whose mines-apk artifact to test (optional)"
+        default: ""
+      api:
+        description: "emulator API level"
+        default: "34"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p apk
+          if [ -n "${{ inputs.run_id }}" ]; then
+            gh run download "${{ inputs.run_id }}" --repo "${{ github.repository }}" -n mines-apk -D apk
+          else
+            gh release download "${{ inputs.tag }}" --repo "${{ github.repository }}" -p '*.apk' -D apk
+          fi
+          ls -la apk
+          echo "APK=$(ls apk/*.apk | head -1)" >> "$GITHUB_ENV"
+      - name: Local sshd for the app to log in to (10.0.2.2:22 from the emulator)
+        run: |
+          sudo apt-get install -y -qq openssh-server >/dev/null
+          echo 'root:MinesSmoke-2026' | sudo chpasswd
+          printf 'PermitRootLogin yes\nPasswordAuthentication yes\nKbdInteractiveAuthentication yes\nPubkeyAuthentication yes\n' | sudo tee /etc/ssh/sshd_config.d/99-smoke.conf
+          sudo systemctl restart ssh || sudo service ssh restart
+          ssh-keyscan -T 5 127.0.0.1 | head -2
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      - name: Emulator + UI drive
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ inputs.api }}
+          target: google_apis
+          arch: x86_64
+          ram-size: 4096M
+          disk-size: 6G
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot
+          disable-animations: true
+          script: bash hark-build/smoke/run.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vps-smoke-out
+          path: smoke-out
