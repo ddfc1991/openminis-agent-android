@@ -277,7 +277,22 @@ def user_like_state():
         if tap_any(["壁纸与形象"], wait=4): break
         scroll_down()
     snap("personalize")
-    tap_any(["极光"], wait=2, exact=True)
+    # Photo wallpaper (the user's phone has one): pick /sdcard/Pictures/smoke-wall.jpg
+    picked = False
+    if tap_any(["相册"], wait=5, exact=True):
+        for _ in range(3):
+            root = snap("picker")
+            hit = None
+            for t, d, x, y, n in nodes(root):
+                if "smoke-wall" in t or "smoke-wall" in d or d.startswith("Photo taken") or d.startswith("Image") or "照片" in d:
+                    hit = (x, y); break
+            if hit:
+                sh(f"input tap {hit[0]} {hit[1]}"); time.sleep(5); picked = True; break
+            tap_any(["Browse", "Allow", "Images", "Pictures"], wait=3)
+        snap("after-pick")
+    if not picked:
+        tap_any(["极光"], wait=2, exact=True)
+    print("photo wallpaper picked:", picked, flush=True)
     for _ in range(3):
         if toggle_near("首页也用这张壁纸"): break
         scroll_down()
