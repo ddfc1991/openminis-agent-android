@@ -78,6 +78,145 @@ index 7a1629e..fd4c2be 100644
 +    IdentityFile ~/.ssh/minis_vps_ed25519
 +    IdentityFile ~/.ssh/id_ed25519
 +    IdentityFile ~/.ssh/id_rsa
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-dsh b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-dsh
+index 4056b74..825f636 100644
+--- a/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-dsh
++++ b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-dsh
+@@ -6,17 +6,21 @@
+ #   minis-dsh list                                      what is installed and which tools each one adds
+ #   minis-dsh off|on <package>                          disable / re-enable without uninstalling
+ #   minis-dsh gateway                                   serve plugin models (OpenAI format) on 127.0.0.1:8790
++#   minis-dsh web                                       serve Web UI / widget plugins on 127.0.0.1:8791
++#   minis-dsh selftest                                  install known plugins in a scratch home and check they load
+ #   minis-dsh wb-login <file> [--ai]                    phone sign-in for dsh-workbuddy-connect
+ #   minis-dsh mcp-add <name> <npm-package> [args…]       add an MCP server (runs with npx)
+ #   minis-dsh mcp-remove <name>                         remove it
+ #
+ # All plugins share ONE MCP server named "dsh" in Minis (started only when a
+ # tool is called), so adding plugins doesn't add background processes.
+-# Works for plugins that add tools / prompt sections; plugins that need dsh's
+-# own model loop, sessions or web UI are reported as unsupported.
++# Works for plugins that add tools / prompt sections, model providers (llm
++# service → `gateway`) and Web UI widgets (webServer → `web`, shown by Mines
++# as a floating widget). Plugins needing dsh's own model loop or sessions are
++# reported as unsupported. Installs never ask questions (no terminal needed).
+ set -e
+ H="${MINIS_DSH_HOME:-$HOME/.minis-dsh}"
+-SOCK=/usr/local/lib/minis-dsh/socket.mjs
++SOCK="${MINIS_DSH_SOCK:-/usr/local/lib/minis-dsh/socket.mjs}"
+ SERVERS="${MINIS_MCP_SERVERS:-/var/minis/mcp-servers/servers.json}"
+ mkdir -p "$H"
+ [ -f "$H/package.json" ] || printf '{"name":"minis-dsh-plugins","private":true,"type":"module"}\n' > "$H/package.json"
+@@ -72,6 +76,38 @@ set_state() { # op pkg
+     '
+ }
+ 
++# [Mines-dsh] Make package.json list every package that is already installed
++# at top level. npm prunes anything installed but not in the manifest, which is
++# how one `add` used to remove 17 other plugins ("removed 17 packages").
++adopt_installed() {
++    [ -d "$H/node_modules" ] || return 0
++    H="$H" node --input-type=module -e '
++      import fs from "node:fs"; import path from "node:path"
++      const H = process.env.H, f = path.join(H, "package.json")
++      const pj = JSON.parse(fs.readFileSync(f, "utf8")); pj.dependencies ||= {}
++      const nm = path.join(H, "node_modules")
++      const tops = []
++      for (const d of fs.readdirSync(nm)) {
++        if (d.startsWith(".")) continue
++        if (d.startsWith("@")) { for (const e of fs.readdirSync(path.join(nm, d))) tops.push(d + "/" + e) } else tops.push(d)
++      }
++      // Only adopt what something we manage needs: plugins in plugins.json and
++      // the @deepseek-ai libraries; transitive deps stay transitive.
++      let plugins = []
++      try { plugins = (JSON.parse(fs.readFileSync(path.join(H, "plugins.json"), "utf8")).plugins || []).map(p => p.package) } catch {}
++      let changed = false
++      for (const name of tops) {
++        if (pj.dependencies[name]) continue
++        if (!plugins.includes(name) && !name.startsWith("@deepseek-ai/")) continue
++        try {
++          const v = JSON.parse(fs.readFileSync(path.join(nm, name, "package.json"), "utf8")).version
++          if (v) { pj.dependencies[name] = "^" + v; changed = true }
++        } catch {}
++      }
++      if (changed) fs.writeFileSync(f, JSON.stringify(pj, null, 2) + "\n")
++    ' 2>/dev/null || true
++}
++
+ # npm spec -> installed package name
+ pkg_name() {
+     case "$1" in
+@@ -90,7 +126,9 @@ add)
+     [ -n "$1" ] || { echo "用法: minis-dsh add <npm 包名 或 github:用户/仓库>" >&2; exit 2; }
+     need_node
+     echo "安装 $1 …" >&2
+-    NPMI="npm install --no-audit --no-fund --omit=dev --ignore-scripts --legacy-peer-deps"
++    NPMI="npm install --save --no-audit --no-fund --omit=dev --ignore-scripts --legacy-peer-deps --yes"
++    export npm_config_yes=true CI=true
++    adopt_installed
+     # The pieces of dsh that plugins import directly (about 11 MB, installed once).
+     [ -d "$H/node_modules/@deepseek-ai/dsh-tools" ] || (cd "$H" && $NPMI @deepseek-ai/dsh-tools@next @deepseek-ai/cordis@next \
+         @deepseek-ai/dsh-scope@next @deepseek-ai/dsh-llm@next @deepseek-ai/dsh-sandbox@next \
+@@ -107,6 +145,7 @@ add)
+         (cd "$H" && { $NPMI "$miss@next" >/dev/null 2>&1 || $NPMI "$miss" >/dev/null 2>&1; }) || break
+         i=$((i+1))
+     done
++    adopt_installed
+     register_mcp
+     MINIS_DSH_HOME="$H" node "$SOCK" --check | grep -F "$name" || true
+     ;;
+@@ -114,7 +153,8 @@ remove|rm)
+     need_node
+     name=$(pkg_name "$1")
+     set_state remove "$name"
+-    (cd "$H" && npm uninstall --no-audit --no-fund "$name" >/dev/null 2>&1) || true
++    adopt_installed
++    (cd "$H" && npm uninstall --save --no-audit --no-fund "$name" >/dev/null 2>&1) || true
+     unregister_if_empty
+     echo "已卸载 $name"
+     ;;
+@@ -127,6 +167,34 @@ list|ls)
+ gateway)
+     need_node
+     exec env MINIS_DSH_HOME="$H" node "$SOCK" --gateway ;;
++web)
++    need_node
++    exec env MINIS_DSH_HOME="$H" node "$SOCK" --web ;;
++selftest)
++    # Install a tool-less model plugin and a widget plugin into a scratch home
++    # and report what each registers. Exit 0 only when both load.
++    need_node
++    T=$(mktemp -d)
++    export MINIS_DSH_HOME="$T/home" MINIS_MCP_SERVERS="$T/servers.json"
++    echo '{"mcpServers":{}}' > "$MINIS_MCP_SERVERS"
++    rc=0
++    for p in ${*:-dsh-workbuddy-connect dsh-whale-widget}; do
++        echo "== $p" >&2
++        sh "$0" add "$p@latest" >"$T/add.log" 2>&1 || { echo "✗ $p 安装失败"; tail -5 "$T/add.log"; rc=1; continue; }
++    done
++    out=$(node "$SOCK" --check 2>&1); echo "$out"
++    for p in ${*:-dsh-workbuddy-connect dsh-whale-widget}; do
++        printf '%s\n' "$out" | grep -q "^✓ $p" || rc=1
++    done
++    # The widget must actually serve its page.
++    if printf '%s\n' "$out" | grep -q "界面"; then
++        MINIS_DSH_WEB_PORT=18791 node "$SOCK" --web & wp=$!
++        ok=0; i=0; while [ $i -lt 40 ]; do curl -fs http://127.0.0.1:18791/__mines/health >/dev/null 2>&1 && { ok=1; break; }; sleep 0.5; i=$((i+1)); done
++        if [ $ok = 1 ] && curl -fs http://127.0.0.1:18791/ | grep -q "<script"; then echo "✓ 挂件页面可用（127.0.0.1:18791/）"; else echo "✗ 挂件页面没起来"; rc=1; fi
++        kill $wp 2>/dev/null
++    fi
++    rm -rf "$T"; exit $rc
++    ;;
+ wb-login)
+     # The phone has no WorkBuddy desktop app, so the plugin can't read its
+     # sign-in. Take a sign-in the user copies over instead and store it as the
+@@ -194,5 +262,5 @@ mcp-remove)
+     '
+     echo "已移除 MCP 服务 $1"
+     ;;
+-*) sed -n '2,17p' "$0" ;;
++*) sed -n '2,22p' "$0" ;;
+ esac
 diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-vps b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-vps
 index c1033ef..7c9d587 100755
 --- a/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-vps
@@ -390,6 +529,171 @@ index c1033ef..7c9d587 100755
 +    ;;
 +*)      sed -n '2,32p' "$0" ;;
  esac
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-dsh/socket.mjs b/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-dsh/socket.mjs
+index 466fe61..7f0d8b7 100644
+--- a/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-dsh/socket.mjs
++++ b/src/android/app/src/main/assets/default_mount/usr/local/lib/minis-dsh/socket.mjs
+@@ -17,7 +17,7 @@ import http from 'node:http'
+ 
+ const HOME = process.env.MINIS_DSH_HOME || path.join(process.env.HOME || '/root', '.minis-dsh')
+ const STATE = path.join(HOME, 'plugins.json')
+-const SUPPORTED = new Set(['tools', 'systemPrompt', 'commands', 'skills', 'logger', 'agents', 'llm'])
++const SUPPORTED = new Set(['tools', 'systemPrompt', 'commands', 'skills', 'logger', 'agents', 'llm', 'webServer', 'credentials', 'connection'])
+ const fmt = (v) => v instanceof Error ? (v.stack || v.message) : (typeof v === 'string' ? v : (() => { try { return JSON.stringify(v) } catch { return String(v) } })())
+ const log = (...a) => { try { fs.appendFileSync(path.join(HOME, 'socket.log'), `[${new Date().toISOString()}] ${a.join(' ')}\n`) } catch {} }
+ 
+@@ -25,6 +25,29 @@ const tools = new Map()        // name -> { def, plugin }
+ const sections = []            // { plugin, order, text|fn }
+ const status = {}              // plugin -> { ok, reason, tools: [], llm: [] }
+ const adapters = new Map()     // provider route id -> { adapter, plugin }
++// [Mines-dsh-ui] Web UI plugins (widgets such as dsh-whale-widget): their
++// HTTP routes, index-page transforms and event listeners. `--web` serves them
++// on 127.0.0.1:8791 and Mines shows that page in a floating overlay.
++const routes = []              // { kind, path, method, handler, plugin }
++const indexTaps = []           // html => html
++const listeners = new Map()    // event -> Set<fn>
++function emit(name, ...args) { for (const fn of listeners.get(name) || []) { try { fn(...args) } catch (e) { log('event', name, e.message) } } }
++const CRED_FILE = path.join(HOME, 'credentials.json')
++function readCreds() { try { return JSON.parse(fs.readFileSync(CRED_FILE, 'utf8')) } catch { return {} } }
++const credentials = {
++  async resolve(ref) {
++    const r = String(ref || '')
++    const v = readCreds()[r] ?? process.env[r]
++    if (!v) throw new Error(`没有 ${r}：在 Mines 账号连接里填写并打开「交给 AI 使用」`)
++    return { ref: r, value: String(v) }
++  },
++  async get(ref) { try { return await credentials.resolve(ref) } catch { return null } },
++  async set(ref, value) { const c = readCreds(); c[String(ref)] = String(value); fs.writeFileSync(CRED_FILE, JSON.stringify(c, null, 2), { mode: 0o600 }) },
++  async unset(ref) { const c = readCreds(); delete c[String(ref)]; fs.writeFileSync(CRED_FILE, JSON.stringify(c, null, 2), { mode: 0o600 }) },
++  async deleteRecord(ref) { return credentials.unset(ref) },
++  has(ref) { return !!(readCreds()[String(ref)] ?? process.env[String(ref)]) },
++}
++const connection = { requestRejection() { return null }, isTrusted() { return true } }
+ 
+ // The `llm` service: model-provider plugins register an adapter per provider
+ // route. Mines does not run dsh's model loop; the gateway below turns each
+@@ -76,8 +99,26 @@ function makeCtx(pluginName, config) {
+     skills: { register() { return () => {} } },
+     agents: {},
+     llm: makeLlm(pluginName),
+-    on() { return () => {} },
+-    emit() {}, serial: async () => {}, parallel: async () => {},
++    webServer: {
++      register(route) {
++        if (!route || typeof route.handler !== 'function') throw new Error('route needs a handler')
++        const r = { kind: route.kind || 'exact', path: String(route.path || '/'), method: route.method, handler: route.handler, plugin: pluginName }
++        routes.push(r)
++        return reg(() => { const i = routes.indexOf(r); if (i >= 0) routes.splice(i, 1) })
++      },
++      tapIndex(fn) { indexTaps.push(fn); status[pluginName].ui = true; return reg(() => { const i = indexTaps.indexOf(fn); if (i >= 0) indexTaps.splice(i, 1) }) },
++      get port() { return WEB_PORT },
++    },
++    credentials,
++    connection,
++    on(name, fn) {
++      if (typeof fn !== 'function') return () => {}
++      if (!listeners.has(name)) listeners.set(name, new Set())
++      listeners.get(name).add(fn)
++      if (name === 'webserver/index-inject') status[pluginName].ui = true
++      return () => listeners.get(name)?.delete(fn)
++    },
++    emit: (name, ...a) => emit(name, ...a), serial: async () => {}, parallel: async () => {},
+     effect(fn) { try { const d = fn(); if (typeof d === 'function') disposers.push(d) } catch (e) { log(pluginName, 'effect', e.message) } return () => {} },
+     // Callable (`ctx.logger('x').info()`) and usable directly (`ctx.logger.warn()`).
+     logger: Object.assign(
+@@ -94,6 +135,7 @@ function makeCtx(pluginName, config) {
+       return () => {}
+     },
+     get(name) { return SUPPORTED.has(name) ? ctx[name] : undefined },
++    root: undefined,
+     set() {}, provide() {}, mixin() {},
+     scope: { dispose: () => disposers.forEach(d => { try { d() } catch {} }) },
+   }
+@@ -121,7 +163,7 @@ function injectList(mod) {
+ 
+ async function loadPlugin(entry) {
+   const name = entry.package
+-  status[name] = { ok: false, reason: '', tools: [], llm: [] }
++  status[name] = { ok: false, reason: '', tools: [], llm: [], ui: false }
+   try {
+     const req = createRequire(path.join(HOME, 'node_modules', 'noop.js'))
+     let resolved
+@@ -178,12 +220,63 @@ async function boot() {
+   try { state = JSON.parse(fs.readFileSync(STATE, 'utf8')) } catch {}
+   process.on('exit', () => { try { fs.writeFileSync(path.join(HOME, 'status.json'), JSON.stringify(status, null, 2)) } catch {} })
+   for (const p of state.plugins || []) {
+-    if (p.enabled === false) { status[p.package] = { ok: false, reason: '已停用', tools: [], llm: [] }; continue }
++    if (p.enabled === false) { status[p.package] = { ok: false, reason: '已停用', tools: [], llm: [], ui: false }; continue }
+     await loadPlugin(p)
+   }
+   try { fs.writeFileSync(path.join(HOME, 'status.json'), JSON.stringify(status, null, 2)) } catch {}
+ }
+ 
++const WEB_PORT = Number(process.env.MINIS_DSH_WEB_PORT || 8791)
++
++// --- `node socket.mjs --web`: host for Web UI plugins --------------------
++//   GET /                the widget page (transparent, plugin scripts injected)
++//   GET /__mines/health  liveness for Mines
++//   *   <plugin routes>  exactly what each plugin registered on webServer
++// Bound to 127.0.0.1 only; Mines shows the page in a floating overlay.
++async function renderIndex() {
++  const table = []
++  emit('webserver/index-inject', table)
++  const rows = table.map(r => {
++    if (!r) return ''
++    if (r.kind === 'script-src' && r.src) return `<script src="${String(r.src).replace(/"/g, '&quot;')}"></script>`
++    if (r.kind === 'script' && r.text) return `<script>${r.text}</script>`
++    if (r.kind === 'style' && r.text) return `<style>${r.text}</style>`
++    if (r.kind === 'html' && r.text) return r.text
++    return ''
++  }).join('\n')
++  let html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
++<style>html,body{background:transparent!important;margin:0;height:100%;overflow:hidden;font-family:sans-serif}
++#mines-composer{position:absolute;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0}</style></head>
++<body data-mines-host="1"><textarea id="mines-composer" aria-hidden="true"></textarea>${rows}</body></html>`
++  for (const fn of indexTaps) { try { const v = await fn(html); if (typeof v === 'string') html = v } catch (e) { log('tapIndex', e.message) } }
++  return html
++}
++
++if (process.argv.includes('--web')) {
++  await boot()
++  const srv = http.createServer(async (req, res) => {
++    try {
++      const url = new URL(req.url || '/', 'http://127.0.0.1')
++      const p = url.pathname
++      if (p === '/__mines/health') { res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: true, routes: routes.length })) }
++      const method = String(req.method || 'GET').toUpperCase()
++      const hit = routes.find(r => (r.kind === 'prefix' ? p.startsWith(r.path) : p === r.path) &&
++        (!r.method || String(r.method).toUpperCase() === method))
++      if (hit) return await hit.handler(req, res)
++      if (p === '/' || p === '/index.html') {
++        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
++        return res.end(await renderIndex())
++      }
++      res.writeHead(404); res.end('not found')
++    } catch (e) {
++      log('web', e.stack || e.message)
++      try { res.writeHead(500); res.end(String(e.message || e)) } catch {}
++    }
++  })
++  srv.listen(WEB_PORT, '127.0.0.1', () => log('web host on', WEB_PORT))
++  await new Promise(() => {})
++}
++
+ // --- model gateway helpers ---------------------------------------------
+ const GATEWAY_PORT = Number(process.env.MINIS_DSH_GATEWAY_PORT || 8790)
+ 
+@@ -248,7 +341,9 @@ if (process.argv.includes('--check')) {
+   for (const [name, st] of Object.entries(status)) {
+     const llm = idx.providers.filter(p => p.plugin === name)
+     const llmText = llm.length ? `  模型: ${llm.map(p => `${p.name}(${p.models.length})`).join(', ')}` : ''
+-    console.log(`${st.ok ? '✓' : '✗'} ${name}${st.ok ? `  工具: ${st.tools.join(', ') || '无'}${llmText}` : `  ${st.reason}`}`)
++    const uiText = st.ui ? '  界面: 挂件（在 Mines 插件页点「显示挂件」）' : ''
++    const toolText = st.tools.length ? `  工具: ${st.tools.join(', ')}` : (st.ui || llm.length ? '' : '  工具: 无')
++    console.log(`${st.ok ? '✓' : '✗'} ${name}${st.ok ? `${toolText}${llmText}${uiText}` : `  ${st.reason}`}`)
+   }
+   process.exit(0)
+ }
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Avatars.kt b/src/android/app/src/main/java/com/openminis/app/plus/Avatars.kt
 index c5539cc..ca876db 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/Avatars.kt
@@ -758,6 +1062,19 @@ index 09d9b84..b86f879 100644
              })
          }
          prefs?.edit()
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt
+index 0a14230..8143a1a 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt
+@@ -36,7 +36,7 @@ enum class PermLevel(val label: String) { ALLOW("允许"), ASK("询问"), DENY("
+ data class Capability(
+     val id: String,
+     val label: String,
+-    val section: Int, // 0 = 读取权限, 1 = 写入和删除权限, 2 = Background actions
++    val section: Int, // 0 = 读取权限, 1 = 写入和删除权限, 2 = 后台操作
+     val default: PermLevel,
+     val locked: Boolean = false,
+ )
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt
 index be32a8f..5c67010 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt
@@ -1465,7 +1782,7 @@ index 57866d4..d589efc 100644
          // component out of Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES. It
 diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/FastUi.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/FastUi.kt
 new file mode 100644
-index 0000000..f580524
+index 0000000..7990d2c
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/FastUi.kt
 @@ -0,0 +1,442 @@
@@ -1511,7 +1828,7 @@ index 0000000..f580524
 + *      `uiautomator dump` + `input tap/text/swipe/keyevent`. Slower to read
 + *      (~1–2 s per list) but needs no accessibility grant and no root.
 + */
-+class FastUi(private val context: Context) {
++internal class FastUi(private val context: Context) {
 +
 +    data class El(
 +        val n: Int, val label: String, val role: String, val bounds: Rect,
@@ -2026,7 +2343,7 @@ index 32851a7..db57988 100644
          AvatarTile("相册…", selected = false, onClick = { picker.launch("image/*") }) {
              Box(Modifier.size(84.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)),
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
-index 4395c47..8266462 100644
+index 4395c47..5589aec 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
 @@ -179,7 +179,7 @@ fun ConnectionsScreen(onBack: () -> Unit) {
@@ -2034,7 +2351,7 @@ index 4395c47..8266462 100644
              Text(
                  "点「连接」会打开官方登录页，登录好自动回来。密钥和登录状态加密存在这台手机里。",
 -                style = MaterialTheme.typography.bodyMedium,
-+                style = MaterialTheme.typography.bodySmall,
++                fontSize = 13.sp,
                  color = MaterialTheme.colorScheme.onSurfaceVariant,
              )
          }
@@ -2050,7 +2367,7 @@ index 4395c47..8266462 100644
                          Spacer(Modifier.width(14.dp))
 -                        Text(base.name, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
 -                        TextButton(onClick = { addAccount(base) }, modifier = Modifier.heightIn(min = 44.dp)) {
-+                        Text(base.name, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
++                        Text(base.name, fontSize = 16.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
 +                        TextButton(onClick = { addAccount(base) }, modifier = Modifier.heightIn(min = 40.dp)) {
                              Icon(Icons.Outlined.Add, null, modifier = Modifier.size(20.dp))
                              Spacer(Modifier.width(4.dp))
@@ -2073,8 +2390,8 @@ index 4395c47..8266462 100644
                                  Text(e?.account?.takeIf { it.isNotBlank() } ?: "账号 ${id.substringAfter('#', "1")}",
 -                                    style = MaterialTheme.typography.bodyMedium)
 -                                Text(if (isDef) "已连接 · 默认" else "已连接", style = MaterialTheme.typography.bodyMedium, color = Green)
-+                                    style = MaterialTheme.typography.bodySmall)
-+                                Text(if (isDef) "已连接 · 默认" else "已连接", style = MaterialTheme.typography.bodySmall, color = Green)
++                                    fontSize = 13.sp)
++                                Text(if (isDef) "已连接 · 默认" else "已连接", fontSize = 13.sp, color = Green)
                              }
                              Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
                          }
@@ -2094,7 +2411,7 @@ index 4395c47..8266462 100644
                  }
                  Spacer(Modifier.width(14.dp))
 -                Text("添加网站登录", style = MaterialTheme.typography.titleSmall)
-+                Text("添加网站登录", style = MaterialTheme.typography.bodyMedium)
++                Text("添加网站登录", fontSize = 16.sp)
              }
          }
      }
@@ -2112,7 +2429,7 @@ index 4395c47..8266462 100644
  
  @Composable
 -fun BrandIcon(kind: ConnectionKind, size: Dp = 44.dp) {
-+fun BrandIcon(kind: ConnectionKind, size: Dp = 36.dp) {
++fun BrandIcon(kind: ConnectionKind, size: Dp = 40.dp) {
      Box(
          Modifier.size(size).clip(RoundedCornerShape(size * 0.27f)).background(Color.White)
              .border(BorderStroke(1.dp, Color(0x1F000000)), RoundedCornerShape(size * 0.27f)),
@@ -2129,8 +2446,8 @@ index 4395c47..8266462 100644
          Column(Modifier.weight(1f)) {
 -            Text(k.name, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Medium)
 -            Text(sub, style = MaterialTheme.typography.bodyMedium, color = if (connected) Green else MaterialTheme.colorScheme.onSurfaceVariant,
-+            Text(k.name, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
-+            Text(sub, style = MaterialTheme.typography.bodySmall, color = if (connected) Green else MaterialTheme.colorScheme.onSurfaceVariant,
++            Text(k.name, fontSize = 16.sp, fontWeight = FontWeight.Medium)
++            Text(sub, fontSize = 13.sp, color = if (connected) Green else MaterialTheme.colorScheme.onSurfaceVariant,
                  maxLines = 2)
          }
          Spacer(Modifier.width(8.dp))
@@ -2149,15 +2466,15 @@ index 4395c47..8266462 100644
          // ---- header ----
          Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 16.dp), verticalAlignment = Alignment.CenterVertically) {
 -            BrandIcon(kind, 64.dp)
-+            BrandIcon(kind, 48.dp)
++            BrandIcon(kind, 44.dp)
              Spacer(Modifier.width(16.dp))
              Column(Modifier.weight(1f)) {
 -                Text(kind.name, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
-+                Text(kind.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
++                Text(kind.name, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
                  Text(
                      if (entry != null) "已连接" + (entry.account.takeIf { it.isNotBlank() }?.let { " · $it" } ?: "") else kind.desc,
 -                    style = MaterialTheme.typography.bodyMedium,
-+                    style = MaterialTheme.typography.bodySmall,
++                    fontSize = 13.sp,
                      color = if (entry != null) Green else MaterialTheme.colorScheme.onSurfaceVariant,
                  )
              }
@@ -2177,7 +2494,7 @@ index 4395c47..8266462 100644
                      tint = if (isDef) Color(0xFFFFB300) else MaterialTheme.colorScheme.onSurfaceVariant)
                  Spacer(Modifier.width(8.dp))
 -                Text(if (isDef) "默认账号：AI 不指定账号时用它" else "不是默认账号", style = MaterialTheme.typography.bodyMedium,
-+                Text(if (isDef) "默认账号：AI 不指定账号时用它" else "不是默认账号", style = MaterialTheme.typography.bodySmall,
++                Text(if (isDef) "默认账号：AI 不指定账号时用它" else "不是默认账号", fontSize = 13.sp,
                      modifier = Modifier.weight(1f))
 -                if (!isDef) TextButton(onClick = { PlusVault.setDefault(context, kind.id) }) { Text("设为默认", fontSize = 14.sp) }
 +                if (!isDef) TextButton(onClick = { PlusVault.setDefault(context, kind.id) }) { Text("设为默认", fontSize = 13.sp) }
@@ -2190,8 +2507,8 @@ index 4395c47..8266462 100644
                      Column(Modifier.weight(1f)) {
 -                        Text("交给 AI 使用", style = MaterialTheme.typography.titleSmall)
 -                        Text("以 ${kind.envKey} 提供给沙箱，聊天里自动打码", style = MaterialTheme.typography.bodyMedium,
-+                        Text("交给 AI 使用", style = MaterialTheme.typography.bodyMedium)
-+                        Text("以 ${kind.envKey} 提供给沙箱，聊天里自动打码", style = MaterialTheme.typography.bodySmall,
++                        Text("交给 AI 使用", fontSize = 16.sp)
++                        Text("以 ${kind.envKey} 提供给沙箱，聊天里自动打码", fontSize = 13.sp,
                              color = MaterialTheme.colorScheme.onSurfaceVariant)
                      }
                      Switch(entry.shareWithAi, onCheckedChange = { PlusVault.setShare(context, kind, it) })
@@ -2200,41 +2517,63 @@ index 4395c47..8266462 100644
                      Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
                          Column(Modifier.weight(1f)) {
 -                            Text("保活", style = MaterialTheme.typography.titleSmall)
-+                            Text("保活", style = MaterialTheme.typography.bodyMedium)
++                            Text("保活", fontSize = 16.sp)
                              val last = PlusVault.extra(kind.id, "keepalive_last")?.toLongOrNull()
                              Text(
                                  "免费服务器两周不登录会被归档。打开后每 10 天在后台用已保存的登录打开一次面板；登录失效会发通知提醒你。" +
                                      (last?.let { "\n上次：" + SimpleDateFormat("M月d日 HH:mm", Locale.CHINA).format(Date(it)) } ?: ""),
 -                                style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
-+                                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
++                                fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
                              )
                          }
                          Switch(on, onCheckedChange = {
-@@ -461,20 +461,20 @@ private fun ConnectionDetailScreen(
+@@ -453,28 +453,35 @@ private fun ConnectionDetailScreen(
+ 
+         // ---- permissions ----
+         val caps = PlusVault.capabilities(kind.profile)
+-        listOf("读取权限", "写入和删除权限", "Background actions").forEachIndexed { sec, title ->
++        listOf("读取权限", "写入和删除权限", "后台操作").forEachIndexed { sec, title ->
+             val rows = caps.filter { it.section == sec }
+             if (rows.isEmpty()) return@forEachIndexed
+             PlusSection(title, footer = if (sec == 1) "「询问」会在 AI 动手前弹出确认卡片，你点同意它才做。支付和交易永远要问你。" else null) {
+                 rows.forEachIndexed { i, cap ->
                      @Suppress("UNUSED_EXPRESSION") permVersion
                      val cur = PlusVault.level(kind, cap)
-                     Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp)) {
+-                    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp)) {
 -                        Text(cap.label + if (cap.locked) "（固定）" else "", style = MaterialTheme.typography.titleSmall)
-+                        Text(cap.label + if (cap.locked) "（固定）" else "", style = MaterialTheme.typography.bodyMedium)
-                         Spacer(Modifier.height(8.dp))
-                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                             PermLevel.entries.forEach { lv ->
+-                        Spacer(Modifier.height(8.dp))
+-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+-                            PermLevel.entries.forEach { lv ->
++                    // [Mines-compact] Name on the left, a compact 允许/询问/禁止
++                    // segmented control on the right — one row per permission.
++                    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
++                        verticalAlignment = Alignment.CenterVertically) {
++                        Text(cap.label + if (cap.locked) "（固定）" else "", fontSize = 15.sp, modifier = Modifier.weight(1f),
++                            maxLines = 2)
++                        Spacer(Modifier.width(8.dp))
++                        Row(
++                            Modifier.clip(RoundedCornerShape(8.dp))
++                                .border(BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant), RoundedCornerShape(8.dp)),
++                        ) {
++                            PermLevel.entries.forEachIndexed { li, lv ->
                                  val sel = cur == lv
                                  val color = when (lv) { PermLevel.ALLOW -> Green; PermLevel.ASK -> Color(0xFFFF9500); PermLevel.DENY -> Red }
++                                if (li > 0) Box(Modifier.width(1.dp).height(30.dp).background(MaterialTheme.colorScheme.outlineVariant))
                                  Box(
 -                                    Modifier.weight(1f).heightIn(min = 46.dp).clip(RoundedCornerShape(12.dp))
-+                                    Modifier.weight(1f).heightIn(min = 38.dp).clip(RoundedCornerShape(12.dp))
-                                         .background(if (sel) color.copy(alpha = 0.16f) else MaterialTheme.colorScheme.surface)
-                                         .border(BorderStroke(if (sel) 2.dp else 1.dp, if (sel) color else MaterialTheme.colorScheme.outlineVariant), RoundedCornerShape(12.dp))
+-                                        .background(if (sel) color.copy(alpha = 0.16f) else MaterialTheme.colorScheme.surface)
+-                                        .border(BorderStroke(if (sel) 2.dp else 1.dp, if (sel) color else MaterialTheme.colorScheme.outlineVariant), RoundedCornerShape(12.dp))
++                                    Modifier.width(46.dp).height(30.dp)
++                                        .background(if (sel) color.copy(alpha = 0.22f) else Color.Transparent)
                                          .clickable(enabled = !cap.locked) { PlusVault.setLevel(kind, cap, lv) },
                                      contentAlignment = Alignment.Center,
                                  ) {
 -                                    Text(lv.label, fontSize = 14.sp, fontWeight = if (sel) FontWeight.Bold else FontWeight.Normal,
-+                                    Text(lv.label, fontSize = 13.sp, fontWeight = if (sel) FontWeight.Bold else FontWeight.Normal,
++                                    Text(lv.label, fontSize = 12.sp, maxLines = 1, fontWeight = if (sel) FontWeight.Bold else FontWeight.Normal,
                                          color = if (sel) color else if (cap.locked) MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
                                          else MaterialTheme.colorScheme.onSurface)
                                  }
-@@ -492,18 +492,18 @@ private fun ConnectionDetailScreen(
+@@ -492,18 +499,18 @@ private fun ConnectionDetailScreen(
  private fun BigAction(text: String, onClick: () -> Unit) {
      Button(
          onClick = onClick,
@@ -2257,37 +2596,37 @@ index 4395c47..8266462 100644
  }
  
  /** GitHub / Microsoft: OAuth device flow with the code shown big, copied, and the official page opened. */
-@@ -557,17 +557,17 @@ private fun DeviceFlowBlock(kind: ConnectionKind, autoStart: Boolean, onWeb: (St
+@@ -557,17 +564,17 @@ private fun DeviceFlowBlock(kind: ConnectionKind, autoStart: Boolean, onWeb: (St
          val c = code
          if (c != null) {
              Column(Modifier.fillMaxWidth().padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
 -                Text("你的授权码", style = MaterialTheme.typography.titleSmall)
-+                Text("你的授权码", style = MaterialTheme.typography.bodyMedium)
++                Text("你的授权码", fontSize = 16.sp)
                  Spacer(Modifier.height(8.dp))
 -                Text(c.userCode, fontSize = 40.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace, letterSpacing = 4.sp,
 +                Text(c.userCode, fontSize = 30.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace, letterSpacing = 4.sp,
                      color = MaterialTheme.colorScheme.primary)
                  Spacer(Modifier.height(8.dp))
 -                Text(status, style = MaterialTheme.typography.bodyMedium)
-+                Text(status, style = MaterialTheme.typography.bodySmall)
++                Text(status, fontSize = 13.sp)
              }
              SecondaryAction("再打开授权页") { openExternal(context, c.verifyUrl) }
          } else {
              BigAction(if (PlusVault.entries.value.containsKey(kind.id)) "重新授权" else "一键授权") { start() }
 -            if (status.isNotEmpty()) Text(status, style = MaterialTheme.typography.bodyMedium,
-+            if (status.isNotEmpty()) Text(status, style = MaterialTheme.typography.bodySmall,
++            if (status.isNotEmpty()) Text(status, fontSize = 13.sp,
                  modifier = Modifier.padding(horizontal = 16.dp).padding(bottom = 10.dp))
          }
          if (kind.loginUrl != null) SecondaryAction(if (kind.method == ConnMethod.GITHUB) "也在 Mines 浏览器里登录 GitHub 网页" else "网页登录 Outlook") {
-@@ -623,24 +623,24 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
+@@ -623,24 +630,24 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
                  Row(verticalAlignment = Alignment.CenterVertically) {
                      Icon(Icons.Outlined.ContentPaste, null, tint = Green)
                      Spacer(Modifier.width(8.dp))
 -                    Text("剪贴板里有 ${kind.name} 的${kind.keyLabel}", style = MaterialTheme.typography.titleSmall)
-+                    Text("剪贴板里有 ${kind.name} 的${kind.keyLabel}", style = MaterialTheme.typography.bodyMedium)
++                    Text("剪贴板里有 ${kind.name} 的${kind.keyLabel}", fontSize = 16.sp)
                  }
 -                Text("••••" + f.takeLast(4), style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(vertical = 6.dp))
-+                Text("••••" + f.takeLast(4), style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(vertical = 6.dp))
++                Text("••••" + f.takeLast(4), fontSize = 13.sp, modifier = Modifier.padding(vertical = 6.dp))
                  Button(
                      onClick = { if (!needsAccount || account.isNotBlank()) save(f) else Toast.makeText(context, "先填上你的 Gmail 地址", Toast.LENGTH_SHORT).show() },
                      colors = ButtonDefaults.buttonColors(containerColor = Green),
@@ -2310,7 +2649,7 @@ index 4395c47..8266462 100644
              modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp),
          )
          if (kind.id == "gemini") {
-@@ -659,8 +659,8 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
+@@ -659,8 +666,8 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
          }
          if (manual.isNotBlank()) Button(
              onClick = { if (!needsAccount || account.isNotBlank()) save(manual.trim()) else Toast.makeText(context, "先填上你的 Gmail 地址", Toast.LENGTH_SHORT).show() },
