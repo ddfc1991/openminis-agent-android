@@ -162,6 +162,93 @@ def add_server(name, host, password, port=None):
     time.sleep(3)
 
 
+def edits(root):
+    return [(x, y, n) for t, d, x, y, n in nodes(root) if n.get("class", "").endswith("EditText")]
+
+
+def fill_edit(idx, value, clear=True):
+    root = dump(); e = edits(root)
+    if idx >= len(e):
+        print(f"  (no EditText #{idx}; have {len(e)})", flush=True); return
+    x, y, _ = e[idx]
+    sh(f"input tap {x} {y}"); time.sleep(0.7)
+    if clear:
+        sh("input keyevent KEYCODE_MOVE_END")
+        sh("input keyevent " + " ".join(["KEYCODE_DEL"] * 40))
+    type_text(value); time.sleep(0.6)
+
+
+def scroll_down():
+    sh("input swipe 540 1700 540 600 300"); time.sleep(1.2)
+
+
+def tap_any(labels, wait=2.5, exact=False):
+    root = dump()
+    for lab in labels:
+        if find(root, lab, exact):
+            return tap_text(lab, exact=exact, wait=wait, root=root)
+    return False
+
+
+def setup_provider():
+    """Onboarding: OpenAI-compatible provider at the runner's fake endpoint, one model, one chat."""
+    tap_text("Add a Provider", wait=4)
+    root = snap("provider-chooser")
+    if find(root, "Choose Provider") or find(root, "OpenAI"):
+        tap_text("OpenAI", exact=True, wait=3) or tap_text("OpenAI", wait=3)
+        root = snap("provider-picked")
+        if find(root, "API Key", exact=True):
+            tap_text("API Key", exact=True, wait=3); root = snap("auth-picked")
+    e = edits(dump())
+    print("  edit texts:", [n.get("text") for _, _, n in e], flush=True)
+    # label, key, base url (order on the configure page)
+    if len(e) >= 3:
+        fill_edit(1, "sk-smoke-000000000000000000000000")
+        fill_edit(2, "http://10.0.2.2:8088/v1")
+    elif len(e) == 2:
+        fill_edit(1, "sk-smoke-000000000000000000000000")
+        scroll_down(); e2 = edits(dump())
+        if len(e2) >= 2: fill_edit(len(e2) - 1, "http://10.0.2.2:8088/v1")
+    sh("input keyevent KEYCODE_BACK"); time.sleep(1)
+    root = snap("provider-filled")
+    for _ in range(3):
+        if tap_any(["Save Provider", "Save API Key", "Save", "保存"], wait=4):
+            break
+        scroll_down()
+    root = snap("provider-saved")
+    for _ in range(3):
+        if find(root, "Select Models"):
+            break
+        sh("input keyevent KEYCODE_BACK"); time.sleep(2); root = dump()
+    tap_text("Select Models", wait=10)
+    root = snap("models")
+    if not tap_text("smoke-model", wait=2):
+        if tap_any(["Add Model Manually"], wait=3):
+            fill_edit(0, "smoke-model", clear=False)
+            tap_any(["Add", "Save", "OK", "添加"], wait=3)
+    root = snap("model-picked")
+    tap_any(["Done (1/3)", "Done ("], wait=5)
+    root = snap("after-models")
+    for _ in range(3):
+        if find(root, "Start a Conversation") or find(root, "工作位置"):
+            break
+        sh("input keyevent KEYCODE_BACK"); time.sleep(2); root = dump()
+    if find(root, "Start a Conversation"):
+        tap_text("Start a Conversation", wait=6)
+        root = snap("chat")
+        e = edits(root)
+        if e:
+            sh(f"input tap {e[-1][0]} {e[-1][1]}"); time.sleep(0.6); type_text("hello")
+            sh("input keyevent KEYCODE_BACK"); time.sleep(0.6)
+            tap_any(["Send", "发送"], wait=10) or sh("input keyevent KEYCODE_ENTER")
+            time.sleep(8)
+        snap("chat-sent")
+        check("chat with fake model")
+        sh("input keyevent KEYCODE_BACK"); time.sleep(3)
+    root = snap("home-with-chat")
+    check("home list (TodayCard) shown")
+
+
 def dump_fatal():
     out = adb("logcat", "-d", "-v", "threadtime", "-b", "crash", timeout=60)
     print("---- crash buffer ----\n" + out[-15000:], flush=True)
@@ -179,8 +266,13 @@ def main():
         time.sleep(3); print(sh(f"am start -W -n {PKG}/com.openminis.app.MainActivity", timeout=90)); time.sleep(12)
         snap("launch-2"); check("second launch"); dump_fatal()
     dismiss_dialogs()
-    snap("home")
+    root = snap("home")
     check("launch")
+    if find(root, "Welcome to Mines"):
+        setup_provider()
+        sh(f"am force-stop {PKG}"); time.sleep(2)
+        relaunch(); snap("relaunch-with-home"); check("cold launch with chats (home list)")
+        dump_fatal()
 
     # Home Today card → 工作位置
     if not tap_text("工作位置", wait=6):
