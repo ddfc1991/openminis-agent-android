@@ -1,0 +1,1393 @@
+diff --git a/src/android/app/src/main/java/com/openminis/app/MainActivity.kt b/src/android/app/src/main/java/com/openminis/app/MainActivity.kt
+index 66d186a..6434338 100644
+--- a/src/android/app/src/main/java/com/openminis/app/MainActivity.kt
++++ b/src/android/app/src/main/java/com/openminis/app/MainActivity.kt
+@@ -661,6 +661,8 @@ class MainActivity : ComponentActivity() {
+ 
+     override fun onStart() {
+         super.onStart()
++        // [Mines-sources-33] every saved login / key becomes a data source automatically (toast on a new build)
++        runCatching { com.openminis.app.plus.AutoSources.onForeground(this) }
+         if (!hasResumedFromBackground) {
+             hasResumedFromBackground = true
+             return
+diff --git a/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt b/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt
+index 4d603b7..e30a9cb 100644
+--- a/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt
++++ b/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt
+@@ -817,9 +817,15 @@ class BrowserUseManager(
+         }
+         if (st.otpAutofill && scan.otpField) {
+             hv.armOtp()
+-            if (scan.otpEmpty) hv.takeCode()?.let { code ->
+-                val r = runCatching { evaluateJavascript(hv.fillJs(code, null)) }.getOrNull()
+-                if (r == "ok") text += "\n[验证码] 已自动填入刚收到的短信/邮件验证码（${code.length} 位）。"
++            if (scan.otpEmpty) {
++                val code = hv.takeCode()
++                if (code != null) {
++                    val r = runCatching { evaluateJavascript(hv.fillJs(code, null)) }.getOrNull()
++                    if (r == "ok") text += "\n[验证码] 已自动填入刚收到的短信/邮件验证码（${code.length} 位）。" else hv.putBack(code)
++                } else if (runCatching { com.openminis.app.plus.MailSources.available(ctx) }.getOrDefault(false)) {
++                    // [Mines-sources-33] mailboxes the user is signed in to are being read in the background
++                    text += "\n[验证码] Mines 正在自动读取用户已登录的邮箱和通知里的验证码。点完「发送验证码」后调用 browser 的 wait_for_otp，收到会自动填入，不要让用户手动输入。"
++                }
+             }
+         }
+         val out = result.copy(text = text)
+@@ -846,8 +852,9 @@ class BrowserUseManager(
+         if (!hv.settings.value.otpAutofill) {
+             return BrowserActionResult.error("验证码自动填写已在设置里关闭，请让用户把验证码告诉你")
+         }
+-        if (!com.openminis.app.offload.MinisNotificationListenerService.isConnected()) {
+-            return BrowserActionResult.error("Mines 没有通知使用权，收不到短信验证码。请让用户在 设置 → 浏览器验证 里打开通知使用权，或把验证码直接告诉你")
++        val mailOk = runCatching { com.openminis.app.plus.MailSources.available(ctx) }.getOrDefault(false)
++        if (!com.openminis.app.offload.MinisNotificationListenerService.isConnected() && !mailOk) {
++            return BrowserActionResult.error("Mines 没有通知使用权，也没有已登录的邮箱，收不到验证码。请让用户在 设置 → 浏览器验证 里打开通知使用权，或把验证码直接告诉你")
+         }
+         val code = hv.awaitCode(com.openminis.app.plus.HumanVerify.WAIT_SLICE_MS)
+             ?: return BrowserActionResult(text = "约 50 秒内没收到验证码短信/邮件通知。确认已经点了发送验证码后，可以再调用一次 wait_for_otp。", success = true)
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/AutoSources.kt b/src/android/app/src/main/java/com/openminis/app/plus/AutoSources.kt
+new file mode 100644
+index 0000000..5615f28
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/AutoSources.kt
+@@ -0,0 +1,230 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import android.webkit.CookieManager
++import android.widget.Toast
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import kotlinx.coroutines.withTimeoutOrNull
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import java.util.concurrent.TimeUnit
++
++/**
++ * [Mines-sources-33] Every login becomes a working data source, with no
++ * 「连接这个来源」 step (user, 2026-10-13: 「应该是智能的，你搞成半自动有点恼火」).
++ *
++ * [scan] looks at everything Mines already holds — WebView session cookies for every
++ * service in the catalog, Google / Gmail cookies, OAuth tokens (GitHub, Microsoft),
++ * API keys (incl. keys sitting in 模型组), IMAP app passwords, notification access —
++ * and, for a signed-in service that has no 账号连接 row yet, adds the row itself
++ * (via "web", marked auto) so every page treats it as connected. It runs on every
++ * app start (cheap: cookie reads only) and after each login; the first launch of a new
++ * build shows one toast 「已自动接入 N 个来源」, later launches only when something new
++ * turned up.
++ *
++ * What each source feeds, automatically:
++ *  - mailboxes (Gmail web session / Outlook token / IMAP) → one-time codes for the
++ *    browser + 消息汇总 ([MailSources])
++ *  - GitHub token, or just the github.com session → notifications in 消息汇总
++ *  - X session → mentions + followed keywords in 消息汇总 (read off-screen)
++ *  - provider consoles with a session but no balance API → balance from the billing
++ *    page ([sessionBalances])
++ */
++object AutoSources {
++    private const val PREFS = "mines_auto_sources"
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
++    private val http = OkHttpClient.Builder().connectTimeout(8, TimeUnit.SECONDS).readTimeout(15, TimeUnit.SECONDS)
++        .callTimeout(20, TimeUnit.SECONDS).followRedirects(false).build()
++
++    data class Src(val id: String, val name: String, val how: String, val feeds: String)
++
++    private val _active = MutableStateFlow<List<Src>>(emptyList())
++    val active: StateFlow<List<Src>> = _active.asStateFlow()
++
++    /** Services whose session cookie we can check (catalog + Gmail). */
++    private fun cookieKinds(): List<ConnectionKind> = PlusVault.kinds.filter { it.doneCookies.isNotEmpty() && !it.hidden }
++
++    /** Signed-in services found in the WebView cookie jar: kindId → account hint. */
++    fun sessions(): Map<String, String?> {
++        val out = LinkedHashMap<String, String?>()
++        val cm = runCatching { CookieManager.getInstance() }.getOrNull() ?: return out
++        for (k in cookieKinds()) {
++            if (!LoginWeb.signedIn(k)) continue
++            val c = listOfNotNull(k.loginUrl, k.panelUrl).firstNotNullOfOrNull { runCatching { cm.getCookie(it) }.getOrNull() }
++            out[k.id] = MailParse.accountFromCookies(k.id, c)
++        }
++        return out
++    }
++
++    fun xSignedIn(): Boolean = PlusVault.kind("x")?.let { LoginWeb.signedIn(it) } == true
++    fun githubSession(): Boolean = PlusVault.kind("github")?.let { LoginWeb.signedIn(it) } == true
++    fun githubToken(): String? = (PlusVault.defaultAccount("github")?.let { PlusVault.secret(it) } ?: PlusVault.secret("github"))?.takeIf { it.isNotBlank() }
++
++    /**
++     * Adopts every signed-in service and key; returns the ids that were added now.
++     * Cookie reads only (plus the 模型组 key scan): safe on the main thread.
++     */
++    fun scan(context: Context): List<String> {
++        PlusVault.init(context)
++        val added = ArrayList<String>()
++        runCatching { if (ProviderKeys.adopt(context) > 0) added += "keys" }
++        for ((id, account) in sessions()) {
++            val kind = PlusVault.kind(id) ?: continue
++            if (PlusVault.accountsOf(id).isNotEmpty()) {
++                // already a row: make sure it is marked signed in (the session may be newer than the row)
++                PlusVault.defaultAccount(id)?.let { if (PlusVault.extra(it, "session") != "1") LoginWeb.markSignedIn(it, account) }
++                continue
++            }
++            PlusVault.save(context, kind, account ?: "网页登录（自动发现）", null, share = false, via = "web")
++            PlusVault.setExtra(id, "auto", "1")
++            LoginWeb.markSignedIn(id, account)
++            runCatching { PlusConnect.snapshotCookies(kind, listOfNotNull(kind.loginUrl, kind.panelUrl)) }
++            added += id
++        }
++        _active.value = list(context)
++        return added
++    }
++
++    /** What is feeding Mines right now (for the toast, 消息 and 账号连接). */
++    fun list(context: Context): List<Src> {
++        PlusVault.init(context)
++        val out = ArrayList<Src>()
++        if (com.openminis.app.offload.MinisNotificationListenerService.isEnabled(context)) out += Src("notif", "手机通知", "通知使用权", "验证码 · 消息")
++        MailSources.boxes(context).forEach { out += Src(it.id, it.label, it.how, "验证码 · 邮件") }
++        if (githubToken() != null) out += Src("github", "GitHub", "授权", "通知")
++        else if (githubSession()) out += Src("github", "GitHub", "网页登录", "通知")
++        if (xSignedIn()) out += Src("x", "X", "网页登录", "@你 · 关注")
++        (KeyBalance.billingUrl.keys + extraBilling.keys).map { PlusVault.defaultAccount(it) ?: it }.filter { PlusVault.extra(it, "balance_via") == "web" }.forEach { id ->
++            out += Src("bal:$id", PlusVault.kind(id)?.name ?: id, "网页登录", "余额")
++        }
++        PlusVault.entries.value.values.filter { it.via in setOf("key", "model", "token") && KeyBalance.hasApi(PlusVault.baseId(it.kindId)) }.forEach { e ->
++            out += Src("key:" + e.kindId, PlusVault.kind(e.kindId)?.name ?: e.kindId, "密钥", "余额")
++        }
++        return out.distinctBy { it.id }
++    }
++
++    /** 「接入更多来源」 rows: only what is truly missing. Pairs of (key, why). */
++    fun missing(context: Context): List<Pair<String, String>> = buildList {
++        if (!com.openminis.app.offload.MinisNotificationListenerService.isEnabled(context)) add("通知" to "打开「通知使用权」，微信、短信验证码等才能自动读到")
++        if (githubToken() == null && !githubSession()) add("GitHub" to "登录 GitHub，看 @你、审代码和安全提醒")
++        if (!xSignedIn()) add("X" to "登录 X，按你关注的词看实时推文")
++        if (MailSources.boxes(context).isEmpty()) add("Gmail" to "在 Mines 里登录一次 Gmail，验证码邮件会自动填")
++    }
++
++    // ---------------- app start ----------------
++
++    /** Called from MainActivity.onStart: scan, toast, then refresh what the sources feed. */
++    fun onForeground(context: Context) {
++        val app = context.applicationContext
++        scope.launch {
++            delay(2500) // let the first frame and the cookie store settle
++            val added = withContext(Dispatchers.Main) { runCatching { scan(app) }.getOrDefault(emptyList()) }
++            val p = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++            val build = com.openminis.app.BuildConfig.MINES_BUILD
++            val firstOfBuild = p.getInt("scan_build", -1) != build
++            val n = if (firstOfBuild) _active.value.size else added.size
++            p.edit().putInt("scan_build", build).apply()
++            if (n > 0 && (firstOfBuild || added.isNotEmpty())) withContext(Dispatchers.Main) {
++                Toast.makeText(app, "已自动接入 $n 个来源", Toast.LENGTH_SHORT).show()
++            }
++            // feed the sources: balances via sessions, then the digest (each throttled)
++            runCatching { sessionBalances(app) }
++            if (System.currentTimeMillis() - p.getLong("digest_at", 0L) > 30 * 60_000L) {
++                p.edit().putLong("digest_at", System.currentTimeMillis()).apply()
++                runCatching { Digest.refresh(app) }
++            }
++        }
++    }
++
++    /** After a login screen closed: adopt it right away (no toast; the screen already said 已连接). */
++    fun afterLogin(context: Context) {
++        val app = context.applicationContext
++        scope.launch(Dispatchers.Main) { runCatching { scan(app) }; MailSources.invalidate() }
++    }
++
++    // ---------------- GitHub through the web session ----------------
++
++    fun githubWebItems(): List<Digest.Item> {
++        if (githubToken() != null || !githubSession()) return emptyList()
++        val url = "https://github.com/notifications?query=is%3Aunread"
++        val cookie = runCatching { CookieManager.getInstance().getCookie(url) }.getOrNull() ?: return emptyList()
++        val html = http.newCall(Request.Builder().url(url).header("Cookie", cookie).header("User-Agent", MINES_MOBILE_UA)
++            .header("Accept", "text/html").build()).execute().use { if (it.code == 200) it.body?.string() else null } ?: return emptyList()
++        return MailParse.githubNotifications(html).take(40).map { n ->
++            val need = when {
++                n.reason.contains("review") -> "请你审代码"; n.reason.contains("mention") -> "有人 @你"; n.reason.contains("assign") -> "分配给你"
++                n.reason.contains("security") -> "安全警告"; n.reason.contains("ci") -> "CI 结果"; else -> "有更新"
++            }
++            Digest.Item("ghw:" + n.url.hashCode(), "GitHub", "github:" + n.repo, n.repo, n.title, "$need · ${n.title}".take(120),
++                System.currentTimeMillis() - 60_000L, url = n.url)
++        }
++    }
++
++    // ---------------- X through the web session (off-screen) ----------------
++
++    @Volatile private var xAt = 0L
++
++    /** Mentions + followed keywords; at most every 10 minutes. */
++    suspend fun readX(context: Context): Boolean {
++        if (!xSignedIn() || System.currentTimeMillis() - xAt < 10 * 60_000L) return false
++        xAt = System.currentTimeMillis()
++        val out = ArrayList<Digest.Item>()
++        val pages = listOf("https://x.com/notifications/mentions" to "@你") +
++            Digest.follows(context).take(2).map { q -> "https://x.com/search?q=" + java.net.URLEncoder.encode(q, "UTF-8") + "&f=live" to q }
++        for ((u, q) in pages) {
++            val json = withTimeoutOrNull(30_000L) {
++                HiddenWeb.read(context, u, DigestX.EXTRACT_JS, timeoutMs = 28_000L, settleMs = 1500, until = { it.length > 10 && it != "[]" })
++            } ?: continue
++            out += DigestX.parse(json, q)
++        }
++        if (out.isEmpty()) return false
++        DigestX.store(out.distinctBy { it.id })
++        return true
++    }
++
++    // ---------------- balances through console sessions ----------------
++
++    private val extraBilling = mapOf(
++        "aliyun" to "https://usercenter2.aliyun.com/finance/fund-management/overview",
++        "tencentcloud" to "https://console.cloud.tencent.com/expense/overview",
++        "digitalocean" to "https://cloud.digitalocean.com/account/billing",
++    )
++
++    /**
++     * For every service with a billing page whose console the user is signed in to in
++     * Mines but whose balance has no API (or no key): read the page off-screen and keep
++     * the figure. At most 4 pages per pass, each service at most every 6 hours.
++     */
++    suspend fun sessionBalances(context: Context) {
++        PlusVault.init(context)
++        val cm = withContext(Dispatchers.Main) { runCatching { CookieManager.getInstance() }.getOrNull() } ?: return
++        val now = System.currentTimeMillis()
++        val todo = (KeyBalance.billingUrl + extraBilling).filter { (base, url) ->
++            val hasKeyBalance = KeyBalance.hasApi(base) && PlusVault.accountsOf(base).any { PlusVault.secret(it) != null }
++            if (hasKeyBalance) return@filter false
++            val id = PlusVault.defaultAccount(base) ?: base
++            if (now - (PlusVault.extra(id, "balance_try")?.toLongOrNull() ?: 0L) < 6 * 3_600_000L) return@filter false
++            val c = runCatching { cm.getCookie(url) }.getOrNull().orEmpty()
++            c.split(';').count { it.contains('=') } >= 3 // a console that has seen a login
++        }.toList().take(4)
++        for ((base, url) in todo) {
++            val id = PlusVault.defaultAccount(base) ?: base
++            PlusVault.setExtra(id, "balance_try", now.toString())
++            val text = HiddenWeb.text(context, url, 25_000L) ?: continue
++            val bal = MailParse.balance(text) ?: continue
++            PlusVault.setExtra(id, "balance", "余额 $bal（网页）")
++            PlusVault.setExtra(id, "balance_low", if ((bal.drop(1).replace(",", "").toDoubleOrNull() ?: 99.0) < 2.0) "1" else "0")
++            PlusVault.setExtra(id, "balance_at", now.toString())
++            PlusVault.setExtra(id, "balance_via", "web")
++        }
++        _active.value = list(context)
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt b/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt
+index 0f40164..a622d50 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt
+@@ -275,6 +275,9 @@ object Digest {
+                     async { patrol() },
+                     async { DigestX.cached() },
+                     async { runCatching { FreeOffers.load(c); offers(c) }.getOrDefault(emptyList()) },
++                    // [Mines-sources-33] every signed-in source feeds the digest with no setup
++                    async { runCatching { MailSources.digestItems(c) }.getOrElse { errs += "邮箱：${it.message}"; emptyList() } },
++                    async { runCatching { AutoSources.githubWebItems() }.getOrDefault(emptyList()) },
+                 ).awaitAll()
+             }
+             lastRaw = mergeDupes(parts.flatten())
+@@ -285,6 +288,14 @@ object Digest {
+             // [Mines-feed-32] headlines for the top cards: free model, batched, cached, daily cap
+             runCatching { if (DigestWriter.writeAll(c, _items.value.take(36))) _items.value = scoreAll(c, lastRaw) }
+         } finally { _busy.value = false }
++        // [Mines-sources-33] X through the signed-in session, read off-screen after the fast sources
++        runCatching {
++            if (AutoSources.readX(c)) {
++                lastRaw = mergeDupes(lastRaw.filterNot { it.source == "X" } + DigestX.cached())
++                _items.value = scoreAll(c, lastRaw)
++            }
++        }
++        Unit
+     }
+ }
+ 
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/HiddenWeb.kt b/src/android/app/src/main/java/com/openminis/app/plus/HiddenWeb.kt
+new file mode 100644
+index 0000000..3a26bc4
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/HiddenWeb.kt
+@@ -0,0 +1,74 @@
++package com.openminis.app.plus
++
++import android.annotation.SuppressLint
++import android.content.Context
++import android.webkit.WebView
++import android.webkit.WebViewClient
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.suspendCancellableCoroutine
++import kotlinx.coroutines.withContext
++import kotlinx.coroutines.withTimeoutOrNull
++import kotlin.coroutines.resume
++
++/**
++ * [Mines-sources-33] One off-screen WebView that reads a page with the user's own
++ * signed-in session (the app-wide cookie jar), so every login the user already did
++ * becomes a data source with no extra setup: Gmail's feed, 163 / QQ webmail,
++ * github.com/notifications, a provider console's balance page.
++ *
++ * No window is ever added: the WebView is created, loads, is read through JS and is
++ * destroyed. Everything happens on the main thread (WebView's requirement) and the
++ * caller suspends. A page that never finishes is abandoned at [timeoutMs].
++ */
++object HiddenWeb {
++    const val DEFAULT_TIMEOUT = 25_000L
++
++    /** Loads [url] and returns the value of [js] (default: the whole document), or null. */
++    @SuppressLint("SetJavaScriptEnabled")
++    suspend fun read(
++        context: Context,
++        url: String,
++        js: String = "document.documentElement.outerHTML",
++        timeoutMs: Long = DEFAULT_TIMEOUT,
++        settleMs: Long = 1200,
++        until: (String) -> Boolean = { it.length > 80 },
++    ): String? = withTimeoutOrNull(timeoutMs) {
++        withContext(Dispatchers.Main) {
++            val wv = WebView(context.applicationContext)
++            LoginWeb.configure(wv)
++            var finished = false
++            wv.webViewClient = object : WebViewClient() {
++                override fun onPageFinished(view: WebView, u: String) { finished = true }
++            }
++            try {
++                wv.loadUrl(url)
++                val start = System.currentTimeMillis()
++                var out: String? = null
++                while (System.currentTimeMillis() - start < timeoutMs - 500) {
++                    delay(if (finished) settleMs else 700)
++                    val v = eval(wv, js)
++                    if (v != null && until(v)) { out = v; break }
++                    if (finished && System.currentTimeMillis() - start > settleMs + 4000) { out = v; break }
++                }
++                LoginWeb.flush()
++                out
++            } finally {
++                runCatching { wv.stopLoading(); wv.destroy() }
++            }
++        }
++    }
++
++    /** Visible text of [url] (what a person would read), for pages whose HTML is noise. */
++    suspend fun text(context: Context, url: String, timeoutMs: Long = DEFAULT_TIMEOUT): String? =
++        read(context, url, "(document.body&&document.body.innerText)||''", timeoutMs, until = { it.length > 40 })
++
++    private suspend fun eval(wv: WebView, js: String): String? = suspendCancellableCoroutine { c ->
++        runCatching {
++            wv.evaluateJavascript("(function(){try{return String($js)}catch(e){return ''}})()") { r ->
++                val v = runCatching { org.json.JSONTokener(r ?: "\"\"").nextValue() as? String }.getOrNull().orEmpty()
++                if (c.isActive) c.resume(v)
++            }
++        }.onFailure { if (c.isActive) c.resume(null) }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/HumanVerify.kt b/src/android/app/src/main/java/com/openminis/app/plus/HumanVerify.kt
+index 849f722..e92da31 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/HumanVerify.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/HumanVerify.kt
+@@ -13,6 +13,7 @@ import android.webkit.CookieManager
+ import androidx.core.app.NotificationCompat
+ import androidx.core.content.ContextCompat
+ import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.flow.asStateFlow
+@@ -55,11 +56,13 @@ object HumanVerify {
+     private val _pending = MutableStateFlow<Pending?>(null)
+     val pending: StateFlow<Pending?> = _pending.asStateFlow()
+     @Volatile private var prefs: SharedPreferences? = null
++    @Volatile private var appCtx: Context? = null
+ 
+     fun init(context: Context) {
+         if (prefs != null) return
+         synchronized(this) {
+             if (prefs != null) return
++            appCtx = context.applicationContext
+             val p = context.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+             prefs = p
+             _settings.value = Settings(p.getBoolean("challenges", true), p.getBoolean("otp", true))
+@@ -205,52 +208,90 @@ return JSON.stringify({kind:kind,otp:cands.length>0,split:single.length>=4,otpEm
+     @Volatile private var code: String? = null
+     @Volatile private var codeAt = 0L
+ 
++    /**
++     * [Mines-sources-33] A code may arrive a little before the page shows its code
++     * field (the agent clicks 发送验证码, the mail lands, then the field appears), so
++     * codes that came in up to [EARLY_MS] before arming still count.
++     */
++    private const val EARLY_MS = 90_000L
++    private val watchScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO)
++    @Volatile private var watching = false
++    /** Codes already handed out (memory only), so the same mail is not filled twice. */
++    private val used = java.util.Collections.synchronizedMap(LinkedHashMap<String, Long>())
++
++    fun armedSince(): Long = armedAt
++
+     /** A page is asking for a code (or the agent said it requested one). */
+     fun armOtp() {
+-        if (System.currentTimeMillis() - armedAt > OTP_WINDOW_MS) { armedAt = System.currentTimeMillis(); code = null }
++        if (System.currentTimeMillis() - armedAt > OTP_WINDOW_MS) {
++            armedAt = System.currentTimeMillis()
++            if (codeAt < armedAt - EARLY_MS) code = null
++        }
++        startMailWatch()
++    }
++
++    /**
++     * [Mines-sources-33] While a page waits for a code, read every signed-in mailbox
++     * (Gmail web session, Outlook, IMAP) every ~6 s for up to 2 minutes; the
++     * notification listener keeps working in parallel.
++     */
++    private fun startMailWatch() {
++        val ctx = appCtx ?: return
++        if (watching || !_settings.value.otpAutofill) return
++        if (!runCatching { MailSources.available(ctx) }.getOrDefault(false)) return
++        watching = true
++        val since = armedAt - EARLY_MS
++        watchScope.launch {
++            try {
++                val start = System.currentTimeMillis()
++                while (System.currentTimeMillis() - start < OTP_WINDOW_MS && System.currentTimeMillis() - armedAt <= OTP_WINDOW_MS) {
++                    if (hasFreshCode()) break
++                    runCatching { MailSources.code(ctx, since) }.getOrNull()?.let { offer(it) }
++                    if (hasFreshCode()) break
++                    delay(6000)
++                }
++            } finally { watching = false }
++        }
++    }
++
++    /** A code found in mail (or by a self-test). Ignored when it was handed out before. */
++    fun offer(c: String) {
++        val now = System.currentTimeMillis()
++        synchronized(used) { used.entries.removeAll { now - it.value > 15 * 60_000L } }
++        if (used.containsKey(c)) return
++        code = c; codeAt = now
+     }
+ 
+-    private val KEYWORDS = Regex("(验证码|校验码|动态码|確認碼|驗證碼|动态密码|短信码|verification|security code|one[- ]time|passcode|\\bcode\\b|\\botp\\b)", RegexOption.IGNORE_CASE)
+     private val DIGITS = Regex("(?<![0-9])([0-9]{4,8})(?![0-9])")
+ 
+     /** From the notification listener. Never logs the text or the code. */
+     fun onNotification(context: Context, sbn: StatusBarNotification) {
+         if (!_settings.value.otpAutofill) return
+         val now = System.currentTimeMillis()
+-        if (armedAt == 0L || now - armedAt > OTP_WINDOW_MS) return
++        // [Mines-sources-33] always keep the newest code (memory only): it is used only if a page asks within EARLY_MS
+         if (sbn.packageName == context.packageName) return
+         val ex = sbn.notification?.extras ?: return
+         val text = listOfNotNull(
+             ex.getCharSequence("android.title"), ex.getCharSequence("android.text"), ex.getCharSequence("android.bigText"),
+         ).joinToString(" ")
+-        extractCode(text)?.let { code = it; codeAt = now }
++        extractCode(text)?.let { if (!used.containsKey(it)) { code = it; codeAt = now } }
+     }
+ 
+-    fun extractCode(text: String): String? {
+-        val kw = KEYWORDS.findAll(text).map { it.range.first }.toList()
+-        if (kw.isEmpty()) return null
+-        return DIGITS.findAll(text)
+-            .filterNot { m -> // skip things that look like years / amounts / phone numbers
+-                val v = m.value
+-                (v.length == 4 && v.startsWith("20") && text.getOrNull(m.range.last + 1) == '年') ||
+-                    text.getOrNull(m.range.first - 1) == '¥' || text.getOrNull(m.range.first - 1) == '$'
+-            }
+-            .minByOrNull { m -> kw.minOf { k -> kotlin.math.abs(k - m.range.first) } }
+-            ?.value
+-    }
++    fun extractCode(text: String): String? = MailParse.extractCode(text)
+ 
+-    /** A code that arrived after the page asked, not used yet. Consumes it. */
++    /** A code that arrived after (or just before) the page asked, not used yet. Consumes it. */
+     fun takeCode(): String? {
+         val c = code ?: return null
+-        if (codeAt < armedAt || System.currentTimeMillis() - codeAt > OTP_WINDOW_MS) return null
++        if (codeAt < armedAt - EARLY_MS || System.currentTimeMillis() - codeAt > OTP_WINDOW_MS) return null
+         code = null
++        used[c] = System.currentTimeMillis()
+         return c
+     }
+ 
+     /** Keep a code that could not be placed yet (still within its window). */
+-    fun putBack(c: String) { code = c; codeAt = System.currentTimeMillis() }
++    fun putBack(c: String) { used.remove(c); code = c; codeAt = System.currentTimeMillis() }
+ 
+-    fun hasFreshCode(): Boolean = code != null && codeAt >= armedAt && System.currentTimeMillis() - codeAt <= OTP_WINDOW_MS
++    fun hasFreshCode(): Boolean = code != null && codeAt >= armedAt - EARLY_MS && System.currentTimeMillis() - codeAt <= OTP_WINDOW_MS
+ 
+     /** Waits up to [timeoutMs] for a code; null on timeout. */
+     suspend fun awaitCode(timeoutMs: Long): String? {
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/LoginWeb.kt b/src/android/app/src/main/java/com/openminis/app/plus/LoginWeb.kt
+index 0e95835..38a117a 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/LoginWeb.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/LoginWeb.kt
+@@ -91,7 +91,7 @@ return (t.length<8&&n<3)?'blank':'ok';}catch(e){return 'ok'}})()"""
+             listOfNotNull(kind.loginUrl, kind.panelUrl).map { "https://" + rootDomain(PlusConnect.hostOf(it)) + "/" }
+         return urls.any { u ->
+             val c = runCatching { cm.getCookie(u) }.getOrNull().orEmpty()
+-            c.isNotEmpty() && kind.doneCookies.any { name -> c.contains(if (name.contains('=')) name else "$name=") }
++            MailParse.cookieHas(c, kind.doneCookies) // [Mines-sources-33] exact cookie names ("SID" is not "HSID")
+         }
+     }
+ 
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MailParse.kt b/src/android/app/src/main/java/com/openminis/app/plus/MailParse.kt
+new file mode 100644
+index 0000000..4bc4dbb
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/MailParse.kt
+@@ -0,0 +1,246 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-sources-33] Pure parsing used by the automatic data sources (no Android
++ * imports, so it is unit-tested on a plain JVM; see hark-build/selftest/MailParseTest.kt).
++ *
++ *  - [extractCode]: a one-time code next to 验证码 / code / OTP … in mail or notification text
++ *  - [atom]: Gmail's Atom feed (https://mail.google.com/mail/u/N/feed/atom, read with the
++ *    signed-in WebView session)
++ *  - [mime] / [decodeWords] / [qp] / [htmlText]: enough MIME to read an IMAP message body
++ *  - [githubNotifications]: github.com/notifications HTML (web session, no token)
++ *  - [balance]: a balance figure from a billing page's visible text
++ *  - [cookieHas]: the "signed in" cookie test shared by the scanner and the login screen
++ */
++object MailParse {
++    data class Mail(
++        val id: String,
++        val source: String,      // "Gmail", "Outlook", "163 邮箱", "QQ 邮箱" …
++        val from: String,
++        val subject: String,
++        val text: String,        // plain text (snippet or decoded body)
++        val at: Long,            // epoch ms, 0 = unknown
++        val url: String? = null,
++    )
++
++    // ---------------- one-time codes ----------------
++
++    private val KEYWORDS = Regex(
++        "(验证码|校验码|动态码|確認碼|驗證碼|认证码|動態密碼|动态密码|短信码|安全码|登录码|激活码|verification|verify|security code|one[- ]time|passcode|sign[- ]in code|login code|confirmation code|\\bcode\\b|\\botp\\b|\\b2fa\\b)",
++        RegexOption.IGNORE_CASE,
++    )
++    private val DIGITS = Regex("(?<![0-9A-Za-z])([0-9]{4,8})(?![0-9])")
++    private val SPACED = Regex("(?<![0-9])([0-9]{3})[ \\-]([0-9]{3})(?![0-9])") // "482 913" / "482-913"
++
++    /** The code nearest a keyword, or null. Years, amounts, phone/zip-like and long ids are skipped. */
++    fun extractCode(text: String): String? {
++        if (text.isBlank()) return null
++        val t = text.replace('\u00a0', ' ')
++        val kw = KEYWORDS.findAll(t).map { it.range.first }.toList()
++        if (kw.isEmpty()) return null
++        data class C(val v: String, val pos: Int)
++        val cands = ArrayList<C>()
++        DIGITS.findAll(t).forEach { m ->
++            val v = m.groupValues[1]
++            val before = t.getOrNull(m.range.first - 1)
++            val after = t.getOrNull(m.range.last + 1)
++            val year = v.length == 4 && (v.startsWith("19") || v.startsWith("20"))
++            val nearKw = kw.any { k -> kotlin.math.abs(k - m.range.first) <= 40 }
++            when {
++                before == '¥' || before == '$' || before == '￥' || before == '#' -> {}
++                after == '年' || after == '元' || after == '%' || after == '.' && t.getOrNull(m.range.last + 2)?.isDigit() == true -> {}
++                before == '.' || before == ':' && t.getOrNull(m.range.first - 2)?.isDigit() == true -> {} // 12:34, 1.2345
++                year && !nearKw -> {}
++                year && t.substring(maxOf(0, m.range.first - 2), m.range.first).contains("©") -> {}
++                else -> cands += C(v, m.range.first)
++            }
++        }
++        SPACED.findAll(t).forEach { m -> cands += C(m.groupValues[1] + m.groupValues[2], m.range.first) }
++        if (cands.isEmpty()) return null
++        val best = cands.minByOrNull { c -> kw.minOf { k -> val d = c.pos - k; if (d >= 0) d else -d * 2 } } ?: return null
++        val dist = kw.minOf { k -> kotlin.math.abs(best.pos - k) }
++        return if (dist <= 300) best.v else null
++    }
++
++    /** Newest code among mails received at or after [sinceMs] (unknown dates count as fresh). */
++    fun codeFrom(mails: List<Mail>, sinceMs: Long): Pair<String, Mail>? =
++        mails.filter { it.at == 0L || it.at >= sinceMs }.sortedByDescending { it.at }
++            .firstNotNullOfOrNull { m -> extractCode(m.subject + "\n" + m.text)?.let { it to m } }
++
++    // ---------------- Gmail Atom feed ----------------
++
++    private fun tag(s: String, name: String): String? =
++        Regex("<$name(?:\\s[^>]*)?>([\\s\\S]*?)</$name>").find(s)?.groupValues?.get(1)
++
++    fun unescape(s: String): String = s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"")
++        .replace("&#39;", "'").replace("&apos;", "'").replace("&nbsp;", " ")
++        .replace(Regex("&#(\\d+);")) { m -> m.groupValues[1].toIntOrNull()?.let { String(Character.toChars(it)) } ?: "" }
++        .replace(Regex("&#x([0-9a-fA-F]+);")) { m -> m.groupValues[1].toIntOrNull(16)?.let { String(Character.toChars(it)) } ?: "" }
++        .replace("&amp;", "&")
++
++    /** Returns null when [xml] is not a Gmail feed (e.g. a login page). */
++    fun atom(xml: String, source: String = "Gmail"): List<Mail>? {
++        if (!xml.contains("<feed") || !xml.contains("gmail", ignoreCase = true) && !xml.contains("<entry")) return null
++        return xml.split("<entry").drop(1).mapNotNull { e ->
++            val title = unescape(tag(e, "title").orEmpty()).trim()
++            val summary = unescape(tag(e, "summary").orEmpty()).trim()
++            val author = tag(e, "author").orEmpty()
++            val name = unescape(tag(author, "name").orEmpty()).trim()
++            val email = tag(author, "email").orEmpty().trim()
++            val at = (tag(e, "issued") ?: tag(e, "modified"))?.trim()?.let { parseIso(it) } ?: 0L
++            val link = Regex("<link[^>]*href=\"([^\"]+)\"").find(e)?.groupValues?.get(1)?.let { unescape(it) }
++            val id = tag(e, "id")?.trim() ?: (title + at)
++            if (title.isBlank() && summary.isBlank()) null
++            else Mail("gm:" + id.hashCode(), source, name.ifBlank { email }, title, summary, at, link)
++        }
++    }
++
++    fun parseIso(s: String): Long = runCatching {
++        java.time.OffsetDateTime.parse(s.trim().replace(" ", "T")).toInstant().toEpochMilli()
++    }.recoverCatching { java.time.Instant.parse(s.trim()).toEpochMilli() }.getOrDefault(0L)
++
++    // ---------------- MIME (IMAP bodies) ----------------
++
++    /** RFC 2047 encoded words: =?UTF-8?B?…?= / =?gbk?Q?…?= */
++    fun decodeWords(s: String): String =
++        Regex("=\\?([^?]+)\\?([bBqQ])\\?([^?]*)\\?=(\\s+(?==\\?))?").replace(s) { m ->
++            val cs = charset(m.groupValues[1])
++            val data = m.groupValues[3]
++            runCatching {
++                if (m.groupValues[2].equals("B", true)) String(java.util.Base64.getMimeDecoder().decode(data), cs)
++                else String(qpBytes(data.replace('_', ' ')), cs)
++            }.getOrDefault(m.value)
++        }
++
++    private fun charset(name: String): java.nio.charset.Charset = runCatching {
++        val n = name.trim().trim('"').lowercase()
++        java.nio.charset.Charset.forName(if (n == "gb2312" || n == "gbk") "GB18030" else n)
++    }.getOrDefault(Charsets.UTF_8)
++
++    fun qpBytes(s: String): ByteArray {
++        val out = java.io.ByteArrayOutputStream()
++        val src = s.replace(Regex("=\\r?\\n"), "")
++        var i = 0
++        while (i < src.length) {
++            val c = src[i]
++            if (c == '=' && i + 2 < src.length) {
++                val hex = src.substring(i + 1, i + 3)
++                val v = hex.toIntOrNull(16)
++                if (hex.length == 2 && v != null) { out.write(v); i += 3; continue }
++            }
++            val b = c.toString().toByteArray(Charsets.UTF_8)
++            out.write(b, 0, b.size)
++            i++
++        }
++        return out.toByteArray()
++    }
++
++    fun qp(s: String, cs: String = "utf-8"): String = String(qpBytes(s), charset(cs))
++
++    fun htmlText(html: String): String = unescape(
++        html.replace(Regex("(?is)<(script|style|head)[^>]*>.*?</\\1>"), " ")
++            .replace(Regex("(?i)<br\\s*/?>|</p>|</div>|</tr>|</h\\d>"), "\n")
++            .replace(Regex("<[^>]+>"), " "),
++    ).replace(Regex("[ \\t\\u00a0]+"), " ").replace(Regex("\\n\\s*\\n+"), "\n").trim()
++
++    private fun headerValue(headers: String, name: String): String? {
++        val unfolded = headers.replace(Regex("\\r?\\n[ \\t]+"), " ")
++        return Regex("(?im)^$name:\\s*(.*)$").find(unfolded)?.groupValues?.get(1)?.trim()
++    }
++
++    /** Subject + From from a header block. */
++    fun headers(block: String): Pair<String, String> =
++        decodeWords(headerValue(block, "Subject").orEmpty()) to decodeWords(headerValue(block, "From").orEmpty()).replace("\"", "")
++
++    /**
++     * Plain text of a MIME entity ([raw] = headers + blank line + body, or just a body
++     * with [contentType] / [encoding] given). Picks text/plain, else text/html, recursing
++     * into multiparts. Truncated input is fine.
++     */
++    fun mime(raw: String, contentType: String? = null, encoding: String? = null, depth: Int = 0): String {
++        if (depth > 5) return ""
++        val split = Regex("\\r?\\n\\r?\\n").find(raw)
++        val hasHeaders = contentType == null && split != null && Regex("(?im)^content-type:").containsMatchIn(raw.substring(0, split.range.first))
++        val head = if (hasHeaders) raw.substring(0, split!!.range.first) else ""
++        val body = if (hasHeaders) raw.substring(split!!.range.last + 1) else raw
++        val ct = contentType ?: headerValue(head, "Content-Type") ?: "text/plain"
++        val enc = (encoding ?: headerValue(head, "Content-Transfer-Encoding") ?: "").lowercase().trim()
++        val cs = Regex("(?i)charset=\"?([^\";\\s]+)").find(ct)?.groupValues?.get(1) ?: "utf-8"
++        if (ct.lowercase().startsWith("multipart/")) {
++            val boundary = Regex("(?i)boundary=\"?([^\";]+)\"?").find(ct)?.groupValues?.get(1)?.trim() ?: return htmlText(body)
++            val parts = body.split("--$boundary").map { it.trim('\r', '\n') }.filter { it.isNotBlank() && it != "--" && !it.startsWith("--") }
++            val decoded = parts.map { p -> p to mime(p, depth = depth + 1) }
++            val plain = decoded.firstOrNull { (p, t) -> Regex("(?i)content-type:\\s*text/plain").containsMatchIn(p.take(400)) && t.isNotBlank() }
++            return (plain ?: decoded.firstOrNull { it.second.isNotBlank() })?.second.orEmpty()
++        }
++        val text = when (enc) {
++            "base64" -> runCatching { String(java.util.Base64.getMimeDecoder().decode(body.replace(Regex("[^A-Za-z0-9+/=]"), "").let { it.substring(0, it.length - it.length % 4) }), charset(cs)) }.getOrDefault(body)
++            "quoted-printable" -> qp(body, cs)
++            else -> body
++        }
++        return if (ct.lowercase().contains("html") || text.contains("<html", true) || text.contains("<div", true)) htmlText(text) else text.trim()
++    }
++
++    // ---------------- GitHub notifications page (web session) ----------------
++
++    data class GhNote(val title: String, val repo: String, val url: String, val reason: String)
++
++    fun githubNotifications(html: String): List<GhNote> {
++        if (!html.contains("notifications-list-item")) return emptyList()
++        return html.split(Regex("<li[^>]*notifications-list-item")).drop(1).mapNotNull { li ->
++            val href = Regex("href=\"(/[^\"]+/(?:issues|pull|discussions|commit|releases|security|actions)[^\"]*)\"").find(li)?.groupValues?.get(1)
++                ?: Regex("class=\"[^\"]*notification-list-item-link[^\"]*\"[^>]*href=\"([^\"]+)\"").find(li)?.groupValues?.get(1)
++                ?: Regex("href=\"([^\"]+)\"[^>]*class=\"[^\"]*notification-list-item-link").find(li)?.groupValues?.get(1)
++                ?: return@mapNotNull null
++            val title = Regex("<p[^>]*markdown-title[^>]*>([\\s\\S]*?)</p>").find(li)?.groupValues?.get(1)?.let { htmlText(it) }
++                ?: return@mapNotNull null
++            val repo = Regex("^/([^/]+/[^/]+)/").find(href)?.groupValues?.get(1) ?: ""
++            val reason = Regex("(?i)\\b(review requested|mention|assigned|author|comment|subscribed|state change|security alert|ci activity|team mention)\\b").find(htmlText(li))?.value ?: ""
++            GhNote(title.trim(), repo, if (href.startsWith("http")) href else "https://github.com" + unescape(href), reason.lowercase())
++        }.distinctBy { it.url }
++    }
++
++    // ---------------- balances from page text ----------------
++
++    private val BAL = Regex(
++        "(可用余额|账户余额|现金余额|余额|剩余额度|可用额度|赠送余额|Credits remaining|Remaining credits|Available balance|Credit balance|Balance|Credits)" +
++            "[^0-9¥$￥\\n]{0,24}\\n?[^0-9¥$￥\\n]{0,12}([¥$￥]|US\\$|CNY|USD)?\\s*(-?[0-9][0-9,]*(?:\\.[0-9]+)?)\\s*(元|CNY|USD)?",
++        RegexOption.IGNORE_CASE,
++    )
++
++    /** "¥12.34" / "$5.00" or null. */
++    fun balance(text: String): String? {
++        val m = BAL.find(text) ?: return null
++        val cur = m.groupValues[2].ifBlank { m.groupValues[4] }
++        val sym = when {
++            cur.contains("$") || cur.equals("USD", true) -> "$"
++            cur.isBlank() && Regex("(?i)credits|balance").containsMatchIn(m.groupValues[1]) && !text.contains("¥") && !text.contains("元") -> "$"
++            else -> "¥"
++        }
++        return sym + m.groupValues[3]
++    }
++
++    // ---------------- cookies ----------------
++
++    /** True when [cookieHeader] holds one of [names] ("SID" = a cookie named SID, "a=b" = that exact pair). */
++    fun cookieHas(cookieHeader: String?, names: List<String>): Boolean {
++        if (cookieHeader.isNullOrBlank() || names.isEmpty()) return false
++        val pairs = cookieHeader.split(';').map { it.trim() }.filter { it.isNotEmpty() }
++        return names.any { n ->
++            val want = n.trimEnd('=')
++            if (want.contains('=')) pairs.any { it == want }
++            else pairs.any { p -> p.substringBefore('=') == want && p.substringAfter('=', "").isNotBlank() }
++        }
++    }
++
++    /** A user name hint from well-known session cookies (GitHub dotcom_user, …). */
++    fun accountFromCookies(kindId: String, cookieHeader: String?): String? {
++        val pairs = cookieHeader.orEmpty().split(';').map { it.trim() }.associate { it.substringBefore('=') to it.substringAfter('=', "") }
++        return when (kindId) {
++            "github" -> pairs["dotcom_user"]
++            "bilibili" -> pairs["DedeUserID"]?.let { "UID $it" }
++            "x" -> pairs["twid"]?.let { java.net.URLDecoder.decode(it, "UTF-8").removePrefix("u=").let { id -> "id $id" } }
++            else -> null
++        }?.takeIf { it.isNotBlank() }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MailSources.kt b/src/android/app/src/main/java/com/openminis/app/plus/MailSources.kt
+new file mode 100644
+index 0000000..928ae75
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/MailSources.kt
+@@ -0,0 +1,258 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import android.webkit.CookieManager
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.async
++import kotlinx.coroutines.awaitAll
++import kotlinx.coroutines.coroutineScope
++import kotlinx.coroutines.withContext
++import kotlinx.coroutines.withTimeoutOrNull
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import org.json.JSONObject
++import java.io.BufferedInputStream
++import java.io.ByteArrayOutputStream
++import java.io.OutputStream
++import java.util.concurrent.TimeUnit
++import javax.net.ssl.SSLSocket
++import javax.net.ssl.SSLSocketFactory
++
++/**
++ * [Mines-sources-33] Every mailbox the user is already signed in to, read with no
++ * extra setup, for one-time codes (HumanVerify) and for 消息汇总.
++ *
++ *  1. Gmail through the signed-in web session: the Atom feed
++ *     https://mail.google.com/mail/u/N/feed/atom (newest unread inbox mail, title +
++ *     snippet + time), fetched with the app's own WebView cookies. Works whenever
++ *     Google cookies exist in Mines' cookie jar (signed in to Gmail inside Mines).
++ *  2. Outlook / Hotmail through the Microsoft connection (device-flow token already has
++ *     Mail.ReadWrite): Graph /me/messages.
++ *  3. IMAP with a saved app password / 授权码: Gmail (imap.gmail.com), 163 / 126 / yeah
++ *     (imap.163.com …, with the IMAP ID command 163 requires), QQ (imap.qq.com).
++ *  4. Phone notifications stay the fallback (HumanVerify.onNotification).
++ *
++ * Mail text stays in memory. Codes are never logged, never written to disk and
++ * never shown to the model.
++ */
++object MailSources {
++    private val http = OkHttpClient.Builder().connectTimeout(8, TimeUnit.SECONDS).readTimeout(12, TimeUnit.SECONDS)
++        .callTimeout(18, TimeUnit.SECONDS).followRedirects(false).build()
++
++    /** Test hook (adb-only SelfTestProvider): an extra Atom feed URL read like Gmail's. */
++    @Volatile var testFeedUrl: String? = null
++
++    @Volatile private var cache: List<MailParse.Mail> = emptyList()
++    @Volatile private var cacheAt = 0L
++
++    data class Box(val id: String, val label: String, val how: String)
++
++    // ---------------- which mailboxes are usable ----------------
++
++    fun gmailWebSignedIn(): Boolean = runCatching {
++        val cm = CookieManager.getInstance()
++        MailParse.cookieHas(cm.getCookie("https://mail.google.com/mail/"), listOf("SID", "__Secure-1PSID", "OSID")) ||
++            MailParse.cookieHas(cm.getCookie("https://accounts.google.com/"), listOf("SID", "__Secure-1PSID"))
++    }.getOrDefault(false)
++
++    private fun imapHost(email: String, kindBase: String): String? {
++        val d = email.substringAfter('@', "").lowercase()
++        return when {
++            kindBase == "gmail" || d == "gmail.com" || d == "googlemail.com" -> "imap.gmail.com"
++            d == "163.com" -> "imap.163.com"
++            d == "126.com" -> "imap.126.com"
++            d == "yeah.net" -> "imap.yeah.net"
++            d == "qq.com" || d == "foxmail.com" || kindBase == "qqmail" -> "imap.qq.com"
++            kindBase == "mail163" -> "imap.163.com"
++            d == "sina.com" || d == "sina.cn" -> "imap.sina.com"
++            d.endsWith("aliyun.com") -> "imap.aliyun.com"
++            else -> null
++        }
++    }
++
++    private fun imapAccounts(): List<Triple<String, String, String>> = // (label, host+user, pass)
++        listOf("gmail", "mail163", "qqmail").flatMap { base ->
++            PlusVault.accountsOf(base).mapNotNull { id ->
++                val pass = PlusVault.secret(id) ?: return@mapNotNull null
++                val user = PlusVault.entries.value[id]?.account?.trim().orEmpty()
++                if (!user.contains('@')) return@mapNotNull null
++                val host = imapHost(user, base) ?: return@mapNotNull null
++                Triple(label(base), "$host|$user", pass.replace(" ", ""))
++            }
++        }
++
++    private fun label(base: String) = when (base) { "gmail" -> "Gmail"; "mail163" -> "网易邮箱"; "qqmail" -> "QQ 邮箱"; else -> base }
++
++    fun boxes(context: Context): List<Box> {
++        PlusVault.init(context)
++        val out = ArrayList<Box>()
++        if (gmailWebSignedIn()) out += Box("gmail_web", "Gmail", "网页登录")
++        if (PlusVault.defaultAccount("microsoft")?.let { PlusVault.secret(it) } != null) out += Box("outlook", "Outlook", "微软授权")
++        imapAccounts().forEach { (l, hu, _) -> out += Box("imap:" + hu.substringAfter('|'), l, "IMAP") }
++        return out
++    }
++
++    fun available(context: Context): Boolean = testFeedUrl != null || boxes(context).isNotEmpty()
++
++    // ---------------- reading ----------------
++
++    /** Recent mail from every usable mailbox (cached for [maxAgeMs]). Never throws. */
++    suspend fun recent(context: Context, maxAgeMs: Long = 60_000L): List<MailParse.Mail> = withContext(Dispatchers.IO) {
++        if (System.currentTimeMillis() - cacheAt < maxAgeMs) return@withContext cache
++        PlusVault.init(context)
++        val jobs = coroutineScope {
++            val list = ArrayList<kotlinx.coroutines.Deferred<List<MailParse.Mail>>>()
++            testFeedUrl?.let { u -> list += async { runCatching { atomAt(u, "Gmail") }.getOrDefault(emptyList()) } }
++            if (gmailWebSignedIn()) list += async { runCatching { gmailAtom() }.getOrDefault(emptyList()) }
++            if (PlusVault.defaultAccount("microsoft") != null) list += async { runCatching { outlook(context) }.getOrDefault(emptyList()) }
++            imapAccounts().forEach { (l, hu, p) ->
++                list += async { withTimeoutOrNull(20_000L) { runCatching { Imap.recent(hu.substringBefore('|'), hu.substringAfter('|'), p, l) }.getOrNull() }.orEmpty() }
++            }
++            list.awaitAll()
++        }
++        val all = jobs.flatten().distinctBy { it.id }.sortedByDescending { it.at }
++        cache = all; cacheAt = System.currentTimeMillis()
++        all
++    }
++
++    fun invalidate() { cacheAt = 0L }
++
++    /** A code from mail that arrived at or after [sinceMs], or null. */
++    suspend fun code(context: Context, sinceMs: Long): String? {
++        if (!available(context)) return null
++        invalidate()
++        return MailParse.codeFrom(recent(context, 0L), sinceMs)?.first
++    }
++
++    private fun cookieGet(url: String): String? {
++        val cookie = runCatching { CookieManager.getInstance().getCookie(url) }.getOrNull()
++        val b = Request.Builder().url(url).header("User-Agent", MINES_MOBILE_UA).header("Accept", "application/atom+xml,text/xml,*/*")
++        if (!cookie.isNullOrBlank()) b.header("Cookie", cookie)
++        return http.newCall(b.build()).execute().use { r -> if (r.code == 200) r.body?.string() else null }
++    }
++
++    private fun atomAt(url: String, source: String): List<MailParse.Mail> = MailParse.atom(cookieGet(url).orEmpty(), source).orEmpty()
++
++    /** Gmail inbox (u/0 and u/1 when the user has two accounts signed in). */
++    private fun gmailAtom(): List<MailParse.Mail> {
++        val a = atomAt("https://mail.google.com/mail/u/0/feed/atom", "Gmail")
++        val b = runCatching { atomAt("https://mail.google.com/mail/u/1/feed/atom", "Gmail") }.getOrDefault(emptyList())
++        return a + b.filter { m -> a.none { it.id == m.id } }
++    }
++
++    private fun outlook(context: Context): List<MailParse.Mail> {
++        val token = PlusConnect.microsoftToken(context) ?: return emptyList()
++        val url = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?\$top=15&\$orderby=receivedDateTime%20desc&\$select=id,subject,bodyPreview,from,receivedDateTime,webLink"
++        val body = http.newCall(Request.Builder().url(url).header("Authorization", "Bearer $token").header("Accept", "application/json").build())
++            .execute().use { if (it.isSuccessful) it.body?.string() else null } ?: return emptyList()
++        val arr = JSONObject(body).optJSONArray("value") ?: return emptyList()
++        return (0 until arr.length()).map { i ->
++            val o = arr.getJSONObject(i)
++            val from = o.optJSONObject("from")?.optJSONObject("emailAddress")
++            MailParse.Mail("ol:" + o.optString("id").hashCode(), "Outlook", from?.optString("name")?.ifBlank { from.optString("address") }.orEmpty(),
++                o.optString("subject"), o.optString("bodyPreview"), MailParse.parseIso(o.optString("receivedDateTime")), o.optString("webLink").ifBlank { null })
++        }
++    }
++
++    // ---------------- 消息汇总 items ----------------
++
++    private val noisy = Regex("(?i)newsletter|unsubscribe|digest|promo|marketing|退订|广告|推广")
++
++    /** Mail as feed items: security / code / personal mail first, newsletters dropped. */
++    suspend fun digestItems(context: Context): List<Digest.Item> {
++        if (!available(context)) return emptyList()
++        val since = System.currentTimeMillis() - 3 * 86_400_000L
++        return recent(context, 5 * 60_000L).filter { it.at == 0L || it.at >= since }.filterNot { noisy.containsMatchIn(it.subject + " " + it.from) }.take(25).map { m ->
++            val hasCode = MailParse.extractCode(m.subject + " " + m.text) != null
++            // a code never reaches the feed: say that there is one, not what it is
++            val summary = if (hasCode) "一封验证码邮件（Mines 需要时会自动填，不在这里显示）" else m.text.replace(Regex("\\s+"), " ").take(140)
++            Digest.Item("ml:" + m.id, m.source, "mail:" + m.source, m.from.ifBlank { m.source }, m.subject.ifBlank { "（无主题）" }, summary,
++                if (m.at > 0) m.at else System.currentTimeMillis(), url = m.url)
++        }
++    }
++
++    // ---------------- tiny IMAP client ----------------
++
++    object Imap {
++        private val DATE = java.time.format.DateTimeFormatter.ofPattern("d-MMM-yyyy HH:mm:ss Z", java.util.Locale.US)
++
++        /** Newest [max] messages of INBOX (first 12 KB of each). */
++        fun recent(host: String, user: String, pass: String, label: String, max: Int = 8): List<MailParse.Mail> {
++            val s = (SSLSocketFactory.getDefault().createSocket(host, 993) as SSLSocket).apply { soTimeout = 15_000; startHandshake() }
++            s.use { sock ->
++                val inp = BufferedInputStream(sock.inputStream)
++                val out = sock.outputStream
++                readLine(inp) // greeting
++                var n = 0
++                fun cmd(c: String): List<Any> { n++; val tag = "m$n"; send(out, "$tag $c"); return readTagged(inp, tag) }
++                if (host.contains("163") || host.contains("126") || host.contains("yeah")) cmd("ID (\"name\" \"Mines\" \"version\" \"33\" \"vendor\" \"Mines\")")
++                val login = cmd("LOGIN ${q(user)} ${q(pass)}")
++                if (!lastOk(login)) throw IllegalStateException("IMAP 登录失败")
++                val sel = cmd("SELECT INBOX")
++                val exists = sel.filterIsInstance<String>().firstNotNullOfOrNull { Regex("^\\* (\\d+) EXISTS").find(it)?.groupValues?.get(1)?.toIntOrNull() } ?: 0
++                if (exists == 0) return emptyList()
++                val from = maxOf(1, exists - max + 1)
++                val res = cmd("FETCH $from:$exists (UID INTERNALDATE BODY.PEEK[]<0.12000>)")
++                runCatching { cmd("LOGOUT") }
++                // res alternates "* n FETCH (UID x INTERNALDATE "…" BODY[]<0> {len}" + literal bytes
++                val mails = ArrayList<MailParse.Mail>()
++                var i = 0
++                while (i < res.size) {
++                    val line = res[i] as? String
++                    val lit = res.getOrNull(i + 1) as? ByteArray
++                    if (line != null && line.contains("FETCH") && lit != null) {
++                        val uid = Regex("UID (\\d+)").find(line)?.groupValues?.get(1) ?: line.hashCode().toString()
++                        val at = Regex("INTERNALDATE \"([^\"]+)\"").find(line)?.groupValues?.get(1)?.let {
++                            runCatching { java.time.ZonedDateTime.parse(it.trim(), DATE).toInstant().toEpochMilli() }.getOrDefault(0L)
++                        } ?: 0L
++                        val raw = String(lit, Charsets.UTF_8)
++                        val headEnd = Regex("\\r?\\n\\r?\\n").find(raw)?.range?.first ?: raw.length
++                        val (subject, fromH) = MailParse.headers(raw.substring(0, headEnd))
++                        val text = runCatching { MailParse.mime(raw) }.getOrDefault("")
++                        mails += MailParse.Mail("im:$host:$user:$uid".hashCode().toString(), label,
++                            fromH.substringBefore('<').trim().ifBlank { fromH }, subject, text.take(4000), at)
++                        i += 2
++                    } else i++
++                }
++                return mails
++            }
++        }
++
++        private fun q(s: String) = "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
++
++        private fun send(out: OutputStream, line: String) { out.write((line + "\r\n").toByteArray(Charsets.UTF_8)); out.flush() }
++
++        private fun lastOk(r: List<Any>) = (r.lastOrNull() as? String)?.split(' ')?.getOrNull(1)?.equals("OK", true) == true
++
++        private fun readLine(inp: BufferedInputStream): String {
++            val b = ByteArrayOutputStream()
++            while (true) {
++                val c = inp.read()
++                if (c < 0) break
++                if (c == '\n'.code) break
++                if (c != '\r'.code) b.write(c)
++            }
++            return String(b.toByteArray(), Charsets.UTF_8)
++        }
++
++        /** Lines (String) and literals (ByteArray) up to and including the tagged status line. */
++        private fun readTagged(inp: BufferedInputStream, tag: String): List<Any> {
++            val out = ArrayList<Any>()
++            var guard = 0
++            while (guard++ < 5000) {
++                val line = readLine(inp)
++                out += line
++                val lit = Regex("\\{(\\d+)\\}$").find(line)?.groupValues?.get(1)?.toIntOrNull()
++                if (lit != null) {
++                    val buf = ByteArray(lit); var got = 0
++                    while (got < lit) { val r = inp.read(buf, got, lit - got); if (r < 0) break; got += r }
++                    out += buf
++                    continue
++                }
++                if (line.startsWith("$tag ")) break
++                if (line.isEmpty() && inp.available() == 0 && guard > 4000) break
++            }
++            return out
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt
+index 0ff09d3..59f629b 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt
+@@ -115,11 +115,23 @@ object PlusVault {
+         ConnectionKind("google", "Google 账号", "在 Chrome 里登录 Google（Google 不允许内嵌网页登录）", G_COMMON,
+             R.drawable.ic_brand_google, ConnMethod.GOOGLE, PermProfile.GENERIC,
+             loginUrl = "https://accounts.google.com/ServiceLogin?continue=https://myaccount.google.com/"),
+-        ConnectionKind("gmail", "Gmail", "让 AI 读写邮件（应用专用密码，IMAP/SMTP）", G_COMMON,
++        // [Mines-sources-33] Gmail: signed in inside Mines (web session) → codes + mail read automatically;
++        // the app password (IMAP/SMTP) stays as the second way in.
++        ConnectionKind("gmail", "Gmail", "自动读验证码和重要邮件（在 Mines 里登录一次即可）", G_COMMON,
+             R.drawable.ic_brand_gmail, ConnMethod.KEY, PermProfile.MAIL,
++            loginUrl = "https://accounts.google.com/ServiceLogin?service=mail&continue=https%3A%2F%2Fmail.google.com%2Fmail%2F",
++            doneCookies = listOf("SID", "__Secure-1PSID"), panelUrl = "https://mail.google.com/mail/",
++            accountJs = """(document.title.match(/[\w.+-]+@[\w-]+\.[\w.]+/)||[''])[0]""",
+             keyUrl = "https://myaccount.google.com/apppasswords",
+             keyRegex = Regex("""\b[a-z]{4} ?[a-z]{4} ?[a-z]{4} ?[a-z]{4}\b"""),
+             keyLabel = "应用专用密码（16 位）", envKey = "GMAIL_APP_PASSWORD"),
++        // [Mines-sources-33] Chinese mailboxes: IMAP with the mailbox's 授权码 (account = the address)
++        ConnectionKind("mail163", "网易邮箱", "163 / 126 / yeah 邮箱：自动读验证码和邮件（IMAP 授权码）", G_COMMON,
++            0, ConnMethod.KEY, PermProfile.MAIL, keyUrl = "https://mail.163.com/", keyLabel = "IMAP 授权码", envKey = "MAIL163_AUTH_CODE",
++            site = "https://mail.163.com"),
++        ConnectionKind("qqmail", "QQ 邮箱", "自动读验证码和邮件（IMAP 授权码）", G_COMMON,
++            0, ConnMethod.KEY, PermProfile.MAIL, keyUrl = "https://wx.mail.qq.com/", keyLabel = "IMAP 授权码", envKey = "QQMAIL_AUTH_CODE",
++            site = "https://mail.qq.com"),
+         ConnectionKind("gcal", "Google 日历", "读取手机里同步的 Google 日历", G_COMMON,
+             R.drawable.ic_brand_gcal, ConnMethod.CALENDAR, PermProfile.CALENDAR),
+         ConnectionKind("gdrive", "Google 云端硬盘", "在 Chrome 里登录云端硬盘", G_COMMON,
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
+index 6cfd900..dafbe2e 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
+@@ -66,6 +66,51 @@ class SelfTestProvider : ContentProvider() {
+                 }
+                 out.putString("result", "ok")
+             }
++            "sources" -> {
++                // [Mines-sources-33] "fake": put a GitHub + X session cookie in the WebView jar (as a login would),
++                // then run the same automatic scan the app runs at start; "list": just report.
++                val c = context!!.applicationContext
++                val r = kotlinx.coroutines.runBlocking(kotlinx.coroutines.Dispatchers.Main) {
++                    if (arg == "fake") {
++                        val cm = android.webkit.CookieManager.getInstance()
++                        cm.setCookie("https://github.com/", "logged_in=yes; Domain=.github.com; Path=/; Secure")
++                        cm.setCookie("https://github.com/", "user_session=smoke-selftest; Path=/; Secure")
++                        cm.setCookie("https://github.com/", "dotcom_user=smoke-selftest; Domain=.github.com; Path=/; Secure")
++                        cm.setCookie("https://x.com/", "auth_token=smoke-selftest; Domain=.x.com; Path=/; Secure")
++                        cm.flush()
++                    }
++                    val added = AutoSources.scan(c)
++                    if (added.isNotEmpty()) android.widget.Toast.makeText(c, "已自动接入 ${AutoSources.active.value.size} 个来源", android.widget.Toast.LENGTH_LONG).show()
++                    org.json.JSONObject()
++                        .put("added", org.json.JSONArray(added))
++                        .put("active", org.json.JSONArray(AutoSources.active.value.map { it.id }))
++                        .put("missing", org.json.JSONArray(AutoSources.missing(c).map { it.first }))
++                        .put("vault", org.json.JSONArray(PlusVault.entries.value.keys.toList()))
++                }
++                out.putString("result", r.toString())
++            }
++            "mailcode" -> {
++                // [Mines-sources-33] simulated code e-mail: arg "<atom feed url>|<page with a code field>".
++                // Arms OTP like a page asking for a code, reads the feed through the mailbox path,
++                // then fills the page off-screen and reads the field back. adb-only.
++                val c = context!!.applicationContext
++                val (feed, page) = (arg ?: "").split('|').let { it.getOrElse(0) { "" } to it.getOrNull(1) }
++                HumanVerify.init(c)
++                HumanVerify.update(c) { it.copy(otpAutofill = true) }
++                MailSources.testFeedUrl = feed.ifBlank { null }
++                MailSources.invalidate()
++                val t0 = System.currentTimeMillis()
++                val code = kotlinx.coroutines.runBlocking { HumanVerify.awaitCode(30_000L) }
++                val o = org.json.JSONObject().put("code", code ?: "").put("ms", System.currentTimeMillis() - t0)
++                if (code != null && !page.isNullOrBlank()) {
++                    val js = "(function(){var r=" + HumanVerify.fillJs(code, null) + ";var e=document.querySelector('input');return r+':'+(e?e.value:'');})()"
++                    val v = kotlinx.coroutines.runBlocking { HiddenWeb.read(c, page, js, 25_000L, until = { it.startsWith("ok:") }) }
++                    o.put("filled", v ?: "")
++                }
++                MailSources.testFeedUrl = null
++                out.putString("result", o.toString())
++            }
++            "extract" -> out.putString("result", MailParse.extractCode(arg ?: "") ?: "")
+             else -> out.putString("result", "unknown method")
+         }
+         return out
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
+index 6fb1731..5813f16 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
+@@ -164,6 +164,7 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+                     // The shared cookie jar now holds this account, so it is the default one.
+                     if (k.method == ConnMethod.WEB) PlusVault.setDefault(context, k.id, swapCookies = false)
+                     Toast.makeText(context, "已连接 ${k.name}", Toast.LENGTH_SHORT).show()
++                    com.openminis.app.plus.AutoSources.afterLogin(context)
+                     detailId = k.id
+                 }
+                 web = null
+@@ -468,7 +469,7 @@ private fun ConnectionDetailScreen(
+                     (com.openminis.app.plus.AccountLabel.identity(kind.id, entry)?.let { " · $it" } ?: "") +
+                     (if (PlusVault.hasSecret(kind.id) && (entry.via == "key" || entry.via == "token" || entry.via == "model")) "\n" + kind.keyLabel + "：" + com.openminis.app.plus.AccountLabel.maskSecret(PlusVault.secret(kind.id) ?: "") else "") +
+                     (com.openminis.app.plus.KeyBalance.text(kind.id)?.let { "\n$it" } ?: "")
+-                else kind.desc,
++                else kind.desc + (com.openminis.app.plus.KeyBalance.text(kind.id)?.let { "\n$it" } ?: ""), // [Mines-sources-33] balance read via a console session
+                 fontSize = 16.sp, textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                 color = if (entry != null) Green else MaterialTheme.colorScheme.onSurfaceVariant,
+             )
+@@ -492,6 +493,8 @@ private fun ConnectionDetailScreen(
+                             isMcpOnly -> PlusNav.go(PlusRoutes.MARKET)
+                             kind.method == ConnMethod.WEB -> { PlusConnect.restoreCookies(kind); onWeb(kind.loginUrl ?: "", true, "登录 ${kind.name}") }
+                             kind.method == ConnMethod.GOOGLE -> openExternal(context, kind.loginUrl ?: "https://accounts.google.com/")
++                            // [Mines-sources-33] Gmail: sign in inside Mines so codes + mail are read automatically
++                            kind.id == "gmail" && PlusVault.extra(kind.id, "google_refused") != "1" -> onWeb(kind.loginUrl ?: "", true, "登录 Gmail")
+                             com.openminis.app.plus.KeyAgent.recipe(kind.id)?.mode == com.openminis.app.plus.KeyAgent.Mode.WEBVIEW -> agentOpen = true
+                             kind.keyUrl != null -> openExternal(context, kind.keyUrl)
+                         }
+@@ -565,7 +568,14 @@ private fun ConnectionDetailScreen(
+                 }
+             }
+             ConnMethod.GITHUB, ConnMethod.MICROSOFT -> DeviceFlowBlock(kind, autoStart && entry == null, onWeb)
+-            ConnMethod.KEY -> KeyBlock(kind, resumes, autoStart && entry == null)
++            ConnMethod.KEY -> {
++                if (kind.id == "gmail") PlusSection(null, footer = "登录后，网页要验证码时 Mines 会自己去 Gmail 里找并填好，重要邮件也会进「消息」。Google 不让在 App 里登录时，改用下面的应用专用密码，或打开通知使用权读 Gmail App 的通知。") {
++                    BigAction(if (com.openminis.app.plus.MailSources.gmailWebSignedIn()) "Gmail 已登录 · 重新登录" else "在 Mines 里登录 Gmail（自动读验证码）") {
++                        onWeb(kind.loginUrl ?: "", true, "登录 Gmail")
++                    }
++                }
++                KeyBlock(kind, resumes, autoStart && entry == null && kind.id != "gmail")
++            }
+             ConnMethod.CALENDAR -> CalendarBlock(kind)
+             ConnMethod.A11Y -> A11yBlock(kind, resumes)
+         }
+@@ -834,7 +844,7 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
+     var account by remember { mutableStateOf(existing?.account ?: "") }
+     var model by remember { mutableStateOf(PlusVault.extra(kind.id, "model") ?: com.openminis.app.plus.GeminiLive.DEFAULT_MODEL) }
+     var voice by remember { mutableStateOf(PlusVault.extra(kind.id, "voice") ?: com.openminis.app.plus.GeminiLive.DEFAULT_VOICE) }
+-    val needsAccount = kind.id == "gmail"
++    val needsAccount = kind.id in setOf("gmail", "mail163", "qqmail")
+ 
+     LaunchedEffect(resumes) {
+         // Clipboard reads need window focus on Android 10+: try twice shortly after resuming.
+@@ -872,13 +882,13 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
+                 }
+                 Text("••••" + f.takeLast(4), fontSize = 13.sp, modifier = Modifier.padding(vertical = 6.dp))
+                 Button(
+-                    onClick = { if (!needsAccount || account.isNotBlank()) save(f) else Toast.makeText(context, "先填上你的 Gmail 地址", Toast.LENGTH_SHORT).show() },
++                    onClick = { if (!needsAccount || account.isNotBlank()) save(f) else Toast.makeText(context, "先填上你的邮箱地址", Toast.LENGTH_SHORT).show() },
+                     colors = ButtonDefaults.buttonColors(containerColor = Green),
+                     modifier = Modifier.fillMaxWidth().heightIn(min = 40.dp),
+                 ) { Text("一键填入并连接", fontSize = 13.sp, fontWeight = FontWeight.SemiBold) }
+             }
+         }
+-        if (needsAccount) OutlinedTextField(account, { account = it }, label = { Text("Gmail 地址") }, singleLine = true,
++        if (needsAccount) OutlinedTextField(account, { account = it }, label = { Text(if (kind.id == "gmail") "Gmail 地址" else "邮箱地址") }, singleLine = true,
+             textStyle = MaterialTheme.typography.bodyMedium,
+             modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp))
+         OutlinedTextField(
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
+index b9a72d3..93bc8ca 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
+@@ -88,8 +88,7 @@ fun DigestScreen(onBack: () -> Unit) {
+         owner.lifecycle.addObserver(obs); onDispose { owner.lifecycle.removeObserver(obs) }
+     }
+     LaunchedEffect(Unit) { Digest.refresh(context); xTick++ }
+-    val xOn = vault.keys.any { com.openminis.app.plus.PlusVault.baseId(it) == "x" }
+-    if (xTick > 0 && xOn) XReader(xTick) { scope.launch { Digest.refresh(context) } }
++    // [Mines-sources-33] X is read off-screen by Digest.refresh (AutoSources.readX) whenever the X session exists
+ 
+     fun act(it: Digest.Item) {
+         val a = it.act
+@@ -125,12 +124,9 @@ fun DigestScreen(onBack: () -> Unit) {
+                 // ---- sources that are off: one tap each ----
+                 item(key = "sources") {
+                     @Suppress("UNUSED_EXPRESSION") resumes
+-                    val rows = buildList {
+-                        if (!com.openminis.app.offload.MinisNotificationListenerService.isEnabled(context)) add("通知" to "打开「通知使用权」，微信、Gmail 等消息才能汇总进来")
+-                        if (vault.keys.none { com.openminis.app.plus.PlusVault.baseId(it) == "github" }) add("GitHub" to "连接 GitHub，看 @你、审代码和安全提醒")
+-                        if (!xOn) add("X" to "登录 X，按你关注的词看实时推文")
+-                        if (vault.keys.none { com.openminis.app.plus.PlusVault.baseId(it) == "gmail" }) add("Gmail" to "连接 Gmail，新登录、改密码等安全邮件会排到最前")
+-                    }
++                    // [Mines-sources-33] only sources that are truly missing (signed-in ones are used automatically)
++                    @Suppress("UNUSED_EXPRESSION") vault
++                    val rows = com.openminis.app.plus.AutoSources.missing(context)
+                     // [Mines-feed-32] one compact card: off sources as pills, so the feed itself stays on the first screen
+                     if (rows.isNotEmpty()) GlassCard(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp), shape = RoundedCornerShape(18.dp), elevation = 2.dp) {
+                         val fg = cardTextColor(MaterialTheme.colorScheme.surfaceContainerLow)
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
+index 3ba9233..9d01590 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
+@@ -191,26 +191,23 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+             Text(
+                 when (phase) {
+                     GeminiLive.Phase.IDLE -> "准备中"
+-                    GeminiLive.Phase.CONNECTING -> error ?: "正在连接…"
++                    GeminiLive.Phase.CONNECTING -> error?.let { plainVoiceError(it) } ?: "正在连接…"
+                     GeminiLive.Phase.LISTENING -> if (muted) "已静音" else "我在听，直接说"
+                     GeminiLive.Phase.SPEAKING -> "说话中（随时打断我）"
+-                    GeminiLive.Phase.ERROR -> error ?: "出错了"
++                    GeminiLive.Phase.ERROR -> error?.let { plainVoiceError(it) } ?: "连不上，点「重新连接」"
+                 },
+                 color = if (phase == GeminiLive.Phase.ERROR) Color(0xFFFF6B6B) else Color.White,
+                 style = MaterialTheme.typography.titleMedium,
+                 textAlign = TextAlign.Center,
+                 modifier = Modifier.padding(horizontal = 24.dp),
+             )
+-            // [Mines-voice-26] Connection status: route + model, always visible.
+-            Text(
+-                (if (route.isNotBlank()) "线路：$route" else if (phase == GeminiLive.Phase.CONNECTING) "正在找能连上 Gemini 的线路…" else "线路：未连接") +
+-                    "  ·  模型：$modelInUse",
+-                color = Color(0xFFB8C2D6), fontSize = 13.sp, textAlign = TextAlign.Center,
+-                modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp),
+-            )
++            // [Mines-voice-33] No route / proxy / model line here (user, 2026-10-13): only a short plain
++            // message when the connection has a problem; the details live in ⚙ → 连接详情.
++            @Suppress("UNUSED_EXPRESSION") route
++            @Suppress("UNUSED_EXPRESSION") modelInUse
+             if (phase != GeminiLive.Phase.ERROR && phase != GeminiLive.Phase.CONNECTING && !error.isNullOrBlank()) {
+-                Text(error ?: "", color = Color(0xFFFFC46B), fontSize = 13.sp, textAlign = TextAlign.Center,
+-                    modifier = Modifier.padding(horizontal = 24.dp))
++                Text(plainVoiceError(error ?: ""), color = Color(0xFFFFC46B), fontSize = 14.sp, textAlign = TextAlign.Center,
++                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp))
+             }
+             val allFailed by live.allFailed.collectAsState()
+             if (phase == GeminiLive.Phase.ERROR && allFailed) {
+@@ -282,6 +279,14 @@ private fun VoiceSettingsSheet(onDismiss: () -> Unit, onChanged: () -> Unit) {
+         Column(Modifier.fillMaxWidth().verticalScroll(androidx.compose.foundation.rememberScrollState()).padding(horizontal = 20.dp).padding(bottom = 28.dp),
+             verticalArrangement = Arrangement.spacedBy(10.dp)) {
+             Text("语音设置", fontSize = 20.sp)
++            // [Mines-voice-33] connection details moved here from the call screen
++            com.openminis.app.plus.VoiceSession.live.collectAsState().value?.let { lv ->
++                val r by lv.route.collectAsState(); val m by lv.modelInUse.collectAsState(); val e by lv.error.collectAsState()
++                Text("连接详情", fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
++                Text("线路：" + r.ifBlank { "未连接" } + "\n模型：" + m + (e?.takeIf { it.isNotBlank() }?.let { "\n最近的问题：$it" } ?: ""),
++                    fontSize = 14.sp, modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
++                        .background(MaterialTheme.colorScheme.surfaceVariant).padding(12.dp))
++            }
+             Text("声音", fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+             GeminiLive.voiceLabels.forEach { (id, label) ->
+                 Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+@@ -401,3 +406,16 @@ private fun PlainVoiceContent(plain: com.openminis.app.plus.PlainVoice, onBackTo
+         }
+     }
+ }
++
++
++/** [Mines-voice-33] One short plain line for the call screen: no route / proxy / model / codes. */
++internal fun plainVoiceError(raw: String): String {
++    val first = raw.lineSequence().firstOrNull { it.isNotBlank() }.orEmpty()
++        .replace(Regex("[（(]线路[：:][^）)]*[）)]"), "").replace(Regex("线路[：:].*"), "").trim().trimEnd('，', ',', '·')
++    return when {
++        first.contains("重连") -> "连接断了，正在重连…"
++        first.isBlank() -> "连不上，点「重新连接」"
++        first.length > 40 -> first.take(40) + "…"
++        else -> first
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
+index b03d115..c917306 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
+@@ -82,6 +82,7 @@ fun WebLoginScreen(
+     // [Mines-login-32] this provider's page did not render inside Mines → it is open in a Chrome Custom Tab
+     var external by remember { mutableStateOf(PlusVault.extra(kind.id, "login_external") == "1") }
+     var status by remember { mutableStateOf<String?>(if (detect) "正在检查是否已经登录…" else null) }
++    var googleInApp by remember { mutableStateOf(kind.id == "gmail" && PlusVault.extra(kind.id, "google_refused") != "1") }
+ 
+     suspend fun eval(js: String): String {
+         val wv = webView ?: return ""
+@@ -131,6 +132,42 @@ fun WebLoginScreen(
+             GoogleAuthRouter.openInCustomTab(context, current.ifBlank { url })
+         }
+     }
++    // [Mines-sources-33] Google refused the embedded sign-in → say what still works, stop retrying.
++    if (kind.id == "gmail") LaunchedEffect(webView) {
++        if (webView == null) return@LaunchedEffect
++        while (!finished && googleInApp) {
++            delay(2500)
++            val refused = eval("((document.body&&document.body.innerText)||'').match(/disallowed_useragent|may not be secure|可能不安全|不安全的浏览器|Couldn.t sign you in|无法让您登录/i)?'1':''")
++            if (refused == "1") {
++                googleInApp = false
++                PlusVault.setExtra(kind.id, "google_refused", "1")
++                status = "Google 不让在 App 里登录。验证码仍会自动读：打开「通知使用权」后，Gmail App 的通知里的验证码会自动填；也可以在 Gmail 页填应用专用密码"
++            }
++        }
++    }
++    // [Mines-sources-33] Login pages that ask for an SMS / e-mail code: fill it from notifications
++    // or the user's signed-in mailboxes, no typing.
++    LaunchedEffect(webView) {
++        if (webView == null) return@LaunchedEffect
++        val hv = com.openminis.app.plus.HumanVerify
++        hv.init(context)
++        var filledAt = 0L
++        while (!finished) {
++            delay(2500)
++            if (!hv.settings.value.otpAutofill || System.currentTimeMillis() - filledAt < 20_000L) continue
++            val raw = webView?.let { wv -> suspendCancellableCoroutine<String> { cont ->
++                runCatching { wv.evaluateJavascript(hv.DETECT_JS) { r ->
++                    if (cont.isActive) cont.resume(runCatching { org.json.JSONTokener(r ?: "\"\"").nextValue() as? String }.getOrNull().orEmpty()) } }
++                    .onFailure { if (cont.isActive) cont.resume("") }
++            } }.orEmpty()
++            val scan = hv.parseScan(raw)
++            if (!scan.otpField || !scan.otpEmpty) continue
++            hv.armOtp()
++            val code = hv.takeCode() ?: continue
++            if (eval(hv.fillJs(code, null)) == "ok") { filledAt = System.currentTimeMillis(); status = "已自动填入验证码（${code.length} 位）" }
++            else hv.putBack(code)
++        }
++    }
+     val owner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+     DisposableEffect(owner) {
+         val obs = androidx.lifecycle.LifecycleEventObserver { _, e -> if (e == androidx.lifecycle.Lifecycle.Event.ON_PAUSE) LoginWeb.flush() }
+@@ -149,7 +186,7 @@ fun WebLoginScreen(
+                 val cm = CookieManager.getInstance()
+                 val cookieHit = kind.doneCookies.isNotEmpty() && visited.any { v ->
+                     val c = cm.getCookie(v).orEmpty()
+-                    kind.doneCookies.any { name -> c.contains(if (name.contains('=')) name else "$name=") }
++                    com.openminis.app.plus.MailParse.cookieHas(c, kind.doneCookies)
+                 }
+                 val urlHit = kind.doneUrl?.matches(u) == true
+                 val jsHit = kind.doneJs?.let { eval(it).isNotBlank() } == true
+@@ -210,7 +247,11 @@ fun WebLoginScreen(
+                             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                                 val u = request.url.toString()
+                                 // Google blocks sign-in inside WebViews; hand that hop to Chrome.
+-                                if (GoogleAuthRouter.shouldRouteExternally(u)) {
++                                // [Mines-sources-33] Gmail is tried inside Mines first (clean Chrome UA, no
++                                // X-Requested-With) so its session can feed codes + mail; Google's refusal
++                                // page is detected below and then we stop trying.
++                                val tryGoogleHere = googleInApp && !u.contains("apple.com")
++                                if (GoogleAuthRouter.shouldRouteExternally(u) && !tryGoogleHere) {
+                                     // [Mines-login-32] Google / Apple sign-in always in Chrome
+                                     external = true
+                                     status = "Google / Apple 登录只能在 Chrome 里完成，已为你打开。登录好后回来点下面的按钮"
