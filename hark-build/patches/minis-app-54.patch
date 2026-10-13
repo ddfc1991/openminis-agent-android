@@ -48,10 +48,10 @@ index 4d603b7..e30a9cb 100644
              ?: return BrowserActionResult(text = "约 50 秒内没收到验证码短信/邮件通知。确认已经点了发送验证码后，可以再调用一次 wait_for_otp。", success = true)
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/AutoSources.kt b/src/android/app/src/main/java/com/openminis/app/plus/AutoSources.kt
 new file mode 100644
-index 0000000..5615f28
+index 0000000..fa1c84b
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/AutoSources.kt
-@@ -0,0 +1,230 @@
+@@ -0,0 +1,231 @@
 +package com.openminis.app.plus
 +
 +import android.content.Context
@@ -191,6 +191,7 @@ index 0000000..5615f28
 +            }
 +            // feed the sources: balances via sessions, then the digest (each throttled)
 +            runCatching { sessionBalances(app) }
++            runCatching { ChatKnowledge.run(app) } // [Mines-kb-33] chats → 对话整理 knowledge
 +            if (System.currentTimeMillis() - p.getLong("digest_at", 0L) > 30 * 60_000L) {
 +                p.edit().putLong("digest_at", System.currentTimeMillis()).apply()
 +                runCatching { Digest.refresh(app) }
@@ -280,6 +281,185 @@ index 0000000..5615f28
 +            PlusVault.setExtra(id, "balance_via", "web")
 +        }
 +        _active.value = list(context)
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ChatKnowledge.kt b/src/android/app/src/main/java/com/openminis/app/plus/ChatKnowledge.kt
+new file mode 100644
+index 0000000..9cfc585
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/ChatKnowledge.kt
+@@ -0,0 +1,173 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.withContext
++import okhttp3.MediaType.Companion.toMediaType
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.RequestBody.Companion.toRequestBody
++import org.json.JSONArray
++import org.json.JSONObject
++import java.util.concurrent.TimeUnit
++
++/**
++ * [Mines-kb-33] 对话整理: every chat window becomes knowledge with no setup (default on).
++ *
++ * When a chat has been idle for [IDLE_MS] and changed since its last summary, its text is
++ * summarised by the best key the user has (DeepSeek → 智谱 glm-4-flash → 硅基流动 Qwen) into
++ * {topic, summary, facts, decisions, links, files}; without a key a rule-based digest is
++ * kept (title, first questions, links, files). Each chat is one document in the fixed
++ * knowledge base 「对话整理」 (id "chats"), so `search_knowledge` finds it, and the
++ * summary is listed on the 知识库 page. Runs on app start (AutoSources.onForeground),
++ * at most [PER_PASS] chats a pass and [DAILY_CAP] model calls a day. Everything stays on
++ * the phone except the one summarising call to the user's own model key.
++ */
++object ChatKnowledge {
++    const val KB_ID = "chats"
++    const val KB_NAME = "对话整理"
++    private const val PREFS = "mines_chat_knowledge"
++    private const val IDLE_MS = 20 * 60_000L
++    private const val PER_PASS = 6
++    private const val DAILY_CAP = 60
++    private val http = OkHttpClient.Builder().connectTimeout(8, TimeUnit.SECONDS).readTimeout(60, TimeUnit.SECONDS).callTimeout(70, TimeUnit.SECONDS).build()
++
++    data class Entry(val sessionId: String, val title: String, val topic: String, val summary: String,
++                     val facts: List<String>, val decisions: List<String>, val links: List<String>, val files: List<String>, val at: Long, val byModel: Boolean)
++
++    private val _entries = MutableStateFlow<List<Entry>>(emptyList())
++    val entries: StateFlow<List<Entry>> = _entries.asStateFlow()
++    private val _busy = MutableStateFlow(false)
++    val busy: StateFlow<Boolean> = _busy.asStateFlow()
++
++    private fun prefs(c: Context) = c.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++    fun enabled(c: Context) = prefs(c).getBoolean("on", true)
++    fun setEnabled(c: Context, on: Boolean) = prefs(c).edit().putBoolean("on", on).apply()
++
++    fun load(c: Context): List<Entry> {
++        val p = prefs(c)
++        val list = p.all.keys.filter { it.startsWith("e_") }.mapNotNull { k -> runCatching { parse(JSONObject(p.getString(k, "{}")!!)) }.getOrNull() }
++            .sortedByDescending { it.at }
++        _entries.value = list
++        return list
++    }
++
++    private fun arr(o: JSONObject, k: String) = o.optJSONArray(k)?.let { a -> (0 until a.length()).map { a.optString(it) }.filter { it.isNotBlank() } } ?: emptyList()
++    private fun parse(o: JSONObject) = Entry(o.getString("sid"), o.optString("title"), o.optString("topic"), o.optString("summary"),
++        arr(o, "facts"), arr(o, "decisions"), arr(o, "links"), arr(o, "files"), o.optLong("at"), o.optBoolean("model"))
++    private fun toJson(e: Entry) = JSONObject().put("sid", e.sessionId).put("title", e.title).put("topic", e.topic).put("summary", e.summary)
++        .put("facts", JSONArray(e.facts)).put("decisions", JSONArray(e.decisions)).put("links", JSONArray(e.links)).put("files", JSONArray(e.files))
++        .put("at", e.at).put("model", e.byModel)
++
++    fun search(q: String): List<Entry> {
++        val t = q.trim().lowercase(); if (t.isEmpty()) return _entries.value
++        return _entries.value.filter { e -> (e.title + e.topic + e.summary + e.facts + e.decisions + e.links + e.files).lowercase().contains(t) }
++    }
++
++    /** One pass over idle, changed chats. Blocking IO; safe to call often. */
++    suspend fun run(c: Context) = withContext(Dispatchers.IO) {
++        if (!enabled(c) || _busy.value) return@withContext
++        val app = c.applicationContext as? com.openminis.app.MinisApp ?: return@withContext
++        _busy.value = true
++        try {
++            load(c)
++            val dao = app.database.chatDao()
++            val now = System.currentTimeMillis()
++            val p = prefs(c)
++            val todo = dao.listSessions().filter { s ->
++                now - s.updatedAt > IDLE_MS && s.updatedAt > p.getLong("done_" + s.id, 0L)
++            }.take(PER_PASS)
++            if (todo.isEmpty()) return@withContext
++            KnowledgeBase.ensure(c, KB_ID, KB_NAME)
++            for (s in todo) {
++                val msgs = runCatching { dao.loadMessages(s.id) }.getOrDefault(emptyList())
++                val lines = ArrayList<String>(); val files = LinkedHashSet<String>()
++                for (m in msgs) {
++                    val (text, f) = partsText(m.partsJson)
++                    files += f
++                    if (text.isBlank() || (m.role != "user" && m.role != "assistant")) continue
++                    lines += (if (m.role == "user") "用户：" else "助手：") + text.replace(Regex("\\s+"), " ").take(1500)
++                }
++                if (lines.size < 2) { p.edit().putLong("done_" + s.id, s.updatedAt).apply(); continue }
++                val transcript = lines.joinToString("\n").let { if (it.length > 14_000) it.take(4_000) + "\n…\n" + it.takeLast(10_000) else it }
++                val links = Regex("https?://[^\\s)\"'<>，。]+").findAll(transcript).map { it.value.trimEnd('.', ',') }.distinct().take(12).toList()
++                val title = s.title?.takeIf { it.isNotBlank() } ?: lines.first().removePrefix("用户：").take(30)
++                val e = summarize(c, s.id, title, transcript, links, files.toList()) ?: fallback(s.id, title, lines, links, files.toList())
++                val doc = buildString {
++                    append("对话：").append(e.title).append("\n主题：").append(e.topic).append("\n摘要：").append(e.summary)
++                    if (e.facts.isNotEmpty()) append("\n要点：\n").append(e.facts.joinToString("\n") { "- $it" })
++                    if (e.decisions.isNotEmpty()) append("\n决定：\n").append(e.decisions.joinToString("\n") { "- $it" })
++                    if (e.links.isNotEmpty()) append("\n链接：\n").append(e.links.joinToString("\n"))
++                    if (e.files.isNotEmpty()) append("\n文件：").append(e.files.joinToString("、"))
++                }
++                runCatching { KnowledgeBase.replaceSource(c, KB_ID, "对话：" + e.title, "chat:" + s.id, doc) }
++                p.edit().putString("e_" + s.id, toJson(e).toString()).putLong("done_" + s.id, s.updatedAt).apply()
++            }
++            load(c)
++        } finally { _busy.value = false }
++    }
++
++    /** Plain text + file names of one message's parts JSON. */
++    private fun partsText(json: String): Pair<String, List<String>> = runCatching {
++        val a = JSONArray(json)
++        val sb = StringBuilder(); val files = ArrayList<String>()
++        for (i in 0 until a.length()) {
++            val o = a.optJSONObject(i) ?: continue
++            when (o.optString("type")) {
++                "text" -> sb.append(o.optString("value")).append('\n')
++                "mediaRef" -> o.optJSONObject("value")?.let { v -> listOf("name", "fileName", "filename", "path").firstNotNullOfOrNull { k -> v.optString(k).takeIf { it.isNotBlank() } }?.let { files += it.substringAfterLast('/') } }
++            }
++        }
++        sb.toString().trim() to files
++    }.getOrDefault("" to emptyList())
++
++    private fun endpoint(): Triple<String, String, String>? {
++        PlusVault.defaultAccount("deepseek")?.let { PlusVault.secret(it) }?.let { return Triple("https://api.deepseek.com/chat/completions", it, "deepseek-chat") }
++        PlusVault.defaultAccount("zhipu")?.let { PlusVault.secret(it) }?.let { return Triple("https://open.bigmodel.cn/api/paas/v4/chat/completions", it, "glm-4-flash") }
++        PlusVault.defaultAccount("siliconflow")?.let { PlusVault.secret(it) }?.let { return Triple("https://api.siliconflow.cn/v1/chat/completions", it, "Qwen/Qwen2.5-7B-Instruct") }
++        return null
++    }
++
++    private fun summarize(c: Context, sid: String, title: String, transcript: String, links: List<String>, files: List<String>): Entry? {
++        val p = prefs(c)
++        val day = java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.US).format(java.util.Date())
++        val used = if (p.getString("day", "") == day) p.getInt("count", 0) else 0
++        if (used >= DAILY_CAP) return null
++        val (url, key, model) = endpoint() ?: return null
++        p.edit().putString("day", day).putInt("count", used + 1).apply()
++        val prompt = "把下面这段用户和助手的对话整理成用户以后能查的知识。只输出 JSON：" +
++            "{\"topic\":\"2-6 字主题\",\"summary\":\"2-3 句大白话总结\",\"facts\":[\"关键事实/配置/数字，最多 8 条\"],\"decisions\":[\"做出的决定或结论，最多 5 条\"],\"links\":[\"重要链接\"],\"files\":[\"提到的文件\"]}。" +
++            "不要写密码、密钥、验证码。\n标题：$title\n已发现链接：${links.joinToString(" ")}\n已发现文件：${files.joinToString(" ")}\n对话：\n$transcript"
++        val body = JSONObject().put("model", model).put("temperature", 0.2).put("max_tokens", 1200)
++            .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
++        val text = runCatching {
++            http.newCall(Request.Builder().url(url).header("Authorization", "Bearer $key")
++                .post(body.toString().toRequestBody("application/json".toMediaType())).build()).execute().use { r ->
++                if (!r.isSuccessful) return null
++                JSONObject(r.body?.string().orEmpty()).getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content")
++            }
++        }.getOrNull() ?: return null
++        val o = runCatching { JSONObject(text.substring(text.indexOf('{'), text.lastIndexOf('}') + 1)) }.getOrNull() ?: return null
++        return Entry(sid, title, o.optString("topic").ifBlank { ChatOrganizerTopic.of(title + transcript) }, o.optString("summary").take(400),
++            arr(o, "facts").take(8), arr(o, "decisions").take(5), (arr(o, "links") + links).distinct().take(12), (arr(o, "files") + files).distinct().take(12),
++            System.currentTimeMillis(), true)
++    }
++
++    private fun fallback(sid: String, title: String, lines: List<String>, links: List<String>, files: List<String>): Entry {
++        val asks = lines.filter { it.startsWith("用户：") }.map { it.removePrefix("用户：").take(80) }.take(4)
++        return Entry(sid, title, ChatOrganizerTopic.of(title + lines.joinToString(" ")), "聊了：" + asks.joinToString("；").take(200),
++            asks, emptyList(), links, files, System.currentTimeMillis(), false)
++    }
++}
++
++/** Topic by the same keywords 对话整理 chips use (no model). */
++internal object ChatOrganizerTopic {
++    fun of(text: String): String {
++        val t = text.lowercase()
++        return ChatOrganizer.topics.maxByOrNull { tp -> tp.keywords.count { t.contains(it) } }
++            ?.takeIf { tp -> tp.keywords.any { t.contains(it) } }?.name ?: "其他"
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt b/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt
@@ -528,6 +708,39 @@ index 849f722..e92da31 100644
  
      /** Waits up to [timeoutMs] for a code; null on timeout. */
      suspend fun awaitCode(timeoutMs: Long): String? {
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/KnowledgeBase.kt b/src/android/app/src/main/java/com/openminis/app/plus/KnowledgeBase.kt
+index 4bc0f4b..9895e34 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/KnowledgeBase.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/KnowledgeBase.kt
+@@ -95,6 +95,19 @@ object KnowledgeBase {
+         return kb
+     }
+ 
++    /** [Mines-kb-33] A knowledge base with a fixed id (created when missing), e.g. 「对话整理」. */
++    fun ensure(ctx: Context, id: String, name: String): Kb {
++        load(ctx)
++        return _bases.value.firstOrNull { it.id == id } ?: Kb(id, name, emptyList()).also { writeMeta(ctx, it) }
++    }
++
++    /** [Mines-kb-33] Replace every document that came from [source] with new text (one doc). */
++    @Synchronized
++    fun replaceSource(ctx: Context, kbId: String, title: String, source: String, text: String): Doc {
++        load(ctx).firstOrNull { it.id == kbId }?.docs?.filter { it.source == source }?.forEach { removeDoc(ctx, kbId, it.id) }
++        return addText(ctx, kbId, title, source, text)
++    }
++
+     fun rename(ctx: Context, id: String, name: String) {
+         val kb = load(ctx).firstOrNull { it.id == id } ?: return
+         writeMeta(ctx, kb.copy(name = name.trim().ifBlank { kb.name }))
+@@ -302,7 +315,7 @@ object KnowledgeBase {
+         val names = load(ctx).filter { it.docs.isNotEmpty() }.joinToString("、") { "「${it.name}」(${it.docs.size} 篇)" }
+         return AgentToolDefinition(
+             name = TOOL_NAME,
+-            description = "Search the user's local knowledge bases (documents they imported into Mines: PDFs, notes, web pages). " +
++            description = "Search the user's local knowledge bases (documents they imported into Mines: PDFs, notes, web pages, plus 对话整理: summaries of their past chats with facts, decisions, links and files). " +
+                 "Available: $names. Use it whenever the question may be answered by the user's own documents, before answering from general knowledge, " +
+                 "and cite the document titles you used. Keyword search (BM25): pass the key terms, in the language of the documents.",
+             parameters = mapOf(
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/LoginWeb.kt b/src/android/app/src/main/java/com/openminis/app/plus/LoginWeb.kt
 index 0e95835..38a117a 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/LoginWeb.kt
@@ -1142,6 +1355,73 @@ index 6cfd900..dafbe2e 100644
              else -> out.putString("result", "unknown method")
          }
          return out
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt b/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt
+index 2897258..4290a7b 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt
+@@ -110,6 +110,7 @@ object SplitProxy {
+     val active: Boolean get() = _settings.value.enabled && _running.value
+ 
+     fun init(context: Context) {
++        ctxRef = context.applicationContext
+         if (prefs != null) return
+         synchronized(this) {
+             if (prefs != null) return
+@@ -314,14 +315,43 @@ object SplitProxy {
+     }
+ 
+     /** Checks every configured upstream once (blocking; call off the main thread). */
++    /** [Mines-design-33] consecutive failed checks per proxy (memory only). */
++    private val fails = java.util.concurrent.ConcurrentHashMap<String, Int>()
++    @Volatile private var ctxRef: Context? = null
++
+     fun checkAll() {
+         val ups = _settings.value.all
+         val m = HashMap<String, Health>()
+         for (u in ups) m[u.key] = check(u)
+         _health.value = m
++        for (u in ups) if (m[u.key]?.ok == true) fails.remove(u.key) else fails.merge(u.key, 1) { a, b -> a + b }
++        pruneDead()
+         pickCurrent()
+     }
+ 
++    /**
++     * [Mines-design-33] Auto-detected proxies (system proxy / app ports, e.g. the random
++     * 127.x ports a VPN app leaves behind) that failed 3 checks in a row are dropped instead
++     * of sitting in red; when the primary is such a proxy and a backup works, the working
++     * one becomes the primary. Proxies the user typed in are never removed.
++     */
++    private fun pruneDead() {
++        val c = ctxRef ?: return
++        val st = _settings.value
++        val h = _health.value
++        fun auto(u: Upstream) = u.label.isNotBlank()
++        fun dead(u: Upstream) = (fails[u.key] ?: 0) >= 3
++        val primaryAuto = st.primary?.let { p -> st.backups.firstOrNull { it.key == p.key }?.label?.isNotBlank() == true || PlusVaultLess.isAutoPrimary(c) } == true
++        var n = st.copy(backups = st.backups.filterNot { auto(it) && dead(it) && it.key != st.primary?.key })
++        val p = n.primary
++        if (p != null && dead(p) && primaryAuto) {
++            val alt = n.backups.firstOrNull { h[it.key]?.ok == true }
++            n = if (alt != null) n.copy(upstreamType = alt.type, upstreamHost = alt.host, upstreamPort = alt.port, backups = n.backups.filter { it.key != alt.key })
++                else n
++        }
++        if (n != st) { Log.i(TAG, "pruned dead auto-detected proxies"); update(c, { n }); fails.keys.retainAll(n.all.map { it.key }.toSet()) }
++    }
++
+     /** One upstream: open a tunnel to a well-known HTTPS host through it. */
+     fun check(u: Upstream, target: String = "www.gstatic.com"): Health {
+         // (a tunnel to www.gstatic.com:443 proves the proxy really forwards to the outside)
+@@ -614,3 +644,10 @@ object SplitProxy {
+         return sock
+     }
+ }
++
++
++/** [Mines-design-33] whether the primary proxy was filled by 一键检测 (not typed by the user). */
++internal object PlusVaultLess {
++    fun isAutoPrimary(c: Context): Boolean = c.getSharedPreferences("mines_split_proxy_meta", Context.MODE_PRIVATE).getBoolean("primary_auto", false)
++    fun setAutoPrimary(c: Context, v: Boolean) = c.getSharedPreferences("mines_split_proxy_meta", Context.MODE_PRIVATE).edit().putBoolean("primary_auto", v).apply()
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
 index 6fb1731..5813f16 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
@@ -1243,6 +1523,634 @@ index b9a72d3..93bc8ca 100644
                      // [Mines-feed-32] one compact card: off sources as pills, so the feed itself stays on the first screen
                      if (rows.isNotEmpty()) GlassCard(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp), shape = RoundedCornerShape(18.dp), elevation = 2.dp) {
                          val fg = cardTextColor(MaterialTheme.colorScheme.surfaceContainerLow)
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/KnowledgeScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/KnowledgeScreen.kt
+index 5ee3b4d..8843d0f 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/KnowledgeScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/KnowledgeScreen.kt
+@@ -66,14 +66,9 @@ fun KnowledgeScreen(onBack: () -> Unit) {
+         dismissButton = { TextButton(onClick = { showNew = false }) { Text("取消") } },
+     )
+ 
+-    PlusPage("知识库", onBack) {
+-        Text(
+-            "把 PDF、TXT、Markdown 或网页导入知识库，AI 回答时会先用「search_knowledge」查你的资料并注明出处。全部在手机本地检索（关键词 BM25），不上传。",
+-            style = MaterialTheme.typography.bodyMedium,
+-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+-            modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
+-        )
+-        PlusSection(if (bases.isEmpty()) "知识库" else "知识库 · ${bases.size}") {
++    PlusPage("知识库", onBack, subtitle = "你的资料和聊过的事，AI 回答前会先查这里") {
++        ChatDigestSection()
++        PlusSection(if (bases.isEmpty()) "我的资料" else "我的资料 · ${bases.size}") {
+             bases.forEachIndexed { i, kb ->
+                 Row(
+                     Modifier.fillMaxWidth().clickable { openId = kb.id }.padding(horizontal = 16.dp, vertical = 14.dp),
+@@ -81,7 +76,7 @@ fun KnowledgeScreen(onBack: () -> Unit) {
+                 ) {
+                     Column(Modifier.weight(1f)) {
+                         Text(kb.name, style = MaterialTheme.typography.titleMedium)
+-                        Text("${kb.docs.size} 篇文档 · ${kb.docs.sumOf { it.chunks }} 段", style = MaterialTheme.typography.bodyMedium,
++                        Text("${kb.docs.size} 篇", style = MaterialTheme.typography.bodyMedium,
+                             color = MaterialTheme.colorScheme.onSurfaceVariant)
+                     }
+                     Text("›", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+@@ -89,9 +84,11 @@ fun KnowledgeScreen(onBack: () -> Unit) {
+                 if (i < bases.lastIndex) PlusDivider()
+             }
+             if (bases.isNotEmpty()) PlusDivider()
+-            ActionRow(Icons.Outlined.Add, "新建知识库") { showNew = true }
++            ActionRow(Icons.Outlined.Add, "导入资料（PDF、TXT、Markdown、网页）") { if (bases.isEmpty()) showNew = true else openId = bases.first().id }
++            PlusDivider()
++            ActionRow(Icons.Outlined.FileOpen, "新建一个资料库") { showNew = true }
+         }
+-        PlusSection("对话", footer = "每个对话可以单独开关：对话右上角 ⋯ →「知识库」。这里是新对话的默认值。") {
++        PlusSection("对话", footer = "单个对话可在右上角 ⋯ 里开关") {
+             SwitchRow("新对话默认使用知识库", null, defaultOn) { on -> defaultOn = on; KnowledgeBase.setDefaultOn(ctx, on) }
+         }
+         if (bases.any { it.docs.isNotEmpty() }) SearchTry(null)
+@@ -214,3 +211,48 @@ private fun SearchTry(kbId: String?) {
+         }
+     }
+ }
++
++
++/** [Mines-kb-33] 对话整理: every chat turned into knowledge automatically. */
++@Composable
++private fun ChatDigestSection() {
++    val ctx = LocalContext.current
++    val scope = rememberCoroutineScope()
++    val entries by com.openminis.app.plus.ChatKnowledge.entries.collectAsState()
++    val busy by com.openminis.app.plus.ChatKnowledge.busy.collectAsState()
++    var on by remember { mutableStateOf(com.openminis.app.plus.ChatKnowledge.enabled(ctx)) }
++    var q by remember { mutableStateOf("") }
++    var open by remember { mutableStateOf<String?>(null) }
++    androidx.compose.runtime.LaunchedEffect(Unit) {
++        com.openminis.app.plus.ChatKnowledge.load(ctx)
++        com.openminis.app.plus.ChatKnowledge.run(ctx)
++    }
++    PlusSection(if (entries.isEmpty()) "对话整理" else "对话整理 · ${entries.size}") {
++        SwitchRow("自动整理每个对话", if (busy) "正在整理…" else "聊完会自动总结成要点、决定、链接和文件", on) { v ->
++            on = v; com.openminis.app.plus.ChatKnowledge.setEnabled(ctx, v)
++            if (v) scope.launch { com.openminis.app.plus.ChatKnowledge.run(ctx) }
++        }
++        if (entries.isNotEmpty()) {
++            PlusDivider()
++            OutlinedTextField(q, { q = it }, placeholder = { Text("搜聊过的事") }, singleLine = true,
++                leadingIcon = { com.openminis.app.ui.brand.MinesIcon(Icons.Outlined.Search, null) },
++                shape = androidx.compose.foundation.shape.RoundedCornerShape(16.dp),
++                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp))
++        } else {
++            PlusDivider()
++            PlusRow(Icons.Outlined.Search, "还没有整理好的对话", "对话停下 20 分钟后会自动整理", chevron = false)
++        }
++        val shown = com.openminis.app.plus.ChatKnowledge.search(q).take(40)
++        shown.forEach { e ->
++            PlusDivider()
++            PlusRow(Icons.Outlined.Link, e.title, (if (e.topic.isNotBlank()) e.topic + " · " else "") + e.summary.take(if (open == e.sessionId) 400 else 60),
++                onClick = { open = if (open == e.sessionId) null else e.sessionId }, chevron = false)
++            if (open == e.sessionId) Column(Modifier.fillMaxWidth().padding(start = 66.dp, end = 16.dp, bottom = 10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
++                e.facts.forEach { Text("• $it", style = MaterialTheme.typography.bodyMedium) }
++                e.decisions.forEach { Text("✓ $it", style = MaterialTheme.typography.bodyMedium) }
++                e.links.take(5).forEach { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary, maxLines = 1, overflow = TextOverflow.Ellipsis) }
++                if (e.files.isNotEmpty()) Text("文件：" + e.files.joinToString("、"), style = MaterialTheme.typography.bodySmall)
++            }
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
+index ab303ff..06061b9 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
+@@ -12,6 +12,18 @@ import androidx.compose.animation.core.tween
+ import androidx.compose.foundation.Canvas
+ import androidx.compose.foundation.Image
+ import androidx.compose.foundation.background
++import androidx.compose.foundation.border
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.layout.widthIn
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.material3.LocalContentColor
++import androidx.compose.material3.TopAppBarDefaults
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.draw.shadow
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.ColumnScope
+@@ -207,13 +219,27 @@ fun PetAvatar(
+     )
+ }
+ 
++// ── [Mines-design-33] One design system for every Plus page ────────────────
++// User, 2026-10-13: 「设计就设计风格好点，简陋得我都看不下去」. Reference: Cue settings / feed.
++// Pages sit on the home wallpaper; sections are frosted 22 dp cards with a soft shadow;
++// a large bold title; rows have a line icon in a tinted circle, title 16 sp, muted
++// 14 sp subtitle, an optional right-side value and a chevron; buttons are pills.
++
++/** Accent used for icon circles and pill buttons (Mines terracotta, softened in dark). */
++@Composable
++fun minesAccent(): Color = if (MaterialTheme.colorScheme.surface.luminance() < 0.5f) Color(0xFFE8906F) else Color(0xFFC8643F)
++
++@Composable
++fun minesMuted(): Color = MaterialTheme.colorScheme.onSurfaceVariant
++
+ @OptIn(ExperimentalMaterial3Api::class)
+ @Composable
+-fun PlusPage(title: String, onBack: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
++fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, content: @Composable ColumnScope.() -> Unit) {
++    // [Mines-design-33] light polish only (full restyle comes with build-34's design system)
+     Scaffold(
+         topBar = {
+             TopAppBar(
+-                title = { Text(title) },
++                title = {},
+                 navigationIcon = {
+                     IconButton(onClick = onBack) {
+                         MinesIcon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
+@@ -224,39 +250,121 @@ fun PlusPage(title: String, onBack: () -> Unit, content: @Composable ColumnScope
+     ) { padding ->
+         Column(
+             Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState())
+-                .padding(bottom = 32.dp),
+-            content = content,
+-        )
++                .padding(bottom = 40.dp),
++        ) {
++            Text(title, fontSize = 28.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onBackground,
++                modifier = Modifier.padding(start = 22.dp, end = 22.dp, top = 0.dp, bottom = if (subtitle == null) 4.dp else 2.dp))
++            if (subtitle != null) Text(subtitle, fontSize = 15.sp, lineHeight = 21.sp,
++                color = MaterialTheme.colorScheme.onSurfaceVariant,
++                modifier = Modifier.padding(horizontal = 22.dp).padding(bottom = 4.dp))
++            content()
++        }
+     }
+ }
+ 
+ @Composable
+ fun PlusSection(title: String?, footer: String? = null, content: @Composable ColumnScope.() -> Unit) {
+-    Column(Modifier.fillMaxWidth().padding(top = 18.dp)) {
++    Column(Modifier.fillMaxWidth().padding(top = 16.dp)) {
+         if (title != null) Text(
+             title,
+-            style = MaterialTheme.typography.labelSmall,
++            fontSize = 15.sp,
+             color = MaterialTheme.colorScheme.onSurfaceVariant,
+-            fontWeight = FontWeight.Medium,
+-            letterSpacing = 0.5.sp,
+-            modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp),
++            fontWeight = FontWeight.SemiBold,
++            modifier = Modifier.padding(horizontal = 24.dp, vertical = 6.dp),
+         )
+         Column(
+             Modifier.fillMaxWidth().padding(horizontal = 16.dp)
+-                .clip(RoundedCornerShape(12.dp))
+-                .background(MaterialTheme.colorScheme.surfaceContainerLow),
++                .clip(RoundedCornerShape(20.dp))
++                .background(MaterialTheme.colorScheme.surfaceContainerLow)
++                .padding(vertical = 4.dp),
+             content = content,
+         )
+         if (footer != null) Text(
+             footer,
+-            style = MaterialTheme.typography.bodySmall,
++            fontSize = 13.sp,
+             color = MaterialTheme.colorScheme.onSurfaceVariant,
+-            modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp),
+-            lineHeight = 16.sp,
++            modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp),
++            lineHeight = 18.sp,
+         )
+     }
+ }
+ 
++/** Line icon in a tinted circle. */
++@Composable
++fun IconBubble(icon: androidx.compose.ui.graphics.vector.ImageVector, tint: Color = minesAccent(), size: Dp = 36.dp) {
++    Box(Modifier.size(size).clip(CircleShape).background(tint.copy(alpha = 0.16f)), contentAlignment = Alignment.Center) {
++        MinesIcon(icon, null, tint = tint, modifier = Modifier.size(size * 0.54f))
++    }
++}
++
++/** The standard row: icon bubble · title / subtitle · value · chevron. */
++@Composable
++fun PlusRow(
++    icon: androidx.compose.ui.graphics.vector.ImageVector?,
++    title: String,
++    sub: String? = null,
++    value: String? = null,
++    tint: Color = minesAccent(),
++    chevron: Boolean = true,
++    trailing: (@Composable () -> Unit)? = null,
++    onClick: (() -> Unit)? = null,
++) {
++    Row(
++        Modifier.fillMaxWidth().heightIn(min = 58.dp)
++            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
++            .padding(horizontal = 16.dp, vertical = 10.dp),
++        verticalAlignment = Alignment.CenterVertically,
++    ) {
++        if (icon != null) { IconBubble(icon, tint); Spacer(Modifier.width(14.dp)) }
++        Column(Modifier.weight(1f)) {
++            Text(title, fontSize = 16.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
++            if (!sub.isNullOrBlank()) Text(sub, fontSize = 14.sp, lineHeight = 19.sp, color = minesMuted())
++        }
++        if (value != null) Text(value, fontSize = 15.sp, color = minesMuted(), maxLines = 1,
++            modifier = Modifier.padding(start = 8.dp).widthIn(max = 150.dp))
++        if (trailing != null) { Spacer(Modifier.width(8.dp)); trailing() }
++        else if (chevron && onClick != null) Text("›", fontSize = 24.sp, color = minesMuted(), modifier = Modifier.padding(start = 8.dp))
++    }
++}
++
++/** Status dot + word (能用 / 连不上 …). */
++@Composable
++fun StatusPill(text: String, ok: Boolean?) {
++    val c = when (ok) { true -> Color(0xFF34C759); false -> Color(0xFFFF6B5E); null -> minesMuted() }
++    Row(Modifier.clip(RoundedCornerShape(50)).background(c.copy(alpha = 0.15f)).padding(horizontal = 10.dp, vertical = 4.dp),
++        verticalAlignment = Alignment.CenterVertically) {
++        Box(Modifier.size(7.dp).clip(CircleShape).background(c))
++        Spacer(Modifier.width(6.dp))
++        Text(text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = c)
++    }
++}
++
++/** Pill buttons: primary (accent fill) and secondary (outlined, quiet). */
++@Composable
++fun PillButton(text: String, modifier: Modifier = Modifier, primary: Boolean = true, enabled: Boolean = true, onClick: () -> Unit) {
++    val accent = minesAccent()
++    val shape = RoundedCornerShape(50)
++    val bg = when { !enabled -> Color.Transparent; primary -> accent; else -> Color.Transparent }
++    val fg = when { !enabled -> minesMuted().copy(alpha = 0.5f); primary -> Color.White; else -> accent }
++    val border = when { !enabled -> minesMuted().copy(alpha = 0.3f); primary -> Color.Transparent; else -> accent.copy(alpha = 0.6f) }
++    Box(
++        modifier.heightIn(min = 50.dp).shadow(if (primary && enabled) 4.dp else 0.dp, shape, clip = false)
++            .clip(shape).background(bg).border(1.dp, border, shape)
++            .then(if (enabled) Modifier.clickable(onClick = onClick) else Modifier)
++            .padding(horizontal = 22.dp, vertical = 12.dp),
++        contentAlignment = Alignment.Center,
++    ) { Text(text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = fg) }
++}
++
++/** Short hint line with an ⓘ, instead of long paragraphs. */
++@Composable
++fun InfoLine(text: String) {
++    Row(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 6.dp), verticalAlignment = Alignment.Top) {
++        Text("ⓘ", fontSize = 14.sp, color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f))
++        Spacer(Modifier.width(6.dp))
++        Text(text, fontSize = 13.sp, lineHeight = 18.sp, color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.66f))
++    }
++}
+ 
+ // ── [Mines-a11y-26] Readable text on cards ───────────────────────────────
+ // The user is partially sighted: card text must reach WCAG AA (4.5:1). build-25's
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ReportScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ReportScreen.kt
+index 402bec4..d4af28d 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/ReportScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ReportScreen.kt
+@@ -1,5 +1,9 @@
+ package com.openminis.app.ui.plus
+ 
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.outlined.*
+ import android.net.Uri
+ import androidx.activity.compose.rememberLauncherForActivityResult
+ import androidx.activity.result.PickVisualMediaRequest
+@@ -71,42 +75,45 @@ fun ReportScreen(onBack: () -> Unit) {
+         }
+     }
+ 
+-    PlusPage("测试与上报", onBack) {
+-        PlusSection(null, footer = "会检查：模型服务、实时语音握手、账号密钥、无障碍/Shizuku/悬浮窗、沙箱、MCP。结果和日志（密钥、Token 已隐去，邮箱打码）用你连接的 GitHub 账号发成一条问题，Hark 会看。") {
+-            Button(onClick = { runAndReport() }, enabled = busy == null,
+-                modifier = Modifier.fillMaxWidth().padding(14.dp).heightIn(min = 64.dp)) {
+-                Text(busy ?: "一键冒烟测试 + 上报", fontSize = 19.sp, fontWeight = FontWeight.SemiBold)
++    PlusPage("测试与上报", onBack, subtitle = "一键查一遍哪里坏了，结果自动发给 Hark") {
++        // [Mines-design-33] cards + short icon list instead of a paragraph
++        PlusSection("会检查") {
++            PlusRow(Icons.Outlined.Memory, "模型服务", "能不能正常回答", chevron = false)
++            PlusDivider()
++            PlusRow(Icons.Outlined.GraphicEq, "实时语音", "能不能连上", chevron = false)
++            PlusDivider()
++            PlusRow(Icons.Outlined.Key, "账号和密钥", "有没有失效", chevron = false)
++            PlusDivider()
++            PlusRow(Icons.Outlined.TouchApp, "手机控制权限", "无障碍、悬浮窗、Shizuku", chevron = false)
++            PlusDivider()
++            PlusRow(Icons.Outlined.Terminal, "沙箱和插件", "命令行、MCP", chevron = false)
++            Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp)) {
++                PillButton(busy ?: "开始检查并上报", Modifier.fillMaxWidth(), enabled = busy == null) { runAndReport() }
+             }
+         }
++        InfoLine("密钥、Token 会自动隐去，邮箱打码；用你连接的 GitHub 账号发一条问题")
+         result?.let { r ->
+             PlusSection(null) {
+-                Text(if (r.ok) "✓ 已上报给 Hark" else "✗ " + r.message, fontSize = 18.sp,
+-                    color = if (r.ok) Color(0xFF1F7A3F) else Color(0xFFB3261E), modifier = Modifier.padding(14.dp))
+-                if (r.url != null) OutlinedButton(onClick = { uri.openUri(r.url) }, modifier = Modifier.padding(horizontal = 14.dp, vertical = 4.dp)) { Text("打开这条问题") }
++                PlusRow(if (r.ok) Icons.Outlined.CheckCircle else Icons.Outlined.ErrorOutline, if (r.ok) "已发给 Hark" else "没发出去",
++                    if (r.ok) null else r.message.take(60), tint = if (r.ok) Color(0xFF34C759) else Color(0xFFFF6B5E),
++                    onClick = r.url?.let { u -> { uri.openUri(u) } }, value = if (r.url != null) "查看" else null)
+             }
+         }
+-        if (checks.isNotEmpty()) PlusSection("检查结果") {
+-            checks.forEach { c ->
+-                Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp)) {
+-                    Text(if (c.ok) "✓" else if (c.warn) "!" else "✗", fontSize = 18.sp,
+-                        color = if (c.ok) Color(0xFF1F7A3F) else if (c.warn) Color(0xFF9A6700) else Color(0xFFB3261E))
+-                    Spacer(Modifier.width(10.dp))
+-                    Column(Modifier.weight(1f)) {
+-                        Text(c.name, fontSize = 16.sp)
+-                        Text(c.detail, fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+-                    }
+-                }
++        if (checks.isNotEmpty()) PlusSection("检查结果 · ${checks.count { it.ok }}/${checks.size} 通过") {
++            checks.forEachIndexed { i, c ->
++                PlusRow(if (c.ok) Icons.Outlined.CheckCircle else if (c.warn) Icons.Outlined.Info else Icons.Outlined.ErrorOutline, c.name, c.detail.take(80),
++                    tint = if (c.ok) Color(0xFF34C759) else if (c.warn) Color(0xFFFFB020) else Color(0xFFFF6B5E), chevron = false)
++                if (i < checks.lastIndex) PlusDivider()
+             }
+         }
+-        PlusSection("报告问题", footer = "写一句哪里不对就行；截图可选。") {
+-            OutlinedTextField(desc, { desc = it }, label = { Text("哪里不对？") }, minLines = 3,
+-                modifier = Modifier.fillMaxWidth().padding(14.dp))
+-            OutlinedButton(onClick = { pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
+-                modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp).heightIn(min = 52.dp)) {
+-                Text(if (shot != null) "已选截图 ✓（点这里换一张）" else "加一张截图（可选）", fontSize = 16.sp)
++        PlusSection("报告问题") {
++            Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
++                OutlinedTextField(desc, { desc = it }, placeholder = { Text("写一句哪里不对就行") }, minLines = 3,
++                    shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth())
++                PlusRow(Icons.Outlined.Image, if (shot != null) "已选截图" else "加一张截图", if (shot != null) "点这里换一张" else "可选",
++                    onClick = { pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) })
++                PillButton("发给 Hark", Modifier.fillMaxWidth(), primary = desc.isNotBlank(), enabled = busy == null && desc.isNotBlank()) { manual() }
+             }
+-            Button(onClick = { manual() }, enabled = busy == null && desc.isNotBlank(),
+-                modifier = Modifier.fillMaxWidth().padding(14.dp).heightIn(min = 56.dp)) { Text("发给 Hark", fontSize = 18.sp) }
+         }
+     }
+ }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt
+index 2f21e6a..f8c8182 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt
+@@ -12,6 +12,13 @@ import androidx.compose.foundation.text.KeyboardOptions
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.outlined.Add
+ import androidx.compose.material.icons.outlined.Refresh
++import androidx.compose.material.icons.outlined.Bolt
++import androidx.compose.material.icons.outlined.Speed
++import androidx.compose.material.icons.outlined.Layers
++import androidx.compose.material.icons.outlined.Info
++import androidx.compose.material.icons.outlined.Memory
++import androidx.compose.material.icons.outlined.Shield
++import androidx.compose.ui.unit.sp
+ import androidx.compose.material3.Button
+ import androidx.compose.material3.FilterChip
+ import androidx.compose.material3.MaterialTheme
+@@ -40,19 +47,9 @@ import com.openminis.app.plus.SplitProxy
+ import kotlinx.coroutines.launch
+ 
+ @Composable
+-internal fun SwitchRow(title: String, sub: String?, checked: Boolean, onChange: (Boolean) -> Unit) {
+-    Row(
+-        Modifier.fillMaxWidth().clickable { onChange(!checked) }.padding(horizontal = 16.dp, vertical = 12.dp),
+-        verticalAlignment = Alignment.CenterVertically,
+-    ) {
+-        Column(Modifier.weight(1f)) {
+-            Text(title, style = MaterialTheme.typography.titleMedium)
+-            if (sub != null) Text(sub, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+-        }
+-        Spacer(Modifier.width(8.dp))
+-        Switch(checked, onCheckedChange = onChange)
+-    }
+-}
++internal fun SwitchRow(title: String, sub: String?, checked: Boolean, onChange: (Boolean) -> Unit) =
++    PlusRow(null, title, sub, chevron = false, onClick = { onChange(!checked) },
++        trailing = { Switch(checked, onCheckedChange = onChange) }) // [Mines-design-33]
+ 
+ /** 模型路由与分流: smart model routing + rule-based split proxy. */
+ @Composable
+@@ -67,40 +64,28 @@ fun RoutingScreen(onBack: () -> Unit) {
+     var note by remember { mutableStateOf("") }
+     LaunchedEffect(Unit) { SmartRouter.refreshIfStale(ctx) }
+ 
+-    PlusPage("模型路由与分流", onBack) {
+-        PlusSection("智能路由", footer = "开着时，「按顺序备用」的模型组先用最快、能连上的那个供应商；出错或超时会自动换下一个（也按快慢排）。") {
+-            SwitchRow("智能路由", "按速度和健康自动挑供应商", routerOn) { SmartRouter.setEnabled(ctx, it) }
++    PlusPage("模型路由与分流", onBack, subtitle = "自动挑最快、能用的模型和网络线路") {
++        PlusSection("智能路由") {
++            PlusRow(Icons.Outlined.Bolt, "智能路由", "先用最快的，出错自动换下一个", chevron = false,
++                onClick = { SmartRouter.setEnabled(ctx, !routerOn) }, trailing = { Switch(routerOn, onCheckedChange = { SmartRouter.setEnabled(ctx, it) }) })
+             PlusDivider()
+-            Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+-                Button(onClick = { scope.launch { SmartRouter.testAll(ctx) } }, enabled = !testing, modifier = Modifier.weight(1f)) {
+-                    Text(if (testing) "测速中…" else "立即测速")
+-                }
+-                OutlinedButton(onClick = {
+-                    val n = SmartRouter.buildSameModelGroups(ctx)
+-                    note = if (n == 0) "没有被多个供应商同时提供的模型" else "已生成/更新 $n 个「⚡」模型组，可以在模型选择里选它"
+-                }, modifier = Modifier.weight(1f)) { Text("同模型自动成组") }
+-            }
+-            if (note.isNotBlank()) Text(note, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp))
++            PlusRow(Icons.Outlined.Speed, if (testing) "测速中…" else "立即测速", "给每个供应商测一次快慢", onClick = { if (!testing) scope.launch { SmartRouter.testAll(ctx) } })
++            PlusDivider()
++            PlusRow(Icons.Outlined.Layers, "同模型自动成组", note.ifBlank { "多个供应商有同一个模型时合成一组" }, onClick = {
++                val n = SmartRouter.buildSameModelGroups(ctx)
++                note = if (n == 0) "没有被多个供应商同时提供的模型" else "已生成 $n 个「⚡」模型组"
++            })
+         }
+         val insts = config?.instances?.filter { it.isEnabled }.orEmpty()
+-        PlusSection("供应商速度", footer = "绿色 = 能连上，数字是响应时间；红色 = 连不上或出错。") {
+-            if (insts.isEmpty()) Text("还没有供应商", modifier = Modifier.padding(16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
++        PlusSection("供应商") {
++            if (insts.isEmpty()) PlusRow(Icons.Outlined.Info, "还没有供应商", chevron = false)
+             insts.sortedBy { stats[it.id]?.let { s -> if (s.ok) s.latencyMs else 100_000 + s.latencyMs } ?: 50_000 }
+                 .forEachIndexed { i, inst ->
+                     val s = stats[inst.id]
+-                    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+-                        Text(inst.label.ifBlank { inst.providerType.displayName }, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+-                        Text(
+-                            when {
+-                                s == null -> "未测"
+-                                s.ok -> "${s.latencyMs} ms"
+-                                s.code > 0 -> "出错 ${s.code}"
+-                                else -> "连不上"
+-                            },
+-                            style = MaterialTheme.typography.titleMedium,
+-                            color = when { s == null -> MaterialTheme.colorScheme.onSurfaceVariant; s.ok -> Color(0xFF34C759); else -> Color(0xFFFF3B30) },
+-                        )
+-                    }
++                    PlusRow(Icons.Outlined.Memory, inst.label.ifBlank { inst.providerType.displayName },
++                        when { s == null -> "还没测"; s.ok -> "响应 ${s.latencyMs} 毫秒"; s.code == 401 || s.code == 403 -> "密钥不对或没权限"; s.code == 429 -> "请求太多，被限流了"; s.code > 0 -> "服务出错，稍后再试"; else -> "网络连不上" },
++                        tint = if (s?.ok == true) Color(0xFF34C759) else if (s == null) minesAccent() else Color(0xFFFF6B5E), chevron = false,
++                        trailing = { StatusPill(when { s == null -> "未测"; s.ok -> "能用"; else -> "连不上" }, s?.ok) })
+                     if (i < insts.lastIndex) PlusDivider()
+                 }
+         }
+@@ -121,13 +106,12 @@ private fun SplitProxySection() {
+     var newMode by remember { mutableStateOf(SplitProxy.Mode.PROXY) }
+     fun applyToSandbox() = scope.launch { runCatching { com.openminis.app.sandbox.ExecutionCoordinator.broadcastProxyChange() } }
+ 
+-    PlusSection("分流代理", footer = when {
+-        s.enabled && !running -> "代理没能启动（端口 ${SplitProxy.PORT} 被占用？）"
+-        s.enabled && !s.hasUpstream -> "还没填代理服务器：标「代理」的网站现在会直连。"
+-        s.enabled -> "沙箱和 App 的网络按下面的规则走（App 内置浏览器不受影响）。"
+-        else -> "按网站决定走代理还是直连。需要你自己的代理服务器（HTTP 或 SOCKS5），这里不预填任何服务器。"
++    PlusSection("分流", footer = when {
++        s.enabled && !running -> "分流没能启动，重开一下 Mines 试试"
++        s.enabled && !s.hasUpstream -> "还没有代理：要走代理的网站现在会直连"
++        else -> null
+     }) {
+-        SwitchRow("开启分流", if (running) "运行中 · 127.0.0.1:${SplitProxy.PORT}" else null, s.enabled) { on ->
++        SwitchRow("开启分流", if (s.enabled && running) "国内直连，境外按规则走代理" else "按网站决定走代理还是直连", s.enabled) { on ->
+             SplitProxy.update(ctx) { it.copy(enabled = on) }; applyToSandbox()
+         }
+         PlusDivider()
+@@ -135,7 +119,7 @@ private fun SplitProxySection() {
+         PlusDivider()
+         SwitchRow("用于 App（模型请求等）", null, s.forApp) { on -> SplitProxy.update(ctx) { it.copy(forApp = on) } }
+     }
+-    PlusSection("代理服务器") {
++    PlusSection("自己填代理（可选）") {
+         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                 FilterChip(selected = s.upstreamType == "http", onClick = { SplitProxy.update(ctx) { it.copy(upstreamType = "http") } }, label = { Text("HTTP") })
+@@ -145,13 +129,14 @@ private fun SplitProxySection() {
+             OutlinedTextField(port, { port = it.filter(Char::isDigit).take(5) }, label = { Text("端口") }, singleLine = true,
+                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.fillMaxWidth())
+             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+-                Button(onClick = { SplitProxy.update(ctx) { it.copy(upstreamHost = host, upstreamPort = port.toIntOrNull() ?: 0) } }, modifier = Modifier.weight(1f)) { Text("保存") }
+-                OutlinedButton(onClick = { host = ""; port = ""; SplitProxy.update(ctx) { it.copy(upstreamHost = "", upstreamPort = 0) } }, modifier = Modifier.weight(1f)) { Text("清空") }
++                PillButton("保存", Modifier.weight(1f)) { SplitProxy.update(ctx) { it.copy(upstreamHost = host, upstreamPort = port.toIntOrNull() ?: 0) }; com.openminis.app.plus.PlusVaultLess.setAutoPrimary(ctx, false) }
++                PillButton("清空", Modifier.weight(1f), primary = false) { host = ""; port = ""; SplitProxy.update(ctx) { it.copy(upstreamHost = "", upstreamPort = 0) } }
+             }
+         }
+     }
+     ProxyAutoSection()
+-    PlusSection("没写规则的网站", footer = "自动 = 国内网站和国内软件源直连；pypi、npm、GitHub、Alpine 这类境外源有可用代理时直接走代理；其它网站先试直连（含 TLS 握手），不通再走代理，记住 30 分钟。代理连不上时一律直连，不会卡在坏代理上。") {
++    InfoLine("自动：国内直连，境外先试直连、不通再走代理；代理坏了一律直连")
++    PlusSection("没写规则的网站") {
+         Row(Modifier.padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+             SplitProxy.Mode.entries.forEach { m ->
+                 FilterChip(selected = s.defaultMode == m, onClick = { SplitProxy.update(ctx) { it.copy(defaultMode = m) } }, label = { Text(m.label) })
+@@ -164,7 +149,7 @@ private fun SplitProxySection() {
+             if (i < SplitProxy.presets.lastIndex) PlusDivider()
+         }
+     }
+-    PlusSection(if (s.rules.isEmpty()) "规则" else "规则 · ${s.rules.size}", footer = "写域名即可，自动包含子域名；以 . 开头表示后缀（如 .cn）。点模式可以切换。") {
++    PlusSection(if (s.rules.isEmpty()) "规则" else "规则 · ${s.rules.size}", footer = "写域名即可，含子域名；点模式可以切换") {
+         s.rules.sortedBy { it.pattern }.forEach { r ->
+             Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                 Text(r.pattern, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+@@ -183,15 +168,15 @@ private fun SplitProxySection() {
+             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                 SplitProxy.Mode.entries.forEach { m -> FilterChip(selected = newMode == m, onClick = { newMode = m }, label = { Text(m.label) }) }
+                 Spacer(Modifier.weight(1f))
+-                Button(enabled = newRule.isNotBlank() && !newRule.contains(' '), onClick = {
++                PillButton("添加", enabled = newRule.isNotBlank() && !newRule.contains(' ')) {
+                     val r = SplitProxy.Rule(newRule, newMode)
+                     SplitProxy.update(ctx) { st -> st.copy(rules = st.rules.filter { it.pattern != r.pattern } + r) }
+                     newRule = ""
+-                }) { Text("添加") }
++                }
+             }
+         }
+     }
+-    if (recent.isNotEmpty()) PlusSection("最近的连接") {
++    if (recent.isNotEmpty()) PlusSection("最近走的线路") {
+         recent.take(12).forEachIndexed { i, h ->
+             Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
+                 Text(h.host, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+@@ -223,17 +208,19 @@ private fun ProxyAutoSection() {
+             else if (st.all.any { it.key == u.key }) st
+             else st.copy(backups = st.backups + u)
+         }
++        if (s.primary == null) com.openminis.app.plus.PlusVaultLess.setAutoPrimary(ctx, true)
+         recheck()
+     }
+-    PlusSection("自动检测代理", footer = "会查系统代理和常见代理软件端口（Clash 7890/7891、v2rayNG 10808/10809、sing-box/NekoBox 2080、1080、Hiddify 12334）。第一个填成主代理，其余加为备用。") {
+-        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+-            Button(enabled = !busy, onClick = {
++    PlusSection("找代理") {
++        Column(Modifier.padding(horizontal = 16.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
++            Text("自动找手机上已经在跑的代理软件（Clash、v2rayNG 等）", fontSize = 14.sp, color = minesMuted())
++            PillButton(if (busy) "正在检测…" else "一键检测本机代理", Modifier.fillMaxWidth(), enabled = !busy) {
+                 scope.launch {
+                     busy = true
+                     found = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { SplitProxy.detect(ctx) }
+                     busy = false
+                 }
+-            }, modifier = Modifier.fillMaxWidth()) { Text(if (busy) "正在检测…" else "一键检测本机代理") }
++            }
+             found?.let { list ->
+                 if (list.isEmpty()) Text("没找到正在运行的代理。先打开代理软件（并开启「允许局域网/本地代理」或 HTTP 代理端口），再点一次。",
+                     style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+@@ -266,31 +253,41 @@ private fun ProxyAutoSection() {
+             }
+         }
+     }
+-    if (s.all.isNotEmpty()) PlusSection("代理列表 · 自动切换", footer = "每分钟检查一次（经代理连 www.gstatic.com）。当前代理连不上时自动换到下一个能用的，恢复后再切回主代理。") {
+-        SwitchRow("自动切换", null, s.autoSwitch) { on -> SplitProxy.update(ctx) { it.copy(autoSwitch = on) }; recheck() }
+-        s.all.forEachIndexed { i, u ->
++    // [Mines-design-33] working proxy first; plain reasons; dead auto-detected ones are dropped by SplitProxy
++    if (s.all.isNotEmpty()) PlusSection("代理") {
++        SwitchRow("坏了自动换", "每分钟检查一次，能用的排前面", s.autoSwitch) { on -> SplitProxy.update(ctx) { it.copy(autoSwitch = on) }; recheck() }
++        val primaryKey = s.all.first().key
++        s.all.sortedWith(compareBy({ if (it.key == current) 0 else 1 }, { if (health[it.key]?.ok == true) 0 else 1 })).forEach { u ->
+             PlusDivider()
+             val h = health[u.key]
+-            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+-                Column(Modifier.weight(1f)) {
+-                    Text((if (i == 0) "主 · " else "备用 · ") + "${u.host}:${u.port}" + (if (u.key == current) "  ← 正在用" else ""),
+-                        style = MaterialTheme.typography.bodyLarge)
+-                    Text(
+-                        (if (u.type == "socks5") "SOCKS5" else "HTTP") + (if (u.label.isNotBlank()) " · ${u.label}" else "") + " · " + when {
+-                            h == null -> "未检查"
+-                            h.ok -> "能用 ${h.ms} ms"
+-                            else -> "连不上" + (h.error?.let { "（${it.take(40)}）" } ?: "")
+-                        },
+-                        style = MaterialTheme.typography.bodyMedium,
+-                        color = when { h == null -> MaterialTheme.colorScheme.onSurfaceVariant; h.ok -> Color(0xFF34C759); else -> Color(0xFFFF3B30) },
+-                    )
+-                }
+-                if (i > 0) TextButton(onClick = { SplitProxy.update(ctx) { st -> st.copy(backups = st.backups.filter { it.key != u.key }) } }) {
+-                    Text("移除", color = Color(0xFFFF3B30))
+-                }
+-            }
++            val name = u.label.ifBlank { if (u.key == primaryKey) "我的代理" else "备用代理" }
++            PlusRow(Icons.Outlined.Shield, name + if (u.key == current) " · 正在用" else "",
++                when { h == null -> "还没检查"; h.ok -> "响应 ${h.ms} 毫秒"; else -> plainProxyReason(h.error) },
++                tint = if (h?.ok == true) Color(0xFF34C759) else if (h == null) minesAccent() else Color(0xFFFF6B5E), chevron = false,
++                trailing = {
++                    Row(verticalAlignment = Alignment.CenterVertically) {
++                        StatusPill(when { h == null -> "未查"; h.ok -> "能用"; else -> "连不上" }, h?.ok)
++                        if (u.key != primaryKey) TextButton(onClick = { SplitProxy.update(ctx) { st -> st.copy(backups = st.backups.filter { it.key != u.key }) } }) {
++                            Text("移除", color = minesMuted())
++                        }
++                    }
++                })
+         }
+         PlusDivider()
+         ActionRow(Icons.Outlined.Refresh, if (busy) "正在检查…" else "立即检查") { recheck() }
+     }
+ }
++
++
++/** [Mines-design-33] Raw socket errors → one plain reason. */
++internal fun plainProxyReason(e: String?): String {
++    val t = e.orEmpty().lowercase()
++    return when {
++        t.contains("refused") || t.contains("failed to connect") -> "代理软件没在运行"
++        t.contains("timeout") || t.contains("timed out") -> "太慢，超时了"
++        t.contains("407") || t.contains("auth") -> "需要账号密码"
++        t.contains("reset") || t.contains("closed") -> "连上后被断开"
++        t.contains("unknown host") || t.contains("unable to resolve") -> "地址不对"
++        else -> "暂时连不上"
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
 index 3ba9233..9d01590 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
@@ -1391,3 +2299,32 @@ index b03d115..c917306 100644
                                      // [Mines-login-32] Google / Apple sign-in always in Chrome
                                      external = true
                                      status = "Google / Apple 登录只能在 Chrome 里完成，已为你打开。登录好后回来点下面的按钮"
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt
+index 1d18f7f..5f57c45 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt
+@@ -343,21 +343,13 @@ private fun ServerRow(s: VpsServer, onClick: () -> Unit, onEdit: () -> Unit, onT
+ }
+ 
+ @Composable
+-internal fun ActionRow(icon: ImageVector, title: String, onClick: () -> Unit) {
+-    Row(
+-        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 14.dp),
+-        verticalAlignment = Alignment.CenterVertically,
+-    ) {
+-        MinesIcon(icon, null, tint = MaterialTheme.colorScheme.onSurface, modifier = Modifier.size(22.dp))
+-        Spacer(Modifier.width(12.dp))
+-        Text(title, color = MaterialTheme.colorScheme.onSurface)
+-    }
+-}
++internal fun ActionRow(icon: ImageVector, title: String, onClick: () -> Unit) =
++    PlusRow(icon, title, onClick = onClick) // [Mines-design-33]
+ 
+ @Composable
+ internal fun PlusDivider() {
+     Box(
+-        Modifier.fillMaxWidth().padding(start = 16.dp).height(0.5.dp)
++        Modifier.fillMaxWidth().padding(start = 66.dp, end = 16.dp).height(0.5.dp)
+             .background(MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+     )
+ }
