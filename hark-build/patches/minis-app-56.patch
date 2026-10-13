@@ -1,3 +1,48 @@
+diff --git a/src/android/app/src/main/java/com/openminis/app/agent/FailurePatternGuard.kt b/src/android/app/src/main/java/com/openminis/app/agent/FailurePatternGuard.kt
+index d485673..e661a6e 100644
+--- a/src/android/app/src/main/java/com/openminis/app/agent/FailurePatternGuard.kt
++++ b/src/android/app/src/main/java/com/openminis/app/agent/FailurePatternGuard.kt
+@@ -23,7 +23,7 @@ class FailurePatternGuard(private val limit: Int = 3) {
+ 
+     /** Returns a user-facing reason when this failure pattern hit [limit], else null. */
+     fun onResult(tool: String, isError: Boolean, content: String): String? {
+-        val sig = signature(content, isError) ?: return null
++        val sig = signature(content, isError, tool) ?: return null
+         val key = "$tool|$sig"
+         val n = (counts[key] ?: 0) + 1
+         counts[key] = n
+@@ -57,10 +57,29 @@ class FailurePatternGuard(private val limit: Int = 3) {
+             else -> t
+         }
+ 
++        /**
++         * [Mines-loop-34] For a tool that reported success, only a line that STARTS like an error
++         * report counts ("Error: …", "fatal: …", "Traceback …", "xxxException: …", "失败：…").
++         * Smoke run 21: memory_get returned the persona text, whose bullet "遇到失败先自己换办法重试"
++         * contains 失败 — three identical successful reads were stopped as a "failure loop".
++         */
++        private val errHeader = Regex(
++            "(?i)^(\\[?(error|err|fatal|exception|traceback|failed|failure|denied|refused|timeout|timed out|forbidden|unauthori[sz]ed|" +
++                "错误|失败|拒绝|超时|无法)\\]?[\\s:：!,，(]|[\\w.$]*(error|exception)\\b\\s*[:：(]|curl: \\(\\d+\\)|\\w+: (command )?not found)")
++
++        /** Tools that read stored text: their successful output is content, never a failure report. */
++        private fun isReader(tool: String): Boolean {
++            val t = tool.lowercase()
++            return t.startsWith("memory") || t.contains("read") || t.contains("knowledge") || t.contains("search") ||
++                t.startsWith("get_") || t.startsWith("list") || t == "file_list" || t == "skill_view"
++        }
++
+         /** Normalized signature of the first error-looking line, or null when [content] doesn't look like a failure. */
+-        fun signature(content: String, isError: Boolean): String? {
++        fun signature(content: String, isError: Boolean, tool: String = ""): String? {
++            if (!isError && isReader(tool)) return null
+             val head = content.take(4000)
+-            val line = head.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() && errWords.containsMatchIn(it) }
++            val line = (if (isError) head.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() && errWords.containsMatchIn(it) }
++                else head.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() && errHeader.containsMatchIn(it) })
+                 ?: if (isError) head.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() } else null
+             line ?: return null
+             return line.lowercase()
 diff --git a/src/android/app/src/main/java/com/openminis/app/browser/BrowserRenderCheck.kt b/src/android/app/src/main/java/com/openminis/app/browser/BrowserRenderCheck.kt
 new file mode 100644
 index 0000000..40b46b8
