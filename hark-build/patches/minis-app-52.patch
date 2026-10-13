@@ -1,11 +1,16 @@
 diff --git a/src/android/app/src/main/AndroidManifest.xml b/src/android/app/src/main/AndroidManifest.xml
-index 86531b5..65ffdcd 100644
+index 86531b5..9d16beb 100644
 --- a/src/android/app/src/main/AndroidManifest.xml
 +++ b/src/android/app/src/main/AndroidManifest.xml
-@@ -508,6 +508,18 @@
+@@ -508,6 +508,23 @@
              android:name=".plus.WakeWordService"
              android:exported="false"
              android:foregroundServiceType="microphone" />
++        <!-- [Mines-patrol-31] 账号巡查 (JobScheduler, ~4 h, network + battery not low) -->
++        <service
++            android:name=".plus.AccountPatrolJob"
++            android:permission="android.permission.BIND_JOB_SERVICE"
++            android:exported="false" />
 +        <!-- [Mines-voice-31] live voice call kept alive outside the voice page -->
 +        <service
 +            android:name=".plus.VoiceCallService"
@@ -81,6 +86,429 @@ index 7c9d587..dfd05ae 100755
  setup)
      need_ssh
      [ -n "$1" ] || { echo "usage: minis-vps setup user@host [port]" >&2; exit 2; }
+diff --git a/src/android/app/src/main/assets/mines-link/install-bundle.sh b/src/android/app/src/main/assets/mines-link/install-bundle.sh
+new file mode 100644
+index 0000000..3e55cde
+--- /dev/null
++++ b/src/android/app/src/main/assets/mines-link/install-bundle.sh
+@@ -0,0 +1,417 @@
++#!/bin/sh
++# Install the Mines link worker (systemd). Run as root on the server:
++#   sh install-bundle.sh [--port 8443] [--ssh-mux]        (self-contained; Mines → 服务器 → 一键安装 does this over SSH)
++#   or, with mines-link.py next to it:  sh install.sh [--port 8443] [--ssh-mux]
++# Re-running keeps the existing token and certificate (the phone stays paired).
++# Prints a one-line 连接码 for Mines (also saved in /etc/mines-link/phone.txt,
++# which Mines can read by itself over SSH).
++set -e
++PORT=8443; MUX=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --port) PORT="$2"; shift 2 ;;
++    --ssh-mux) MUX="--ssh-mux"; shift ;;
++    *) echo "unknown option $1"; exit 2 ;;
++  esac
++done
++[ "$(id -u)" = 0 ] || { echo "请用 root 运行"; exit 1; }
++command -v python3 >/dev/null || { (apt-get update -qq && apt-get install -y -qq python3) || yum install -y -q python3 || dnf install -y -q python3; }
++command -v openssl >/dev/null || { (apt-get install -y -qq openssl) || yum install -y -q openssl || dnf install -y -q openssl; }
++SRC="${MINES_LINK_SRC:-https://cdn.jsdelivr.net/gh/ddfc1991/openminis-agent-android@hark-minis-build/hark-build/vps-worker/mines-link.py}"
++mkdir -p /etc/mines-link /opt/mines-link
++if true; then cat > /opt/mines-link/mines-link.py <<'__MINES_EOF__'
++#!/usr/bin/env python3
++# Mines link worker — the phone's outbound, HTTPS-looking channel to this server.
++#
++# The phone (Mines app) opens ONE wss:// connection to this worker. Over it it
++# runs short commands and long jobs. Jobs run detached from the connection
++# (their own session/process group, output appended to a file), so a dropped
++# phone never kills them; on reconnect the phone resumes each job's output
++# from the exact byte offset it had. The brain stays on the phone: this worker
++# only executes, it never calls a model.
++#
++# Python 3.8+ stdlib only. TLS with a self-signed cert the phone pins by
++# SHA-256; a random token authenticates the phone.
++#
++# Optional --ssh-mux: the same port also carries SSH (connections that start
++# with "SSH-" or send nothing for 1.5 s are spliced to 127.0.0.1:22), so one
++# port 443 serves both the link and plain ssh.
++#
++# Protocol (JSON text frames):
++#  phone → {"t":"hello","token":…}                     ← {"t":"hello","ok":true,"host":…,"v":1}
++#          {"t":"ping","n":…}                          ← {"t":"pong","n":…}
++#          {"t":"exec","rid":…,"cmd":…,"timeout":s}    ← {"t":"res","rid":…,"code":n,"out":…}
++#          {"t":"run","id":…,"cmd":…}                  ← {"t":"started","id":…,"pid":n}   (idempotent per id)
++#          {"t":"sub","id":…,"since":off}              ← {"t":"ev","id":…,"off":o,"b":base64} … {"t":"exit","id":…,"code":n,"off":o}
++#          {"t":"stop","id":…}                         ← {"t":"stopped","id":…}
++#          {"t":"jobs"}                                ← {"t":"jobs","list":[{"id","state","code","size","started"}]}
++#          {"t":"stat","rid":…,"path":…}               ← {"t":"res","rid":…,"size":n,"sha256":…}
++#          {"t":"put","rid":…,"path":…,"off":o,"b":…}  ← {"t":"res","rid":…,"size":n}   (resumable, chunked upload)
++#          {"t":"get","rid":…,"path":…,"off":o,"len":n}← {"t":"res","rid":…,"b":…,"size":total}
++# SPDX-License-Identifier: GPL-3.0-or-later  (part of Mines, a continuation of OpenMinis)
++import argparse, asyncio, base64, hashlib, hmac, json, os, signal, socket, ssl, struct, sys, time
++
++VERSION = 1
++INTERNAL_TLS_PORT = 18443
++GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
++HOME = os.path.expanduser("~")
++JOBS = os.path.join(HOME, ".mines-link", "jobs")
++
++
++def log(*a):
++    print(time.strftime("%H:%M:%S"), *a, flush=True)
++
++
++# ---------------------------------------------------------------- websocket
++class WS:
++    def __init__(self, r, w):
++        self.r, self.w = r, w
++        self.lock = asyncio.Lock()
++        self.closed = False
++
++    async def recv(self):
++        buf = b""
++        opcode0 = None
++        while True:
++            h = await self.r.readexactly(2)
++            fin, op = h[0] & 0x80, h[0] & 0x0F
++            masked, ln = h[1] & 0x80, h[1] & 0x7F
++            if ln == 126:
++                ln = struct.unpack(">H", await self.r.readexactly(2))[0]
++            elif ln == 127:
++                ln = struct.unpack(">Q", await self.r.readexactly(8))[0]
++            if ln > 64 * 1024 * 1024:
++                raise ConnectionError("frame too large")
++            mask = await self.r.readexactly(4) if masked else b"\0\0\0\0"
++            data = bytearray(await self.r.readexactly(ln))
++            for i in range(ln):
++                data[i] ^= mask[i % 4]
++            if op == 8:
++                raise ConnectionError("closed by peer")
++            if op == 9:
++                await self.send_raw(10, bytes(data)); continue
++            if op == 10:
++                continue
++            if op != 0:
++                opcode0 = op
++            buf += bytes(data)
++            if fin:
++                return buf.decode("utf-8", "replace") if opcode0 == 1 else buf
++
++    async def send_raw(self, op, payload):
++        n = len(payload)
++        if n < 126:
++            hdr = bytes([0x80 | op, n])
++        elif n < 65536:
++            hdr = bytes([0x80 | op, 126]) + struct.pack(">H", n)
++        else:
++            hdr = bytes([0x80 | op, 127]) + struct.pack(">Q", n)
++        async with self.lock:
++            self.w.write(hdr + payload)
++            await self.w.drain()
++
++    async def send(self, obj):
++        if self.closed:
++            return
++        try:
++            await self.send_raw(1, json.dumps(obj, ensure_ascii=False).encode())
++        except Exception:
++            self.closed = True
++
++
++# ---------------------------------------------------------------- jobs
++def jdir(jid):
++    safe = "".join(c for c in jid if c.isalnum() or c in "._-")[:80]
++    if not safe:
++        raise ValueError("bad id")
++    return os.path.join(JOBS, safe)
++
++
++def start_job(jid, cmd):
++    d = jdir(jid)
++    if os.path.exists(os.path.join(d, "pid")):
++        return int(open(os.path.join(d, "pid")).read().strip() or 0)
++    os.makedirs(d, exist_ok=True)
++    open(os.path.join(d, "cmd"), "w").write(cmd)
++    open(os.path.join(d, "out"), "wb").close()
++    open(os.path.join(d, "started"), "w").write(str(int(time.time())))
++    # The wrapper writes the exit code; the job is its own session so it
++    # survives this worker restarting and the phone disconnecting.
++    wrapper = 'cd ~; sh "$0/cmd" >> "$0/out" 2>&1 < /dev/null; echo $? > "$0/rc.tmp"; mv "$0/rc.tmp" "$0/rc"'
++    p = __import__("subprocess").Popen(["sh", "-c", wrapper, d], stdin=open(os.devnull), stdout=open(os.devnull, "w"),
++                                        stderr=__import__("subprocess").STDOUT, start_new_session=True)
++    open(os.path.join(d, "pid"), "w").write(str(p.pid))
++    return p.pid
++
++
++def job_state(jid):
++    d = jdir(jid)
++    rc = os.path.join(d, "rc")
++    if os.path.exists(rc):
++        try:
++            return "done", int(open(rc).read().strip() or 1)
++        except ValueError:
++            return "done", 1
++    try:
++        pid = int(open(os.path.join(d, "pid")).read().strip())
++        os.kill(pid, 0)
++        return "running", None
++    except Exception:
++        return ("done", 1) if os.path.exists(os.path.join(d, "pid")) else ("missing", None)
++
++
++async def follow(ws, jid, since):
++    d = jdir(jid)
++    out = os.path.join(d, "out")
++    if not os.path.exists(out):
++        await ws.send({"t": "exit", "id": jid, "code": 127, "off": 0, "err": "no such job"}); return
++    off = max(0, int(since or 0))
++    while not ws.closed:
++        size = os.path.getsize(out)
++        if size > off:
++            with open(out, "rb") as f:
++                f.seek(off)
++                while off < size and not ws.closed:
++                    chunk = f.read(min(64 * 1024, size - off))
++                    if not chunk:
++                        break
++                    await ws.send({"t": "ev", "id": jid, "off": off, "b": base64.b64encode(chunk).decode()})
++                    off += len(chunk)
++        st, code = job_state(jid)
++        if st != "running" and os.path.getsize(out) <= off:
++            await ws.send({"t": "exit", "id": jid, "code": code if code is not None else 1, "off": off}); return
++        await asyncio.sleep(0.25)
++
++
++def list_jobs():
++    out = []
++    if not os.path.isdir(JOBS):
++        return out
++    for jid in sorted(os.listdir(JOBS))[-60:]:
++        st, code = job_state(jid)
++        d = jdir(jid)
++        try:
++            started = int(open(os.path.join(d, "started")).read())
++        except Exception:
++            started = 0
++        out.append({"id": jid, "state": st, "code": code, "size": os.path.getsize(os.path.join(d, "out")) if os.path.exists(os.path.join(d, "out")) else 0, "started": started})
++    return out
++
++
++def sha256_file(path):
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        for b in iter(lambda: f.read(1 << 20), b""):
++            h.update(b)
++    return h.hexdigest()
++
++
++def clean_path(p):
++    p = os.path.expanduser(p or "")
++    return p if os.path.isabs(p) else os.path.join(HOME, p)
++
++
++# ---------------------------------------------------------------- session
++async def session(ws, token, peer):
++    hello = json.loads(await asyncio.wait_for(ws.recv(), 20))
++    if hello.get("t") != "hello" or not hmac.compare_digest(str(hello.get("token", "")), token):
++        await ws.send({"t": "hello", "ok": False, "err": "bad token"}); return
++    await ws.send({"t": "hello", "ok": True, "host": socket.gethostname(), "v": VERSION})
++    log("phone connected", peer)
++    tasks = {}
++    while True:
++        m = json.loads(await asyncio.wait_for(ws.recv(), 90))  # phone pings every 15 s
++        t = m.get("t")
++        try:
++            if t == "ping":
++                await ws.send({"t": "pong", "n": m.get("n")})
++            elif t == "exec":
++                async def ex(m=m):
++                    try:
++                        p = await asyncio.create_subprocess_shell(m["cmd"], stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
++                                                                  stdin=asyncio.subprocess.DEVNULL, cwd=HOME, start_new_session=True)
++                        try:
++                            data, _ = await asyncio.wait_for(p.communicate(), float(m.get("timeout") or 60))
++                            code = p.returncode
++                        except asyncio.TimeoutError:
++                            try: os.killpg(p.pid, signal.SIGKILL)
++                            except Exception: pass
++                            data, code = b"(timeout)", 124
++                        await ws.send({"t": "res", "rid": m.get("rid"), "code": code, "out": data[-1_000_000:].decode("utf-8", "replace")})
++                    except Exception as e:
++                        await ws.send({"t": "res", "rid": m.get("rid"), "code": 1, "out": "worker error: %s" % e})
++                asyncio.ensure_future(ex())
++            elif t == "run":
++                pid = start_job(m["id"], m["cmd"])
++                await ws.send({"t": "started", "id": m["id"], "pid": pid, "rid": m.get("rid")})
++            elif t == "sub":
++                old = tasks.pop(m["id"], None)
++                if old: old.cancel()
++                tasks[m["id"]] = asyncio.ensure_future(follow(ws, m["id"], m.get("since", 0)))
++            elif t == "stop":
++                try:
++                    pid = int(open(os.path.join(jdir(m["id"]), "pid")).read())
++                    os.killpg(os.getpgid(pid), signal.SIGTERM)
++                except Exception:
++                    pass
++                await ws.send({"t": "stopped", "id": m["id"], "rid": m.get("rid")})
++            elif t == "jobs":
++                await ws.send({"t": "jobs", "list": list_jobs(), "rid": m.get("rid")})
++            elif t == "stat":
++                p = clean_path(m["path"])
++                if os.path.exists(p):
++                    await ws.send({"t": "res", "rid": m.get("rid"), "size": os.path.getsize(p), "sha256": sha256_file(p)})
++                else:
++                    await ws.send({"t": "res", "rid": m.get("rid"), "size": -1})
++            elif t == "put":
++                p = clean_path(m["path"]); os.makedirs(os.path.dirname(p) or HOME, exist_ok=True)
++                off = int(m.get("off", 0)); data = base64.b64decode(m.get("b", ""))
++                mode = "r+b" if os.path.exists(p) else "wb"
++                with open(p, mode) as f:
++                    f.truncate(off); f.seek(off); f.write(data)
++                await ws.send({"t": "res", "rid": m.get("rid"), "size": off + len(data)})
++            elif t == "get":
++                p = clean_path(m["path"]); off = int(m.get("off", 0)); ln = min(int(m.get("len", 1 << 20)), 4 << 20)
++                with open(p, "rb") as f:
++                    f.seek(off); data = f.read(ln)
++                await ws.send({"t": "res", "rid": m.get("rid"), "b": base64.b64encode(data).decode(), "size": os.path.getsize(p)})
++            else:
++                await ws.send({"t": "error", "err": "unknown " + str(t)})
++        except Exception as e:
++            await ws.send({"t": "error", "rid": m.get("rid"), "id": m.get("id"), "err": str(e)})
++
++
++# ---------------------------------------------------------------- http / tls / mux
++async def handle_tls(r, w, token, path):
++    peer = w.get_extra_info("peername")
++    try:
++        head = await asyncio.wait_for(r.readuntil(b"\r\n\r\n"), 15)
++        lines = head.decode("latin-1").split("\r\n")
++        req = lines[0].split(" ")
++        hdr = {l.split(":", 1)[0].strip().lower(): l.split(":", 1)[1].strip() for l in lines[1:] if ":" in l}
++        if len(req) < 2 or req[1].split("?")[0] != path or hdr.get("upgrade", "").lower() != "websocket":
++            body = b"<html><body>ok</body></html>"
++            w.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s" % (len(body), body))
++            await w.drain(); w.close(); return
++        acc = base64.b64encode(hashlib.sha1((hdr["sec-websocket-key"] + GUID).encode()).digest()).decode()
++        w.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n" % acc).encode())
++        await w.drain()
++        ws = WS(r, w)
++        await session(ws, token, peer)
++    except (asyncio.IncompleteReadError, ConnectionError, asyncio.TimeoutError, ssl.SSLError, OSError):
++        pass
++    except Exception as e:
++        log("session error", peer, e)
++    finally:
++        try: w.close()
++        except Exception: pass
++        log("phone gone", peer)
++
++
++async def splice(r1, w1, r2, w2):
++    try:
++        while True:
++            b = await r1.read(65536)
++            if not b:
++                break
++            w2.write(b); await w2.drain()
++    except Exception:
++        pass
++    finally:
++        try: w2.close()
++        except Exception: pass
++
++
++async def handle_mux(r, w, token, path, ctx, ssh_port):
++    """Plain TCP accept on the shared port: TLS → link; SSH or silence → sshd."""
++    try:
++        first = await asyncio.wait_for(r.read(1), 1.5)
++    except asyncio.TimeoutError:
++        first = b""
++    # TLS ClientHello → the internal TLS link listener; anything else → sshd.
++    target = INTERNAL_TLS_PORT if first == b"\x16" else ssh_port
++    try:
++        r2, w2 = await asyncio.open_connection("127.0.0.1", target)
++    except Exception:
++        w.close(); return
++    if first:
++        w2.write(first); await w2.drain()
++    await asyncio.gather(splice(r, w, r2, w2), splice(r2, w2, r, w))
++    return
++    try:
++        r2, w2 = await asyncio.open_connection("127.0.0.1", ssh_port)
++    except Exception:
++        w.close(); return
++    if first:
++        w2.write(first); await w2.drain()
++    await asyncio.gather(splice(r, w, r2, w2), splice(r2, w2, r, w))
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--port", type=int, default=8443)
++    ap.add_argument("--path", default="/mines")
++    ap.add_argument("--conf", default="/etc/mines-link")
++    ap.add_argument("--ssh-mux", action="store_true", help="also splice SSH on the same port to 127.0.0.1:22")
++    ap.add_argument("--ssh-port", type=int, default=22)
++    a = ap.parse_args()
++    token = open(os.path.join(a.conf, "token")).read().strip()
++    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
++    ctx.load_cert_chain(os.path.join(a.conf, "cert.pem"), os.path.join(a.conf, "key.pem"))
++    os.makedirs(JOBS, exist_ok=True)
++
++    async def run():
++        if a.ssh_mux:
++            inner = await asyncio.start_server(lambda r, w: handle_tls(r, w, token, a.path), host="127.0.0.1", port=INTERNAL_TLS_PORT, ssl=ctx)
++            srv = await asyncio.start_server(lambda r, w: handle_mux(r, w, token, a.path, ctx, a.ssh_port), host=None, port=a.port)
++        else:
++            srv = await asyncio.start_server(lambda r, w: handle_tls(r, w, token, a.path), host=None, port=a.port, ssl=ctx)
++        log("mines-link v%d listening on %d%s" % (VERSION, a.port, " (+ssh mux)" if a.ssh_mux else ""))
++        async with srv:
++            await srv.serve_forever()
++    asyncio.run(run())
++
++
++if __name__ == "__main__":
++    main()
++__MINES_EOF__
++else curl -fsSL --retry 3 "$SRC" -o /opt/mines-link/mines-link.py || curl -fsSL --retry 3 \
++  "https://raw.githubusercontent.com/ddfc1991/openminis-agent-android/hark-minis-build/hark-build/vps-worker/mines-link.py" -o /opt/mines-link/mines-link.py; fi
++python3 -c "import ast,sys;ast.parse(open('/opt/mines-link/mines-link.py').read())"
++cd /etc/mines-link
++[ -s token ] || (head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' > token)
++chmod 600 token
++if [ ! -s cert.pem ]; then
++  openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=$(hostname)" -keyout key.pem -out cert.pem >/dev/null 2>&1
++  chmod 600 key.pem
++fi
++PIN=$(openssl x509 -in cert.pem -outform der | openssl dgst -sha256 | awk '{print $NF}')
++if [ -n "$MUX" ] && [ "$PORT" = 443 ] && ss -ltnp 2>/dev/null | grep -q ':443 .*sshd'; then
++  echo "注意：443 端口现在被 sshd 占用。--ssh-mux 模式会自己把 SSH 转给 22 端口，请先从 sshd 配置里去掉 Port 443 再重跑。"; exit 1
++fi
++cat > /etc/systemd/system/mines-link.service <<EOF
++[Unit]
++Description=Mines link worker (phone's HTTPS channel)
++After=network-online.target
++[Service]
++ExecStart=/usr/bin/env python3 /opt/mines-link/mines-link.py --port $PORT $MUX
++Restart=always
++RestartSec=2
++User=root
++MemoryMax=200M
++[Install]
++WantedBy=multi-user.target
++EOF
++systemctl daemon-reload
++systemctl enable mines-link >/dev/null 2>&1
++systemctl restart mines-link
++command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q active && ufw allow "$PORT"/tcp >/dev/null || true
++command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1 && { firewall-cmd --permanent --add-port="$PORT"/tcp >/dev/null; firewall-cmd --reload >/dev/null; } || true
++IP=$(curl -s --max-time 5 https://api.ipify.org || hostname -I | awk '{print $1}')
++LINE="mines-link://$IP:$PORT/mines#token=$(cat token)&pin=$PIN"
++echo "$LINE" > /etc/mines-link/phone.txt; chmod 600 /etc/mines-link/phone.txt
++sleep 1
++systemctl is-active mines-link >/dev/null && echo "✓ mines-link 已运行（端口 $PORT）" || { echo "✗ 没启动成功："; journalctl -u mines-link -n 20 --no-pager; exit 1; }
++echo "云服务器安全组需要放行 TCP $PORT。"
++echo "Mines 连接码（在 Mines → 工作位置 → 服务器 → 快速线路 里会自动读取，也可以粘贴）："
++echo "$LINE"
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/AccountLabel.kt b/src/android/app/src/main/java/com/openminis/app/plus/AccountLabel.kt
 new file mode 100644
 index 0000000..0859d81
@@ -155,8 +583,173 @@ index 0000000..0859d81
 +        return "$m · $ident"
 +    }
 +}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/AccountPatrol.kt b/src/android/app/src/main/java/com/openminis/app/plus/AccountPatrol.kt
+new file mode 100644
+index 0000000..6c4f4c7
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/AccountPatrol.kt
+@@ -0,0 +1,159 @@
++package com.openminis.app.plus
++
++import android.app.NotificationChannel
++import android.app.NotificationManager
++import android.app.PendingIntent
++import android.app.job.JobInfo
++import android.app.job.JobParameters
++import android.app.job.JobScheduler
++import android.app.job.JobService
++import android.content.ComponentName
++import android.content.Context
++import android.content.Intent
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import org.json.JSONObject
++
++/**
++ * [Mines-patrol-31] 账号巡查: a battery-friendly background check of every
++ * connected account (JobScheduler, every ~4 h, only on network + battery not
++ * low). Per account: key / token still valid (one cheap auth call), balance
++ * low, rate-limited, server reachable. Result = 正常 / 注意 / 异常 + one line,
++ * shown as a dot on 账号连接. A notification goes out only for a NEW 异常
++ * (same reason is not repeated within 24 h).
++ *
++ * Not yet: login/security e-mails via Gmail, OAuth expiry dates, trial /
++ * credit expiry (no API) — noted for a later build.
++ */
++object AccountPatrol {
++    enum class Level(val label: String) { OK("正常"), WARN("注意"), BAD("异常") }
++    data class Status(val level: Level, val reason: String, val at: Long, val fix: String? = null)
++
++    private const val PREFS = "mines_account_patrol"
++    private const val JOB_ID = 73101
++    private const val CHANNEL = "mines_patrol"
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++
++    private val _status = MutableStateFlow<Map<String, Status>>(emptyMap())
++    val status: StateFlow<Map<String, Status>> = _status.asStateFlow()
++    private val _running = MutableStateFlow(false)
++    val running: StateFlow<Boolean> = _running.asStateFlow()
++
++    fun load(context: Context) {
++        if (_status.value.isNotEmpty()) return
++        val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++        val raw = p.getString("status", null) ?: return
++        runCatching {
++            val o = JSONObject(raw)
++            _status.value = o.keys().asSequence().associateWith { k ->
++                val e = o.getJSONObject(k)
++                Status(Level.valueOf(e.optString("level", "OK")), e.optString("reason"), e.optLong("at"), e.optString("fix").ifBlank { null })
++            }
++        }
++    }
++
++    private fun save(context: Context) {
++        val o = JSONObject()
++        _status.value.forEach { (k, s) -> o.put(k, JSONObject().put("level", s.level.name).put("reason", s.reason).put("at", s.at).put("fix", s.fix ?: "")) }
++        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("status", o.toString()).apply()
++    }
++
++    /** Problems for 消息汇总 (要处理). */
++    fun problems(): List<Pair<String, Status>> = _status.value.filter { it.value.level != Level.OK }.toList()
++
++    fun schedule(context: Context) {
++        val js = context.getSystemService(JobScheduler::class.java) ?: return
++        if (js.getPendingJob(JOB_ID) != null) return
++        runCatching {
++            js.schedule(JobInfo.Builder(JOB_ID, ComponentName(context, AccountPatrolJob::class.java))
++                .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
++                .setRequiresBatteryNotLow(true)
++                .setPeriodic(4 * 60 * 60 * 1000L, 60 * 60 * 1000L)
++                .setPersisted(false)
++                .build())
++        }
++    }
++
++    fun runNow(context: Context) { scope.launch { run(context.applicationContext) } }
++
++    suspend fun run(context: Context) = withContext(Dispatchers.IO) {
++        if (_running.value) return@withContext
++        _running.value = true
++        try {
++            load(context)
++            PlusVault.init(context)
++            val now = System.currentTimeMillis()
++            val out = HashMap<String, Status>()
++            for (e in PlusVault.entries.value.values) {
++                val secret = PlusVault.secret(e.kindId)
++                val base = PlusVault.baseId(e.kindId)
++                out[e.kindId] = if (secret != null && (e.via == "key" || e.via == "token" || e.via == "oauth" || base == "github")) {
++                    val r = KeyTester.test(base, secret)
++                    when {
++                        r.message.startsWith("测试时连不上") -> Status(Level.WARN, "这次没连上服务器，下次再试", now)
++                        !r.ok -> Status(Level.BAD, r.message, now, fix = if (KeyAgent.recipe(base) != null) "regen" else "relogin")
++                        r.needsCredit -> Status(Level.WARN, "余额不足，需要你自己充值", now)
++                        r.message.contains("限流") -> Status(Level.WARN, "最近被限流（429）", now)
++                        else -> Status(Level.OK, "密钥有效", now)
++                    }
++                } else Status(Level.OK, if (e.via == "web") "网页登录（不自动检查）" else "已连接", now)
++            }
++            // balances that are low
++            runCatching { Balances.refresh(context, 0) }.getOrNull()?.filter { it.low }?.forEach { b ->
++                val id = PlusVault.entries.value.keys.firstOrNull { PlusVault.kind(it)?.name?.let { n -> b.name.contains(n) || n.contains(b.name) } == true }
++                if (id != null && out[id]?.level != Level.BAD) out[id] = Status(Level.WARN, "余额低：${b.text}", now)
++            }
++            // servers
++            PlusPrefs.state.value.servers.filter { it.enabled }.forEach { s ->
++                out["vps:" + s.id] = if (s.lastLatencyMs >= 0 || MinesLink.states.value[s.id]?.first == MinesLink.State.ONLINE)
++                    Status(Level.OK, "服务器在线", now)
++                else Status(Level.BAD, "服务器 ${s.name.ifBlank { s.host }} 连不上：${s.lastError.lineSequence().firstOrNull().orEmpty().take(60)}", now, fix = "vps")
++            }
++            val before = _status.value
++            _status.value = out
++            save(context)
++            notifyNew(context, before, out)
++        } finally { _running.value = false }
++    }
++
++    private fun notifyNew(context: Context, before: Map<String, Status>, now: Map<String, Status>) {
++        val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++        val fresh = now.filter { (k, s) ->
++            s.level == Level.BAD && before[k]?.reason != s.reason &&
++                System.currentTimeMillis() - p.getLong("notified_" + (k + s.reason).hashCode(), 0) > 24 * 3600_000L
++        }
++        if (fresh.isEmpty()) return
++        fresh.forEach { (k, s) -> p.edit().putLong("notified_" + (k + s.reason).hashCode(), System.currentTimeMillis()).apply() }
++        val nm = context.getSystemService(NotificationManager::class.java) ?: return
++        if (nm.getNotificationChannel(CHANNEL) == null) nm.createNotificationChannel(NotificationChannel(CHANNEL, "账号巡查", NotificationManager.IMPORTANCE_DEFAULT))
++        val open = PendingIntent.getActivity(context, 73, Intent(context, com.openminis.app.MainActivity::class.java)
++            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
++        val first = fresh.entries.first()
++        val name = if (first.key.startsWith("vps:")) "服务器" else PlusVault.kind(first.key)?.name ?: first.key
++        runCatching {
++            nm.notify(73102, android.app.Notification.Builder(context, CHANNEL)
++                .setSmallIcon(com.openminis.app.R.drawable.ic_launcher_monochrome)
++                .setContentTitle(if (fresh.size == 1) "$name 有问题" else "${fresh.size} 个账号有问题")
++                .setContentText(first.value.reason)
++                .setContentIntent(open).setAutoCancel(true).build())
++        }
++    }
++}
++
++class AccountPatrolJob : JobService() {
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++    override fun onStartJob(params: JobParameters?): Boolean {
++        scope.launch {
++            runCatching { AccountPatrol.run(applicationContext) }
++            jobFinished(params, false)
++        }
++        return true
++    }
++    override fun onStopJob(params: JobParameters?): Boolean = true
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt b/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt
-index afc2dcd..97eb701 100644
+index afc2dcd..204d424 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt
 @@ -252,12 +252,14 @@ class DeskPetService : Service() {
@@ -239,7 +832,24 @@ index afc2dcd..97eb701 100644
          Overlays.update(wm, tv, lp)
      }
  
-@@ -570,7 +606,7 @@ class DeskPetService : Service() {
+@@ -559,6 +595,16 @@ class DeskPetService : Service() {
+         root.addView(label("余额", 13f, "#8A8079"))
+         val bal = label("读取中…", 14f, "#6B625C")
+         root.addView(bal)
++        // [Mines-digest-31] 消息汇总 top 3
++        val top = Digest.top(3)
++        if (top.isNotEmpty()) {
++            root.addView(label("消息（点开看全部）", 13f, "#8A8079"))
++            top.forEach { m ->
++                root.addView(label("· " + m.cat.label + "｜" + m.summary.ifBlank { m.title }.take(36), 15f).apply {
++                    setOnClickListener { closePanel(); openApp(com.openminis.app.ui.plus.PlusRoutes.DIGEST) }
++                })
++            }
++        }
+         // Quick actions
+         val row1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, dp(10), 0, 0) }
+         val row2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, dp(6), 0, 0) }
+@@ -570,7 +616,7 @@ class DeskPetService : Service() {
              setOnClickListener { onClick() }
          }
          val clp = { LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(6) } }
@@ -248,6 +858,254 @@ index afc2dcd..97eb701 100644
          row1.addView(chip("打开 Mines") { closePanel(); openApp(null) }, clp())
          row2.addView(chip("插件挂件") {
              closePanel()
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt b/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt
+new file mode 100644
+index 0000000..fc1b1e1
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt
+@@ -0,0 +1,242 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.async
++import kotlinx.coroutines.awaitAll
++import kotlinx.coroutines.coroutineScope
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.withContext
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import org.json.JSONArray
++import org.json.JSONObject
++import java.util.concurrent.TimeUnit
++import kotlin.math.exp
++
++/**
++ * [Mines-digest-31] 消息汇总: messages from the user's sources, ranked by an
++ * algorithm (not by time alone), all on the phone.
++ *
++ * Sources: phone notifications (WeChat, Gmail app, …) via the notification
++ * listener, GitHub notifications (connected GitHub token), GitHub Trending
++ * (daily, filtered by the follow list), 账号巡查 problems, and X posts read
++ * through the user's own logged-in X session (DigestX, WebView).
++ *
++ * score = 3·关注匹配 + 来源权重(学自点开/置顶/静音) + 2·紧急词 + 2.5·要处理
++ *         + 2·新鲜度(e^(−age/12h)) − 3·噪音(群发/通讯/赏金刷屏)
++ * Category: 要处理 / 可薅 / 可学 / 飙升 / 其他.
++ */
++object Digest {
++    enum class Cat(val label: String) { ACT("要处理"), DEAL("可薅"), LEARN("可学"), HOT("飙升"), OTHER("其他") }
++
++    data class Item(
++        val id: String,
++        val source: String,        // "微信", "GitHub", "Gmail", "X", "Trending", "账号巡查", app label
++        val sourceKey: String,     // weight key: package / "github" / "x:@user" …
++        val sender: String,
++        val title: String,
++        val summary: String,       // one line: what it needs from the user
++        val at: Long,
++        val url: String? = null,
++        val pkg: String? = null,
++        val stars: String? = null,
++        var score: Double = 0.0,
++        var cat: Cat = Cat.OTHER,
++        var pinned: Boolean = false,
++    )
++
++    private val _items = MutableStateFlow<List<Item>>(emptyList())
++    val items: StateFlow<List<Item>> = _items.asStateFlow()
++    private val _busy = MutableStateFlow(false)
++    val busy: StateFlow<Boolean> = _busy.asStateFlow()
++    @Volatile var lastError: String? = null; private set
++
++    private const val PREFS = "mines_digest"
++    private val http = OkHttpClient.Builder().connectTimeout(8, TimeUnit.SECONDS).readTimeout(15, TimeUnit.SECONDS).callTimeout(25, TimeUnit.SECONDS).build()
++
++    // ---- follow list + learned weights ----
++    fun follows(c: Context): List<String> = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("follows", null)
++        ?.split('\n')?.map { it.trim() }?.filter { it.isNotEmpty() }
++        ?: listOf("羊毛", "免费", "白嫖", "空投", "airdrop", "free credits", "giveaway", "教程", "Gemini", "Claude", "DeepSeek", "OKX", "BTC")
++    fun setFollows(c: Context, list: List<String>) = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("follows", list.joinToString("\n")).apply()
++    fun languages(c: Context): String = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("langs", "") ?: ""
++    fun setLanguages(c: Context, v: String) = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("langs", v).apply()
++
++    private fun weights(c: Context): JSONObject = runCatching { JSONObject(c.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("w", "{}")!!) }.getOrDefault(JSONObject())
++    private fun saveWeights(c: Context, w: JSONObject) = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("w", w.toString()).apply()
++    private fun toggleSet(c: Context, name: String, value: String?) {
++        val p = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++        val s = (p.getStringSet(name, emptySet()) ?: emptySet()).toMutableSet()
++        if (value == null) return; if (!s.add(value)) s.remove(value)
++        p.edit().putStringSet(name, s).apply()
++    }
++    private fun prefSet(c: Context, name: String): Set<String> = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getStringSet(name, emptySet()) ?: emptySet()
++
++    /** Feedback ---------------------------------------------------------- */
++    fun opened(c: Context, it: Item) { bump(c, it.sourceKey, 0.4); bump(c, "sender:" + it.sender, 0.6); rerank(c) }
++    fun pin(c: Context, it: Item) { toggleSet(c, "pinned", it.id); bump(c, "sender:" + it.sender, 1.0); rerank(c) }
++    fun mute(c: Context, it: Item) { toggleSet(c, "muted", it.sourceKey); rerank(c) }
++    fun notInterested(c: Context, it: Item) {
++        toggleSet(c, "hidden", it.id); bump(c, it.sourceKey, -0.8); bump(c, "sender:" + it.sender, -1.0); rerank(c)
++    }
++    private fun bump(c: Context, k: String, d: Double) {
++        val w = weights(c); w.put(k, (w.optDouble(k, 0.0) + d).coerceIn(-5.0, 5.0)); saveWeights(c, w)
++    }
++
++    // ---- scoring ----
++    private val urgent = Regex("(?i)urgent|asap|deadline|today|expire|expiring|due|紧急|马上|尽快|截止|到期|今天|逾期|最后")
++    private val action = Regex("(?i)approve|review requested|mention|assigned|security|sign-in|password|verify|payment|invoice|failed|2fa|login|请回复|回复我|审批|批准|验证码|安全|登录|异地|密码|付款|账单|扣款|失败|待处理|@你")
++    private val deal = Regex("(?i)free|giveaway|airdrop|coupon|discount|promo|credits|白嫖|羊毛|免费|空投|优惠|折扣|领取|赠送|福利|薅")
++    private val learn = Regex("(?i)tutorial|guide|how to|course|paper|learn|thread|docs|教程|指南|学习|课程|论文|入门|干货|笔记")
++    private val noise = Regex("(?i)newsletter|unsubscribe|digest|no-reply|noreply|marketing|bounty|claude-builders-bounty|weekly|推广|广告|订阅|退订|营销")
++
++    fun scoreAll(c: Context, raw: List<Item>): List<Item> {
++        val w = weights(c)
++        val fol = follows(c).map { it.lowercase() }
++        val pinned = prefSet(c, "pinned"); val muted = prefSet(c, "muted"); val hidden = prefSet(c, "hidden")
++        val now = System.currentTimeMillis()
++        // flood detection: one sender with many items in a day is noise (e.g. bounty bots)
++        val perSender = raw.groupingBy { it.sourceKey + "|" + it.sender }.eachCount()
++        return raw.filter { it.id !in hidden && it.sourceKey !in muted }.map { it ->
++            val text = (it.title + " " + it.summary + " " + it.sender).lowercase()
++            val f = fol.count { k -> text.contains(k) }.coerceAtMost(3)
++            val ageH = (now - it.at).coerceAtLeast(0) / 3_600_000.0
++            val flood = (perSender[it.sourceKey + "|" + it.sender] ?: 1) >= 8
++            val isAct = action.containsMatchIn(text) || it.source == "账号巡查"
++            val nz = (if (noise.containsMatchIn(text)) 1.0 else 0.0) + (if (flood) 1.0 else 0.0)
++            it.score = 3.0 * f + w.optDouble(it.sourceKey, 0.0) + w.optDouble("sender:" + it.sender, 0.0) +
++                (if (urgent.containsMatchIn(text)) 2.0 else 0.0) + (if (isAct) 2.5 else 0.0) +
++                2.0 * exp(-ageH / 12.0) - 3.0 * nz + (if (it.source == "Trending") 0.5 else 0.0)
++            it.pinned = it.id in pinned
++            if (it.pinned) it.score += 100.0
++            it.cat = when {
++                isAct && nz < 1 -> Cat.ACT
++                it.source == "Trending" || it.stars != null -> Cat.HOT
++                deal.containsMatchIn(text) -> Cat.DEAL
++                learn.containsMatchIn(text) -> Cat.LEARN
++                else -> Cat.OTHER
++            }
++            it
++        }.sortedByDescending { it.score }
++    }
++
++    private var lastRaw: List<Item> = emptyList()
++    fun rerank(c: Context) { _items.value = scoreAll(c, lastRaw) }
++
++    fun top(n: Int = 3): List<Item> = _items.value.take(n)
++
++    // ---- sources ----
++    private fun notifications(c: Context): List<Item> = runCatching {
++        val arr = com.openminis.app.offload.MinisNotificationListenerService.getActiveNotifications() ?: return emptyList()
++        val pm = c.packageManager
++        arr.filter { it.packageName != c.packageName && !it.isOngoing }.mapNotNull { sbn ->
++            val ex = sbn.notification.extras
++            val title = ex.getCharSequence(android.app.Notification.EXTRA_TITLE)?.toString().orEmpty()
++            val text = (ex.getCharSequence(android.app.Notification.EXTRA_BIG_TEXT) ?: ex.getCharSequence(android.app.Notification.EXTRA_TEXT))?.toString().orEmpty()
++            if (title.isBlank() && text.isBlank()) return@mapNotNull null
++            val app = runCatching { pm.getApplicationLabel(pm.getApplicationInfo(sbn.packageName, 0)).toString() }.getOrDefault(sbn.packageName)
++            val src = when { sbn.packageName.contains("tencent.mm") -> "微信"; sbn.packageName.contains("google.android.gm") -> "Gmail"; else -> app }
++            Item("n:" + sbn.key, src, sbn.packageName, title, title, oneLine(text), sbn.postTime, pkg = sbn.packageName)
++        }
++    }.getOrDefault(emptyList())
++
++    private fun ghToken() = (PlusVault.defaultAccount("github")?.let { PlusVault.secret(it) } ?: PlusVault.secret("github"))?.takeIf { it.isNotBlank() }
++
++    private fun githubNotifications(): List<Item> {
++        val t = ghToken() ?: return emptyList()
++        val body = http.newCall(Request.Builder().url("https://api.github.com/notifications?per_page=40")
++            .header("Authorization", "Bearer $t").header("Accept", "application/vnd.github+json").build()).execute().use { if (it.isSuccessful) it.body?.string() else null } ?: return emptyList()
++        val a = JSONArray(body)
++        return (0 until a.length()).map { i ->
++            val n = a.getJSONObject(i)
++            val repo = n.optJSONObject("repository")?.optString("full_name").orEmpty()
++            val sub = n.optJSONObject("subject") ?: JSONObject()
++            val reason = n.optString("reason")
++            val need = when (reason) {
++                "review_requested" -> "请你审代码"; "mention", "team_mention" -> "有人 @你"; "assign" -> "分配给你"
++                "security_alert" -> "安全警告"; "ci_activity" -> "CI 结果"; "author" -> "你发起的有更新"; else -> "有更新"
++            }
++            val apiUrl = sub.optString("url")
++            val web = apiUrl.replace("https://api.github.com/repos/", "https://github.com/").replace("/pulls/", "/pull/")
++            Item("gh:" + n.optString("id"), "GitHub", "github:$repo", repo, sub.optString("title"), "$need · ${sub.optString("type")} · ${sub.optString("title")}".take(120),
++                java.time.Instant.parse(n.optString("updated_at", "1970-01-01T00:00:00Z")).toEpochMilli(), url = web.ifBlank { "https://github.com/notifications" })
++        }
++    }
++
++    /** github.com/trending (daily), filtered by the user's languages; each item shows stars gained. */
++    private fun trending(c: Context): List<Item> {
++        val langs = languages(c).split(',', ' ', '，').map { it.trim().lowercase() }.filter { it.isNotEmpty() }
++        val urls = if (langs.isEmpty()) listOf("https://github.com/trending?since=daily") else langs.take(3).map { "https://github.com/trending/${java.net.URLEncoder.encode(it, "UTF-8")}?since=daily" }
++        val out = ArrayList<Item>()
++        for (u in urls) {
++            val html = runCatching { http.newCall(Request.Builder().url(u).header("User-Agent", MINES_MOBILE_UA).build()).execute().use { it.body?.string() } }.getOrNull() ?: continue
++            html.split("<article").drop(1).take(15).forEach { art ->
++                val repo = Regex("""<h2[^>]*>\s*<a[^>]*href="/([^"]+)"""").find(art)?.groupValues?.get(1)?.trim() ?: return@forEach
++                val desc = Regex("""<p[^>]*>([\s\S]*?)</p>""").find(art)?.groupValues?.get(1)?.replace(Regex("<[^>]+>"), "")?.trim().orEmpty()
++                val stars = Regex("""([\d,]+)\s+stars\s+today""").find(art)?.groupValues?.get(1)
++                out += Item("tr:$repo", "Trending", "trending", repo.substringBefore('/'), repo, oneLine((stars?.let { "今日 +$it ★ · " } ?: "") + desc),
++                    System.currentTimeMillis() - 3_600_000, url = "https://github.com/$repo", stars = stars)
++            }
++        }
++        return out.distinctBy { it.id }
++    }
++
++    private fun patrol(): List<Item> = AccountPatrol.problems().map { (k, s) ->
++        val name = if (k.startsWith("vps:")) "服务器" else PlusVault.kind(k)?.name ?: k
++        Item("pt:$k:${s.reason.hashCode()}", "账号巡查", "patrol", name, "$name：${s.level.label}", s.reason, s.at)
++    }
++
++    private fun oneLine(s: String) = s.replace(Regex("\\s+"), " ").trim().take(140)
++
++    suspend fun refresh(c: Context) = withContext(Dispatchers.IO) {
++        if (_busy.value) return@withContext
++        _busy.value = true
++        try {
++            PlusVault.init(c)
++            val errs = ArrayList<String>()
++            val parts = coroutineScope {
++                listOf(
++                    async { notifications(c) },
++                    async { runCatching { githubNotifications() }.getOrElse { errs += "GitHub：${it.message}"; emptyList() } },
++                    async { runCatching { trending(c) }.getOrElse { errs += "Trending：${it.message}"; emptyList() } },
++                    async { patrol() },
++                    async { DigestX.cached() },
++                ).awaitAll()
++            }
++            lastRaw = parts.flatten()
++            lastError = errs.joinToString("；").ifBlank { null }
++            _items.value = scoreAll(c, lastRaw)
++        } finally { _busy.value = false }
++    }
++}
++
++/**
++ * [Mines-digest-31] X / Twitter through the user's own logged-in X session
++ * (the shared WebView cookie jar — log in once under 账号连接 → X). Reads the
++ * search page for followed keywords (live) and bookmarks; no paid API.
++ */
++object DigestX {
++    @Volatile private var cache: List<Digest.Item> = emptyList()
++    fun cached() = cache
++    fun store(items: List<Digest.Item>) { cache = items }
++
++    /** JS run on x.com pages: posts as JSON [{u,t,url,ts}]. */
++    const val EXTRACT_JS = """(function(){var out=[];document.querySelectorAll('article[data-testid=tweet]').forEach(function(a){
++      try{var u=(a.querySelector('[data-testid=User-Name]')||{}).innerText||'';var t=(a.querySelector('[data-testid=tweetText]')||{}).innerText||'';
++      var l=a.querySelector('a[href*="/status/"]');var tm=a.querySelector('time');
++      out.push({u:u.split('\n')[0],h:(u.match(/@\w+/)||[''])[0],t:t,url:l?l.href:'',ts:tm?tm.getAttribute('datetime'):''});}catch(e){}});return JSON.stringify(out.slice(0,25));})()"""
++
++    fun parse(json: String, query: String): List<Digest.Item> = runCatching {
++        val a = JSONArray(json)
++        (0 until a.length()).mapNotNull { i ->
++            val o = a.getJSONObject(i)
++            val t = o.optString("t"); if (t.isBlank()) return@mapNotNull null
++            val ts = runCatching { java.time.Instant.parse(o.optString("ts")).toEpochMilli() }.getOrDefault(System.currentTimeMillis())
++            Digest.Item("x:" + o.optString("url").ifBlank { t.hashCode().toString() }, "X", "x:" + o.optString("h"), o.optString("u"),
++                t.take(80), (if (query.isNotBlank()) "「$query」 · " else "") + t.replace(Regex("\\s+"), " ").take(130), ts, url = o.optString("url").ifBlank { null })
++        }
++    }.getOrDefault(emptyList())
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt b/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
 index 35deb04..8cdf37b 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
@@ -1444,7 +2302,7 @@ index a5dfd02..ad59d59 100644
              ?.putString("wakeText", next.wakeText)
              ?.apply()
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt
-index 29672dd..853cc62 100644
+index 29672dd..f605cbb 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt
 @@ -41,9 +41,46 @@ object PlusVps {
@@ -1541,12 +2399,13 @@ index 29672dd..853cc62 100644
              put("MINIS_VPS_SERVERS", list.ifEmpty { "none" },
                  "Mines Plus 服务器列表，按延迟排序；minis-vps 自动选第一个可用的，断开切下一台")
          }.onFailure { Log.w(TAG, "env sync failed: ${it.message}") }
-@@ -201,6 +250,21 @@ object PlusVps {
+@@ -201,6 +250,22 @@ object PlusVps {
       * the effective mode from local back to VPS on its own.
       */
      fun startMonitor(context: Context) {
 +        appContext = context.applicationContext
 +        LinkBridge.start(context)
++        AccountPatrol.load(context); AccountPatrol.schedule(context)
 +        // [Mines-vps-31] one-time: known backup routes for the user's two boxes (identified by IP;
 +        // the user can change them in 编辑服务器). 梦云 → Cloudflare tunnel first; Aliyun HK → 443 then Tailscale.
 +        val mp = context.getSharedPreferences("mines_vps_routes", Context.MODE_PRIVATE)
@@ -1563,7 +2422,7 @@ index 29672dd..853cc62 100644
          val appCtx = context.applicationContext
          PlusPrefs.init(appCtx)
          registerNetworkCallback(appCtx)
-@@ -228,7 +292,7 @@ object PlusVps {
+@@ -228,7 +293,7 @@ object PlusVps {
              val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
              cm.registerDefaultNetworkCallback(object : android.net.ConnectivityManager.NetworkCallback() {
                  override fun onAvailable(network: android.net.Network) {
@@ -1572,7 +2431,7 @@ index 29672dd..853cc62 100644
                  }
                  override fun onLost(network: android.net.Network) { VpsSsh.dropAll() }
              })
-@@ -301,6 +365,13 @@ object PlusVps {
+@@ -301,6 +366,13 @@ object PlusVps {
              val (ms, why) = bannerProbe(s.host, s.port, null, null, 0)
              out += RouteTry("直连", "", ms >= 0, ms, why)
          }.onFailure { out += RouteTry("直连", "", false, -2, VpsSsh.reason(it)) }
@@ -2010,13 +2869,16 @@ index 575a8ec..0b868be 100644
                  kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.KnowledgeBase.runTool(context, argsJson) }
              else -> ToolExecutionResult("Unknown tool: $name", false)
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt b/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
-index c71b8de..d4bdb27 100644
+index c71b8de..4e8e0c8 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
-@@ -667,6 +667,9 @@ fun AppNavigation(
+@@ -667,6 +667,12 @@ fun AppNavigation(
          composable(com.openminis.app.ui.plus.PlusRoutes.VERIFY) {
              com.openminis.app.ui.plus.VerifyScreen(onBack = { navController.safePopBackStack() })
          }
++        composable(com.openminis.app.ui.plus.PlusRoutes.DIGEST) {
++            com.openminis.app.ui.plus.DigestScreen(onBack = { navController.safePopBackStack() })
++        }
 +        composable(com.openminis.app.ui.plus.PlusRoutes.REPORT) {
 +            com.openminis.app.ui.plus.ReportScreen(onBack = { navController.safePopBackStack() })
 +        }
@@ -2024,13 +2886,18 @@ index c71b8de..d4bdb27 100644
              com.openminis.app.ui.plus.UpdateScreen(onBack = { navController.safePopBackStack() })
          }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
-index 821f094..f4b4652 100644
+index 821f094..c24c8b2 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
-@@ -186,6 +186,16 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+@@ -186,6 +186,21 @@ fun ConnectionsScreen(onBack: () -> Unit) {
              )
          }
          val bases = entries.keys.map { PlusVault.baseId(it) }.distinct().sorted().mapNotNull { PlusVault.kind(it) }
++        val patrol by com.openminis.app.plus.AccountPatrol.status.collectAsState()
++        val patrolRunning by com.openminis.app.plus.AccountPatrol.running.collectAsState()
++        LaunchedEffect(Unit) { com.openminis.app.plus.AccountPatrol.load(context) }
++        if (entries.isNotEmpty()) TextButton(onClick = { com.openminis.app.plus.AccountPatrol.runNow(context) }, enabled = !patrolRunning,
++            modifier = Modifier.padding(horizontal = 12.dp)) { Text(if (patrolRunning) "正在巡查…" else "立即巡查所有账号", fontSize = 15.sp) }
 +        // [Mines-accounts-31] Fill in a missing account name once from the provider's "who am I" API.
 +        LaunchedEffect(entries.size) {
 +            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
@@ -2044,19 +2911,34 @@ index 821f094..f4b4652 100644
          if (bases.isNotEmpty()) {
              PlusSection("已连接 · ${entries.size} 个账号", footer = "每个服务可以连多个账号。点 ☆ 设为默认账号：AI 不指定账号时用默认的。") {
                  bases.forEachIndexed { i, base ->
-@@ -218,8 +228,9 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+@@ -218,9 +233,23 @@ fun ConnectionsScreen(onBack: () -> Unit) {
                                      tint = if (isDef) Color(0xFFFFB300) else MaterialTheme.colorScheme.onSurfaceVariant)
                              }
                              Column(Modifier.weight(1f)) {
 -                                Text(e?.account?.takeIf { it.isNotBlank() } ?: "账号 ${id.substringAfter('#', "1")}",
 -                                    fontSize = 13.sp)
+-                                Text(if (isDef) "已连接 · 默认" else "已连接", fontSize = 13.sp, color = Green)
 +                                // [Mines-accounts-31] login method + masked identity instead of "账号 1"
 +                                val kindOf = PlusVault.kind(id) ?: base
 +                                Text(com.openminis.app.plus.AccountLabel.row(id, kindOf, e), fontSize = 15.sp)
-                                 Text(if (isDef) "已连接 · 默认" else "已连接", fontSize = 13.sp, color = Green)
++                                // [Mines-patrol-31] status dot + one-line reason from 账号巡查
++                                val ps = patrol[id]
++                                val dotColor = when (ps?.level) {
++                                    com.openminis.app.plus.AccountPatrol.Level.BAD -> Color(0xFFD93025)
++                                    com.openminis.app.plus.AccountPatrol.Level.WARN -> Color(0xFFE8A200)
++                                    else -> Green
++                                }
++                                Row(verticalAlignment = Alignment.CenterVertically) {
++                                    Box(Modifier.size(10.dp).clip(androidx.compose.foundation.shape.CircleShape).background(dotColor))
++                                    Spacer(Modifier.width(6.dp))
++                                    Text((ps?.level?.label ?: "已连接") + (if (isDef) " · 默认" else "") +
++                                        (ps?.reason?.takeIf { ps?.level != com.openminis.app.plus.AccountPatrol.Level.OK }?.let { " · $it" } ?: ""),
++                                        fontSize = 14.sp, color = if (ps?.level == com.openminis.app.plus.AccountPatrol.Level.BAD) Color(0xFFD93025) else MaterialTheme.colorScheme.onSurfaceVariant)
++                                }
                              }
                              MinesIcon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
-@@ -351,7 +362,11 @@ private fun ConnectionDetailScreen(
+                         }
+@@ -351,7 +380,11 @@ private fun ConnectionDetailScreen(
              Column(Modifier.weight(1f)) {
                  Text(kind.name, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
                  Text(
@@ -2069,7 +2951,7 @@ index 821f094..f4b4652 100644
                      fontSize = 13.sp,
                      color = if (entry != null) Green else MaterialTheme.colorScheme.onSurfaceVariant,
                  )
-@@ -405,6 +420,10 @@ private fun ConnectionDetailScreen(
+@@ -405,6 +438,10 @@ private fun ConnectionDetailScreen(
              ConnMethod.CALENDAR -> CalendarBlock(kind)
              ConnMethod.A11Y -> A11yBlock(kind, resumes)
          }
@@ -2080,7 +2962,7 @@ index 821f094..f4b4652 100644
          if (kind.alsoKey && kind.method == ConnMethod.WEB) {
              PlusSection("也可以只用 ${kind.keyLabel}", footer = "用 ${kind.keyLabel} 时，AI 在沙箱里通过 ${kind.envKey} 调 API，不需要邮箱。") {
                  KeyBlockBody(kind, resumes, false)
-@@ -622,7 +641,9 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
+@@ -622,7 +659,9 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
      }
  
      Column(Modifier.fillMaxWidth()) {
@@ -2091,7 +2973,7 @@ index 821f094..f4b4652 100644
          val f = found
          if (f != null) {
              Column(
-@@ -712,3 +733,42 @@ private fun A11yBlock(kind: ConnectionKind, resumes: Int) {
+@@ -712,3 +751,42 @@ private fun A11yBlock(kind: ConnectionKind, resumes: Int) {
      }
  }
  
@@ -2132,6 +3014,198 @@ index 821f094..f4b4652 100644
 +    if (open) KeyAgentDialog(kind) { saved ->
 +        open = false
 +        if (saved) Toast.makeText(context, "已连接 ${kind.name}", Toast.LENGTH_SHORT).show()
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
+new file mode 100644
+index 0000000..3fc5462
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
+@@ -0,0 +1,186 @@
++package com.openminis.app.ui.plus
++
++import android.annotation.SuppressLint
++import android.content.Intent
++import android.net.Uri
++import android.webkit.WebView
++import android.webkit.WebViewClient
++import androidx.compose.foundation.background
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.horizontalScroll
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.Button
++import androidx.compose.material3.FilterChip
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import com.openminis.app.plus.Digest
++import com.openminis.app.plus.DigestX
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.suspendCancellableCoroutine
++import kotlin.coroutines.resume
++
++/** [Mines-digest-31] 消息汇总 page: ranked, categorised, big text, one tap opens the source. */
++@Composable
++fun DigestScreen(onBack: () -> Unit) {
++    val context = LocalContext.current
++    val items by Digest.items.collectAsState()
++    val busy by Digest.busy.collectAsState()
++    val scope = rememberCoroutineScope()
++    var cat by remember { mutableStateOf<Digest.Cat?>(null) }
++    var menuFor by remember { mutableStateOf<Digest.Item?>(null) }
++    var editFollows by remember { mutableStateOf(false) }
++    var xTick by remember { mutableStateOf(0) }
++    LaunchedEffect(Unit) { Digest.refresh(context); xTick++ }
++
++    // X: read the user's own logged-in session in an off-screen WebView (followed keywords, live).
++    if (xTick > 0) XReader(xTick) { scope.launch { Digest.refresh(context) } }
++
++    PlusPage("消息汇总", onBack) {
++        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 8.dp),
++            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++            FilterChip(cat == null, { cat = null }, label = { Text("全部 ${items.size}", fontSize = 16.sp) })
++            Digest.Cat.values().forEach { c ->
++                val n = items.count { it.cat == c }
++                if (n > 0 || c != Digest.Cat.OTHER) FilterChip(cat == c, { cat = if (cat == c) null else c }, label = { Text("${c.label} $n", fontSize = 16.sp) })
++            }
++        }
++        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++            Button(onClick = { scope.launch { Digest.refresh(context) }; xTick++ }, enabled = !busy, modifier = Modifier.weight(1f).heightIn(min = 52.dp)) {
++                Text(if (busy) "正在汇总…" else "刷新", fontSize = 17.sp)
++            }
++            TextButton(onClick = { editFollows = true }, modifier = Modifier.heightIn(min = 52.dp)) { Text("关注的内容", fontSize = 16.sp) }
++        }
++        Digest.lastError?.let { Text(it, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(horizontal = 16.dp)) }
++        if (!com.openminis.app.offload.MinisNotificationListenerService.isEnabled(context)) {
++            TextButton(onClick = {
++                runCatching { context.startActivity(Intent(android.provider.Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
++            }, modifier = Modifier.padding(horizontal = 8.dp)) { Text("打开「通知使用权」，微信等应用的消息才能汇总进来", fontSize = 15.sp) }
++        }
++        val shown = items.filter { cat == null || it.cat == cat }
++        if (shown.isEmpty() && !busy) Text("现在没有需要看的消息", fontSize = 17.sp, modifier = Modifier.padding(20.dp))
++        shown.take(80).forEach { it -> DigestRow(it, onOpen = {
++            Digest.opened(context, it)
++            val u = it.url
++            runCatching {
++                if (u != null) context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(u)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
++                else it.pkg?.let { p -> context.packageManager.getLaunchIntentForPackage(p)?.let { li -> context.startActivity(li.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) } }
++            }
++        }, onMenu = { menuFor = it }) }
++    }
++
++    menuFor?.let { m ->
++        AlertDialog(onDismissRequest = { menuFor = null }, title = { Text(m.source + " · " + m.sender, maxLines = 1) },
++            text = {
++                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                    Button(onClick = { Digest.pin(context, m); menuFor = null }, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) { Text(if (m.pinned) "取消置顶" else "置顶", fontSize = 17.sp) }
++                    Button(onClick = { Digest.mute(context, m); menuFor = null }, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) { Text("静音此来源", fontSize = 17.sp) }
++                    Button(onClick = { Digest.notInterested(context, m); menuFor = null }, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) { Text("不感兴趣", fontSize = 17.sp) }
++                }
++            }, confirmButton = { TextButton(onClick = { menuFor = null }) { Text("关闭") } })
++    }
++    if (editFollows) {
++        var text by remember { mutableStateOf(Digest.follows(context).joinToString("\n")) }
++        var langs by remember { mutableStateOf(Digest.languages(context)) }
++        AlertDialog(onDismissRequest = { editFollows = false }, title = { Text("关注的内容") },
++            text = {
++                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                    Text("一行一个：关键词、人名、仓库、币种或项目。匹配到的消息会排在前面，X 也会按这些词搜索。", fontSize = 14.sp)
++                    OutlinedTextField(text, { text = it }, minLines = 5, modifier = Modifier.fillMaxWidth())
++                    OutlinedTextField(langs, { langs = it }, label = { Text("GitHub Trending 语言（如 python, kotlin）") }, singleLine = true)
++                }
++            },
++            confirmButton = { Button(onClick = {
++                Digest.setFollows(context, text.lines()); Digest.setLanguages(context, langs); editFollows = false
++                scope.launch { Digest.refresh(context) }; xTick++
++            }) { Text("保存") } },
++            dismissButton = { TextButton(onClick = { editFollows = false }) { Text("取消") } })
++    }
++}
++
++@Composable
++private fun DigestRow(it: Digest.Item, onOpen: () -> Unit, onMenu: () -> Unit) {
++    val catColor = when (it.cat) {
++        Digest.Cat.ACT -> Color(0xFFD93025); Digest.Cat.DEAL -> Color(0xFF1E8E3E); Digest.Cat.LEARN -> Color(0xFF1A73E8)
++        Digest.Cat.HOT -> Color(0xFFE37400); Digest.Cat.OTHER -> Color(0xFF80868B)
++    }
++    Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 5.dp).clip(RoundedCornerShape(16.dp))
++        .background(MaterialTheme.colorScheme.surfaceContainerLow).clickable(onClick = onOpen).padding(12.dp),
++        verticalAlignment = Alignment.CenterVertically) {
++        Box(Modifier.size(44.dp).clip(RoundedCornerShape(12.dp)).background(catColor.copy(alpha = 0.15f)), contentAlignment = Alignment.Center) {
++            Text(sourceGlyph(it.source), fontSize = 18.sp, fontWeight = FontWeight.Bold, color = catColor)
++        }
++        Spacer(Modifier.width(12.dp))
++        Column(Modifier.weight(1f)) {
++            Text((if (it.pinned) "📌 " else "") + it.cat.label + " · " + it.source + (if (it.sender.isNotBlank() && it.sender != it.title) " · " + it.sender else ""),
++                fontSize = 13.sp, color = catColor, maxLines = 1, overflow = TextOverflow.Ellipsis)
++            Text(it.summary.ifBlank { it.title }, fontSize = 17.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
++        }
++        TextButton(onClick = onMenu) { Text("⋯", fontSize = 22.sp) }
++    }
++}
++
++private fun sourceGlyph(s: String) = when (s) {
++    "微信" -> "微"; "GitHub" -> "GH"; "Trending" -> "★"; "X" -> "X"; "Gmail" -> "M"; "账号巡查" -> "!"; else -> s.take(1)
++}
++
++/** Loads x.com searches for the first followed keywords in a hidden WebView (user's own cookies), extracts posts. */
++@SuppressLint("SetJavaScriptEnabled")
++@Composable
++private fun XReader(tick: Int, onDone: () -> Unit) {
++    val context = LocalContext.current
++    LaunchedEffect(tick) {
++        val wv = WebView(context).apply {
++            settings.javaScriptEnabled = true; settings.domStorageEnabled = true
++            settings.userAgentString = com.openminis.app.plus.MINES_MOBILE_UA
++            webViewClient = WebViewClient()
++        }
++        suspend fun eval(js: String): String = suspendCancellableCoroutine { c ->
++            wv.evaluateJavascript(js) { r -> if (c.isActive) c.resume(runCatching { org.json.JSONTokener(r ?: "\"\"").nextValue() as? String }.getOrNull() ?: "") }
++        }
++        val out = ArrayList<Digest.Item>()
++        val qs = Digest.follows(context).take(4)
++        try {
++            for (q in qs) {
++                wv.loadUrl("https://x.com/search?q=" + Uri.encode(q) + "&f=live")
++                var got = ""
++                repeat(8) { if (got.length < 10) { delay(1500); got = eval(DigestX.EXTRACT_JS) } }
++                out += DigestX.parse(got, q)
++            }
++            wv.loadUrl("https://x.com/i/bookmarks"); delay(5000)
++            out += DigestX.parse(eval(DigestX.EXTRACT_JS), "书签")
++        } finally { runCatching { wv.destroy() } }
++        if (out.isNotEmpty()) { DigestX.store(out.distinctBy { it.id }); onDone() }
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/KeyAgentScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/KeyAgentScreen.kt
@@ -2462,7 +3536,7 @@ index 0000000..402bec4
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt
-index fc63799..bbd0b16 100644
+index fc63799..f8feba1 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt
 @@ -2,6 +2,10 @@ package com.openminis.app.ui.plus
@@ -2484,7 +3558,7 @@ index fc63799..bbd0b16 100644
          PlusSection("操作") {
              Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                  val entry = "${server.user}@${server.host}:${server.port}" +
-@@ -187,3 +192,65 @@ private fun Meter(title: String, value: String, frac: Float?, sub: String?) {
+@@ -187,3 +192,78 @@ private fun Meter(title: String, value: String, frac: Float?, sub: String?) {
          }
      }
  }
@@ -2507,10 +3581,9 @@ index fc63799..bbd0b16 100644
 +        PlusPrefs.update(context) { st -> st.copy(servers = st.servers.map { if (it.id == server.id) it.copy(linkUrl = code.trim()) else it }) }
 +        msg = "已保存连接码，正在连接…"
 +    }
-+    val install = "curl -fsSL https://cdn.jsdelivr.net/gh/ddfc1991/openminis-agent-android@hark-minis-build/hark-build/vps-worker/install.sh | sh"
 +    PlusSection("快速线路（HTTPS，抗代理和断线）",
 +        footer = if (paired) "任务在服务器上跑，手机断线不会中断；网络恢复后自动续上输出。" else
-+            "在服务器上用 root 运行一次下面的安装命令（只装一个小程序，开机自启）。装好后点「自动配置」，或复制它打印的连接码后点「粘贴连接码」。") {
++            "点「一键安装」：Mines 通过 SSH 在服务器上装一个小程序（开机自启，端口 8443，安全组要放行）。已经装好就点「自动配置」，或复制安装时打印的连接码后点「粘贴连接码」。") {
 +        val st = states[server.id]
 +        Text(
 +            when {
@@ -2543,13 +3616,63 @@ index fc63799..bbd0b16 100644
 +                if (code != null && com.openminis.app.plus.MinesLink.parse(code) != null) save(code) else msg = "剪贴板里没有连接码（以 mines-link:// 开头）"
 +            }, modifier = Modifier.weight(1f).heightIn(min = 52.dp)) { Text("粘贴连接码") }
 +        }
-+        TextButton(onClick = {
-+            val cm = context.getSystemService(android.content.ClipboardManager::class.java)
-+            cm?.setPrimaryClip(android.content.ClipData.newPlainText("install", install))
-+            msg = "安装命令已复制"
-+        }, modifier = Modifier.padding(horizontal = 6.dp)) { Text("复制安装命令") }
++        if (!paired) OutlinedButton(onClick = {
++            msg = "正在通过 SSH 安装快速线路（约 1 分钟）…"
++            scope.launch {
++                val r = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
++                    runCatching {
++                        val bundle = context.assets.open("mines-link/install-bundle.sh").use { it.readBytes() }
++                        val (sess, _) = com.openminis.app.plus.VpsSsh.session(context, server.copy(linkUrl = ""))
++                        val sudo = if (server.user == "root") "" else "sudo -n "
++                        com.openminis.app.plus.VpsSsh.exec(sess, "${sudo}sh -s -- --port 8443", 300_000, bundle).output
++                    }
++                }
++                val out = r.getOrNull().orEmpty()
++                val code = out.lines().firstOrNull { it.startsWith("mines-link://") }
++                if (code != null) save(code)
++                else msg = if (r.isFailure) "SSH 连不上，没法安装：${com.openminis.app.plus.VpsSsh.reason(r.exceptionOrNull()!!)}"
++                    else "安装没成功：" + out.lines().lastOrNull { it.isNotBlank() }.orEmpty().take(160)
++            }
++        }, modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp).heightIn(min = 52.dp)) { Text("一键安装到这台服务器（通过 SSH，端口 8443）") }
++
 +    }
 +}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
+index 12c4ce0..90a7570 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
+@@ -1,6 +1,7 @@
+ package com.openminis.app.ui.plus
+ 
+ import androidx.compose.ui.unit.sp
++import kotlinx.coroutines.launch
+ import androidx.compose.ui.semantics.contentDescription
+ import androidx.compose.ui.semantics.semantics
+ import com.openminis.app.ui.brand.MinesIcon
+@@ -67,6 +68,7 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier) {
+     val vault by PlusVault.entries.collectAsState()
+     LaunchedEffect(Unit) {
+         PlusVps.startMonitor(context)
++        launch { runCatching { com.openminis.app.plus.Digest.refresh(context) } }
+         com.openminis.app.plus.SandboxCare.startAuto(context)
+         if (PlusPrefs.state.value.petEnabled && com.openminis.app.plus.DeskPetService.canShow(context)) {
+             com.openminis.app.plus.DeskPetService.start(context)
+@@ -127,6 +129,15 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier) {
+                     Text(date, style = MaterialTheme.typography.labelSmall, color = readableSecondary(fg, bg),
+                         maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                 }
++                // [Mines-digest-31] 消息汇总: one tap from home
++                androidx.compose.material3.FilledTonalButton(
++                    onClick = { onOpen(PlusRoutes.DIGEST) }, modifier = Modifier.height(36.dp),
++                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp),
++                ) {
++                    val n = com.openminis.app.plus.Digest.items.collectAsState().value.count { it.cat == com.openminis.app.plus.Digest.Cat.ACT }
++                    Text(if (n > 0) "消息 $n" else "消息", fontSize = 14.sp, maxLines = 1)
++                }
++                Spacer(Modifier.width(6.dp))
+                 androidx.compose.material3.FilledTonalIconButton(
+                     onClick = { onOpen(PlusRoutes.VOICE) }, modifier = Modifier.size(36.dp),
+                 ) {
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
 index b56898d..3ba9233 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
