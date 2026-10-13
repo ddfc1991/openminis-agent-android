@@ -774,6 +774,24 @@ def build34():
         j = selftest_json("zoom", prof, timeout=40)
         print(f"  zoom {prof}: {j}", flush=True)
         if not j.get("ok"): selftest_fail.append(f"b34 zoom {prof} {j}")
+    # [build-34] agent browser renders real pages (BrowserTabPool navigate / get_text / screenshot), both UA modes.
+    # example.com must pass; vulbox.com must pass whenever it is reachable from the runner (title or text came back).
+    def _reach(u):
+        try:
+            import urllib.request
+            urllib.request.urlopen(urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0 (Linux; Android 14) Chrome/124.0 Mobile"}), timeout=20).read(200)
+            return True
+        except Exception as e:
+            print(f"  runner cannot reach {u}: {e}", flush=True); return False
+    vulbox_ok = _reach("https://www.vulbox.com/")
+    for url in ("https://example.com/", "https://www.vulbox.com/"):
+        if "vulbox" in url and not vulbox_ok:
+            print("  (vulbox.com not reachable from the runner; skipped)", flush=True); continue
+        for prof in ("mobile", "desktop"):
+            j = selftest_json("webrender", f"{url}|{prof}", timeout=130)
+            print(f"  webrender {url} {prof}: {json.dumps(j, ensure_ascii=False)[:900]}", flush=True)
+            if j.get("ok"): continue
+            selftest_fail.append(f"b34 webrender {url} {prof} {json.dumps(j, ensure_ascii=False)[:400]}")
     # settings + its design pages
     go_home()
     if tap_text("设置", exact=True, wait=5):
