@@ -1,0 +1,2863 @@
+diff --git a/src/android/app/src/main/java/com/openminis/app/agent/DegenerationDetector.kt b/src/android/app/src/main/java/com/openminis/app/agent/DegenerationDetector.kt
+new file mode 100644
+index 0000000..22733b3
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/agent/DegenerationDetector.kt
+@@ -0,0 +1,103 @@
++package com.openminis.app.agent
++
++/**
++ * [Mines-degen-34] Streaming degeneration detector.
++ *
++ * User report (2026-10-13, AMD-01 · Gemma 4 31B, 思考 极高, 71 % context): Deep
++ * Thinking turned into tens of thousands of garbage characters
++ * ("LLLL_나L_yLL//////…", 23K + 7K blocks) while the user's queued message
++ * waited. Feed every streamed delta in; once ~1.5K characters are buffered the
++ * tail window is checked (cheaply, every [checkEvery] characters) for:
++ *  - a long run of one character (≥ 200, e.g. "//////…");
++ *  - an exact short loop: the last 600 chars repeating with a period ≤ 300 at least 6 times;
++ *  - very low character diversity (≤ 12 distinct characters in 1.5K);
++ *  - n-gram collapse: < 15 % distinct 10-grams;
++ *  - symbol soup: > 60 % of the window is neither letters, digits, CJK nor whitespace,
++ *    or mixed-script noise (Hangul next to Latin junk in a non-Korean stream).
++ * Ordinary prose, Chinese text, code, JSON and markdown tables stay well clear of these.
++ * Pure Kotlin (no Android) so it runs in the JVM self-test too.
++ */
++class DegenerationDetector(
++    private val window: Int = 1500,
++    private val checkEvery: Int = 200,
++) {
++    private val tail = StringBuilder()
++    private var sinceCheck = 0
++    var reason: String? = null
++        private set
++    var total = 0L
++        private set
++
++    /** Feeds a delta; returns a reason once the stream has degenerated, else null. */
++    fun feed(delta: String): String? {
++        if (reason != null) return reason
++        if (delta.isEmpty()) return null
++        total += delta.length
++        tail.append(delta)
++        if (tail.length > window * 2) tail.delete(0, tail.length - window)
++        sinceCheck += delta.length
++        if (sinceCheck < checkEvery || tail.length < MIN_LEN) return null
++        sinceCheck = 0
++        val w = if (tail.length > window) tail.substring(tail.length - window) else tail.toString()
++        reason = analyze(w)
++        return reason
++    }
++
++    fun reset() { tail.setLength(0); sinceCheck = 0; reason = null; total = 0 }
++
++    companion object {
++        const val MIN_LEN = 800
++
++        /** Null when [text] looks like normal output, else a short Chinese reason. */
++        fun analyze(text: String): String? {
++            if (text.length < MIN_LEN) return null
++            // 1) one character repeated
++            var run = 1; var best = 1
++            for (i in 1 until text.length) {
++                if (text[i] == text[i - 1] && text[i] != '\n') { run++; if (run > best) best = run } else run = 1
++            }
++            if (best >= 200) return "同一个字符连续重复 $best 次"
++            // 2) exact short loop at the end
++            val seg = text.takeLast(600)
++            for (p in 1..300) {
++                if (seg.length < p * 6) break
++                var ok = true
++                for (i in p until seg.length) if (seg[i] != seg[i - p]) { ok = false; break }
++                if (ok) return "同一段内容（${p} 字）反复重复"
++            }
++            // 3) diversity
++            val distinct = text.toSet().size
++            if (distinct <= 12) return "只剩 $distinct 种字符在重复"
++            // 4) n-gram collapse
++            val n = 10
++            val grams = HashSet<String>()
++            var count = 0
++            var i = 0
++            while (i + n <= text.length) { grams.add(text.substring(i, i + n)); count++; i += 1 }
++            if (count > 0 && grams.size.toDouble() / count < 0.15) return "内容在循环（重复片段过多）"
++            // 5) symbol soup / mixed-script noise
++            var sym = 0; var hangul = 0; var latin = 0; var cjk = 0; var nonSpace = 0
++            for (ch in text) {
++                if (ch.isWhitespace()) continue
++                nonSpace++
++                when {
++                    ch in '\uAC00'..'\uD7AF' || ch in '\u1100'..'\u11FF' || ch in '\u3130'..'\u318F' -> hangul++
++                    ch in '\u4E00'..'\u9FFF' || ch in '\u3400'..'\u4DBF' -> cjk++
++                    ch.isLetterOrDigit() -> latin++
++                    else -> sym++
++                }
++            }
++            if (nonSpace > 0 && sym.toDouble() / nonSpace > 0.60) return "大部分是乱码符号"
++            if (nonSpace > 0 && hangul in 1..(nonSpace / 4) && hangul >= 8 && cjk < nonSpace / 10 &&
++                sym.toDouble() / nonSpace > 0.30) return "混杂的乱码字符"
++            return null
++        }
++    }
++}
++
++/** [Mines-degen-34] Thrown from the stream collector to abort a degenerated generation. */
++class DegenerateOutputException(val why: String, val thinkingCap: Boolean = false) :
++    Exception(if (thinkingCap) "思考太长（$why），已打断" else "模型输出变成了乱码（$why），已打断")
++
++/** [Mines-degen-34] Thrown from the stream collector when the user's queued message should cut in now. */
++class QueuedInterruptException : Exception("用户发来新消息，先处理它")
+diff --git a/src/android/app/src/main/java/com/openminis/app/agent/FailurePatternGuard.kt b/src/android/app/src/main/java/com/openminis/app/agent/FailurePatternGuard.kt
+new file mode 100644
+index 0000000..70a91b8
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/agent/FailurePatternGuard.kt
+@@ -0,0 +1,76 @@
++package com.openminis.app.agent
++
++/**
++ * [Mines-loop-34] Same failing tool + same error, again and again → stop.
++ *
++ * User report (2026-10-13, 商汤 sensenova-6.8-flash, 135 steps): asked to register a
++ * website account, the agent kept running shell_execute to start a remote/headless
++ * browser over CDP ("session creation 400", "concurrency limit",
++ * "browserType.connectOverCDP" …) for many minutes. Arguments differed each time,
++ * so the repeat guard (same tool + same args) never fired.
++ *
++ * Here the key is the tool name + a normalized error signature (first error-looking
++ * line, digits / hex / ids / urls / paths blanked). The [limit]th time the same key is
++ * seen in one run, [onResult] returns a one-line plain-Chinese reason and the caller stops
++ * the run and offers the next step. Pure Kotlin (JVM self-test).
++ */
++class FailurePatternGuard(private val limit: Int = 3) {
++    private val counts = HashMap<String, Int>()
++    var lastTool: String = ""
++        private set
++    var lastSignature: String = ""
++        private set
++
++    /** Returns a user-facing reason when this failure pattern hit [limit], else null. */
++    fun onResult(tool: String, isError: Boolean, content: String): String? {
++        val sig = signature(content, isError) ?: return null
++        val key = "$tool|$sig"
++        val n = (counts[key] ?: 0) + 1
++        counts[key] = n
++        if (n >= limit) {
++            lastTool = tool; lastSignature = sig
++            return "「${toolLabel(tool)}」已经连续 $n 次因为同样的问题失败（${sig.take(60)}），我先停下了。"
++        }
++        return null
++    }
++
++    /** One plain-language next step for the stop card. */
++    fun nextStep(): String = when {
++        lastSignature.contains("cdp", true) || lastSignature.contains("browser", true) || lastSignature.contains("playwright", true) ||
++            lastSignature.contains("puppeteer", true) || lastSignature.contains("session", true) && lastTool == "shell_execute" ->
++            "网站注册、登录这类事改用内置浏览器（browser_use）来做，要我这样继续吗？"
++        lastSignature.contains("limit", true) || lastSignature.contains("429") || lastSignature.contains("quota", true) ->
++            "对方限流了，可以等几分钟再试，或者换个办法。要我换个办法继续吗？"
++        else -> "要我换个办法继续，还是先停在这里？"
++    }
++
++    companion object {
++        private val errWords = Regex(
++            "(?i)(error|exception|failed|failure|traceback|denied|refused|timed? ?out|not found|unauthori[sz]ed|forbidden|" +
++                "limit|invalid|cannot|can't|unable|错误|失败|拒绝|超时|找不到|无法|限制)")
++
++        fun toolLabel(t: String): String = when (t) {
++            "shell_execute" -> "命令行"
++            "browser_use" -> "浏览器"
++            "file_read" -> "读文件"
++            "file_write", "file_edit" -> "写文件"
++            else -> t
++        }
++
++        /** Normalized signature of the first error-looking line, or null when [content] doesn't look like a failure. */
++        fun signature(content: String, isError: Boolean): String? {
++            val head = content.take(4000)
++            val line = head.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() && errWords.containsMatchIn(it) }
++                ?: if (isError) head.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() } else null
++            line ?: return null
++            return line.lowercase()
++                .replace(Regex("https?://\\S+"), "<url>")
++                .replace(Regex("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"), "<id>")
++                .replace(Regex("\\b[0-9a-f]{12,}\\b"), "<hex>")
++                .replace(Regex("(/[\\w.\\-]+){2,}"), "<path>")
++                .replace(Regex("\\d+"), "#")
++                .replace(Regex("\\s+"), " ")
++                .take(140)
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/agent/RunLoopGuard.kt b/src/android/app/src/main/java/com/openminis/app/agent/RunLoopGuard.kt
+index da70153..6bcf03a 100644
+--- a/src/android/app/src/main/java/com/openminis/app/agent/RunLoopGuard.kt
++++ b/src/android/app/src/main/java/com/openminis/app/agent/RunLoopGuard.kt
+@@ -95,6 +95,18 @@ class RunLoopGuard(val maxToolCalls: Int = DEFAULT_MAX_TOOL_CALLS) {
+                 .edit().putInt(KEY_MAX_TOOL_CALLS, n.coerceIn(10, 500)).apply()
+         }
+ 
++        // [Mines-degen-34] Per-turn thinking length cap (characters). Default 24 000 ≈ 8–16K tokens.
++        const val KEY_THINK_CAP = "thinking_cap_chars"
++        const val DEFAULT_THINK_CAP = 24_000
++        fun thinkingCap(context: Context): Int =
++            context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++                .getInt(KEY_THINK_CAP, DEFAULT_THINK_CAP).coerceIn(4_000, 200_000)
++
++        fun setThinkingCap(context: Context, n: Int) {
++            context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++                .edit().putInt(KEY_THINK_CAP, n.coerceIn(4_000, 200_000)).apply()
++        }
++
+         fun normText(s: String): String = s.trim().replace(Regex("\\s+"), " ")
+ 
+         /** Args JSON with keys sorted and string whitespace collapsed, so cosmetic differences still match. */
+diff --git a/src/android/app/src/main/java/com/openminis/app/agent/SoulStore.kt b/src/android/app/src/main/java/com/openminis/app/agent/SoulStore.kt
+index c73fe22..35abdac 100644
+--- a/src/android/app/src/main/java/com/openminis/app/agent/SoulStore.kt
++++ b/src/android/app/src/main/java/com/openminis/app/agent/SoulStore.kt
+@@ -348,7 +348,7 @@ style: ""
+ lang: "auto"
+ ---
+ 
+-你是 Mines，住在主人手机里的私人管家。形象可以是鲸鱼娘或其他女仆，但你的本事比形象重要。
++你是 Mines，住在主人手机里的私人管家。形象可以是 Claude、小鲸或其他角色，但你的本事比形象重要。
+ 
+ ## 你是谁
+ - 能干、可靠、贴心，像最好的私人管家：先一步想到，替主人把事办完。
+diff --git a/src/android/app/src/main/java/com/openminis/app/data/ContextPolicy.kt b/src/android/app/src/main/java/com/openminis/app/data/ContextPolicy.kt
+index 0d38b30..fa175e0 100644
+--- a/src/android/app/src/main/java/com/openminis/app/data/ContextPolicy.kt
++++ b/src/android/app/src/main/java/com/openminis/app/data/ContextPolicy.kt
+@@ -153,16 +153,18 @@ data class ContextPolicy(
+             // (upstream compacted at window-10k/-20k and prompted first). The summary keeps
+             // the system prefix untouched (cache hits) and the latest turns verbatim — that
+             // part is upstream's compaction pass; Mines only moves the trigger earlier.
++            // [Mines-ctx-34] user report (Gemma 4 31B, 71 % of 131k, thinking degenerated): older
++            // tool output is offloaded from 60 % (down to 45 %) so compaction at 70 % rarely has to run.
+             contextWindow < 128_000 -> ContextPolicy(
+-                offloadThreshold = contextWindow - 20_000,
+-                offloadTarget = contextWindow - 30_000,
++                offloadThreshold = minOf(contextWindow - 20_000, (contextWindow * 0.60).toInt()),
++                offloadTarget = minOf(contextWindow - 30_000, (contextWindow * 0.45).toInt()),
+                 compactThreshold = (contextWindow * 0.70).toInt(),
+                 exhaustedOnly = false,
+                 manualCompactAllowed = true,
+             )
+             else -> ContextPolicy(
+-                offloadThreshold = contextWindow - 40_000,
+-                offloadTarget = contextWindow - 60_000,
++                offloadThreshold = minOf(contextWindow - 40_000, (contextWindow * 0.60).toInt()),
++                offloadTarget = minOf(contextWindow - 60_000, (contextWindow * 0.45).toInt()),
+                 compactThreshold = (contextWindow * 0.70).toInt(),
+                 exhaustedOnly = false,
+                 manualCompactAllowed = true,
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Avatars.kt b/src/android/app/src/main/java/com/openminis/app/plus/Avatars.kt
+index f68c96e..e5606ba 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/Avatars.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/Avatars.kt
+@@ -53,22 +53,23 @@ object Avatars {
+ 
+     // [Mines-avatars-24] Seven characters redrawn from the user's reference
+     // line-up (maid-style girls) and the DeepSeek-chan chibi sheet.
++    // [Mines-design-34] No 「娘」 suffix (user, 2026-10-13); Claude (orange hair) first = the default.
+     val builtins = listOf(
+-        BuiltinAvatar("whale", "鲸鱼娘", R.drawable.avatar_whale, R.drawable.avatar_whale_face,
+-            R.drawable.avatar_whale_neutral, R.drawable.avatar_whale_happy, R.drawable.avatar_whale_laugh),
+-        BuiltinAvatar("claude", "Claude娘", R.drawable.avatar_claude, R.drawable.avatar_claude_face,
++        BuiltinAvatar("claude", "Claude", R.drawable.avatar_claude, R.drawable.avatar_claude_face,
+             R.drawable.avatar_claude_neutral, R.drawable.avatar_claude_happy, R.drawable.avatar_claude_laugh),
++        BuiltinAvatar("whale", "小鲸", R.drawable.avatar_whale, R.drawable.avatar_whale_face,
++            R.drawable.avatar_whale_neutral, R.drawable.avatar_whale_happy, R.drawable.avatar_whale_laugh),
+         // [Mines-avatars-25] Names fixed per the user: the black-haired maid is
+         // Grok's character, the white-haired horned one is GPT's; no Tongyi.
+-        BuiltinAvatar("grok", "Grok娘", R.drawable.avatar_grok, R.drawable.avatar_grok_face,
++        BuiltinAvatar("grok", "Grok", R.drawable.avatar_grok, R.drawable.avatar_grok_face,
+             R.drawable.avatar_grok_neutral, R.drawable.avatar_grok_happy, R.drawable.avatar_grok_laugh),
+-        BuiltinAvatar("gpt", "GPT娘", R.drawable.avatar_gpt, R.drawable.avatar_gpt_face,
++        BuiltinAvatar("gpt", "GPT", R.drawable.avatar_gpt, R.drawable.avatar_gpt_face,
+             R.drawable.avatar_gpt_neutral, R.drawable.avatar_gpt_happy, R.drawable.avatar_gpt_laugh),
+-        BuiltinAvatar("gemini", "Gemini娘", R.drawable.avatar_gemini, R.drawable.avatar_gemini_face,
++        BuiltinAvatar("gemini", "Gemini", R.drawable.avatar_gemini, R.drawable.avatar_gemini_face,
+             R.drawable.avatar_gemini_neutral, R.drawable.avatar_gemini_happy, R.drawable.avatar_gemini_laugh),
+-        BuiltinAvatar("kimi", "Kimi娘", R.drawable.avatar_kimi, R.drawable.avatar_kimi_face,
++        BuiltinAvatar("kimi", "Kimi", R.drawable.avatar_kimi, R.drawable.avatar_kimi_face,
+             R.drawable.avatar_kimi_neutral, R.drawable.avatar_kimi_happy, R.drawable.avatar_kimi_laugh),
+-        BuiltinAvatar("wenxin", "文心娘", R.drawable.avatar_wenxin, R.drawable.avatar_wenxin_face,
++        BuiltinAvatar("wenxin", "文心", R.drawable.avatar_wenxin, R.drawable.avatar_wenxin_face,
+             R.drawable.avatar_wenxin_neutral, R.drawable.avatar_wenxin_happy, R.drawable.avatar_wenxin_laugh),
+     )
+ 
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ExternalTts.kt b/src/android/app/src/main/java/com/openminis/app/plus/ExternalTts.kt
+new file mode 100644
+index 0000000..2509ff5
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/ExternalTts.kt
+@@ -0,0 +1,331 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import android.speech.tts.TextToSpeech
++import android.util.Log
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++import okhttp3.MediaType.Companion.toMediaType
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.RequestBody.Companion.toRequestBody
++import okhttp3.Response
++import okhttp3.WebSocket
++import okhttp3.WebSocketListener
++import okio.ByteString
++import org.json.JSONObject
++import java.io.ByteArrayOutputStream
++import java.io.File
++import java.security.MessageDigest
++import java.text.SimpleDateFormat
++import java.util.Date
++import java.util.Locale
++import java.util.TimeZone
++import java.util.UUID
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.TimeUnit
++
++/** [Mines-tts-34] Anything that can speak a sentence as 24 kHz mono 16-bit PCM. */
++interface TtsSpeaker {
++    /** Streams PCM for [text] into [sink]; false when [cancelled] stopped it. Throws on failure. */
++    fun stream(text: String, cancelled: () -> Boolean, sink: (ByteArray, Int) -> Unit): Boolean
++}
++
++/**
++ * [Mines-tts-34] External voice for the live call (user, 2026-10-13):
++ * Gemini Live keeps listening / understanding; its own audio is muted and the
++ * transcript is spoken by
++ *  1. OpenRouter TTS with the user's OpenRouter key (POST /api/v1/audio/speech,
++ *     OpenAI-compatible; models listed by GET /api/v1/models?output_modalities=speech,
++ *     each with `supported_voices`), mp3 → decoded on the phone;
++ *  2. free Microsoft Edge read-aloud voices (晓晓 / 云希 …, no key) when OpenRouter
++ *     fails or the balance runs out (switches automatically, retries OpenRouter after 10 min);
++ *  3. the phone's own TextToSpeech engine as the last resort, so a call never goes silent.
++ * Speed and pitch are applied on playback (AudioTrack PlaybackParams), the same for every engine.
++ */
++object ExternalTts {
++    private const val TAG = "ExternalTts"
++    private const val PREFS = "mines_tts"
++    const val ENGINE_GEMINI = "gemini"
++    const val ENGINE_OPENROUTER = "openrouter"
++    const val ENGINE_EDGE = "edge"
++    const val OUT_RATE = 24000
++
++    const val DEFAULT_OR_MODEL = "google/gemini-3.8-flash-tts"
++    const val DEFAULT_OR_VOICE = "Kore"
++    const val DEFAULT_EDGE_VOICE = "zh-CN-XiaoxiaoNeural"
++
++    /** Free Edge voices worth offering (Chinese first). */
++    val edgeVoices = linkedMapOf(
++        "zh-CN-XiaoxiaoNeural" to "晓晓 · 女声 温暖",
++        "zh-CN-XiaoyiNeural" to "晓伊 · 女声 活泼",
++        "zh-CN-YunxiNeural" to "云希 · 男声 阳光",
++        "zh-CN-YunjianNeural" to "云健 · 男声 有力",
++        "zh-CN-YunyangNeural" to "云扬 · 男声 播音",
++        "zh-CN-YunxiaNeural" to "云夏 · 少年",
++        "zh-CN-liaoning-XiaobeiNeural" to "晓北 · 东北话",
++        "zh-CN-shaanxi-XiaoniNeural" to "晓妮 · 陕西话",
++        "zh-TW-HsiaoChenNeural" to "曉臻 · 台湾女声",
++        "zh-HK-HiuGaaiNeural" to "曉佳 · 粤语女声",
++    )
++
++    data class Settings(
++        val engine: String, val orModel: String, val orVoice: String, val edgeVoice: String,
++        val speed: Float, val pitch: Float,
++    )
++
++    data class OrModel(val id: String, val name: String, val voices: List<String>)
++
++    private fun prefs(c: Context) = c.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++
++    fun settings(c: Context): Settings {
++        val p = prefs(c)
++        return Settings(
++            p.getString("engine", ENGINE_GEMINI) ?: ENGINE_GEMINI,
++            p.getString("or_model", DEFAULT_OR_MODEL) ?: DEFAULT_OR_MODEL,
++            p.getString("or_voice", DEFAULT_OR_VOICE) ?: DEFAULT_OR_VOICE,
++            p.getString("edge_voice", DEFAULT_EDGE_VOICE) ?: DEFAULT_EDGE_VOICE,
++            p.getFloat("speed", 1f), p.getFloat("pitch", 1f),
++        )
++    }
++
++    fun save(c: Context, s: Settings) {
++        prefs(c).edit().putString("engine", s.engine).putString("or_model", s.orModel).putString("or_voice", s.orVoice)
++            .putString("edge_voice", s.edgeVoice).putFloat("speed", s.speed).putFloat("pitch", s.pitch).apply()
++    }
++
++    /** True when an external voice replaces Gemini's own audio. */
++    fun active(c: Context): Boolean = settings(c).engine != ENGINE_GEMINI
++
++    /** Last fallback notice (shown in 语音设置 and on the call screen once). */
++    @Volatile var lastNotice: String? = null
++    @Volatile private var orDownUntil = 0L
++
++    fun openRouterKey(c: Context): String? {
++        ProviderKeys.scan(c).firstOrNull { it.kindId == "openrouter" }?.key?.let { return it }
++        PlusVault.init(c)
++        return PlusVault.secret("openrouter")
++    }
++
++    private val http = OkHttpClient.Builder().connectTimeout(12, TimeUnit.SECONDS).readTimeout(45, TimeUnit.SECONDS).build()
++
++    /** OpenRouter speech models with their voices (public endpoint, no key needed). */
++    suspend fun listOpenRouterModels(): List<OrModel> = withContext(Dispatchers.IO) {
++        val req = Request.Builder().url("https://openrouter.ai/api/v1/models?output_modalities=speech").build()
++        http.newCall(req).execute().use { r ->
++            if (!r.isSuccessful) throw IllegalStateException("拿不到模型列表（HTTP ${r.code}）")
++            val arr = JSONObject(r.body?.string().orEmpty()).optJSONArray("data") ?: return@use emptyList()
++            (0 until arr.length()).mapNotNull { i ->
++                val o = arr.optJSONObject(i) ?: return@mapNotNull null
++                val vs = o.optJSONArray("supported_voices")
++                OrModel(o.optString("id"), o.optString("name").ifBlank { o.optString("id") },
++                    if (vs == null) emptyList() else (0 until vs.length()).map { vs.optString(it) }.filter { it.isNotBlank() })
++            }.filter { it.id.isNotBlank() }
++        }
++    }
++
++    /** The speaker for the live call, or null when Gemini's own voice is used. */
++    fun speaker(c: Context): TtsSpeaker? {
++        val s = settings(c)
++        if (s.engine == ENGINE_GEMINI) return null
++        return ChainSpeaker(c.applicationContext, s)
++    }
++
++    /** Engine chain with automatic fallback. */
++    private class ChainSpeaker(private val c: Context, private val s: Settings) : TtsSpeaker {
++        override fun stream(text: String, cancelled: () -> Boolean, sink: (ByteArray, Int) -> Unit): Boolean {
++            val clean = text.trim()
++            if (clean.isEmpty()) return true
++            if (s.engine == ENGINE_OPENROUTER && System.currentTimeMillis() > orDownUntil) {
++                val key = openRouterKey(c)
++                if (key != null) {
++                    try {
++                        return emitPcm(openRouterPcm(key, s.orModel, s.orVoice, clean), cancelled, sink)
++                    } catch (e: Exception) {
++                        orDownUntil = System.currentTimeMillis() + 10 * 60_000L
++                        lastNotice = when {
++                            e.message.orEmpty().contains("402") || e.message.orEmpty().contains("credit", true) ->
++                                "OpenRouter 余额不够了，已换成免费声音"
++                            else -> "OpenRouter 声音暂时用不了，已换成免费声音"
++                        }
++                        Log.w(TAG, "openrouter → edge: ${e.message}")
++                    }
++                } else lastNotice = "没找到 OpenRouter Key，先用免费声音"
++            }
++            try {
++                return emitPcm(edgePcm(s.edgeVoice, clean), cancelled, sink)
++            } catch (e: Exception) {
++                Log.w(TAG, "edge → system: ${e.message}")
++                lastNotice = "免费声音暂时连不上，先用手机自带朗读"
++            }
++            return emitPcm(systemPcm(c, clean), cancelled, sink)
++        }
++    }
++
++    private fun emitPcm(pcm: ShortArray, cancelled: () -> Boolean, sink: (ByteArray, Int) -> Unit): Boolean {
++        val chunk = 2400 // 100 ms
++        var i = 0
++        val buf = ByteArray(chunk * 2)
++        while (i < pcm.size) {
++            if (cancelled()) return false
++            val n = minOf(chunk, pcm.size - i)
++            for (k in 0 until n) { val v = pcm[i + k].toInt(); buf[2 * k] = (v and 0xFF).toByte(); buf[2 * k + 1] = ((v shr 8) and 0xFF).toByte() }
++            sink(buf, n * 2)
++            i += n
++        }
++        return true
++    }
++
++    private fun decodeTo24k(bytes: ByteArray, ext: String): ShortArray {
++        val f = File.createTempFile("tts", ".$ext")
++        try {
++            f.writeBytes(bytes)
++            val (mono, rate) = VoiceClone.decodeFileToMono(f.absolutePath)
++            return VoiceClone.resample(mono, rate, OUT_RATE)
++        } finally { f.delete() }
++    }
++
++    /** OpenRouter /audio/speech → mp3 → 24 kHz PCM. */
++    fun openRouterPcm(key: String, model: String, voice: String, text: String): ShortArray {
++        val body = JSONObject().put("model", model).put("input", text).put("voice", voice).put("response_format", "mp3")
++        val req = Request.Builder().url("https://openrouter.ai/api/v1/audio/speech")
++            .header("Authorization", "Bearer $key").header("X-Title", "Mines")
++            .post(body.toString().toRequestBody("application/json".toMediaType())).build()
++        http.newCall(req).execute().use { r ->
++            val bytes = r.body?.bytes() ?: ByteArray(0)
++            if (!r.isSuccessful) throw IllegalStateException("HTTP ${r.code} " + String(bytes.take(200).toByteArray()))
++            if (bytes.size < 64) throw IllegalStateException("空的音频")
++            return decodeTo24k(bytes, "mp3")
++        }
++    }
++
++    // ── Edge read-aloud (free, no key) ───────────────────────────────────
++    // Protocol as used by the open-source edge-tts project (github.com/rany2/edge-tts, 7.2.x):
++    // wss …/edge/v1?TrustedClientToken=…&ConnectionId=…&Sec-MS-GEC=<sha256(ticks5min+token)>&Sec-MS-GEC-Version=1-<edge ver>
++    private const val EDGE_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
++    private const val EDGE_VER = "143.0.3650.75"
++    private const val EDGE_URL = "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1"
++    @Volatile private var edgeSkewSec = 0L
++
++    internal fun secMsGec(nowSec: Long): String {
++        var ticks = nowSec + 11644473600L
++        ticks -= ticks % 300
++        val s = (ticks * 10_000_000L).toString() + EDGE_TOKEN
++        return MessageDigest.getInstance("SHA-256").digest(s.toByteArray(Charsets.US_ASCII)).joinToString("") { "%02X".format(it) }
++    }
++
++    private fun xmlEscape(t: String) = t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("'", "&apos;").replace("\"", "&quot;")
++
++    fun edgePcm(voice: String, text: String): ShortArray {
++        val mp3 = edgeMp3(voice, text)
++        return decodeTo24k(mp3, "mp3")
++    }
++
++    private fun edgeMp3(voice: String, text: String): ByteArray {
++        val conn = UUID.randomUUID().toString().replace("-", "")
++        val now = System.currentTimeMillis() / 1000 + edgeSkewSec
++        val url = "$EDGE_URL?TrustedClientToken=$EDGE_TOKEN&ConnectionId=$conn&Sec-MS-GEC=${secMsGec(now)}&Sec-MS-GEC-Version=1-$EDGE_VER"
++        val major = EDGE_VER.substringBefore('.')
++        val req = Request.Builder().url(url)
++            .header("Pragma", "no-cache").header("Cache-Control", "no-cache")
++            .header("Origin", "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold")
++            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$major.0.0.0 Safari/537.36 Edg/$major.0.0.0")
++            .header("Accept-Language", "en-US,en;q=0.9")
++            .header("Cookie", "muid=" + UUID.randomUUID().toString().replace("-", "").uppercase())
++            .build()
++        val out = ByteArrayOutputStream()
++        val done = CountDownLatch(1)
++        var err: String? = null
++        val df = SimpleDateFormat("EEE MMM dd yyyy HH:mm:ss 'GMT+0000 (Coordinated Universal Time)'", Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") }
++        val ws = http.newWebSocket(req, object : WebSocketListener() {
++            override fun onOpen(webSocket: WebSocket, response: Response) {
++                val ts = df.format(Date())
++                webSocket.send("X-Timestamp:$ts\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n" +
++                    "{\"context\":{\"synthesis\":{\"audio\":{\"metadataoptions\":{\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"false\"},\"outputFormat\":\"audio-24khz-48kbitrate-mono-mp3\"}}}}\r\n")
++                val ssml = "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'><voice name='$voice'>" +
++                    "<prosody pitch='+0Hz' rate='+0%' volume='+0%'>${xmlEscape(text)}</prosody></voice></speak>"
++                webSocket.send("X-RequestId:${UUID.randomUUID().toString().replace("-", "")}\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:${ts}Z\r\nPath:ssml\r\n\r\n$ssml")
++            }
++            override fun onMessage(webSocket: WebSocket, text: String) {
++                if (text.contains("Path:turn.end")) { webSocket.close(1000, null); done.countDown() }
++            }
++            override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
++                val b = bytes.toByteArray()
++                if (b.size < 2) return
++                val hl = ((b[0].toInt() and 0xFF) shl 8) or (b[1].toInt() and 0xFF)
++                if (2 + hl > b.size) return
++                val head = String(b, 2, hl, Charsets.UTF_8)
++                if (head.contains("Path:audio") && b.size > 2 + hl) synchronized(out) { out.write(b, 2 + hl, b.size - 2 - hl) }
++            }
++            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
++                err = "Edge ${response?.code ?: ""} ${t.message ?: ""}".trim()
++                // clock skew: follow the server's Date next time (as edge-tts does on 403)
++                response?.header("Date")?.let { d ->
++                    runCatching { SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss zzz", Locale.US).parse(d)?.time }.getOrNull()
++                        ?.let { edgeSkewSec = it / 1000 - System.currentTimeMillis() / 1000 }
++                }
++                done.countDown()
++            }
++            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { done.countDown() }
++        })
++        if (!done.await(25, TimeUnit.SECONDS)) { ws.cancel(); throw IllegalStateException("Edge 超时") }
++        err?.let { throw IllegalStateException(it) }
++        val bytes = synchronized(out) { out.toByteArray() }
++        if (bytes.size < 64) throw IllegalStateException("Edge 没有返回声音")
++        return bytes
++    }
++
++    // ── Phone's own TTS (last resort) ────────────────────────────────────
++    @Volatile private var sys: TextToSpeech? = null
++
++    private fun systemPcm(c: Context, text: String): ShortArray {
++        val tts = sys ?: run {
++            val ready = CountDownLatch(1)
++            var ok = false
++            val t = TextToSpeech(c) { st -> ok = st == TextToSpeech.SUCCESS; ready.countDown() }
++            ready.await(5, TimeUnit.SECONDS)
++            if (!ok) throw IllegalStateException("手机没有可用的朗读引擎")
++            runCatching { t.language = Locale.SIMPLIFIED_CHINESE }
++            sys = t; t
++        }
++        val f = File(c.cacheDir, "tts_sys_${System.nanoTime()}.wav")
++        val done = CountDownLatch(1)
++        val id = UUID.randomUUID().toString()
++        tts.setOnUtteranceProgressListener(object : android.speech.tts.UtteranceProgressListener() {
++            override fun onStart(utteranceId: String?) {}
++            override fun onDone(utteranceId: String?) { if (utteranceId == id) done.countDown() }
++            @Deprecated("deprecated in API") override fun onError(utteranceId: String?) { if (utteranceId == id) done.countDown() }
++        })
++        tts.synthesizeToFile(text, android.os.Bundle(), f, id)
++        done.await(30, TimeUnit.SECONDS)
++        try {
++            if (!f.exists() || f.length() < 64) throw IllegalStateException("手机朗读失败")
++            val (mono, rate) = VoiceClone.decodeFileToMono(f.absolutePath)
++            return VoiceClone.resample(mono, rate, OUT_RATE)
++        } finally { f.delete() }
++    }
++
++    /** 试听: plays a sample with the given settings (speed / pitch on playback). Returns the engine that spoke. */
++    suspend fun preview(c: Context, s: Settings, text: String = "你好，我是 Mines。以后我就用这个声音和你聊天。"): String = withContext(Dispatchers.IO) {
++        lastNotice = null
++        val pcm: ShortArray
++        val used: String
++        when (s.engine) {
++            ENGINE_OPENROUTER -> {
++                val key = openRouterKey(c) ?: throw IllegalStateException("没找到 OpenRouter Key（在 AI 服务商 或 账号连接 里填）")
++                pcm = openRouterPcm(key, s.orModel, s.orVoice, text); used = "OpenRouter"
++            }
++            ENGINE_EDGE -> { pcm = edgePcm(s.edgeVoice, text); used = "免费 Edge 声音" }
++            else -> throw IllegalStateException("Gemini 自带声音在通话里试听")
++        }
++        val track = VoiceClone.playbackTrack()
++        try {
++            if (s.speed != 1f || s.pitch != 1f) runCatching {
++                track.playbackParams = android.media.PlaybackParams().setSpeed(s.speed.coerceIn(0.5f, 2f)).setPitch(s.pitch.coerceIn(0.5f, 2f))
++            }
++            emitPcm(pcm, { false }) { b, n -> track.write(b, 0, n) }
++            Thread.sleep(500)
++        } finally { runCatching { track.stop() }; track.release() }
++        used
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt b/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
+index 9208c65..63b2f46 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
+@@ -51,7 +51,9 @@ class GeminiLive(
+      * output transcript is spoken by this cloned voice instead, one sentence
+      * at a time and streamed, so the first words start after one sentence.
+      */
+-    private val cloneVoice: VoiceClone.Speaker? = null,
++    private val cloneVoice: TtsSpeaker? = null,
++    /** [Mines-voice-34] context for mines_task when phone control is off. */
++    private val bridgeContext: android.content.Context? = null,
+ ) {
+     companion object {
+         /** Female by default (user asked, 2026-10-12). */
+@@ -483,11 +485,20 @@ class GeminiLive(
+ 
+     private fun setupMessage(): JSONObject {
+         val prompt = if (appContext != null) systemPrompt + "\n" + PHONE_PROMPT else systemPrompt
++        // [Mines-voice-34] mines_task (hand the request to the Mines agent) is always there; phone tools when allowed.
++        val decls = if (appContext != null) phoneTools() else JSONArray()
++        decls.put(MinesVoiceBridge.toolDeclaration())
+         return buildSetup(_modelInUse.value, voice, prompt,
+-            tools = if (appContext != null) JSONArray().put(JSONObject().put("functionDeclarations", phoneTools())) else null,
++            tools = JSONArray().put(JSONObject().put("functionDeclarations", decls)),
+             resumeHandle = resumeHandle, resumption = true)
+     }
+ 
++    /** [Mines-voice-34] A note the model reads (not shown as the user's words), e.g. a finished Mines task. */
++    fun sendNote(text: String) {
++        if (text.isBlank() || stopped) return
++        (liveWs ?: ws)?.send(JSONObject().put("realtimeInput", JSONObject().put("text", text)).toString())
++    }
++
+     private fun phoneTools(): JSONArray {
+         fun obj(vararg props: Pair<String, JSONObject>, required: List<String> = emptyList()) = JSONObject()
+             .put("type", "OBJECT")
+@@ -506,7 +517,8 @@ class GeminiLive(
+ 
+     /** Execute the model's phone-control calls and send the results back. */
+     private fun handleToolCall(calls: JSONArray) {
+-        val ctx = appContext ?: return
++        // [Mines-voice-34] mines_task works without phone control (uses the app context of the bridge)
++        val ctx = appContext ?: bridgeContext ?: return
+         scope.launch {
+             val responses = JSONArray()
+             for (i in 0 until calls.length()) {
+@@ -515,6 +527,10 @@ class GeminiLive(
+                 val ui = com.openminis.app.sandbox.offload.FastUi(ctx)
+                 val out = runCatching {
+                     when (c.optString("name")) {
++                        "mines_task" -> MinesVoiceBridge.start(ctx, args.optString("task")) { result ->
++                            sendNote("（Mines 刚完成你交给它的任务，结果如下，请用一两句口语告诉用户）\n" + result)
++                            append(false, "✓ " + result.take(120))
++                        }
+                         "phone_screen" -> ui.voiceScreen()
+                         "phone_do" -> ui.voiceDo(args.optString("steps"), args.optBoolean("confirmed", false))
+                         "phone_open_app" -> ui.voiceOpenApp(args.optString("name"))
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MinesVoiceBridge.kt b/src/android/app/src/main/java/com/openminis/app/plus/MinesVoiceBridge.kt
+new file mode 100644
+index 0000000..89abb7e
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/MinesVoiceBridge.kt
+@@ -0,0 +1,77 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import android.util.Log
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.launch
++import org.json.JSONObject
++
++/**
++ * [Mines-voice-34] Voice acts as Mines (user, 2026-10-13: voice said it "can't do" things
++ * Mines can do). The Live session gets the Mines persona and one function, `mines_task`,
++ * that hands the spoken request to the real Mines agent (same tools, same model routing)
++ * in a dedicated 「语音任务」 chat. The call answers at once ("好，我去办"), the agent runs in
++ * the background, and its result is fed back into the call as a note so the voice reports it.
++ */
++object MinesVoiceBridge {
++    private const val TAG = "MinesVoiceBridge"
++    private const val PREFS = "mines_voice_bridge"
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++
++    fun persona(c: Context): String {
++        val name = Avatars.name(PlusPrefs.state.value.petStyle).takeIf { it != "我的形象" }
++        return "你就是 ${com.openminis.app.ui.brand.Brand.NAME}" + (name?.let { "（形象是 $it）" } ?: "") +
++            "，住在用户手机里的私人管家，和文字聊天里的 Mines 是同一个人、有同样的本事：查资料、跑命令、改文件、写代码、" +
++            "登录网站、管理服务器和账号、看消息汇总。用户视力不好，请用简短、口语化的中文回答，一次只说一件事。\n" +
++            "凡是需要动手去做的请求（不只是聊天或常识问答），都调用 mines_task，把用户要做的事和关键细节写清楚交给 Mines 执行；" +
++            "绝对不要说「我做不到」「我没有这个能力」。调用后先用一句话告诉用户「好，我去办」，结果回来后用一两句话汇报，" +
++            "需要用户决定的地方再问。付款、转账、下单、发消息之类的事，先口头确认再交给 Mines。"
++    }
++
++    fun toolDeclaration(): JSONObject = JSONObject()
++        .put("name", "mines_task")
++        .put("description", "把一件需要动手的事交给 Mines 智能体去执行（它有命令行、文件、浏览器、账号、服务器等全部工具）。立刻返回“已开始”，完成后结果会作为备注发回通话。")
++        .put("parameters", JSONObject().put("type", "OBJECT")
++            .put("properties", JSONObject()
++                .put("task", JSONObject().put("type", "STRING").put("description", "要做的事，写清目标和细节（用用户的原话）"))
++                .put("confirmed", JSONObject().put("type", "BOOLEAN").put("description", "涉及付款/下单/发送时，用户已口头确认为 true")))
++            .put("required", org.json.JSONArray().put("task")))
++
++    /** Starts the task; returns the immediate tool result. [report] gets the final text later. */
++    fun start(c: Context, task: String, report: (String) -> Unit): String {
++        val app = c.applicationContext
++        if (task.isBlank()) return "没听清要做什么，请再说一次"
++        scope.launch {
++            val out = runCatching { run(app, task) }.getOrElse { e ->
++                Log.w(TAG, "task failed: ${e.message}")
++                "没办成：" + (e.message ?: "出错了").take(200)
++            }
++            report(out)
++        }
++        return "已交给 Mines 开始执行，完成后会把结果告诉你。先简短告诉用户「好，我去办」。"
++    }
++
++    private suspend fun run(c: Context, task: String): String {
++        val p = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++        val saved = p.getString("session", null)
++        val alive = saved != null && runCatching {
++            (c as? com.openminis.app.MinisApp)?.chatRepository?.getSession(saved) != null
++        }.getOrDefault(true)
++        val sid: String = if (alive && saved != null) saved else {
++            val n = com.openminis.app.debug.HeadlessChatRunner.ensureSession(c)
++            p.edit().putString("session", n).apply()
++            n
++        }
++        val r = com.openminis.app.debug.HeadlessChatRunner.prompt(
++            c, sid, "（来自语音通话）$task", wait = true, timeoutMs = 10 * 60_000L,
++        )
++        val text = r.responseText?.trim().orEmpty()
++        return when {
++            r.timedOut -> "还在做，已经超过 10 分钟，结果会留在「语音任务」对话里。"
++            text.isNotEmpty() -> text.take(1500)
++            else -> "做完了（${r.status}），详情在对话里。"
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ModelHealth.kt b/src/android/app/src/main/java/com/openminis/app/plus/ModelHealth.kt
+new file mode 100644
+index 0000000..68b5d45
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/ModelHealth.kt
+@@ -0,0 +1,60 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import org.json.JSONArray
++import org.json.JSONObject
++
++/**
++ * [Mines-degen-34] Models that produced garbage twice in a turn are marked 「不稳定」
++ * (shown in 模型路由 with 清除). Also the weak/flash heuristic behind the
++ * "switch to a stronger model" hint.
++ */
++object ModelHealth {
++    private const val PREFS = "mines_model_health"
++    data class Mark(val id: String, val name: String, val why: String, val at: Long)
++
++    private val _marks = MutableStateFlow<List<Mark>>(emptyList())
++    val marks: StateFlow<List<Mark>> = _marks.asStateFlow()
++    @Volatile private var loaded = false
++
++    fun load(c: Context) {
++        if (loaded) return
++        loaded = true
++        val raw = c.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("marks", "[]") ?: "[]"
++        _marks.value = runCatching {
++            val a = JSONArray(raw)
++            (0 until a.length()).map { val o = a.getJSONObject(it); Mark(o.optString("id"), o.optString("name"), o.optString("why"), o.optLong("at")) }
++        }.getOrDefault(emptyList())
++    }
++
++    private fun save(c: Context) {
++        val a = JSONArray()
++        _marks.value.forEach { a.put(JSONObject().put("id", it.id).put("name", it.name).put("why", it.why).put("at", it.at)) }
++        c.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("marks", a.toString()).apply()
++    }
++
++    fun markUnstable(c: Context, id: String, name: String, why: String) {
++        load(c)
++        _marks.value = (_marks.value.filterNot { it.id == id } + Mark(id, name, why, System.currentTimeMillis())).takeLast(30)
++        save(c)
++    }
++
++    fun clear(c: Context, id: String? = null) {
++        load(c)
++        _marks.value = if (id == null) emptyList() else _marks.value.filterNot { it.id == id }
++        save(c)
++    }
++
++    fun isUnstable(c: Context, id: String): Boolean { load(c); return _marks.value.any { it.id == id } }
++
++    /** Heuristic: flash / lite / mini / nano / small open models (≤ 35B) are "light" for long agent runs. */
++    fun isWeak(id: String, name: String): Boolean {
++        val s = (id + " " + name).lowercase()
++        if (Regex("flash|lite|mini|nano|tiny|small|haiku|air\\b|turbo").containsMatchIn(s)) return true
++        val b = Regex("(\\d+(?:\\.\\d+)?)\\s*b\\b").find(s)?.groupValues?.get(1)?.toDoubleOrNull()
++        return b != null && b <= 35.0
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusPrefs.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusPrefs.kt
+index 62b6b2d..774ea02 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/PlusPrefs.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/PlusPrefs.kt
+@@ -64,7 +64,7 @@ data class PlusState(
+     /** Also show the wallpaper behind the conversation list. */
+     val wallpaperOnHome: Boolean = false,
+     val petEnabled: Boolean = false,
+-    val petStyle: String = "whale",      // Avatars.builtins id, or "custom"
++    val petStyle: String = "claude",      // Avatars.builtins id, or "custom"
+     val petColor: Int = 0xFFD97757.toInt(),
+     /** Bumped whenever the custom picture or its crop changes (cache key). */
+     val avatarVersion: Long = 0L,
+@@ -137,6 +137,13 @@ object PlusPrefs {
+                 p.edit().apply { if (old != null) putString("petStyle", Avatars.migrate24(old)) }
+                     .putBoolean("avatarIds25", true).apply()
+             }
++            // [Mines-design-34] Default character is now Claude (user-approved design). The old
++            // default 小鲸 is switched once; picking 小鲸 again afterwards sticks.
++            if (!p.getBoolean("avatarDefault34", false)) {
++                val cur = p.getString("petStyle", null)
++                p.edit().apply { if (cur == null || cur == "whale") putString("petStyle", "claude") }
++                    .putBoolean("avatarDefault34", true).apply()
++            }
+             _state.value = read(p)
+         }
+     }
+@@ -174,7 +181,7 @@ object PlusPrefs {
+             wallpaperAlpha = p.getFloat("wallpaperAlpha", 1f),
+             wallpaperOnHome = p.getBoolean("wallpaperOnHome", false),
+             petEnabled = p.getBoolean("petEnabled", false),
+-            petStyle = Avatars.normalize(p.getString("petStyle", "whale") ?: "whale"),
++            petStyle = Avatars.normalize(p.getString("petStyle", "claude") ?: "claude"),
+             // build-3..19 default blue → Mines terracotta
+             petColor = p.getInt("petColor", 0xFFD97757.toInt()).let { if (it == 0xFF5B8DEF.toInt() && !p.contains("avatarVersion")) 0xFFD97757.toInt() else it },
+             avatarVersion = p.getLong("avatarVersion", 0L),
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
+index dafbe2e..57ed394 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
+@@ -111,6 +111,51 @@ class SelfTestProvider : ContentProvider() {
+                 out.putString("result", o.toString())
+             }
+             "extract" -> out.putString("result", MailParse.extractCode(arg ?: "") ?: "")
++            "degen" -> {
++                // [Mines-degen-34] detector on built-in samples: garbage must trip, normal text must not
++                val rnd = java.util.Random(7)
++                val junk = StringBuilder("让我想想这个推特链接分享的问题。"); val al = "LLLL_나L_yLL//////"
++                while (junk.length < 6000) junk.append(al[rnd.nextInt(al.length)])
++                val bad = listOf(junk.toString(), "好的。" + "/".repeat(3000), "检查一下。" + "我需要再检查一下这个链接是否安全。".repeat(200))
++                val good = listOf(
++                    (1..300).joinToString("") { "第${it}步：检查 t.co/${(it * 7919).toString(36)} 的跳转目标，确认是 x.com，再看证书。" },
++                    (1..300).joinToString(",", "[", "]") { "{\"id\":$it,\"name\":\"item-$it\",\"price\":${it * 3 % 97}}" },
++                )
++                fun run(t: String): String? { val d = com.openminis.app.agent.DegenerationDetector(); var i = 0
++                    while (i < t.length) { d.feed(t.substring(i, minOf(t.length, i + 40)))?.let { return it }; i += 40 }; return null }
++                val br = bad.map { run(it) }; val gr = good.map { run(it) }
++                val ok = br.all { it != null } && gr.all { it == null }
++                out.putString("result", org.json.JSONObject().put("ok", ok).put("bad", org.json.JSONArray(br.map { it ?: "MISSED" }))
++                    .put("good", org.json.JSONArray(gr.map { it ?: "ok" })).toString())
++            }
++            "failguard" -> {
++                // [Mines-loop-34] the CDP sign-up loop from the user's report: stops on the 3rd identical failure
++                val g = com.openminis.app.agent.FailurePatternGuard()
++                val outs = listOf(
++                    "Error: browserType.connectOverCDP: WebSocket error: 400 Bad Request (session 4f1a2b)",
++                    "Error: browserType.connectOverCDP: WebSocket error: 400 Bad Request (session 9c3d77)",
++                    "Error: browserType.connectOverCDP: WebSocket error: 400 Bad Request (session 11aa02)",
++                )
++                val r = outs.mapIndexed { i, o -> g.onResult("shell_execute", true, "attempt ${i + 1}\n" + o) }
++                val ok = r[0] == null && r[1] == null && r[2] != null
++                out.putString("result", org.json.JSONObject().put("ok", ok).put("stop", r[2] ?: "").put("next", g.nextStep()).toString())
++            }
++            "theme" -> {
++                // [Mines-design-34] switch the desk-pet character (→ app accent / wallpaper glow / voice rings)
++                val c = context!!
++                val id = arg ?: "claude"
++                PlusPrefs.update(c) { it.copy(petStyle = id) }
++                val t = com.openminis.app.ui.plus.MinesDesign.theme(id)
++                out.putString("result", org.json.JSONObject().put("style", PlusPrefs.state.value.petStyle)
++                    .put("name", Avatars.name(id)).put("primary", "%08X".format(t.primary.value.toLong() ushr 32)).toString())
++            }
++            "tts" -> {
++                // [Mines-tts-34] engine choice + Sec-MS-GEC sanity (no network): "edge" | "openrouter" | "gemini"
++                val c = context!!
++                arg?.let { e -> ExternalTts.save(c, ExternalTts.settings(c).copy(engine = e)) }
++                out.putString("result", org.json.JSONObject().put("engine", ExternalTts.settings(c).engine)
++                    .put("gec", ExternalTts.secMsGec(1760000000L)).toString())
++            }
+             else -> out.putString("result", "unknown method")
+         }
+         return out
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/VoiceClone.kt b/src/android/app/src/main/java/com/openminis/app/plus/VoiceClone.kt
+index d981031..378a705 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/VoiceClone.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/VoiceClone.kt
+@@ -108,6 +108,17 @@ object VoiceClone {
+         val ex = MediaExtractor()
+         c.contentResolver.openFileDescriptor(uri, "r")?.use { fd -> ex.setDataSource(fd.fileDescriptor) }
+             ?: throw IllegalStateException("打不开这个文件")
++        return decodeExtractor(ex)
++    }
++
++    /** [Mines-tts-34] Decode an audio file (mp3 / wav / ogg …) to mono PCM. */
++    internal fun decodeFileToMono(path: String): Pair<ShortArray, Int> {
++        val ex = MediaExtractor()
++        ex.setDataSource(path)
++        return decodeExtractor(ex)
++    }
++
++    private fun decodeExtractor(ex: MediaExtractor): Pair<ShortArray, Int> {
+         try {
+             var track = -1
+             for (i in 0 until ex.trackCount) {
+@@ -171,7 +182,7 @@ object VoiceClone {
+         } finally { ex.release() }
+     }
+ 
+-    private fun resample(src: ShortArray, from: Int, to: Int): ShortArray {
++    internal fun resample(src: ShortArray, from: Int, to: Int): ShortArray {
+         if (from == to || src.isEmpty()) return src
+         val n = (src.size.toLong() * to / from).toInt()
+         val out = ShortArray(n)
+@@ -315,14 +326,14 @@ object VoiceClone {
+     // ---- 3. speak -----------------------------------------------------------
+ 
+     class Speaker(private val key: String, private val voiceUri: String, private val ref: File?, private val refText: String,
+-                  private val speed: Float) {
++                  private val speed: Float) : TtsSpeaker {
+         private val refB64: String? by lazy { ref?.let { "data:audio/wav;base64," + Base64.encodeToString(it.readBytes(), Base64.NO_WRAP) } }
+ 
+         /**
+          * Streams 16-bit PCM at [OUT_RATE] for [text] into [sink] as it arrives.
+          * Returns false when [cancelled] stopped it.
+          */
+-        fun stream(text: String, cancelled: () -> Boolean, sink: (ByteArray, Int) -> Unit): Boolean {
++        override fun stream(text: String, cancelled: () -> Boolean, sink: (ByteArray, Int) -> Unit): Boolean {
+             val body = JSONObject().put("model", MODEL).put("input", text.replace(" ", ""))
+                 .put("response_format", "pcm").put("sample_rate", OUT_RATE).put("stream", true)
+                 .put("speed", speed.toDouble())
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/VoiceSession.kt b/src/android/app/src/main/java/com/openminis/app/plus/VoiceSession.kt
+index 023df74..c4d400c 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/VoiceSession.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/VoiceSession.kt
+@@ -66,10 +66,16 @@ object VoiceSession {
+             key, PlusVault.extra("gemini", "model") ?: GeminiLive.DEFAULT_MODEL,
+             userVoice ?: GeminiLive.DEFAULT_VOICE,
+             // [Mines-voice-33] speed/pitch only apply to the external (cloned) voice; Gemini's own audio plays as sent
+-            speed = if (VoiceClone.settings(c).enabled) PlusVault.extra("gemini", "speed")?.toFloatOrNull() ?: 1f else 1f,
+-            pitch = if (VoiceClone.settings(c).enabled) PlusVault.extra("gemini", "pitch")?.toFloatOrNull() ?: 1f else 1f,
++            // [Mines-tts-34] external voice (OpenRouter → Edge → phone TTS) or the cloned voice: Gemini audio muted,
++            // speed / pitch applied on playback. Gemini's own voice plays as sent.
++            speed = when { VoiceClone.settings(c).enabled -> PlusVault.extra("gemini", "speed")?.toFloatOrNull() ?: 1f
++                ExternalTts.active(c) -> ExternalTts.settings(c).speed; else -> 1f },
++            pitch = when { VoiceClone.settings(c).enabled -> PlusVault.extra("gemini", "pitch")?.toFloatOrNull() ?: 1f
++                ExternalTts.active(c) -> ExternalTts.settings(c).pitch; else -> 1f },
+             appContext = if (PlusVault.extra("gemini", "phone") != "0") c else null,
+-            cloneVoice = VoiceClone.speaker(c),
++            cloneVoice = VoiceClone.speaker(c) ?: ExternalTts.speaker(c),
++            systemPrompt = MinesVoiceBridge.persona(c),
++            bridgeContext = c.applicationContext,
+         )
+         _live.value = g
+         lastUser.value = ""; lastAnswer.value = ""
+diff --git a/src/android/app/src/main/java/com/openminis/app/tools/AgentTools.kt b/src/android/app/src/main/java/com/openminis/app/tools/AgentTools.kt
+index e36f2d1..bd04e31 100644
+--- a/src/android/app/src/main/java/com/openminis/app/tools/AgentTools.kt
++++ b/src/android/app/src/main/java/com/openminis/app/tools/AgentTools.kt
+@@ -125,7 +125,11 @@ object AgentTools {
+             "Package installs: apk and pip are wrapped (stalled downloads are stopped, the fastest mirror is re-picked and the command retried once). " +
+             "If an install still fails (hangs, SSL/certificate errors, proxy errors, 'unable to fetch'), run `mines-doctor` FIRST and follow its 怎么修 lines instead of guessing; " +
+             "`mines-mirror auto` re-picks mirrors (apk/pip/npm), `mines-devkit install` installs gcc/g++/make, python3+pip, nodejs/npm, git and openjdk17 in one go. " +
+-            "Never set http_proxy/https_proxy yourself; Mines exports a working proxy (or none).",
++            "Never set http_proxy/https_proxy yourself; Mines exports a working proxy (or none). " +
++            // [Mines-agent-34] user report: a sign-up task spun up remote/headless browsers over CDP from the shell for minutes
++            "Do NOT start headless/remote browsers from the shell (playwright/puppeteer/selenium, connectOverCDP, browserless or cloud browser sessions) " +
++            "to sign up, log in, fill forms or read logged-in pages: use the browser_use tool instead (the app's own in-app browser, with the user's saved logins, " +
++            "automatic SMS/e-mail code fill via wait_for_otp and human-check hand-off via wait_for_human). If the same command fails the same way twice, change approach or tell the user.",
+         parameters = mapOf(
+             "tool_title" to AgentToolParam("string", "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Install Python data analysis packages', 'List files in home directory'). Use the same language as the user."),
+             "command" to AgentToolParam("string", "The shell command to execute. Supports multi-line commands directly — no special escaping needed. Keep under 1000 chars; for longer scripts, write to a file with file_write first, then run it."),
+@@ -145,7 +149,10 @@ object AgentTools {
+         // the ceiling became dynamic (3 alone, +2 per active agent, capped at
+         // 6), and an agent sees only its own tabs anyway — so the honest thing
+         // to tell it is which tabs it may use, not a number that is now wrong.
+-        description = "Control a web browser with a few tabs (list_tabs shows the ones you may use). " +
++        description = "Control the app's built-in in-app browser with a few tabs (list_tabs shows the ones you may use). " +
++            // [Mines-agent-34]
++            "This is THE tool for any website task: registering an account, logging in, filling forms, reading pages behind a login — " +
++            "prefer it over any shell-based browser automation (no playwright/puppeteer/CDP in shell_execute). " +
+             "Do NOT use this tool for minis:// action URLs (open_terminal, views, settings) — those are app deep links, use Markdown links in chat instead. " +
+             "The browser supports both web URLs and minis:// resource URLs. Use minis:// URLs to preview session files (e.g. navigate to minis://workspace/index.html). " +
+             "Sub-resources (JS, CSS, images, fonts) referenced via minis:// absolute paths or relative paths within HTML pages resolve correctly. " +
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/brand/MinesIcons.kt b/src/android/app/src/main/java/com/openminis/app/ui/brand/MinesIcons.kt
+index c0e42e7..e7fb64c 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/brand/MinesIcons.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/brand/MinesIcons.kt
+@@ -106,6 +106,10 @@ object MinesIcons {
+         "wallet" to listOf("M19 7V4a1 1 0 0 0-1-1H5a2 2 0 0 0 0 4h15a1 1 0 0 1 1 1v4h-3a2 2 0 0 0 0 4h3a1 1 0 0 0 1-1v-2a1 1 0 0 0-1-1", "M3 5v14a2 2 0 0 0 2 2h15a1 1 0 0 0 1-1v-4"),
+         "wifi" to listOf("M12 20h.01", "M2 8.82a15 15 0 0 1 20 0", "M5 12.859a10 10 0 0 1 14 0", "M8.5 16.429a5 5 0 0 1 7 0"),
+         "wrench" to listOf("M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.106-3.105c.32-.322.863-.22.983.218a6 6 0 0 1-8.259 7.057l-7.91 7.91a1 1 0 0 1-2.999-3l7.91-7.91a6 6 0 0 1 7.057-8.259c.438.12.54.662.219.984z"),
++        "volume-2" to listOf("M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z", "M16 9a5 5 0 0 1 0 6", "M19.364 18.364a9 9 0 0 0 0-12.728"),
++        "captions" to listOf("M5.0 5.0h14.0a2.0 2.0 0 0 1 2.0 2.0v10.0a2.0 2.0 0 0 1 -2.0 2.0h-14.0a2.0 2.0 0 0 1 -2.0 -2.0v-10.0a2.0 2.0 0 0 1 2.0 -2.0Z", "M7 15h4", "M15 15h2", "M7 11h2", "M13 11h4"),
++        "audio-lines" to listOf("M2 10v3", "M6 6v11", "M10 3v18", "M14 8v7", "M18 5v13", "M22 10v3"),
++        "fingerprint" to listOf("M12 10a2 2 0 0 0-2 2c0 1.02-.1 2.51-.26 4", "M14 13.12c0 2.38 0 6.38-1 8.88", "M17.29 21.02c.12-.6.43-2.3.5-3.02", "M2 12a10 10 0 0 1 18-6", "M2 16h.01", "M21.8 16c.2-2 .131-5.354 0-6", "M5 19.5C5.5 18 6 15 6 12a6 6 0 0 1 .34-2", "M8.65 22c.21-.66.45-1.32.57-2", "M9 6.8a6 6 0 0 1 9 5.2v2"),
+         "x" to listOf("M18 6 6 18", "m6 6 12 12"),
+     )
+ 
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatAssistantMessageUI.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatAssistantMessageUI.kt
+index 0f96235..e3c4c6f 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatAssistantMessageUI.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatAssistantMessageUI.kt
+@@ -1075,7 +1075,10 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast:
+     // where the same UserDefaults gate sits at the one-shot auto-expand site.
+     val context = LocalContext.current
+     val autoExpandThinking = remember { autoExpandThinkingEnabled(context) }
+-    var expanded by remember(block.id) { mutableStateOf(autoExpandThinking && isLast && isStreaming) }
++    // [Mines-degen-34] Collapsed by default (user, 2026-10-13: a 23K-char garbage thinking block filled the
++    // chat): one summary line + token estimate; tap to read. The old auto-expand setting is ignored.
++    @Suppress("UNUSED_VARIABLE") val autoExpandUnused = autoExpandThinking
++    var expanded by remember(block.id) { mutableStateOf(false) }
+     // [T-android-thinking-collapse-latch] What the user last chose, or null if
+     // they have not touched THIS block. Deliberately tri-state rather than the
+     // old `userTouched: Boolean`.
+@@ -1099,8 +1102,17 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast:
+         // One-shot auto-collapse when streaming for this block ends.
+         if (shouldAutoCollapseThinking(isStreaming, userIntent)) expanded = false
+     }
+-    val thinkingBlue = Color(0xFF007AFF)
++    // [Mines-design-34] porcelain glass backing, opaque enough over any wallpaper; ink text ≥ 4.5:1
++    val mc = com.openminis.app.ui.plus.mines()
++    val thinkingBlue = mc.primaryText
+     val charCount = block.content.length
++    val tokenEstimate = remember(charCount / 200) {
++        var cjk = 0; for (ch in block.content) if (ch.code >= 0x2E80) cjk++
++        cjk + (charCount - cjk) / 4
++    }
++    val summaryLine = remember(charCount / 120) {
++        block.content.trim().lineSequence().map { it.trim() }.lastOrNull { it.length >= 4 }?.take(80).orEmpty()
++    }
+     val charLabel = when {
+         charCount >= 1000 -> "${charCount / 1000}K"
+         else -> "$charCount"
+@@ -1123,9 +1135,9 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast:
+         modifier = Modifier
+             .fillMaxWidth()
+             .padding(vertical = 4.dp)
+-            .background(thinkingBlue.copy(alpha = 0.06f), RoundedCornerShape(12.dp))
+-            .border(0.5.dp, thinkingBlue.copy(alpha = 0.15f), RoundedCornerShape(12.dp))
+-            .clip(RoundedCornerShape(12.dp))
++            .background(com.openminis.app.ui.plus.minesGlassFill(strong = true), RoundedCornerShape(16.dp))
++            .border(1.dp, mc.hairline, RoundedCornerShape(16.dp))
++            .clip(RoundedCornerShape(16.dp))
+             .padding(horizontal = 12.dp, vertical = 8.dp),
+     ) {
+         // Header row — only the header reacts to taps. Mirrors iOS, where
+@@ -1169,19 +1181,19 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast:
+                 Spacer(modifier = Modifier.width(6.dp))
+             }
+             Text(
+-                text = "Deep Thinking",
+-                fontSize = 13.sp,
++                text = "深度思考",
++                fontSize = 15.sp,
+                 fontWeight = FontWeight.SemiBold,
+                 color = thinkingBlue,
+             )
+             Spacer(modifier = Modifier.weight(1f))
+             if (charCount > 0) {
++                @Suppress("UNUSED_EXPRESSION") charLabel
+                 Text(
+-                    text = charLabel,
+-                    fontSize = 11.sp,
++                    text = "约 ${if (tokenEstimate >= 1000) "${tokenEstimate / 1000}K" else tokenEstimate.toString()} tokens",
++                    fontSize = 14.sp,
+                     fontWeight = FontWeight.Medium,
+-                    fontFamily = FontFamily.Monospace,
+-                    color = thinkingBlue.copy(alpha = 0.6f),
++                    color = mc.ink2,
+                 )
+                 Spacer(modifier = Modifier.width(4.dp))
+             }
+@@ -1210,6 +1222,10 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast:
+         // block is streaming, manual drag at any time, and pause-on-user-scroll
+         // so a user reading earlier reasoning isn't yanked back to the tail by
+         // the next token.
++        if (!expanded && summaryLine.isNotEmpty()) {
++            Text(summaryLine, fontSize = 15.sp, lineHeight = 20.sp, color = mc.ink2, maxLines = 1,
++                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, modifier = Modifier.padding(top = 4.dp))
++        }
+         AnimatedVisibility(visible = expanded && !overHardCap) {
+             val scrollState = rememberScrollState()
+             // [T-thinking-render-perf-android] Render only the tail window so
+@@ -1290,9 +1306,9 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast:
+                 }
+                 Text(
+                     text = displayContent,
+-                    fontSize = 13.sp,
+-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f),
+-                    lineHeight = 19.sp,
++                    fontSize = 15.sp,
++                    color = mc.ink2,
++                    lineHeight = 21.sp,
+                 )
+             }
+         }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
+index 0b868be..18992fc 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
+@@ -5561,7 +5561,7 @@ class ChatViewModel(
+      * Bounds compact-thrash within a single turn; the MAX_AGENT_TURNS ceiling is
+      * never reset by compaction, so this is a second, tighter backstop.
+      */
+-    private val maxInLoopCompactions = 3
++    private val maxInLoopCompactions = 6 // [Mines-ctx-34] long runs (1000+ steps) need more than 3
+ 
+     /**
+      * [T-android-auto-compact-inloop] Re-evaluate [ContextPolicy] between agent
+@@ -10755,7 +10755,12 @@ class ChatViewModel(
+         var pendingScriptedTurn: com.openminis.app.scheduled.ScriptedToolTurn? = scriptedTurnFor(prefill)
+         // [Mines-loop-30] Repeat detection + per-run tool-call cap (see RunLoopGuard).
+         val runGuard = com.openminis.app.agent.RunLoopGuard(com.openminis.app.agent.RunLoopGuard.maxToolCalls(context))
+-        for (turn in 0 until turnCap) {
++        // [Mines-degen-34] per-turn thinking length cap (characters), configurable in 设置 → 沙箱与防杀
++        val degenThinkCap = com.openminis.app.agent.RunLoopGuard.thinkingCap(context)
++        // [Mines-loop-34] same failing tool + same error 3× → stop; weak-model hint once per run
++        val failGuard = com.openminis.app.agent.FailurePatternGuard()
++        var weakModelHinted = false
++        turnLoop@ for (turn in 0 until turnCap) {
+             // [T-android-switch-model-next-request] The user picked another
+             // model while this turn ran. Apply it HERE, before the next
+             // request: the request or tool call that was in flight when they
+@@ -11230,6 +11235,11 @@ class ChatViewModel(
+             // so we catch at collect level and unwrap.
+             var collectDone = false
+             var retryAttempt = 0  // per-turn auto-retry counter (resets on each new turn)
++            // [Mines-degen-34] garbage / runaway-thinking guard for this turn
++            val degen = com.openminis.app.agent.DegenerationDetector()
++            var degenRetries = 0
++            var degenForceFallback = false
++            var turnThinkingOverride: ThinkingLevel? = null
+             while (!collectDone) {
+                 try {
+                     // [T-android-enhanced-cache] Stamp the per-turn Enhanced
+@@ -11340,7 +11350,7 @@ class ChatViewModel(
+                             // currentModel mid-turn while the turn keeps its local
+                             // provider, so reading the class-level model would send the
+                             // NEW model's reasoning decision to the OLD model.
+-                            thinkingLevel = if (currentProvider.model.supportsReasoning == true) _thinkingLevel.value else ThinkingLevel.OFF,
++                            thinkingLevel = if (currentProvider.model.supportsReasoning == true) (turnThinkingOverride ?: _thinkingLevel.value) else ThinkingLevel.OFF,
+                         )
+                     }
+                     turnChunks.collect { chunk ->
+@@ -11363,6 +11373,15 @@ class ChatViewModel(
+                 when (chunk) {
+                     is LLMStreamChunk.ThinkingDelta -> {
+                         turnThinking.append(chunk.text)
++                        // [Mines-degen-34] abort garbage / endless thinking; let a queued user message cut in
++                        degen.feed(chunk.text)?.let { throw com.openminis.app.agent.DegenerateOutputException(it) }
++                        if (turnThinking.length > degenThinkCap) {
++                            throw com.openminis.app.agent.DegenerateOutputException("超过 $degenThinkCap 字", thinkingCap = true)
++                        }
++                        if (turnThinking.length > 3000 && helperConfig == null && turnThinking.length % 50 < chunk.text.length.coerceAtLeast(1) &&
++                            QueuedPromptBatching.nextInsertBatch(_promptQueue.value).any { it.origin == QueuedPromptOrigin.USER }) {
++                            throw com.openminis.app.agent.QueuedInterruptException()
++                        }
+                         // [T-android-live-update-content] Surface the
+                         // thinking phase to the FGS notification / overlay.
+                         // Deduped inside the tracker, so per-token cost is
+@@ -11407,6 +11426,7 @@ class ChatViewModel(
+                         // T307: append-only on the StringBuilder; .toString()
+                         // is taken once below at flush time, not per delta.
+                         turnTextSb.append(chunk.text)
++                        degen.feed(chunk.text)?.let { throw com.openminis.app.agent.DegenerateOutputException(it) }
+                         // Append to the trailing text block — or open a new one if the last
+                         // block isn't a text block (i.e. a tool call or thinking was in between).
+                         // This preserves the chronological interleaving of text and tool calls
+@@ -11796,6 +11816,73 @@ class ChatViewModel(
+                 } catch (e: Exception) {
+                     if (e is CancellationException && e.cause == null) throw e  // real job cancellation
+                     val actual = unwrapFlowException(e)
++                    // [Mines-degen-34] Our own aborts: degenerated output / runaway thinking / queued user message.
++                    val qInt = (e as? com.openminis.app.agent.QueuedInterruptException) ?: (actual as? com.openminis.app.agent.QueuedInterruptException)
++                    val dgn = (e as? com.openminis.app.agent.DegenerateOutputException) ?: (actual as? com.openminis.app.agent.DegenerateOutputException)
++                    if (qInt != null || dgn != null) {
++                        AppLogger.warning(TAG_STREAM, "[Degen] turn=$turn model=${currentProvider.model.displayName} " +
++                            (dgn?.message ?: "queued user message cuts in") + " thinking=${turnThinking.length} retries=$degenRetries")
++                        // Roll back this attempt's partial blocks (garbage is not kept on screen or in history).
++                        while (allToolBlocks.size > turnStartBlockIndex) allToolBlocks.removeAt(allToolBlocks.size - 1)
++                        turnTextSb.setLength(0)
++                        currentTextBlockSb = null
++                        turnTextBlockIdx = -1
++                        turnThinking.clear()
++                        toolCalls.clear()
++                        toolCallSignatures.clear()
++                        pendingChunkSb.setLength(0)
++                        lastUiUpdateMs = 0L
++                        lastFlushedLen = 0
++                        lastFileToolInputMs = 0L
++                        lastOtherToolInputMs = 0L
++                        degen.reset()
++                        withContext(Dispatchers.Main) { updateAssistantMessage(assistantId, accumulatedText, true, allToolBlocks) }
++                    }
++                    if (qInt != null) {
++                        val qBatch = QueuedPromptBatching.nextInsertBatch(_promptQueue.value)
++                        val handledQ = try {
++                            injectQueuedPromptsAsNewTurn(
++                                finishedAssistantId = assistantId,
++                                finishedAccumulatedText = accumulatedText,
++                                finishedAllToolBlocks = allToolBlocks,
++                                batch = qBatch,
++                            )
++                        } catch (ie: Exception) { Log.e(TAG, "inject on thinking interrupt failed", ie); null }
++                        if (handledQ != null) {
++                            assistantId = handledQ.newAssistantId
++                            scriptedTurnFor(handledQ.prefill)?.let { pendingScriptedTurn = it }
++                            accumulatedText = ""
++                            allToolBlocks.clear()
++                            allToolInputs.clear()
++                            toolInputChunkRings.clear()
++                            _canResume.value = false
++                            continue@turnLoop
++                        }
++                        continue // nothing to inject after all: retry the same request
++                    }
++                    if (dgn != null) {
++                        if (degenRetries == 0) {
++                            // Retry once with a lower thinking level.
++                            degenRetries = 1
++                            turnThinkingOverride = when (_thinkingLevel.value) {
++                                ThinkingLevel.OFF, ThinkingLevel.LOW -> ThinkingLevel.OFF
++                                else -> ThinkingLevel.LOW
++                            }
++                            allToolBlocks.add(AssistantBlock(
++                                id = "degen_info_${turn}_${System.currentTimeMillis()}",
++                                kind = "info",
++                                content = "⚠️ ${dgn.message}。已降低思考强度，重试一次。",
++                                toolTitle = "已打断",
++                                toolStatus = ToolBlockStatus.SUCCESS,
++                            ))
++                            withContext(Dispatchers.Main) { updateAssistantMessage(assistantId, accumulatedText, true, allToolBlocks) }
++                            continue
++                        }
++                        // Repeated: mark the model 不稳定 (shown in 模型路由) and move to the next model in the group.
++                        com.openminis.app.plus.ModelHealth.markUnstable(context, currentProvider.model.id,
++                            currentProvider.model.displayName, dgn.why)
++                        degenForceFallback = true
++                    }
+                     val isRateLimit = actual is com.openminis.app.data.model.LLMError.RateLimited
+                     // [T-android-503-fallback] A confirmed HTTP 5xx, taken from
+                     // the structured status the provider mappers now attach.
+@@ -12018,8 +12105,8 @@ class ChatViewModel(
+                     // group, as on iOS; other errors are unaffected.
+                     val isDirectEntryOverflow = _selectedGroupId.value == null &&
+                         ContextOverflowGuard.isContextOverflow(overflowErr?.httpStatus, overflowErr?.detail)
+-                    val shouldFallback = !isDirectEntryOverflow && (isRateLimit || is5xx || isFallbackableError ||
+-                        loopFallbackStrategy == com.openminis.app.data.model.FallbackStrategy.always)
++                    val shouldFallback = degenForceFallback || (!isDirectEntryOverflow && (isRateLimit || is5xx || isFallbackableError ||
++                        loopFallbackStrategy == com.openminis.app.data.model.FallbackStrategy.always))
+                     // [T-android-fallback-chain-refill] Rebuild from the live
+                     // group, excluding everything already tried in this streak,
+                     // instead of popping a queue that can only shrink. The
+@@ -12066,7 +12153,10 @@ class ChatViewModel(
+                         val isRealModelChange = next.model.id != currentProvider.model.id
+                         fallbackReasons.add("⚠️ ${currentProvider.model.displayName}: $reason")
+                         Log.i(TAG, "🔀 $reason on ${currentProvider.model.displayName}, switching to ${next.model.displayName} (realModelChange=$isRealModelChange)")
++                        if (degenForceFallback) fallbackReasons.add("（${currentProvider.model.displayName} 已在 模型路由 标记为「不稳定」）")
+                         currentProvider = next
++                        // [Mines-degen-34] the next model gets its own retry and the user's thinking level
++                        degenRetries = 0; degenForceFallback = false; turnThinkingOverride = null; degen.reset()
+                         // [T-fallback-5xx-status] Fresh same-model budget for the
+                         // member we just switched to. The counter is per-turn, so
+                         // without this reset every member after the first got
+@@ -12184,6 +12274,8 @@ class ChatViewModel(
+                                 throw com.openminis.app.data.model.LLMError.ProviderError("$trail\n$finalDesc")
+                             }
+                         }
++                        if (degenForceFallback) throw com.openminis.app.data.model.LLMError.ProviderError(
++                            "${actual.message}。这个模型已在 模型路由 标记为「不稳定」，换一个模型再试（模型路由里能选）。")
+                         throw actual  // re-throw unwrapped, all fallbacks exhausted
+                     }
+                 }
+@@ -12845,6 +12937,19 @@ class ChatViewModel(
+             if (guardVerdict != com.openminis.app.agent.RunLoopGuard.Verdict.OK) {
+                 AppLogger.warning(TAG_STREAM, "[LoopGuard] turn=$turn verdict=$guardVerdict calls=${runGuard.toolCalls}/${runGuard.maxToolCalls} repeat=${runGuard.lastRepeat}")
+             }
++            // [Mines-loop-34] failure pattern (tool + normalized error) seen 3 times in this run
++            val failStop: String? = if (helperConfig != null) null else resultParts
++                .filterIsInstance<AgentContentPart.ToolResult>()
++                .firstNotNullOfOrNull { failGuard.onResult(it.name, it.isError, it.content) }
++            if (failStop != null) AppLogger.warning(TAG_STREAM, "[FailGuard] turn=$turn $failStop")
++            // [Mines-loop-34] weak / flash model on a long tool run → one gentle hint to switch in 模型路由
++            if (!weakModelHinted && helperConfig == null && runGuard.toolCalls >= 15 &&
++                com.openminis.app.plus.ModelHealth.isWeak(currentProvider.model.id, currentProvider.model.displayName)) {
++                weakModelHinted = true
++                withContext(Dispatchers.Main) {
++                    appendSystemInfo("当前模型「${currentProvider.model.displayName}」偏轻量，长任务容易绕圈。复杂的事建议在 设置 → 模型路由 换成更强的模型（如 DeepSeek、GLM、Claude）。", "info")
++                }
++            }
+             if (guardVerdict == com.openminis.app.agent.RunLoopGuard.Verdict.WARN) {
+                 val li = resultParts.indexOfLast { it is AgentContentPart.ToolResult }
+                 if (li >= 0) {
+@@ -12889,12 +12994,15 @@ class ChatViewModel(
+             ))
+ 
+             // [Mines-loop-30] Pause (results are already in history, every call stays paired).
+-            if (guardVerdict == com.openminis.app.agent.RunLoopGuard.Verdict.PAUSE_REPEAT ||
++            if (failStop != null || guardVerdict == com.openminis.app.agent.RunLoopGuard.Verdict.PAUSE_REPEAT ||
+                 guardVerdict == com.openminis.app.agent.RunLoopGuard.Verdict.PAUSE_CAP) {
+                 if (helperConfig != null) break // helper: ends like the turn cap (finalizeAtTurnLimit below)
+-                val why = if (guardVerdict == com.openminis.app.agent.RunLoopGuard.Verdict.PAUSE_REPEAT)
+-                    "检测到重复循环，已暂停（${runGuard.lastRepeat}）"
+-                else "这次任务已调用 ${runGuard.toolCalls} 次工具（上限 ${runGuard.maxToolCalls}），已暂停"
++                val why = when {
++                    failStop != null -> failStop + failGuard.nextStep()
++                    guardVerdict == com.openminis.app.agent.RunLoopGuard.Verdict.PAUSE_REPEAT ->
++                        "检测到重复循环，已暂停（${runGuard.lastRepeat}）"
++                    else -> "这次任务已调用 ${runGuard.toolCalls} 次工具（上限 ${runGuard.maxToolCalls}），先停下问问你：要继续吗？"
++                }
+                 withContext(Dispatchers.Main) {
+                     updateAssistantMessage(
+                         assistantId, accumulatedText, false, allToolBlocks,
+@@ -15236,6 +15344,7 @@ Memory system (currently DISABLED):
+             " For delegating a whole task that needs tools and multiple rounds, use the subagent_task tool instead."
+         } else ""
+         val browserPromptBullet = if (browserToolEnabled) """- browser_use: Web browsing (navigate, screenshot, click, type, get_text, scroll, scroll_and_collect, get_readable, get_backbone, fetch, etc.). Starts with a desktop Chrome user agent. Use screenshot to see the page.
++  网站注册 / 登录 / 填表 / 读登录后的页面：一律用 browser_use（App 内置浏览器，带用户已登录的会话，验证码用 wait_for_otp 自动填，人机验证用 wait_for_human 交给用户）。不要在 shell_execute 里起 playwright / puppeteer / selenium / connectOverCDP / 远程或云端浏览器会话；同一个办法失败两次就换办法或直接告诉用户卡在哪。
+   当 browser_use 触达 Google 登录 / OAuth 页（accounts.google.com、signin.google.com、myaccount.google.com、oauth2.googleapis.com 等）或网页返回 "disallowed_useragent" / 403 包含 "browser is not secure" 字样时，**不要重试或尝试登录** — Google 永久禁止 in-app WebView 完成登录，重试只会浪费 turn。改为告诉用户："此页面需要在系统 Chrome 完成登录" 并给出可点击的 Markdown link [在 Chrome 中打开](https://accounts.google.com/...)。点该 link 时 app 会跳出 Custom Tab；用户在 Chrome 完成操作后，请他**把所需结果（邮件正文 / 文档摘要 / 表格数据）粘贴回 chat**，你再继续帮他处理。这是 Android 平台限制，不是 bug。${toolListMemoryBullets}""" else ""
+         val minisUrlNote = if (browserToolEnabled) """IMPORTANT: minis:// URLs are app-internal — they are NOT web URLs. Do NOT pass minis:// action URLs (open_terminal, views, settings) to browser_use — those are app deep links, use Markdown links in chat instead. However, minis:// resource URLs CAN be opened in browser_use with navigate. All directories under /var/minis/ are accessible: workspace, attachments, offloads, shared, etc. The built-in browser fully supports minis:// — HTML pages and all sub-resources (JS, CSS, images, fonts, etc.) referenced via minis:// absolute URLs or relative paths resolve correctly within the current session. When building multi-file web projects, use file_write to create files in the same directory (e.g. /var/minis/workspace/myapp/), then reference sub-resources with relative paths in HTML (e.g. <link href="style.css">, <script src="app.js">, <img src="logo.png">). The browser resolves relative paths against the minis:// base URL automatically. Cross-directory references also work with absolute minis:// URLs (e.g. <img src="minis://attachments/photo.png"> from a workspace HTML page). Navigate to the entry HTML to preview, e.g. minis://workspace/myapp/index.html.""" else """IMPORTANT: minis:// URLs are app-internal — they are NOT web URLs. Do NOT treat minis:// action URLs (open_terminal, views, settings) as web links — those are app deep links, use Markdown links in chat instead."""
+         // [T-prompt-file-search-rg] The "File search" bullet below is the single
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/Glass.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/Glass.kt
+index 9b851b9..402ddfd 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/Glass.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/Glass.kt
+@@ -117,8 +117,9 @@ fun GlassCard(
+     val glass = st.glassOn
+ 
+     // Base colour of the scrim and the opacity needed for 4.5:1 against the worst backdrop.
+-    val base = if (dark) Color(0xFF101318) else Color(0xFFF7F5F2)
+-    val userA = if (glass) st.glassOpacity.coerceIn(0.3f, 0.95f) else 0.94f
++    // [Mines-design-34] porcelain glass (#FFFDFA / #221D1A) instead of the cool grey
++    val base = if (dark) Color(0xFF221D1A) else Color(0xFFFFFDFA)
++    val userA = if (glass) st.glassOpacity.coerceIn(0.3f, 0.95f).coerceAtLeast(if (wallOn) 0.3f else 0.72f) else 0.94f
+     val worstWall = when {
+         !wallOn || lum == null -> cs.surface.luminance()
+         dark -> lum.max
+@@ -180,7 +181,7 @@ fun GlassCard(
+             Modifier.matchParentSize().background(
+                 Brush.linearGradient(
+                     listOf(
+-                        cs.primary.copy(alpha = 0.22f).compositeOverSafe(base.copy(alpha = a)),
++                        cs.primaryContainer.copy(alpha = 0.18f).compositeOverSafe(base.copy(alpha = a)),
+                         base.copy(alpha = a),
+                     ),
+                 ),
+@@ -194,7 +195,7 @@ fun GlassCard(
+                 shape,
+             ),
+         )
+-        val fg = if (dark) Color.White else Color(0xFF111111)
++        val fg = if (dark) MinesDesign.InkDark else MinesDesign.Ink
+         CompositionLocalProvider(LocalCardSurface provides worstBg, LocalContentColor provides fg) {
+             content()
+         }
+@@ -220,7 +221,7 @@ fun glassRowBrush(): Brush? {
+     val st by PlusPrefs.state.collectAsState()
+     if (!st.glassOn || st.wallpaper.isEmpty() || !st.wallpaperOnHome) return null
+     val dark = MaterialTheme.colorScheme.surface.luminance() < 0.5f
+-    val base = if (dark) Color(0xFF101318) else Color(0xFFF7F5F2)
++    val base = if (dark) Color(0xFF221D1A) else Color(0xFFFFFDFA)
+     val a = maxOf(st.glassOpacity, 0.72f).coerceAtMost(0.95f)
+     return Brush.verticalGradient(listOf(base.copy(alpha = a - 0.06f), base.copy(alpha = a)))
+ }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt
+new file mode 100644
+index 0000000..a90ff36
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt
+@@ -0,0 +1,186 @@
++package com.openminis.app.ui.plus
++
++import androidx.compose.foundation.Canvas
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.Immutable
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.staticCompositionLocalOf
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.graphics.Brush
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import com.openminis.app.plus.PlusPrefs
++
++/**
++ * [Mines-design-34] 「暖瓷 · 毛玻璃」 design system (user-approved 2026-10-13,
++ * /workspace design33/design-system.md). Warm porcelain background, soft
++ * gradient wallpaper with four blurred colour blobs, translucent 22 dp cards,
++ * body 17 sp (min 15 sp), all text ≥ 4.5:1.
++ *
++ * Per-character themes (user, 2026-10-13): the desk-pet character picks the
++ * accent (buttons, links, icon circles), the wallpaper glow and the voice
++ * rings. Claude = terracotta, 小鲸 = sea blue, the others from their hair
++ * colour. Every primary was chosen so white text on it is ≥ 4.8:1, and the
++ * link colour is ≥ 5.3:1 on the porcelain background (dark: ≥ 8:1).
++ */
++@Immutable
++data class CharacterTheme(
++    val id: String,
++    val primary: Color, val primaryText: Color, val container: Color, val onContainer: Color, val brand: Color,
++    val darkPrimary: Color, val darkOnPrimary: Color, val darkContainer: Color, val darkOnContainer: Color,
++    val blobs: List<Color>, val darkBlobs: List<Color>, val ring: Color,
++)
++
++object MinesDesign {
++    // Porcelain neutrals (light / dark)
++    val Bg = Color(0xFFF6F2EC); val BgDark = Color(0xFF14110F)
++    val Surface = Color(0xFFFFFFFF); val SurfaceDark = Color(0xFF1F1B18)
++    val Surface2 = Color(0xFFEFEAE3); val Surface2Dark = Color(0xFF2A2521)
++    val Glass = Color(0xB3FFFDFA); val GlassDark = Color(0x9E221D1A)          // .70 / .62
++    val GlassStrong = Color(0xDBFFFDFA); val GlassStrongDark = Color(0xDB221D1A) // .86
++    val GlassBorder = Color(0xBFFFFFFF); val GlassBorderDark = Color(0x1AFFFFFF)
++    val Hairline = Color(0x171C1915); val HairlineDark = Color(0x17FFFFFF)
++    val Ink = Color(0xFF1C1915); val InkDark = Color(0xFFF5F0EA)
++    val Ink2 = Color(0xFF5A534B); val Ink2Dark = Color(0xFFC9C0B5)
++    val Ink3 = Color(0xFF6F665D); val Ink3Dark = Color(0xFFA39A90)
++    // Semantic (text colour on its container ≥ 5:1)
++    val Success = Color(0xFF1E6B40); val SuccessC = Color(0xFFE1F2E7)
++    val Warning = Color(0xFF8A4E00); val WarningC = Color(0xFFFCEFD9)
++    val Danger = Color(0xFFB3261E); val DangerC = Color(0xFFFBE3E0)
++    val DangerFill = Color(0xFFC9372C)
++    val Info = Color(0xFF2F5FB3); val InfoC = Color(0xFFE3ECFA)
++    val Violet = Color(0xFF6A4BB0); val VioletC = Color(0xFFECE6F8)
++    val Teal = Color(0xFF16676B); val TealC = Color(0xFFDDF0EF)
++    val SuccessDark = Color(0xFF7FD3A0); val SuccessCDark = Color(0xFF173A26)
++    val WarningDark = Color(0xFFF2B866); val WarningCDark = Color(0xFF3D2A0E)
++    val DangerDark = Color(0xFFFF9C92); val DangerCDark = Color(0xFF4A1A16)
++    val InfoDark = Color(0xFF9DBBF2); val InfoCDark = Color(0xFF1B2A47)
++    // Voice page
++    val VoiceBg = Color(0xFF2A1C2C)
++    val VoiceGlass = Color(0x21FFFFFF); val VoiceGlassBorder = Color(0x38FFFFFF)
++    val HangUp = Color(0xFFE5484D); val OnlineDot = Color(0xFF7CE3A2)
++
++    val themes: Map<String, CharacterTheme> = mapOf(
++        "claude" to CharacterTheme("claude", Color(0xFFB5532F), Color(0xFFA84B2A), Color(0xFFFBE6DC), Color(0xFF7A2E14), Color(0xFFD97757),
++            Color(0xFFEE9474), Color(0xFF2A1206), Color(0xFF4A2416), Color(0xFFFFD9CA),
++            listOf(Color(0xFFF9D9C6), Color(0xFFE9DDF3), Color(0xFFF6CDB8), Color(0xFFDCE9E1)), listOf(Color(0xFF4A2B20), Color(0xFF2E2440), Color(0xFF4A2618), Color(0xFF1C2E27)), Color(0xFFFFC4AA)),
++        "whale" to CharacterTheme("whale", Color(0xFF2E73C2), Color(0xFF2865AB), Color(0xFFD9E9FC), Color(0xFF1C4778), Color(0xFF3C8EEC),
++            Color(0xFF7FADE1), Color(0xFF0C1D32), Color(0xFF1D3249), Color(0xFFA0C2E9),
++            listOf(Color(0xFFC9DCF3), Color(0xFFDFDBF0), Color(0xFFC1E3F1), Color(0xFFEADCDC)), listOf(Color(0xFF1F3651), Color(0xFF2A2442), Color(0xFF1C3D4A), Color(0xFF301D1D)), Color(0xFF97C4F7)),
++        "grok" to CharacterTheme("grok", Color(0xFF68728A), Color(0xFF5B6479), Color(0xFFE5E8F1), Color(0xFF404654), Color(0xFF6F85B8),
++            Color(0xFFA5ACBB), Color(0xFF1A1D23), Color(0xFF2E3138), Color(0xFFBCC1CD),
++            listOf(Color(0xFFD4DAE8), Color(0xFFE3DBF0), Color(0xFFCCDAE6), Color(0xFFEADFDC)), listOf(Color(0xFF1F2E51), Color(0xFF2F2442), Color(0xFF1C354A), Color(0xFF30211D)), Color(0xFFB3BFDB)),
++        "gpt" to CharacterTheme("gpt", Color(0xFF746BA1), Color(0xFF665D92), Color(0xFFE6E3F2), Color(0xFF464064), Color(0xFF7667C1),
++            Color(0xFFADA8C7), Color(0xFF1A1825), Color(0xFF2E2B3B), Color(0xFFBCB7D1),
++            listOf(Color(0xFFD6D2EA), Color(0xFFECDBF0), Color(0xFFCACDE7), Color(0xFFEAE5DC)), listOf(Color(0xFF271F51), Color(0xFF3D2442), Color(0xFF1C204A), Color(0xFF30291D)), Color(0xFFBAB3DB)),
++        "gemini" to CharacterTheme("gemini", Color(0xFF835EC2), Color(0xFF744CBB), Color(0xFFE7DCF9), Color(0xFF4F3181), Color(0xFF814EDA),
++            Color(0xFFB59FDB), Color(0xFF1B112C), Color(0xFF2F2343), Color(0xFFC0AEE0),
++            listOf(Color(0xFFD9CDEF), Color(0xFFF0DBEF), Color(0xFFCAC5ED), Color(0xFFEAE8DC)), listOf(Color(0xFF311F51), Color(0xFF422441), Color(0xFF211C4A), Color(0xFF302D1D)), Color(0xFFBA97F7)),
++        "kimi" to CharacterTheme("kimi", Color(0xFF427A85), Color(0xFF396A74), Color(0xFFDFF3F7), Color(0xFF2C5159), Color(0xFF5ABACE),
++            Color(0xFF7DB4BF), Color(0xFF142629), Color(0xFF273B3F), Color(0xFFAACED5),
++            listOf(Color(0xFFCFE8EC), Color(0xFFDBDFF0), Color(0xFFC7EAE7), Color(0xFFEADCE1)), listOf(Color(0xFF1F4951), Color(0xFF242942), Color(0xFF1C4A46), Color(0xFF301D23)), Color(0xFF97E7F7)),
++        "wenxin" to CharacterTheme("wenxin", Color(0xFF5E6BC2), Color(0xFF4C5BBB), Color(0xFFDCE0F9), Color(0xFF313C81), Color(0xFF4E61DA),
++            Color(0xFF9FA7DB), Color(0xFF11152C), Color(0xFF232743), Color(0xFFAEB4E0),
++            listOf(Color(0xFFCDD1EF), Color(0xFFE6DBF0), Color(0xFFC5D4ED), Color(0xFFEAE1DC)), listOf(Color(0xFF1F2651), Color(0xFF342442), Color(0xFF1C2E4A), Color(0xFF30241D)), Color(0xFF97A4F7)),
++    )
++
++    /** Theme for a character id ("custom" and unknown ids → Claude, the brand colours). */
++    fun theme(style: String?): CharacterTheme = themes[style] ?: themes.getValue("claude")
++}
++
++/** The accent family in use (follows the desk-pet character). */
++@Immutable
++data class MinesColors(
++    val dark: Boolean, val character: CharacterTheme,
++    val bg: Color, val surface: Color, val surface2: Color, val glass: Color, val glassStrong: Color, val glassBorder: Color,
++    val hairline: Color, val ink: Color, val ink2: Color, val ink3: Color,
++    val primary: Color, val onPrimary: Color, val primaryText: Color, val container: Color, val onContainer: Color,
++    val brand: Color, val blobs: List<Color>, val ring: Color,
++)
++
++fun minesColors(style: String?, dark: Boolean): MinesColors {
++    val t = MinesDesign.theme(style)
++    return if (dark) MinesColors(
++        true, t, MinesDesign.BgDark, MinesDesign.SurfaceDark, MinesDesign.Surface2Dark, MinesDesign.GlassDark, MinesDesign.GlassStrongDark,
++        MinesDesign.GlassBorderDark, MinesDesign.HairlineDark, MinesDesign.InkDark, MinesDesign.Ink2Dark, MinesDesign.Ink3Dark,
++        t.darkPrimary, t.darkOnPrimary, t.darkPrimary, t.darkContainer, t.darkOnContainer, t.brand, t.darkBlobs, t.ring,
++    ) else MinesColors(
++        false, t, MinesDesign.Bg, MinesDesign.Surface, MinesDesign.Surface2, MinesDesign.Glass, MinesDesign.GlassStrong,
++        MinesDesign.GlassBorder, MinesDesign.Hairline, MinesDesign.Ink, MinesDesign.Ink2, MinesDesign.Ink3,
++        t.primary, Color.White, t.primaryText, t.container, t.onContainer, t.brand, t.blobs, t.ring,
++    )
++}
++
++val LocalMinesColors = staticCompositionLocalOf { minesColors("claude", false) }
++
++/** Current design colours (provided by MinisTheme from the chosen character). */
++@Composable
++fun mines(): MinesColors = LocalMinesColors.current
++
++/** Semantic icon-circle colours: (icon tint, circle fill). */
++enum class Tone { DANGER, WARNING, SUCCESS, INFO, VIOLET, TEAL, NEUTRAL, ACCENT }
++
++@Composable
++fun toneColors(tone: Tone): Pair<Color, Color> {
++    val m = mines()
++    return if (!m.dark) when (tone) {
++        Tone.DANGER -> MinesDesign.Danger to MinesDesign.DangerC
++        Tone.WARNING -> MinesDesign.Warning to MinesDesign.WarningC
++        Tone.SUCCESS -> MinesDesign.Success to MinesDesign.SuccessC
++        Tone.INFO -> MinesDesign.Info to MinesDesign.InfoC
++        Tone.VIOLET -> MinesDesign.Violet to MinesDesign.VioletC
++        Tone.TEAL -> MinesDesign.Teal to MinesDesign.TealC
++        Tone.NEUTRAL -> m.ink2 to Color(0x0F1C1915)
++        Tone.ACCENT -> m.primaryText to m.container
++    } else when (tone) {
++        Tone.DANGER -> MinesDesign.DangerDark to MinesDesign.DangerCDark
++        Tone.WARNING -> MinesDesign.WarningDark to MinesDesign.WarningCDark
++        Tone.SUCCESS -> MinesDesign.SuccessDark to MinesDesign.SuccessCDark
++        Tone.INFO -> MinesDesign.InfoDark to MinesDesign.InfoCDark
++        Tone.VIOLET -> Color(0xFFC3B0F0) to Color(0xFF2C2343)
++        Tone.TEAL -> Color(0xFF86D3D0) to Color(0xFF123536)
++        Tone.NEUTRAL -> m.ink2 to Color(0x12FFFFFF)
++        Tone.ACCENT -> m.onContainer to m.container
++    }
++}
++
++/**
++ * The default 「暖雾」 wallpaper: warm porcelain gradient + four soft radial
++ * blobs tinted by the character (apricot/lavender/peach/sage for Claude).
++ * Drawn behind every Plus page and the home list when no photo wallpaper is set.
++ */
++@Composable
++fun PorcelainBackdrop(modifier: Modifier = Modifier) {
++    val m = mines()
++    val base = if (m.dark) listOf(Color(0xFF1A1512), MinesDesign.BgDark) else listOf(Color(0xFFFBF6F0), Color(0xFFF4ECE3))
++    Box(modifier.background(Brush.linearGradient(base))) {
++        Canvas(Modifier.fillMaxSize()) {
++            val w = size.width; val h = size.height
++            val spots = listOf(
++                Offset(w * 0.08f, h * 0.10f) to 0.75f,
++                Offset(w * 0.95f, h * 0.18f) to 0.65f,
++                Offset(w * 0.90f, h * 0.86f) to 0.80f,
++                Offset(w * 0.02f, h * 0.55f) to 0.60f,
++            )
++            spots.forEachIndexed { i, (c, r) ->
++                val col = m.blobs.getOrElse(i) { m.blobs.first() }
++                val radius = w * r
++                drawCircle(Brush.radialGradient(listOf(col.copy(alpha = 0.95f), col.copy(alpha = 0f)), center = c, radius = radius), radius = radius, center = c)
++            }
++        }
++    }
++}
++
++/** Character id currently picked (reads PlusPrefs). */
++@Composable
++fun currentCharacter(): String {
++    val ctx = LocalContext.current
++    PlusPrefs.init(ctx)
++    val st by PlusPrefs.state.collectAsState()
++    return st.petStyle
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
+index 06061b9..5b87928 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
+@@ -49,6 +49,7 @@ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.produceState
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.graphicsLayer
+ import androidx.compose.ui.graphics.Brush
+ import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.graphics.compositeOver
+@@ -170,7 +171,8 @@ fun ChatWallpaperLayer(modifier: Modifier = Modifier, home: Boolean = false) {
+  */
+ @Composable
+ fun homeCardColor(base: Color): Color =
+-    if (wallpaperOn(home = true)) base.copy(alpha = 0.55f) else base
++    if (wallpaperOn(home = true)) base.copy(alpha = 0.55f)
++    else mines().let { m -> (if (m.dark) Color(0xFF221D1A) else Color(0xFFFFFDFA)).copy(alpha = if (m.dark) 0.80f else 0.78f) }
+ 
+ /** True when a wallpaper is drawn on this screen (bars then go translucent). */
+ @Composable
+@@ -225,79 +227,123 @@ fun PetAvatar(
+ // a large bold title; rows have a line icon in a tinted circle, title 16 sp, muted
+ // 14 sp subtitle, an optional right-side value and a chevron; buttons are pills.
+ 
+-/** Accent used for icon circles and pill buttons (Mines terracotta, softened in dark). */
++/** [Mines-design-34] Accent for icons and links: the character's link colour (≥ 5.3:1 on porcelain). */
+ @Composable
+-fun minesAccent(): Color = if (MaterialTheme.colorScheme.surface.luminance() < 0.5f) Color(0xFFE8906F) else Color(0xFFC8643F)
++fun minesAccent(): Color = mines().primaryText
+ 
+ @Composable
+-fun minesMuted(): Color = MaterialTheme.colorScheme.onSurfaceVariant
++fun minesMuted(): Color = mines().ink2
++
++/** Page backdrop: the user's wallpaper when it is on for home, else the porcelain 「暖雾」. */
++@Composable
++fun MinesBackdrop(modifier: Modifier = Modifier) {
++    if (wallpaperOn(home = true)) {
++        Box(modifier) {
++            PorcelainBackdrop(Modifier.fillMaxSize())
++            ChatWallpaperLayer(Modifier.fillMaxSize(), home = true)
++        }
++    } else PorcelainBackdrop(modifier)
++}
+ 
+ @OptIn(ExperimentalMaterial3Api::class)
+ @Composable
+-fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, content: @Composable ColumnScope.() -> Unit) {
+-    // [Mines-design-33] light polish only (full restyle comes with build-34's design system)
+-    Scaffold(
+-        topBar = {
+-            TopAppBar(
+-                title = {},
+-                navigationIcon = {
+-                    IconButton(onClick = onBack) {
+-                        MinesIcon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
+-                    }
+-                },
+-            )
+-        },
+-    ) { padding ->
+-        Column(
+-            Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState())
+-                .padding(bottom = 40.dp),
+-        ) {
+-            Text(title, fontSize = 28.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onBackground,
+-                modifier = Modifier.padding(start = 22.dp, end = 22.dp, top = 0.dp, bottom = if (subtitle == null) 4.dp else 2.dp))
+-            if (subtitle != null) Text(subtitle, fontSize = 15.sp, lineHeight = 21.sp,
+-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+-                modifier = Modifier.padding(horizontal = 22.dp).padding(bottom = 4.dp))
+-            content()
++fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, actions: (@Composable () -> Unit)? = null,
++             content: @Composable ColumnScope.() -> Unit) {
++    // [Mines-design-34] 「暖瓷 · 毛玻璃」: backdrop, 60 dp bar with back + 22 sp bold title, glass sections.
++    val m = mines()
++    Box(Modifier.fillMaxSize()) {
++        MinesBackdrop(Modifier.fillMaxSize())
++        Scaffold(
++            containerColor = Color.Transparent,
++            topBar = {
++                TopAppBar(
++                    title = { Text(title, fontSize = 22.sp, lineHeight = 30.sp, fontWeight = FontWeight.Bold, color = m.ink, maxLines = 1,
++                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) },
++                    navigationIcon = {
++                        IconButton(onClick = onBack) {
++                            MinesIcon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回", tint = m.ink)
++                        }
++                    },
++                    actions = { actions?.invoke() },
++                    colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent, scrolledContainerColor = Color.Transparent),
++                )
++            },
++        ) { padding ->
++            Column(
++                Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState())
++                    .padding(bottom = 40.dp),
++            ) {
++                if (subtitle != null) Text(subtitle, fontSize = 16.sp, lineHeight = 24.sp, color = m.ink2,
++                    modifier = Modifier.padding(horizontal = 24.dp).padding(bottom = 4.dp))
++                content()
++            }
+         }
+     }
+ }
+ 
++/** Glass section card fill: translucent porcelain, opaque enough that ink stays ≥ 4.5:1 over any backdrop. */
+ @Composable
+-fun PlusSection(title: String?, footer: String? = null, content: @Composable ColumnScope.() -> Unit) {
+-    Column(Modifier.fillMaxWidth().padding(top = 16.dp)) {
+-        if (title != null) Text(
+-            title,
+-            fontSize = 15.sp,
+-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+-            fontWeight = FontWeight.SemiBold,
+-            modifier = Modifier.padding(horizontal = 24.dp, vertical = 6.dp),
+-        )
+-        Column(
+-            Modifier.fillMaxWidth().padding(horizontal = 16.dp)
+-                .clip(RoundedCornerShape(20.dp))
+-                .background(MaterialTheme.colorScheme.surfaceContainerLow)
+-                .padding(vertical = 4.dp),
+-            content = content,
+-        )
++fun minesGlassFill(strong: Boolean = false): Color {
++    val m = mines()
++    val photo = wallpaperOn(home = true)
++    val a = when { photo -> 0.88f; strong -> 0.90f; else -> 0.78f }
++    return (if (m.dark) Color(0xFF221D1A) else Color(0xFFFFFDFA)).copy(alpha = a)
++}
++
++/** A frosted 22 dp card (no blur pass: translucent fill + 1 dp highlight + soft warm shadow). */
++@Composable
++fun MinesCard(modifier: Modifier = Modifier, strong: Boolean = false, onClick: (() -> Unit)? = null, content: @Composable ColumnScope.() -> Unit) {
++    val m = mines()
++    val shape = RoundedCornerShape(22.dp)
++    Column(
++        modifier.shadow(if (m.dark) 0.dp else 3.dp, shape, clip = false, ambientColor = Color(0xFF3C2814).copy(alpha = 0.10f), spotColor = Color(0xFF3C2814).copy(alpha = 0.12f))
++            .clip(shape).background(minesGlassFill(strong)).border(1.dp, m.glassBorder, shape)
++            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier),
++        content = content,
++    )
++}
++
++@Composable
++fun PlusSection(title: String?, footer: String? = null, action: String? = null, onAction: (() -> Unit)? = null,
++                content: @Composable ColumnScope.() -> Unit) {
++    val m = mines()
++    Column(Modifier.fillMaxWidth().padding(top = 18.dp)) {
++        if (title != null) Row(Modifier.fillMaxWidth().padding(start = 24.dp, end = 24.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
++            Text(title, fontSize = 16.sp, color = m.ink2, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
++            if (action != null && onAction != null) Text(action, fontSize = 15.sp, color = m.primaryText, fontWeight = FontWeight.Medium,
++                modifier = Modifier.clickable(onClick = onAction).padding(4.dp))
++        }
++        MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
++            Column(Modifier.fillMaxWidth().padding(vertical = 4.dp), content = content)
++        }
+         if (footer != null) Text(
+             footer,
+-            fontSize = 13.sp,
+-            color = MaterialTheme.colorScheme.onSurfaceVariant,
++            fontSize = 15.sp,
++            color = m.ink3,
+             modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp),
+-            lineHeight = 18.sp,
++            lineHeight = 20.sp,
+         )
+     }
+ }
+ 
+-/** Line icon in a tinted circle. */
++/** Line icon in a tinted circle (40 dp; icon in the tint, circle in its light container). */
+ @Composable
+-fun IconBubble(icon: androidx.compose.ui.graphics.vector.ImageVector, tint: Color = minesAccent(), size: Dp = 36.dp) {
+-    Box(Modifier.size(size).clip(CircleShape).background(tint.copy(alpha = 0.16f)), contentAlignment = Alignment.Center) {
+-        MinesIcon(icon, null, tint = tint, modifier = Modifier.size(size * 0.54f))
++fun IconBubble(icon: androidx.compose.ui.graphics.vector.ImageVector, tint: Color = minesAccent(), size: Dp = 40.dp, fill: Color? = null) {
++    val m = mines()
++    val bg = fill ?: if (tint == minesAccent()) m.container else tint.copy(alpha = if (m.dark) 0.22f else 0.13f)
++    Box(Modifier.size(size).clip(CircleShape).background(bg), contentAlignment = Alignment.Center) {
++        MinesIcon(icon, null, tint = tint, modifier = Modifier.size(size * 0.52f))
+     }
+ }
+ 
+-/** The standard row: icon bubble · title / subtitle · value · chevron. */
++/** Icon circle in one of the semantic tones (要处理 = danger, 余额 = warning, 可薅 = success, 可学 = info …). */
++@Composable
++fun ToneBubble(icon: androidx.compose.ui.graphics.vector.ImageVector, tone: Tone, size: Dp = 40.dp) {
++    val (fg, bg) = toneColors(tone)
++    IconBubble(icon, fg, size, bg)
++}
++
++/** The standard row: icon bubble · title / subtitle · value · chevron (min 64 dp). */
+ @Composable
+ fun PlusRow(
+     icon: androidx.compose.ui.graphics.vector.ImageVector?,
+@@ -309,60 +355,64 @@ fun PlusRow(
+     trailing: (@Composable () -> Unit)? = null,
+     onClick: (() -> Unit)? = null,
+ ) {
++    val m = mines()
+     Row(
+-        Modifier.fillMaxWidth().heightIn(min = 58.dp)
++        Modifier.fillMaxWidth().heightIn(min = 64.dp)
+             .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
+             .padding(horizontal = 16.dp, vertical = 10.dp),
+         verticalAlignment = Alignment.CenterVertically,
+     ) {
+         if (icon != null) { IconBubble(icon, tint); Spacer(Modifier.width(14.dp)) }
+         Column(Modifier.weight(1f)) {
+-            Text(title, fontSize = 16.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
+-            if (!sub.isNullOrBlank()) Text(sub, fontSize = 14.sp, lineHeight = 19.sp, color = minesMuted())
++            Text(title, fontSize = 17.sp, lineHeight = 24.sp, fontWeight = FontWeight.Medium, color = m.ink)
++            if (!sub.isNullOrBlank()) Text(sub, fontSize = 15.sp, lineHeight = 20.sp, color = m.ink2)
+         }
+-        if (value != null) Text(value, fontSize = 15.sp, color = minesMuted(), maxLines = 1,
++        if (value != null) Text(value, fontSize = 16.sp, color = m.ink2, maxLines = 1,
+             modifier = Modifier.padding(start = 8.dp).widthIn(max = 150.dp))
+         if (trailing != null) { Spacer(Modifier.width(8.dp)); trailing() }
+-        else if (chevron && onClick != null) Text("›", fontSize = 24.sp, color = minesMuted(), modifier = Modifier.padding(start = 8.dp))
++        else if (chevron && onClick != null) Text("›", fontSize = 26.sp, color = m.ink3, modifier = Modifier.padding(start = 8.dp))
+     }
+ }
+ 
+ /** Status dot + word (能用 / 连不上 …). */
+ @Composable
+ fun StatusPill(text: String, ok: Boolean?) {
+-    val c = when (ok) { true -> Color(0xFF34C759); false -> Color(0xFFFF6B5E); null -> minesMuted() }
+-    Row(Modifier.clip(RoundedCornerShape(50)).background(c.copy(alpha = 0.15f)).padding(horizontal = 10.dp, vertical = 4.dp),
++    val (c, bg) = toneColors(when (ok) { true -> Tone.SUCCESS; false -> Tone.DANGER; null -> Tone.NEUTRAL })
++    Row(Modifier.clip(RoundedCornerShape(50)).background(bg).padding(horizontal = 10.dp, vertical = 4.dp),
+         verticalAlignment = Alignment.CenterVertically) {
+-        Box(Modifier.size(7.dp).clip(CircleShape).background(c))
++        Box(Modifier.size(8.dp).clip(CircleShape).background(c))
+         Spacer(Modifier.width(6.dp))
+-        Text(text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = c)
++        Text(text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = c)
+     }
+ }
+ 
+-/** Pill buttons: primary (accent fill) and secondary (outlined, quiet). */
++/** Pill buttons: primary (character colour, white text ≥ 4.8:1) and secondary (quiet fill + ink). 56 dp. */
+ @Composable
+ fun PillButton(text: String, modifier: Modifier = Modifier, primary: Boolean = true, enabled: Boolean = true, onClick: () -> Unit) {
+-    val accent = minesAccent()
++    val m = mines()
+     val shape = RoundedCornerShape(50)
+-    val bg = when { !enabled -> Color.Transparent; primary -> accent; else -> Color.Transparent }
+-    val fg = when { !enabled -> minesMuted().copy(alpha = 0.5f); primary -> Color.White; else -> accent }
+-    val border = when { !enabled -> minesMuted().copy(alpha = 0.3f); primary -> Color.Transparent; else -> accent.copy(alpha = 0.6f) }
++    val bg = when { primary -> m.primary; else -> if (m.dark) Color(0x1FFFFFFF) else Color(0x141C1915) }
++    val fg = when { primary -> m.onPrimary; else -> m.ink }
+     Box(
+-        modifier.heightIn(min = 50.dp).shadow(if (primary && enabled) 4.dp else 0.dp, shape, clip = false)
+-            .clip(shape).background(bg).border(1.dp, border, shape)
++        modifier.heightIn(min = 56.dp).graphicsLayerAlpha(if (enabled) 1f else 0.38f)
++            .shadow(if (primary && enabled && !m.dark) 6.dp else 0.dp, shape, clip = false, spotColor = m.primary.copy(alpha = 0.35f), ambientColor = m.primary.copy(alpha = 0.2f))
++            .clip(shape).background(bg)
+             .then(if (enabled) Modifier.clickable(onClick = onClick) else Modifier)
+-            .padding(horizontal = 22.dp, vertical = 12.dp),
++            .padding(horizontal = 24.dp, vertical = 14.dp),
+         contentAlignment = Alignment.Center,
+-    ) { Text(text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = fg) }
++    ) { Text(text, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = fg) }
+ }
+ 
++private fun Modifier.graphicsLayerAlpha(a: Float): Modifier = if (a >= 1f) this else this.then(Modifier.graphicsLayer { alpha = a })
++
+ /** Short hint line with an ⓘ, instead of long paragraphs. */
+ @Composable
+ fun InfoLine(text: String) {
++    val m = mines()
+     Row(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 6.dp), verticalAlignment = Alignment.Top) {
+-        Text("ⓘ", fontSize = 14.sp, color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f))
++        Text("ⓘ", fontSize = 15.sp, color = m.ink3)
+         Spacer(Modifier.width(6.dp))
+-        Text(text, fontSize = 13.sp, lineHeight = 18.sp, color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.66f))
++        Text(text, fontSize = 15.sp, lineHeight = 20.sp, color = m.ink3)
+     }
+ }
+ 
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt
+index f8c8182..d6772d9 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt
+@@ -76,6 +76,26 @@ fun RoutingScreen(onBack: () -> Unit) {
+                 note = if (n == 0) "没有被多个供应商同时提供的模型" else "已生成 $n 个「⚡」模型组"
+             })
+         }
++        // [Mines-degen-34] 防乱码: models marked 不稳定 + thinking length cap
++        com.openminis.app.plus.ModelHealth.load(ctx)
++        val unstable by com.openminis.app.plus.ModelHealth.marks.collectAsState()
++        var thinkCap by remember { mutableStateOf(com.openminis.app.agent.RunLoopGuard.thinkingCap(ctx)) }
++        PlusSection("防乱码", footer = "输出变成乱码或思考没完没了时，会自动打断、降低思考强度重试一次；再坏就换下一个模型，并把它标成「不稳定」。") {
++            PlusRow(Icons.Outlined.Memory, "每轮思考上限", "超过就打断，换个方式重来", value = "${thinkCap / 1000}K 字", chevron = false)
++            androidx.compose.material3.Slider(thinkCap.toFloat(), {
++                thinkCap = ((it / 2000f).toInt() * 2000).coerceIn(4_000, 200_000)
++                com.openminis.app.agent.RunLoopGuard.setThinkingCap(ctx, thinkCap)
++            }, valueRange = 4_000f..100_000f, modifier = Modifier.padding(horizontal = 16.dp))
++            if (unstable.isEmpty()) {
++                PlusDivider()
++                PlusRow(Icons.Outlined.Shield, "没有不稳定的模型", null, chevron = false)
++            }
++            unstable.forEach { mk ->
++                PlusDivider()
++                PlusRow(Icons.Outlined.Info, mk.name + " · 不稳定", mk.why, tint = MinesDesign.Warning, chevron = false,
++                    trailing = { TextButton(onClick = { com.openminis.app.plus.ModelHealth.clear(ctx, mk.id) }) { Text("清除", fontSize = 16.sp) } })
++            }
++        }
+         val insts = config?.instances?.filter { it.isEnabled }.orEmpty()
+         PlusSection("供应商") {
+             if (insts.isEmpty()) PlusRow(Icons.Outlined.Info, "还没有供应商", chevron = false)
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
+index cb997a2..4194b7b 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
+@@ -9,6 +9,9 @@ import com.openminis.app.ui.brand.MinesIcon
+ import androidx.compose.animation.AnimatedVisibility
+ import androidx.compose.foundation.background
+ import androidx.compose.foundation.clickable
++import androidx.compose.foundation.border
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.ui.draw.shadow
+ import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.Column
+@@ -88,135 +91,139 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier) {
+         in 11..12 -> "中午好"
+         in 13..17 -> "下午好"
+         in 18..22 -> "晚上好"
+-        else -> "夜深了，早点休息"
++        else -> "夜深了"
+     }
+-    val date = SimpleDateFormat("M月d日 EEEE", Locale.CHINA).format(cal.time)
+-    // [Mines-glass-26] iOS "Today"-style widgets: a greeting widget and three small
+-    // status widgets on an 8 dp grid, 22 dp corners, frosted glass, bold hierarchy,
+-    // fade-in on first show, press-scale on tap. Text sizes are sp (follow the
+-    // system font size) and values wrap instead of being cut off.
++    val weekday = SimpleDateFormat("EEEE", Locale.CHINA).format(cal.time).replace("星期", "周")
++    // [Mines-design-34] 「暖瓷 · 毛玻璃」 home (design33 screen 01): greeting + one-line summary,
++    // 对话 | 消息 segmented track, the top 3 「要处理」 items in a glass card, then 最近对话.
++    val m = mines()
++    val feed by com.openminis.app.plus.Digest.items.collectAsState()
++    val todo = feed.filter { it.cat == com.openminis.app.plus.Digest.Cat.ACT }
++    val top = (todo + feed.filter { it.cat != com.openminis.app.plus.Digest.Cat.ACT }).take(3)
+     var shown by androidx.compose.runtime.saveable.rememberSaveable { androidx.compose.runtime.mutableStateOf(false) }
+     LaunchedEffect(Unit) { shown = true }
+     val appear by androidx.compose.animation.core.animateFloatAsState(if (shown) 1f else 0f, androidx.compose.animation.core.tween(280), label = "appear")
+-    // [Mines-compact-29] User (partially sighted, large system font, build-28
+-    // screenshot): the greeting card was ~110 dp with a title that wrapped to
+-    // two lines, and the three status widgets were ~150 dp tall with 22 sp
+-    // bold values that wrapped ("2/2 在 / 线", "18 个已 / 连"). Now: one slim
+-    // greeting row (~52 dp: 32 dp avatar, single-line ellipsized title, small
+-    // mic) and one slim row of pills (icon + dot + short value, label only in
+-    // the accessibility description), every text maxLines = 1 so nothing
+-    // wraps up to fontScale 1.3. Sizes are ~60 % of build-28. No intrinsic
+-    // measurement any more (the build-28 Glass.kt fix stays in place anyway).
+     Column(
+-        modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)
++        modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)
+             .graphicsLayer { alpha = appear; translationY = (1f - appear) * 8f },
+-        verticalArrangement = Arrangement.spacedBy(6.dp),
++        verticalArrangement = Arrangement.spacedBy(12.dp),
+     ) {
+-        // [Mines-feed-32] top segmented control 对话 | 消息 (no bottom bar, so the floating buttons stay free)
+-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+-            listOf("对话" to true, "消息" to false).forEach { (label, sel) ->
+-                GlassCard(Modifier.weight(1f).semantics(mergeDescendants = true) { contentDescription = if (sel) "$label（当前）" else "打开$label" },
+-                    shape = RoundedCornerShape(14.dp), elevation = 2.dp,
+-                    onClick = { if (!sel) onOpen(PlusRoutes.DIGEST) }) {
+-                    val fill = MaterialTheme.colorScheme.surfaceContainerHigh
+-                    val fg = if (sel) MaterialTheme.colorScheme.primary else cardTextColor(fill)
+-                    Text(label, fontSize = 16.sp, fontWeight = if (sel) FontWeight.Bold else FontWeight.Medium, color = fg, maxLines = 1,
+-                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+-                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp))
+-                }
++        // Greeting row
++        Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
++            Column(Modifier.weight(1f).semantics(mergeDescendants = true) {}) {
++                Text("$weekday$greet", fontSize = 15.sp, lineHeight = 20.sp, color = m.ink2, maxLines = 1,
++                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
++                Text(if (todo.isEmpty()) "今天没有要你处理的事" else "有 ${todo.size} 件事等你看看", fontSize = 22.sp, lineHeight = 30.sp,
++                    fontWeight = FontWeight.Bold, color = m.ink, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+             }
++            HeaderCircle(com.openminis.app.ui.brand.MinesIcons.named("layout-grid")!!, "应用与账号") { onOpen(PlusRoutes.CONNECTIONS) }
++            Spacer(Modifier.width(8.dp))
++            HeaderCircle(com.openminis.app.ui.brand.MinesIcons.named("mic")!!, "实时语音") { onOpen(PlusRoutes.VOICE) }
++            Spacer(Modifier.width(8.dp))
++            Box(Modifier.size(44.dp).clip(CircleShape).clickable { switcher = true }.semantics { contentDescription = "换角色" },
++                contentAlignment = Alignment.Center) { PetAvatar(size = 40.dp) }
+         }
+-        GlassCard(Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), elevation = 2.dp,
+-            onClick = { PlusPrefs.update(context) { it.copy(todayCollapsed = !it.todayCollapsed) } }) {
+-            val fill = MaterialTheme.colorScheme.surfaceContainerLow
+-            val fg = cardTextColor(fill)
+-            val bg = LocalCardSurface.current ?: fill
+-            Row(
+-                Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp),
+-                verticalAlignment = Alignment.CenterVertically,
+-            ) {
+-                Box(Modifier.clickable { switcher = true }) { PetAvatar(size = 32.dp) }
+-                Spacer(Modifier.width(10.dp))
+-                Column(Modifier.weight(1f)) {
+-                    Text(greet, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, color = fg,
+-                        maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+-                    Text(date, style = MaterialTheme.typography.labelSmall, color = readableSecondary(fg, bg),
+-                        maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+-                }
+-                // [Mines-digest-31] 消息汇总: one tap from home
+-                androidx.compose.material3.FilledTonalButton(
+-                    onClick = { onOpen(PlusRoutes.DIGEST) }, modifier = Modifier.height(36.dp),
+-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp),
+-                ) {
+-                    val n = com.openminis.app.plus.Digest.items.collectAsState().value.count { it.cat == com.openminis.app.plus.Digest.Cat.ACT }
+-                    Text(if (n > 0) "消息 $n" else "消息", fontSize = 14.sp, maxLines = 1)
+-                }
+-                Spacer(Modifier.width(6.dp))
+-                androidx.compose.material3.FilledTonalIconButton(
+-                    onClick = { onOpen(PlusRoutes.VOICE) }, modifier = Modifier.size(36.dp),
+-                ) {
+-                    MinesIcon(Icons.Outlined.Mic, contentDescription = "实时语音", modifier = Modifier.size(18.dp))
++        // 对话 | 消息 segmented track (48 dp)
++        Row(
++            Modifier.fillMaxWidth().height(48.dp).clip(RoundedCornerShape(50)).background(minesGlassFill(strong = true))
++                .border(1.dp, m.glassBorder, RoundedCornerShape(50)).padding(4.dp),
++        ) {
++            Box(Modifier.weight(1f).fillMaxHeight().shadow(2.dp, RoundedCornerShape(50)).clip(RoundedCornerShape(50))
++                .background(if (m.dark) Color(0x29FFFFFF) else Color.White).semantics { contentDescription = "对话（当前）" },
++                contentAlignment = Alignment.Center) {
++                Text("对话", fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = m.ink)
++            }
++            Row(Modifier.weight(1f).fillMaxHeight().clip(RoundedCornerShape(50)).clickable { onOpen(PlusRoutes.DIGEST) }
++                .semantics(mergeDescendants = true) { contentDescription = "打开消息" + if (todo.isNotEmpty()) "，${todo.size} 条要处理" else "" },
++                horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
++                Text("消息", fontSize = 17.sp, fontWeight = FontWeight.Medium, color = m.ink2)
++                if (todo.isNotEmpty()) {
++                    Spacer(Modifier.width(6.dp))
++                    Box(Modifier.size(22.dp).clip(CircleShape).background(MinesDesign.DangerFill), contentAlignment = Alignment.Center) {
++                        Text(if (todo.size > 9) "9+" else todo.size.toString(), fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
++                    }
+                 }
+-                Spacer(Modifier.width(2.dp))
+-                MinesIcon(
+-                    if (st.todayCollapsed) Icons.Outlined.ExpandMore else Icons.Outlined.ExpandLess,
+-                    contentDescription = if (st.todayCollapsed) "展开" else "收起",
+-                    tint = readableSecondary(fg, bg), modifier = Modifier.size(18.dp),
+-                )
+             }
+         }
++        // 要处理的消息 (top 3)
++        MinesCard(Modifier.fillMaxWidth(), onClick = { onOpen(PlusRoutes.DIGEST) }) {
++            Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
++                Text(if (todo.isNotEmpty()) "要处理的消息" else "消息", fontSize = 19.sp, fontWeight = FontWeight.SemiBold, color = m.ink, modifier = Modifier.weight(1f))
++                Text("全部 ${feed.size} ›", fontSize = 15.sp, fontWeight = FontWeight.Medium, color = m.primaryText)
++            }
++            if (top.isEmpty()) {
++                Text("还没有消息。接入 GitHub 或打开通知权限后，重要的事会出现在这里", fontSize = 16.sp, lineHeight = 24.sp, color = m.ink2,
++                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp))
++            }
++            top.forEachIndexed { i, item ->
++                if (i > 0) Box(Modifier.padding(start = 70.dp).fillMaxWidth().height(1.dp).background(m.hairline))
++                FeedRow(item)
++            }
++            Spacer(Modifier.height(6.dp))
++        }
++        // Status pills (工作位置 / 服务器 / 账号), one slim row, collapsible
+         AnimatedVisibility(!st.todayCollapsed) {
+-            Row(
+-                Modifier.fillMaxWidth(),
+-                horizontalArrangement = Arrangement.spacedBy(6.dp),
+-            ) {
++            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                 val eff = PlusVps.effectiveMode(st)
+                 val online = st.onlineServers.size
+-                Chip(
+-                    Modifier.weight(1f), Icons.Outlined.Cloud, "工作位置",
+-                    when {
+-                        !st.isVps -> "本机"
+-                        eff == PlusState.MODE_LOCAL -> "回本机"
+-                        else -> "VPS"
+-                    },
+-                    dot = when {
+-                        !st.isVps -> Color(0xFF0A84FF)
+-                        eff == PlusState.MODE_LOCAL -> Color(0xFFFF9F0A)
+-                        else -> Color(0xFF30D158)
+-                    },
++                Chip(Modifier.weight(1f), Icons.Outlined.Cloud, "工作位置",
++                    when { !st.isVps -> "本机"; eff == PlusState.MODE_LOCAL -> "回本机"; else -> "VPS" },
++                    dot = when { !st.isVps -> MinesDesign.Info; eff == PlusState.MODE_LOCAL -> MinesDesign.Warning; else -> MinesDesign.Success },
+                 ) { onOpen(PlusRoutes.WORK) }
+-                Chip(
+-                    Modifier.weight(1f), Icons.Outlined.Dns, "服务器",
++                Chip(Modifier.weight(1f), Icons.Outlined.Dns, "服务器",
+                     if (st.servers.isEmpty()) "无" else "$online/${st.servers.size}",
+-                    dot = if (st.servers.isEmpty()) Color(0xFF8E8E93) else if (online > 0) Color(0xFF30D158) else Color(0xFFFF453A),
++                    dot = if (st.servers.isEmpty()) m.ink3 else if (online > 0) MinesDesign.Success else MinesDesign.Danger,
+                 ) { onOpen(PlusRoutes.WORK) }
+-                Chip(
+-                    Modifier.weight(1f), Icons.Outlined.Key, "账号",
++                Chip(Modifier.weight(1f), Icons.Outlined.Key, "账号",
+                     if (vault.isEmpty()) "去连接" else "${vault.size}",
+-                    dot = if (vault.isEmpty()) Color(0xFF8E8E93) else Color(0xFF30D158),
++                    dot = if (vault.isEmpty()) m.ink3 else MinesDesign.Success,
+                 ) { onOpen(PlusRoutes.CONNECTIONS) }
+             }
+         }
+-        // [Mines-feed-32] big 消息 card: top 3, one tap opens the feed
+-        val feed by com.openminis.app.plus.Digest.items.collectAsState()
+-        GlassCard(Modifier.fillMaxWidth().semantics(mergeDescendants = true) { contentDescription = "消息汇总：${feed.size} 条" },
+-            shape = RoundedCornerShape(16.dp), elevation = 2.dp, onClick = { onOpen(PlusRoutes.DIGEST) }) {
+-            val fill = MaterialTheme.colorScheme.surfaceContainerLow
+-            val fg = cardTextColor(fill)
+-            val bg = LocalCardSurface.current ?: fill
+-            Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
+-                Row(verticalAlignment = Alignment.CenterVertically) {
+-                    Text("消息汇总", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, color = fg, modifier = Modifier.weight(1f))
+-                    Text("全部 ›", fontSize = 14.sp, color = readableSecondary(fg, bg))
+-                }
+-                if (feed.isEmpty()) Text("点这里看要处理、可薅、可学、飙升的消息", fontSize = 15.sp, color = readableSecondary(fg, bg), maxLines = 1,
+-                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+-                feed.take(3).forEach { m ->
+-                    Text("• " + (m.headline ?: m.title).ifBlank { m.summary }, fontSize = 15.sp, color = fg, maxLines = 1,
+-                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, modifier = Modifier.padding(top = 2.dp))
+-                }
+-            }
++        Row(Modifier.fillMaxWidth().padding(start = 8.dp, end = 4.dp, top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
++            Text("最近对话", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = m.ink2, modifier = Modifier.weight(1f))
++            Text(if (st.todayCollapsed) "状态 ›" else "收起状态", fontSize = 15.sp, color = m.primaryText,
++                modifier = Modifier.clip(RoundedCornerShape(50)).clickable { PlusPrefs.update(context) { s -> s.copy(todayCollapsed = !s.todayCollapsed) } }
++                    .padding(horizontal = 8.dp, vertical = 6.dp)
++                    .semantics { contentDescription = if (st.todayCollapsed) "展开状态" else "收起状态" })
++        }
++    }
++}
++
++@Composable
++private fun HeaderCircle(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, onClick: () -> Unit) {
++    val m = mines()
++    Box(Modifier.size(44.dp).clip(CircleShape).background(minesGlassFill(strong = true)).border(1.dp, m.glassBorder, CircleShape)
++        .clickable(onClick = onClick).semantics { contentDescription = label }, contentAlignment = Alignment.Center) {
++        MinesIcon(icon, null, tint = m.ink, modifier = Modifier.size(22.dp))
++    }
++}
++
++@Composable
++private fun FeedRow(item: com.openminis.app.plus.Digest.Item) {
++    val it = item
++    val m = mines()
++    val (icon, tone) = when (it.cat) {
++        com.openminis.app.plus.Digest.Cat.ACT -> "message-square-warning" to Tone.DANGER
++        com.openminis.app.plus.Digest.Cat.DEAL -> "wallet" to Tone.SUCCESS
++        com.openminis.app.plus.Digest.Cat.LEARN -> "book-open" to Tone.INFO
++        com.openminis.app.plus.Digest.Cat.HOT -> "chart-column" to Tone.WARNING
++        else -> "mail" to Tone.NEUTRAL
++    }
++    val time = runCatching {
++        val d = System.currentTimeMillis() - it.at
++        if (d < 86_400_000L) SimpleDateFormat("HH:mm", Locale.CHINA).format(java.util.Date(it.at)) else "${d / 86_400_000L} 天前"
++    }.getOrDefault("")
++    Row(Modifier.fillMaxWidth().heightIn(min = 68.dp).padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
++        ToneBubble(com.openminis.app.ui.brand.MinesIcons.named(icon)!!, tone)
++        Spacer(Modifier.width(14.dp))
++        Column(Modifier.weight(1f)) {
++            Text((it.headline ?: it.title).ifBlank { it.summary }, fontSize = 17.sp, lineHeight = 24.sp, fontWeight = FontWeight.Medium, color = m.ink,
++                maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
++            val sub = it.summary.takeIf { s -> s.isNotBlank() && s != it.headline } ?: it.source
++            Text(sub, fontSize = 15.sp, lineHeight = 20.sp, color = m.ink2, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+         }
++        if (time.isNotEmpty()) Text(time, fontSize = 15.sp, color = m.ink3, modifier = Modifier.padding(start = 8.dp))
+     }
+ }
+ 
+@@ -234,7 +241,7 @@ private fun Chip(modifier: Modifier, icon: androidx.compose.ui.graphics.vector.I
+             Spacer(Modifier.width(4.dp))
+             Box(Modifier.size(6.dp).background(dot, CircleShape))
+             Spacer(Modifier.width(5.dp))
+-            Text(value, style = MaterialTheme.typography.labelLarge, fontSize = 13.sp, fontWeight = FontWeight.Bold, color = fg,
++            Text(value, style = MaterialTheme.typography.labelLarge, fontSize = 15.sp, fontWeight = FontWeight.Bold, color = fg,
+                 maxLines = 1, softWrap = false, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+         }
+     }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/TtsSection.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/TtsSection.kt
+new file mode 100644
+index 0000000..60b63a6
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/TtsSection.kt
+@@ -0,0 +1,164 @@
++package com.openminis.app.ui.plus
++
++import androidx.compose.foundation.background
++import androidx.compose.foundation.border
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.verticalScroll
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.Slider
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.semantics.contentDescription
++import androidx.compose.ui.semantics.semantics
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import com.openminis.app.plus.ExternalTts
++import kotlinx.coroutines.launch
++
++/**
++ * [Mines-tts-34] 语音设置 → 「说话的声音」: Gemini 自带 / OpenRouter（你的 Key）/ 免费声音（Edge）,
++ * model + voice pickers, speed / pitch sliders (shown whenever an external voice is on) and 试听.
++ * When OpenRouter fails or runs out of credit the call switches to the free voice by itself.
++ */
++@Composable
++fun TtsSection(onChanged: () -> Unit) {
++    val c = LocalContext.current
++    val m = mines()
++    var s by remember { mutableStateOf(ExternalTts.settings(c)) }
++    var models by remember { mutableStateOf<List<ExternalTts.OrModel>>(emptyList()) }
++    var loadErr by remember { mutableStateOf<String?>(null) }
++    var busy by remember { mutableStateOf<String?>(null) }
++    var msg by remember { mutableStateOf<String?>(null) }
++    var showModels by remember { mutableStateOf(false) }
++    val scope = rememberCoroutineScope()
++    fun save(n: ExternalTts.Settings) { s = n; ExternalTts.save(c, n); onChanged() }
++    LaunchedEffect(s.engine) {
++        if (s.engine == ExternalTts.ENGINE_OPENROUTER && models.isEmpty()) {
++            runCatching { ExternalTts.listOpenRouterModels() }.onSuccess { models = it; loadErr = null }
++                .onFailure { loadErr = "模型列表拿不到，先用默认的（${it.message?.take(60)}）" }
++        }
++    }
++    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
++        Text("说话的声音", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = m.ink2)
++        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++            listOf(ExternalTts.ENGINE_GEMINI to "Gemini 自带", ExternalTts.ENGINE_OPENROUTER to "OpenRouter", ExternalTts.ENGINE_EDGE to "免费声音")
++                .forEach { (id, label) ->
++                    val sel = s.engine == id
++                    Text(label, fontSize = 16.sp, fontWeight = if (sel) FontWeight.SemiBold else FontWeight.Medium,
++                        color = if (sel) m.onPrimary else m.ink,
++                        modifier = Modifier.weight(1f).heightIn(min = 48.dp).clip(RoundedCornerShape(50))
++                            .background(if (sel) m.primary else m.surface2)
++                            .clickable {
++                                save(s.copy(engine = id))
++                                // the cloned voice would mute these: one external voice at a time
++                                if (id != ExternalTts.ENGINE_GEMINI) com.openminis.app.plus.VoiceClone.setEnabled(c, false)
++                            }
++                            .padding(vertical = 12.dp)
++                            .semantics { contentDescription = label + if (sel) "（已选）" else "" },
++                        textAlign = androidx.compose.ui.text.style.TextAlign.Center, maxLines = 1)
++                }
++        }
++        when (s.engine) {
++            ExternalTts.ENGINE_GEMINI -> Text("用 Gemini 实时语音自己的声音（下面选声音）。", fontSize = 15.sp, color = m.ink3)
++            ExternalTts.ENGINE_OPENROUTER -> {
++                Text("用你在 AI 服务商里的 OpenRouter Key。余额用完或出错时，自动换成免费声音。", fontSize = 15.sp, lineHeight = 20.sp, color = m.ink3)
++                if (ExternalTts.openRouterKey(c) == null) Text("还没找到 OpenRouter Key", fontSize = 15.sp, color = MinesDesign.Danger)
++                loadErr?.let { Text(it, fontSize = 15.sp, color = m.ink3) }
++                PickerRow("模型", models.firstOrNull { it.id == s.orModel }?.name ?: s.orModel) { showModels = !showModels }
++                if (showModels) Column(Modifier.fillMaxWidth().heightIn(max = 320.dp).clip(RoundedCornerShape(16.dp)).background(m.surface2)
++                    .verticalScroll(rememberScrollState())) {
++                    (if (models.isEmpty()) listOf(ExternalTts.OrModel(ExternalTts.DEFAULT_OR_MODEL, ExternalTts.DEFAULT_OR_MODEL, listOf(ExternalTts.DEFAULT_OR_VOICE))) else models)
++                        .forEach { mo ->
++                            Text(mo.name, fontSize = 16.sp, color = if (mo.id == s.orModel) m.primaryText else m.ink,
++                                fontWeight = if (mo.id == s.orModel) FontWeight.SemiBold else FontWeight.Normal,
++                                modifier = Modifier.fillMaxWidth().clickable {
++                                    save(s.copy(orModel = mo.id, orVoice = mo.voices.firstOrNull { v -> v == s.orVoice } ?: mo.voices.firstOrNull() ?: s.orVoice))
++                                    showModels = false
++                                }.padding(horizontal = 14.dp, vertical = 12.dp))
++                        }
++                }
++                val voices = models.firstOrNull { it.id == s.orModel }?.voices.orEmpty()
++                if (voices.isNotEmpty()) {
++                    Text("声音", fontSize = 15.sp, color = m.ink2)
++                    ChipFlow(voices.take(40), s.orVoice) { save(s.copy(orVoice = it)) }
++                }
++            }
++            ExternalTts.ENGINE_EDGE -> {
++                Text("微软 Edge 朗读的免费声音，不用 Key。", fontSize = 15.sp, color = m.ink3)
++                ExternalTts.edgeVoices.forEach { (id, label) ->
++                    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clip(RoundedCornerShape(14.dp))
++                        .background(if (s.edgeVoice == id) m.container else androidx.compose.ui.graphics.Color.Transparent)
++                        .clickable { save(s.copy(edgeVoice = id)) }.padding(horizontal = 12.dp, vertical = 10.dp),
++                        verticalAlignment = Alignment.CenterVertically) {
++                        Text(label, fontSize = 17.sp, color = if (s.edgeVoice == id) m.onContainer else m.ink, modifier = Modifier.weight(1f))
++                        if (s.edgeVoice == id) Text("✓", fontSize = 17.sp, color = m.onContainer)
++                    }
++                }
++            }
++        }
++        if (s.engine != ExternalTts.ENGINE_GEMINI) {
++            Text("语速 ${"%.1f".format(s.speed)}×", fontSize = 16.sp, color = m.ink)
++            Slider(s.speed, { save(s.copy(speed = (it * 10).toInt() / 10f)) }, valueRange = 0.6f..1.8f)
++            Text("音调 ${"%.1f".format(s.pitch)}", fontSize = 16.sp, color = m.ink)
++            Slider(s.pitch, { save(s.copy(pitch = (it * 10).toInt() / 10f)) }, valueRange = 0.7f..1.4f)
++            PillButton(busy ?: "试听", Modifier.fillMaxWidth(), primary = true, enabled = busy == null) {
++                busy = "正在合成…"; msg = null
++                scope.launch {
++                    msg = runCatching { "用的是：" + ExternalTts.preview(c, s) }.getOrElse { e ->
++                        if (s.engine == ExternalTts.ENGINE_OPENROUTER) runCatching { ExternalTts.preview(c, s.copy(engine = ExternalTts.ENGINE_EDGE)); "OpenRouter 不行（${e.message?.take(60)}），免费声音可以" }
++                            .getOrElse { "试听失败：${e.message?.take(80)}" }
++                        else "试听失败：${e.message?.take(80)}"
++                    }
++                    busy = null
++                }
++            }
++        }
++        (msg ?: ExternalTts.lastNotice)?.let { Text(it, fontSize = 15.sp, color = m.ink2) }
++    }
++}
++
++@Composable
++private fun PickerRow(label: String, value: String, onClick: () -> Unit) {
++    val m = mines()
++    Row(Modifier.fillMaxWidth().heightIn(min = 52.dp).clip(RoundedCornerShape(16.dp)).background(m.surface2).clickable(onClick = onClick)
++        .padding(horizontal = 14.dp), verticalAlignment = Alignment.CenterVertically) {
++        Text(label, fontSize = 16.sp, color = m.ink2)
++        Text(value, fontSize = 16.sp, color = m.ink, maxLines = 1, modifier = Modifier.weight(1f).padding(start = 12.dp),
++            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
++        Text("›", fontSize = 22.sp, color = m.ink3)
++    }
++}
++
++@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
++@Composable
++private fun ChipFlow(items: List<String>, selected: String, onPick: (String) -> Unit) {
++    val m = mines()
++    androidx.compose.foundation.layout.FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
++        items.forEach { v ->
++            val sel = v == selected
++            Text(v.substringBefore(':'), fontSize = 15.sp, color = if (sel) m.surface else m.ink,
++                modifier = Modifier.heightIn(min = 40.dp).clip(RoundedCornerShape(50))
++                    .background(if (sel) m.ink else m.glassStrong).border(1.dp, m.hairline, RoundedCornerShape(50))
++                    .clickable { onPick(v) }.padding(horizontal = 14.dp, vertical = 9.dp))
++        }
++    }
++}
++
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
+index 3345347..61a68ab 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
+@@ -3,6 +3,14 @@ package com.openminis.app.ui.plus
+ import com.openminis.app.ui.brand.MinesIcon
+ 
+ import android.Manifest
++import androidx.compose.foundation.border
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.layout.widthIn
++import androidx.compose.foundation.layout.windowInsetsPadding
++import androidx.compose.ui.draw.blur
++import androidx.compose.ui.graphics.compositeOver
++import androidx.compose.ui.graphics.graphicsLayer
++import androidx.compose.ui.text.font.FontWeight
+ import android.content.pm.PackageManager
+ import android.view.WindowManager
+ import androidx.activity.compose.rememberLauncherForActivityResult
+@@ -129,52 +137,57 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+     DisposableEffect(plain) { onDispose { plain.stop() } }
+     fun enterPlain() { hungUp = true; com.openminis.app.plus.VoiceSession.stop(context); plainMode = true; if (hasMic) plain.start() else askMic.launch(Manifest.permission.RECORD_AUDIO) }
+     if (showSettings) VoiceSettingsSheet(onDismiss = { showSettings = false }, onChanged = { com.openminis.app.plus.VoiceSession.restart(context) })
+-    Scaffold(
+-        containerColor = Color(0xFF0E1320),
+-        topBar = {
+-            TopAppBar(
+-                title = { Text("实时语音", color = Color.White) },
+-                navigationIcon = {
+-                    IconButton(onClick = onBack) { MinesIcon(Icons.AutoMirrored.Filled.ArrowBack, "返回", tint = Color.White) }
+-                },
+-                actions = {
+-                    androidx.compose.material3.TextButton(onClick = { runDiag() }) {
+-                        Text(if (diagBusy) "测试中…" else "测试语音", color = Color.White)
++    // [Mines-design-34] Showcase voice page (design33 screen 09): frosted haze over the blurred
++    // character, voice-reactive rings in the character colour, glass transcript bubbles, a glass
++    // control bar. No route / proxy / model text anywhere on this page.
++    val mc = mines()
++    var showCaptions by remember { mutableStateOf(true) }
++    var speaker by remember { mutableStateOf(true) }
++    Box(Modifier.fillMaxSize().background(MinesDesign.VoiceBg)) {
++        VoiceHaze(mc)
++        Column(Modifier.fillMaxSize().windowInsetsPadding(androidx.compose.foundation.layout.WindowInsets.systemBars),
++            horizontalAlignment = Alignment.CenterHorizontally) {
++            // top bar: back · 通话中 mm:ss · ⋯
++            val callStart = remember(live) { System.currentTimeMillis() }
++            var now by remember { mutableStateOf(System.currentTimeMillis()) }
++            LaunchedEffect(live) { while (true) { now = System.currentTimeMillis(); kotlinx.coroutines.delay(1000) } }
++            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
++                GlassCircle(Icons.AutoMirrored.Filled.ArrowBack, "返回", onClick = onBack)
++                Spacer(Modifier.weight(1f))
++                if (live != null || plainMode) {
++                    val sec = ((now - callStart) / 1000).coerceAtLeast(0)
++                    Row(Modifier.clip(RoundedCornerShape(50)).background(MinesDesign.VoiceGlass)
++                        .border(1.dp, MinesDesign.VoiceGlassBorder, RoundedCornerShape(50)).padding(horizontal = 14.dp, vertical = 8.dp),
++                        verticalAlignment = Alignment.CenterVertically) {
++                        Box(Modifier.size(9.dp).clip(CircleShape).background(MinesDesign.OnlineDot))
++                        Spacer(Modifier.width(8.dp))
++                        Text("通话中 %02d:%02d".format(sec / 60, sec % 60), color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                     }
+-                    IconButton(onClick = { showSettings = true }) {
+-                        MinesIcon(Icons.Filled.Settings, "语音设置", tint = Color.White)
+-                    }
+-                },
+-                colors = androidx.compose.material3.TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
+-            )
+-        },
+-    ) { pad ->
+-        Column(Modifier.fillMaxSize().padding(pad), horizontalAlignment = Alignment.CenterHorizontally) {
++                }
++                Spacer(Modifier.weight(1f))
++                GlassCircle(com.openminis.app.ui.brand.MinesIcons.named("ellipsis")!!, "语音设置") { showSettings = true }
++            }
+             if (plainMode) {
+                 PlainVoiceContent(plain, onBackToLive = if (key != null) ({ plain.stop(); plainMode = false; hungUp = false; com.openminis.app.plus.VoiceSession.start(context) }) else null,
+                     onHangUp = { plain.stop(); onBack() })
+                 return@Column
+             }
+-            if (live == null && key != null) {
+-                // [Mines-voice-31] Hung up (or not started yet): one big button to call again.
+-                Spacer(Modifier.height(80.dp))
+-                PetAvatar(size = 120.dp)
+-                Spacer(Modifier.height(24.dp))
+-                Button(onClick = { hungUp = false; if (hasMic) com.openminis.app.plus.VoiceSession.start(context) else askMic.launch(Manifest.permission.RECORD_AUDIO) },
+-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp).height(64.dp)) {
+-                    Text("开始语音", style = MaterialTheme.typography.titleMedium)
+-                }
+-                return@Column
+-            }
+             if (live == null) {
+-                Spacer(Modifier.height(80.dp))
+-                PetAvatar(size = 120.dp)
+-                Spacer(Modifier.height(24.dp))
+-                Text("先填一个 Gemini API Key", color = Color.White, style = MaterialTheme.typography.titleMedium)
+-                Spacer(Modifier.height(16.dp))
+-                Button(onClick = onOpenConnections) { Text("去 账号连接 填写") }
+-                Spacer(Modifier.height(12.dp))
+-                androidx.compose.material3.OutlinedButton(onClick = { enterPlain() }) { Text("先用普通语音模式（不用 Google）", color = Color.White) }
++                Spacer(Modifier.weight(0.3f))
++                VoiceCharacter(mc, GeminiLive.Phase.IDLE, 0f, Modifier.fillMaxWidth().weight(1f))
++                Text(com.openminis.app.plus.Avatars.name(currentCharacter()), color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold)
++                Spacer(Modifier.height(20.dp))
++                if (key != null) {
++                    VoicePrimary("开始语音") { hungUp = false; if (hasMic) com.openminis.app.plus.VoiceSession.start(context) else askMic.launch(Manifest.permission.RECORD_AUDIO) }
++                } else {
++                    Text("先在 账号连接 填一个 Gemini API Key", color = Color.White, fontSize = 17.sp, textAlign = TextAlign.Center,
++                        modifier = Modifier.padding(horizontal = 24.dp))
++                    Spacer(Modifier.height(12.dp))
++                    VoicePrimary("去 账号连接 填写", onClick = onOpenConnections)
++                    Spacer(Modifier.height(10.dp))
++                    VoiceSecondary("先用普通语音模式（不用 Google）") { enterPlain() }
++                }
++                Spacer(Modifier.height(40.dp))
+                 return@Column
+             }
+             val phase by live.phase.collectAsState()
+@@ -182,86 +195,182 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+             val muted by live.muted.collectAsState()
+             val error by live.error.collectAsState()
+             val lines by live.lines.collectAsState()
+-            val route by live.route.collectAsState()
+-            val modelInUse by live.modelInUse.collectAsState()
++            val allFailed by live.allFailed.collectAsState()
+ 
+-            Spacer(Modifier.height(24.dp))
+-            Orb(phase, level)
+-            Spacer(Modifier.height(16.dp))
+-            Text(
+-                when (phase) {
+-                    GeminiLive.Phase.IDLE -> "准备中"
+-                    GeminiLive.Phase.CONNECTING -> error?.let { plainVoiceError(it) } ?: "正在连接…"
+-                    GeminiLive.Phase.LISTENING -> if (muted) "已静音" else "我在听，直接说"
+-                    GeminiLive.Phase.SPEAKING -> "说话中（随时打断我）"
+-                    GeminiLive.Phase.ERROR -> error?.let { plainVoiceError(it) } ?: "连不上，点「重新连接」"
+-                },
+-                color = if (phase == GeminiLive.Phase.ERROR) Color(0xFFFF6B6B) else Color.White,
+-                style = MaterialTheme.typography.titleMedium,
+-                textAlign = TextAlign.Center,
+-                modifier = Modifier.padding(horizontal = 24.dp),
+-            )
+-            // [Mines-voice-33] No route / proxy / model line here (user, 2026-10-13): only a short plain
+-            // message when the connection has a problem; the details live in ⚙ → 连接详情.
+-            @Suppress("UNUSED_EXPRESSION") route
+-            @Suppress("UNUSED_EXPRESSION") modelInUse
++            VoiceCharacter(mc, phase, level, Modifier.fillMaxWidth().weight(1f))
++            Text(com.openminis.app.plus.Avatars.name(currentCharacter()), color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold)
++            Spacer(Modifier.height(6.dp))
++            Row(verticalAlignment = Alignment.CenterVertically) {
++                Text(
++                    when (phase) {
++                        GeminiLive.Phase.IDLE -> "准备中"
++                        GeminiLive.Phase.CONNECTING -> error?.let { plainVoiceError(it) } ?: "正在连接…"
++                        GeminiLive.Phase.LISTENING -> if (muted) "已静音" else "正在听你说"
++                        GeminiLive.Phase.SPEAKING -> "正在说（随时打断我）"
++                        GeminiLive.Phase.ERROR -> error?.let { plainVoiceError(it) } ?: "连不上，点「重新连接」"
++                    },
++                    color = if (phase == GeminiLive.Phase.ERROR) Color(0xFFFFB4AB) else Color(0xFFF3E9EF),
++                    fontSize = 17.sp, textAlign = TextAlign.Center,
++                )
++                if (phase == GeminiLive.Phase.LISTENING || phase == GeminiLive.Phase.SPEAKING) { Spacer(Modifier.width(10.dp)); VoiceWave(level, phase == GeminiLive.Phase.SPEAKING) }
++            }
+             if (phase != GeminiLive.Phase.ERROR && phase != GeminiLive.Phase.CONNECTING && !error.isNullOrBlank()) {
+-                Text(plainVoiceError(error ?: ""), color = Color(0xFFFFC46B), fontSize = 14.sp, textAlign = TextAlign.Center,
++                Text(plainVoiceError(error ?: ""), color = Color(0xFFFFD08A), fontSize = 15.sp, textAlign = TextAlign.Center,
+                     modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp))
+             }
+-            val allFailed by live.allFailed.collectAsState()
+-            if (phase == GeminiLive.Phase.ERROR && allFailed) {
+-                Spacer(Modifier.height(12.dp))
+-                Button(onClick = { enterPlain() },
+-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp).height(64.dp)) {
+-                    Text("改用普通语音模式（不用 Google）", style = MaterialTheme.typography.titleMedium)
+-                }
+-            }
+             if (phase == GeminiLive.Phase.ERROR) {
+-                Spacer(Modifier.height(12.dp))
+-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+-                    Button(onClick = { live.start() }) { Text("重新连接") }
+-                    androidx.compose.material3.OutlinedButton(onClick = { runDiag() }) { Text(if (diagBusy) "测试中…" else "测试语音", color = Color.White) }
++                Spacer(Modifier.height(10.dp))
++                Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.padding(horizontal = 20.dp)) {
++                    VoicePrimary("重新连接", Modifier.weight(1f)) { live.start() }
++                    VoiceSecondary(if (diagBusy) "测试中…" else "测试语音", Modifier.weight(1f)) { runDiag() }
+                 }
++                if (allFailed) { Spacer(Modifier.height(8.dp)); VoiceSecondary("改用普通语音模式（不用 Google）") { enterPlain() } }
+             }
+-
+-            val listState = rememberLazyListState()
+-            LaunchedEffect(lines.size, lines.lastOrNull()?.text?.length) {
+-                if (lines.isNotEmpty()) listState.animateScrollToItem(lines.lastIndex)
+-            }
+-            LazyColumn(
+-                state = listState,
+-                modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+-                verticalArrangement = Arrangement.spacedBy(8.dp),
+-            ) {
+-                items(lines) { l ->
+-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = if (l.user) Arrangement.End else Arrangement.Start) {
+-                        Text(
+-                            l.text,
+-                            color = Color.White,
+-                            style = MaterialTheme.typography.bodyLarge,
+-                            modifier = Modifier.clip(RoundedCornerShape(16.dp))
+-                                .background(if (l.user) Color(0xFF3A5BD9) else Color(0x33FFFFFF))
+-                                .padding(horizontal = 12.dp, vertical = 8.dp),
+-                        )
+-                    }
++            // glass transcript bubbles (last few lines)
++            if (showCaptions) {
++                val listState = rememberLazyListState()
++                LaunchedEffect(lines.size, lines.lastOrNull()?.text?.length) {
++                    if (lines.isNotEmpty()) listState.animateScrollToItem(lines.lastIndex)
+                 }
+-            }
+-
+-            Text("离开这页也会继续通话，点桌宠可以挂断", color = Color(0xFFB8C2D6), fontSize = 13.sp,
+-                modifier = Modifier.padding(bottom = 8.dp))
++                LazyColumn(
++                    state = listState,
++                    modifier = Modifier.fillMaxWidth().heightIn(max = 230.dp).padding(horizontal = 16.dp, vertical = 10.dp),
++                    verticalArrangement = Arrangement.spacedBy(8.dp),
++                ) {
++                    items(lines.takeLast(12)) { l -> VoiceBubble(l.user, l.text) }
++                }
++            } else Spacer(Modifier.height(16.dp))
++            // glass control bar: 静音 · 字幕 · 扬声器 · 挂断
+             Row(
+-                Modifier.fillMaxWidth().padding(bottom = 36.dp),
++                Modifier.padding(horizontal = 16.dp).padding(bottom = 16.dp).fillMaxWidth()
++                    .clip(RoundedCornerShape(32.dp)).background(MinesDesign.VoiceGlass)
++                    .border(1.dp, MinesDesign.VoiceGlassBorder, RoundedCornerShape(32.dp)).padding(vertical = 14.dp),
+                 horizontalArrangement = Arrangement.SpaceEvenly,
+                 verticalAlignment = Alignment.CenterVertically,
+             ) {
+-                RoundButton(if (muted) Icons.Filled.MicOff else Icons.Filled.Mic,
+-                    if (muted) "取消静音" else "静音", if (muted) Color(0xFFFF9500) else Color(0x33FFFFFF)) {
+-                    live.setMuted(!muted)
++                RoundButton(if (muted) Icons.Filled.MicOff else Icons.Filled.Mic, if (muted) "取消静音" else "静音",
++                    if (muted) Color.White else Color(0x29FFFFFF), dark = muted) { live.setMuted(!muted) }
++                RoundButton(com.openminis.app.ui.brand.MinesIcons.named("captions")!!, "字幕",
++                    if (showCaptions) Color.White else Color(0x29FFFFFF), dark = showCaptions) { showCaptions = !showCaptions }
++                RoundButton(com.openminis.app.ui.brand.MinesIcons.named("volume-2")!!, "扬声器",
++                    if (speaker) Color.White else Color(0x29FFFFFF), dark = speaker) {
++                    speaker = !speaker
++                    runCatching {
++                        val am = context.getSystemService(android.content.Context.AUDIO_SERVICE) as android.media.AudioManager
++                        @Suppress("DEPRECATION")
++                        am.isSpeakerphoneOn = speaker
++                    }
+                 }
+-                RoundButton(Icons.Filled.CallEnd, "挂断", Color(0xFFFF3B30)) { hungUp = true; com.openminis.app.plus.VoiceSession.stop(context); onBack() }
++                RoundButton(Icons.Filled.CallEnd, "挂断", MinesDesign.HangUp) { hungUp = true; com.openminis.app.plus.VoiceSession.stop(context); onBack() }
++            }
++        }
++    }
++}
++
++/** Dreamy backdrop: the character, heavily blurred, under a warm glow + lavender haze + bottom scrim. */
++@Composable
++private fun VoiceHaze(mc: MinesColors) {
++    val b = com.openminis.app.plus.Avatars.builtins.firstOrNull { it.id == currentCharacter() }
++    Box(Modifier.fillMaxSize()) {
++        if (b != null) androidx.compose.foundation.Image(
++            androidx.compose.ui.res.painterResource(b.full), null,
++            contentScale = androidx.compose.ui.layout.ContentScale.Crop, alpha = 0.55f,
++            modifier = Modifier.fillMaxSize().blur(40.dp),
++        )
++        Canvas(Modifier.fillMaxSize()) {
++            val w = size.width; val h = size.height
++            drawCircle(Brush.radialGradient(listOf(mc.ring.copy(alpha = 0.40f), Color.Transparent), center = androidx.compose.ui.geometry.Offset(w * 0.5f, h * 0.30f), radius = w * 0.9f),
++                radius = w * 0.9f, center = androidx.compose.ui.geometry.Offset(w * 0.5f, h * 0.30f))
++            drawCircle(Brush.radialGradient(listOf(Color(0x47BAA0FF), Color.Transparent), center = androidx.compose.ui.geometry.Offset(w * 0.9f, h * 0.65f), radius = w * 0.8f),
++                radius = w * 0.8f, center = androidx.compose.ui.geometry.Offset(w * 0.9f, h * 0.65f))
++            drawRect(Brush.verticalGradient(listOf(Color(0x332A1C2C), Color(0x002A1C2C), Color(0xCC1E1420)), startY = 0f, endY = h))
++        }
++    }
++}
++
++/** Sharp character in the middle, breathing, with voice-reactive halo + 3 expanding rings (2.4 s). */
++@Composable
++private fun VoiceCharacter(mc: MinesColors, phase: GeminiLive.Phase, level: Float, modifier: Modifier) {
++    val active = phase == GeminiLive.Phase.LISTENING || phase == GeminiLive.Phase.SPEAKING
++    val t = androidx.compose.animation.core.rememberInfiniteTransition(label = "voice")
++    val ring by t.animateFloat(0f, 1f, androidx.compose.animation.core.infiniteRepeatable(androidx.compose.animation.core.tween(2400, easing = androidx.compose.animation.core.LinearEasing)), label = "ring")
++    val breath by t.animateFloat(0.985f, 1.015f, androidx.compose.animation.core.infiniteRepeatable(androidx.compose.animation.core.tween(2000), androidx.compose.animation.core.RepeatMode.Reverse), label = "breath")
++    val lv by animateFloatAsState(if (phase == GeminiLive.Phase.SPEAKING) 0.6f else level, androidx.compose.animation.core.tween(80), label = "lv")
++    val halo = 1f + lv.coerceIn(0f, 1f) * 0.12f
++    Box(modifier, contentAlignment = Alignment.Center) {
++        Canvas(Modifier.fillMaxSize()) {
++            val c = androidx.compose.ui.geometry.Offset(size.width / 2f, size.height * 0.45f)
++            val r0 = minOf(size.width, size.height) * 0.30f
++            drawCircle(Brush.radialGradient(listOf(mc.ring.copy(alpha = 0.55f), mc.ring.copy(alpha = 0f)), center = c, radius = r0 * 1.5f * halo),
++                radius = r0 * 1.5f * halo, center = c)
++            if (active) for (i in 0 until 3) {
++                val p = (ring + i / 3f) % 1f
++                drawCircle(mc.ring.copy(alpha = (1f - p) * 0.55f), radius = r0 * (1f + p * 0.9f), center = c,
++                    style = androidx.compose.ui.graphics.drawscope.Stroke(width = 3.dp.toPx()))
+             }
+         }
++        Box(Modifier.fillMaxSize().padding(vertical = 8.dp).graphicsLayer { scaleX = breath * (if (active) 1f + lv * 0.02f else 1f); scaleY = scaleX },
++            contentAlignment = Alignment.Center) {
++            val b = com.openminis.app.plus.Avatars.builtins.firstOrNull { it.id == currentCharacter() }
++            if (b != null) androidx.compose.foundation.Image(androidx.compose.ui.res.painterResource(b.full), com.openminis.app.plus.Avatars.name(b.id),
++                contentScale = androidx.compose.ui.layout.ContentScale.Fit, modifier = Modifier.fillMaxSize())
++            else PetAvatar(size = 180.dp)
++        }
++    }
++}
++
++/** 60 fps-ish bars following the mic / speech level. */
++@Composable
++private fun VoiceWave(level: Float, speaking: Boolean) {
++    val t = androidx.compose.animation.core.rememberInfiniteTransition(label = "wave")
++    val ph by t.animateFloat(0f, 6.2832f, androidx.compose.animation.core.infiniteRepeatable(androidx.compose.animation.core.tween(900, easing = androidx.compose.animation.core.LinearEasing)), label = "ph")
++    val amp = if (speaking) 0.7f else level.coerceIn(0.08f, 1f)
++    Canvas(Modifier.width(96.dp).height(26.dp)) {
++        val n = 13; val gap = size.width / n
++        for (i in 0 until n) {
++            val v = (0.25f + 0.75f * amp * (0.5f + 0.5f * kotlin.math.sin(ph + i * 0.9f))).coerceIn(0.15f, 1f)
++            val hgt = size.height * v
++            drawRoundRect(Color(0xFFF3E9EF), androidx.compose.ui.geometry.Offset(i * gap + gap * 0.3f, (size.height - hgt) / 2f),
++                androidx.compose.ui.geometry.Size(gap * 0.4f, hgt), androidx.compose.ui.geometry.CornerRadius(gap * 0.2f))
++        }
++    }
++}
++
++@Composable
++private fun VoiceBubble(user: Boolean, text: String) {
++    Row(Modifier.fillMaxWidth(), horizontalArrangement = if (user) Arrangement.End else Arrangement.Start) {
++        Text(
++            text, color = Color.White, fontSize = 17.sp, lineHeight = 25.sp,
++            modifier = Modifier.widthIn(max = 300.dp).clip(RoundedCornerShape(20.dp))
++                // dark-enough glass: white text stays ≥ 4.5:1 whatever the haze behind it
++                .background(if (user) Color(0x52FFC8B0).compositeOver(Color(0xB0241820)) else Color(0x21FFFFFF).compositeOver(Color(0xB0241820)))
++                .border(1.dp, MinesDesign.VoiceGlassBorder, RoundedCornerShape(20.dp))
++                .padding(horizontal = 16.dp, vertical = 12.dp),
++        )
++    }
++}
++
++@Composable
++private fun GlassCircle(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, onClick: () -> Unit) {
++    Box(Modifier.size(44.dp).clip(CircleShape).background(MinesDesign.VoiceGlass).border(1.dp, MinesDesign.VoiceGlassBorder, CircleShape)
++        .clickable(onClick = onClick), contentAlignment = Alignment.Center) {
++        MinesIcon(icon, label, tint = Color.White, modifier = Modifier.size(22.dp))
++    }
++}
++
++@Composable
++private fun VoicePrimary(text: String, modifier: Modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp), onClick: () -> Unit) {
++    val mc = mines()
++    Box(modifier.height(56.dp).clip(RoundedCornerShape(50)).background(mc.character.primary).clickable(onClick = onClick), contentAlignment = Alignment.Center) {
++        Text(text, color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
++    }
++}
++
++@Composable
++private fun VoiceSecondary(text: String, modifier: Modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp), onClick: () -> Unit) {
++    Box(modifier.height(52.dp).clip(RoundedCornerShape(50)).background(Color(0x33FFFFFF)).border(1.dp, MinesDesign.VoiceGlassBorder, RoundedCornerShape(50))
++        .clickable(onClick = onClick), contentAlignment = Alignment.Center) {
++        Text(text, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Medium, textAlign = TextAlign.Center)
+     }
+ }
+ 
+@@ -278,7 +387,7 @@ private fun VoiceSettingsSheet(onDismiss: () -> Unit, onChanged: () -> Unit) {
+     androidx.compose.material3.ModalBottomSheet(onDismissRequest = { onChanged(); onDismiss() }) {
+         Column(Modifier.fillMaxWidth().verticalScroll(androidx.compose.foundation.rememberScrollState()).padding(horizontal = 20.dp).padding(bottom = 28.dp),
+             verticalArrangement = Arrangement.spacedBy(10.dp)) {
+-            Text("语音设置", fontSize = 20.sp)
++            Text("语音设置", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+             val ctxV = androidx.compose.ui.platform.LocalContext.current
+             // [Mines-voice-33] connection details moved here from the call screen
+             com.openminis.app.plus.VoiceSession.live.collectAsState().value?.let { lv ->
+@@ -306,6 +415,9 @@ private fun VoiceSettingsSheet(onDismiss: () -> Unit, onChanged: () -> Unit) {
+                     if (voice == id) Text("  ✓", fontSize = 16.sp, color = MaterialTheme.colorScheme.primary)
+                 }
+             }
++            // [Mines-tts-34] external voice: OpenRouter / free Edge, speed + pitch + 试听
++            TtsSection(onChanged = {})
++
+             // [Mines-voice-33] Gemini Live has no pitch / speed control: only for the external (cloned) voice
+             if (com.openminis.app.plus.VoiceClone.settings(ctxV).enabled) {
+             Text("语速 ${"%.1f".format(speed)}×（自定义声音）", fontSize = 15.sp)
+@@ -356,14 +468,14 @@ private fun Orb(phase: GeminiLive.Phase, level: Float) {
+ }
+ 
+ @Composable
+-private fun RoundButton(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, bg: Color, onClick: () -> Unit) {
++private fun RoundButton(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, bg: Color, dark: Boolean = false, onClick: () -> Unit) {
+     Column(horizontalAlignment = Alignment.CenterHorizontally) {
+         Box(
+-            Modifier.size(68.dp).clip(CircleShape).background(bg).clickable(onClick = onClick),
++            Modifier.size(60.dp).clip(CircleShape).background(bg).clickable(onClick = onClick),
+             contentAlignment = Alignment.Center,
+-        ) { MinesIcon(icon, label, tint = Color.White, modifier = Modifier.size(30.dp)) }
++        ) { MinesIcon(icon, label, tint = if (dark) Color(0xFF2A1C2C) else Color.White, modifier = Modifier.size(28.dp)) }
+         Spacer(Modifier.height(6.dp))
+-        Text(label, color = Color.White, style = MaterialTheme.typography.labelMedium)
++        Text(label, color = Color.White, fontSize = 15.sp)
+     }
+ }
+ 
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
+index 3bbd62f..02718a1 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
+@@ -838,13 +838,17 @@ fun SessionListScreen(
+             .map { list -> list.count { it.enabled } }
+     }.collectAsState(initial = 0)
+ 
+-    val minesHomeWallpaper = com.openminis.app.ui.plus.wallpaperOn(home = true)
++    // [Mines-design-34] Home always sits on a backdrop: the user's photo / preset, or the
++    // 「暖雾」 porcelain gradient tinted by the character. Bars stay transparent.
++    val minesPhotoWall = com.openminis.app.ui.plus.wallpaperOn(home = true)
++    val minesHomeWallpaper = true
+     // [Mines-wallpaper-edge] The wallpaper is the Scaffold's own background,
+     // drawn edge to edge behind the status bar, top bar and navigation bar.
+     // The Scaffold and its top bar go fully transparent so no opaque band
+     // (the old 60%-surface bar) sits over the picture.
+     Box(Modifier.fillMaxSize()) {
+-    if (minesHomeWallpaper) com.openminis.app.ui.plus.ChatWallpaperLayer(Modifier.fillMaxSize(), home = true)
++    if (minesPhotoWall) com.openminis.app.ui.plus.ChatWallpaperLayer(Modifier.fillMaxSize(), home = true)
++    else com.openminis.app.ui.plus.PorcelainBackdrop(Modifier.fillMaxSize())
+     Scaffold(
+         containerColor = if (minesHomeWallpaper) Color.Transparent else MaterialTheme.colorScheme.background,
+         topBar = {
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/theme/Theme.kt b/src/android/app/src/main/java/com/openminis/app/ui/theme/Theme.kt
+index b81182e..12d7837 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/theme/Theme.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/theme/Theme.kt
+@@ -9,6 +9,7 @@ import androidx.compose.material3.darkColorScheme
+ import androidx.compose.material3.lightColorScheme
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.runtime.collectAsState
+ import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.text.TextStyle
+ import androidx.compose.ui.unit.dp
+@@ -156,7 +157,12 @@ fun MinisTheme(
+     fontScale: Float = 1f,
+     content: @Composable () -> Unit,
+ ) {
+-    val colorScheme = if (darkTheme) DarkColorScheme else LightColorScheme
++    // [Mines-design-34] 「暖瓷 · 毛玻璃」 palette; the accent follows the desk-pet character.
++    val ctx = androidx.compose.ui.platform.LocalContext.current
++    com.openminis.app.plus.PlusPrefs.init(ctx)
++    val plusSt = com.openminis.app.plus.PlusPrefs.state.collectAsState().value
++    val mc = com.openminis.app.ui.plus.minesColors(plusSt.petStyle, darkTheme)
++    val colorScheme = porcelainScheme(if (darkTheme) DarkColorScheme else LightColorScheme, mc)
+     val typography = scaledTypography(fontScale)
+     val chatPalette = if (darkTheme) DarkChatPalette else LightChatPalette
+ 
+@@ -165,15 +171,56 @@ fun MinisTheme(
+         shapes = MinisShapes,
+         typography = typography,
+     ) {
+-        CompositionLocalProvider(LocalChatPalette provides chatPalette, content = content)
++        CompositionLocalProvider(
++            LocalChatPalette provides chatPalette,
++            com.openminis.app.ui.plus.LocalMinesColors provides mc,
++            content = content,
++        )
+     }
+ }
+ 
++/** [Mines-design-34] Material scheme from the porcelain tokens + character accent. */
++private fun porcelainScheme(base: androidx.compose.material3.ColorScheme, m: com.openminis.app.ui.plus.MinesColors) = base.copy(
++    primary = m.primary,
++    onPrimary = m.onPrimary,
++    primaryContainer = m.container,
++    onPrimaryContainer = m.onContainer,
++    secondary = m.primaryText,
++    onSecondary = m.onPrimary,
++    secondaryContainer = m.container,
++    onSecondaryContainer = m.onContainer,
++    tertiary = m.primaryText,
++    background = m.bg,
++    onBackground = m.ink,
++    surface = m.bg,
++    onSurface = m.ink,
++    surfaceVariant = m.surface2,
++    onSurfaceVariant = m.ink2,
++    surfaceContainerLowest = m.bg,
++    surfaceContainerLow = m.surface,
++    surfaceContainer = m.surface,
++    surfaceContainerHigh = m.surface2,
++    surfaceContainerHighest = m.surface2,
++    outline = if (m.dark) Color(0xFF6A615A) else Color(0xFF8F857A),
++    outlineVariant = if (m.dark) Color(0xFF3A342F) else Color(0xFFE2DAD0),
++)
++
+ private fun TextStyle.scale(factor: Float): TextStyle =
+     if (factor == 1f) this else copy(fontSize = fontSize * factor)
+ 
+ private fun scaledTypography(factor: Float): Typography {
+-    val base = Typography()
++    // [Mines-design-34] body 17 sp, nothing under 14 sp (tags) / 15 sp (text) — the user is partially sighted.
++    val m3 = Typography()
++    val base = m3.copy(
++        bodyLarge = m3.bodyLarge.copy(fontSize = 17.sp, lineHeight = 26.sp),
++        bodyMedium = m3.bodyMedium.copy(fontSize = 16.sp, lineHeight = 24.sp),
++        bodySmall = m3.bodySmall.copy(fontSize = 15.sp, lineHeight = 20.sp),
++        titleMedium = m3.titleMedium.copy(fontSize = 17.sp, lineHeight = 24.sp),
++        titleSmall = m3.titleSmall.copy(fontSize = 16.sp, lineHeight = 22.sp),
++        labelLarge = m3.labelLarge.copy(fontSize = 15.sp, lineHeight = 20.sp),
++        labelMedium = m3.labelMedium.copy(fontSize = 15.sp, lineHeight = 20.sp),
++        labelSmall = m3.labelSmall.copy(fontSize = 14.sp, lineHeight = 18.sp),
++    )
+     return Typography(
+         displayLarge = base.displayLarge.scale(factor),
+         displayMedium = base.displayMedium.scale(factor),
