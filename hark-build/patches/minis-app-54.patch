@@ -491,6 +491,75 @@ index 0f40164..a622d50 100644
      }
  }
  
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt b/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
+index bf40f07..9208c65 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
+@@ -159,6 +159,17 @@ class GeminiLive(
+     /** [Mines-voice-31] A silent hop (goAway / drop) is in progress: nothing is shown unless it fails. */
+     @Volatile private var hopping = false
+     @Volatile private var hopFails = 0
++    /** [Mines-voice-33] Connection log for ⚙ → 连接详情: every close code/reason, goAway, hop. */
++    private val _events = MutableStateFlow<List<String>>(emptyList())
++    val events: StateFlow<List<String>> = _events.asStateFlow()
++    private fun logEvent(e: String) {
++        val t = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())
++        _events.value = (_events.value + "$t  $e").takeLast(30)
++        android.util.Log.i("MinesVoice", e)
++    }
++    /** The voice really sent in the setup message (shown in ⚙). */
++    val voiceName: String get() = voice
++    private var proactiveJob: kotlinx.coroutines.Job? = null
+     private val _reconnects = MutableStateFlow(0)
+     /** Seamless reconnects so far in this call (diagnostics). */
+     val reconnects: StateFlow<Int> = _reconnects.asStateFlow()
+@@ -392,6 +403,7 @@ class GeminiLive(
+ 
+     private fun onClosed(code: Int, reason: String) {
+         if (stopped) return
++        logEvent("连接关闭 code=$code" + (if (reason.isNotBlank()) " 原因=$reason" else "") + (routeSel?.label?.let { " 线路=$it" } ?: ""))
+         if (liveWs != null && liveWs === ws) liveWs = null
+         // [Mines-voice-31] An established call that drops for a network reason
+         // hops silently: audio keeps running (no audible restart), the session
+@@ -399,12 +411,13 @@ class GeminiLive(
+         // itself fails twice.
+         val established = setupAt > 0 && !GeminiLive.isConfigError(code, reason) &&
+             !(reason.contains("API key", true) || code == 1008 && reason.contains("key", true))
+-        if (established && hopFails < 2 && routeSel != null) {
++        if (established && hopFails < 3 && routeSel != null) {
+             if (hopping && !setupDone) hopFails++
+             hopping = true
+             setupDone = false
+             retryJob?.cancel()
+-            retryJob = scope.launch { kotlinx.coroutines.delay(if (hopFails == 0) 150L else 800L); if (!stopped) openSocket() }
++            logEvent("静默重连（第 ${hopFails + 1} 次，带续接句柄=${resumeHandle != null}）")
++            retryJob = scope.launch { kotlinx.coroutines.delay(when (hopFails) { 0 -> 150L; 1 -> 800L; else -> 2000L }); if (!stopped) openSocket() }
+             return
+         }
+         hopping = false; hopFails = 0
+@@ -522,6 +535,7 @@ class GeminiLive(
+             if (u.optBoolean("resumable", true)) u.optString("newHandle").takeIf { it.isNotBlank() }?.let { resumeHandle = it }
+         }
+         if (msg.has("goAway")) {
++            logEvent("服务器 goAway（剩余 ${msg.optJSONObject("goAway")?.optString("timeLeft") ?: "?"}）→ 提前换新连接")
+             // [Mines-voice-31] Server is about to close this connection: open the
+             // next one (same route, latest resumption handle) while the old one
+             // still plays, switch the mic over on setupComplete, then close the
+@@ -542,6 +556,14 @@ class GeminiLive(
+             }
+             setupDone = true
+             setupAt = System.currentTimeMillis()
++            logEvent((if (prev != null && prev !== ws) "已无缝换到新连接" else "已连接") + " · 声音=$voice · 模型=${_modelInUse.value}" + (routeSel?.label?.let { " · 线路=$it" } ?: ""))
++            // [Mines-voice-33] connections are capped (~10 min): hop before the limit even if goAway never comes
++            proactiveJob?.cancel()
++            val mine = ws
++            proactiveJob = scope.launch {
++                kotlinx.coroutines.delay(9 * 60_000L)
++                if (!stopped && ws === mine && !hopping) { logEvent("连接快到 10 分钟上限 → 提前换新连接"); hopping = true; hopFails = 0; openSocket() }
++            }
+             rounds = 0; sameRouteDrops = 0
+             _allFailed.value = false
+             retries = 0
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/HiddenWeb.kt b/src/android/app/src/main/java/com/openminis/app/plus/HiddenWeb.kt
 new file mode 100644
 index 0000000..3a26bc4
@@ -1422,6 +1491,22 @@ index 2897258..4290a7b 100644
 +    fun isAutoPrimary(c: Context): Boolean = c.getSharedPreferences("mines_split_proxy_meta", Context.MODE_PRIVATE).getBoolean("primary_auto", false)
 +    fun setAutoPrimary(c: Context, v: Boolean) = c.getSharedPreferences("mines_split_proxy_meta", Context.MODE_PRIVATE).edit().putBoolean("primary_auto", v).apply()
 +}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/VoiceSession.kt b/src/android/app/src/main/java/com/openminis/app/plus/VoiceSession.kt
+index 3d61d47..023df74 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/VoiceSession.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/VoiceSession.kt
+@@ -65,8 +65,9 @@ object VoiceSession {
+         val g = GeminiLive(
+             key, PlusVault.extra("gemini", "model") ?: GeminiLive.DEFAULT_MODEL,
+             userVoice ?: GeminiLive.DEFAULT_VOICE,
+-            speed = PlusVault.extra("gemini", "speed")?.toFloatOrNull() ?: 1f,
+-            pitch = PlusVault.extra("gemini", "pitch")?.toFloatOrNull() ?: 1f,
++            // [Mines-voice-33] speed/pitch only apply to the external (cloned) voice; Gemini's own audio plays as sent
++            speed = if (VoiceClone.settings(c).enabled) PlusVault.extra("gemini", "speed")?.toFloatOrNull() ?: 1f else 1f,
++            pitch = if (VoiceClone.settings(c).enabled) PlusVault.extra("gemini", "pitch")?.toFloatOrNull() ?: 1f else 1f,
+             appContext = if (PlusVault.extra("gemini", "phone") != "0") c else null,
+             cloneVoice = VoiceClone.speaker(c),
+         )
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
 index 6fb1731..5813f16 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
@@ -2152,7 +2237,7 @@ index 2f21e6a..f8c8182 100644
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
-index 3ba9233..9d01590 100644
+index 3ba9233..3345347 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
 @@ -191,26 +191,23 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
@@ -2190,22 +2275,53 @@ index 3ba9233..9d01590 100644
              }
              val allFailed by live.allFailed.collectAsState()
              if (phase == GeminiLive.Phase.ERROR && allFailed) {
-@@ -282,6 +279,14 @@ private fun VoiceSettingsSheet(onDismiss: () -> Unit, onChanged: () -> Unit) {
+@@ -282,11 +279,26 @@ private fun VoiceSettingsSheet(onDismiss: () -> Unit, onChanged: () -> Unit) {
          Column(Modifier.fillMaxWidth().verticalScroll(androidx.compose.foundation.rememberScrollState()).padding(horizontal = 20.dp).padding(bottom = 28.dp),
              verticalArrangement = Arrangement.spacedBy(10.dp)) {
              Text("语音设置", fontSize = 20.sp)
++            val ctxV = androidx.compose.ui.platform.LocalContext.current
 +            // [Mines-voice-33] connection details moved here from the call screen
 +            com.openminis.app.plus.VoiceSession.live.collectAsState().value?.let { lv ->
 +                val r by lv.route.collectAsState(); val m by lv.modelInUse.collectAsState(); val e by lv.error.collectAsState()
++                val ev by lv.events.collectAsState()
 +                Text("连接详情", fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-+                Text("线路：" + r.ifBlank { "未连接" } + "\n模型：" + m + (e?.takeIf { it.isNotBlank() }?.let { "\n最近的问题：$it" } ?: ""),
++                Text("当前声音：" + lv.voiceName + "\n线路：" + r.ifBlank { "未连接" } + "\n模型：" + m + (e?.takeIf { it.isNotBlank() }?.let { "\n最近的问题：$it" } ?: "") +
++                    (if (ev.isNotEmpty()) "\n\n最近的连接记录：\n" + ev.takeLast(10).joinToString("\n") else ""),
 +                    fontSize = 14.sp, modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
 +                        .background(MaterialTheme.colorScheme.surfaceVariant).padding(12.dp))
 +            }
              Text("声音", fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
              GeminiLive.voiceLabels.forEach { (id, label) ->
                  Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
-@@ -401,3 +406,16 @@ private fun PlainVoiceContent(plain: com.openminis.app.plus.PlainVoice, onBackTo
+                     .background(if (voice == id) MaterialTheme.colorScheme.primary.copy(alpha = 0.14f) else Color.Transparent)
+-                    .clickable { voice = id; PlusVault.setExtra("gemini", "voice", id); PlusVault.setExtra("gemini", "voice_user", "1") }
++                    .clickable {
++                        voice = id; PlusVault.setExtra("gemini", "voice", id); PlusVault.setExtra("gemini", "voice_user", "1")
++                        // [Mines-voice-33] a Gemini voice only plays when the cloned voice is off (it mutes Gemini audio)
++                        com.openminis.app.plus.VoiceClone.setEnabled(ctxV, false)
++                    }
+                     .padding(horizontal = 12.dp, vertical = 10.dp),
+                     verticalAlignment = Alignment.CenterVertically) {
+                     Text(label, fontSize = 16.sp, modifier = Modifier.weight(1f))
+@@ -294,12 +306,15 @@ private fun VoiceSettingsSheet(onDismiss: () -> Unit, onChanged: () -> Unit) {
+                     if (voice == id) Text("  ✓", fontSize = 16.sp, color = MaterialTheme.colorScheme.primary)
+                 }
+             }
+-            Text("语速 ${"%.1f".format(speed)}×", fontSize = 15.sp)
++            // [Mines-voice-33] Gemini Live has no pitch / speed control: only for the external (cloned) voice
++            if (com.openminis.app.plus.VoiceClone.settings(ctxV).enabled) {
++            Text("语速 ${"%.1f".format(speed)}×（自定义声音）", fontSize = 15.sp)
+             androidx.compose.material3.Slider(speed, { speed = (it * 10).toInt() / 10f; PlusVault.setExtra("gemini", "speed", speed.toString()) },
+                 valueRange = 0.7f..1.5f)
+-            Text("音调 ${"%.1f".format(pitch)}", fontSize = 15.sp)
++            Text("音调 ${"%.1f".format(pitch)}（自定义声音）", fontSize = 15.sp)
+             androidx.compose.material3.Slider(pitch, { pitch = (it * 10).toInt() / 10f; PlusVault.setExtra("gemini", "pitch", pitch.toString()) },
+                 valueRange = 0.7f..1.4f)
++            }
+             Row(verticalAlignment = Alignment.CenterVertically) {
+                 Column(Modifier.weight(1f)) {
+                     Text("通话里可以操作手机", fontSize = 16.sp)
+@@ -401,3 +416,16 @@ private fun PlainVoiceContent(plain: com.openminis.app.plus.PlainVoice, onBackTo
          }
      }
  }
