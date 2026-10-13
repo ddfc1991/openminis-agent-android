@@ -573,6 +573,91 @@ def build32_visual():
     print("PET LOG:\n" + sh("logcat -d -s MinesPet:I", timeout=30)[-2000:], flush=True)
 
 
+def build33_sources():
+    """[build-33] logins become data sources automatically: code extraction, auto-detect of a
+    signed-in GitHub + X session (no taps), a simulated code e-mail read through the mailbox path
+    and filled into a page, and the 消息 「接入更多来源」 card no longer asking for signed-in sources."""
+    probe = selftest("extract", "【阿里云】您的验证码为 482913，5分钟内有效。")
+    if "unknown method" in probe:
+        print("  (build-33 self-tests not in this APK, skipping)", flush=True); return
+    if "482913" not in probe:
+        selftest_fail.append("b33 extract code")
+    go_home()
+    out = selftest("sources", "fake", timeout=60)
+    time.sleep(0.6); snap("b33-auto-toast")
+    m = re.search(r"result=(\{.*\})", out, re.S)
+    try:
+        j = json.loads(m.group(1)) if m else {}
+    except Exception:
+        j = {}
+    print("  b33 sources:", j, flush=True)
+    vault = j.get("vault", []); miss = j.get("missing", []); act = j.get("active", [])
+    if "github" not in vault or "x" not in vault:
+        selftest_fail.append(f"b33 auto-detect (vault={vault})")
+    if "GitHub" in miss or "X" in miss:
+        selftest_fail.append(f"b33 card still asks for signed-in sources ({miss})")
+    if "github" not in act or "x" not in act:
+        selftest_fail.append(f"b33 active sources ({act})")
+    out = selftest("mailcode", "http://10.0.2.2:8088/feed/atom|http://10.0.2.2:8088/otp", timeout=120)
+    if '"code":"482913"' not in out:
+        selftest_fail.append("b33 code e-mail not picked up")
+    if "ok:482913" not in out:
+        selftest_fail.append("b33 code not filled into the page")
+    # 消息: the sources card must not list GitHub / X any more
+    sh(f"am force-stop {PKG}"); time.sleep(1); relaunch(); time.sleep(4)
+    snap("b33-relaunch")
+    go_home()
+    if tap_text("消息", exact=True, wait=8):
+        time.sleep(6)
+        r = snap("b33-feed")
+        t = " ".join(texts(r))
+        if "＋ GitHub" in t or "＋ X" in t:
+            selftest_fail.append("b33 feed card shows signed-in sources")
+        for _ in range(2): sh("input keyevent KEYCODE_BACK"); time.sleep(1)
+    else:
+        page_missing.append("b33 消息")
+    go_home()
+    if tap_text("账号：", wait=6) or tap_text("账号", exact=True, wait=6):
+        time.sleep(2); snap("b33-apps")
+        if tap_text("搜索应用", wait=2):
+            type_text("gmail"); time.sleep(2); sh("input keyevent KEYCODE_BACK"); time.sleep(1)
+            if tap_text("Gmail", exact=True, wait=4):
+                time.sleep(2); snap("b33-gmail-detail")
+        for _ in range(3): sh("input keyevent KEYCODE_BACK"); time.sleep(1.2)
+    if not alive(): relaunch()
+    # [build-33] polished pages: 知识库 / 模型路由与分流 / 测试与上报 (from 设置)
+    for lab, name in [("知识库", "b33-knowledge"), ("模型路由与分流", "b33-routing"), ("一键冒烟测试", "b33-report")]:
+        go_home()
+        for st in ["设置", "Settings"]:
+            if tap_text(st, exact=True, wait=4): break
+        opened = False
+        for _ in range(6):
+            if tap_text(lab, wait=4):
+                opened = True; break
+            scroll_down(); time.sleep(1)
+        if opened:
+            time.sleep(4); r = snap(name); check(name)
+            t = " ".join(texts(r))
+            if "BM25" in t or "failed to connect" in t:
+                selftest_fail.append(f"{name} shows raw tech text")
+            scroll_down(); time.sleep(1); snap(name + "-2")
+        else:
+            page_missing.append(name)
+        for _ in range(3): sh("input keyevent KEYCODE_BACK"); time.sleep(1.2)
+        if not alive(): relaunch()
+    # voice screen: no 线路/模型 line under the status text (details only in ⚙)
+    go_home()
+    if tap_text("实时语音", wait=8):
+        time.sleep(8)
+        r = snap("b33-voice")
+        if any("线路：" in t or "模型：" in t for t in texts(r)):
+            selftest_fail.append("b33 voice screen still shows route/model")
+        for _ in range(2): sh("input keyevent KEYCODE_BACK"); time.sleep(1.2)
+    else:
+        page_missing.append("b33 voice")
+    if not alive(): relaunch()
+
+
 def build31_pages():
     open_page("应用 page", ["账号："], ["搜索应用", "应用"])
     open_page("消息 feed page", [("消息", True), ("消息 ", False)], ["我关注的", "全部"], linger=8)
@@ -670,6 +755,10 @@ def main():
         build32_visual()
     except Exception as e:
         print("build32_visual error:", e, flush=True); page_missing.append(f"visual error {e}")
+    try:
+        build33_sources()
+    except Exception as e:
+        print("build33_sources error:", e, flush=True); selftest_fail.append(f"b33 error {e}")
 
     # Cold start with VPS mode + servers saved (the user's state)
     sh(f"am force-stop {PKG}"); time.sleep(2)

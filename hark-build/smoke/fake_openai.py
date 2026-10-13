@@ -35,6 +35,23 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/stats"):
             return self._json(STATS)
+        # [build-33] simulated Gmail Atom feed with a fresh code mail + a page with a one-time-code field
+        if self.path.startswith("/feed/atom"):
+            now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            xml = ('<?xml version="1.0" encoding="UTF-8"?><feed version="0.3" xmlns="http://purl.org/atom/ns#">'
+                   '<title>Gmail - Inbox for smoke@gmail.com</title><fullcount>1</fullcount>'
+                   '<entry><title>Your Supabase verification code</title>'
+                   '<summary>Enter this code to sign in: 482913. It expires in 10 minutes.</summary>'
+                   f'<issued>{now}</issued><modified>{now}</modified><id>tag:gmail.google.com,2004:smoke1</id>'
+                   '<author><name>Supabase</name><email>noreply@mail.app.supabase.io</email></author></entry></feed>').encode()
+            self.send_response(200); self.send_header("Content-Type", "application/atom+xml")
+            self.send_header("Content-Length", str(len(xml))); self.end_headers(); self.wfile.write(xml); return
+        if self.path.startswith("/otp"):
+            html = (b'<html><body><h3>Enter the code we e-mailed you</h3>'
+                    b'<input id="code" name="otp" autocomplete="one-time-code" inputmode="numeric" style="width:200px;height:40px">'
+                    b'<button>Verify</button></body></html>')
+            self.send_response(200); self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(html))); self.end_headers(); self.wfile.write(html); return
         if self.path.rstrip("/").endswith("/models"):
             return self._json({"object": "list", "data": [{"id": "smoke-model", "object": "model", "owned_by": "smoke"}]})
         self._json({"ok": True})
