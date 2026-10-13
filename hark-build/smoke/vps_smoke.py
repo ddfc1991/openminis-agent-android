@@ -475,9 +475,102 @@ def open_page(step, tap_labels, expect, wait=6, exact=False, linger=0):
         relaunch()
 
 
+def build32_apps():
+    """[build-32] 「应用」 catalog: open, search, a detail page, tap 网站 ↗ (Custom Tab / browser), come back alive."""
+    root = go_home()
+    if root is None:
+        relaunch(); root = dump()
+    if not (tap_text("账号：", wait=6, root=root) or tap_text("账号", exact=True, wait=6)):
+        page_missing.append("应用 (not opened)"); return
+    r = snap("apps-catalog"); check("open 应用 catalog")
+    if r is None or not (find(r, "搜索应用") or find(r, "应用", True)):
+        page_missing.append("应用 title")
+    if tap_text("搜索应用", wait=2):
+        type_text("groq"); time.sleep(2)
+        snap("apps-search"); check("search 应用")
+        sh("input keyevent KEYCODE_BACK"); time.sleep(1)  # hide keyboard
+    if tap_text("Groq", exact=True, wait=4):
+        snap("apps-detail"); check("open app detail")
+        for _ in range(4):
+            r = dump()
+            if r is not None and find(r, "网站", True): break
+            scroll_down(); time.sleep(1)
+        if tap_text("网站", exact=True, wait=6):
+            snap("apps-site-link"); check("tap 网站 ↗")
+            sh("input keyevent KEYCODE_BACK"); time.sleep(2)
+            relaunch_needed = not alive()
+            if relaunch_needed: relaunch()
+            check("back from 网站 ↗")
+        else:
+            page_missing.append("网站 ↗ row")
+    else:
+        page_missing.append("Groq row")
+    for _ in range(3):
+        sh("input keyevent KEYCODE_BACK"); time.sleep(1.5)
+
+
+def build32_visual():
+    """[build-32] screens the user asked to be looked at, plus the pet frame check."""
+    # settings grouped page
+    root = go_home()
+    for lab in ["设置", "Settings"]:
+        if tap_text(lab, exact=True, wait=4): break
+    else:
+        sh("input keyevent KEYCODE_MENU"); time.sleep(2)
+    snap("v-settings"); check("settings page")
+    for _ in range(3): sh("input keyevent KEYCODE_BACK"); time.sleep(1)
+    # login pages: aliyun + supabase through 应用 → detail → + 添加
+    for name in ["阿里云", "Supabase"]:
+        go_home()
+        if not (tap_text("账号：", wait=5) or tap_text("账号", exact=True, wait=5)): break
+        if tap_text("搜索应用", wait=2):
+            type_text("aliyun" if name == "阿里云" else "supabase"); time.sleep(2); sh("input keyevent KEYCODE_BACK"); time.sleep(1)
+        if tap_text(name, wait=4):
+            snap(f"v-detail-{name}")
+            if tap_text("+ 添加", wait=12):
+                time.sleep(10)
+                snap(f"v-login-{name}"); check(f"login page {name}")
+        for _ in range(4): sh("input keyevent KEYCODE_BACK"); time.sleep(1.5)
+        if not alive(): relaunch()
+    # 消息 feed + detail sheet
+    open_page("消息 feed visual", [("消息", True)], ["我关注的", "全部"], linger=10)
+    # detail sheet: open the feed again and tap the first card we can find
+    go_home()
+    if tap_text("消息", exact=True, wait=8):
+        time.sleep(6)
+        snap("v-feed")
+        opened = False
+        for lab in ["智谱", "阿里云百炼", "硅基流动", "Groq", "OpenRouter", "Gemini", "免费"]:
+            if tap_text(lab, wait=4):
+                opened = True; break
+        if opened:
+            time.sleep(2); snap("v-feed-detail"); check("feed detail sheet")
+            sh("input keyevent KEYCODE_BACK"); time.sleep(1.5)
+        else:
+            page_missing.append("feed card (none tappable)")
+        for _ in range(2): sh("input keyevent KEYCODE_BACK"); time.sleep(1)
+    # server quick link state: open smoke server, wait > 10 s, capture
+    go_home()
+    if tap_text("服务器：", wait=6) or tap_work(wait=6):
+        if tap_text("smoke", exact=True, wait=8):
+            for _ in range(3): scroll_down(); time.sleep(1)
+            time.sleep(14); snap("v-server-quicklink"); check("server quick link state")
+    for _ in range(3): sh("input keyevent KEYCODE_BACK"); time.sleep(1)
+    # desk pet: start it, then hold each frame (adb self-test) and capture; plus 3 natural frames
+    selftest("pet", "show", timeout=20)
+    sh("input keyevent KEYCODE_HOME"); time.sleep(5)
+    for i in range(3):
+        snap(f"v-pet-{i}"); time.sleep(0.7)
+    for fr in ["blink", "mouth_a", "mouth_o", "think"]:
+        selftest("pet", fr, timeout=20); time.sleep(0.8)
+        snap(f"v-pet-{fr}")
+    time.sleep(10)
+    print("PET LOG:\n" + sh("logcat -d -s MinesPet:I", timeout=30)[-2000:], flush=True)
+
+
 def build31_pages():
-    open_page("账号连接 page", ["账号："], ["账号连接"])
-    open_page("消息汇总 page", [("消息", True), ("消息 ", False)], ["消息汇总"], linger=8)
+    open_page("应用 page", ["账号："], ["搜索应用", "应用"])
+    open_page("消息 feed page", [("消息", True), ("消息 ", False)], ["我关注的", "全部"], linger=8)
     open_page("server page", ["服务器："], ["服务器", "smoke"])
     open_page("voice page", ["实时语音"], ["语音", "通话", "Gemini"], linger=6)
 
@@ -564,6 +657,14 @@ def main():
         build31_pages()
     except Exception as e:
         print("build31_pages error:", e, flush=True); page_missing.append(f"error {e}")
+    try:
+        build32_apps()
+    except Exception as e:
+        print("build32_apps error:", e, flush=True); page_missing.append(f"apps error {e}")
+    try:
+        build32_visual()
+    except Exception as e:
+        print("build32_visual error:", e, flush=True); page_missing.append(f"visual error {e}")
 
     # Cold start with VPS mode + servers saved (the user's state)
     sh(f"am force-stop {PKG}"); time.sleep(2)
