@@ -1,0 +1,356 @@
+diff --git a/src/android/app/src/main/java/com/openminis/app/browser/BrowserRenderCheck.kt b/src/android/app/src/main/java/com/openminis/app/browser/BrowserRenderCheck.kt
+new file mode 100644
+index 0000000..40b46b8
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/browser/BrowserRenderCheck.kt
+@@ -0,0 +1,130 @@
++package com.openminis.app.browser
++
++import android.content.Context
++import android.graphics.Bitmap
++import android.graphics.BitmapFactory
++import org.json.JSONObject
++
++/**
++ * [Mines-render-34] "我的浏览器渲染不了" (user report 2026-10-13, vulbox.com task).
++ *
++ * Three ways the agent's browser looked "unrendered" to the model:
++ *  1. Text-only main models (DeepSeek / GLM on 商汤 / AMD) never receive a screenshot's
++ *     pixels — the provider swaps them for a "does not support vision input" placeholder,
++ *     so a screenshot result carried nothing the model could read. Screenshot results now
++ *     always carry the viewport's visible text + the inputs/buttons on screen.
++ *  2. The headless GPU capture can hand back the Presentation's white background before the
++ *     WebView's first real frame (slow GPUs): a blank image with no fallback. A blank capture
++ *     now falls back to the software draw, and a still-blank shot says so in the result.
++ *  3. SPA pages (vulbox.com is a uni-app H5 page: an empty <div id=app> until JS runs) fire
++ *     onPageFinished before anything is in the DOM, so navigate → get_text read an empty
++ *     page. Navigate now waits (bounded) for visible content.
++ */
++object BrowserRenderCheck {
++
++    /** Probe: is there anything to see yet? */
++    const val CONTENT_PROBE_JS = """(function(){try{var b=document.body;var t=b?(b.innerText||'').replace(/\s+/g,' ').trim():'';
++return JSON.stringify({t:t.length,img:document.images?document.images.length:0,
++m:b?b.querySelectorAll('canvas,svg,video,iframe,input,button').length:0,
++vis:document.visibilityState||'',rs:document.readyState||'',w:window.innerWidth||0,h:window.innerHeight||0});}
++catch(e){return JSON.stringify({t:0,err:String(e)});}})()"""
++
++    /** Visible text inside the current viewport + the controls on screen, for text-only models. */
++    const val VIEWPORT_TEXT_JS = """(function(){try{var W=window.innerWidth,H=window.innerHeight,out=[],n=0,b=document.body;
++if(!b)return JSON.stringify({t:'',all:0,el:[]});
++var tw=document.createTreeWalker(b,NodeFilter.SHOW_TEXT,null),x;
++while((x=tw.nextNode())&&n<1600){var s=(x.nodeValue||'').replace(/\s+/g,' ').trim();if(!s)continue;var p=x.parentElement;if(!p)continue;
++var r=p.getBoundingClientRect();if(r.width<1||r.height<1||r.bottom<0||r.top>H||r.right<0||r.left>W)continue;
++var cs=window.getComputedStyle(p);if(cs.visibility==='hidden'||cs.display==='none'||cs.opacity==='0')continue;
++if(out.length&&out[out.length-1]===s)continue;out.push(s);n+=s.length+3;}
++var el=[].slice.call(b.querySelectorAll('input,textarea,select,button,a[href],[role=button]')).filter(function(e){var r=e.getBoundingClientRect();
++return r.width>0&&r.height>0&&r.bottom>0&&r.top<H&&r.right>0&&r.left<W;}).slice(0,30).map(function(e){var g=e.tagName.toLowerCase();
++var l=(e.getAttribute('placeholder')||e.getAttribute('aria-label')||(g==='input'?'':(e.innerText||''))||e.getAttribute('title')||'').replace(/\s+/g,' ').trim().slice(0,40);
++var r=e.getBoundingClientRect();return g+(g==='input'&&e.type?'['+e.type+']':'')+(l?' "'+l+'"':'')+' @'+Math.round(r.left+r.width/2)+','+Math.round(r.top+r.height/2);});
++return JSON.stringify({t:out.join(' | ').slice(0,1600),all:(b.innerText||'').length,el:el});}catch(e){return JSON.stringify({t:'',all:0,el:[],err:String(e)});}})()"""
++
++    data class Blankness(val dominant: Double, val colors: Int) {
++        /** One flat colour (white, black, the page background) with nothing drawn on it. */
++        val blank: Boolean get() = dominant >= 0.997 || colors <= 2
++        fun describe() = "dominant=${"%.4f".format(dominant)} colors=$colors"
++    }
++
++    /** Samples a ~96×96 grid; colours quantised to 4 bits per channel. */
++    fun blankness(bmp: Bitmap): Blankness {
++        val w = bmp.width; val h = bmp.height
++        if (w <= 0 || h <= 0) return Blankness(1.0, 0)
++        val stepX = maxOf(1, w / 96); val stepY = maxOf(1, h / 96)
++        val counts = HashMap<Int, Int>()
++        var total = 0
++        var y = 0
++        while (y < h) {
++            var x = 0
++            while (x < w) {
++                val p = bmp.getPixel(x, y)
++                val q = (((p shr 20) and 0xF) shl 8) or (((p shr 12) and 0xF) shl 4) or ((p shr 4) and 0xF)
++                counts[q] = (counts[q] ?: 0) + 1
++                total++
++                x += stepX
++            }
++            y += stepY
++        }
++        val max = counts.values.maxOrNull() ?: 0
++        return Blankness(if (total == 0) 1.0 else max.toDouble() / total, counts.size)
++    }
++
++    fun blanknessOfFile(path: String?): Blankness? = runCatching {
++        val o = BitmapFactory.Options().apply { inSampleSize = 2 }
++        BitmapFactory.decodeFile(path ?: return null, o)?.let { b -> blankness(b).also { b.recycle() } }
++    }.getOrNull()
++
++    /** Formats [VIEWPORT_TEXT_JS]'s answer as plain lines for a tool result. */
++    fun formatViewportText(json: String?): String? = runCatching {
++        val o = JSONObject(json ?: return null)
++        val t = o.optString("t")
++        val el = o.optJSONArray("el")
++        buildString {
++            appendLine("  Visible text (this viewport): " + t.ifBlank { "(none)" })
++            if (el != null && el.length() > 0) {
++                append("  On screen: ")
++                append((0 until el.length()).joinToString("; ") { el.optString(it) })
++                appendLine()
++            }
++            append("  Page text total: ${o.optInt("all")} chars")
++        }
++    }.getOrNull()
++
++    /**
++     * Self-test (adb SelfTestProvider "webrender"): drives the agent's real browser path —
++     * a [BrowserTabPool] and its actions, exactly what browser_use runs — on [url] in the
++     * given UA profile, and checks DOM text + a non-blank screenshot.
++     */
++    suspend fun selfTest(context: Context, url: String, profile: UserAgentProfile, needText: Int = 20): String {
++        val o = JSONObject().put("url", url).put("profile", profile.value)
++        val pool = BrowserTabPool(context.applicationContext)
++        try {
++            pool.execute(BrowserActionInput(action = BrowserAction.SET_USER_AGENT, userAgent = profile), singleTab = true, owner = null)
++            val t0 = System.currentTimeMillis()
++            val nav = pool.execute(BrowserActionInput(action = BrowserAction.NAVIGATE, url = url), singleTab = true, owner = null)
++            o.put("navMs", System.currentTimeMillis() - t0).put("navOk", nav.success).put("nav", nav.text.take(500))
++            val txt = pool.execute(BrowserActionInput(action = BrowserAction.GET_TEXT), singleTab = true, owner = null)
++            val body = txt.text
++            o.put("textOk", txt.success).put("textLen", body.length).put("text", body.take(160))
++            val shot = pool.execute(BrowserActionInput(action = BrowserAction.SCREENSHOT), singleTab = true, owner = null)
++            o.put("shotOk", shot.success && shot.base64Image != null)
++            val b = blanknessOfFile(shot.imageFilePath)
++            o.put("blank", b?.blank ?: true).put("pixels", b?.describe() ?: "no image")
++            o.put("shotText", shot.text.take(700))
++            o.put("hasViewportText", shot.text.contains("Visible text"))
++            o.put("gpuDisabled", HeadlessRenderHost.disabled ?: "")
++            val ok = nav.success && txt.success && body.length >= needText && shot.success &&
++                shot.base64Image != null && b != null && !b.blank && shot.text.contains("Visible text")
++            o.put("ok", ok)
++        } catch (e: Throwable) {
++            o.put("ok", false).put("error", "${e.javaClass.simpleName}: ${e.message}")
++        } finally {
++            runCatching { kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) { pool.destroyAllTabs() } }
++            runCatching { BrowserTabPoolRegistry.unregister(pool) }
++        }
++        return o.toString()
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt b/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt
+index 88276e6..04f6dec 100644
+--- a/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt
++++ b/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt
+@@ -51,6 +51,8 @@ class BrowserUseManager(
+     companion object {
+         private const val TAG = "BrowserUseManager"
+         private const val NAVIGATION_TIMEOUT_MS = 30_000L
++        /** [Mines-render-34] Max wait after onPageFinished for an SPA to put something on screen. */
++        private const val CONTENT_WAIT_MS = 6_000L
+         private const val SCREENSHOT_QUALITY = 80        // Explicit screenshot action (iOS: 0.8)
+         private const val SNAPSHOT_QUALITY = 70          // Auto-snapshot after visual-change actions (iOS: 0.7)
+         private const val DEFAULT_DOM_STABLE_TIMEOUT_MS = 5_000
+@@ -925,8 +927,29 @@ class BrowserUseManager(
+         _currentURL.value = _currentURL.value.ifEmpty { normalized }
+         _isLoading.value = false
+ 
++        // [Mines-render-34] SPA pages (vulbox.com: an empty <div id=app> until JS runs)
++        // finish loading before anything is in the DOM; wait (bounded) for visible content.
++        val content = awaitVisibleContent(CONTENT_WAIT_MS)
+         val meta = navigationMetadata()
+-        return BrowserActionResult(text = meta)
++        val note = if (content != null && content.optInt("t") == 0 && content.optInt("img") == 0 && content.optInt("m") == 0)
++            "\n  Note: the page shows nothing yet (no text or images after ${CONTENT_WAIT_MS / 1000}s). It may still be loading, " +
++                "need a login, or block this browser — try wait_for_dom_stable, then get_text or screenshot."
++            else ""
++        return BrowserActionResult(text = meta + note)
++    }
++
++    /** [Mines-render-34] Polls [BrowserRenderCheck.CONTENT_PROBE_JS] until the page has text / media, or [maxMs]. */
++    private suspend fun awaitVisibleContent(maxMs: Long): JSONObject? {
++        val start = System.currentTimeMillis()
++        var last: JSONObject? = null
++        while (true) {
++            if (isRendererDead) return last
++            last = evalSoft(BrowserRenderCheck.CONTENT_PROBE_JS, 3_000L)?.let { runCatching { JSONObject(it) }.getOrNull() } ?: last
++            val o = last
++            if (o != null && (o.optInt("t") > 0 || o.optInt("img") > 0 || o.optInt("m") > 0)) return o
++            if (System.currentTimeMillis() - start >= maxMs) return o
++            delay(300)
++        }
+     }
+ 
+     private suspend fun navigationMetadata(): String {
+@@ -1069,11 +1092,24 @@ class BrowserUseManager(
+             originalHeightPx = originalHeightPx,
+         )
+ 
++        // [Mines-render-34] Text-only models never see the pixels (the provider swaps them for a
++        // placeholder), so every screenshot also carries the viewport's visible text + controls.
++        val blank = shotBlankness?.blank == true
++        val viewText = BrowserRenderCheck.formatViewportText(evalSoft(BrowserRenderCheck.VIEWPORT_TEXT_JS, 4_000L))
++        val extra = buildString {
++            if (viewText != null) append("\n").append(viewText)
++            if (blank) append("\n  Note: this screenshot came out as one flat colour (${shotBlankness?.describe()}). ")
++                .append("If the visible text above is not empty the page IS loaded — read it with get_text / get_readable instead of retrying screenshots.")
++        }
++        shotBlankness = null
+         return BrowserActionResult(
+-            text = meta, base64Image = base64, imageFilePath = file.absolutePath
++            text = meta + extra, base64Image = base64, imageFilePath = file.absolutePath
+         )
+     }
+ 
++    /** [Mines-render-34] Blankness of the last agent capture (set by [captureWebViewBitmap]). */
++    @Volatile private var shotBlankness: BrowserRenderCheck.Blankness? = null
++
+     /** Collect viewport + page metadata for screenshot results. Mirrors iOS viewportMetadata. */
+     private suspend fun viewportMetadata(
+         imageW: Int,
+@@ -1194,7 +1230,16 @@ class BrowserUseManager(
+                 webView.layout(0, 0, targetW, targetH)
+                 w = targetW; h = targetH
+             }
+-            if (gpu) HeadlessRenderHost.capture(webView, w, h)?.let { return@withContext it }
++            // [Mines-render-34] The GPU path can return the host window's white background before the
++            // WebView's first real frame (slow GPUs): check it, and fall back to the software draw.
++            var gpuShot: Bitmap? = null
++            var gpuBlank: BrowserRenderCheck.Blankness? = null
++            if (gpu) HeadlessRenderHost.capture(webView, w, h)?.let { g ->
++                val b = BrowserRenderCheck.blankness(g)
++                if (!b.blank) { shotBlankness = b; return@withContext g }
++                Log.w(TAG, "gpu capture is blank (${b.describe()}); trying the software draw")
++                gpuShot = g; gpuBlank = b
++            }
+             val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+             val canvas = Canvas(bitmap)
+             // [T-android-browser-screenshot-scroll-offset] Undo the scroll
+@@ -1240,6 +1285,16 @@ class BrowserUseManager(
+             webView.draw(canvas)
+             Log.d(TAG, "captureWebViewBitmap ${w}x$h offset=(${offsetX},${offsetY}) " +
+                 "css=(${cssScroll.first},${cssScroll.second}) view=(${webView.scrollX},${webView.scrollY})")
++            if (gpu) {
++                val sb = BrowserRenderCheck.blankness(bitmap)
++                val g = gpuShot; val gb = gpuBlank
++                if (g != null && gb != null && sb.blank && gb.colors > sb.colors) {
++                    bitmap.recycle(); shotBlankness = gb; return@withContext g
++                }
++                g?.recycle()
++                shotBlankness = sb
++                if (sb.blank) Log.w(TAG, "software capture is blank too (${sb.describe()})")
++            }
+             bitmap
+         } catch (e: Exception) {
+             Log.e(TAG, "captureWebViewBitmap failed: ${e.message}")
+@@ -1688,6 +1743,25 @@ class BrowserUseManager(
+         }
+     }
+ 
++    /**
++     * [Mines-render-34] Best-effort evaluation for optional extras (content probe, viewport text):
++     * null on timeout / dead renderer and, unlike [evaluateJavascript], never marks the tab wedged.
++     */
++    private suspend fun evalSoft(js: String, timeoutMs: Long): String? {
++        if (isRendererDead) return null
++        val d = CompletableDeferred<String?>()
++        withContext(Dispatchers.Main) {
++            runCatching {
++                webView.evaluateJavascript(js) { r ->
++                    val v = if (r != null && r.startsWith("\"") && r.endsWith("\""))
++                        runCatching { JSONObject("{\"v\":$r}").getString("v") }.getOrDefault(r) else r
++                    d.complete(v)
++                }
++            }.onFailure { d.complete(null) }
++        }
++        return withTimeoutOrNull(timeoutMs) { d.await() }
++    }
++
+     private suspend fun evaluateAndReturn(js: String): BrowserActionResult {
+         return try {
+             val raw = evaluateJavascript(js)
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
+index da5cb64..aa059fc 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
+@@ -159,28 +159,38 @@ class SelfTestProvider : ContentProvider() {
+             }
+             "zoom" -> {
+                 // [Mines-zoom-34] in-app browser zoom: settings for the tab profile ("mobile" | "desktop") and
+-                // that a zoom-locking meta viewport is rewritten to user-scalable=yes / maximum-scale=5
++                // that a zoom-locking meta viewport is rewritten to user-scalable=yes / maximum-scale=5.
++                // [Mines-render-34] run 20 timed out here: the detached WebView was only referenced from the
++                // posted Runnable, so nothing kept it alive and it could be collected (renderer released) before
++                // onPageFinished. It is now held in [held] until the check ends, and the stage reached is reported.
+                 val c = context!!
+-                val res = java.util.concurrent.atomic.AtomicReference("timeout")
++                val res = java.util.concurrent.atomic.AtomicReference<String?>(null)
++                val stage = java.util.concurrent.atomic.AtomicReference("post")
+                 val latch = java.util.concurrent.CountDownLatch(1)
+-                android.os.Handler(android.os.Looper.getMainLooper()).post {
++                val main = android.os.Handler(android.os.Looper.getMainLooper())
++                main.post {
+                     try {
+-                        val wv = android.webkit.WebView(c)
++                        val wv = android.webkit.WebView(c.applicationContext)
++                        held = wv
++                        stage.set("created")
+                         val prof = if (arg == "desktop") com.openminis.app.browser.UserAgentProfile.DESKTOP_CHROME
+                             else com.openminis.app.browser.UserAgentProfile.MOBILE_CHROME
+                         com.openminis.app.browser.BrowserUseManager.configureWebView(wv, prof)
+                         val desc = com.openminis.app.browser.BrowserZoom.describe(wv)
+                         wv.webViewClient = object : android.webkit.WebViewClient() {
++                            override fun onPageStarted(v: android.webkit.WebView, u: String?, f: android.graphics.Bitmap?) { stage.set("started") }
++                            override fun onRenderProcessGone(v: android.webkit.WebView, d: android.webkit.RenderProcessGoneDetail?): Boolean {
++                                stage.set("renderer-gone"); res.compareAndSet(null, "{\"ok\":false,\"error\":\"renderer gone\"}"); latch.countDown(); return true
++                            }
+                             override fun onPageFinished(v: android.webkit.WebView, u: String?) {
++                                stage.set("finished")
+                                 com.openminis.app.browser.BrowserZoom.onPage(v, u, finished = true)
+-                                // a detached View defers post() until it is attached: use the main Handler
+-                                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
++                                main.postDelayed({
+                                     v.evaluateJavascript("document.querySelector('meta[name=viewport]').getAttribute('content')") { meta ->
+                                         val ok = desc.contains("supportZoom=true builtIn=true display=false wide=true overview=true") &&
+                                             (meta ?: "").contains("user-scalable=yes") && (meta ?: "").contains("maximum-scale=5")
+-                                        res.set(org.json.JSONObject().put("ok", ok).put("profile", prof.value).put("settings", desc)
++                                        res.compareAndSet(null, org.json.JSONObject().put("ok", ok).put("profile", prof.value).put("settings", desc)
+                                             .put("meta", meta ?: "").toString())
+-                                        runCatching { v.destroy() }
+                                         latch.countDown()
+                                     }
+                                 }, 300)
+@@ -189,16 +199,34 @@ class SelfTestProvider : ContentProvider() {
+                         wv.loadDataWithBaseURL("https://example.com/",
+                             "<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no\"></head><body>zoom</body></html>",
+                             "text/html", "utf-8", null)
+-                    } catch (e: Throwable) { res.set("{\"ok\":false,\"error\":\"${e.javaClass.simpleName}\"}"); latch.countDown() }
++                        stage.set("loading")
++                    } catch (e: Throwable) { res.compareAndSet(null, "{\"ok\":false,\"error\":\"${e.javaClass.simpleName}\"}"); latch.countDown() }
+                 }
+-                latch.await(15, TimeUnit.SECONDS)
+-                out.putString("result", res.get())
++                latch.await(40, TimeUnit.SECONDS)
++                main.post { runCatching { held?.destroy() }; held = null }
++                out.putString("result", res.get() ?: org.json.JSONObject().put("ok", false).put("error", "timeout").put("stage", stage.get()).toString())
++            }
++            "webrender" -> {
++                // [Mines-render-34] the agent's real browser path (BrowserTabPool → navigate / get_text / screenshot):
++                // arg "<url>|mobile" or "<url>|desktop"; ok needs DOM text, a non-blank screenshot and viewport text.
++                val c = context!!.applicationContext
++                val parts = (arg ?: "").split('|')
++                val url = parts.getOrElse(0) { "" }.ifBlank { "https://example.com/" }
++                val prof = if (parts.getOrNull(1) == "desktop") com.openminis.app.browser.UserAgentProfile.DESKTOP_CHROME
++                    else com.openminis.app.browser.UserAgentProfile.MOBILE_CHROME
++                val r = kotlinx.coroutines.runBlocking {
++                    kotlinx.coroutines.withTimeoutOrNull(100_000L) { com.openminis.app.browser.BrowserRenderCheck.selfTest(c, url, prof) }
++                }
++                out.putString("result", r ?: "{\"ok\":false,\"error\":\"timeout\"}")
+             }
+             else -> out.putString("result", "unknown method")
+         }
+         return out
+     }
+ 
++    /** [Mines-render-34] Keeps the zoom self-test's detached WebView reachable until the check ends. */
++    @Volatile private var held: android.webkit.WebView? = null
++
+     private fun split(s: String): List<String> {
+         val out = ArrayList<String>(); val cur = StringBuilder(); var q: Char? = null; var any = false
+         for (c in s) {
