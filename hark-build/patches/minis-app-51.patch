@@ -1,0 +1,852 @@
+diff --git a/src/android/app/src/main/java/com/openminis/app/agent/RunLoopGuard.kt b/src/android/app/src/main/java/com/openminis/app/agent/RunLoopGuard.kt
+new file mode 100644
+index 0000000..da70153
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/agent/RunLoopGuard.kt
+@@ -0,0 +1,113 @@
++package com.openminis.app.agent
++
++import android.content.Context
++import org.json.JSONArray
++import org.json.JSONObject
++
++/**
++ * [Mines-loop-30] Per-run guard against an agent that repeats itself.
++ *
++ * build-29 user report: on 商汤 / deepseek-flash the assistant wrote the same
++ * line 「继续逆向 nanoMuse APK…」 and issued the same tool call over and over
++ * until 224/224 tool runs. [ToolLoopDetector] only warns at 10 identical calls
++ * and blocks at 20–30 identical *results*, and the chat cap is 200 turns, so
++ * nothing stopped it.
++ *
++ * Rules (one instance per runAgentLoop call):
++ *  - the same tool name + normalized args ≥ [REPEAT] times in this run, or the
++ *    same assistant text in ≥ [REPEAT] consecutive turns → [Verdict.WARN]
++ *    (the caller tells the model it is repeating);
++ *  - after a warning, the same call / text again → [Verdict.PAUSE_REPEAT];
++ *  - more than [maxToolCalls] tool calls in this run → [Verdict.PAUSE_CAP].
++ * Pure logic, no Android state, so it is cheap to reason about.
++ */
++class RunLoopGuard(val maxToolCalls: Int = DEFAULT_MAX_TOOL_CALLS) {
++
++    enum class Verdict { OK, WARN, PAUSE_REPEAT, PAUSE_CAP }
++
++    private val callCounts = HashMap<String, Int>()
++    private var lastText: String? = null
++    private var textStreak = 0
++    private val warnedSigs = HashSet<String>()
++    private var warnedText: String? = null
++    var warned = false
++        private set
++    var toolCalls = 0
++        private set
++    /** Human-readable description of what repeated, for the note / log. */
++    var lastRepeat: String = ""
++        private set
++
++    /** Call once per assistant turn that requested tools: [calls] = (name, argsJson). */
++    fun onTurn(text: String, calls: List<Pair<String, String>>): Verdict {
++        toolCalls += calls.size
++        val t = normText(text)
++        if (t.isNotEmpty() && t == lastText) textStreak++ else textStreak = if (t.isEmpty()) 0 else 1
++        lastText = t.ifEmpty { null }
++
++        val sigs = calls.map { (n, a) -> n + "|" + canonical(a) }
++        for (s in sigs) callCounts[s] = (callCounts[s] ?: 0) + 1
++
++        if (warned) {
++            val again = sigs.firstOrNull { it in warnedSigs }
++                ?: sigs.firstOrNull { (callCounts[it] ?: 0) >= REPEAT }
++            val textAgain = t.isNotEmpty() && (t == warnedText || textStreak >= REPEAT)
++            if (again != null || textAgain) {
++                lastRepeat = again?.let { "工具 ${it.substringBefore('|')}（同样的参数）" } ?: "同一段话"
++                return Verdict.PAUSE_REPEAT
++            }
++        }
++        val repeated = sigs.filter { (callCounts[it] ?: 0) >= REPEAT }
++        val textRepeated = textStreak >= REPEAT
++        if (!warned && (repeated.isNotEmpty() || textRepeated)) {
++            warned = true
++            warnedSigs += repeated
++            if (textRepeated) warnedText = t
++            lastRepeat = repeated.firstOrNull()?.let { s ->
++                "工具 ${s.substringBefore('|')}（同样的参数已调用 ${callCounts[s]} 次）"
++            } ?: "同一段话（连续 $textStreak 轮）"
++            return Verdict.WARN
++        }
++        if (toolCalls >= maxToolCalls) return Verdict.PAUSE_CAP
++        return Verdict.OK
++    }
++
++    /** The note appended to the last tool result after [Verdict.WARN]. */
++    fun warningNote(): String =
++        "<system-reminder>You are repeating yourself: $lastRepeat. The results above did not change, " +
++            "so doing the same thing again will not help. Read the tool results you already have, then " +
++            "either change your approach (different command, different file, different arguments) or stop " +
++            "calling tools and answer the user with what you found. If you repeat the same call again the " +
++            "run will be paused.</system-reminder>"
++
++    companion object {
++        const val REPEAT = 3
++        const val DEFAULT_MAX_TOOL_CALLS = 60
++        private const val PREFS = "mines_agent"
++        const val KEY_MAX_TOOL_CALLS = "max_tool_calls_per_run"
++
++        fun maxToolCalls(context: Context): Int =
++            context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++                .getInt(KEY_MAX_TOOL_CALLS, DEFAULT_MAX_TOOL_CALLS).coerceIn(10, 500)
++
++        fun setMaxToolCalls(context: Context, n: Int) {
++            context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++                .edit().putInt(KEY_MAX_TOOL_CALLS, n.coerceIn(10, 500)).apply()
++        }
++
++        fun normText(s: String): String = s.trim().replace(Regex("\\s+"), " ")
++
++        /** Args JSON with keys sorted and string whitespace collapsed, so cosmetic differences still match. */
++        fun canonical(json: String): String = runCatching { canon(JSONObject(json)) }
++            .getOrElse { normText(json) }
++
++        private fun canon(v: Any?): String = when (v) {
++            is JSONObject -> v.keys().asSequence().toList().sorted()
++                .joinToString(",", "{", "}") { k -> JSONObject.quote(k) + ":" + canon(v.opt(k)) }
++            is JSONArray -> (0 until v.length()).joinToString(",", "[", "]") { canon(v.opt(it)) }
++            is String -> JSONObject.quote(normText(v))
++            null, JSONObject.NULL -> "null"
++            else -> v.toString()
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/auth/ClaudeOAuthManager.kt b/src/android/app/src/main/java/com/openminis/app/auth/ClaudeOAuthManager.kt
+index 8f9848c..ef496bd 100644
+--- a/src/android/app/src/main/java/com/openminis/app/auth/ClaudeOAuthManager.kt
++++ b/src/android/app/src/main/java/com/openminis/app/auth/ClaudeOAuthManager.kt
+@@ -53,14 +53,22 @@ class ClaudeOAuthManager(context: Context, instanceId: String) : OAuthManager(co
+          */
+         val ANTHROPIC_OAUTH_IDENTIFIER_PROMPT: String
+             get() = BuildConfig.ANTHROPIC_OAUTH_IDENTIFIER_PROMPT.ifEmpty {
++                // [Mines-30] Only reached on the Claude Code OAuth path; plain words for the user.
+                 throw IllegalStateException(
+-                    "ANTHROPIC_OAUTH_IDENTIFIER_PROMPT is not configured. Copy "
+-                        + "app/provider-customization.properties.example to "
+-                        + "app/provider-customization.properties and set "
+-                        + "ANTHROPIC_OAUTH_IDENTIFIER_PROMPT before using Claude Code OAuth."
++                    "这个 Mines 版本不支持用 Claude Code 账号登录 Anthropic（缺少官方客户端标识）。"
++                        + "请在 账号连接 → Anthropic 改用 API Key，或换一个供应商。"
+                 )
+             }
+ 
++        /**
++         * [Mines-30] The prefix, or "" when this build has none. For code that
++         * only strips/compares it on non-OAuth paths: those must never throw
++         * (build-29 showed "ANTHROPIC_OAUTH_IDENTIFIER_PROMPT is not configured"
++         * on a 商汤/DeepSeek chat because systemPromptFor() read the throwing getter).
++         */
++        val identifierPromptOrEmpty: String
++            get() = BuildConfig.ANTHROPIC_OAUTH_IDENTIFIER_PROMPT
++
+         /**
+          * How long before expiry we proactively refresh. Mirrors iOS
+          * `ClaudeOAuthManager.refreshBuffer` (5 minutes) — significantly tighter
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt b/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
+index ac97c14..a8fe86b 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
+@@ -69,6 +69,36 @@ class GeminiLive(
+             "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+         /** Checked against ai.google.dev/gemini-api/docs/live-api/get-started-websocket (2026-09-15). */
+         const val DEFAULT_MODEL = "gemini-3.8-live"
++
++        /**
++         * [Mines-voice-30] The Live setup message, per ai.google.dev/api/live
++         * (BidiGenerateContentSetup): responseModalities and speechConfig live
++         * in setup.generationConfig. build-25..29 put them directly under
++         * setup → server closed with 1007 「Unknown name "responseModalities"
++         * at 'setup'」 on every route. Shared by the call and 测试语音.
++         */
++        fun buildSetup(model: String, voice: String?, prompt: String?, tools: JSONArray? = null,
++                       resumeHandle: String? = null, resumption: Boolean = false): JSONObject {
++            val gen = JSONObject().put("responseModalities", JSONArray().put("AUDIO"))
++            if (!voice.isNullOrBlank()) gen.put("speechConfig", JSONObject().put("voiceConfig",
++                JSONObject().put("prebuiltVoiceConfig", JSONObject().put("voiceName", voice))))
++            val setup = JSONObject().put("model", if (model.startsWith("models/")) model else "models/$model")
++                .put("generationConfig", gen)
++            if (!prompt.isNullOrBlank()) setup.put("systemInstruction",
++                JSONObject().put("parts", JSONArray().put(JSONObject().put("text", prompt))))
++            if (tools != null && tools.length() > 0) setup.put("tools", tools)
++            setup.put("inputAudioTranscription", JSONObject())
++            setup.put("outputAudioTranscription", JSONObject())
++            if (resumption) setup.put("sessionResumption", JSONObject().apply { resumeHandle?.let { put("handle", it) } })
++            return JSONObject().put("setup", setup)
++        }
++
++        /** [Mines-voice-30] Server rejected the request itself (not the network): never fail over on this. */
++        fun isConfigError(code: Int, reason: String): Boolean {
++            if (code in listOf(1003, 1007, 1008)) return true
++            return listOf("Invalid JSON", "Unknown name", "Cannot find field", "INVALID_ARGUMENT", "invalid argument",
++                "HTTP 400").any { reason.contains(it, true) }
++        }
+         /** [Mines-voice-29] Full passes over every route before falling back to 普通语音模式. */
+         const val MAX_ROUNDS = 3
+         const val DEFAULT_PROMPT =
+@@ -125,7 +155,6 @@ class GeminiLive(
+     private var aec: AcousticEchoCanceler? = null
+     private var ns: NoiseSuppressor? = null
+     @Volatile private var setupDone = false
+-    @Volatile private var legacySetup = false
+     @Volatile private var stopped = false
+     @Volatile private var lastAudioAt = 0L
+     // [Mines-voice-reconnect] Auto-reconnect state: attempts since the last
+@@ -209,6 +238,8 @@ class GeminiLive(
+         connect()
+     }
+ 
++    private fun isConfigError(code: Int, reason: String) = GeminiLive.isConfigError(code, reason)
++
+     private fun isSocketLevel(reason: String) = listOf("Socket closed", "reset", "EOF", "refused", "超时", "timeout",
+         "Broken pipe", "被重置", "被拒绝", "SocketException", "Connection", "unexpected end").any { reason.contains(it, true) }
+ 
+@@ -289,6 +320,10 @@ class GeminiLive(
+                     _error.value = "Gemini 拒绝了这个 API Key：${pick.keyProblem}\n请在 账号连接 → Gemini 重新填写"
+                     _phase.value = Phase.ERROR; return@launch
+                 }
++                if (pick.configProblem != null) {
++                    _error.value = "Gemini 拒绝了通话设置（配置错误，不是网络问题，线路是通的）：\n${pick.configProblem}"
++                    _phase.value = Phase.ERROR; return@launch
++                }
+                 val r = pick.route
+                 if (r == null) {
+                     rounds++
+@@ -341,11 +376,6 @@ class GeminiLive(
+     private fun onClosed(code: Int, reason: String) {
+         if (stopped) return
+         stopAudio()
+-        // Older servers want responseModalities inside generationConfig: retry once.
+-        if (!setupDone && !legacySetup && code in 1007..1008) {
+-            legacySetup = true
+-            connect(); return
+-        }
+         // [Mines-voice-26] A model the server doesn't take: re-read the list once and switch.
+         if (!setupDone && (reason.contains("not found", true) || reason.contains("not supported", true) && reason.contains("model", true)) && !modelSwitchTried) {
+             modelSwitchTried = true
+@@ -365,6 +395,16 @@ class GeminiLive(
+             _phase.value = Phase.ERROR
+             return
+         }
++        // [Mines-voice-30] A protocol/config rejection (1007 invalid payload,
++        // 1008 policy, 1003, HTTP 400) is NOT a network problem: every route
++        // would get the same answer. Stop here, keep the route, show the
++        // server's own words. Only socket-level errors fail over.
++        if (isConfigError(code, reason)) {
++            retryJob?.cancel()
++            _error.value = "Gemini 拒绝了通话设置（配置错误，不是网络问题）：\n" + reason.ifBlank { "代码 $code" }
++            _phase.value = Phase.ERROR
++            return
++        }
+         // [Mines-voice-29] Route failover. A socket that dies before setup, or
+         // dies with a socket-level error within 30 s of setup, marks its route
+         // bad for this call and the next route is tried at once (instead of
+@@ -396,26 +436,10 @@ class GeminiLive(
+     }
+ 
+     private fun setupMessage(): JSONObject {
+-        val setup = JSONObject().put("model", "models/${_modelInUse.value}")
+-        val speech = JSONObject().put("voiceConfig",
+-            JSONObject().put("prebuiltVoiceConfig", JSONObject().put("voiceName", voice)))
+-        if (legacySetup) {
+-            setup.put("generationConfig", JSONObject()
+-                .put("responseModalities", JSONArray().put("AUDIO"))
+-                .put("speechConfig", speech))
+-        } else {
+-            setup.put("responseModalities", JSONArray().put("AUDIO"))
+-            setup.put("speechConfig", speech)
+-        }
+         val prompt = if (appContext != null) systemPrompt + "\n" + PHONE_PROMPT else systemPrompt
+-        setup.put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", prompt))))
+-        if (appContext != null) setup.put("tools", JSONArray().put(JSONObject().put("functionDeclarations", phoneTools())))
+-        setup.put("inputAudioTranscription", JSONObject())
+-        setup.put("outputAudioTranscription", JSONObject())
+-        if (!legacySetup) {
+-            setup.put("sessionResumption", JSONObject().apply { resumeHandle?.let { put("handle", it) } })
+-        }
+-        return JSONObject().put("setup", setup)
++        return buildSetup(_modelInUse.value, voice, prompt,
++            tools = if (appContext != null) JSONArray().put(JSONObject().put("functionDeclarations", phoneTools())) else null,
++            resumeHandle = resumeHandle, resumption = true)
+     }
+ 
+     private fun phoneTools(): JSONArray {
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/GeminiRoute.kt b/src/android/app/src/main/java/com/openminis/app/plus/GeminiRoute.kt
+index 0b6fd13..cea0eb3 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/GeminiRoute.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/GeminiRoute.kt
+@@ -42,6 +42,8 @@ object GeminiRoute {
+     data class Probe(val route: Route, val ok: Boolean, val note: String, val models: List<String> = emptyList(), val keyProblem: Boolean = false)
+ 
+     @Volatile private var lastGood: String? = null
++    /** [Mines-voice-30] Prefix of a handshake result that is a config/protocol rejection, not a network failure. */
++    const val CONFIG_MARK = "✗⚙ "
+ 
+     /** The Gemini key: default account under 账号连接 → Gemini, else the plain entry. */
+     fun apiKey(): String? = runCatching { PlusVault.defaultAccount("gemini")?.let { PlusVault.secret(it) } }.getOrNull()
+@@ -142,7 +144,7 @@ object GeminiRoute {
+     }
+ 
+     data class Pick(val route: Route?, val models: List<String>, val report: List<String>, val keyProblem: String? = null,
+-                    val model: String? = null, val tried: List<Tried> = emptyList())
++                    val model: String? = null, val tried: List<Tried> = emptyList(), val configProblem: String? = null)
+ 
+     /**
+      * [Mines-voice-29] Tries the routes in order, each with a REAL check of
+@@ -173,8 +175,14 @@ object GeminiRoute {
+             val model = chooseModel(wantedModel, p.models)
+             onStep("正在试：${r.label}（实时通道握手）…")
+             val hs = liveHandshake(r, key, model)
+-            report += "${if (hs.startsWith("✓")) "✓" else "✗"} ${r.label}：HTTPS ${p.note}；${hs.removePrefix("✓ ").removePrefix("✗ ")}"
++            report += "${if (hs.startsWith("✓")) "✓" else "✗"} ${r.label}：HTTPS ${p.note}；${hs.removePrefix("✓ ").removePrefix(CONFIG_MARK).removePrefix("✗ ")}"
+             if (hs.startsWith("✓")) { lastGood = r.label; return Pick(r, p.models, report, model = model, tried = tried + Tried(r, Fail.NONE, "ok")) }
++            // [Mines-voice-30] The route works (HTTPS ok, socket opened) but the server rejected the setup:
++            // every other route would get the same answer, so stop and report it as a config error.
++            if (hs.startsWith(CONFIG_MARK) && hs.contains("API key", true))
++                return Pick(null, emptyList(), report, hs.removePrefix(CONFIG_MARK), tried = tried)
++            if (hs.startsWith(CONFIG_MARK)) return Pick(null, p.models, report, model = model,
++                tried = tried + Tried(r, Fail.NONE, "config"), configProblem = hs.removePrefix(CONFIG_MARK))
+             tried += Tried(r, Fail.LIVE, hs.removePrefix("✗ "))
+         }
+         return Pick(null, emptyList(), report, tried = tried)
+@@ -218,6 +226,11 @@ object GeminiRoute {
+         val pick = pick(context, key, wantedModel)
+         out += pick.report
+         if (pick.keyProblem != null) { out += "→ 去 账号连接 → Gemini 换一个有效的 Key"; return out }
++        if (pick.configProblem != null) {
++            out += "✗ 线路是通的，但 Gemini 拒绝了通话设置（配置错误，不是网络问题）：${pick.configProblem}"
++            out += "→ 这是 Mines 的问题，请把这一页截图发给开发者；换线路没有用"
++            return out
++        }
+         val route = pick.route
+         if (route == null) {
+             out += "✗ " + plainSummary(pick.tried)
+@@ -262,15 +275,16 @@ object GeminiRoute {
+         var result = "✗ Live 握手超时（10 秒没有 setupComplete）"
+         val ws = client(route, 0).newWebSocket(Request.Builder().url(GeminiLive.WS_URL + "?key=" + key).build(), object : WebSocketListener() {
+             override fun onOpen(webSocket: WebSocket, response: Response) {
+-                webSocket.send(JSONObject().put("setup", JSONObject().put("model", "models/$model")
+-                    .put("responseModalities", JSONArray().put("AUDIO"))).toString())
++                // [Mines-voice-30] Same setup shape as the call (generationConfig.responseModalities).
++                webSocket.send(GeminiLive.buildSetup(model, GeminiLive.DEFAULT_VOICE, null).toString())
+             }
+             override fun onMessage(webSocket: WebSocket, text: String) {
+                 if (text.contains("setupComplete")) { result = "✓ Live 实时通道握手成功（$model）"; done.countDown() }
+             }
+             override fun onMessage(webSocket: WebSocket, bytes: okio.ByteString) = onMessage(webSocket, bytes.utf8())
+             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+-                result = "✗ 服务器关闭了连接（$code）：${reason.ifBlank { "没有说明" }}"; done.countDown()
++                result = (if (GeminiLive.isConfigError(code, reason)) CONFIG_MARK else "✗ ") +
++                    "服务器关闭了连接（$code）：${reason.ifBlank { "没有说明" }}"; done.countDown()
+             }
+             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                 result = "✗ Live 连接失败：" + (response?.let { "HTTP ${it.code} ${it.message} " } ?: "") + shortErr(t); done.countDown()
+diff --git a/src/android/app/src/main/java/com/openminis/app/provider/anthropic/AnthropicProvider.kt b/src/android/app/src/main/java/com/openminis/app/provider/anthropic/AnthropicProvider.kt
+index 172e191..f93e3ee 100644
+--- a/src/android/app/src/main/java/com/openminis/app/provider/anthropic/AnthropicProvider.kt
++++ b/src/android/app/src/main/java/com/openminis/app/provider/anthropic/AnthropicProvider.kt
+@@ -339,7 +339,8 @@ class AnthropicProvider(
+      *   Returns null when the prompt is null/empty (iOS parity — no empty `system` field).
+      */
+     internal fun resolveSystemPrompt(userPrompt: String?): JSONArray? {
+-        val claudeCodePrefix = com.openminis.app.auth.ClaudeOAuthManager.ANTHROPIC_OAUTH_IDENTIFIER_PROMPT
++        val claudeCodePrefix = if (isOAuth) com.openminis.app.auth.ClaudeOAuthManager.ANTHROPIC_OAUTH_IDENTIFIER_PROMPT
++            else com.openminis.app.auth.ClaudeOAuthManager.identifierPromptOrEmpty
+         if (isOAuth) {
+             // Strip the prefix if the caller already prepended it; the tail is the real user prompt.
+             val tail = when {
+diff --git a/src/android/app/src/main/java/com/openminis/app/provider/openai/OpenAIProvider.kt b/src/android/app/src/main/java/com/openminis/app/provider/openai/OpenAIProvider.kt
+index 875eeb3..4bfea36 100644
+--- a/src/android/app/src/main/java/com/openminis/app/provider/openai/OpenAIProvider.kt
++++ b/src/android/app/src/main/java/com/openminis/app/provider/openai/OpenAIProvider.kt
+@@ -2383,7 +2383,12 @@ class OpenAIProvider private constructor(
+                             messagesArray.put(JSONObject().apply {
+                                 put("role", "tool")
+                                 put("tool_call_id", capChatToolCallId(tr.id))
+-                                put("content", tr.content)
++                                // [Mines-loop-30] Never send an empty tool reply: some
++                                // OpenAI-compatible backends (DeepSeek via relays) treat
++                                // "" as no result and the model re-issues the same call.
++                                put("content", tr.content.ifBlank {
++                                    if (tr.isError) "(tool failed with no output)" else "(command finished with no output)"
++                                })
+                             })
+                             // [T-android-toolresult-image-dropped] THE reported bug.
+                             // read_image hands its pixels back on the ToolResult
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt
+index 7b85754..bf0df66 100644
+--- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt
+@@ -79,6 +79,8 @@ Groups:
+   dialog    detect | dismiss
+   extract   text | list | form
+   service   status | ping
++  foreground            current package + activity
++  perm open <action>    open the settings page a PERM_DENIED error names
+ 
+ Output: JSON envelope { ok, data | error: { code, message } }.
+ Use --compact to emit on a single line; --quiet to strip the envelope.
+@@ -128,17 +130,22 @@ First-run: enable "Mines" under Settings → Accessibility, then `service ping`.
+             return NativeOffloadResult(if (args.positional.isEmpty()) 2 else 0, TOP_HELP)
+         }
+         val sub = args.positional[0]
++        // [Mines-30] `perm open <action>` opens the settings page a PERM_DENIED named.
++        if (sub == "perm") {
++            if (args.positional.getOrNull(1) != "open" || args.positional.getOrNull(2).isNullOrBlank())
++                return NativeOffloadResult(2, "用法：android-a11y-cli perm open <action>（action 来自 PERM_DENIED 的 action 字段）\n")
++            val (okOpen, msg) = PermDenied.open(context, args.positional[2])
++            return NativeOffloadResult(if (okOpen) 0 else 1, msg + "\n")
++        }
+         // T330: tri-state agent gate via OffloadPermissionManager. `service`
+         // and `--version` are diagnostic and pass through so the agent (or
+         // a curious developer) can still verify the service runs even when
+         // the agent surface is blocked.
+         if (sub != "service" && sub != "--version") {
+             if (!OffloadGate.allow("a11y_cli", "android-a11y-cli", request)) {
+-                return err(
+-                    args,
+-                    "PERMISSION_DENIED",
++                return PermDenied.result(args, "PERMISSION_DENIED",
+                     "Agent is not allowed to use android-a11y-cli. Open Settings → Permissions → Integrations to change.",
+-                )
++                    PermDenied.MINES_PERMISSIONS, exit = 1)
+             }
+         }
+         // [Mines-fast-ui] Numbered list / tap <n> / type / key / do batches.
+@@ -169,7 +176,7 @@ First-run: enable "Mines" under Settings → Accessibility, then `service ping`.
+         // `handle` is not a suspend fun. The prompt self-cancels after
+         // AccessibilityRecoveryManager.PROMPT_TIMEOUT_MS so this can never
+         // block the worker indefinitely.
+-        if (sub != "service" && sub != "--version") {
++        if (sub != "service" && sub != "--version" && sub != "foreground" && sub != "fg") {
+             val usable = kotlinx.coroutines.runBlocking {
+                 AccessibilityRecoveryManager.ensureGrantOrPrompt(context)
+             }
+@@ -181,7 +188,7 @@ First-run: enable "Mines" under Settings → Accessibility, then `service ping`.
+                 // toggle that is greyed out and cannot be moved — the actual
+                 // blocker is the restricted-settings gate, so name it.
+                 val restricted = RestrictedSettingsManager.isRestricted(context)
+-                return err(
++                return PermDenied.result(
+                     args,
+                     "SERVICE_NOT_RUNNING",
+                     if (restricted) {
+@@ -196,6 +203,7 @@ First-run: enable "Mines" under Settings → Accessibility, then `service ping`.
+                             "Re-enable Mines under Settings → Accessibility, or use Settings → " +
+                             "Permissions → Integrations to repair it with Shizuku."
+                     },
++                    if (restricted) PermDenied.APP_DETAILS else PermDenied.ACCESSIBILITY,
+                     exit = 77,
+                 )
+             }
+@@ -236,19 +244,59 @@ First-run: enable "Mines" under Settings → Accessibility, then `service ping`.
+                 "dialog"    -> dialogSub(args)
+                 "extract"   -> extractSub(args)
+                 "service"   -> serviceSub(args)
++                "foreground", "fg" -> foreground(args)
+                 "--version" -> NativeOffloadResult(0, "android-a11y-cli 0.1\n")
+                 else        -> NativeOffloadResult(2, "$TOOL: unknown subcommand '$sub'\n$TOP_HELP")
+             }
+         } catch (e: NotRunning) {
+-            err(args, "SERVICE_NOT_RUNNING",
++            PermDenied.result(args, "SERVICE_NOT_RUNNING",
+                 e.message ?: "Accessibility service is not running. Enable Mines under Settings → Accessibility.",
+-                exit = 77)
++                PermDenied.ACCESSIBILITY, exit = 77)
+         } catch (e: Throwable) {
+             AppLogger.warning(TAG, "uncaught: ${e.javaClass.simpleName} ${e.message}")
+             err(args, "INTERNAL", "${e.javaClass.simpleName}: ${e.message ?: ""}")
+         }
+     }
+ 
++    // ── foreground ([Mines-30]) ─────────────────────────────────────────
++
++    /**
++     * Current foreground package + activity. Activity: Shizuku `dumpsys
++     * activity activities` (exact) when ready, else the last window-state
++     * event of the accessibility service for that package (best effort).
++     */
++    private fun foreground(args: OffloadArgs): NativeOffloadResult {
++        val svc = MinisAccessibilityService.getInstance()
++        var pkg: String? = svc?.foregroundPackage()?.first
++        var activity: String? = null
++        var source = "accessibility"
++        if (FastUi.shizukuReady()) runCatching {
++            val out = com.openminis.app.offload.ShizukuManager.runProcess(arrayOf("sh", "-c",
++                "dumpsys activity activities | grep -E 'topResumedActivity|mResumedActivity|ResumedActivity:' | head -3"),
++                timeoutMs = 6_000L).stdout
++            val m = Regex("""([A-Za-z0-9_.]+)/([A-Za-z0-9_.$]+)""").find(out)
++            if (m != null) {
++                pkg = m.groupValues[1]
++                val a = m.groupValues[2]
++                activity = if (a.startsWith(".")) pkg + a else a
++                source = "shizuku"
++            }
++        }
++        if (activity == null && svc != null && pkg != null) {
++            activity = svc.snapshotEvents().lastOrNull {
++                it.type == "TYPE_WINDOW_STATE_CHANGED" && it.packageName == pkg &&
++                    !it.className.isNullOrBlank() && !it.className.startsWith("android.widget.") &&
++                    !it.className.startsWith("android.view.")
++            }?.className
++        }
++        if (pkg == null) {
++            return PermDenied.result(args, "SERVICE_NOT_RUNNING",
++                "Can't read the foreground app: accessibility is off and Shizuku is not ready. Enable Mines under Settings → Accessibility.",
++                PermDenied.ACCESSIBILITY)
++        }
++        return ok(args, JSONObject().put("package", pkg).put("activity", activity ?: JSONObject.NULL).put("source", source))
++    }
++
+     // ── service ──────────────────────────────────────────────────────────
+ 
+     private fun serviceSub(args: OffloadArgs): NativeOffloadResult {
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/FastUi.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/FastUi.kt
+index 433f376..371502f 100644
+--- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/FastUi.kt
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/FastUi.kt
+@@ -242,13 +242,15 @@ Backend: accessibility when enabled, otherwise Shizuku (uiautomator + input).
+             else -> return false to "不认识的步骤（可用：tap/type/key/scroll/wait/open/shade/list）"
+         }
+         if (r.first) settle(be)
++        // [Mines-30] Going home starts the launcher's enter animation; give it time.
++        if (r.first && (verb == "home" || verb == "key" && rest.lowercase() in setOf("home", "主页"))) Thread.sleep(350)
+         return r
+     }
+ 
+     // ── snapshot ─────────────────────────────────────────────────────────
+ 
+     private fun list(be: Backend, all: Boolean): String {
+-        val els = if (be == Backend.A11Y) snapshotA11y(all) else snapshotShizuku(all)
++        val els = stableSnapshot(be, all)
+         last = els
+         val sb = StringBuilder()
+         sb.append("屏幕：").append(lastPkg.ifBlank { "?" }).append(" · ").append(be.label).append(" · ").append(els.size).append(" 项\n")
+@@ -525,7 +527,32 @@ Backend: accessibility when enabled, otherwise Shizuku (uiautomator + input).
+             ShizukuManager.State.NOT_INSTALLED -> "没装 Shizuku"
+             else -> "Shizuku 就绪"
+         }
+-        return "手机控制不可用：无障碍服务没开；$shz。\n最简单：设置 → 无障碍 → Mines 打开。\n"
++        // [Mines-perm-30] Same machine-readable PERM_DENIED line as the other phone CLIs.
++        val action = if (st == ShizukuManager.State.NEED_PERMISSION) PermDenied.SHIZUKU else PermDenied.ACCESSIBILITY
++        return PermDenied.json("SERVICE_NOT_RUNNING", "accessibility off and Shizuku not usable", action).toString() + "\n" +
++            "手机控制不可用：无障碍服务没开；$shz。\n最简单：设置 → 无障碍 → Mines 打开。\n"
++    }
++
++    /**
++     * [Mines-30] build-28 smoke: icon coordinates on the home screen changed
++     * between two `key home; list` runs — the launcher was still animating
++     * (icons fly in / page snaps) and sends no accessibility events while
++     * doing so, so [settle] returned early. Take snapshots until two in a row
++     * agree on every label + bounds (max ~1.5 s); Shizuku dumps are slow
++     * enough to be taken once.
++     */
++    private fun stableSnapshot(be: Backend, all: Boolean): List<El> {
++        if (be != Backend.A11Y) return snapshotShizuku(all)
++        fun sig(l: List<El>) = l.joinToString("|") { it.label + "@" + it.bounds.flattenToString() }
++        var prev = snapshotA11y(all)
++        val until = System.currentTimeMillis() + 1500
++        while (System.currentTimeMillis() < until) {
++            Thread.sleep(150)
++            val cur = snapshotA11y(all)
++            if (sig(cur) == sig(prev)) return cur
++            prev = cur
++        }
++        return prev
+     }
+ 
+     // ── settle ───────────────────────────────────────────────────────────
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/OffloadGate.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/OffloadGate.kt
+index 80b3c6b..88d2159 100644
+--- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/OffloadGate.kt
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/OffloadGate.kt
+@@ -61,11 +61,9 @@ internal object OffloadGate {
+         request: NativeOffloadRequest? = null,
+     ): NativeOffloadResult? {
+         if (allow(toolName, displayName, request?.sessionId)) return null
+-        val body = JSONObject()
+-            .put("error", "permission_denied")
+-            .put("message",
+-                "Agent is not allowed to use $displayName. Open Settings → Permissions to change.")
+-            .toString()
+-        return NativeOffloadResult(126, OffloadOutput.formatBody(body, args) + "\n")
++        // [Mines-perm-30] Same PERM_DENIED shape as the phone CLIs.
++        return PermDenied.result(args, "permission_denied",
++            "Agent is not allowed to use $displayName. Open Settings → Permissions to change.",
++            PermDenied.MINES_PERMISSIONS, exit = 126)
+     }
+ }
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/PermDenied.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/PermDenied.kt
+new file mode 100644
+index 0000000..72d0887
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/PermDenied.kt
+@@ -0,0 +1,49 @@
++package com.openminis.app.sandbox.offload
++
++import android.content.Context
++import android.content.Intent
++import android.net.Uri
++import com.openminis.app.sandbox.NativeOffloadResult
++import org.json.JSONObject
++
++/**
++ * [Mines-perm-30] One shape for every "not allowed / not enabled" answer of the
++ * phone CLIs (build-28 smoke report: each tool said it differently):
++ *
++ *   {"ok":false,"error":{"code":"PERM_DENIED","reason":"<old code>",
++ *    "message":"…","action":"<Android settings action>",
++ *    "open":"android-a11y-cli perm open <action>"}}
++ *
++ * `action` names the settings page that fixes it; `perm open <action>` opens it.
++ */
++internal object PermDenied {
++    const val CODE = "PERM_DENIED"
++    const val ACCESSIBILITY = "android.settings.ACCESSIBILITY_SETTINGS"
++    const val APP_DETAILS = "android.settings.APPLICATION_DETAILS_SETTINGS"
++    const val SHIZUKU = "moe.shizuku.privileged.api"
++    /** Mines' own Settings → Permissions (agent gate). */
++    const val MINES_PERMISSIONS = "mines.settings.PERMISSIONS"
++
++    fun json(reason: String, message: String, action: String): JSONObject =
++        JSONObject().put("ok", false).put("error", JSONObject()
++            .put("code", CODE).put("reason", reason).put("message", message)
++            .put("action", action).put("open", "android-a11y-cli perm open $action"))
++
++    fun result(args: OffloadArgs, reason: String, message: String, action: String, exit: Int = 77): NativeOffloadResult =
++        NativeOffloadResult(exit, OffloadOutput.formatBody(json(reason, message, action).toString(), args) + "\n")
++
++    /** `perm open <action>`: start the settings page named by [action]. */
++    fun open(context: Context, action: String): Pair<Boolean, String> = runCatching {
++        val i = when (action) {
++            APP_DETAILS -> Intent(APP_DETAILS, Uri.parse("package:" + context.packageName))
++            SHIZUKU -> context.packageManager.getLaunchIntentForPackage(SHIZUKU)
++                ?: return false to "没装 Shizuku"
++            MINES_PERMISSIONS -> context.packageManager.getLaunchIntentForPackage(context.packageName)
++                ?: return false to "打不开 Mines"
++            else -> Intent(action)
++        }
++        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
++        context.startActivity(i)
++        true to "已打开：$action" + (if (action == MINES_PERMISSIONS) "（在 Mines 里进 设置 → 权限）" else "")
++    }.getOrElse { false to "打不开 $action：${it.message}" }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ShizukuOffloadHandler.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ShizukuOffloadHandler.kt
+index b22bce7..41b1186 100644
+--- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ShizukuOffloadHandler.kt
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ShizukuOffloadHandler.kt
+@@ -61,29 +61,27 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
+         // OffloadGate for the sync→suspend rationale (handler interface
+         // is sync, manager API is suspend).
+         if (!OffloadGate.allow("shizuku_cli", "android-shizuku-cli", request)) {
+-            return errEnvelope(
+-                "PERMISSION_DENIED",
++            return PermDenied.result(args, "PERMISSION_DENIED",
+                 "Agent is not allowed to use android-shizuku-cli. Open Settings → Permissions → Integrations to change.",
+-                args,
+-            )
++                PermDenied.MINES_PERMISSIONS, exit = 1)
+         }
+ 
+         // Every other group needs binder + permission.
+         ShizukuManager.refresh()
+         when (val st = ShizukuManager.snapshot.value.state) {
+             ShizukuManager.State.NOT_INSTALLED ->
+-                return errEnvelope("SERVICE_NOT_RUNNING", "Shizuku is not installed. Open Settings → Permissions → Shizuku.", args)
++                return PermDenied.result(args, "SERVICE_NOT_RUNNING", "Shizuku is not installed. Open Settings → Permissions → Shizuku.", PermDenied.MINES_PERMISSIONS, exit = 1)
+             ShizukuManager.State.NOT_RUNNING ->
+-                return errEnvelope("SERVICE_NOT_RUNNING", "Shizuku 已安装但没启动：打开 Shizuku 用无线调试启动后重试。(Shizuku service is not running.)", args)
++                return PermDenied.result(args, "SERVICE_NOT_RUNNING", "Shizuku 已安装但没启动：打开 Shizuku 用无线调试启动后重试。(Shizuku service is not running.)", PermDenied.SHIZUKU, exit = 1)
+             ShizukuManager.State.NEED_PERMISSION -> {
+                 // [Mines-shizuku-29] Ask right here (Shizuku's own one-tap dialog)
+                 // and continue when the user allows, instead of failing.
+                 if (!com.openminis.app.plus.ShizukuAsk.requestAndWait(context, 30_000)) {
+-                    return errEnvelope("PERMISSION_DENIED",
++                    return PermDenied.result(args, "PERMISSION_DENIED",
+                         (if (com.openminis.app.plus.ShizukuAsk.permanentlyDenied())
+                             "Mines 在 Shizuku 里被设成了拒绝：已打开 Shizuku，请在「授权应用」里打开 Mines，然后重试。"
+                         else "已弹出 Shizuku 授权框，但 30 秒内没有点「允许」。点允许后重试。") +
+-                            " 不用 Shizuku 的替代：android-a11y-cli（无障碍）可以点屏幕、打开应用。", args)
++                            " 不用 Shizuku 的替代：android-a11y-cli（无障碍）可以点屏幕、打开应用。", PermDenied.SHIZUKU, exit = 1)
+                 }
+             }
+             ShizukuManager.State.READY -> { /* fall through */ }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatMiscViews.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatMiscViews.kt
+index 9877e7b..8e91678 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatMiscViews.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatMiscViews.kt
+@@ -920,6 +920,26 @@ internal fun rememberBrowserLiveSnapshot(
+  * a single mid value, since it sits over a low-alpha tint and reads
+  * the same on both themes).
+  */
++/** [Mines-loop-30] Shown when the agent was paused for repeating itself or hitting the per-run tool cap. */
++@Composable
++internal fun LoopPauseBanner(text: String, onContinue: () -> Unit, onStop: () -> Unit) {
++    val orange = Color(0xFFFF9500)
++    Column(
++        modifier = Modifier
++            .fillMaxWidth()
++            .padding(vertical = 2.dp)
++            .clip(RoundedCornerShape(10.dp))
++            .background(orange.copy(alpha = 0.10f))
++            .padding(horizontal = 12.dp, vertical = 8.dp),
++    ) {
++        androidx.compose.material3.Text(text = text, style = androidx.compose.material3.MaterialTheme.typography.bodyMedium, color = androidx.compose.material3.MaterialTheme.colorScheme.onSurface)
++        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
++            androidx.compose.material3.TextButton(onClick = onStop) { androidx.compose.material3.Text("停止") }
++            androidx.compose.material3.TextButton(onClick = onContinue) { androidx.compose.material3.Text("继续") }
++        }
++    }
++}
++
+ @Composable
+ internal fun ResumeBanner(onResume: () -> Unit) {
+     val orange = Color(0xFFFF9500)
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt
+index aa004e0..acf54a6 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt
+@@ -603,6 +603,7 @@ fun ChatScreen(
+     val hasOlderMessages by viewModel.hasOlderMessages.collectAsState()
+     val isStreaming by viewModel.isStreaming.collectAsState()
+     val canResume by viewModel.canResume.collectAsState()
++    val loopPause by viewModel.loopPause.collectAsState()
+     // [T-android-context-usage-hint] Context-window pressure. `contextUsage`
+     // is live (drives the glow on every usage chunk); `contextUsageHint` is
+     // the discrete, generation-keyed placeholder line.
+@@ -4294,7 +4295,18 @@ fun ChatScreen(
+                             )
+                         }
+                     }
+-                    if (canResume && !isStreaming && error == null && !lastAssistantHasError) {
++                    // [Mines-loop-30] Loop-guard pause: reason + 继续 / 停止.
++                    val pauseText = loopPause
++                    if (pauseText != null && !isStreaming) {
++                        item(key = "__loop_pause__", contentType = "loop_pause") {
++                            LoopPauseBanner(
++                                text = pauseText,
++                                onContinue = { viewModel.loopPauseContinue() },
++                                onStop = { viewModel.loopPauseStop() },
++                            )
++                        }
++                    }
++                    if (loopPause == null && canResume && !isStreaming && error == null && !lastAssistantHasError) {
+                         item(key = "__resume_banner__", contentType = "resume_banner") {
+                             ResumeBanner(onResume = {
+                                 viewModel.resume()
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
+index 990aba4..575a8ec 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
+@@ -988,6 +988,22 @@ class ChatViewModel(
+     private val _canResume = MutableStateFlow(false)
+     val canResume: StateFlow<Boolean> = _canResume.asStateFlow()
+ 
++    /** [Mines-loop-30] Non-null while a run is paused by the loop guard: the reason, shown with 继续 / 停止. */
++    private val _loopPause = MutableStateFlow<String?>(null)
++    val loopPause: StateFlow<String?> = _loopPause.asStateFlow()
++
++    /** [Mines-loop-30] 继续: resume the paused run (a fresh run, so the guard starts over). */
++    fun loopPauseContinue() {
++        _loopPause.value = null
++        resume()
++    }
++
++    /** [Mines-loop-30] 停止: leave the run paused for good; the user can type a new message. */
++    fun loopPauseStop() {
++        _loopPause.value = null
++        _canResume.value = false
++    }
++
+     /**
+      * [T-android-group-pause-badge-restamp] Marks the ONE `_canResume = true`
+      * assignment that is a RE-DETECTION of an interruption that already
+@@ -7198,7 +7214,9 @@ class ChatViewModel(
+      * The rest of the prompt is not model-specific on Android.
+      */
+     private fun systemPromptFor(provider: LLMProvider, prompt: String?): String? {
+-        val prefix = com.openminis.app.auth.ClaudeOAuthManager.ANTHROPIC_OAUTH_IDENTIFIER_PROMPT
++        val oauthProvider = (provider as? com.openminis.app.provider.anthropic.AnthropicProvider)?.isOAuth == true
++        val prefix = if (oauthProvider) com.openminis.app.auth.ClaudeOAuthManager.ANTHROPIC_OAUTH_IDENTIFIER_PROMPT
++            else com.openminis.app.auth.ClaudeOAuthManager.identifierPromptOrEmpty
+         if (prompt == null || prefix.isEmpty()) return prompt
+         val bare = if (prompt.startsWith(prefix)) prompt.removePrefix(prefix).trimStart('\n') else prompt
+         val oauth = (provider as? com.openminis.app.provider.anthropic.AnthropicProvider)?.isOAuth == true
+@@ -9036,6 +9054,7 @@ class ChatViewModel(
+     }
+ 
+     fun sendMessage(text: String) {
++        _loopPause.value = null // [Mines-loop-30] a new message ends a guard pause
+         // [T-android-stop-sibling-subagent] New work in this session lifts the
+         // stop: delegations from here on may drive the turn again.
+         com.openminis.app.agent.jobs.AgentJobRegistry.clearDelegationMute(activeSessionId)
+@@ -10734,6 +10753,8 @@ class ChatViewModel(
+         // loop or survive a cancel. A mid-loop injection that carries its own
+         // prefill re-arms it (see the injectQueuedPromptsAsNewTurn call site).
+         var pendingScriptedTurn: com.openminis.app.scheduled.ScriptedToolTurn? = scriptedTurnFor(prefill)
++        // [Mines-loop-30] Repeat detection + per-run tool-call cap (see RunLoopGuard).
++        val runGuard = com.openminis.app.agent.RunLoopGuard(com.openminis.app.agent.RunLoopGuard.maxToolCalls(context))
+         for (turn in 0 until turnCap) {
+             // [T-android-switch-model-next-request] The user picked another
+             // model while this turn ran. Apply it HERE, before the next
+@@ -12814,6 +12835,24 @@ class ChatViewModel(
+             // Flatten in tool_use order, never completion order.
+             for (parts in slotResults) parts?.let { resultParts.addAll(it) }
+ 
++            // [Mines-loop-30] Same call / same text again and again → tell the
++            // model (note on the last tool result, so tool pairing stays
++            // valid); if it still repeats, or the per-run cap is hit, pause.
++            val guardCalls = toolCalls.filterNot { com.openminis.app.scheduled.ScriptedToolTurn.isScriptedId(it.first) }
++                .map { it.second to it.third.toString() }
++            val guardVerdict = if (guardCalls.isEmpty()) com.openminis.app.agent.RunLoopGuard.Verdict.OK
++                else runGuard.onTurn(turnText, guardCalls)
++            if (guardVerdict != com.openminis.app.agent.RunLoopGuard.Verdict.OK) {
++                AppLogger.warning(TAG_STREAM, "[LoopGuard] turn=$turn verdict=$guardVerdict calls=${runGuard.toolCalls}/${runGuard.maxToolCalls} repeat=${runGuard.lastRepeat}")
++            }
++            if (guardVerdict == com.openminis.app.agent.RunLoopGuard.Verdict.WARN) {
++                val li = resultParts.indexOfLast { it is AgentContentPart.ToolResult }
++                if (li >= 0) {
++                    val tr = resultParts[li] as AgentContentPart.ToolResult
++                    resultParts[li] = tr.copy(content = tr.content + "\n\n" + runGuard.warningNote())
++                }
++            }
++
+             // Update UI with tool statuses. Mark as awaiting the next model
+             // response so "Mines is thinking" shows during the network gap
+             // between tool results being sent and the next turn's first chunk.
+@@ -12849,6 +12888,30 @@ class ChatViewModel(
+                 dbMessageId = toolResultDbId,
+             ))
+ 
++            // [Mines-loop-30] Pause (results are already in history, every call stays paired).
++            if (guardVerdict == com.openminis.app.agent.RunLoopGuard.Verdict.PAUSE_REPEAT ||
++                guardVerdict == com.openminis.app.agent.RunLoopGuard.Verdict.PAUSE_CAP) {
++                if (helperConfig != null) break // helper: ends like the turn cap (finalizeAtTurnLimit below)
++                val why = if (guardVerdict == com.openminis.app.agent.RunLoopGuard.Verdict.PAUSE_REPEAT)
++                    "检测到重复循环，已暂停（${runGuard.lastRepeat}）"
++                else "这次任务已调用 ${runGuard.toolCalls} 次工具（上限 ${runGuard.maxToolCalls}），已暂停"
++                withContext(Dispatchers.Main) {
++                    updateAssistantMessage(
++                        assistantId, accumulatedText, false, allToolBlocks,
++                        isAwaitingModelResponse = false,
++                    )
++                    clearStreamFlushState(assistantId)
++                    if (_streamingById.value.containsKey(assistantId)) {
++                        _streamingById.value = _streamingById.value - assistantId
++                    }
++                    markLiveInterruption()
++                    _loopPause.value = why
++                    _canResume.value = true
++                }
++                loopExitedNormally = true
++                break
++            }
++
+             // Auto-title after first exchange (mirrors iOS generateSessionTitleIfNeeded)
+             if (turn == 0) {
+                 generateSessionTitleIfNeeded()
