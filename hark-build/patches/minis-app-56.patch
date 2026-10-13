@@ -45,10 +45,10 @@ index d485673..e661a6e 100644
              return line.lowercase()
 diff --git a/src/android/app/src/main/java/com/openminis/app/browser/BrowserRenderCheck.kt b/src/android/app/src/main/java/com/openminis/app/browser/BrowserRenderCheck.kt
 new file mode 100644
-index 0000000..40b46b8
+index 0000000..d7256f7
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/browser/BrowserRenderCheck.kt
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,134 @@
 +package com.openminis.app.browser
 +
 +import android.content.Context
@@ -167,7 +167,11 @@ index 0000000..40b46b8
 +            o.put("shotText", shot.text.take(700))
 +            o.put("hasViewportText", shot.text.contains("Visible text"))
 +            o.put("gpuDisabled", HeadlessRenderHost.disabled ?: "")
-+            val ok = nav.success && txt.success && body.length >= needText && shot.success &&
++            // set_user_agent right before navigate is what agents do when switching 手机/电脑 mode;
++            // the navigate must report the real page, never the about:blank placeholder.
++            val navBlank = nav.text.startsWith("Navigated to about:blank") || shot.text.contains("URL: about:blank")
++            o.put("navBlank", navBlank)
++            val ok = !navBlank && nav.success && txt.success && body.length >= needText && shot.success &&
 +                shot.base64Image != null && b != null && !b.blank && shot.text.contains("Visible text")
 +            o.put("ok", ok)
 +        } catch (e: Throwable) {
@@ -180,7 +184,7 @@ index 0000000..40b46b8
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt b/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt
-index 88276e6..04f6dec 100644
+index 88276e6..86da1c7 100644
 --- a/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt
 @@ -51,6 +51,8 @@ class BrowserUseManager(
@@ -192,7 +196,53 @@ index 88276e6..04f6dec 100644
          private const val SCREENSHOT_QUALITY = 80        // Explicit screenshot action (iOS: 0.8)
          private const val SNAPSHOT_QUALITY = 70          // Auto-snapshot after visual-change actions (iOS: 0.7)
          private const val DEFAULT_DOM_STABLE_TIMEOUT_MS = 5_000
-@@ -925,8 +927,29 @@ class BrowserUseManager(
+@@ -191,6 +193,9 @@ class BrowserUseManager(
+     /** Deferred for awaiting navigation completion. */
+     private var navigationDeferred: CompletableDeferred<Unit>? = null
+ 
++    /** [Mines-render-34] URL the pending [navigate] asked for (null when none / not a navigate). */
++    @Volatile private var navigationTarget: String? = null
++
+     /** Screenshots directory. */
+     private val screenshotsDir: File by lazy {
+         File(webView.context.cacheDir, "browser_screenshots").also { it.mkdirs() }
+@@ -459,8 +464,17 @@ class BrowserUseManager(
+                 _pageTitle.value = view.title ?: ""
+                 _canGoBack.value = view.canGoBack()
+                 _canGoForward.value = view.canGoForward()
+-                navigationDeferred?.complete(Unit)
+-                navigationDeferred = null
++                // [Mines-render-34] A finish of the blank placeholder page (initial tab page, or the reload a
++                // set_user_agent just issued) must not end a navigate to a real site: it used to, and the
++                // agent got "Navigated to about:blank" + an empty page while the site was still loading.
++                val target = navigationTarget
++                val stray = target != null && !target.startsWith("about:") && !target.startsWith("data:") &&
++                    (url.isNullOrEmpty() || url == "about:blank" || url.startsWith("data:"))
++                if (!stray) {
++                    navigationDeferred?.complete(Unit)
++                    navigationDeferred = null
++                    navigationTarget = null
++                } else Log.i(TAG, "ignoring onPageFinished($url) while navigating to $target")
+                 BrowserZoom.onPage(view, url, finished = true)
+                 // Record in browser history
+                 val histUrl = url ?: ""
+@@ -892,6 +906,7 @@ class BrowserUseManager(
+ 
+         val deferred = CompletableDeferred<Unit>()
+         navigationDeferred = deferred
++        navigationTarget = normalized
+         _isLoading.value = true
+ 
+         withContext(Dispatchers.Main) {
+@@ -912,6 +927,7 @@ class BrowserUseManager(
+                 _isLoading.value = false
+                 deferred.complete(Unit)
+                 navigationDeferred = null
++                navigationTarget = null
+             }
+         }
+         handler.postDelayed(timeoutRunnable, NAVIGATION_TIMEOUT_MS)
+@@ -925,8 +941,29 @@ class BrowserUseManager(
          _currentURL.value = _currentURL.value.ifEmpty { normalized }
          _isLoading.value = false
  
@@ -223,7 +273,7 @@ index 88276e6..04f6dec 100644
      }
  
      private suspend fun navigationMetadata(): String {
-@@ -1069,11 +1092,24 @@ class BrowserUseManager(
+@@ -1069,11 +1106,24 @@ class BrowserUseManager(
              originalHeightPx = originalHeightPx,
          )
  
@@ -249,7 +299,7 @@ index 88276e6..04f6dec 100644
      /** Collect viewport + page metadata for screenshot results. Mirrors iOS viewportMetadata. */
      private suspend fun viewportMetadata(
          imageW: Int,
-@@ -1194,7 +1230,16 @@ class BrowserUseManager(
+@@ -1194,7 +1244,16 @@ class BrowserUseManager(
                  webView.layout(0, 0, targetW, targetH)
                  w = targetW; h = targetH
              }
@@ -267,7 +317,7 @@ index 88276e6..04f6dec 100644
              val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
              val canvas = Canvas(bitmap)
              // [T-android-browser-screenshot-scroll-offset] Undo the scroll
-@@ -1240,6 +1285,16 @@ class BrowserUseManager(
+@@ -1240,6 +1299,16 @@ class BrowserUseManager(
              webView.draw(canvas)
              Log.d(TAG, "captureWebViewBitmap ${w}x$h offset=(${offsetX},${offsetY}) " +
                  "css=(${cssScroll.first},${cssScroll.second}) view=(${webView.scrollX},${webView.scrollY})")
@@ -284,7 +334,34 @@ index 88276e6..04f6dec 100644
              bitmap
          } catch (e: Exception) {
              Log.e(TAG, "captureWebViewBitmap failed: ${e.message}")
-@@ -1688,6 +1743,25 @@ class BrowserUseManager(
+@@ -1555,7 +1624,9 @@ class BrowserUseManager(
+             applyViewport()
+             val oldUrl = _currentURL.value
+             if (oldUrl.isNotEmpty()) {
+-                webView.reload()
++                // [Mines-render-34] wait for the reload: a navigate issued right after used to be ended
++                // by this reload's onPageFinished and report the OLD page (about:blank) as loaded.
++                reloadAndWait()
+             }
+         }
+         val vp = newProfile.viewportSize
+@@ -1585,6 +1656,7 @@ class BrowserUseManager(
+     suspend fun reloadAndWait() {
+         val deferred = CompletableDeferred<Unit>()
+         navigationDeferred = deferred
++        navigationTarget = null
+         _isLoading.value = true
+         val url = _currentURL.value
+         if (url.isEmpty() || url == "about:blank") {
+@@ -1625,6 +1697,7 @@ class BrowserUseManager(
+     suspend fun loadBlankPage() {
+         val deferred = CompletableDeferred<Unit>()
+         navigationDeferred = deferred
++        navigationTarget = null
+         _isLoading.value = true
+         webView.loadDataWithBaseURL(null, BLANK_PAGE_HTML, "text/html", "utf-8", null)
+         val handler = Handler(Looper.getMainLooper())
+@@ -1688,6 +1761,25 @@ class BrowserUseManager(
          }
      }
  
