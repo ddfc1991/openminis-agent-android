@@ -1,3 +1,28 @@
+diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
+index 565718e..4842c5b 100644
+--- a/src/android/app/build.gradle.kts
++++ b/src/android/app/build.gradle.kts
+@@ -344,6 +344,9 @@ dependencies {
+     // app/libs/, not a checked-in binary. Backends are decided by
+     // deps/rclone-mobile/backends/backends.go, shared with the iOS build.
+     implementation(group = "", name = "rclone", ext = "aar")
++    // [Mines-voiceprint-34] sherpa-onnx 1.13.8 (static ONNX Runtime, so no clash with the VAD's libonnxruntime);
++    // CI downloads sherpa-onnx-static-link-onnxruntime-1.13.8.aar into app/libs/sherpa-onnx.aar and checks its SHA-256.
++    implementation(group = "", name = "sherpa-onnx", ext = "aar")
+ 
+     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+     implementation("com.squareup.okhttp3:okhttp-sse:4.12.0")
+diff --git a/src/android/app/proguard-rules.pro b/src/android/app/proguard-rules.pro
+index 5ad2731..5531557 100644
+--- a/src/android/app/proguard-rules.pro
++++ b/src/android/app/proguard-rules.pro
+@@ -47,3 +47,6 @@
+ -dontwarn org.slf4j.**
+ -dontwarn org.newsclub.net.unix.**
+ -dontwarn com.sun.jna.platform.**
++
++# [Mines-voiceprint-34] sherpa-onnx JNI looks up Kotlin classes/fields by name
++-keep class com.k2fsa.sherpa.onnx.** { *; }
 diff --git a/src/android/app/src/main/java/com/openminis/app/agent/DegenerationDetector.kt b/src/android/app/src/main/java/com/openminis/app/agent/DegenerationDetector.kt
 new file mode 100644
 index 0000000..22733b3
@@ -225,6 +250,128 @@ index c73fe22..35abdac 100644
  
  ## 你是谁
  - 能干、可靠、贴心，像最好的私人管家：先一步想到，替主人把事办完。
+diff --git a/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt b/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt
+index e30a9cb..88276e6 100644
+--- a/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt
++++ b/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt
+@@ -119,12 +119,13 @@ class BrowserUseManager(
+                 databaseEnabled = true
+                 loadWithOverviewMode = true
+                 useWideViewPort = true
+-                builtInZoomControls = false
+                 setSupportMultipleWindows(true)
+                 mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                 val ua = customUA ?: profile.userAgentString
+                 if (ua != null) userAgentString = ua
+             }
++            // [Mines-zoom-34] pinch / double-tap zoom + per-site 文字大小 in 手机 and 电脑 modes
++            BrowserZoom.configure(webView)
+             // T-android-webview-v3-port: enable first- + third-party cookies.
+             // WebView ships with third-party cookies disabled by default; that
+             // breaks hCaptcha / Turnstile / reCAPTCHA flows where the
+@@ -460,6 +461,7 @@ class BrowserUseManager(
+                 _canGoForward.value = view.canGoForward()
+                 navigationDeferred?.complete(Unit)
+                 navigationDeferred = null
++                BrowserZoom.onPage(view, url, finished = true)
+                 // Record in browser history
+                 val histUrl = url ?: ""
+                 val histTitle = view.title ?: ""
+diff --git a/src/android/app/src/main/java/com/openminis/app/browser/BrowserZoom.kt b/src/android/app/src/main/java/com/openminis/app/browser/BrowserZoom.kt
+new file mode 100644
+index 0000000..ed273ec
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/browser/BrowserZoom.kt
+@@ -0,0 +1,89 @@
++package com.openminis.app.browser
++
++import android.content.Context
++import android.net.Uri
++import android.webkit.WebSettings
++import android.webkit.WebView
++import androidx.webkit.WebViewCompat
++import androidx.webkit.WebViewFeature
++
++/**
++ * [Mines-zoom-34] The in-app browser must always be zoomable (user is partially
++ * sighted; vulbox.com login rendered tiny and could not be pinch-zoomed in 手机 or
++ * 电脑 mode because builtInZoomControls was false).
++ *
++ * - pinch + double-tap zoom on (no on-screen +/- buttons), wide viewport + overview
++ * - pages that lock zoom (meta viewport user-scalable=no / maximum-scale=1) are
++ *   rewritten to maximum-scale=5, user-scalable=yes, at document start (MutationObserver)
++ *   and again on page finish
++ * - 文字大小 (textZoom 100–200 %) remembered per site; default follows the system font size
++ */
++object BrowserZoom {
++    private const val PREFS = "mines_browser_zoom"
++    const val MIN = 100
++    const val MAX = 200
++
++    /** Rewrites zoom-locking meta viewport tags; safe to run any number of times. */
++    const val UNLOCK_JS = """(function(){try{
++var fix=function(m){if(!m||!m.getAttribute)return;var n=(m.getAttribute('name')||'').toLowerCase();if(n!=='viewport')return;
++var c=m.getAttribute('content')||'';var o=c;
++c=c.replace(/user-scalable\s*=\s*(no|0)/ig,'user-scalable=yes').replace(/maximum-scale\s*=\s*[0-9.]+/ig,'maximum-scale=5').replace(/minimum-scale\s*=\s*[0-9.]+/ig,'minimum-scale=0.25');
++if(!/maximum-scale/i.test(c))c+=(c?',':'')+'maximum-scale=5';if(!/user-scalable/i.test(c))c+=',user-scalable=yes';
++if(c!==o)m.setAttribute('content',c);};
++var all=function(){var l=document.querySelectorAll('meta[name=viewport],meta[name=Viewport]');for(var i=0;i<l.length;i++)fix(l[i]);};
++all();
++if(!window.__minesZoom){window.__minesZoom=1;try{new MutationObserver(function(ms){for(var i=0;i<ms.length;i++){var a=ms[i].addedNodes;for(var j=0;j<a.length;j++){var x=a[j];if(x.tagName==='META')fix(x);}if(ms[i].type==='attributes')fix(ms[i].target);}}).observe(document.documentElement||document,{childList:true,subtree:true,attributes:true,attributeFilter:['content']});}catch(e){}}
++try{document.documentElement.style.touchAction='auto';}catch(e){}
++}catch(e){}})();"""
++
++    private fun prefs(c: Context) = c.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++
++    /** Default text size: the system font scale (the user runs a large font), 100–200 %. */
++    fun defaultTextZoom(c: Context): Int =
++        (c.resources.configuration.fontScale * 100).toInt().coerceIn(MIN, MAX)
++
++    fun hostOf(url: String?): String = runCatching { Uri.parse(url ?: "").host.orEmpty().removePrefix("www.") }.getOrDefault("")
++
++    fun textZoomFor(c: Context, url: String?): Int {
++        val h = hostOf(url)
++        return if (h.isEmpty()) defaultTextZoom(c) else prefs(c).getInt("t:$h", defaultTextZoom(c)).coerceIn(MIN, MAX)
++    }
++
++    fun setTextZoom(c: Context, url: String?, pct: Int) {
++        val h = hostOf(url); val v = pct.coerceIn(MIN, MAX)
++        if (h.isNotEmpty()) prefs(c).edit().putInt("t:$h", v).apply()
++    }
++
++    /** Zoom-related settings; called from configureWebView for every tab, both UA modes. */
++    fun configure(webView: WebView) {
++        webView.settings.apply {
++            setSupportZoom(true)
++            builtInZoomControls = true      // enables pinch zoom
++            displayZoomControls = false     // no floating +/- buttons
++            useWideViewPort = true
++            loadWithOverviewMode = true     // also enables double-tap zoom
++            textZoom = defaultTextZoom(webView.context)
++            layoutAlgorithm = WebSettings.LayoutAlgorithm.TEXT_AUTOSIZING
++        }
++        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
++            runCatching { WebViewCompat.addDocumentStartJavaScript(webView, UNLOCK_JS, setOf("*")) }
++        }
++    }
++
++    /** On page start/finish: per-site text size + unlock zoom (fallback when document-start scripts aren't supported). */
++    fun onPage(webView: WebView, url: String?, finished: Boolean) {
++        runCatching {
++            val t = textZoomFor(webView.context, url)
++            if (webView.settings.textZoom != t) webView.settings.textZoom = t
++            if (finished) webView.evaluateJavascript(UNLOCK_JS, null)
++        }
++    }
++
++    /** For the selftest / smoke: zoom state of a WebView. */
++    fun describe(webView: WebView): String {
++        val s = webView.settings
++        return "supportZoom=${s.supportZoom()} builtIn=${s.builtInZoomControls} display=${s.displayZoomControls} " +
++            "wide=${s.useWideViewPort} overview=${s.loadWithOverviewMode} textZoom=${s.textZoom} " +
++            "docStart=${WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)}"
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/data/ContextPolicy.kt b/src/android/app/src/main/java/com/openminis/app/data/ContextPolicy.kt
 index 0d38b30..fa175e0 100644
 --- a/src/android/app/src/main/java/com/openminis/app/data/ContextPolicy.kt
@@ -626,7 +773,7 @@ index 0000000..2509ff5
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt b/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
-index 9208c65..63b2f46 100644
+index 9208c65..5aa40c2 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
 @@ -51,7 +51,9 @@ class GeminiLive(
@@ -640,7 +787,17 @@ index 9208c65..63b2f46 100644
  ) {
      companion object {
          /** Female by default (user asked, 2026-10-12). */
-@@ -483,11 +485,20 @@ class GeminiLive(
+@@ -173,6 +175,9 @@ class GeminiLive(
+     private val _reconnects = MutableStateFlow(0)
+     /** Seamless reconnects so far in this call (diagnostics). */
+     val reconnects: StateFlow<Int> = _reconnects.asStateFlow()
++    private val _voiceprintOn = MutableStateFlow(false)
++    /** [Mines-voiceprint-34] true while the call only listens to the enrolled voice. */
++    val voiceprintOn: StateFlow<Boolean> = _voiceprintOn.asStateFlow()
+     private var micJob: Job? = null
+     private var record: AudioRecord? = null
+     private var track: AudioTrack? = null
+@@ -483,11 +488,20 @@ class GeminiLive(
  
      private fun setupMessage(): JSONObject {
          val prompt = if (appContext != null) systemPrompt + "\n" + PHONE_PROMPT else systemPrompt
@@ -662,7 +819,7 @@ index 9208c65..63b2f46 100644
      private fun phoneTools(): JSONArray {
          fun obj(vararg props: Pair<String, JSONObject>, required: List<String> = emptyList()) = JSONObject()
              .put("type", "OBJECT")
-@@ -506,7 +517,8 @@ class GeminiLive(
+@@ -506,7 +520,8 @@ class GeminiLive(
  
      /** Execute the model's phone-control calls and send the results back. */
      private fun handleToolCall(calls: JSONArray) {
@@ -672,7 +829,7 @@ index 9208c65..63b2f46 100644
          scope.launch {
              val responses = JSONArray()
              for (i in 0 until calls.length()) {
-@@ -515,6 +527,10 @@ class GeminiLive(
+@@ -515,6 +530,10 @@ class GeminiLive(
                  val ui = com.openminis.app.sandbox.offload.FastUi(ctx)
                  val out = runCatching {
                      when (c.optString("name")) {
@@ -683,6 +840,44 @@ index 9208c65..63b2f46 100644
                          "phone_screen" -> ui.voiceScreen()
                          "phone_do" -> ui.voiceDo(args.optString("steps"), args.optBoolean("confirmed", false))
                          "phone_open_app" -> ui.voiceOpenApp(args.optString("name"))
+@@ -655,6 +674,10 @@ class GeminiLive(
+         if (AcousticEchoCanceler.isAvailable()) aec = AcousticEchoCanceler.create(rec.audioSessionId)?.apply { enabled = true }
+         if (NoiseSuppressor.isAvailable()) ns = NoiseSuppressor.create(rec.audioSessionId)?.apply { enabled = true }
+         rec.startRecording()
++        // [Mines-voiceprint-34] only the enrolled voice reaches Gemini when 声纹 is on
++        val vpCtx = appContext ?: bridgeContext
++        val vpGate = vpCtx?.let { runCatching { Voiceprint.gate(it) }.getOrNull() }
++        _voiceprintOn.value = vpGate != null
+         micJob = scope.launch {
+             val buf = ByteArray(3200) // 100 ms
+             while (isActive && !stopped) {
+@@ -670,8 +693,11 @@ class GeminiLive(
+                 _level.value = (sqrt(sum / (n / 2)) / 6000.0).toFloat().coerceIn(0f, 1f)
+                 if (_muted.value) continue
+                 val out = liveWs ?: continue // [Mines-voice-31] between sockets of a hop: drop 100 ms frames
+-                val b64 = Base64.encodeToString(buf, 0, n, Base64.NO_WRAP)
+-                out.send("{\"realtimeInput\":{\"audio\":{\"data\":\"$b64\",\"mimeType\":\"audio/pcm;rate=16000\"}}}")
++                val frames = if (vpGate != null) runCatching { vpGate.process(buf, n) }.getOrElse { listOf(buf.copyOf(n)) } else listOf(buf.copyOf(n))
++                for (f in frames) {
++                    val b64 = Base64.encodeToString(f, 0, f.size, Base64.NO_WRAP)
++                    out.send("{\"realtimeInput\":{\"audio\":{\"data\":\"$b64\",\"mimeType\":\"audio/pcm;rate=16000\"}}}")
++                }
+             }
+         }
+     }
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/LoginWeb.kt b/src/android/app/src/main/java/com/openminis/app/plus/LoginWeb.kt
+index 38a117a..c5e98e0 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/LoginWeb.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/LoginWeb.kt
+@@ -58,6 +58,8 @@ object LoginWeb {
+         s.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+         s.mediaPlaybackRequiresUserGesture = true
+         s.userAgentString = userAgent(wv.context)
++        // [Mines-zoom-34] login pages are zoomable too (pinch / double-tap, unlocked viewport)
++        com.openminis.app.browser.BrowserZoom.configure(wv)
+         wv.setBackgroundColor(android.graphics.Color.WHITE)
+         runCatching {
+             if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) WebSettingsCompat.setAlgorithmicDarkeningAllowed(s, false)
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MinesVoiceBridge.kt b/src/android/app/src/main/java/com/openminis/app/plus/MinesVoiceBridge.kt
 new file mode 100644
 index 0000000..89abb7e
@@ -869,10 +1064,10 @@ index 62b6b2d..774ea02 100644
              petColor = p.getInt("petColor", 0xFFD97757.toInt()).let { if (it == 0xFF5B8DEF.toInt() && !p.contains("avatarVersion")) 0xFFD97757.toInt() else it },
              avatarVersion = p.getLong("avatarVersion", 0L),
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
-index dafbe2e..57ed394 100644
+index dafbe2e..707e042 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
-@@ -111,6 +111,51 @@ class SelfTestProvider : ContentProvider() {
+@@ -111,6 +111,87 @@ class SelfTestProvider : ContentProvider() {
                  out.putString("result", o.toString())
              }
              "extract" -> out.putString("result", MailParse.extractCode(arg ?: "") ?: "")
@@ -920,6 +1115,42 @@ index dafbe2e..57ed394 100644
 +                arg?.let { e -> ExternalTts.save(c, ExternalTts.settings(c).copy(engine = e)) }
 +                out.putString("result", org.json.JSONObject().put("engine", ExternalTts.settings(c).engine)
 +                    .put("gec", ExternalTts.secMsGec(1760000000L)).toString())
++            }
++            "zoom" -> {
++                // [Mines-zoom-34] in-app browser zoom: settings for the tab profile ("mobile" | "desktop") and
++                // that a zoom-locking meta viewport is rewritten to user-scalable=yes / maximum-scale=5
++                val c = context!!
++                val res = java.util.concurrent.atomic.AtomicReference("timeout")
++                val latch = java.util.concurrent.CountDownLatch(1)
++                android.os.Handler(android.os.Looper.getMainLooper()).post {
++                    try {
++                        val wv = android.webkit.WebView(c)
++                        val prof = if (arg == "desktop") com.openminis.app.browser.UserAgentProfile.DESKTOP_CHROME
++                            else com.openminis.app.browser.UserAgentProfile.MOBILE_CHROME
++                        com.openminis.app.browser.BrowserUseManager.configureWebView(wv, prof)
++                        val desc = com.openminis.app.browser.BrowserZoom.describe(wv)
++                        wv.webViewClient = object : android.webkit.WebViewClient() {
++                            override fun onPageFinished(v: android.webkit.WebView, u: String?) {
++                                com.openminis.app.browser.BrowserZoom.onPage(v, u, finished = true)
++                                v.postDelayed({
++                                    v.evaluateJavascript("document.querySelector('meta[name=viewport]').getAttribute('content')") { meta ->
++                                        val ok = desc.contains("supportZoom=true builtIn=true display=false wide=true overview=true") &&
++                                            (meta ?: "").contains("user-scalable=yes") && (meta ?: "").contains("maximum-scale=5")
++                                        res.set(org.json.JSONObject().put("ok", ok).put("profile", prof.value).put("settings", desc)
++                                            .put("meta", meta ?: "").toString())
++                                        runCatching { v.destroy() }
++                                        latch.countDown()
++                                    }
++                                }, 300)
++                            }
++                        }
++                        wv.loadDataWithBaseURL("https://example.com/",
++                            "<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no\"></head><body>zoom</body></html>",
++                            "text/html", "utf-8", null)
++                    } catch (e: Throwable) { res.set("{\"ok\":false,\"error\":\"${e.javaClass.simpleName}\"}"); latch.countDown() }
++                }
++                latch.await(15, TimeUnit.SECONDS)
++                out.putString("result", res.get())
 +            }
              else -> out.putString("result", "unknown method")
          }
@@ -996,6 +1227,268 @@ index 023df74..c4d400c 100644
          )
          _live.value = g
          lastUser.value = ""; lastAnswer.value = ""
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Voiceprint.kt b/src/android/app/src/main/java/com/openminis/app/plus/Voiceprint.kt
+new file mode 100644
+index 0000000..c3a3f51
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/Voiceprint.kt
+@@ -0,0 +1,256 @@
++package com.openminis.app.plus
++
++import android.annotation.SuppressLint
++import android.content.Context
++import android.media.AudioFormat
++import android.media.AudioRecord
++import android.media.MediaRecorder
++import android.util.Log
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.withContext
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import org.json.JSONArray
++import java.io.File
++import java.util.concurrent.TimeUnit
++import kotlin.math.sqrt
++
++/**
++ * [Mines-voiceprint-34] On-device voiceprint / speaker verification (user, 2026-10-13:
++ * other people's voices were picked up and answers got muddled).
++ *
++ * Model: 3D-Speaker CAM++ (zh-cn, 16 kHz, 512-dim) run by sherpa-onnx
++ * (k2-fsa/sherpa-onnx 1.13.8, static ONNX Runtime). The model (~28 MB) is
++ * downloaded once on first enrolment; nothing leaves the phone afterwards.
++ *
++ * Enrolment: three short phrases → embeddings averaged → saved.
++ * Live: [Gate] sits in the call's mic loop. At the start of each utterance it
++ * holds ≤ 0.8 s of audio, scores it against the enrolled voice, then either
++ * flushes the held frames (pass) or sends silence (someone else). While speech
++ * continues it re-checks every ~1.5 s. One CAM++ pass on 1 s of audio is a few
++ * tens of ms, so the only added delay is the 0.8 s hold at utterance onset,
++ * which is flushed in one burst.
++ */
++object Voiceprint {
++    private const val TAG = "Voiceprint"
++    private const val PREFS = "mines_voiceprint"
++    const val RATE = 16000
++    const val MODEL_NAME = "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"
++    private val MODEL_URLS = listOf(
++        "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/$MODEL_NAME",
++        "https://ghfast.top/https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/$MODEL_NAME",
++        "https://hf-mirror.com/csukuangfj/speaker-embedding-models/resolve/main/$MODEL_NAME",
++    )
++    val PHRASES = listOf(
++        "你好 Mines，今天帮我看看有什么要处理的。",
++        "把明天上午的事情提醒我一下，谢谢。",
++        "这是我的声音，只听我说的话。",
++    )
++
++    data class Settings(val enabled: Boolean, val threshold: Float, val enrolled: Boolean)
++
++    private fun prefs(c: Context) = c.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++
++    fun settings(c: Context): Settings {
++        val p = prefs(c)
++        return Settings(p.getBoolean("enabled", false), p.getFloat("threshold", 0.50f), p.getString("embedding", null) != null)
++    }
++
++    fun setEnabled(c: Context, on: Boolean) { prefs(c).edit().putBoolean("enabled", on).apply() }
++    fun setThreshold(c: Context, t: Float) { prefs(c).edit().putFloat("threshold", t.coerceIn(0.25f, 0.80f)).apply() }
++    fun clear(c: Context) { prefs(c).edit().remove("embedding").putBoolean("enabled", false).apply() }
++
++    private fun enrolled(c: Context): FloatArray? = prefs(c).getString("embedding", null)?.let { s ->
++        runCatching { val a = JSONArray(s); FloatArray(a.length()) { a.getDouble(it).toFloat() } }.getOrNull()
++    }
++
++    fun modelFile(c: Context) = File(File(c.filesDir, "voiceprint").apply { mkdirs() }, MODEL_NAME)
++    fun hasModel(c: Context) = modelFile(c).let { it.exists() && it.length() > 1_000_000 }
++
++    private val _progress = MutableStateFlow<String?>(null)
++    val progress: StateFlow<String?> = _progress.asStateFlow()
++
++    /** Downloads the CAM++ model once (tries GitHub, then two mirrors). */
++    suspend fun ensureModel(c: Context) = withContext(Dispatchers.IO) {
++        if (hasModel(c)) return@withContext
++        val http = OkHttpClient.Builder().connectTimeout(15, TimeUnit.SECONDS).readTimeout(60, TimeUnit.SECONDS).build()
++        var last: Exception? = null
++        for (u in MODEL_URLS) {
++            try {
++                http.newCall(Request.Builder().url(u).build()).execute().use { r ->
++                    if (!r.isSuccessful) throw IllegalStateException("HTTP ${r.code}")
++                    val body = r.body ?: throw IllegalStateException("空的")
++                    val total = body.contentLength()
++                    val tmp = File(modelFile(c).path + ".part")
++                    tmp.outputStream().use { out ->
++                        val inp = body.byteStream(); val buf = ByteArray(64 * 1024); var got = 0L
++                        while (true) {
++                            val n = inp.read(buf); if (n < 0) break
++                            out.write(buf, 0, n); got += n
++                            _progress.value = if (total > 0) "下载声纹模型 ${got * 100 / total}%" else "下载声纹模型 ${got / 1_000_000} MB"
++                        }
++                    }
++                    if (tmp.length() < 1_000_000) throw IllegalStateException("下载不完整")
++                    tmp.renameTo(modelFile(c))
++                }
++                _progress.value = null
++                return@withContext
++            } catch (e: Exception) { last = e; Log.w(TAG, "model $u: ${e.message}") }
++        }
++        _progress.value = null
++        throw IllegalStateException("声纹模型下载失败：${last?.message}")
++    }
++
++    @Volatile private var extractor: com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractor? = null
++
++    private fun extractor(c: Context): com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractor {
++        extractor?.let { return it }
++        synchronized(this) {
++            extractor?.let { return it }
++            val cfg = com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractorConfig(modelFile(c).absolutePath, 2, false, "cpu")
++            return com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractor(null, cfg).also { extractor = it }
++        }
++    }
++
++    /** Embedding of 16 kHz PCM (normalized to unit length), or null when too short. */
++    fun embed(c: Context, pcm: ShortArray, from: Int = 0, len: Int = pcm.size): FloatArray? {
++        val ex = extractor(c)
++        val st = ex.createStream()
++        try {
++            val f = FloatArray(len) { pcm[from + it] / 32768f }
++            st.acceptWaveform(f, RATE)
++            st.inputFinished()
++            if (!ex.isReady(st)) return null
++            return normalize(ex.compute(st))
++        } finally { st.release() }
++    }
++
++    fun normalize(v: FloatArray): FloatArray {
++        var s = 0.0; for (x in v) s += x * x
++        val n = sqrt(s).toFloat().coerceAtLeast(1e-6f)
++        return FloatArray(v.size) { v[it] / n }
++    }
++
++    fun cosine(a: FloatArray, b: FloatArray): Float {
++        var s = 0f; for (i in 0 until minOf(a.size, b.size)) s += a[i] * b[i]
++        return s
++    }
++
++    /** Records [ms] of 16 kHz mono speech (enrolment / test). */
++    @SuppressLint("MissingPermission")
++    suspend fun record(ms: Int): ShortArray = withContext(Dispatchers.IO) {
++        val min = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
++        val rec = AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, RATE, AudioFormat.CHANNEL_IN_MONO,
++            AudioFormat.ENCODING_PCM_16BIT, maxOf(min, 3200) * 2)
++        if (rec.state != AudioRecord.STATE_INITIALIZED) { rec.release(); throw IllegalStateException("麦克风打不开（可能正在通话）") }
++        val out = ShortArray(RATE * ms / 1000)
++        try {
++            rec.startRecording()
++            var got = 0
++            while (got < out.size) { val n = rec.read(out, got, minOf(1600, out.size - got)); if (n <= 0) break; got += n }
++        } finally { runCatching { rec.stop() }; rec.release() }
++        out
++    }
++
++    /** Saves the average of the phrase embeddings. Returns the self-similarity (quality hint). */
++    fun saveEnrolment(c: Context, clips: List<ShortArray>): Float {
++        val embs = clips.mapNotNull { embed(c, it) }
++        if (embs.size < 2) throw IllegalStateException("录到的声音太短或太小，再录一次")
++        val dim = embs[0].size
++        val avg = normalize(FloatArray(dim) { i -> embs.sumOf { it[i].toDouble() }.toFloat() / embs.size })
++        val a = JSONArray(); avg.forEach { a.put(it.toDouble()) }
++        prefs(c).edit().putString("embedding", a.toString()).putBoolean("enabled", true).apply()
++        return embs.map { cosine(it, avg) }.average().toFloat()
++    }
++
++    /** Score of a test clip against the enrolled voice (0..1-ish), or null when nothing is enrolled. */
++    fun score(c: Context, pcm: ShortArray): Float? {
++        val e = enrolled(c) ?: return null
++        return embed(c, pcm)?.let { cosine(it, e) }
++    }
++
++    /** The live gate for the call's mic, or null when off / not enrolled / model missing. */
++    fun gate(c: Context): Gate? {
++        val s = settings(c)
++        if (!s.enabled || !s.enrolled || !hasModel(c)) return null
++        val e = enrolled(c) ?: return null
++        return runCatching { extractor(c); Gate(c.applicationContext, e, s.threshold) }.getOrNull()
++    }
++
++    /** Last decision, for the call screen ("只听你的声音 · 刚才不是你"). */
++    val lastRejectAt = MutableStateFlow(0L)
++
++    class Gate(private val c: Context, private val enrolledEmb: FloatArray, private val threshold: Float) {
++        private enum class St { SILENT, PENDING, PASS, BLOCK }
++        private var st = St.SILENT
++        private val pending = ArrayList<ByteArray>()
++        private val ring = ShortArray(RATE * 2)
++        private var ringPos = 0
++        private var ringFill = 0
++        private var silentMs = 0
++        private var voicedSinceCheck = 0
++        private var noise = 300.0
++        private val silence = ByteArray(3200)
++
++        private fun push(frame: ByteArray, n: Int) {
++            var i = 0
++            while (i + 1 < n) {
++                ring[ringPos] = ((frame[i].toInt() and 0xFF) or (frame[i + 1].toInt() shl 8)).toShort()
++                ringPos = (ringPos + 1) % ring.size; if (ringFill < ring.size) ringFill++
++                i += 2
++            }
++        }
++
++        private fun lastSamples(n: Int): ShortArray {
++            val k = minOf(n, ringFill)
++            return ShortArray(k) { ring[(ringPos - k + it + ring.size) % ring.size] }
++        }
++
++        private fun score(): Float = runCatching { embed(c, lastSamples(RATE))?.let { cosine(it, enrolledEmb) } ?: 1f }.getOrDefault(1f)
++
++        /** Frames to forward for this 100 ms mic frame (0..n frames; rejected speech becomes silence). */
++        fun process(frame: ByteArray, n: Int): List<ByteArray> {
++            val copy = frame.copyOf(n)
++            push(copy, n)
++            var sum = 0.0; var i = 0
++            while (i + 1 < n) { val v = ((copy[i].toInt() and 0xFF) or (copy[i + 1].toInt() shl 8)).toShort().toDouble(); sum += v * v; i += 2 }
++            val rms = sqrt(sum / (n / 2).coerceAtLeast(1))
++            val voiced = rms > maxOf(noise * 2.5, 350.0)
++            if (!voiced) noise = noise * 0.95 + rms * 0.05
++            if (voiced) { silentMs = 0; voicedSinceCheck += 100 } else silentMs += 100
++            when (st) {
++                St.SILENT -> {
++                    if (!voiced) return listOf(copy)
++                    st = St.PENDING; pending.clear(); pending.add(copy); voicedSinceCheck = 100
++                    return emptyList()
++                }
++                St.PENDING -> {
++                    pending.add(copy)
++                    if (voicedSinceCheck < 800 && pending.size < 12) return emptyList()
++                    val s = score(); voicedSinceCheck = 0
++                    return if (s >= threshold) { st = St.PASS; val out = ArrayList(pending); pending.clear(); out }
++                    else { st = St.BLOCK; lastRejectAt.value = System.currentTimeMillis(); val k = pending.size; pending.clear(); List(k) { silence.copyOf(n) } }
++                }
++                St.PASS -> {
++                    if (silentMs >= 1200) st = St.SILENT
++                    else if (voicedSinceCheck >= 1500) {
++                        voicedSinceCheck = 0
++                        if (score() < threshold - 0.10f) { st = St.BLOCK; lastRejectAt.value = System.currentTimeMillis(); return listOf(silence.copyOf(n)) }
++                    }
++                    return listOf(copy)
++                }
++                St.BLOCK -> {
++                    if (silentMs >= 800) { st = St.SILENT; return listOf(copy) }
++                    if (voicedSinceCheck >= 1000) {
++                        voicedSinceCheck = 0
++                        if (score() >= threshold + 0.05f) { st = St.PASS; return listOf(copy) }
++                    }
++                    return listOf(silence.copyOf(n))
++                }
++            }
++        }
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/tools/AgentTools.kt b/src/android/app/src/main/java/com/openminis/app/tools/AgentTools.kt
 index e36f2d1..bd04e31 100644
 --- a/src/android/app/src/main/java/com/openminis/app/tools/AgentTools.kt
@@ -1040,6 +1533,118 @@ index c0e42e7..e7fb64c 100644
          "x" to listOf("M18 6 6 18", "m6 6 12 12"),
      )
  
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserSheet.kt b/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserSheet.kt
+index 56f2230..c6edbb7 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserSheet.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserSheet.kt
+@@ -40,6 +40,7 @@ import androidx.compose.material.icons.filled.Edit
+ import androidx.compose.material.icons.filled.History
+ import androidx.compose.material.icons.filled.Language
+ import androidx.compose.material.icons.filled.PhoneAndroid
++import androidx.compose.material.icons.filled.FormatSize
+ import androidx.compose.material.icons.filled.Refresh
+ import androidx.compose.material3.CircularProgressIndicator
+ import androidx.compose.material3.ExperimentalMaterial3Api
+@@ -116,6 +117,7 @@ fun BrowserSheet(
+     var showSettings by remember { mutableStateOf(false) }
+     // [T-android-browser-download-ux] Downloads panel + badge state.
+     var showDownloads by remember { mutableStateOf(false) }
++    var showTextSize by remember { mutableStateOf(false) }
+     val downloadEntries by tabPool.downloads.collectAsState()
+ 
+     val accent = MaterialTheme.colorScheme.primary
+@@ -408,6 +410,13 @@ fun BrowserSheet(
+                     enabled = canGoForward && !isAgentBusy,
+                     onClick = { selectedTab?.manager?.goForward() },
+                 )
++                // [Mines-zoom-34] 文字大小 (per site, 100–200 %); pinch zoom always works too
++                ToolbarIcon(
++                    icon = Icons.Default.FormatSize,
++                    contentDesc = "文字大小",
++                    enabled = selectedTab != null,
++                    onClick = { showTextSize = true },
++                )
+                 // [T-android-browser-download-ux] Downloads entry: shows while
+                 // the session has ANY download records, disappears when the
+                 // user clears the last one; the badge counts in-flight +
+@@ -451,6 +460,11 @@ fun BrowserSheet(
+         }
+     }
+ 
++    if (showTextSize) {
++        selectedTab?.manager?.let { mgr -> BrowserTextSizeDialog(mgr.webView, onDismiss = { showTextSize = false }) }
++            ?: run { showTextSize = false }
++    }
++
+     if (showDownloads) {
+         BrowserDownloadsSheet(
+             tabPool = tabPool,
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserTextSizeDialog.kt b/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserTextSizeDialog.kt
+new file mode 100644
+index 0000000..315ebf0
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserTextSizeDialog.kt
+@@ -0,0 +1,60 @@
++package com.openminis.app.ui.browser
++
++import android.webkit.WebView
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.Slider
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.semantics.contentDescription
++import androidx.compose.ui.semantics.semantics
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import com.openminis.app.browser.BrowserZoom
++
++/** [Mines-zoom-34] 文字大小 for the current site (WebSettings.textZoom), remembered per site. */
++@Composable
++fun BrowserTextSizeDialog(webView: WebView, onDismiss: () -> Unit) {
++    val ctx = webView.context
++    val url = webView.url
++    val host = BrowserZoom.hostOf(url).ifEmpty { "这个网页" }
++    var pct by remember { mutableIntStateOf(webView.settings.textZoom.coerceIn(BrowserZoom.MIN, BrowserZoom.MAX)) }
++    fun apply(v: Int) {
++        pct = v.coerceIn(BrowserZoom.MIN, BrowserZoom.MAX)
++        webView.settings.textZoom = pct
++        BrowserZoom.setTextZoom(ctx, url, pct)
++    }
++    AlertDialog(
++        onDismissRequest = onDismiss,
++        title = { Text("文字大小", fontSize = 22.sp, fontWeight = FontWeight.Bold) },
++        text = {
++            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
++                Text("$host · $pct%", fontSize = 17.sp)
++                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                    TextButton(onClick = { apply(pct - 10) }, modifier = Modifier.heightIn(min = 48.dp)
++                        .semantics { contentDescription = "缩小文字" }) { Text("A−", fontSize = 18.sp) }
++                    Slider(value = pct.toFloat(), onValueChange = { apply((it / 10).toInt() * 10) },
++                        valueRange = BrowserZoom.MIN.toFloat()..BrowserZoom.MAX.toFloat(), steps = 9,
++                        modifier = Modifier.weight(1f))
++                    TextButton(onClick = { apply(pct + 10) }, modifier = Modifier.heightIn(min = 48.dp)
++                        .semantics { contentDescription = "放大文字" }) { Text("A+", fontSize = 22.sp) }
++                }
++                Text("页面也可以用两指捏合放大，或双击放大。", fontSize = 15.sp)
++            }
++        },
++        confirmButton = { TextButton(onClick = onDismiss) { Text("好", fontSize = 17.sp) } },
++        dismissButton = { TextButton(onClick = { apply(BrowserZoom.defaultTextZoom(ctx)) }) { Text("恢复默认", fontSize = 17.sp) } },
++    )
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatAssistantMessageUI.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatAssistantMessageUI.kt
 index 0f96235..e3c4c6f 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatAssistantMessageUI.kt
@@ -2351,10 +2956,10 @@ index 0000000..60b63a6
 +}
 +
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
-index 3345347..61a68ab 100644
+index 3345347..f84253d 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
-@@ -3,6 +3,14 @@ package com.openminis.app.ui.plus
+@@ -3,11 +3,21 @@ package com.openminis.app.ui.plus
  import com.openminis.app.ui.brand.MinesIcon
  
  import android.Manifest
@@ -2369,7 +2974,14 @@ index 3345347..61a68ab 100644
  import android.content.pm.PackageManager
  import android.view.WindowManager
  import androidx.activity.compose.rememberLauncherForActivityResult
-@@ -129,52 +137,57 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+ import androidx.activity.result.contract.ActivityResultContracts
+ import androidx.compose.animation.core.animateFloatAsState
++import androidx.compose.animation.core.animateFloat
++import androidx.compose.foundation.layout.systemBars
+ import androidx.compose.foundation.Canvas
+ import androidx.compose.foundation.background
+ import androidx.compose.foundation.verticalScroll
+@@ -129,52 +139,57 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
      DisposableEffect(plain) { onDispose { plain.stop() } }
      fun enterPlain() { hungUp = true; com.openminis.app.plus.VoiceSession.stop(context); plainMode = true; if (hasMic) plain.start() else askMic.launch(Manifest.permission.RECORD_AUDIO) }
      if (showSettings) VoiceSettingsSheet(onDismiss = { showSettings = false }, onChanged = { com.openminis.app.plus.VoiceSession.restart(context) })
@@ -2466,7 +3078,7 @@ index 3345347..61a68ab 100644
                  return@Column
              }
              val phase by live.phase.collectAsState()
-@@ -182,86 +195,182 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+@@ -182,86 +197,182 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
              val muted by live.muted.collectAsState()
              val error by live.error.collectAsState()
              val lines by live.lines.collectAsState()
@@ -2668,7 +3280,7 @@ index 3345347..61a68ab 100644
 +    Canvas(Modifier.width(96.dp).height(26.dp)) {
 +        val n = 13; val gap = size.width / n
 +        for (i in 0 until n) {
-+            val v = (0.25f + 0.75f * amp * (0.5f + 0.5f * kotlin.math.sin(ph + i * 0.9f))).coerceIn(0.15f, 1f)
++            val v = (0.25f + 0.75f * amp * (0.5f + 0.5f * kotlin.math.sin((ph + i * 0.9f).toDouble()).toFloat())).coerceIn(0.15f, 1f)
 +            val hgt = size.height * v
 +            drawRoundRect(Color(0xFFF3E9EF), androidx.compose.ui.geometry.Offset(i * gap + gap * 0.3f, (size.height - hgt) / 2f),
 +                androidx.compose.ui.geometry.Size(gap * 0.4f, hgt), androidx.compose.ui.geometry.CornerRadius(gap * 0.2f))
@@ -2714,7 +3326,7 @@ index 3345347..61a68ab 100644
      }
  }
  
-@@ -278,7 +387,7 @@ private fun VoiceSettingsSheet(onDismiss: () -> Unit, onChanged: () -> Unit) {
+@@ -278,7 +389,7 @@ private fun VoiceSettingsSheet(onDismiss: () -> Unit, onChanged: () -> Unit) {
      androidx.compose.material3.ModalBottomSheet(onDismissRequest = { onChanged(); onDismiss() }) {
          Column(Modifier.fillMaxWidth().verticalScroll(androidx.compose.foundation.rememberScrollState()).padding(horizontal = 20.dp).padding(bottom = 28.dp),
              verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -2723,17 +3335,19 @@ index 3345347..61a68ab 100644
              val ctxV = androidx.compose.ui.platform.LocalContext.current
              // [Mines-voice-33] connection details moved here from the call screen
              com.openminis.app.plus.VoiceSession.live.collectAsState().value?.let { lv ->
-@@ -306,6 +415,9 @@ private fun VoiceSettingsSheet(onDismiss: () -> Unit, onChanged: () -> Unit) {
+@@ -306,6 +417,11 @@ private fun VoiceSettingsSheet(onDismiss: () -> Unit, onChanged: () -> Unit) {
                      if (voice == id) Text("  ✓", fontSize = 16.sp, color = MaterialTheme.colorScheme.primary)
                  }
              }
 +            // [Mines-tts-34] external voice: OpenRouter / free Edge, speed + pitch + 试听
 +            TtsSection(onChanged = {})
++            // [Mines-voiceprint-34] only answer the enrolled voice
++            VoiceprintSection()
 +
              // [Mines-voice-33] Gemini Live has no pitch / speed control: only for the external (cloned) voice
              if (com.openminis.app.plus.VoiceClone.settings(ctxV).enabled) {
              Text("语速 ${"%.1f".format(speed)}×（自定义声音）", fontSize = 15.sp)
-@@ -356,14 +468,14 @@ private fun Orb(phase: GeminiLive.Phase, level: Float) {
+@@ -356,14 +472,14 @@ private fun Orb(phase: GeminiLive.Phase, level: Float) {
  }
  
  @Composable
@@ -2752,6 +3366,181 @@ index 3345347..61a68ab 100644
      }
  }
  
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceprintSection.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceprintSection.kt
+new file mode 100644
+index 0000000..361f084
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceprintSection.kt
+@@ -0,0 +1,169 @@
++package com.openminis.app.ui.plus
++
++import android.Manifest
++import android.content.pm.PackageManager
++import androidx.activity.compose.rememberLauncherForActivityResult
++import androidx.activity.result.contract.ActivityResultContracts
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.foundation.verticalScroll
++import androidx.compose.material3.Slider
++import androidx.compose.material3.Switch
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateListOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.semantics.contentDescription
++import androidx.compose.ui.semantics.semantics
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import androidx.compose.ui.window.Dialog
++import androidx.compose.ui.window.DialogProperties
++import androidx.core.content.ContextCompat
++import com.openminis.app.plus.Voiceprint
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++
++/**
++ * [Mines-voiceprint-34] 语音设置 → 「只听我的声音」: on/off, 录入声纹 (three phrases,
++ * full-screen page), 试一下 (score), sensitivity, 删除. Everything runs on the phone.
++ */
++@Composable
++fun VoiceprintSection() {
++    val c = LocalContext.current
++    val m = mines()
++    var s by remember { mutableStateOf(Voiceprint.settings(c)) }
++    var enrol by remember { mutableStateOf(false) }
++    var msg by remember { mutableStateOf<String?>(null) }
++    var busy by remember { mutableStateOf(false) }
++    val scope = rememberCoroutineScope()
++    val progress by Voiceprint.progress.collectAsState()
++    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
++        Text("只听我的声音（声纹）", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = m.ink2)
++        Text("录下你的声音后，通话里别人的说话不会传给 AI。全部在手机上识别，不上传。",
++            fontSize = 15.sp, lineHeight = 20.sp, color = m.ink3)
++        Row(Modifier.fillMaxWidth().heightIn(min = 52.dp).clip(RoundedCornerShape(16.dp)).background(m.surface2)
++            .padding(horizontal = 14.dp), verticalAlignment = Alignment.CenterVertically) {
++            Text(if (s.enrolled) "已录入你的声音" else "还没录入", fontSize = 16.sp, color = m.ink, modifier = Modifier.weight(1f))
++            Switch(checked = s.enabled && s.enrolled, enabled = s.enrolled, onCheckedChange = {
++                Voiceprint.setEnabled(c, it); s = Voiceprint.settings(c)
++            }, modifier = Modifier.semantics { contentDescription = "只听我的声音" })
++        }
++        PillButton(if (s.enrolled) "重新录入声纹" else "录入声纹", Modifier.fillMaxWidth(), primary = !s.enrolled) { enrol = true }
++        if (s.enrolled) {
++            Text("灵敏度 ${"%.2f".format(s.threshold)}（越高越严格）", fontSize = 16.sp, color = m.ink)
++            Slider(s.threshold, { Voiceprint.setThreshold(c, (it * 100).toInt() / 100f); s = Voiceprint.settings(c) }, valueRange = 0.30f..0.75f)
++            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                PillButton(if (busy) "正在听…" else "试一下", Modifier.weight(1f), primary = false, enabled = !busy) {
++                    busy = true; msg = "说一句话（3 秒）…"
++                    scope.launch {
++                        msg = runCatching {
++                            val pcm = Voiceprint.record(3000)
++                            val sc = withContext(Dispatchers.Default) { Voiceprint.score(c, pcm) }
++                            when {
++                                sc == null -> "声音太短，再说长一点"
++                                sc >= s.threshold -> "是你 ✓（相似度 ${"%.2f".format(sc)}）"
++                                else -> "不像你（相似度 ${"%.2f".format(sc)}），可以调低灵敏度或重新录入"
++                            }
++                        }.getOrElse { "没测成：${it.message?.take(60)}" }
++                        busy = false
++                    }
++                }
++                PillButton("删除声纹", Modifier.weight(1f), primary = false) {
++                    Voiceprint.clear(c); s = Voiceprint.settings(c); msg = "已删除"
++                }
++            }
++        }
++        (progress ?: msg)?.let { Text(it, fontSize = 15.sp, color = m.ink2) }
++    }
++    if (enrol) VoiceprintEnrolDialog(onDone = { enrol = false; s = Voiceprint.settings(c) })
++}
++
++@Composable
++fun VoiceprintEnrolDialog(onDone: () -> Unit) {
++    val c = LocalContext.current
++    val m = mines()
++    val scope = rememberCoroutineScope()
++    val clips = remember { mutableStateListOf<ShortArray>() }
++    var step by remember { mutableStateOf(0) }          // phrase index 0..2, 3 = saving/done
++    var recording by remember { mutableStateOf(false) }
++    var msg by remember { mutableStateOf<String?>(null) }
++    var done by remember { mutableStateOf(false) }
++    val progress by Voiceprint.progress.collectAsState()
++    var hasMic by remember {
++        mutableStateOf(ContextCompat.checkSelfPermission(c, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
++    }
++    val ask = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { hasMic = it }
++
++    fun recordOne() {
++        if (!hasMic) { ask.launch(Manifest.permission.RECORD_AUDIO); return }
++        recording = true; msg = null
++        scope.launch {
++            runCatching {
++                Voiceprint.ensureModel(c)
++                val pcm = Voiceprint.record(4000)
++                var sum = 0.0; for (v in pcm) sum += v.toDouble() * v
++                if (Math.sqrt(sum / pcm.size.coerceAtLeast(1)) < 250) throw IllegalStateException("没听清，靠近一点再读一遍")
++                clips.add(pcm)
++                if (clips.size >= Voiceprint.PHRASES.size) {
++                    step = Voiceprint.PHRASES.size
++                    val q = withContext(Dispatchers.Default) { Voiceprint.saveEnrolment(c, clips.toList()) }
++                    msg = if (q > 0.6f) "录好了，以后通话只听你的声音。" else "录好了（声音有点不稳，安静的地方重录效果更好）。"
++                    done = true
++                } else step = clips.size
++            }.onFailure { msg = it.message ?: "没录成，再试一次" }
++            recording = false
++        }
++    }
++
++    Dialog(onDismissRequest = { if (!recording) onDone() }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
++        Box(Modifier.fillMaxSize().background(m.bg)) {
++            Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
++                verticalArrangement = Arrangement.spacedBy(16.dp)) {
++                Spacer(Modifier.height(24.dp))
++                Text("录入你的声音", fontSize = 30.sp, fontWeight = FontWeight.Bold, color = m.ink)
++                Text("在安静的地方，按「开始」后用平常的声音读出下面这句。一共三句。", fontSize = 17.sp, lineHeight = 24.sp, color = m.ink2)
++                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                    Voiceprint.PHRASES.indices.forEach { i ->
++                        Box(Modifier.size(12.dp).clip(CircleShape).background(if (i < clips.size) m.primary else m.hairline))
++                    }
++                }
++                val phrase = Voiceprint.PHRASES.getOrNull(step)
++                Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(22.dp)).background(m.glassStrong).padding(20.dp),
++                    verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                    Text(if (phrase != null) "第 ${step + 1} 句" else "完成", fontSize = 15.sp, color = m.ink3)
++                    Text(phrase ?: "三句都录好了", fontSize = 24.sp, lineHeight = 32.sp, fontWeight = FontWeight.SemiBold, color = m.ink)
++                }
++                (progress ?: msg)?.let { Text(it, fontSize = 16.sp, color = m.ink2) }
++                if (!done) PillButton(
++                    when { recording && progress != null -> "准备中…"; recording -> "正在听…读出上面这句"; !hasMic -> "允许使用麦克风"; else -> "开始" },
++                    Modifier.fillMaxWidth(), primary = true, enabled = !recording) { recordOne() }
++                PillButton(if (done) "完成" else "取消", Modifier.fillMaxWidth(), primary = done, enabled = !recording) { onDone() }
++            }
++        }
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
 index 3bbd62f..02718a1 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
@@ -2776,6 +3565,19 @@ index 3bbd62f..02718a1 100644
      Scaffold(
          containerColor = if (minesHomeWallpaper) Color.Transparent else MaterialTheme.colorScheme.background,
          topBar = {
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt
+index 2337985..58bceaa 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt
+@@ -182,7 +182,7 @@ fun SettingsScreen(
+                     icon = Icons.Outlined.Mic,
+                     iconColor = Color(0xFF5856D6),
+                     title = "实时语音",
+-                    subtitle = "像打电话一样和 Mines 说话，可随时打断",
++                    subtitle = "通话、说话的声音、只听我的声音（声纹）",
+                     onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.VOICE) },
+                 )
+                 SettingsItem(
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/theme/Theme.kt b/src/android/app/src/main/java/com/openminis/app/ui/theme/Theme.kt
 index b81182e..12d7837 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/theme/Theme.kt
