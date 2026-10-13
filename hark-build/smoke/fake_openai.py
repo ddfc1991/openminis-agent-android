@@ -3,6 +3,29 @@
 import json, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+STATS = {"loop_posts": 0, "saw_warning": False, "empty_tool_content": 0, "tool_msgs": 0, "tool": None}
+
+def last_user_text(msgs):
+    for m in reversed(msgs):
+        if m.get("role") == "user":
+            c = m.get("content")
+            if isinstance(c, list):
+                c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+            if isinstance(c, str) and c.strip() and "Image returned" not in c:
+                return c
+    return ""
+
+def pick_tool(tools):
+    names = [t.get("function", {}).get("name") for t in tools or []]
+    for want in ("memory_get", "file_read", "skills_list", "list_skills"):
+        if want in names:
+            t = tools[names.index(want)]; break
+    else:
+        t = (tools or [{}])[0]
+    f = t.get("function", {})
+    req = (f.get("parameters") or {}).get("required") or []
+    return f.get("name", "memory_get"), {k: "smoke-loop" for k in req}
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): print("fake-openai", self.command, self.path, flush=True)
     def _json(self, obj, code=200):
@@ -10,6 +33,8 @@ class H(BaseHTTPRequestHandler):
         self.send_response(code); self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
     def do_GET(self):
+        if self.path.startswith("/stats"):
+            return self._json(STATS)
         if self.path.rstrip("/").endswith("/models"):
             return self._json({"object": "list", "data": [{"id": "smoke-model", "object": "model", "owned_by": "smoke"}]})
         self._json({"ok": True})
@@ -17,6 +42,34 @@ class H(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(n) or b"{}")
         text = "你好，我是测试模型。"
+        msgs = body.get("messages") or []
+        if "LOOPTEST" in last_user_text(msgs) and body.get("stream"):
+            # [build-30 smoke] A model that repeats the same text + tool call forever.
+            STATS["loop_posts"] += 1
+            for m in msgs:
+                if m.get("role") == "tool":
+                    STATS["tool_msgs"] += 1
+                    c = m.get("content")
+                    if not (c if isinstance(c, str) else json.dumps(c)).strip():
+                        STATS["empty_tool_content"] += 1
+                    if "You are repeating yourself" in (c if isinstance(c, str) else json.dumps(c)):
+                        STATS["saw_warning"] = True
+            name, args = pick_tool(body.get("tools"))
+            STATS["tool"] = name
+            self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+            n = STATS["loop_posts"]
+            chunks = [{"role": "assistant", "content": "继续逆向 APK，看看实现："},
+                      {"tool_calls": [{"index": 0, "id": f"call_loop_{n}", "type": "function",
+                                       "function": {"name": name, "arguments": json.dumps(args)}}]}]
+            for dl in chunks:
+                d = {"id": "x", "object": "chat.completion.chunk", "created": int(time.time()), "model": "smoke-model",
+                     "choices": [{"index": 0, "delta": dl, "finish_reason": None}]}
+                self.wfile.write(b"data: " + json.dumps(d).encode() + b"\n\n"); self.wfile.flush()
+            d = {"id": "x", "object": "chat.completion.chunk", "created": int(time.time()), "model": "smoke-model",
+                 "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                 "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10}}
+            self.wfile.write(b"data: " + json.dumps(d).encode() + b"\n\ndata: [DONE]\n\n"); self.wfile.flush()
+            return
         if body.get("stream"):
             self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
             for ch in [text[:3], text[3:]]:

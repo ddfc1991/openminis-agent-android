@@ -8,7 +8,7 @@ shipped): launch -> home Today card -> 工作位置 -> add a reachable SSH serve
 工作位置. After every step it checks the app process is still alive and at the
 end prints every FATAL EXCEPTION from logcat. Exit 1 when the app crashed.
 """
-import os, re, subprocess, sys, time, xml.etree.ElementTree as ET
+import json, os, re, subprocess, sys, time, xml.etree.ElementTree as ET
 
 PKG = os.environ.get("PKG", "com.openminis.mines.plus")
 OUT = os.environ.get("OUT", "smoke-out")
@@ -324,9 +324,40 @@ def setup_provider():
             time.sleep(8)
         snap("chat-sent")
         check("chat with fake model")
+        loop_test()
         sh("input keyevent KEYCODE_BACK"); time.sleep(3)
     root = snap("home-with-chat")
     check("home list (TodayCard) shown")
+
+
+def loop_test():
+    """[build-30] Agent loop guard: the fake model repeats one text + tool call; Mines must warn, then pause."""
+    root = dump()
+    e = edits(root)
+    if not e:
+        print("  loop test: no input field", flush=True); selftest_fail.append("loop test: no input"); return
+    sh(f"input tap {e[-1][0]} {e[-1][1]}"); time.sleep(0.6); type_text("LOOPTEST")
+    sh("input keyevent KEYCODE_BACK"); time.sleep(0.6)
+    tap_any(["Send", "发送"], wait=3) or sh("input keyevent KEYCODE_ENTER")
+    paused = False
+    for _ in range(30):
+        time.sleep(3)
+        root = dump()
+        if find(root, "检测到重复循环"):
+            paused = True; break
+    snap("loop-guard")
+    try:
+        st = json.loads(subprocess.run("curl -s http://127.0.0.1:8088/stats", shell=True, capture_output=True, text=True, timeout=10).stdout or "{}")
+    except Exception as ex:
+        st = {"error": str(ex)}
+    print("  loop test: paused=%s stats=%s" % (paused, st), flush=True)
+    if not paused: selftest_fail.append("loop guard did not pause")
+    if not st.get("saw_warning"): selftest_fail.append("loop guard warning not sent to model")
+    if (st.get("loop_posts") or 99) > 6: selftest_fail.append("loop ran %s model calls" % st.get("loop_posts"))
+    if st.get("empty_tool_content"): selftest_fail.append("empty tool content sent")
+    if find(root, "停止"):
+        tap_text("停止", exact=True, wait=2)
+    check("loop guard pause")
 
 
 def toggle_near(label):
