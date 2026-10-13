@@ -40,9 +40,19 @@ def dump():
         x = sh("cat /sdcard/u.xml")
         if x.strip().startswith("<?xml"):
             try:
-                return ET.fromstring(x[x.index("<hierarchy"):])
+                r = ET.fromstring(x[x.index("<hierarchy"):])
             except Exception:
-                pass
+                continue
+            # [build-34] an emulator system app ANR (googlesdksetup isn't responding) covered every screen in smoke run 20
+            if "isn't responding" in x and "Mines isn't responding" not in x:
+                for n in r.iter("node"):
+                    if n.get("text") in ("Close app", "关闭应用"):
+                        b = [int(v) for v in re.findall(r"\d+", n.get("bounds", ""))]
+                        if len(b) == 4:
+                            sh(f"input tap {(b[0] + b[2]) // 2} {(b[1] + b[3]) // 2}"); time.sleep(1.5)
+                        break
+                continue
+            return r
         time.sleep(1)
     return None
 
