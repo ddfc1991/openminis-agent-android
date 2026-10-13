@@ -791,8 +791,9 @@ def build34():
         for prof in ("mobile", "desktop"):
             j = selftest_json("webrender", f"{url}|{prof}", timeout=130)
             print(f"  webrender {url} {prof}: {json.dumps(j, ensure_ascii=False)[:900]}", flush=True)
-            if j.get("ok"): continue
-            selftest_fail.append(f"b34 webrender {url} {prof} {json.dumps(j, ensure_ascii=False)[:400]}")
+            errpage = any(k in json.dumps(j, ensure_ascii=False) for k in ("Webpage not available", "net::ERR_", "ERR_NAME_NOT_RESOLVED", "ERR_INTERNET_DISCONNECTED"))
+            if j.get("ok") and not errpage: continue
+            selftest_fail.append(f"b34 webrender{' (error page: emulator had no network?)' if errpage else ''} {url} {prof} {json.dumps(j, ensure_ascii=False)[:400]}")
     # settings + its design pages
     go_home()
     if tap_text("设置", exact=True, wait=5):
