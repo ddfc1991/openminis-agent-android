@@ -1,0 +1,2088 @@
+diff --git a/src/android/app/src/main/AndroidManifest.xml b/src/android/app/src/main/AndroidManifest.xml
+index 86531b5..65ffdcd 100644
+--- a/src/android/app/src/main/AndroidManifest.xml
++++ b/src/android/app/src/main/AndroidManifest.xml
+@@ -508,6 +508,18 @@
+             android:name=".plus.WakeWordService"
+             android:exported="false"
+             android:foregroundServiceType="microphone" />
++        <!-- [Mines-voice-31] live voice call kept alive outside the voice page -->
++        <service
++            android:name=".plus.VoiceCallService"
++            android:exported="false"
++            android:foregroundServiceType="microphone" />
++        <activity
++            android:name=".plus.VoiceTrampolineActivity"
++            android:exported="false"
++            android:excludeFromRecents="true"
++            android:noHistory="true"
++            android:taskAffinity=""
++            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+         <service
+             android:name=".plus.PluginWidgetService"
+             android:exported="false"
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/AccountLabel.kt b/src/android/app/src/main/java/com/openminis/app/plus/AccountLabel.kt
+new file mode 100644
+index 0000000..0859d81
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/AccountLabel.kt
+@@ -0,0 +1,68 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-accounts-31] What an account row on 账号连接 says instead of "账号 1":
++ * how it was connected + a masked identity, e.g.
++ *   "Google 登录 · den•••@gmail.com", "GitHub · ddfc1991", "API Key · sk-•••3f2a".
++ * The full identity is only shown on the account's detail page.
++ */
++object AccountLabel {
++    fun method(kind: ConnectionKind, entry: ConnectionEntry?): String {
++        val via = entry?.via.orEmpty()
++        return when {
++            kind.method == ConnMethod.GOOGLE || PlusVault.baseId(kind.id) in setOf("google", "gcal", "gdrive", "youtube") && via != "key" -> "Google 登录"
++            kind.method == ConnMethod.GITHUB && via != "key" -> "GitHub"
++            kind.method == ConnMethod.MICROSOFT -> "Microsoft 登录"
++            kind.method == ConnMethod.CALENDAR -> "手机日历"
++            kind.method == ConnMethod.A11Y -> "无障碍"
++            via == "key" || via == "token" || kind.method == ConnMethod.KEY -> kind.keyLabel
++            via == "oauth" -> "授权登录"
++            via == "app" -> "应用密码"
++            via == "web" || kind.method == ConnMethod.WEB -> "网页登录"
++            else -> "已连接"
++        }
++    }
++
++    /** "den•••@gmail.com" — keep the first 3 characters of the name and the domain. */
++    fun maskEmail(e: String): String {
++        val at = e.indexOf('@')
++        if (at <= 0) return e
++        val name = e.substring(0, at)
++        return name.take(minOf(3, maxOf(1, name.length - 1))) + "•••" + e.substring(at)
++    }
++
++    /** "sk-•••3f2a" — keep a short prefix (up to the first - or _) and the last 4. */
++    fun maskSecret(s: String): String {
++        val t = s.trim()
++        if (t.length <= 8) return "•••" + t.takeLast(2)
++        val cut = t.take(12).indexOfFirst { it == '-' || it == '_' }
++        val prefix = if (cut in 1..10) t.substring(0, cut + 1) else t.take(2)
++        return prefix + "•••" + t.takeLast(4)
++    }
++
++    /** The phone number style "138••••8658". */
++    private fun maskPhone(p: String): String = if (p.length >= 7) p.take(3) + "••••" + p.takeLast(4) else p
++
++    fun maskIdentity(raw: String): String {
++        val a = raw.trim()
++        return when {
++            a.contains('@') -> maskEmail(a)
++            a.matches(Regex("""\+?\d{7,15}""")) -> maskPhone(a)
++            else -> a // a user name (GitHub login, site handle) is not secret
++        }
++    }
++
++    /** Full identity, or null when nothing is known. */
++    fun identity(id: String, entry: ConnectionEntry?): String? =
++        entry?.account?.trim()?.takeIf { it.isNotBlank() && it != "网页登录" }
++            ?: PlusVault.extra(id, "identity")?.takeIf { it.isNotBlank() }
++
++    /** Row title: "<method> · <masked identity or masked key>". */
++    fun row(id: String, kind: ConnectionKind, entry: ConnectionEntry?): String {
++        val m = method(kind, entry)
++        val ident = identity(id, entry)?.let { maskIdentity(it) }
++            ?: PlusVault.secret(id)?.takeIf { entry?.via == "key" || entry?.via == "token" || kind.method == ConnMethod.KEY }?.let { maskSecret(it) }
++            ?: "未读到账号名"
++        return "$m · $ident"
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt b/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt
+index afc2dcd..97eb701 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt
+@@ -252,12 +252,14 @@ class DeskPetService : Service() {
+             override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+                 if (tucked) { untuck(); return true }
+                 view.react(PetView.Mode.JUMP, 650)
++                // [Mines-voice-31] One tap = start / stop the live voice call.
++                if (st.petTapVoice) { closePanel(); toggleVoice(); return true }
+                 if (st.petPanel) togglePanel() else say(PetView.LINES.random())
+                 return true
+             }
+             override fun onDoubleTap(e: MotionEvent): Boolean {
+                 view.react(PetView.Mode.HAPPY, 1500)
+-                openApp(null)
++                if (st.petTapVoice && st.petPanel) togglePanel() else openApp(null)
+                 return true
+             }
+             override fun onLongPress(e: MotionEvent) { if (!dragging) showSwitcher() }
+@@ -452,6 +454,17 @@ class DeskPetService : Service() {
+         }
+         scope.launch { MinesJobs.jobs.collect { petView?.thinking = it.any { j -> j.running && !j.silent } } }
+         scope.launch { PetBus.talking.collect { petView?.talking = it } }
++        // [Mines-voice-31] Transcript bubble during a live call; "通话结束" when it ends.
++        scope.launch {
++            var lastShown = 0L
++            VoiceSession.transcriptTick.collect {
++                if (!VoiceSession.active) { if (lastShown > 0) { lastShown = 0; hideBubble() }; return@collect }
++                val now = System.currentTimeMillis()
++                if (now - lastShown < 350) delay(350 - (now - lastShown))
++                lastShown = System.currentTimeMillis()
++                showTranscript()
++            }
++        }
+         // [Mines-pet-26] Typing pose while the agent works; celebrate when a task ends.
+         scope.launch { com.openminis.app.service.SessionActivityTracker.activeSessions.collect { petView?.typing = it.isNotEmpty() } }
+         scope.launch {
+@@ -471,6 +484,28 @@ class DeskPetService : Service() {
+         }
+     }
+ 
++    /** [Mines-voice-31] Through an invisible activity: Android only allows a mic service from the foreground. */
++    private fun toggleVoice() {
++        say(if (VoiceSession.active) "好，挂断了" else "我在听…", 1500)
++        runCatching {
++            startActivity(Intent(this, VoiceTrampolineActivity::class.java)
++                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION))
++        }.onFailure { say("开不了语音：${it.message}") }
++    }
++
++    /** [Mines-voice-31] Live transcript next to the pet: your last line + the answer, newest part only. */
++    private fun showTranscript() {
++        if (!VoiceSession.active) return
++        fun tail(t: String, n: Int) = if (t.length <= n) t else "…" + t.takeLast(n)
++        val u = VoiceSession.lastUser.value; val a = VoiceSession.lastAnswer.value
++        if (u.isBlank() && a.isBlank()) return
++        val text = buildString {
++            if (u.isNotBlank()) append("你：").append(tail(u, 36))
++            if (a.isNotBlank()) { if (isNotEmpty()) append('\n'); append("答：").append(tail(a, 60)) }
++        }
++        say(text, 9000)
++    }
++
+     private fun say(text: String, ms: Long = 3500) {
+         val manager = wm ?: return
+         val lp0 = petLp ?: return
+@@ -478,6 +513,7 @@ class DeskPetService : Service() {
+             textSize = 14f; setTextColor(Color.parseColor("#2B2522"))
+             setPadding(dp(12), dp(8), dp(12), dp(8))
+             maxWidth = (screenW * 0.6f).toInt()
++            maxLines = 5; ellipsize = android.text.TextUtils.TruncateAt.START
+             background = GradientDrawable().apply { setColor(Color.WHITE); cornerRadius = 16 * density; setStroke(dp(1), Color.parseColor("#22000000")) }
+             elevation = 6 * density
+         }.also { v ->
+@@ -503,7 +539,7 @@ class DeskPetService : Service() {
+         tv.measure(View.MeasureSpec.UNSPECIFIED, View.MeasureSpec.UNSPECIFIED)
+         val bw = tv.measuredWidth
+         lp.x = if (p.x + p.width / 2 > screenW / 2) (p.x - bw + p.width / 3).coerceAtLeast(dp(4)) else (p.x + p.width * 2 / 3).coerceAtMost(screenW - bw - dp(4))
+-        lp.y = (p.y - dp(30)).coerceAtLeast(dp(24))
++        lp.y = (p.y - maxOf(dp(30), tv.measuredHeight - dp(10))).coerceAtLeast(dp(24))
+         Overlays.update(wm, tv, lp)
+     }
+ 
+@@ -570,7 +606,7 @@ class DeskPetService : Service() {
+             setOnClickListener { onClick() }
+         }
+         val clp = { LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(6) } }
+-        row1.addView(chip("🎙 语音聊天", "#D97757", "#FFFFFF") { closePanel(); openApp(com.openminis.app.ui.plus.PlusRoutes.VOICE) }, clp())
++        row1.addView(chip(if (VoiceSession.active) "挂断语音" else "🎙 语音聊天", "#D97757", "#FFFFFF") { closePanel(); toggleVoice() }, clp())
+         row1.addView(chip("打开 Mines") { closePanel(); openApp(null) }, clp())
+         row2.addView(chip("插件挂件") {
+             closePanel()
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt b/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
+index 35deb04..8cdf37b 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
+@@ -90,6 +90,11 @@ class GeminiLive(
+             setup.put("inputAudioTranscription", JSONObject())
+             setup.put("outputAudioTranscription", JSONObject())
+             if (resumption) setup.put("sessionResumption", JSONObject().apply { resumeHandle?.let { put("handle", it) } })
++            // [Mines-voice-31] Without context-window compression an audio
++            // session is capped (~15 min) and the server ends it; the sliding
++            // window keeps the system prompt and drops the oldest turns.
++            // Field per ai.google.dev/api/live ContextWindowCompressionConfig.
++            setup.put("contextWindowCompression", JSONObject().put("slidingWindow", JSONObject()))
+             return JSONObject().put("setup", setup)
+         }
+ 
+@@ -149,6 +154,14 @@ class GeminiLive(
+         .readTimeout(0, TimeUnit.MILLISECONDS)
+         .build()
+     private var ws: WebSocket? = null
++    /** [Mines-voice-31] The socket whose setup completed: mic audio goes here. */
++    @Volatile private var liveWs: WebSocket? = null
++    /** [Mines-voice-31] A silent hop (goAway / drop) is in progress: nothing is shown unless it fails. */
++    @Volatile private var hopping = false
++    @Volatile private var hopFails = 0
++    private val _reconnects = MutableStateFlow(0)
++    /** Seamless reconnects so far in this call (diagnostics). */
++    val reconnects: StateFlow<Int> = _reconnects.asStateFlow()
+     private var micJob: Job? = null
+     private var record: AudioRecord? = null
+     private var track: AudioTrack? = null
+@@ -228,6 +241,7 @@ class GeminiLive(
+ 
+     fun start() {
+         stopped = false
++        hopping = false; hopFails = 0; setupAt = 0L
+         startSpeaker()
+         retries = 0
+         retryJob?.cancel()
+@@ -294,7 +308,7 @@ class GeminiLive(
+     fun sendText(text: String) {
+         if (text.isBlank()) return
+         append(true, text)
+-        ws?.send(JSONObject().put("realtimeInput", JSONObject().put("text", text)).toString())
++        (liveWs ?: ws)?.send(JSONObject().put("realtimeInput", JSONObject().put("text", text)).toString())
+     }
+ 
+     private fun connect() {
+@@ -309,7 +323,8 @@ class GeminiLive(
+         // 测试语音 → 重新连接 during a live call produced it. Detach first.
+         val old = ws
+         ws = null
+-        runCatching { old?.cancel() }
++        if (!hopping) { liveWs = null; runCatching { old?.cancel() } }
++        else if (old != null && old !== liveWs) runCatching { old.cancel() }
+         if (routeSel == null) {
+             // [Mines-voice-26/29] Find a route that really reaches Gemini: port, HTTPS and a Live handshake.
+             scope.launch {
+@@ -360,6 +375,7 @@ class GeminiLive(
+             override fun onMessage(webSocket: WebSocket, bytes: ByteString) = handle(bytes.utf8())
+             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                 webSocket.close(1000, null)
++                if (webSocket === liveWs && webSocket !== ws) { liveWs = null; return } // old socket of a hop
+                 if (webSocket === ws) onClosed(code, reason)
+             }
+             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+@@ -367,6 +383,7 @@ class GeminiLive(
+                 // A socket we already replaced (reconnect / goAway) is not news.
+                 // [Mines-voice-26] Keep the real reason: HTTP status of a refused handshake, socket error.
+                 val why = (response?.let { "HTTP ${it.code} ${it.message} " } ?: "") + GeminiRoute.shortErr(t)
++                if (webSocket === liveWs && webSocket !== ws) { liveWs = null; return }
+                 if (webSocket === ws) onClosed(-1, why)
+             }
+         })
+@@ -374,6 +391,22 @@ class GeminiLive(
+ 
+     private fun onClosed(code: Int, reason: String) {
+         if (stopped) return
++        if (liveWs != null && liveWs === ws) liveWs = null
++        // [Mines-voice-31] An established call that drops for a network reason
++        // hops silently: audio keeps running (no audible restart), the session
++        // resumes with the latest handle, and nothing is shown unless the hop
++        // itself fails twice.
++        val established = setupAt > 0 && !GeminiLive.isConfigError(code, reason) &&
++            !(reason.contains("API key", true) || code == 1008 && reason.contains("key", true))
++        if (established && hopFails < 2 && routeSel != null) {
++            if (hopping && !setupDone) hopFails++
++            hopping = true
++            setupDone = false
++            retryJob?.cancel()
++            retryJob = scope.launch { kotlinx.coroutines.delay(if (hopFails == 0) 150L else 800L); if (!stopped) openSocket() }
++            return
++        }
++        hopping = false; hopFails = 0
+         stopAudio()
+         // [Mines-voice-26] A model the server doesn't take: re-read the list once and switch.
+         if (!setupDone && (reason.contains("not found", true) || reason.contains("not supported", true) && reason.contains("model", true)) && !modelSwitchTried) {
+@@ -477,7 +510,7 @@ class GeminiLive(
+                 responses.put(JSONObject().put("id", c.optString("id")).put("name", c.optString("name"))
+                     .put("response", JSONObject().put("result", out.take(6000))))
+             }
+-            ws?.send(JSONObject().put("toolResponse", JSONObject().put("functionResponses", responses)).toString())
++            (liveWs ?: ws)?.send(JSONObject().put("toolResponse", JSONObject().put("functionResponses", responses)).toString())
+         }
+     }
+ 
+@@ -488,11 +521,24 @@ class GeminiLive(
+             if (u.optBoolean("resumable", true)) u.optString("newHandle").takeIf { it.isNotBlank() }?.let { resumeHandle = it }
+         }
+         if (msg.has("goAway")) {
+-            // Server is about to close this connection: hop to a fresh one now.
+-            scope.launch { kotlinx.coroutines.delay(300); if (!stopped) { stopAudio(); connect() } }
++            // [Mines-voice-31] Server is about to close this connection: open the
++            // next one (same route, latest resumption handle) while the old one
++            // still plays, switch the mic over on setupComplete, then close the
++            // old one. No stopAudio → no audible restart.
++            if (!hopping) {
++                hopping = true; hopFails = 0
++                scope.launch { if (!stopped) openSocket() }
++            }
+             return
+         }
+         if (msg.has("setupComplete")) {
++            val prev = liveWs
++            liveWs = ws
++            if (hopping) {
++                hopping = false; hopFails = 0
++                _reconnects.value = _reconnects.value + 1
++                if (prev != null && prev !== ws) scope.launch { kotlinx.coroutines.delay(1500); runCatching { prev.close(1000, "hop") } }
++            }
+             setupDone = true
+             setupAt = System.currentTimeMillis()
+             rounds = 0; sameRouteDrops = 0
+@@ -599,8 +645,9 @@ class GeminiLive(
+                 }
+                 _level.value = (sqrt(sum / (n / 2)) / 6000.0).toFloat().coerceIn(0f, 1f)
+                 if (_muted.value) continue
++                val out = liveWs ?: continue // [Mines-voice-31] between sockets of a hop: drop 100 ms frames
+                 val b64 = Base64.encodeToString(buf, 0, n, Base64.NO_WRAP)
+-                ws?.send("{\"realtimeInput\":{\"audio\":{\"data\":\"$b64\",\"mimeType\":\"audio/pcm;rate=16000\"}}}")
++                out.send("{\"realtimeInput\":{\"audio\":{\"data\":\"$b64\",\"mimeType\":\"audio/pcm;rate=16000\"}}}")
+             }
+         }
+     }
+@@ -616,6 +663,8 @@ class GeminiLive(
+ 
+     fun stop() {
+         stopped = true
++        hopping = false
++        runCatching { liveWs?.close(1000, "bye") }; liveWs = null
+         dropSpeech()
+         speakJob?.cancel(); speakJob = null
+         retryJob?.cancel()
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/KeyAgent.kt b/src/android/app/src/main/java/com/openminis/app/plus/KeyAgent.kt
+new file mode 100644
+index 0000000..7359dd5
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/KeyAgent.kt
+@@ -0,0 +1,206 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-keys-31] Smart API-key acquisition.
++ *
++ * The user only logs in. After that Mines drives the provider's own key page
++ * (in-app WebView with injected JS; Google pages in Chrome through the
++ * accessibility service), creates a key, reads it straight off the page,
++ * saves it encrypted, tests it with one cheap call and shows ✓.
++ *
++ * It stops and asks exactly one simple thing when a step really needs the
++ * user (SMS code, CAPTCHA, payment) and never clicks anything that pays.
++ * Console URLs checked 2026-10-13 against the providers' docs:
++ *  - Gemini: aistudio.google.com/apikey
++ *  - Mistral: console.mistral.ai → API Keys → Create new key (Free mode, no card)
++ *  - Perplexity: console.perplexity.ai/project/settings (project first) → /project/keys (pay-as-you-go, needs credit)
++ *  - Hugging Face: huggingface.co/settings/tokens/new
++ *  - DigitalOcean: cloud.digitalocean.com → Account → API → Generate New Token
++ *  - Cloudflare: dash.cloudflare.com/profile/api-tokens
++ *  - GitHub: github.com/settings/tokens/new (classic, scopes via query)
++ *  - 阿里云百炼: bailian.console.aliyun.com/cn-beijing/model/settings/api-key → 创建 API Key
++ */
++object KeyAgent {
++    enum class Mode { WEBVIEW, CHROME_A11Y }
++
++    /** One step: click the first element whose text matches any label; or fill the name field. */
++    data class Step(val click: List<String> = emptyList(), val fill: String? = null, val optional: Boolean = false)
++
++    data class Recipe(
++        val kindId: String,
++        val mode: Mode,
++        val url: String,
++        val keyRegex: Regex,
++        val steps: List<Step>,
++        /** A page-text hint that the user still has to sign in. */
++        val loginHints: List<String> = listOf("Sign in", "Log in", "登录", "Continue with Google", "Sign up"),
++        /** Plain note shown before starting. */
++        val note: String = "",
++    )
++
++    private val nameField = "Mines"
++
++    val recipes: Map<String, Recipe> = listOf(
++        Recipe("gemini", Mode.CHROME_A11Y, "https://aistudio.google.com/apikey",
++            Regex("""AIza[0-9A-Za-z_\-]{35}"""),
++            listOf(
++                Step(listOf("Create API key", "创建 API 密钥", "创建 API key", "Get API key")),
++                Step(listOf("Create API key in new project", "在新项目中创建 API 密钥", "Create key", "创建密钥", "Create"), optional = true),
++            ),
++            note = "Google 只能在 Chrome 里登录；需要打开 Mines 的无障碍，Mines 才能在 Chrome 里替你点。"),
++        Recipe("mistral", Mode.WEBVIEW, "https://console.mistral.ai/api-keys",
++            Regex("""\b[A-Za-z0-9]{32}\b"""),
++            listOf(
++                Step(listOf("Free", "Experiment", "Activate", "Start for free", "Choose Experiment", "Subscribe to Experiment"), optional = true),
++                Step(listOf("Create new key", "Create API key", "Create key", "New key")),
++                Step(fill = nameField, optional = true),
++                Step(listOf("Create new key", "Create key", "Create")),
++            ),
++            note = "选免费模式（不绑卡）。如果要验证手机号，Mines 会停下来请你填短信验证码。"),
++        Recipe("perplexity", Mode.WEBVIEW, "https://console.perplexity.ai/project/keys",
++            Regex("""pplx-[A-Za-z0-9]{40,}"""),
++            listOf(
++                Step(listOf("Create project", "Create Project", "New project"), optional = true),
++                Step(fill = nameField, optional = true),
++                Step(listOf("Create", "Save"), optional = true),
++                Step(listOf("Create Key", "Create API Key", "Generate", "Create key", "+ Create Key")),
++                Step(fill = nameField, optional = true),
++                Step(listOf("Create", "Generate", "Confirm"), optional = true),
++            ),
++            note = "Perplexity 的 API 要先充值才能用。Mines 只创建密钥，不会替你付钱。"),
++        Recipe("huggingface", Mode.WEBVIEW, "https://huggingface.co/settings/tokens/new?tokenType=read",
++            Regex("""hf_[A-Za-z0-9]{30,}"""),
++            listOf(
++                Step(listOf("Read"), optional = true),
++                Step(fill = nameField),
++                Step(listOf("Create token", "Create")),
++            )),
++        Recipe("digitalocean", Mode.WEBVIEW, "https://cloud.digitalocean.com/account/api/tokens",
++            Regex("""dop_v1_[a-f0-9]{64}"""),
++            listOf(
++                Step(listOf("Generate New Token", "Generate new token", "Create Token")),
++                Step(fill = nameField),
++                Step(listOf("Full Access"), optional = true),
++                Step(listOf("Generate Token", "Generate token")),
++            )),
++        Recipe("cloudflare", Mode.WEBVIEW, "https://dash.cloudflare.com/profile/api-tokens",
++            Regex("""\b[A-Za-z0-9_\-]{40}\b"""),
++            listOf(
++                Step(listOf("Create Token", "创建令牌")),
++                Step(listOf("Use template", "使用模板")),
++                Step(listOf("Continue to summary", "继续以显示摘要", "继续")),
++                Step(listOf("Create Token", "创建令牌")),
++            ),
++            note = "会用 Cloudflare 的第一个模板（编辑区域 DNS）创建令牌，之后可在 Cloudflare 里改权限。"),
++        Recipe("github", Mode.WEBVIEW, "https://github.com/settings/tokens/new?scopes=repo,workflow,read:user,notifications&description=Mines",
++            Regex("""ghp_[A-Za-z0-9]{36}"""),
++            listOf(
++                Step(listOf("Generate token")),
++            )),
++        Recipe("qwen", Mode.WEBVIEW, "https://bailian.console.aliyun.com/cn-beijing/model/settings/api-key",
++            Regex("""sk-[a-f0-9]{32}"""),
++            listOf(
++                Step(listOf("创建 API Key", "创建API Key", "创建 API-KEY", "创建我的API-KEY")),
++                Step(listOf("确定", "确认")),
++                Step(listOf("查看", "显示"), optional = true),
++            ),
++            note = "百炼按量计费、开通免费；Mines 不会点任何充值或购买按钮。"),
++    ).associateBy { it.kindId }
++
++    fun recipe(kindId: String): Recipe? = recipes[PlusVault.baseId(kindId)]
++
++    /** Words that mean "this step costs money": never clicked, the user is told instead. */
++    val payWords = listOf("支付", "付款", "充值", "购买", "下单", "Add payment", "Payment method", "Credit card", "Add credits", "Buy credits", "Upgrade", "Checkout", "Pay ")
++    val captchaWords = listOf("captcha", "CAPTCHA", "人机验证", "Verify you are human", "I'm not a robot", "滑块", "拖动滑块", "安全验证")
++    val smsWords = listOf("verification code", "Verify your phone", "phone number", "SMS", "短信验证码", "手机号", "验证码")
++
++    /** What the user has to do, in one sentence, or null when Mines can continue. */
++    fun needsUser(pageText: String): String? = when {
++        captchaWords.any { pageText.contains(it, true) } -> "页面要你做一次人机验证，请完成后点「继续」"
++        smsWords.any { pageText.contains(it, true) } && (pageText.contains("phone", true) || pageText.contains("手机", true)) ->
++            "要验证手机号：请在页面上填手机号和收到的短信验证码，填好后点「继续」"
++        else -> null
++    }
++
++    /**
++     * JS helper injected into the page. `click(labels)` only clicks buttons /
++     * links whose own text matches, never anything with a payment word.
++     */
++    val JS_HELPER = """
++(function(){
++ if (window.__mines) return;
++ var PAY = ${payWords.joinToString(",", "[", "]") { "\"" + it.trim().lowercase() + "\"" }};
++ function vis(e){ var r=e.getBoundingClientRect(); return r.width>1&&r.height>1&&getComputedStyle(e).visibility!='hidden'; }
++ function txt(e){ return (e.innerText||e.value||e.getAttribute('aria-label')||'').trim(); }
++ window.__mines = {
++  text: function(){
++    var t = document.body ? document.body.innerText : '';
++    var ins = document.querySelectorAll('input,textarea,code,pre');
++    for (var i=0;i<ins.length;i++){ t += '\n' + (ins[i].value||ins[i].innerText||''); }
++    return t;
++  },
++  click: function(labels){
++    var els = Array.prototype.slice.call(document.querySelectorAll('button,a,[role=button],[role=menuitem],[role=radio],[role=tab],label,div[tabindex],span'));
++    var want = labels.map(function(l){return l.toLowerCase();});
++    for (var pass=0; pass<2; pass++){
++      for (var i=els.length-1;i>=0;i--){
++        var e=els[i]; if(!vis(e)) continue; var t=txt(e).toLowerCase(); if(!t||t.length>60) continue;
++        if (PAY.some(function(p){return t.indexOf(p)>=0;})) continue;
++        for (var j=0;j<want.length;j++){
++          if ((pass==0 && t==want[j]) || (pass==1 && t.indexOf(want[j])>=0)){
++            if (e.disabled) continue;
++            e.scrollIntoView({block:'center'}); e.click(); return labels[j];
++          }
++        }
++      }
++    }
++    return '';
++  },
++  fill: function(v){
++    var root = document.querySelector('[role=dialog]') || document;
++    var ins = root.querySelectorAll('input[type=text],input:not([type]),input[name*=name i]');
++    for (var i=0;i<ins.length;i++){
++      var e=ins[i]; if(!vis(e)||e.readOnly||e.disabled) continue;
++      if (e.value && e.value.length>0) continue;
++      var set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set; set.call(e,v);
++      e.dispatchEvent(new Event('input',{bubbles:true})); e.dispatchEvent(new Event('change',{bubbles:true}));
++      return 'ok';
++    }
++    return '';
++  }
++ };
++})();
++""".trimIndent()
++
++    /** Find a key in page text; the first match that is not something we already saved. */
++    fun findKey(recipe: Recipe, text: String, known: String?): String? =
++        recipe.keyRegex.findAll(text).map { it.value }.firstOrNull { it != known && !it.all { c -> c.isDigit() } }
++
++    /**
++     * Gemini (and any Chrome page): drive Chrome through Mines' accessibility
++     * service. Blocking; call on IO. [status] gets one-line progress.
++     */
++    fun runChromeA11y(context: android.content.Context, recipe: Recipe, known: String?, cancelled: () -> Boolean, status: (String) -> Unit): String? {
++        val ui = com.openminis.app.sandbox.offload.FastUi(context)
++        if (!ui.ready()) { status("没有打开 Mines 的无障碍：请复制密钥后回到这里，Mines 会自动填入"); return null }
++        val until = System.currentTimeMillis() + 4 * 60_000
++        var step = 0
++        var waitedLogin = false
++        while (!cancelled() && System.currentTimeMillis() < until) {
++            Thread.sleep(1500)
++            val text = ui.allText()
++            findKey(recipe, text, known)?.let { return it }
++            needsUser(text)?.let { status(it); continue }
++            if (recipe.loginHints.any { text.contains(it) } && step == 0) {
++                if (!waitedLogin) status("请在 Chrome 里登录，登录好 Mines 会自动继续"); waitedLogin = true; continue
++            }
++            if (step < recipe.steps.size) {
++                val s = recipe.steps[step]
++                val ok = s.click.isNotEmpty() && s.click.any { ui.tapText(it) }
++                if (ok) { status("已点「${s.click.first()}」…"); step++ }
++                else if (s.optional) step++
++            } else status("正在读取新密钥…")
++        }
++        return null
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/KeyTester.kt b/src/android/app/src/main/java/com/openminis/app/plus/KeyTester.kt
+new file mode 100644
+index 0000000..671fbdd
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/KeyTester.kt
+@@ -0,0 +1,85 @@
++package com.openminis.app.plus
++
++import okhttp3.MediaType.Companion.toMediaType
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.RequestBody.Companion.toRequestBody
++import org.json.JSONObject
++import java.net.InetSocketAddress
++import java.net.Proxy
++import java.util.concurrent.TimeUnit
++
++/**
++ * [Mines-keys-31] One cheap call per provider to prove a key works, and read
++ * the account name when the provider says it ("who am I"). Never spends money
++ * beyond a 1-token request where no free endpoint exists (Perplexity).
++ * Domestic providers go direct; overseas ones try direct, then the local
++ * proxies Mines knows (分流代理 / VPN-app ports).
++ */
++object KeyTester {
++    data class Result(val ok: Boolean, val message: String, val identity: String? = null, val needsCredit: Boolean = false)
++
++    private val domestic = setOf("qwen", "deepseek", "kimi", "zhipu", "siliconflow", "aliyun")
++
++    private fun clients(base: String): List<OkHttpClient> {
++        fun c(p: Proxy) = OkHttpClient.Builder().proxy(p).connectTimeout(8, TimeUnit.SECONDS)
++            .readTimeout(15, TimeUnit.SECONDS).callTimeout(25, TimeUnit.SECONDS).build()
++        val out = arrayListOf(c(Proxy.NO_PROXY))
++        if (base !in domestic) {
++            if (SplitProxy.active) out += c(Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", SplitProxy.PORT)))
++            SplitProxy.settings.value.all.take(2).forEach { u ->
++                runCatching { out += c(Proxy(if (u.type == "socks5") Proxy.Type.SOCKS else Proxy.Type.HTTP, InetSocketAddress(u.host, u.port))) }
++            }
++        }
++        return out
++    }
++
++    private data class Http(val code: Int, val body: String)
++
++    private fun call(base: String, req: Request): Http {
++        var last: Exception? = null
++        for (cl in clients(base)) {
++            try { cl.newCall(req).execute().use { r -> return Http(r.code, r.body?.string().orEmpty().take(4000)) } }
++            catch (e: Exception) { last = e }
++        }
++        throw last ?: IllegalStateException("连不上")
++    }
++
++    private fun bearer(url: String, key: String) = Request.Builder().url(url).header("Authorization", "Bearer $key").build()
++
++    fun test(baseId: String, key: String): Result = runCatching { testInner(baseId, key.trim()) }
++        .getOrElse { Result(false, "测试时连不上服务器：${it.message?.take(80)}") }
++
++    private fun testInner(base: String, key: String): Result {
++        fun verdict(h: Http, ident: (JSONObject) -> String? = { null }): Result = when {
++            h.code in 200..299 -> Result(true, "可以用", runCatching { ident(JSONObject(h.body)) }.getOrNull()?.takeIf { it.isNotBlank() })
++            h.code == 401 || h.code == 403 -> Result(false, "密钥无效或没有权限（HTTP ${h.code}）")
++            h.code == 402 || h.body.contains("insufficient", true) || h.body.contains("credit", true) || h.body.contains("余额", true) ->
++                Result(true, "密钥有效，但账户余额不足，需要你自己充值（Mines 不会替你付钱）", needsCredit = true)
++            h.code == 429 -> Result(true, "密钥有效（暂时限流）")
++            else -> Result(false, "服务器回复 HTTP ${h.code}")
++        }
++        return when (base) {
++            "gemini" -> verdict(call(base, Request.Builder().url("https://generativelanguage.googleapis.com/v1beta/models?pageSize=1&key=$key").build()))
++            "mistral" -> verdict(call(base, bearer("https://api.mistral.ai/v1/models", key)))
++            "perplexity" -> verdict(call(base, Request.Builder().url("https://api.perplexity.ai/chat/completions")
++                .header("Authorization", "Bearer $key")
++                .post("""{"model":"sonar","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}""".toRequestBody("application/json".toMediaType())).build()))
++            "huggingface" -> verdict(call(base, bearer("https://huggingface.co/api/whoami-v2", key))) { it.optString("name") }
++            "digitalocean" -> verdict(call(base, bearer("https://api.digitalocean.com/v2/account", key))) { it.optJSONObject("account")?.optString("email") }
++            "cloudflare" -> verdict(call(base, bearer("https://api.cloudflare.com/client/v4/user/tokens/verify", key)))
++            "github" -> verdict(call(base, bearer("https://api.github.com/user", key))) { it.optString("login") }
++            "qwen" -> verdict(call(base, bearer("https://dashscope.aliyuncs.com/compatible-mode/v1/models", key)))
++            "openai" -> verdict(call(base, bearer("https://api.openai.com/v1/models", key)))
++            "deepseek" -> verdict(call(base, bearer("https://api.deepseek.com/models", key)))
++            "openrouter" -> verdict(call(base, bearer("https://openrouter.ai/api/v1/key", key))) { it.optJSONObject("data")?.optString("label") }
++            "siliconflow" -> verdict(call(base, bearer("https://api.siliconflow.cn/v1/user/info", key))) { it.optJSONObject("data")?.optString("name") }
++            "kimi" -> verdict(call(base, bearer("https://api.moonshot.cn/v1/models", key)))
++            "zhipu" -> verdict(call(base, bearer("https://open.bigmodel.cn/api/paas/v4/models", key)))
++            "xai" -> verdict(call(base, bearer("https://api.x.ai/v1/api-key", key))) { it.optString("name") }
++            "anthropic" -> verdict(call(base, Request.Builder().url("https://api.anthropic.com/v1/models")
++                .header("x-api-key", key).header("anthropic-version", "2023-06-01").build()))
++            else -> Result(true, "已保存（这个服务没有测试接口）")
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MinesJobs.kt b/src/android/app/src/main/java/com/openminis/app/plus/MinesJobs.kt
+index 614370a..1278d0e 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/MinesJobs.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/MinesJobs.kt
+@@ -133,6 +133,29 @@ object MinesJobs {
+         if (!appInForeground && !done.silent) notifyFinished(app, done)
+     }
+ 
++    /** [Mines-report-31] Run a sandbox command synchronously (no job row); exit code + output. Blocking. */
++    fun runSync(context: Context, command: String, timeoutMs: Long = 30_000L): Pair<Int, String> {
++        val app = context.applicationContext
++        var waited = 0
++        while (!PRootKernel.isBooted && waited < 15_000) { Thread.sleep(500); waited += 500 }
++        if (!PRootKernel.isBooted) return -1 to "沙箱还没启动"
++        val pb = ProcessBuilder(PRootKernel.buildProotCommand(command)).redirectErrorStream(true)
++        val env = pb.environment()
++        env["PROOT_TMP_DIR"] = PRootKernel.getProotTmpDir(app).absolutePath
++        if (PRootKernel.nativeLibDir.isNotEmpty()) env["LD_LIBRARY_PATH"] = PRootKernel.nativeLibDir
++        if (PRootKernel.prootLoaderPath.isNotEmpty()) env["PROOT_LOADER"] = PRootKernel.prootLoaderPath
++        if (PRootKernel.prootLoader32Path.isNotEmpty()) env["PROOT_LOADER_32"] = PRootKernel.prootLoader32Path
++        for ((k, v) in PRootKernel.customEnvironment) env[k] = v
++        val p = pb.start()
++        runCatching { p.outputStream.close() }
++        val sb = StringBuilder()
++        val reader = Thread({ runCatching { p.inputStream.bufferedReader().forEachLine { if (sb.length < 20_000) sb.append(it).append('\n') } } }, "mines-sync").apply { isDaemon = true; start() }
++        val finished = p.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
++        if (!finished) { runCatching { p.destroyForcibly() } }
++        reader.join(1500)
++        return (if (finished) p.exitValue() else 124) to sb.toString().trim()
++    }
++
+     /** Runs one sandbox command; the time limit kills PRoot (and with it every process inside). */
+     private fun runProot(app: Context, job: Job): Int {
+         val pb = ProcessBuilder(PRootKernel.buildProotCommand(job.command)).redirectErrorStream(true)
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MinesSelfCheck.kt b/src/android/app/src/main/java/com/openminis/app/plus/MinesSelfCheck.kt
+new file mode 100644
+index 0000000..495166b
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/MinesSelfCheck.kt
+@@ -0,0 +1,238 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import android.os.Build
++import android.provider.Settings
++import android.util.Base64
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++import okhttp3.MediaType.Companion.toMediaType
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.RequestBody.Companion.toRequestBody
++import org.json.JSONArray
++import org.json.JSONObject
++import java.io.File
++import java.util.concurrent.TimeUnit
++
++/**
++ * [Mines-report-31] 一键冒烟测试 + 上报.
++ *
++ * Runs on-device self-checks, bundles the failures with a redacted log
++ * excerpt and files a GitHub issue (label `mines-bug`) on the Mines repo
++ * with the user's connected GitHub login, so Hark can read it through the
++ * GitHub connector. The issue body is structured: build, device, a check
++ * table, log excerpt. Keys / tokens are removed, e-mails masked.
++ */
++object MinesSelfCheck {
++    const val REPO = "ddfc1991/openminis-agent-android"
++    const val LABEL = "mines-bug"
++
++    data class Check(val name: String, val ok: Boolean, val detail: String, val ms: Long = 0, val warn: Boolean = false)
++
++    private val http = OkHttpClient.Builder().connectTimeout(8, TimeUnit.SECONDS).readTimeout(15, TimeUnit.SECONDS)
++        .callTimeout(25, TimeUnit.SECONDS).build()
++
++    private inline fun timed(name: String, block: () -> Pair<Boolean, String>): Check {
++        val t0 = System.currentTimeMillis()
++        return runCatching { block() }.fold(
++            { (ok, d) -> Check(name, ok, d, System.currentTimeMillis() - t0) },
++            { e -> Check(name, false, "${e.javaClass.simpleName}: ${e.message?.take(160)}", System.currentTimeMillis() - t0) },
++        )
++    }
++
++    /** Run every check (≈20–60 s). [progress] gets the name of the check being run. */
++    suspend fun runAll(context: Context, progress: (String) -> Unit = {}): List<Check> = withContext(Dispatchers.IO) {
++        val c = context.applicationContext
++        PlusVault.init(c)
++        val out = ArrayList<Check>()
++
++        progress("模型服务")
++        val repo = runCatching { (c as? com.openminis.app.MinisApp)?.providerRepositoryOrNull }.getOrNull()
++        val insts = runCatching { repo?.instances?.filter { it.isEnabled } }.getOrNull().orEmpty()
++        if (insts.isEmpty()) out += Check("模型服务", false, "没有启用的模型服务", warn = true)
++        insts.take(8).forEach { inst ->
++            out += timed("模型 · ${inst.label}") {
++                val base = inst.effectiveBaseURL ?: return@timed true to "官方地址（不测）"
++                val url = base.trimEnd('/') + "/models"
++                val code = http.newCall(Request.Builder().url(url).build()).execute().use { it.code }
++                (code in 200..499) to "HTTP $code（能连上）"
++            }
++        }
++
++        progress("实时语音握手")
++        out += timed("Gemini 实时语音握手") {
++            val key = GeminiRoute.apiKey() ?: return@timed false to "没有 Gemini Key"
++            val r = GeminiRoute.routes(c, false).firstOrNull { GeminiRoute.proxyPortUp(it) } ?: return@timed false to "没有可用线路"
++            val p = GeminiRoute.probe(r, key)
++            p.ok to "线路 ${r.label}：${p.note.take(120)}"
++        }
++
++        progress("账号密钥")
++        PlusVault.entries.value.values.filter { it.via == "key" || it.via == "token" }.take(10).forEach { e ->
++            out += timed("密钥 · ${PlusVault.kind(e.kindId)?.name ?: e.kindId}") {
++                val k = PlusVault.secret(e.kindId) ?: return@timed false to "没有保存密钥"
++                val r = KeyTester.test(PlusVault.baseId(e.kindId), k)
++                r.ok to r.message
++            }
++        }
++
++        progress("权限")
++        out += Check("无障碍", com.openminis.app.accessibility.MinisAccessibilityService.getInstance() != null,
++            if (com.openminis.app.accessibility.MinisAccessibilityService.getInstance() != null) "已开启" else "未开启（设置 → 无障碍 → Mines）")
++        out += timed("Shizuku") {
++            val ok = com.openminis.app.sandbox.offload.FastUi.shizukuReady()
++            ok to (if (ok) "已授权" else "未运行或未授权")
++        }
++        out += Check("悬浮窗（桌宠）", Settings.canDrawOverlays(c), if (Settings.canDrawOverlays(c)) "已允许" else "未允许")
++        out += Check("桌宠", !PlusPrefs.state.value.petEnabled || Settings.canDrawOverlays(c),
++            if (PlusPrefs.state.value.petEnabled) "已开启" else "未开启", warn = !PlusPrefs.state.value.petEnabled)
++
++        progress("沙箱")
++        out += timed("沙箱命令") {
++            val (code, text) = MinesJobs.runSync(c, "echo mines-ok; uname -m; df -h / | tail -1", 30_000)
++            (code == 0 && text.contains("mines-ok")) to text.replace("\n", " ").take(160)
++        }
++        progress("MCP 服务器")
++        out += timed("MCP 服务器") {
++            val (code, text) = MinesJobs.runSync(c, "command -v minis-mcp-cli >/dev/null && timeout 25 minis-mcp-cli list 2>&1 | head -30", 35_000)
++            val bad = text.lines().count { it.contains("timeout", true) || it.contains("超时") || it.contains("error", true) }
++            (code == 0 && bad == 0) to (if (text.isBlank()) "没有输出（退出码 $code）" else text.lines().take(8).joinToString("；").take(300))
++        }
++        out
++    }
++
++    // ---- redaction ----
++
++    private val secretPatterns = listOf(
++        Regex("""sk-[A-Za-z0-9_\-]{12,}"""), Regex("""AIza[0-9A-Za-z_\-]{30,}"""), Regex("""gh[pousr]_[A-Za-z0-9]{20,}"""),
++        Regex("""github_pat_[A-Za-z0-9_]{20,}"""), Regex("""hf_[A-Za-z0-9]{20,}"""), Regex("""pplx-[A-Za-z0-9]{20,}"""),
++        Regex("""dop_v1_[a-f0-9]{20,}"""), Regex("""xai-[A-Za-z0-9]{20,}"""), Regex("""(?i)(bearer|token|key|password|passwd|secret)[=: ]+[^\s"',;]{8,}"""),
++        Regex("""eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{5,}"""), Regex("""\b[A-Za-z0-9+/]{40,}={0,2}\b"""),
++    )
++    private val email = Regex("""[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}""")
++
++    fun redact(s: String): String {
++        var t = s
++        secretPatterns.forEach { p -> t = p.replace(t) { m -> if (m.groupValues.size > 1 && m.groupValues[1].isNotEmpty()) m.groupValues[1] + "=[已隐去]" else "[已隐去]" } }
++        t = email.replace(t) { AccountLabel.maskEmail(it.value) }
++        PlusVault.entries.value.values.forEach { e -> PlusVault.secret(e.kindId)?.takeIf { it.length >= 8 }?.let { t = t.replace(it, "[已隐去]") } }
++        return t
++    }
++
++    fun recentLogs(context: Context, lines: Int = 200): String {
++        val sb = StringBuilder()
++        runCatching {
++            val p = ProcessBuilder("logcat", "-d", "-t", lines.toString(), "--pid=${android.os.Process.myPid()}", "*:W").redirectErrorStream(true).start()
++            sb.append(p.inputStream.bufferedReader().readText().takeLast(12_000))
++            p.waitFor(3, TimeUnit.SECONDS)
++        }
++        runCatching {
++            File(context.filesDir, "logs").listFiles()?.maxByOrNull { it.lastModified() }?.let { f ->
++                sb.append("\n--- app log ").append(f.name).append(" ---\n").append(f.readText().takeLast(6_000))
++            }
++        }
++        runCatching { File(context.filesDir, "mines-last-crash.txt").takeIf { it.exists() }?.let { sb.append("\n--- last crash ---\n").append(it.readText().take(4000)) } }
++        return redact(sb.toString())
++    }
++
++    fun device(): String = "${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})"
++
++    fun issueBody(context: Context, checks: List<Check>, description: String?, screenshotUrl: String?): String {
++        val sb = StringBuilder()
++        sb.append("<!-- mines-report v1 -->\n")
++        sb.append("**Build:** build-").append(com.openminis.app.BuildConfig.MINES_BUILD).append("  \n")
++        sb.append("**Device:** ").append(device()).append("  \n")
++        sb.append("**Time:** ").append(java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss Z", java.util.Locale.US).format(java.util.Date())).append("\n\n")
++        if (!description.isNullOrBlank()) sb.append("### 用户描述\n").append(redact(description)).append("\n\n")
++        if (screenshotUrl != null) sb.append("### 截图\n![screenshot](").append(screenshotUrl).append(")\n\n")
++        if (checks.isNotEmpty()) {
++            val fails = checks.count { !it.ok && !it.warn }
++            sb.append("### 检查结果（").append(checks.size).append(" 项，失败 ").append(fails).append("）\n\n")
++            sb.append("| 状态 | 检查 | 耗时 | 详情 |\n|---|---|---|---|\n")
++            checks.forEach { ch ->
++                sb.append("| ").append(if (ch.ok) "✅" else if (ch.warn) "⚠️" else "❌").append(" | ").append(ch.name.replace("|", "/"))
++                    .append(" | ").append(ch.ms).append(" ms | ").append(redact(ch.detail).replace("|", "/").replace("\n", " ").take(200)).append(" |\n")
++            }
++            sb.append('\n')
++        }
++        sb.append("### 日志（已隐去密钥和邮箱）\n<details><summary>展开</summary>\n\n```\n")
++        sb.append(recentLogs(context).takeLast(15_000).replace("```", "'''"))
++        sb.append("\n```\n</details>\n")
++        return sb.toString()
++    }
++
++    private fun ghToken(): String? = (PlusVault.defaultAccount("github")?.let { PlusVault.secret(it) } ?: PlusVault.secret("github"))?.takeIf { it.isNotBlank() }
++
++    data class Filed(val ok: Boolean, val message: String, val url: String? = null)
++
++    /** Optional screenshot → pushed to branch `mines-reports` (never the build branch, so no CI runs), linked in the issue. */
++    private fun uploadScreenshot(token: String, png: ByteArray): String? = runCatching {
++        fun req(url: String) = Request.Builder().url(url).header("Authorization", "Bearer $token").header("Accept", "application/vnd.github+json")
++        val branch = "mines-reports"
++        val has = http.newCall(req("https://api.github.com/repos/$REPO/git/ref/heads/$branch").build()).execute().use { it.code == 200 }
++        if (!has) {
++            val repoInfo = http.newCall(req("https://api.github.com/repos/$REPO").build()).execute().use { JSONObject(it.body!!.string()) }
++            val def = repoInfo.optString("default_branch", "main")
++            val sha = http.newCall(req("https://api.github.com/repos/$REPO/git/ref/heads/$def").build()).execute()
++                .use { JSONObject(it.body!!.string()).getJSONObject("object").getString("sha") }
++            http.newCall(req("https://api.github.com/repos/$REPO/git/refs").post(JSONObject().put("ref", "refs/heads/$branch").put("sha", sha).toString()
++                .toRequestBody("application/json".toMediaType())).build()).execute().close()
++        }
++        val path = "reports/" + System.currentTimeMillis() + ".png"
++        val body = JSONObject().put("message", "Mines bug report screenshot").put("branch", branch)
++            .put("content", Base64.encodeToString(png, Base64.NO_WRAP))
++        val ok = http.newCall(req("https://api.github.com/repos/$REPO/contents/$path").put(body.toString().toRequestBody("application/json".toMediaType())).build())
++            .execute().use { it.isSuccessful }
++        if (ok) "https://github.com/$REPO/blob/$branch/$path?raw=true" else null
++    }.getOrNull()
++
++    suspend fun file(context: Context, title: String, checks: List<Check>, description: String? = null, screenshot: ByteArray? = null): Filed =
++        withContext(Dispatchers.IO) {
++            val token = ghToken() ?: return@withContext Filed(false, "还没连接 GitHub：去 账号连接 → GitHub 点一下「连接」")
++            val shot = screenshot?.let { uploadScreenshot(token, it) }
++            val body = issueBody(context, checks, description, shot)
++            val json = JSONObject().put("title", title.take(120)).put("body", body.take(60_000)).put("labels", JSONArray().put(LABEL))
++            runCatching {
++                http.newCall(Request.Builder().url("https://api.github.com/repos/$REPO/issues")
++                    .header("Authorization", "Bearer $token").header("Accept", "application/vnd.github+json")
++                    .post(json.toString().toRequestBody("application/json".toMediaType())).build()).execute().use { r ->
++                    val t = r.body?.string().orEmpty()
++                    if (r.isSuccessful) Filed(true, "已上报", JSONObject(t).optString("html_url"))
++                    else Filed(false, "GitHub 拒绝了（HTTP ${r.code}）：" + t.take(160))
++                }
++            }.getOrElse { Filed(false, "上报失败：${it.message}") }
++        }
++}
++
++/** [Mines-report-31] Agent tool: run the self-check, optionally file it to GitHub for Hark. */
++object MinesSelfCheckTool {
++    const val TOOL_NAME = "mines_selfcheck"
++
++    fun definition() = com.openminis.app.data.model.AgentToolDefinition(
++        name = TOOL_NAME,
++        description = "Run Mines' on-device self-check (model providers, Gemini Live handshake, saved API keys, accessibility/Shizuku/overlay permissions, sandbox shell, MCP servers). " +
++            "Set report=true to file the results with a redacted log excerpt as a GitHub issue (label mines-bug) for the developer, e.g. when the user says something is broken. " +
++            "Use description for what the user reported.",
++        parameters = mapOf(
++            "tool_title" to com.openminis.app.data.model.AgentToolParam("string", "A concise 5-10 word summary shown to the user. Use the same language as the user."),
++            "report" to com.openminis.app.data.model.AgentToolParam("boolean", "true = also file a GitHub issue with the results"),
++            "description" to com.openminis.app.data.model.AgentToolParam("string", "Optional: the problem in the user's words"),
++        ),
++        required = listOf("tool_title"),
++        propertyOrdering = listOf("tool_title", "report", "description"),
++    )
++
++    suspend fun run(ctx: Context, argsJson: String): com.openminis.app.tools.ToolExecutionResult = runCatching {
++        val a = JSONObject(argsJson)
++        val checks = MinesSelfCheck.runAll(ctx)
++        val sb = StringBuilder()
++        checks.forEach { sb.append(if (it.ok) "✓ " else if (it.warn) "! " else "✗ ").append(it.name).append(": ").append(MinesSelfCheck.redact(it.detail)).append('\n') }
++        if (a.optBoolean("report", false)) {
++            val fails = checks.filter { !it.ok && !it.warn }
++            val f = MinesSelfCheck.file(ctx, "[AI 自检] " + (a.optString("description").take(50).ifBlank { "${fails.size} 项失败" }), checks, a.optString("description").ifBlank { null })
++            sb.append(if (f.ok) "Filed: ${f.url}" else "Report failed: ${f.message}")
++        }
++        com.openminis.app.tools.ToolExecutionResult(sb.toString(), true)
++    }.getOrElse { com.openminis.app.tools.ToolExecutionResult("Error: ${it.message}", false) }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusConnect.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusConnect.kt
+index 1840fc1..9d51d53 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/PlusConnect.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/PlusConnect.kt
+@@ -67,7 +67,7 @@ object PlusConnect {
+ 
+     /** GitHub CLI's public OAuth app (device flow enabled, no client secret needed). */
+     private const val GH_CLIENT = "178c6fc778ccc68e1d6a"
+-    private const val GH_SCOPES = "repo read:org gist workflow"
++    private const val GH_SCOPES = "repo read:org gist workflow notifications"
+ 
+     /** Microsoft Graph Command Line Tools public client (device code, delegated scopes). */
+     private const val MS_CLIENT = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusPrefs.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusPrefs.kt
+index a5dfd02..e999c08 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/PlusPrefs.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/PlusPrefs.kt
+@@ -39,6 +39,13 @@ data class VpsServer(
+     val authorized: Boolean = false,
+     /** Why the last check failed, in plain words ("" when it worked). */
+     val lastError: String = "",
++    /** [Mines-vps-31] Extra SSH port to try when the main one is cut (0 = 443 when main is 22). */
++    val altPort: Int = 0,
++    /** [Mines-vps-31] Tailscale / other private host name for the same box (tried when the public IP fails). */
++    val tailscaleHost: String = "",
++    /** [Mines-vps-31] Mines link worker (wss://host:443/mines) token; blank = not installed. */
++    val linkToken: String = "",
++    val linkUrl: String = "",
+     /** The last successful check went through [relay], not directly. */
+     val viaRelay: Boolean = false,
+ ) {
+@@ -86,6 +93,8 @@ data class PlusState(
+     val petWalk: Boolean = true,
+     /** Tap shows the status panel (tasks, balances, quick actions). */
+     val petPanel: Boolean = true,
++    /** [Mines-voice-31] Tap the pet = start / stop the live voice call (double tap = status panel). */
++    val petTapVoice: Boolean = true,
+     /** Offline wake word (Vosk) → voice chat. Off by default (uses the mic + battery). */
+     val wakeWord: Boolean = false,
+     val wakeText: String = "你好小鲸",
+@@ -144,6 +153,8 @@ object PlusPrefs {
+                     osLabel = o.optString("os"),
+                     egressIp = o.optString("egress"),
+                     relay = o.optString("relay"),
++                    altPort = o.optInt("altPort", 0), tailscaleHost = o.optString("tailscaleHost"),
++                    linkToken = o.optString("linkToken"), linkUrl = o.optString("linkUrl"),
+                     authorized = o.optBoolean("authorized", false),
+                     lastError = o.optString("err"),
+                     viaRelay = o.optBoolean("viaRelay", false),
+@@ -181,6 +192,7 @@ object PlusPrefs {
+             petHalfHide = p.getBoolean("petHalfHide", true),
+             petWalk = p.getBoolean("petWalk", true),
+             petPanel = p.getBoolean("petPanel", true),
++            petTapVoice = p.getBoolean("petTapVoice", true),
+             wakeWord = p.getBoolean("wakeWord", false),
+             wakeText = p.getString("wakeText", "你好小鲸") ?: "你好小鲸",
+         )
+@@ -199,7 +211,7 @@ object PlusPrefs {
+                 put("id", s.id); put("name", s.name); put("host", s.host)
+                 put("port", s.port); put("user", s.user); put("enabled", s.enabled)
+                 put("lat", s.lastLatencyMs); put("checked", s.lastCheckedAt)
+-                put("os", s.osLabel); put("egress", s.egressIp); put("relay", s.relay)
++                put("os", s.osLabel); put("egress", s.egressIp); put("relay", s.relay); put("altPort", s.altPort); put("tailscaleHost", s.tailscaleHost); put("linkToken", s.linkToken); put("linkUrl", s.linkUrl)
+                 put("authorized", s.authorized); put("err", s.lastError); put("viaRelay", s.viaRelay)
+             })
+         }
+@@ -233,6 +245,7 @@ object PlusPrefs {
+             ?.putBoolean("petHalfHide", next.petHalfHide)
+             ?.putBoolean("petWalk", next.petWalk)
+             ?.putBoolean("petPanel", next.petPanel)
++            ?.putBoolean("petTapVoice", next.petTapVoice)
+             ?.putBoolean("wakeWord", next.wakeWord)
+             ?.putString("wakeText", next.wakeText)
+             ?.apply()
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt
+index 29672dd..bc3b7a3 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt
+@@ -41,9 +41,25 @@ object PlusVps {
+      * bare 连不上 — a connect that succeeds but never shows a banner is the
+      * signature of something on the path interfering with SSH.
+      */
+-    suspend fun probeDetailed(server: VpsServer, timeoutMs: Int = 6000): ProbeResult = withContext(Dispatchers.IO) {
++    suspend fun probeDetailed(server: VpsServer, timeoutMs: Int = 6000, context: Context? = null): ProbeResult = withContext(Dispatchers.IO) {
++        // [Mines-vps-31] every route of the box (22 → 443 → Tailscale); first SSH banner wins.
++        val errs = ArrayList<String>()
++        for (ep in VpsSsh.endpoints(server)) {
++            val r = probeOne(server.copy(host = ep.host, port = ep.port), timeoutMs)
++            if (r.latencyMs >= 0) return@withContext r
++            errs += ep.label + "：" + r.error
++        }
++        val cut = errs.any { it.contains("没有 SSH 回应") || it.contains("握手被中断") || it.contains("被重置") || it.contains("超时") }
++        val ctx = context ?: appContext
++        ProbeResult(-2, errs.joinToString("；") + if (cut && ctx != null && VpsSsh.vpnActive(ctx)) "\n" + VpsSsh.vpnHint(server) else "")
++    }
++
++    /** Set once from anywhere that has a Context (for the VPN hint in background probes). */
++    @Volatile var appContext: Context? = null
++
++    private fun probeOne(server: VpsServer, timeoutMs: Int): ProbeResult {
+         val start = System.nanoTime()
+-        try {
++        return try {
+             Socket().use { sock ->
+                 sock.tcpNoDelay = true
+                 sock.connect(InetSocketAddress(VpsSsh.preferIpv4(server.host), server.port), timeoutMs)
+@@ -78,7 +94,7 @@ object PlusVps {
+      * is blocked but whose relay works counts as online (via relay).
+      */
+     private suspend fun check(context: Context, s: VpsServer): Check = withContext(Dispatchers.IO) {
+-        val direct = probeDetailed(s)
++        val direct = probeDetailed(s, context = context)
+         if (!VpsSsh.hasKey(context)) {
+             if (direct.latencyMs >= 0 || s.relay.isBlank()) {
+                 return@withContext Check(direct.latencyMs, if (direct.latencyMs >= 0) "还没授权" else direct.error, false, false, null, null)
+@@ -201,6 +217,7 @@ object PlusVps {
+      * the effective mode from local back to VPS on its own.
+      */
+     fun startMonitor(context: Context) {
++        appContext = context.applicationContext
+         val appCtx = context.applicationContext
+         PlusPrefs.init(appCtx)
+         registerNetworkCallback(appCtx)
+@@ -301,6 +318,13 @@ object PlusVps {
+             val (ms, why) = bannerProbe(s.host, s.port, null, null, 0)
+             out += RouteTry("直连", "", ms >= 0, ms, why)
+         }.onFailure { out += RouteTry("直连", "", false, -2, VpsSsh.reason(it)) }
++        // [Mines-vps-31] backup port and Tailscale name, direct
++        VpsSsh.endpoints(s).drop(1).forEach { ep ->
++            runCatching {
++                val (ms, why) = bannerProbe(ep.host, ep.port, null, null, 0)
++                out += RouteTry(ep.label, "", ms >= 0, ms, why)
++            }.onFailure { out += RouteTry(ep.label, "", false, -2, VpsSsh.reason(it)) }
++        }
+         val found = runCatching { SplitProxy.detect(context) }.getOrDefault(emptyList())
+         for (f in found) runCatching {
+             val u = f.upstream
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/VoiceSession.kt b/src/android/app/src/main/java/com/openminis/app/plus/VoiceSession.kt
+new file mode 100644
+index 0000000..3d61d47
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/VoiceSession.kt
+@@ -0,0 +1,196 @@
++package com.openminis.app.plus
++
++import android.Manifest
++import android.app.Activity
++import android.app.Notification
++import android.app.NotificationChannel
++import android.app.NotificationManager
++import android.app.PendingIntent
++import android.app.Service
++import android.content.Context
++import android.content.Intent
++import android.content.pm.PackageManager
++import android.content.pm.ServiceInfo
++import android.os.Build
++import android.os.Bundle
++import android.os.IBinder
++import android.widget.Toast
++import androidx.core.content.ContextCompat
++import com.openminis.app.MainActivity
++import com.openminis.app.R
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.launch
++
++/**
++ * [Mines-voice-31] The live voice call, app-wide.
++ *
++ * build-30 created GeminiLive inside VoiceLiveScreen, so leaving the page hung
++ * up. The call now lives here, kept alive by [VoiceCallService] (foreground,
++ * type microphone). VoiceLiveScreen is only a view onto it; the desk pet shows
++ * the running transcript and starts / stops the call with one tap.
++ */
++object VoiceSession {
++    private val _live = MutableStateFlow<GeminiLive?>(null)
++    val live: StateFlow<GeminiLive?> = _live.asStateFlow()
++    /** Last user line and last answer line, for the desk pet bubble. */
++    val lastUser = MutableStateFlow("")
++    val lastAnswer = MutableStateFlow("")
++    /** Bumps on every transcript update (pet refreshes its bubble). */
++    val transcriptTick = MutableStateFlow(0L)
++
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
++    private var watchJobs: List<Job> = emptyList()
++
++    val active: Boolean get() = _live.value != null
++
++    fun hasMic(c: Context) = ContextCompat.checkSelfPermission(c, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
++
++    enum class StartResult { OK, NO_KEY, NO_MIC, ALREADY }
++
++    /** Must be called while Mines is in the foreground (an Activity is visible): Android only lets a
++     *  microphone foreground service start then. The pet goes through [VoiceTrampolineActivity]. */
++    fun start(context: Context): StartResult {
++        val c = context.applicationContext
++        if (_live.value != null) return StartResult.ALREADY
++        PlusVault.init(c)
++        val key = GeminiRoute.apiKey() ?: return StartResult.NO_KEY
++        if (!hasMic(c)) return StartResult.NO_MIC
++        val userVoice = PlusVault.extra("gemini", "voice").takeIf { PlusVault.extra("gemini", "voice_user") == "1" }
++        val g = GeminiLive(
++            key, PlusVault.extra("gemini", "model") ?: GeminiLive.DEFAULT_MODEL,
++            userVoice ?: GeminiLive.DEFAULT_VOICE,
++            speed = PlusVault.extra("gemini", "speed")?.toFloatOrNull() ?: 1f,
++            pitch = PlusVault.extra("gemini", "pitch")?.toFloatOrNull() ?: 1f,
++            appContext = if (PlusVault.extra("gemini", "phone") != "0") c else null,
++            cloneVoice = VoiceClone.speaker(c),
++        )
++        _live.value = g
++        lastUser.value = ""; lastAnswer.value = ""
++        PetBus.inCall.value = true
++        runCatching { ContextCompat.startForegroundService(c, Intent(c, VoiceCallService::class.java)) }
++        watchJobs.forEach { it.cancel() }
++        watchJobs = listOf(
++            scope.launch { g.phase.collect { PetBus.talking.value = it == GeminiLive.Phase.SPEAKING } },
++            scope.launch {
++                g.lines.collect { ls ->
++                    ls.lastOrNull { it.user }?.let { lastUser.value = it.text.trim() }
++                    ls.lastOrNull { !it.user }?.let { lastAnswer.value = it.text.trim() }
++                    transcriptTick.value = System.currentTimeMillis()
++                }
++            },
++        )
++        g.start()
++        return StartResult.OK
++    }
++
++    fun stop(context: Context) {
++        val g = _live.value
++        _live.value = null
++        watchJobs.forEach { it.cancel() }; watchJobs = emptyList()
++        g?.stop()
++        PetBus.inCall.value = false
++        PetBus.talking.value = false
++        transcriptTick.value = System.currentTimeMillis()
++        runCatching { context.applicationContext.stopService(Intent(context.applicationContext, VoiceCallService::class.java)) }
++    }
++
++    /** Settings changed: hang up and call again with the new settings. */
++    fun restart(context: Context) {
++        if (_live.value == null) return
++        stop(context); start(context)
++    }
++
++    fun toggle(context: Context): StartResult =
++        if (_live.value != null) { stop(context); StartResult.ALREADY } else start(context)
++}
++
++/** [Mines-voice-31] Keeps the call (and the mic) alive when Mines is not on screen. */
++class VoiceCallService : Service() {
++    companion object {
++        private const val CHANNEL = "mines_voice_call"
++        private const val NOTIF_ID = 7311
++        const val ACTION_HANGUP = "com.openminis.app.plus.VOICE_HANGUP"
++    }
++
++    override fun onBind(intent: Intent?): IBinder? = null
++
++    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
++        if (intent?.action == ACTION_HANGUP) {
++            VoiceSession.stop(this); stopSelf(); return START_NOT_STICKY
++        }
++        val nm = getSystemService(NotificationManager::class.java)
++        if (nm.getNotificationChannel(CHANNEL) == null) {
++            nm.createNotificationChannel(NotificationChannel(CHANNEL, "语音通话", NotificationManager.IMPORTANCE_LOW).apply { setShowBadge(false) })
++        }
++        val open = PendingIntent.getActivity(this, 11, Intent(this, MainActivity::class.java)
++            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
++            .putExtra("mines_route", com.openminis.app.ui.plus.PlusRoutes.VOICE),
++            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
++        val hang = PendingIntent.getService(this, 12, Intent(this, VoiceCallService::class.java).setAction(ACTION_HANGUP),
++            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
++        val n: Notification = Notification.Builder(this, CHANNEL)
++            .setSmallIcon(R.drawable.ic_launcher_monochrome)
++            .setContentTitle("语音通话中")
++            .setContentText("离开页面也在听。点桌宠或这里的「挂断」结束。")
++            .setContentIntent(open)
++            .addAction(Notification.Action.Builder(null as android.graphics.drawable.Icon?, "挂断", hang).build())
++            .setOngoing(true)
++            .build()
++        val ok = runCatching {
++            if (Build.VERSION.SDK_INT >= 30) startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
++            else startForeground(NOTIF_ID, n)
++        }
++        if (ok.isFailure) {
++            // Android refused a background mic service: the call still runs while Mines is open.
++            android.util.Log.w("VoiceCallService", "startForeground refused", ok.exceptionOrNull())
++            stopSelf()
++            return START_NOT_STICKY
++        }
++        if (!VoiceSession.active) { stopSelf(); return START_NOT_STICKY }
++        return START_NOT_STICKY
++    }
++}
++
++/**
++ * [Mines-voice-31] Invisible one-frame activity the desk pet opens on tap: it
++ * brings Mines to the foreground for an instant so Android allows the mic
++ * service, asks for the mic permission when needed, toggles the call, and
++ * closes. One tap for the user, nothing to navigate.
++ */
++class VoiceTrampolineActivity : Activity() {
++    override fun onCreate(savedInstanceState: Bundle?) {
++        super.onCreate(savedInstanceState)
++        if (!VoiceSession.active && !VoiceSession.hasMic(this)) {
++            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
++            return
++        }
++        act()
++    }
++
++    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
++        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
++        if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) act()
++        else { Toast.makeText(this, "需要麦克风权限才能语音聊天", Toast.LENGTH_LONG).show(); finish() }
++    }
++
++    private fun act() {
++        when (VoiceSession.toggle(this)) {
++            VoiceSession.StartResult.OK -> Toast.makeText(this, "语音已开始，直接说话", Toast.LENGTH_SHORT).show()
++            VoiceSession.StartResult.ALREADY -> Toast.makeText(this, "语音已结束", Toast.LENGTH_SHORT).show()
++            VoiceSession.StartResult.NO_KEY -> {
++                // No Gemini key yet: open the voice page, which offers 账号连接 / 普通语音模式.
++                com.openminis.app.ui.plus.PlusNav.go(com.openminis.app.ui.plus.PlusRoutes.VOICE)
++                startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT))
++            }
++            VoiceSession.StartResult.NO_MIC -> Toast.makeText(this, "需要麦克风权限才能语音聊天", Toast.LENGTH_LONG).show()
++        }
++        finish()
++        overridePendingTransition(0, 0)
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/VpsSsh.kt b/src/android/app/src/main/java/com/openminis/app/plus/VpsSsh.kt
+index a0f9aaa..c4d7fef 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/VpsSsh.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/VpsSsh.kt
+@@ -124,6 +124,8 @@ object VpsSsh {
+ 
+     /** Plain-words reason for a connection failure. */
+     fun reason(t: Throwable): String {
++        // [Mines-vps-31] a route summary from openAny is already in plain words (keep the VPN hint whole)
++        t.message?.let { m -> if (m.contains("检测到代理") || m.startsWith("直连 ")) return m }
+         var c: Throwable? = t
+         while (c != null) {
+             val m = (c.message ?: "").lowercase()
+@@ -232,10 +234,68 @@ object VpsSsh {
+      * the server's relay. [password] non-null = password login (first-time
+      * authorisation), else the app's key.
+      */
+-    fun open(context: Context, s: VpsServer, viaRelay: Boolean, password: String? = null, timeoutMs: Int = 15_000): Session {
++    /** [Mines-vps-31] One way to reach the box: public IP + port, backup port, Tailscale name. */
++    data class Endpoint(val label: String, val host: String, val port: Int)
++
++    /** Routes tried in order: main port → backup port (443 by default when main is 22) → Tailscale → (relay). */
++    fun endpoints(s: VpsServer): List<Endpoint> {
++        val out = arrayListOf(Endpoint("直连 ${s.port}", s.host, s.port))
++        val alt = if (s.altPort > 0) s.altPort else if (s.port == 22) 443 else 0
++        if (alt > 0 && alt != s.port) out += Endpoint("备用端口 $alt", s.host, alt)
++        if (s.tailscaleHost.isNotBlank()) out += Endpoint("Tailscale", s.tailscaleHost.trim(), s.port)
++        return out
++    }
++
++    /** Which endpoint worked last per server (tried first next time). */
++    private val goodRoute = java.util.concurrent.ConcurrentHashMap<String, String>()
++    fun lastRoute(serverId: String): String? = goodRoute[serverId]
++
++    /** A system VPN (Clash / v2ray / …) is the phone's default route. */
++    fun vpnActive(context: Context): Boolean = runCatching {
++        val cm = context.getSystemService(android.net.ConnectivityManager::class.java)
++        cm.getNetworkCapabilities(cm.activeNetwork)?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) == true
++    }.getOrDefault(false)
++
++    private fun preBanner(t: Throwable): Boolean {
++        val r = reason(t)
++        return r.startsWith("握手被中断") || r.startsWith("连接被重置") || r.startsWith("连接超时")
++    }
++
++    /** The one plain hint when a proxy app cuts SSH before the banner. */
++    fun vpnHint(s: VpsServer) = "检测到代理，SSH 被切断：请在代理 App 里把 Mines 或 ${s.host} 设为直连"
++
++    /**
++     * [Mines-vps-31] Open over the first endpoint that answers. Fails over on
++     * pre-banner closes / resets / timeouts (what a VPN cutting SSH looks
++     * like); a wrong key / password or a changed host key stops at once.
++     */
++    fun openAny(context: Context, s: VpsServer, password: String? = null, timeoutMs: Int = 12_000): Session {
++        val eps = endpoints(s).let { l -> val g = goodRoute[s.id]; if (g == null) l else l.sortedBy { if (it.label == g) 0 else 1 } }
++        val errs = ArrayList<String>()
++        var anyPreBanner = false
++        for (ep in eps) {
++            try {
++                val sess = open(context, s, false, password, timeoutMs, ep)
++                goodRoute[s.id] = ep.label
++                sess.setConfig("mines.route", ep.label)
++                return sess
++            } catch (e: NoKeyException) { throw e
++            } catch (e: HostKeyChangedException) { throw e
++            } catch (t: Throwable) {
++                val r = reason(t)
++                if (r.startsWith("钥匙或密码不对")) throw t
++                if (preBanner(t)) anyPreBanner = true
++                errs += "${ep.label}：$r"
++            }
++        }
++        val hint = if (anyPreBanner && vpnActive(context)) "\n" + vpnHint(s) else ""
++        throw IOException(errs.joinToString("；") + hint)
++    }
++
++    fun open(context: Context, s: VpsServer, viaRelay: Boolean, password: String? = null, timeoutMs: Int = 15_000, ep: Endpoint? = null): Session {
+         val jsch = newJsch(context, withKey = password == null)
+-        var host = preferIpv4(s.host)
+-        var port = s.port
++        var host = preferIpv4(ep?.host ?: s.host)
++        var port = ep?.port ?: s.port
+         var proxy: Proxy? = null
+         if (viaRelay) {
+             val r = s.relay.trim()
+@@ -362,14 +422,14 @@ object VpsSsh {
+     /** Live session for [s] (cached), with the route it took. */
+     fun session(context: Context, s: VpsServer): Pair<Session, Boolean> {
+         sessions[s.id]?.takeIf { it.isConnected }?.let { return it to (it.getConfig("mines.relay") == "1") }
+-        val direct = runCatching { open(context, s, viaRelay = false) }
++        val direct = runCatching { openAny(context, s) }
+         val sess: Session; val relay: Boolean
+         if (direct.isSuccess) { sess = direct.getOrThrow(); relay = false }
+         else {
+             val e = direct.exceptionOrNull()!!
+             if (e is NoKeyException || e is HostKeyChangedException || s.relay.isBlank()) throw e
+             sess = try { open(context, s, viaRelay = true) } catch (t: Throwable) {
+-                throw IOException("直连：${reason(e)}；中转：${reason(t)}", t)
++                throw IOException("${reason(e)}；中转：${reason(t)}", t)
+             }
+             relay = true
+         }
+@@ -392,8 +452,11 @@ object VpsSsh {
+      */
+     fun authorize(context: Context, s: VpsServer, password: String): Result<String> = runCatching {
+         val (_, pub) = ensureKey(context)
+-        val viaRelay = runCatching { open(context, s, false, password).also { it.disconnect() } }.isFailure && s.relay.isNotBlank()
+-        val sess = try { open(context, s, viaRelay, password) } catch (t: Throwable) { throw IOException(reason(t), t) }
++        // [Mines-vps-31] same route list as normal logins (22 → 443 → Tailscale), then the relay.
++        val sess = try { openAny(context, s, password) } catch (t: Throwable) {
++            if (s.relay.isBlank()) throw IOException(t.message ?: reason(t), t)
++            try { open(context, s, true, password) } catch (t2: Throwable) { throw IOException((t.message ?: "") + "；中转：" + reason(t2), t2) }
++        }
+         try {
+             val r = exec(sess,
+                 "umask 077; mkdir -p ~/.ssh ~/minis-jobs; k=\$(cat); touch ~/.ssh/authorized_keys; " +
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/WakeWordService.kt b/src/android/app/src/main/java/com/openminis/app/plus/WakeWordService.kt
+index 768d78e..4b90061 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/WakeWordService.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/WakeWordService.kt
+@@ -158,6 +158,11 @@ class WakeWordService : Service() {
+     private fun onWake() {
+         Log.i(TAG, "wake word heard")
+         PetBus.wake.value = System.currentTimeMillis()
++        // [Mines-voice-31] With the desk pet on, the call starts right where the user is
++        // (transcript next to the pet) instead of switching to the voice page.
++        if (VoiceSession.active) return
++        if (android.provider.Settings.canDrawOverlays(this) && PlusPrefs.state.value.petEnabled && PlusPrefs.state.value.petTapVoice &&
++            runCatching { startActivity(Intent(this, VoiceTrampolineActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)) }.isSuccess) return
+         com.openminis.app.ui.plus.PlusNav.go(com.openminis.app.ui.plus.PlusRoutes.VOICE)
+         // Allowed from the background because the app holds "display over other
+         // apps" (the desk pet); without it the notification below opens it.
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/FastUi.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/FastUi.kt
+index 371502f..0a3ea52 100644
+--- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/FastUi.kt
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/FastUi.kt
+@@ -133,6 +133,37 @@ Backend: accessibility when enabled, otherwise Shizuku (uiautomator + input).
+         return null
+     }
+ 
++    // ── [Mines-keys-31] helpers for the API-key agent ─────────────────────
++
++    /** True when a UI backend (accessibility or Shizuku) is available. */
++    fun ready(): Boolean = backend() != null
++
++    /** Every visible text on screen, untruncated (keys can be longer than list labels). */
++    fun allText(): String {
++        val be = backend() ?: return ""
++        if (be == Backend.A11Y) {
++            val svc = MinisAccessibilityService.getInstance() ?: return ""
++            val sb = StringBuilder()
++            fun walk(n: AccessibilityNodeInfo?, depth: Int) {
++                if (n == null || depth > 60 || sb.length > 60_000) return
++                n.text?.let { sb.append(it).append('\n') }
++                n.contentDescription?.let { sb.append(it).append('\n') }
++                for (i in 0 until n.childCount) walk(n.getChild(i), depth + 1)
++            }
++            for (r in svc.rootNodes()) walk(r, 0)
++            return sb.toString()
++        }
++        return snapshotShizuku(true).joinToString("\n") { it.label }
++    }
++
++    /** Tap the first element whose label equals / contains [text]; false when not on screen. */
++    fun tapText(text: String): Boolean {
++        val be = backend() ?: return false
++        ensureListener()
++        val el = findByText(be, text) ?: return false
++        return tapEl(be, el).first
++    }
++
+     /** Open an app by its name as shown on the launcher (or a package name). */
+     fun voiceOpenApp(name: String): String {
+         val r = com.openminis.app.plus.AppLauncher.open(context, name)
+diff --git a/src/android/app/src/main/java/com/openminis/app/tools/AgentTools.kt b/src/android/app/src/main/java/com/openminis/app/tools/AgentTools.kt
+index d74923b..e36f2d1 100644
+--- a/src/android/app/src/main/java/com/openminis/app/tools/AgentTools.kt
++++ b/src/android/app/src/main/java/com/openminis/app/tools/AgentTools.kt
+@@ -65,6 +65,8 @@ object AgentTools {
+             add(subAgentTaskDefinition(rosterNames))
+         }
+         knowledgeTool?.let { add(it) }
++        // [Mines-report-31] self-check / report-to-developer tool
++        if (!isHelper) add(com.openminis.app.plus.MinesSelfCheckTool.definition())
+     }
+ 
+     /**
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
+index 575a8ec..0b868be 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
+@@ -13240,6 +13240,8 @@ class ChatViewModel(
+                     )
+                 }
+             "memory_get" -> executeMemoryGetTool(argsJson)
++            com.openminis.app.plus.MinesSelfCheckTool.TOOL_NAME ->
++                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.MinesSelfCheckTool.run(context, argsJson) }
+             com.openminis.app.plus.KnowledgeBase.TOOL_NAME ->
+                 kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.KnowledgeBase.runTool(context, argsJson) }
+             else -> ToolExecutionResult("Unknown tool: $name", false)
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt b/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
+index c71b8de..d4bdb27 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
+@@ -667,6 +667,9 @@ fun AppNavigation(
+         composable(com.openminis.app.ui.plus.PlusRoutes.VERIFY) {
+             com.openminis.app.ui.plus.VerifyScreen(onBack = { navController.safePopBackStack() })
+         }
++        composable(com.openminis.app.ui.plus.PlusRoutes.REPORT) {
++            com.openminis.app.ui.plus.ReportScreen(onBack = { navController.safePopBackStack() })
++        }
+         composable(com.openminis.app.ui.plus.PlusRoutes.UPDATE) {
+             com.openminis.app.ui.plus.UpdateScreen(onBack = { navController.safePopBackStack() })
+         }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
+index 821f094..f4b4652 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
+@@ -186,6 +186,16 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+             )
+         }
+         val bases = entries.keys.map { PlusVault.baseId(it) }.distinct().sorted().mapNotNull { PlusVault.kind(it) }
++        // [Mines-accounts-31] Fill in a missing account name once from the provider's "who am I" API.
++        LaunchedEffect(entries.size) {
++            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
++                entries.values.filter { com.openminis.app.plus.AccountLabel.identity(it.kindId, it) == null && PlusVault.hasSecret(it.kindId) }
++                    .take(6).forEach { en ->
++                        val r = runCatching { com.openminis.app.plus.KeyTester.test(PlusVault.baseId(en.kindId), PlusVault.secret(en.kindId) ?: return@forEach) }.getOrNull()
++                        r?.identity?.takeIf { it.isNotBlank() }?.let { PlusVault.setExtra(en.kindId, "identity", it) }
++                    }
++            }
++        }
+         if (bases.isNotEmpty()) {
+             PlusSection("已连接 · ${entries.size} 个账号", footer = "每个服务可以连多个账号。点 ☆ 设为默认账号：AI 不指定账号时用默认的。") {
+                 bases.forEachIndexed { i, base ->
+@@ -218,8 +228,9 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+                                     tint = if (isDef) Color(0xFFFFB300) else MaterialTheme.colorScheme.onSurfaceVariant)
+                             }
+                             Column(Modifier.weight(1f)) {
+-                                Text(e?.account?.takeIf { it.isNotBlank() } ?: "账号 ${id.substringAfter('#', "1")}",
+-                                    fontSize = 13.sp)
++                                // [Mines-accounts-31] login method + masked identity instead of "账号 1"
++                                val kindOf = PlusVault.kind(id) ?: base
++                                Text(com.openminis.app.plus.AccountLabel.row(id, kindOf, e), fontSize = 15.sp)
+                                 Text(if (isDef) "已连接 · 默认" else "已连接", fontSize = 13.sp, color = Green)
+                             }
+                             MinesIcon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+@@ -351,7 +362,11 @@ private fun ConnectionDetailScreen(
+             Column(Modifier.weight(1f)) {
+                 Text(kind.name, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+                 Text(
+-                    if (entry != null) "已连接" + (entry.account.takeIf { it.isNotBlank() }?.let { " · $it" } ?: "") else kind.desc,
++                    // [Mines-accounts-31] full identity only here (rows show it masked)
++                    if (entry != null) "已连接 · " + com.openminis.app.plus.AccountLabel.method(kind, entry) +
++                        (com.openminis.app.plus.AccountLabel.identity(kind.id, entry)?.let { " · $it" } ?: "") +
++                        (if (PlusVault.hasSecret(kind.id) && (entry.via == "key" || entry.via == "token")) "\n" + kind.keyLabel + "：" + com.openminis.app.plus.AccountLabel.maskSecret(PlusVault.secret(kind.id) ?: "") else "")
++                    else kind.desc,
+                     fontSize = 13.sp,
+                     color = if (entry != null) Green else MaterialTheme.colorScheme.onSurfaceVariant,
+                 )
+@@ -405,6 +420,10 @@ private fun ConnectionDetailScreen(
+             ConnMethod.CALENDAR -> CalendarBlock(kind)
+             ConnMethod.A11Y -> A11yBlock(kind, resumes)
+         }
++        // [Mines-keys-31] Services connected by login whose API token Mines can also fetch (GitHub, DigitalOcean).
++        if (com.openminis.app.plus.KeyAgent.recipe(kind.id) != null && kind.method != ConnMethod.KEY && !kind.alsoKey) {
++            PlusSection("让 Mines 拿 ${kind.keyLabel}", footer = "你只需要登录，Mines 会自己创建、读取、测试并加密保存。") { KeyAgentButton(kind) }
++        }
+         if (kind.alsoKey && kind.method == ConnMethod.WEB) {
+             PlusSection("也可以只用 ${kind.keyLabel}", footer = "用 ${kind.keyLabel} 时，AI 在沙箱里通过 ${kind.envKey} 调 API，不需要邮箱。") {
+                 KeyBlockBody(kind, resumes, false)
+@@ -622,7 +641,9 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
+     }
+ 
+     Column(Modifier.fillMaxWidth()) {
+-        if (kind.keyUrl != null) BigAction("去获取${kind.keyLabel}") { openExternal(context, kind.keyUrl) }
++        // [Mines-keys-31] Mines creates the key itself; the user only logs in.
++        if (com.openminis.app.plus.KeyAgent.recipe(kind.id) != null) KeyAgentButton(kind)
++        if (kind.keyUrl != null) SecondaryAction("自己去官网拿${kind.keyLabel}") { openExternal(context, kind.keyUrl) }
+         val f = found
+         if (f != null) {
+             Column(
+@@ -712,3 +733,42 @@ private fun A11yBlock(kind: ConnectionKind, resumes: Int) {
+     }
+ }
+ 
++
++
++/** [Mines-keys-31] One tap: Mines opens the key page, creates the key, tests it, saves it. */
++@Composable
++private fun KeyAgentButton(kind: ConnectionKind) {
++    val context = LocalContext.current
++    val recipe = com.openminis.app.plus.KeyAgent.recipe(kind.id) ?: return
++    var open by remember { mutableStateOf(false) }
++    var chromeStatus by remember { mutableStateOf<String?>(null) }
++    val scope = rememberCoroutineScope()
++    BigAction("让 Mines 帮我拿${kind.keyLabel}") {
++        if (recipe.mode == com.openminis.app.plus.KeyAgent.Mode.WEBVIEW) open = true
++        else {
++            openExternal(context, recipe.url)
++            chromeStatus = recipe.note
++            scope.launch {
++                val known = PlusVault.secret(kind.id)
++                val key = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
++                    com.openminis.app.plus.KeyAgent.runChromeA11y(context.applicationContext, recipe, known, { false }) { chromeStatus = it }
++                }
++                if (key != null) {
++                    chromeStatus = "拿到了，正在测试…"
++                    val r = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.KeyTester.test(PlusVault.baseId(kind.id), key) }
++                    if (r.ok) {
++                        PlusVault.save(context, kind, r.identity ?: "", key, share = kind.envKey != null, via = "key")
++                        chromeStatus = "✓ 已拿到并保存：" + com.openminis.app.plus.AccountLabel.maskSecret(key)
++                        runCatching { context.startActivity(android.content.Intent(context, com.openminis.app.MainActivity::class.java)
++                            .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)) }
++                    } else chromeStatus = "拿到的密钥测试没通过：${r.message}"
++                }
++            }
++        }
++    }
++    chromeStatus?.let { Text(it, fontSize = 15.sp, modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) }
++    if (open) KeyAgentDialog(kind) { saved ->
++        open = false
++        if (saved) Toast.makeText(context, "已连接 ${kind.name}", Toast.LENGTH_SHORT).show()
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/KeyAgentScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/KeyAgentScreen.kt
+new file mode 100644
+index 0000000..aa62623
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/KeyAgentScreen.kt
+@@ -0,0 +1,178 @@
++package com.openminis.app.ui.plus
++
++import android.annotation.SuppressLint
++import android.webkit.CookieManager
++import android.webkit.JavascriptInterface
++import android.webkit.WebView
++import android.webkit.WebViewClient
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.navigationBarsPadding
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.statusBarsPadding
++import androidx.compose.material3.Button
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedButton
++import androidx.compose.material3.Surface
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import androidx.compose.ui.viewinterop.AndroidView
++import androidx.compose.ui.window.Dialog
++import androidx.compose.ui.window.DialogProperties
++import com.openminis.app.plus.ConnectionKind
++import com.openminis.app.plus.KeyAgent
++import com.openminis.app.plus.KeyTester
++import com.openminis.app.plus.MINES_MOBILE_UA
++import com.openminis.app.plus.PlusVault
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.suspendCancellableCoroutine
++import kotlinx.coroutines.withContext
++import kotlin.coroutines.resume
++
++/**
++ * [Mines-keys-31] Full-screen "Mines 帮你拿 Key": the provider's key page in an
++ * in-app WebView driven by [KeyAgent]. The user only signs in; one big line
++ * says what is happening, and one button appears only when the user must act.
++ */
++@SuppressLint("SetJavaScriptEnabled")
++@Composable
++fun KeyAgentDialog(kind: ConnectionKind, onClose: (saved: Boolean) -> Unit) {
++    val context = LocalContext.current
++    val recipe = KeyAgent.recipe(kind.id) ?: run { onClose(false); return }
++    var status by remember { mutableStateOf(recipe.note.ifBlank { "正在打开官方页面…" }) }
++    var waitUser by remember { mutableStateOf(false) }
++    var resumeTick by remember { mutableStateOf(0) }
++    var done by remember { mutableStateOf<String?>(null) }
++    var webView by remember { mutableStateOf<WebView?>(null) }
++    val captured = remember { java.util.concurrent.atomic.AtomicReference<String?>(null) }
++    val known = PlusVault.secret(kind.id)
++
++    suspend fun eval(js: String): String {
++        val wv = webView ?: return ""
++        return suspendCancellableCoroutine { cont ->
++            runCatching {
++                wv.evaluateJavascript("(function(){try{${KeyAgent.JS_HELPER};return String($js)}catch(e){return ''}})()") { r ->
++                    val v = runCatching { org.json.JSONTokener(r ?: "\"\"").nextValue() as? String }.getOrNull() ?: ""
++                    if (cont.isActive) cont.resume(v)
++                }
++            }.onFailure { if (cont.isActive) cont.resume("") }
++        }
++    }
++
++    suspend fun finishWith(key: String) {
++        status = "拿到了，正在测试这个密钥…"
++        val r = withContext(Dispatchers.IO) { KeyTester.test(PlusVault.baseId(kind.id), key) }
++        if (!r.ok) { status = "拿到的密钥测试没通过：${r.message}。可以点「继续」再试一次"; waitUser = true; return }
++        PlusVault.save(context, kind, r.identity ?: PlusVault.entries.value[kind.id]?.account ?: "", key,
++            share = PlusVault.entries.value[kind.id]?.shareWithAi ?: (kind.envKey != null), via = "key")
++        r.identity?.let { PlusVault.setExtra(kind.id, "identity", it) }
++        done = "✓ 已拿到并保存：" + com.openminis.app.plus.AccountLabel.maskSecret(key) + "\n" + r.message
++    }
++
++    LaunchedEffect(webView, resumeTick) {
++        val wv = webView ?: return@LaunchedEffect
++        waitUser = false
++        var step = 0
++        var misses = 0
++        val until = System.currentTimeMillis() + 5 * 60_000
++        delay(2500)
++        while (done == null && System.currentTimeMillis() < until) {
++            val text = eval("window.__mines.text()")
++            val key = captured.get()?.let { KeyAgent.findKey(recipe, it, known) } ?: KeyAgent.findKey(recipe, text, known)
++            if (key != null && step > 0) { finishWith(key); if (done != null || waitUser) return@LaunchedEffect }
++            KeyAgent.needsUser(text)?.let { status = it; waitUser = true; return@LaunchedEffect }
++            val url = wv.url.orEmpty()
++            val onLogin = url.contains("login", true) || url.contains("signin", true) || url.contains("sign-in", true) ||
++                url.contains("auth", true) && !url.contains("token", true) ||
++                (step == 0 && recipe.loginHints.any { text.contains(it) } && text.length < 4000 && misses > 2)
++            if (onLogin) { status = "请先在页面上登录，登录好 Mines 会自动继续"; misses = 0; delay(2000); continue }
++            if (step < recipe.steps.size) {
++                val s = recipe.steps[step]
++                val ok = if (s.fill != null) eval("window.__mines.fill(${org.json.JSONObject.quote(s.fill)})").isNotBlank()
++                    else eval("window.__mines.click(${org.json.JSONArray(s.click)})").isNotBlank()
++                if (ok) { status = if (s.fill != null) "已填好名称…" else "已点「${s.click.first()}」…"; step++; misses = 0; delay(1800); continue }
++                misses++
++                if (s.optional && misses >= 3) { step++; misses = 0 }
++                else if (misses >= 12) {
++                    // A payment wall or a page we don't know: say it plainly, never click "pay".
++                    status = if (KeyAgent.payWords.any { text.contains(it, true) }) "这里需要绑卡或充值，Mines 不会替你付钱。你可以自己处理后点「继续」"
++                        else "页面和预想的不一样，请你点一下「${s.click.firstOrNull() ?: "创建"}」，然后点「继续」"
++                    waitUser = true; return@LaunchedEffect
++                }
++            } else {
++                status = "正在读取新密钥…"
++                misses++
++                if (misses == 4) eval("window.__mines.click(['Copy','复制','Copy key','Copy token'])")
++                if (misses > 12) { status = "没在页面上找到新密钥。请点页面上的「复制」，然后点「继续」"; waitUser = true; return@LaunchedEffect }
++            }
++            delay(1500)
++        }
++        if (done == null && !waitUser) { status = "时间太久了。可以点「继续」再试，或关闭后手动粘贴"; waitUser = true }
++    }
++
++    DisposableEffect(Unit) { onDispose { runCatching { webView?.stopLoading(); webView?.destroy() } } }
++
++    Dialog(onDismissRequest = { onClose(done != null) }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
++        Surface(Modifier.fillMaxSize()) {
++            Column(Modifier.fillMaxSize().statusBarsPadding()) {
++                Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.primaryContainer).padding(16.dp)) {
++                    Text("Mines 正在帮你拿 ${kind.name} 的${kind.keyLabel}", fontSize = 17.sp, fontWeight = FontWeight.SemiBold,
++                        color = MaterialTheme.colorScheme.onPrimaryContainer)
++                    Text(done ?: status, fontSize = 18.sp, color = if (done != null) Color(0xFF1F7A3F) else MaterialTheme.colorScheme.onPrimaryContainer,
++                        modifier = Modifier.padding(top = 6.dp))
++                }
++                Box(Modifier.weight(1f).fillMaxWidth()) {
++                    AndroidView(modifier = Modifier.fillMaxSize(), factory = { ctx ->
++                        WebView(ctx).apply {
++                            settings.javaScriptEnabled = true
++                            settings.domStorageEnabled = true
++                            settings.userAgentString = MINES_MOBILE_UA
++                            CookieManager.getInstance().setAcceptCookie(true)
++                            CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
++                            addJavascriptInterface(object {
++                                @JavascriptInterface fun found(t: String?) { if (!t.isNullOrBlank()) captured.set(t) }
++                            }, "MinesKey")
++                            webViewClient = object : WebViewClient() {
++                                override fun onPageFinished(view: WebView, url: String) {
++                                    // Catch the page's own 「复制」 button: clipboard writes go to Mines too.
++                                    view.evaluateJavascript("""(function(){try{if(window.__minesClip)return;window.__minesClip=1;
++                                        var c=navigator.clipboard;if(c&&c.writeText){var o=c.writeText.bind(c);c.writeText=function(t){try{MinesKey.found(String(t))}catch(e){};return o(t)}}
++                                        document.addEventListener('copy',function(){try{MinesKey.found(String(window.getSelection()))}catch(e){}},true);}catch(e){}})()""", null)
++                                    CookieManager.getInstance().flush()
++                                }
++                            }
++                            loadUrl(recipe.url)
++                            webView = this
++                        }
++                    })
++                }
++                Row(Modifier.fillMaxWidth().navigationBarsPadding().padding(12.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
++                    if (done != null) Button(onClick = { onClose(true) }, modifier = Modifier.weight(1f).heightIn(min = 56.dp)) { Text("完成", fontSize = 18.sp) }
++                    else {
++                        if (waitUser) Button(onClick = { resumeTick++ }, modifier = Modifier.weight(1f).heightIn(min = 56.dp)) { Text("继续", fontSize = 18.sp) }
++                        OutlinedButton(onClick = { onClose(false) }, modifier = Modifier.weight(if (waitUser) 0.6f else 1f).heightIn(min = 56.dp)) { Text("关闭", fontSize = 16.sp) }
++                    }
++                }
++            }
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PersonalizeScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PersonalizeScreen.kt
+index 72c454f..c881815 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/PersonalizeScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PersonalizeScreen.kt
+@@ -252,6 +252,7 @@ private fun PetBehaviourSection() {
+         PetToggle("自动贴边", "松手后靠到最近的屏幕边", st.petEdgeSnap) { on -> set { it.copy(petEdgeSnap = on) } }
+         PetToggle("贴边半藏", "不动的时候藏一半到屏幕外，点一下出来", st.petHalfHide) { on -> set { it.copy(petHalfHide = on) } }
+         PetToggle("偶尔散步", "闲着时沿屏幕边走几步", st.petWalk) { on -> set { it.copy(petWalk = on) } }
++        PetToggle("点一下开始/结束语音", "通话时桌宠旁边显示你说的话和回答；双击打开状态面板", st.petTapVoice) { on -> set { it.copy(petTapVoice = on) } }
+         PetToggle("点它显示状态面板", "任务进度、服务器任务、模型余额和快捷按钮", st.petPanel) { on -> set { it.copy(petPanel = on) } }
+         PetToggle("穿透模式", "触摸穿过桌宠", st.petPassThrough) { on -> set { it.copy(petPassThrough = on) } }
+     }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
+index 86d4eec..09ffadd 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
+@@ -79,6 +79,8 @@ object PlusRoutes {
+     const val KNOWLEDGE = "plus_knowledge"
+     const val VERIFY = "plus_verify"
+     const val UPDATE = "plus_update"
++    const val REPORT = "plus_report"
++    const val DIGEST = "plus_digest"
+     const val SERVER = "plus_server/{id}"
+     fun server(id: String) = "plus_server/$id"
+ }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ReportScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ReportScreen.kt
+new file mode 100644
+index 0000000..402bec4
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ReportScreen.kt
+@@ -0,0 +1,112 @@
++package com.openminis.app.ui.plus
++
++import android.net.Uri
++import androidx.activity.compose.rememberLauncherForActivityResult
++import androidx.activity.result.PickVisualMediaRequest
++import androidx.activity.result.contract.ActivityResultContracts
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.width
++import androidx.compose.material3.Button
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedButton
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.platform.LocalUriHandler
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import com.openminis.app.plus.MinesSelfCheck
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++
++/** [Mines-report-31] 一键冒烟测试 + 上报, and 报告问题 (description + screenshot). */
++@Composable
++fun ReportScreen(onBack: () -> Unit) {
++    val context = LocalContext.current
++    val scope = rememberCoroutineScope()
++    val uri = LocalUriHandler.current
++    var busy by remember { mutableStateOf<String?>(null) }
++    var checks by remember { mutableStateOf<List<MinesSelfCheck.Check>>(emptyList()) }
++    var result by remember { mutableStateOf<MinesSelfCheck.Filed?>(null) }
++    var desc by remember { mutableStateOf("") }
++    var shot by remember { mutableStateOf<Uri?>(null) }
++    val pick = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { shot = it }
++
++    fun runAndReport() {
++        if (busy != null) return
++        scope.launch {
++            busy = "正在检查…"
++            checks = MinesSelfCheck.runAll(context) { busy = "正在检查：$it" }
++            val fails = checks.filter { !it.ok && !it.warn }
++            busy = "正在上报…"
++            result = MinesSelfCheck.file(context,
++                "[自检] build-${com.openminis.app.BuildConfig.MINES_BUILD} · " + (if (fails.isEmpty()) "全部通过" else "${fails.size} 项失败：" + fails.take(3).joinToString("、") { it.name }),
++                checks)
++            busy = null
++        }
++    }
++
++    fun manual() {
++        if (busy != null || desc.isBlank()) return
++        scope.launch {
++            busy = "正在上报…"
++            val png = shot?.let { u -> withContext(Dispatchers.IO) { runCatching { context.contentResolver.openInputStream(u)?.use { it.readBytes() } }.getOrNull() } }
++            result = MinesSelfCheck.file(context, "[报告问题] " + desc.lines().first().take(60), checks, desc, png)
++            busy = null
++        }
++    }
++
++    PlusPage("测试与上报", onBack) {
++        PlusSection(null, footer = "会检查：模型服务、实时语音握手、账号密钥、无障碍/Shizuku/悬浮窗、沙箱、MCP。结果和日志（密钥、Token 已隐去，邮箱打码）用你连接的 GitHub 账号发成一条问题，Hark 会看。") {
++            Button(onClick = { runAndReport() }, enabled = busy == null,
++                modifier = Modifier.fillMaxWidth().padding(14.dp).heightIn(min = 64.dp)) {
++                Text(busy ?: "一键冒烟测试 + 上报", fontSize = 19.sp, fontWeight = FontWeight.SemiBold)
++            }
++        }
++        result?.let { r ->
++            PlusSection(null) {
++                Text(if (r.ok) "✓ 已上报给 Hark" else "✗ " + r.message, fontSize = 18.sp,
++                    color = if (r.ok) Color(0xFF1F7A3F) else Color(0xFFB3261E), modifier = Modifier.padding(14.dp))
++                if (r.url != null) OutlinedButton(onClick = { uri.openUri(r.url) }, modifier = Modifier.padding(horizontal = 14.dp, vertical = 4.dp)) { Text("打开这条问题") }
++            }
++        }
++        if (checks.isNotEmpty()) PlusSection("检查结果") {
++            checks.forEach { c ->
++                Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp)) {
++                    Text(if (c.ok) "✓" else if (c.warn) "!" else "✗", fontSize = 18.sp,
++                        color = if (c.ok) Color(0xFF1F7A3F) else if (c.warn) Color(0xFF9A6700) else Color(0xFFB3261E))
++                    Spacer(Modifier.width(10.dp))
++                    Column(Modifier.weight(1f)) {
++                        Text(c.name, fontSize = 16.sp)
++                        Text(c.detail, fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
++                    }
++                }
++            }
++        }
++        PlusSection("报告问题", footer = "写一句哪里不对就行；截图可选。") {
++            OutlinedTextField(desc, { desc = it }, label = { Text("哪里不对？") }, minLines = 3,
++                modifier = Modifier.fillMaxWidth().padding(14.dp))
++            OutlinedButton(onClick = { pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
++                modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp).heightIn(min = 52.dp)) {
++                Text(if (shot != null) "已选截图 ✓（点这里换一张）" else "加一张截图（可选）", fontSize = 16.sp)
++            }
++            Button(onClick = { manual() }, enabled = busy == null && desc.isNotBlank(),
++                modifier = Modifier.fillMaxWidth().padding(14.dp).heightIn(min = 56.dp)) { Text("发给 Hark", fontSize = 18.sp) }
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
+index b56898d..3ba9233 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
+@@ -92,46 +92,22 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+         mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
+     }
+     val askMic = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { hasMic = it }
+-    // [Mines-voice] Voice (female by default), speed, pitch and phone control
+-    // are adjustable from the ⚙ sheet; changing them reconnects with the new
+-    // settings.
+-    var settingsVersion by remember { mutableStateOf(0) }
++    // [Mines-voice-31] The call lives in VoiceSession (foreground service), so
++    // leaving this page no longer hangs up; this screen is a view onto it.
+     var showSettings by remember { mutableStateOf(false) }
+-    val live = remember(key, settingsVersion) {
+-        key?.let {
+-            val userVoice = PlusVault.extra("gemini", "voice").takeIf { PlusVault.extra("gemini", "voice_user") == "1" }
+-            GeminiLive(
+-                it, PlusVault.extra("gemini", "model") ?: GeminiLive.DEFAULT_MODEL,
+-                userVoice ?: GeminiLive.DEFAULT_VOICE,
+-                speed = PlusVault.extra("gemini", "speed")?.toFloatOrNull() ?: 1f,
+-                pitch = PlusVault.extra("gemini", "pitch")?.toFloatOrNull() ?: 1f,
+-                appContext = if (PlusVault.extra("gemini", "phone") != "0") context.applicationContext else null,
+-                cloneVoice = com.openminis.app.plus.VoiceClone.speaker(context),
+-            )
+-        }
+-    }
+-    DisposableEffect(live) {
+-        // [Mines-pet-25] The desk pet talks along; the wake-word listener lets go of the mic.
+-        com.openminis.app.plus.PetBus.inCall.value = live != null
+-        onDispose { live?.stop(); com.openminis.app.plus.PetBus.inCall.value = false; com.openminis.app.plus.PetBus.talking.value = false }
+-    }
+-    if (live != null) {
+-        val ph by live.phase.collectAsState()
+-        LaunchedEffect(ph) { com.openminis.app.plus.PetBus.talking.value = ph == GeminiLive.Phase.SPEAKING }
+-    }
++    val liveState by com.openminis.app.plus.VoiceSession.live.collectAsState()
++    val live = liveState
++    var hungUp by remember { mutableStateOf(false) }
+ 
+-    // Keep the screen on during a call; hang up when leaving.
++    // Keep the screen on while the page is open (the call itself continues when it is left).
+     DisposableEffect(Unit) {
+         val act = context as? android.app.Activity
+         act?.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+-        onDispose {
+-            act?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+-            live?.stop()
+-        }
++        onDispose { act?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
+     }
+-    LaunchedEffect(live, hasMic) {
+-        if (live != null && hasMic) live.start()
+-        else if (live != null && !hasMic) askMic.launch(Manifest.permission.RECORD_AUDIO)
++    LaunchedEffect(key, hasMic) {
++        if (key != null && hasMic && !hungUp && com.openminis.app.plus.VoiceSession.live.value == null) com.openminis.app.plus.VoiceSession.start(context)
++        else if (key != null && !hasMic) askMic.launch(Manifest.permission.RECORD_AUDIO)
+     }
+ 
+     diag?.let { d ->
+@@ -143,7 +119,7 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+                     d.forEach { Text(it, fontSize = 14.sp, modifier = Modifier.padding(vertical = 2.dp)) }
+                 }
+             },
+-            confirmButton = { androidx.compose.material3.TextButton(onClick = { diag = null; live?.start() }) { Text("重新连接") } },
++            confirmButton = { androidx.compose.material3.TextButton(onClick = { diag = null; if (live != null) live.start() else com.openminis.app.plus.VoiceSession.start(context) }) { Text("重新连接") } },
+             dismissButton = { androidx.compose.material3.TextButton(onClick = { diag = null }) { Text("关闭") } },
+         )
+     }
+@@ -151,8 +127,8 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+     var plainMode by remember { mutableStateOf(false) }
+     val plain = remember { com.openminis.app.plus.PlainVoice(context.applicationContext) }
+     DisposableEffect(plain) { onDispose { plain.stop() } }
+-    fun enterPlain() { live?.stop(); plainMode = true; if (hasMic) plain.start() else askMic.launch(Manifest.permission.RECORD_AUDIO) }
+-    if (showSettings) VoiceSettingsSheet(onDismiss = { showSettings = false }, onChanged = { live?.stop(); settingsVersion++ })
++    fun enterPlain() { hungUp = true; com.openminis.app.plus.VoiceSession.stop(context); plainMode = true; if (hasMic) plain.start() else askMic.launch(Manifest.permission.RECORD_AUDIO) }
++    if (showSettings) VoiceSettingsSheet(onDismiss = { showSettings = false }, onChanged = { com.openminis.app.plus.VoiceSession.restart(context) })
+     Scaffold(
+         containerColor = Color(0xFF0E1320),
+         topBar = {
+@@ -175,10 +151,21 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+     ) { pad ->
+         Column(Modifier.fillMaxSize().padding(pad), horizontalAlignment = Alignment.CenterHorizontally) {
+             if (plainMode) {
+-                PlainVoiceContent(plain, onBackToLive = if (live != null) ({ plain.stop(); plainMode = false; live.start() }) else null,
++                PlainVoiceContent(plain, onBackToLive = if (key != null) ({ plain.stop(); plainMode = false; hungUp = false; com.openminis.app.plus.VoiceSession.start(context) }) else null,
+                     onHangUp = { plain.stop(); onBack() })
+                 return@Column
+             }
++            if (live == null && key != null) {
++                // [Mines-voice-31] Hung up (or not started yet): one big button to call again.
++                Spacer(Modifier.height(80.dp))
++                PetAvatar(size = 120.dp)
++                Spacer(Modifier.height(24.dp))
++                Button(onClick = { hungUp = false; if (hasMic) com.openminis.app.plus.VoiceSession.start(context) else askMic.launch(Manifest.permission.RECORD_AUDIO) },
++                    modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp).height(64.dp)) {
++                    Text("开始语音", style = MaterialTheme.typography.titleMedium)
++                }
++                return@Column
++            }
+             if (live == null) {
+                 Spacer(Modifier.height(80.dp))
+                 PetAvatar(size = 120.dp)
+@@ -264,6 +251,8 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+                 }
+             }
+ 
++            Text("离开这页也会继续通话，点桌宠可以挂断", color = Color(0xFFB8C2D6), fontSize = 13.sp,
++                modifier = Modifier.padding(bottom = 8.dp))
+             Row(
+                 Modifier.fillMaxWidth().padding(bottom = 36.dp),
+                 horizontalArrangement = Arrangement.SpaceEvenly,
+@@ -273,7 +262,7 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+                     if (muted) "取消静音" else "静音", if (muted) Color(0xFFFF9500) else Color(0x33FFFFFF)) {
+                     live.setMuted(!muted)
+                 }
+-                RoundButton(Icons.Filled.CallEnd, "挂断", Color(0xFFFF3B30)) { live.stop(); onBack() }
++                RoundButton(Icons.Filled.CallEnd, "挂断", Color(0xFFFF3B30)) { hungUp = true; com.openminis.app.plus.VoiceSession.stop(context); onBack() }
+             }
+         }
+     }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt
+index ee559a8..041346d 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt
+@@ -365,6 +365,8 @@ private fun ServerDialog(
+     var port by remember { mutableStateOf((initial?.port ?: 22).toString()) }
+     var user by remember { mutableStateOf(initial?.user ?: "root") }
+     var relay by remember { mutableStateOf(initial?.relay ?: "") }
++    var altPort by remember { mutableStateOf(initial?.altPort?.takeIf { it > 0 }?.toString() ?: "") }
++    var tsHost by remember { mutableStateOf(initial?.tailscaleHost ?: "") }
+     var password by remember { mutableStateOf("") }
+     val valid = host.isNotBlank() && !host.contains(' ') && (port.toIntOrNull() ?: 0) in 1..65535 &&
+         user.isNotBlank() && user.all { it.isLetterOrDigit() || it in "._-" }
+@@ -388,6 +390,11 @@ private fun ServerDialog(
+                         singleLine = true, visualTransformation = PasswordVisualTransformation(),
+                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password))
+                 }
++                // [Mines-vps-31] backup routes: tried in order 端口 → 备用端口(默认 443) → Tailscale → 中转
++                OutlinedTextField(altPort, { altPort = it.filter(Char::isDigit).take(5) }, label = { Text("备用端口（不填 = 443）") },
++                    singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
++                OutlinedTextField(tsHost, { tsHost = it.trim() }, label = { Text("Tailscale 地址（可不填）") }, singleLine = true,
++                    placeholder = { Text("xxx.tailXXXX.ts.net") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri))
+                 OutlinedTextField(relay, { relay = it.trim() }, label = { Text("中转（可不填）") }, singleLine = true,
+                     placeholder = { Text("ws://IP:8022/ 或 ssh://root@跳板:22") },
+                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri))
+@@ -398,6 +405,7 @@ private fun ServerDialog(
+                 val base = initial ?: VpsServer(name = "", host = "")
+                 val same = initial?.host == host && initial.port == port.toInt() && initial.user == user
+                 onSave(base.copy(name = name.trim(), host = host, port = port.toInt(), user = user, relay = relay,
++                    altPort = altPort.toIntOrNull()?.takeIf { it in 1..65535 } ?: 0, tailscaleHost = tsHost,
+                     lastLatencyMs = if (same) base.lastLatencyMs else -1,
+                     authorized = if (same) base.authorized else false), password)
+             }) { Text("保存") }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt
+index 6f1f3ef..c08b294 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt
+@@ -204,6 +204,13 @@ fun SettingsScreen(
+                     subtitle = "导入 PDF、文档、网页，AI 回答时先查你的资料",
+                     onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.KNOWLEDGE) },
+                 )
++                SettingsItem(
++                    icon = Icons.Outlined.VerifiedUser,
++                    iconColor = Color(0xFFFF9500),
++                    title = "一键冒烟测试 + 上报",
++                    subtitle = "检查语音、模型、权限、沙箱、MCP；有问题一键发给 Hark",
++                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.REPORT) },
++                )
+                 SettingsItem(
+                     icon = Icons.Outlined.Speed,
+                     iconColor = Color(0xFF34C759),
