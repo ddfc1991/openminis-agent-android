@@ -3,7 +3,10 @@
 set -x
 adb wait-for-device
 adb shell getprop ro.product.cpu.abilist
-adb shell pm disable-user --user 0 com.google.android.googlesdksetup 2>/dev/null
+# (do not disable com.google.android.googlesdksetup: on API 35 it provisions the emulator Wi-Fi; disabling it left the emulator with no network in smoke run 21)
+# wait (up to 150 s) for the emulator's network (default route) before driving the app
+for i in $(seq 1 50); do adb shell ip route show table all 2>/dev/null | grep -qE "^default .*dev (wlan0|eth0|radio0)" && break; sleep 3; done
+adb shell ip route show table all | grep default; adb shell dumpsys connectivity 2>/dev/null | grep -m3 -E "NetworkAgentInfo|VALIDATED" | cut -c1-200
 adb install -r -g "$APK" || { echo "install failed"; exit 1; }
 for p in POST_NOTIFICATIONS RECORD_AUDIO; do adb shell pm grant com.openminis.mines.plus android.permission.$p 2>/dev/null; done
 adb shell appops set com.openminis.mines.plus SYSTEM_ALERT_WINDOW allow 2>/dev/null
