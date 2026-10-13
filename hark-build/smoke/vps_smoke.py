@@ -177,7 +177,7 @@ def dismiss_dialogs():
     for _ in range(4):
         root = dump()
         hit = False
-        for lab in ("以后再说", "以后", "跳过", "稍后", "知道了", "不用了", "取消", "Allow", "允许", "ALLOW", "While using the app"):
+        for lab in ("Wait", "等待", "以后再说", "以后", "跳过", "稍后", "知道了", "不用了", "取消", "Allow", "允许", "ALLOW", "While using the app"):
             p = find(root, lab, exact=True)
             if p:
                 sh(f"input tap {p[0]} {p[1]}")
@@ -381,9 +381,13 @@ def toggle_near(label):
 def go_home():
     for _ in range(3):
         root = dump()
+        if find(root, "isn't responding"): dismiss_dialogs(); root = dump()
         if find(root, "工作位置：") or find(root, "工作位置", exact=True) or find(root, "Welcome to Mines"): return root
+        if find(root, "Google search") or find(root, "At a glance"):
+            break  # on the launcher: bring Mines back instead of pressing back
         sh("input keyevent KEYCODE_BACK"); time.sleep(2.5)
         if not alive(): return None
+    sh(f"monkey -p {PKG} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1"); time.sleep(8)
     return dump()
 
 
