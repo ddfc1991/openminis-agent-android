@@ -443,6 +443,45 @@ def dump_fatal():
     print("---- crash buffer ----\n" + out[-15000:], flush=True)
 
 
+page_missing = []
+
+
+def open_page(step, tap_labels, expect, wait=6, exact=False, linger=0):
+    """[build-31] open a page from home, check the app survives and the page title shows."""
+    root = go_home()
+    if root is None:
+        relaunch(); root = dump()
+    ok = False
+    for lab in tap_labels:
+        lab, ex = lab if isinstance(lab, tuple) else (lab, exact)
+        if find(root, lab, ex):
+            ok = tap_text(lab, exact=ex, wait=wait, root=root); break
+    if not ok:
+        # Today card may be collapsed
+        tap_text("展开", wait=2); root = dump()
+        for lab in tap_labels:
+            lab, ex = lab if isinstance(lab, tuple) else (lab, exact)
+            if find(root, lab, ex):
+                ok = tap_text(lab, exact=ex, wait=wait, root=root); break
+    if linger: time.sleep(linger)
+    r = snap(step.replace(" ", "-"))
+    alive_ok = check(step)
+    seen = any(find(r, e) for e in expect) if r is not None else False
+    print(f"PAGE {step}: tapped={ok} title_seen={seen} alive={alive_ok}", flush=True)
+    if not (ok and seen): page_missing.append(step)
+    if alive_ok:
+        sh("input keyevent KEYCODE_BACK"); time.sleep(2.5)
+    else:
+        relaunch()
+
+
+def build31_pages():
+    open_page("账号连接 page", ["账号："], ["账号连接"])
+    open_page("消息汇总 page", [("消息", True), ("消息 ", False)], ["消息汇总"], linger=8)
+    open_page("server page", ["服务器："], ["服务器", "smoke"])
+    open_page("voice page", ["实时语音"], ["语音", "通话", "Gemini"], linger=6)
+
+
 def main():
     m = re.search(r"(\d+)x(\d+)", sh("wm size"))
     if m: SCREEN[0], SCREEN[1] = int(m.group(1)), int(m.group(2))
@@ -521,6 +560,11 @@ def main():
     check("open 服务器 chip")
     sh("input keyevent KEYCODE_BACK"); time.sleep(2)
 
+    try:
+        build31_pages()
+    except Exception as e:
+        print("build31_pages error:", e, flush=True); page_missing.append(f"error {e}")
+
     # Cold start with VPS mode + servers saved (the user's state)
     sh(f"am force-stop {PKG}"); time.sleep(2)
     relaunch()
@@ -553,6 +597,7 @@ def main():
         print("-" * 30)
     print("crashed steps:", crashed)
     print("selftest failures:", selftest_fail)
+    print("pages not confirmed:", page_missing)
     # Mines' own crash log (build-28+), readable through the app's files only for debuggable builds; logcat tag MinesCrash
     for l in log:
         if "MinesCrash" in l:
