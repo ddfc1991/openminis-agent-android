@@ -525,13 +525,14 @@ def build32_visual():
     for _ in range(3): sh("input keyevent KEYCODE_BACK"); time.sleep(1)
     # login pages: aliyun + supabase through 应用 → detail → + 添加
     for name in ["阿里云", "Supabase"]:
-        go_home()
-        if not (tap_text("账号：", wait=5) or tap_text("账号", exact=True, wait=5)): break
+        sh(f"am force-stop {PKG}"); time.sleep(1); relaunch(); go_home()
+        if not (tap_text("账号：", wait=5) or tap_text("账号", exact=True, wait=5) or tap_text("应用", exact=True, wait=5)):
+            page_missing.append(f"login {name}: 应用 not opened"); continue
         if tap_text("搜索应用", wait=2):
             type_text("aliyun" if name == "阿里云" else "supabase"); time.sleep(2); sh("input keyevent KEYCODE_BACK"); time.sleep(1)
         if tap_text(name, wait=4):
             snap(f"v-detail-{name}")
-            if tap_text("+ 添加", wait=12):
+            if tap_text("+ 添加", wait=12) or tap_text("添加", wait=12):
                 time.sleep(10)
                 snap(f"v-login-{name}"); check(f"login page {name}")
         for _ in range(4): sh("input keyevent KEYCODE_BACK"); time.sleep(1.5)
