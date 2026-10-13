@@ -325,6 +325,10 @@ def setup_provider():
         snap("chat-sent")
         check("chat with fake model")
         loop_test()
+        try:
+            garbage_test()
+        except Exception as e:
+            print("garbage test error:", e, flush=True); selftest_fail.append(f"b34 garbage error {e}")
         sh("input keyevent KEYCODE_BACK"); time.sleep(3)
     root = snap("home-with-chat")
     check("home list (TodayCard) shown")
@@ -663,6 +667,131 @@ def build33_sources():
     if not alive(): relaunch()
 
 
+def garbage_test():
+    """[build-34] Degenerating model: Mines must abort the stream, retry once with lower thinking, then stop / mark unstable."""
+    root = dump()
+    e = edits(root)
+    if not e:
+        selftest_fail.append("garbage test: no input"); return
+    sh(f"input tap {e[-1][0]} {e[-1][1]}"); time.sleep(0.6); type_text("GARBAGETEST")
+    sh("input keyevent KEYCODE_BACK"); time.sleep(0.6)
+    tap_any(["Send", "发送"], wait=3) or sh("input keyevent KEYCODE_ENTER")
+    seen = False
+    for _ in range(20):
+        time.sleep(3)
+        root = dump()
+        if find(root, "乱码") or find(root, "不稳定"):
+            seen = True; break
+    snap("v34-garbage")
+    try:
+        st = json.loads(subprocess.run("curl -s http://127.0.0.1:8088/stats", shell=True, capture_output=True, text=True, timeout=10).stdout or "{}")
+    except Exception as ex:
+        st = {"error": str(ex)}
+    print("  garbage test: notice_seen=%s posts=%s" % (seen, st.get("garbage_posts")), flush=True)
+    if not seen: selftest_fail.append("garbage: no 乱码/不稳定 notice")
+    if not (st.get("garbage_posts") in (2, 3)): selftest_fail.append("garbage: posts=%s (want 2: first try + one retry)" % st.get("garbage_posts"))
+    check("garbage abort")
+
+
+def selftest_json(method, arg, timeout=60):
+    out = selftest(method, arg, timeout=timeout)
+    i = out.find("result={")
+    try:
+        return json.JSONDecoder().raw_decode(out[i + 7:])[0] if i >= 0 else {}
+    except Exception:
+        return {}
+
+
+def build34():
+    """[build-34] design system pages, per-character theme switch, voice showcase + TTS picker,
+    degeneration detector + failure-pattern guard self-tests."""
+    j = selftest_json("degen", "x")
+    if not j.get("ok"): selftest_fail.append(f"b34 degen selftest {j}")
+    j = selftest_json("failguard", "x")
+    if not j.get("ok"): selftest_fail.append(f"b34 failguard selftest {j}")
+    j = selftest_json("tts", "gemini")
+    if j.get("gec") != "70AED27457006C255086B4F079B9FE44A4D10827C4AFDFC3C45583B6F40D7DDF":
+        selftest_fail.append(f"b34 edge token {j}")
+    # per-character theme: home + voice page per character
+    for cid, want in [("claude", "B5532F"), ("whale", "2E73C2"), ("gemini", "835EC2")]:
+        j = selftest_json("theme", cid)
+        if not str(j.get("primary", "")).upper().endswith(want) or j.get("style") != cid:
+            selftest_fail.append(f"b34 theme {cid} {j}")
+        sh(f"am force-stop {PKG}"); time.sleep(1); relaunch(); go_home(); time.sleep(3)
+        r = snap(f"v34-home-{cid}"); check(f"home with {cid}")
+        if r is not None and find(r, "娘"): selftest_fail.append(f"b34 '娘' still shown ({cid})")
+        if tap_text("实时语音", wait=6):
+            time.sleep(4); snap(f"v34-voice-{cid}"); check(f"voice page {cid}")
+            vr = dump()
+            if vr is not None and (find(vr, "线路") or find(vr, "模型：")): selftest_fail.append("b34 voice page shows route/model text")
+            for _ in range(2): sh("input keyevent KEYCODE_BACK"); time.sleep(1.5)
+            if not alive(): relaunch()
+    selftest_json("theme", "claude")
+    sh(f"am force-stop {PKG}"); time.sleep(1); relaunch(); go_home(); time.sleep(2)
+    # voice settings: TTS picker + free voice + 试听 button
+    if tap_text("实时语音", wait=6):
+        time.sleep(3)
+        if tap_text("语音设置", wait=4):
+            time.sleep(2); snap("v34-voice-settings"); check("voice settings sheet")
+            if tap_text("免费声音", exact=True, wait=3):
+                r = snap("v34-tts-edge")
+                for _ in range(3):
+                    if r is not None and find(r, "试听"): break
+                    scroll_down(); time.sleep(1); r = dump()
+                snap("v34-tts-edge-scrolled")
+                if r is None or not find(r, "试听"): page_missing.append("b34 试听 button")
+                if r is None or not find(r, "语速"): page_missing.append("b34 speed slider")
+            else:
+                page_missing.append("b34 TTS engine picker")
+            for _ in range(3):
+                r = dump()
+                if r is not None and find(r, "声纹"): break
+                scroll_down(); time.sleep(1)
+            snap("v34-voiceprint-row")
+            if tap_text("录入声纹", wait=3) or tap_text("声纹", wait=3):
+                time.sleep(2); snap("v34-voiceprint"); check("voiceprint enrol page")
+                sh("input keyevent KEYCODE_BACK"); time.sleep(1)
+            else:
+                page_missing.append("b34 voiceprint row")
+            selftest("tts", "gemini")
+        for _ in range(3): sh("input keyevent KEYCODE_BACK"); time.sleep(1.2)
+        if not alive(): relaunch()
+    # design pages
+    open_page("b34 消息", [("消息", True)], ["全部", "要处理"], linger=4)
+    open_page("b34 应用", [("应用与账号", False), ("账号：", False)], ["搜索", "应用"], linger=3)
+    # [build-34] in-app browser zoom in both UA modes (pinch/double-tap on, zoom-locking viewport rewritten)
+    for prof in ("mobile", "desktop"):
+        j = selftest_json("zoom", prof, timeout=40)
+        print(f"  zoom {prof}: {j}", flush=True)
+        if not j.get("ok"): selftest_fail.append(f"b34 zoom {prof} {j}")
+    # settings + its design pages
+    go_home()
+    if tap_text("设置", exact=True, wait=5):
+        time.sleep(2); r = snap("v34-settings"); check("settings page")
+        if r is None or not find(r, "常用"): page_missing.append("b34 设置")
+        for lab, shot in [("知识库", "v34-knowledge"), ("模型路由", "v34-routing")]:
+            for _ in range(4):
+                r = dump()
+                if r is not None and find(r, lab): break
+                scroll_down(); time.sleep(1)
+            if tap_text(lab, wait=5):
+                time.sleep(3); snap(shot); check(shot)
+                sh("input keyevent KEYCODE_BACK"); time.sleep(2)
+            else:
+                page_missing.append("b34 " + lab)
+        for _ in range(2): sh("input keyevent KEYCODE_BACK"); time.sleep(1.2)
+        if not alive(): relaunch()
+    else:
+        page_missing.append("b34 设置 (gear)")
+    # desk pet body motion (articulated mesh): wave / look (turn) / happy, two shots each
+    selftest("pet", "show", timeout=20)
+    sh("input keyevent KEYCODE_HOME"); time.sleep(4)
+    for mo in ["WAVE", "LOOK", "HAPPY"]:
+        selftest("pet", "mode:" + mo, timeout=20); time.sleep(0.6)
+        snap(f"v34-pet-{mo.lower()}-a"); time.sleep(0.9); snap(f"v34-pet-{mo.lower()}-b")
+    relaunch()
+
+
 def build31_pages():
     open_page("应用 page", ["账号："], ["搜索应用", "应用"])
     open_page("消息 feed page", [("消息", True), ("消息 ", False)], ["我关注的", "全部"], linger=8)
@@ -764,6 +893,10 @@ def main():
         build33_sources()
     except Exception as e:
         print("build33_sources error:", e, flush=True); selftest_fail.append(f"b33 error {e}")
+    try:
+        build34()
+    except Exception as e:
+        print("build34 error:", e, flush=True); selftest_fail.append(f"b34 error {e}")
 
     # Cold start with VPS mode + servers saved (the user's state)
     sh(f"am force-stop {PKG}"); time.sleep(2)

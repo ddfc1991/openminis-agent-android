@@ -3,7 +3,7 @@
 import json, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-STATS = {"loop_posts": 0, "saw_warning": False, "empty_tool_content": 0, "tool_msgs": 0, "tool": None}
+STATS = {"garbage_posts": 0, "loop_posts": 0, "saw_warning": False, "empty_tool_content": 0, "tool_msgs": 0, "tool": None}
 
 def last_user_text(msgs):
     for m in reversed(msgs):
@@ -60,6 +60,27 @@ class H(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(n) or b"{}")
         text = "你好，我是测试模型。"
         msgs = body.get("messages") or []
+        if "GARBAGETEST" in last_user_text(msgs) and body.get("stream"):
+            # [build-34 smoke] a model whose output degenerates into garbage (user's Gemma report)
+            STATS["garbage_posts"] += 1
+            import random
+            rnd = random.Random(STATS["garbage_posts"])
+            self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+            alpha = "LLLL_\ub098L_yLL//////"
+            try:
+                d = {"id": "x", "object": "chat.completion.chunk", "created": int(time.time()), "model": "smoke-model",
+                     "choices": [{"index": 0, "delta": {"role": "assistant", "content": "让我想想这个链接。"}, "finish_reason": None}]}
+                self.wfile.write(b"data: " + json.dumps(d).encode() + b"\n\n"); self.wfile.flush()
+                for _ in range(400):
+                    ch = "".join(rnd.choice(alpha) for _ in range(50))
+                    d = {"id": "x", "object": "chat.completion.chunk", "created": int(time.time()), "model": "smoke-model",
+                         "choices": [{"index": 0, "delta": {"content": ch}, "finish_reason": None}]}
+                    self.wfile.write(b"data: " + json.dumps(d).encode() + b"\n\n"); self.wfile.flush()
+                    time.sleep(0.02)
+                self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
+            except Exception:
+                pass  # the app hung up on us: that is the expected outcome
+            return
         if "LOOPTEST" in last_user_text(msgs) and body.get("stream"):
             # [build-30 smoke] A model that repeats the same text + tool call forever.
             STATS["loop_posts"] += 1
