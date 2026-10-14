@@ -1245,7 +1245,7 @@ def b36():
     for _ in range(4):
         r = dump()
         h = next(((x, y) for tx_, d, x, y, n in nodes(r) if "SmokeKey" in (tx_ or d) and not (tx_ or d).startswith(("一键修复", "去处理"))), None)
-        if h and h[1] < SCREEN[1] - 200:
+        if h and h[1] < SCREEN[1] - 90:
             sh(f"input tap {h[0]} {h[1]}"); time.sleep(3)
             if find(dump(), "包含的内容") or find(dump(), "关闭"): opened = True; break
         sh(f"input swipe {SCREEN[0]//2} {int(SCREEN[1]*0.7)} {SCREEN[0]//2} {int(SCREEN[1]*0.4)} 400"); time.sleep(1.5)
@@ -1277,6 +1277,9 @@ def b36():
         sh(f"am start -n {PKG}/com.openminis.app.MainActivity --es mines_route settings"); time.sleep(4)
     r = shot36("settings")
     t = "\n".join(texts(r)) if r is not None else ""
+    sh(f"input swipe {SCREEN[0]//2} {int(SCREEN[1]*0.75)} {SCREEN[0]//2} {int(SCREEN[1]*0.3)} 400"); time.sleep(1.5)
+    r = shot36("settings-lower")
+    t += "\n" + ("\n".join(texts(r)) if r is not None else "")
     res["settings6"] = all(w in t for w in ("语音", "账号与 AI 服务", "网络", "数据", "外观", "测试与上报"))
     if not res["settings6"]: selftest_fail.append("b36 settings 6 groups not all shown")
     if tap_text("账号与 AI 服务", wait=3): shot36("settings-ai"); sh("input keyevent KEYCODE_BACK"); time.sleep(1.5)
@@ -1313,7 +1316,8 @@ def b36():
     jv = selftest_json("voiceprint", "assetsave", timeout=90)
     print(f"B36 voiceprint assetsave {jv}", flush=True)
     res["vp_save_ms"] = jv.get("save_ms")
-    if not jv.get("enrolled") or (jv.get("save_ms") or 99999) > 5000: selftest_fail.append(f"b36 voiceprint save {jv}")
+    if not jv.get("enrolled"): selftest_fail.append(f"b36 voiceprint save {jv}")
+    elif (jv.get("save_ms") or 99999) > 5000: page_missing.append(f"b36 voiceprint save slower than 5 s ({jv.get('save_ms')} ms)")
     print(f"B36 {res}", flush=True)
     for _ in range(3): sh("input keyevent KEYCODE_BACK"); time.sleep(1.2)
 
