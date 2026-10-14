@@ -1,5 +1,54 @@
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/AccountPatrol.kt b/src/android/app/src/main/java/com/openminis/app/plus/AccountPatrol.kt
+index 862eb51..0ff6cd1 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/AccountPatrol.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/AccountPatrol.kt
+@@ -82,6 +82,44 @@ object AccountPatrol {
+ 
+     fun runNow(context: Context) { scope.launch { run(context.applicationContext) } }
+ 
++    /** [Mines-patrol-35.1] ids being re-checked right now (row shows 「检测中…」). */
++    private val _checking = MutableStateFlow<Set<String>>(emptySet())
++    val checking: StateFlow<Set<String>> = _checking.asStateFlow()
++
++    /**
++     * [Mines-patrol-35.1] Re-test ONE account now (after its key was replaced, or 「重新检测」 on its row). The old
++     * error is cleared at once, the account's 账号异常 cards leave 消息, then the fresh result is stored.
++     * User 2026-10-14: a new Cloudflare token kept showing the old error until the next 4-hourly patrol.
++     */
++    fun recheck(context: Context, kindId: String) {
++        val app = context.applicationContext
++        scope.launch {
++            load(app)
++            _checking.value = _checking.value + kindId
++            _status.value = _status.value - kindId
++            runCatching { Digest.dropAccount(app, kindId) }
++            try {
++                val now = System.currentTimeMillis()
++                val e = PlusVault.entries.value[kindId]
++                val secret = PlusVault.secret(kindId)
++                val st = if (e != null && secret != null) {
++                    val base = PlusVault.baseId(kindId)
++                    val r = KeyTester.test(base, secret)
++                    r.identity?.takeIf { it.isNotBlank() }?.let { PlusVault.setExtra(kindId, "identity", it) }
++                    when {
++                        r.message.startsWith("测试时连不上") -> Status(Level.WARN, "这次没连上服务器，稍后再试", now)
++                        !r.ok -> Status(Level.BAD, r.message, now, fix = if (KeyAgent.recipe(base) != null) "regen" else "relogin")
++                        r.needsCredit -> Status(Level.WARN, "余额不足，需要你自己充值", now)
++                        else -> Status(Level.OK, "密钥有效", now)
++                    }
++                } else null
++                _status.value = if (st == null) _status.value - kindId else _status.value + (kindId to st)
++                save(app)
++                if (st?.level != Level.OK) runCatching { Digest.refresh(app) }
++            } finally { _checking.value = _checking.value - kindId }
++        }
++    }
++
+     suspend fun run(context: Context) = withContext(Dispatchers.IO) {
+         if (_running.value) return@withContext
+         _running.value = true
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt b/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt
-index 652eaf5..3130adc 100644
+index 652eaf5..94abd42 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt
 @@ -31,6 +31,8 @@ import kotlin.math.exp
@@ -67,6 +116,68 @@ index 652eaf5..3130adc 100644
              it
          }.sortedByDescending { it.score }
      }
+@@ -160,6 +190,12 @@ object Digest {
+     private var lastRaw: List<Item> = emptyList()
+     fun rerank(c: Context) { _items.value = scoreAll(c, lastRaw) }
+ 
++    /** [Mines-patrol-35.1] an account was fixed / is being re-checked: its 账号巡查 cards leave the feed now. */
++    fun dropAccount(c: Context, kindId: String) {
++        lastRaw = lastRaw.filterNot { it.id.startsWith("pt:$kindId:") }
++        rerank(c)
++    }
++
+     fun top(n: Int = 3): List<Item> = _items.value.take(n)
+ 
+     // ---- sources ----
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/KeyTester.kt b/src/android/app/src/main/java/com/openminis/app/plus/KeyTester.kt
+index 88965f2..93ee3e7 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/KeyTester.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/KeyTester.kt
+@@ -45,6 +45,35 @@ object KeyTester {
+         throw last ?: IllegalStateException("连不上")
+     }
+ 
++    /**
++     * [Mines-keys-35.1] Cloudflare (user 2026-10-14: a new token kept showing the old error). User tokens verify at
++     * /user/tokens/verify; account-owned tokens only at /accounts/{id}/tokens/verify (the user endpoint says 401
++     * for them), so on a non-2xx we look up the accounts the token can see and verify there. A Global API Key is
++     * not a token: say so instead of "invalid". The verify body's status (active/disabled/expired) is checked too.
++     */
++    private fun cloudflare(base: String, key: String, verdict: (Http, (JSONObject) -> String?) -> Result): Result {
++        if (Regex("^[0-9a-f]{37}$").matches(key)) return Result(false, "这是 Global API Key，不是 API 令牌。请在 Cloudflare「API 令牌」里创建一个令牌再填")
++        fun active(h: Http): Boolean = h.code in 200..299 && runCatching {
++            val o = JSONObject(h.body); o.optBoolean("success", true) && o.optJSONObject("result")?.optString("status", "active").let { it == null || it == "active" }
++        }.getOrDefault(true)
++        fun statusOf(h: Http): String? = runCatching { JSONObject(h.body).optJSONObject("result")?.optString("status") }.getOrNull()?.takeIf { it.isNotBlank() && it != "active" }
++        val u = call(base, bearer("https://api.cloudflare.com/client/v4/user/tokens/verify", key))
++        if (active(u)) return Result(true, "可以用")
++        statusOf(u)?.let { return Result(false, if (it == "expired") "令牌已过期" else "令牌已停用（$it）") }
++        val acc = runCatching { call(base, bearer("https://api.cloudflare.com/client/v4/accounts?per_page=20", key)) }.getOrNull()
++        val ids = acc?.takeIf { it.code in 200..299 }?.let { h -> runCatching {
++            val a = JSONObject(h.body).optJSONArray("result"); (0 until (a?.length() ?: 0)).map { a!!.getJSONObject(it).optString("id") to a.getJSONObject(it).optString("name") }
++        }.getOrNull() }.orEmpty().filter { it.first.isNotBlank() }
++        for ((id, name) in ids) {
++            val h = call(base, bearer("https://api.cloudflare.com/client/v4/accounts/$id/tokens/verify", key))
++            if (active(h)) return Result(true, "可以用（账户令牌）", name.ifBlank { null })
++            statusOf(h)?.let { return Result(false, if (it == "expired") "令牌已过期" else "令牌已停用（$it）") }
++        }
++        // the token is valid for some resources but can read neither endpoint → only a real 401/403 on both is "invalid"
++        if (ids.isEmpty() && acc != null && acc.code in 200..299) return Result(true, "可以用（令牌权限受限，无法读取账户列表）")
++        return verdict(u) { null }
++    }
++
+     private fun bearer(url: String, key: String) = Request.Builder().url(url).header("Authorization", "Bearer $key").build()
+ 
+     fun test(baseId: String, key: String): Result = runCatching { testInner(baseId, key.trim()) }
+@@ -67,7 +96,7 @@ object KeyTester {
+                 .post("""{"model":"sonar","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}""".toRequestBody("application/json".toMediaType())).build()))
+             "huggingface" -> verdict(call(base, bearer("https://huggingface.co/api/whoami-v2", key))) { it.optString("name") }
+             "digitalocean" -> verdict(call(base, bearer("https://api.digitalocean.com/v2/account", key))) { it.optJSONObject("account")?.optString("email") }
+-            "cloudflare" -> verdict(call(base, bearer("https://api.cloudflare.com/client/v4/user/tokens/verify", key)))
++            "cloudflare" -> cloudflare(base, key, ::verdict)
+             "github" -> verdict(call(base, bearer("https://api.github.com/user", key))) { it.optString("login") }
+             "qwen" -> verdict(call(base, bearer("https://dashscope.aliyuncs.com/compatible-mode/v1/models", key)))
+             "openai" -> verdict(call(base, bearer("https://api.openai.com/v1/models", key)))
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/LoginWeb.kt b/src/android/app/src/main/java/com/openminis/app/plus/LoginWeb.kt
 index c5e98e0..6d7bd46 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/LoginWeb.kt
@@ -94,6 +205,62 @@ index c5e98e0..6d7bd46 100644
  
      /** True when the session cookie a service sets after login is already in the shared WebView store. */
      fun signedIn(kind: ConnectionKind): Boolean {
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt
+index 59f629b..6d2a6f0 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt
+@@ -566,6 +566,7 @@ object PlusVault {
+ 
+     fun save(context: Context, kind: ConnectionKind, account: String, secret: String?, share: Boolean, via: String = "") {
+         init(context)
++        val changed = secret != null && secret.isNotEmpty() && secrets?.getString(kind.id, null) != secret
+         if (secret != null && secret.isNotEmpty()) secrets?.edit()?.putString(kind.id, secret)?.apply()
+         val prev = _entries.value[kind.id]
+         val e = ConnectionEntry(kind.id, account.trim(), share, System.currentTimeMillis(),
+@@ -573,6 +574,8 @@ object PlusVault {
+         _entries.value = _entries.value + (kind.id to e)
+         persist()
+         syncEnv(context, kind, share)
++        // [Mines-patrol-35.1] new key → test it now and clear the old error (not at the next 4-hourly patrol)
++        if (changed) runCatching { AccountPatrol.recheck(context, kind.id) }
+     }
+ 
+     fun setShare(context: Context, kind: ConnectionKind, share: Boolean) {
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
+index 78e544c..9275831 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
+@@ -1,5 +1,7 @@
+ package com.openminis.app.ui.plus
+ 
++import androidx.compose.ui.semantics.contentDescription
++import androidx.compose.ui.semantics.semantics
+ import com.openminis.app.ui.brand.MinesIcon
+ 
+ import android.Manifest
+@@ -244,6 +246,7 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+             .filter { k -> query.isBlank() || k.name.lowercase().contains(query.trim().lowercase()) || k.id.contains(query.trim().lowercase()) }
+         val patrol by com.openminis.app.plus.AccountPatrol.status.collectAsState()
+         val patrolRunning by com.openminis.app.plus.AccountPatrol.running.collectAsState()
++        val checking by com.openminis.app.plus.AccountPatrol.checking.collectAsState()
+         LaunchedEffect(Unit) { com.openminis.app.plus.AccountPatrol.load(context) }
+         if (entries.isNotEmpty() && query.isBlank()) TextButton(onClick = { com.openminis.app.plus.AccountPatrol.runNow(context) }, enabled = !patrolRunning,
+             modifier = Modifier.padding(horizontal = 12.dp)) { Text(if (patrolRunning) "正在巡查…" else "立即巡查所有账号", fontSize = 15.sp) }
+@@ -308,6 +311,14 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+                                         fontSize = 14.sp, color = if (ps?.level == com.openminis.app.plus.AccountPatrol.Level.BAD) Color(0xFFD93025) else MaterialTheme.colorScheme.onSurfaceVariant)
+                                 }
+                             }
++                            // [Mines-patrol-35.1] 「重新检测」 right on the row
++                            if (PlusVault.hasSecret(id)) {
++                                val busy = id in checking
++                                TextButton(onClick = { com.openminis.app.plus.AccountPatrol.recheck(context, id) }, enabled = !busy,
++                                    modifier = Modifier.heightIn(min = 44.dp).semantics { contentDescription = if (busy) "正在检测" else "重新检测这个账号" }) {
++                                    Text(if (busy) "检测中…" else "重新检测", fontSize = 14.sp)
++                                }
++                            }
+                             MinesIcon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                         }
+                     }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
 index 46c4398..5f72f33 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
