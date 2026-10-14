@@ -1,5 +1,5 @@
 diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
-index 3b26b75..bc0f615 100644
+index 3b26b75..d0eacee 100644
 --- a/src/android/app/build.gradle.kts
 +++ b/src/android/app/build.gradle.kts
 @@ -38,8 +38,8 @@ android {
@@ -8,8 +8,8 @@ index 3b26b75..bc0f615 100644
          targetSdk = 35
 -        versionCode = 28
 -        versionName = "1.14"
-+        versionCode = 31
-+        versionName = "1.17"
++        versionCode = 32
++        versionName = "1.18"
  
          testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
  
@@ -152,6 +152,178 @@ index 0000000..5561eb8
 +dpr:window.devicePixelRatio,scrollWidth:Math.max(d?d.scrollWidth:0,b?b.scrollWidth:0),clientWidth:d?d.clientWidth:0,
 +vvScale:window.visualViewport?visualViewport.scale:0,vvWidth:window.visualViewport?visualViewport.width:0,
 +metaViewport:m?m.getAttribute('content'):'',ua:navigator.userAgent});}catch(e){return JSON.stringify({error:String(e)});}})()"""
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/browser/WebPaintCheck.kt b/src/android/app/src/main/java/com/openminis/app/browser/WebPaintCheck.kt
+new file mode 100644
+index 0000000..47befb1
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/browser/WebPaintCheck.kt
+@@ -0,0 +1,166 @@
++package com.openminis.app.browser
++
++import android.graphics.Bitmap
++import android.graphics.Canvas
++import android.graphics.Rect
++import android.os.Handler
++import android.os.Looper
++import android.util.Log
++import android.view.PixelCopy
++import android.view.View
++import android.view.Window
++import android.view.WindowManager
++import android.webkit.WebView
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.suspendCancellableCoroutine
++import kotlin.coroutines.resume
++
++/**
++ * [Mines-webpaint-38.4] The in-app browser must really draw the page it loaded.
++ *
++ * Smoke 44 (1280×2800 / 480 dpi): www.coze.cn was fully in the accessibility tree (DOM laid out, text
++ * visible to the page) but the screenshot of the browser sheet showed only the page's background colour.
++ * The sheet's WebView was drawn through a hardware layer (LAYER_TYPE_HARDWARE, an old workaround for
++ * blank WebViews in dialogs on some GPUs); with a long, layer-heavy page Chromium hit its tile memory
++ * limit ("tile memory limits exceeded, some content may not draw") and the content tiles never made it
++ * into the layer.
++ *
++ * What the sheet does now: the on-screen WebView draws directly (LAYER_TYPE_NONE: real on-screen
++ * position for tile priority, no extra layer copy) and [heal] watches it. When the page finished loading
++ * but the pixels on screen are one flat colour while the page itself reports visible text in the
++ * viewport, the layer type is switched (none → hardware → software) until the page shows. A page whose
++ * visibility went "hidden" while on screen is resumed. Each step is logged and kept in [lastHeal]
++ * for the self-test.
++ */
++object WebPaintCheck {
++    private const val TAG = "WebPaintCheck"
++
++    /** What the last check / heal did (self-test probe). */
++    @Volatile var lastHeal: String = ""
++
++    /**
++     * Visible text in the viewport as the page sees it: text nodes inside the viewport whose element chain is
++     * displayed, not visibility:hidden and has an effective opacity > 0.1. `hidden` counts text that is in the
++     * viewport but transparent (e.g. a fade-in animation that never ran).
++     */
++    const val TEXT_JS = """(function(){try{var W=innerWidth,H=innerHeight,n=0,hid=0,s=[],c=0,t;
++if(!document.body)return JSON.stringify({vis:document.visibilityState,rs:document.readyState,shown:0,hidden:0});
++var w=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);
++while((t=w.nextNode())&&c<5000){c++;var v=t.nodeValue;if(!v||v.trim().length<2)continue;var e=t.parentElement;if(!e)continue;
++var r=e.getBoundingClientRect();if(r.bottom<=0||r.top>=H||r.right<=0||r.left>=W||r.width<2||r.height<2)continue;
++var o=1,ok=true,x=e;while(x&&x.nodeType==1){var cs=getComputedStyle(x);if(cs.display=='none'||cs.visibility=='hidden'){ok=false;break}o*=parseFloat(cs.opacity||'1');x=x.parentElement}
++if(ok&&o>0.1)n++;else{hid++;if(s.length<6)s.push(e.tagName+':'+o.toFixed(2)+':'+v.trim().slice(0,16))}}
++return JSON.stringify({vis:document.visibilityState,rs:document.readyState,shown:n,hidden:hid,sample:s,raf:window.__minesRaf||-1,
++bg:getComputedStyle(document.body).backgroundColor,scrollY:window.scrollY});}catch(e){return JSON.stringify({err:String(e)})}})()"""
++
++    /** The window [v] is drawn in (a Compose dialog / bottom sheet window, else the activity's). */
++    fun windowOf(v: View): Window? {
++        var cur: Any? = v
++        while (cur is View) {
++            if (cur is androidx.compose.ui.window.DialogWindowProvider) return cur.window
++            cur = cur.parent
++        }
++        var c = v.context
++        while (c is android.content.ContextWrapper) {
++            if (c is android.app.Activity) return c.window
++            c = c.baseContext
++        }
++        return null
++    }
++
++    /**
++     * Share (in 1/10000) of pixels of [b] that differ from its most common colour (5 bits per channel), i.e. how
++     * much is drawn on top of the background. 0 = one flat colour.
++     */
++    fun inkPermyriad(b: Bitmap): Int {
++        val n = b.width * b.height
++        if (n <= 0) return 0
++        val px = IntArray(n); b.getPixels(px, 0, b.width, 0, 0, b.width, b.height)
++        val counts = HashMap<Int, Int>()
++        for (p in px) { val k = p and 0x00F8F8F8; counts[k] = (counts[k] ?: 0) + 1 }
++        val top = counts.values.maxOrNull() ?: n
++        return ((n - top).toLong() * 10000 / n).toInt()
++    }
++
++    /**
++     * [inkPermyriad] of what is really on screen inside [v] (PixelCopy of its window), or -1 when it cannot be
++     * read (secure window, not attached, copy failed).
++     */
++    suspend fun screenInk(v: View): Int {
++        val win = windowOf(v) ?: return -1
++        if (!v.isAttachedToWindow || v.width <= 0 || v.height <= 0) return -1
++        if ((win.attributes.flags and WindowManager.LayoutParams.FLAG_SECURE) != 0) return -1
++        val loc = IntArray(2); v.getLocationInWindow(loc)
++        val r = Rect(loc[0], loc[1], loc[0] + v.width, loc[1] + v.height)
++        val bw = (v.width / 4).coerceAtLeast(1); val bh = (v.height / 4).coerceAtLeast(1)
++        val bmp = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
++        val ok = suspendCancellableCoroutine<Boolean> { cont ->
++            try {
++                PixelCopy.request(win, r, bmp, { res -> if (cont.isActive) cont.resume(res == PixelCopy.SUCCESS) }, Handler(Looper.getMainLooper()))
++            } catch (t: Throwable) { if (cont.isActive) cont.resume(false) }
++        }
++        return if (ok) inkPermyriad(bmp).also { bmp.recycle() } else { bmp.recycle(); -1 }
++    }
++
++    /** [inkPermyriad] of a software draw of [wv] (what the page looks like without the GPU path). */
++    fun softwareInk(wv: WebView): Int = runCatching {
++        val bw = (wv.width / 4).coerceAtLeast(1); val bh = (wv.height / 4).coerceAtLeast(1)
++        val bmp = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
++        val c = Canvas(bmp); c.scale(0.25f, 0.25f); c.translate(-wv.scrollX.toFloat(), -wv.scrollY.toFloat())
++        wv.draw(c)
++        inkPermyriad(bmp).also { bmp.recycle() }
++    }.getOrDefault(-1)
++
++    fun layerName(t: Int) = when (t) { View.LAYER_TYPE_HARDWARE -> "hardware"; View.LAYER_TYPE_SOFTWARE -> "software"; else -> "none" }
++
++    private suspend fun pageText(wv: WebView): org.json.JSONObject? = suspendCancellableCoroutine { cont ->
++        try {
++            wv.evaluateJavascript(TEXT_JS) { r ->
++                val o = runCatching { org.json.JSONObject(org.json.JSONTokener(r ?: "\"\"").nextValue() as String) }.getOrNull()
++                if (cont.isActive) cont.resume(o)
++            }
++        } catch (t: Throwable) { if (cont.isActive) cont.resume(null) }
++    }
++
++    /**
++     * Watches the on-screen browser WebView while it is mounted (call from a LaunchedEffect keyed on it).
++     * Cheap: one small PixelCopy every 1.5 s, only for the first ~30 s after each page finished loading.
++     */
++    suspend fun heal(wv: WebView) {
++        var url: String? = null
++        var checks = 0
++        var healthy = false
++        while (true) {
++            delay(1500)
++            if (!wv.isAttachedToWindow || wv.width <= 0) continue
++            val u = wv.url
++            if (u != url) { url = u; checks = 0; healthy = false }
++            if (healthy || wv.progress < 100 || u.isNullOrBlank() || !u.startsWith("http")) continue
++            if (++checks > 20) continue
++            val ink = screenInk(wv)
++            if (ink < 0) continue
++            if (ink >= 10) {   // ≥ 0.1 % of the view drawn over the background
++                healthy = true
++                lastHeal = "ok ink=$ink layer=${layerName(wv.layerType)} url=$u"
++                continue
++            }
++            // flat on screen: is the page itself showing text right now?
++            val p = pageText(wv) ?: continue
++            if (p.optString("vis") == "hidden") {
++                Log.w(TAG, "page hidden while on screen → onResume ($u)")
++                wv.onResume()
++            }
++            val shown = p.optInt("shown")
++            val from = wv.layerType
++            val to = when (from) { View.LAYER_TYPE_NONE -> View.LAYER_TYPE_HARDWARE; View.LAYER_TYPE_HARDWARE -> View.LAYER_TYPE_SOFTWARE; else -> -1 }
++            if (shown >= 3 && checks >= 2 && to >= 0) {
++                Log.w(TAG, "blank paint: ink=$ink text=$shown layer ${layerName(from)} → ${layerName(to)} ($u)")
++                wv.setLayerType(to, null)
++                wv.invalidate()
++                lastHeal = "switched ${layerName(from)}→${layerName(to)} ink=$ink text=$shown url=$u"
++            } else {
++                lastHeal = "flat ink=$ink text=$shown hiddenText=${p.optInt("hidden")} layer=${layerName(from)} url=$u"
++            }
++        }
++    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/CharacterVoices.kt b/src/android/app/src/main/java/com/openminis/app/plus/CharacterVoices.kt
 new file mode 100644
@@ -653,10 +825,18 @@ index 5c7f934..6e513f5 100644
              wv.webViewClient = object : WebViewClient() {
                  override fun onPageFinished(view: WebView, u: String) {
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
-index 0b722dc..fbac6fc 100644
+index 0b722dc..9efdfeb 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
-@@ -112,6 +112,38 @@ class SelfTestProvider : ContentProvider() {
+@@ -13,6 +13,7 @@ import com.openminis.app.sandbox.NativeOffloadServer
+ import java.util.concurrent.Callable
+ import java.util.concurrent.Executors
+ import java.util.concurrent.TimeUnit
++import kotlinx.coroutines.launch
+ 
+ /**
+  * [Mines-selftest-29] Lets the CI emulator smoke test run the same offload
+@@ -112,6 +113,38 @@ class SelfTestProvider : ContentProvider() {
                  out.putString("result", o.toString())
              }
              "extract" -> out.putString("result", MailParse.extractCode(arg ?: "") ?: "")
@@ -695,7 +875,7 @@ index 0b722dc..fbac6fc 100644
              "degen" -> {
                  // [Mines-degen-34] detector on built-in samples: garbage must trip, normal text must not
                  val rnd = java.util.Random(7)
-@@ -183,7 +215,7 @@ class SelfTestProvider : ContentProvider() {
+@@ -183,7 +216,7 @@ class SelfTestProvider : ContentProvider() {
                              kotlinx.coroutines.runBlocking {
                                  runCatching { Voiceprint.ensureModel(c) }.onFailure { j.put("model_error", it.message) }
                                  j.put("model", Voiceprint.hasModel(c)).put("model_ms", System.currentTimeMillis() - t0)
@@ -704,7 +884,7 @@ index 0b722dc..fbac6fc 100644
                                  j.put("clip_samples", clips.sumOf { it.size })
                                  if (Voiceprint.hasModel(c)) runCatching {
                                      j.put("quality", Voiceprint.saveEnrolment(c, clips).toDouble())
-@@ -201,11 +233,14 @@ class SelfTestProvider : ContentProvider() {
+@@ -201,11 +234,14 @@ class SelfTestProvider : ContentProvider() {
                          Voiceprint.inject = "speech"
                          try {
                              kotlinx.coroutines.runBlocking {
@@ -721,7 +901,7 @@ index 0b722dc..fbac6fc 100644
                                      .onFailure { j.put("error", it.message) }
                                  j.put("save_ms", System.currentTimeMillis() - t0).put("model", Voiceprint.hasModel(c))
                              }
-@@ -386,6 +421,55 @@ class SelfTestProvider : ContentProvider() {
+@@ -386,6 +422,81 @@ class SelfTestProvider : ContentProvider() {
                  val k = arg ?: ""
                  out.putString("result", org.json.JSONObject().put("has", PlusVault.hasSecret(k)).put("tail", PlusVault.secret(k)?.takeLast(8) ?: "").toString())
              }
@@ -734,6 +914,19 @@ index 0b722dc..fbac6fc 100644
 +                val main = android.os.Handler(android.os.Looper.getMainLooper())
 +                when {
 +                    a == "secureoff" -> { Privacy.secureOffForSelfTest = true; out.putString("result", "{\"ok\":true}") }
++                    a.startsWith("layer:") -> {
++                        // [Mines-webpaint-38.4] smoke A/B: force the on-screen browser WebView's layer type (none / hardware / software)
++                        val l = java.util.concurrent.CountDownLatch(1)
++                        main.post {
++                            com.openminis.app.browser.WebFit.shown?.get()?.let { w ->
++                                w.setLayerType(when (a.removePrefix("layer:")) { "hardware" -> android.view.View.LAYER_TYPE_HARDWARE; "software" -> android.view.View.LAYER_TYPE_SOFTWARE; else -> android.view.View.LAYER_TYPE_NONE }, null)
++                                w.invalidate()
++                            }
++                            l.countDown()
++                        }
++                        l.await(5, TimeUnit.SECONDS)
++                        out.putString("result", "{\"ok\":true}")
++                    }
 +                    a.startsWith("open:") -> {
 +                        val l = java.util.concurrent.CountDownLatch(1)
 +                        main.post {
@@ -757,6 +950,17 @@ index 0b722dc..fbac6fc 100644
 +                                .put("densityDpi", dm.densityDpi).put("screenWidthDp", c.resources.configuration.screenWidthDp)
 +                                .put("settings", com.openminis.app.browser.BrowserZoom.describe(wv))
 +                                .put("settingsUa", wv.settings.userAgentString ?: "").put("scale", wv.scale.toDouble())
++                            // [Mines-webpaint-38.4] paint diagnostics: layer type, load progress, what heal did, how much is drawn
++                            // on screen (PixelCopy) and in a software draw, and the page's own view of its visible text
++                            base.put("layer", com.openminis.app.browser.WebPaintCheck.layerName(wv.layerType)).put("progress", wv.progress)
++                                .put("heal", com.openminis.app.browser.WebPaintCheck.lastHeal)
++                                .put("softwareInk", com.openminis.app.browser.WebPaintCheck.softwareInk(wv))
++                            wv.evaluateJavascript("if(!window.__minesRafOn){window.__minesRafOn=1;window.__minesRaf=0;(function f(){window.__minesRaf++;if(window.__minesRaf<100000)requestAnimationFrame(f)})()}", null)
++                            kotlinx.coroutines.MainScope().launch {
++                                base.put("screenInk", com.openminis.app.browser.WebPaintCheck.screenInk(wv))
++                                kotlinx.coroutines.delay(500)
++                                wv.evaluateJavascript(com.openminis.app.browser.WebPaintCheck.TEXT_JS) { tr ->
++                                    runCatching { base.put("text", org.json.JSONObject(org.json.JSONTokener(tr ?: "\"\"").nextValue() as String)) }
 +                            wv.evaluateJavascript(com.openminis.app.browser.WebFit.PROBE_JS) { r ->
 +                                val page = runCatching { org.json.JSONObject(org.json.JSONTokener(r ?: "\"\"").nextValue() as String) }.getOrNull()
 +                                base.put("page", page ?: org.json.JSONObject())
@@ -767,6 +971,8 @@ index 0b722dc..fbac6fc 100644
 +                                        .put("mobileUa", page.optString("ua").contains("Mobile"))
 +                                }
 +                                res.set(base.put("ok", true).toString()); l.countDown()
++                            }
++                                }
 +                            }
 +                        }
 +                        l.await(10, TimeUnit.SECONDS)
@@ -1070,7 +1276,7 @@ index e7fb64c..d6a561a 100644
          "arrow-left" to listOf("m12 19-7-7 7-7", "M19 12H5"),
          "battery-full" to listOf("M10 10v4", "M14 10v4", "M22 14v-4", "M6 10v4", "M4.0 6.0h12.0a2.0 2.0 0 0 1 2.0 2.0v8.0a2.0 2.0 0 0 1 -2.0 2.0h-12.0a2.0 2.0 0 0 1 -2.0 -2.0v-8.0a2.0 2.0 0 0 1 2.0 -2.0Z"),
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserSheet.kt b/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserSheet.kt
-index 1b7e0af..9034b1a 100644
+index 1b7e0af..3c1504e 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserSheet.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserSheet.kt
 @@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.Column
@@ -1081,15 +1287,16 @@ index 1b7e0af..9034b1a 100644
  import androidx.compose.foundation.layout.fillMaxWidth
  import androidx.compose.foundation.layout.height
  import androidx.compose.foundation.layout.padding
-@@ -184,6 +185,7 @@ fun BrowserSheet(
+@@ -184,6 +185,8 @@ fun BrowserSheet(
      StandardChatSheet(
          title = pageTitle.ifEmpty { stringResource(R.string.browser_title) },
          onDismiss = onDismiss,
 +        sheetMaxWidth = androidx.compose.ui.unit.Dp.Unspecified,  // [Mines-webfit-38.3] full width in landscape
++        singleLineTitle = true,  // [Mines-webpaint-38.4] long titles: one line + …, close X always visible
          leadingAction = {
              // UA-profile icon doubles as the entry point to settings, matching
              // the prior centered-title-with-icon affordance.
-@@ -200,7 +202,8 @@ fun BrowserSheet(
+@@ -200,7 +203,8 @@ fun BrowserSheet(
              }
          },
      ) {
@@ -1100,18 +1307,54 @@ index 1b7e0af..9034b1a 100644
              // (Add/History flank the tabs row so all tab-related controls
              // sit on one line, leaving the URL bar uncluttered below.)
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserWebView.kt b/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserWebView.kt
-index 997796f..969ee40 100644
+index 997796f..7640e49 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserWebView.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserWebView.kt
-@@ -55,6 +55,8 @@ fun BrowserWebView(
+@@ -6,6 +6,7 @@ import android.view.ViewGroup
+ import android.webkit.WebView
+ import android.widget.FrameLayout
+ import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.viewinterop.AndroidView
+ 
+@@ -39,6 +40,8 @@ fun BrowserWebView(
+             val mounted = container.getChildAt(0)
+             if (mounted !== webView) {
+                 container.removeAllViews()
++                // [Mines-webpaint-38.4] the tab we leave goes back to its off-screen hardware layer
++                (mounted as? WebView)?.let { runCatching { it.setLayerType(android.view.View.LAYER_TYPE_HARDWARE, null) } }
+                 // The WebView may still be parented to a previous container
+                 // (sheet re-open racing the old node's disposal) — detach
+                 // first or addView throws "child already has a parent".
+@@ -55,6 +58,13 @@ fun BrowserWebView(
                      }
                      false
                  }
 +                // [Mines-webfit-38.3] the page the user is looking at, for the fit-to-screen self-test
 +                com.openminis.app.browser.WebFit.shown = java.lang.ref.WeakReference(webView)
++                // [Mines-webpaint-38.4] on screen the page draws directly (no hardware layer): smoke 44 showed
++                // coze.cn's background only — the layer never got the content tiles. WebPaintCheck.heal switches
++                // back to a layer if this device draws nothing without one. Restored on release (headless capture).
++                if (webView.layerType != android.view.View.LAYER_TYPE_NONE) webView.setLayerType(android.view.View.LAYER_TYPE_NONE, null)
++                webView.onResume()
                  container.addView(
                      webView,
                      FrameLayout.LayoutParams(
+@@ -67,8 +77,13 @@ fun BrowserWebView(
+         onRelease = { container ->
+             // Free the WebView so a later mount (same or different sheet)
+             // can re-parent it without hitting the has-a-parent guard.
++            val mounted = container.getChildAt(0) as? WebView
+             container.removeAllViews()
++            // [Mines-webpaint-38.4] off screen it goes back to the hardware layer BrowserUseManager configured
++            mounted?.let { runCatching { it.setLayerType(android.view.View.LAYER_TYPE_HARDWARE, null) } }
+         },
+         modifier = modifier,
+     )
++    // [Mines-webpaint-38.4] page loaded but nothing drawn on screen → switch the layer type until it shows
++    LaunchedEffect(webView) { com.openminis.app.browser.WebPaintCheck.heal(webView) }
+ }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatAssistantMessageUI.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatAssistantMessageUI.kt
 index e3c4c6f..2df1574 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatAssistantMessageUI.kt
@@ -1297,20 +1540,22 @@ index 9332e3f..17920b9 100644
          ) {
              Column(modifier = Modifier.padding(20.dp)) {
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/StandardChatSheet.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/StandardChatSheet.kt
-index d7cb700..3c19df7 100644
+index d7cb700..7b86dd5 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/StandardChatSheet.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/StandardChatSheet.kt
-@@ -55,6 +55,9 @@ fun StandardChatSheet(
+@@ -55,6 +55,11 @@ fun StandardChatSheet(
      onDismiss: () -> Unit,
      leadingAction: (@Composable () -> Unit)? = null,
      heightFraction: Float = 0.9f,
 +    // [Mines-webfit-38.3] the in-app browser passes Dp.Unspecified: full screen width in landscape too
 +    // (Material's default caps a sheet at 640 dp, which left the page in a narrow centred column)
 +    sheetMaxWidth: androidx.compose.ui.unit.Dp = androidx.compose.material3.BottomSheetDefaults.SheetMaxWidth,
++    // [Mines-webpaint-38.4] the in-app browser: a long page title stays on one line (…) so the close X is always there
++    singleLineTitle: Boolean = false,
      content: @Composable () -> Unit,
  ) {
      val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-@@ -64,6 +67,7 @@ fun StandardChatSheet(
+@@ -64,6 +69,7 @@ fun StandardChatSheet(
      ModalBottomSheet(
          onDismissRequest = onDismiss,
          sheetState = sheetState,
@@ -1318,6 +1563,60 @@ index d7cb700..3c19df7 100644
          containerColor = ChatColors.background,
          dragHandle = { CompactDragHandle() },
      ) {
+@@ -76,6 +82,7 @@ fun StandardChatSheet(
+                 title = title,
+                 onDismiss = onDismiss,
+                 leadingAction = leadingAction,
++                singleLineTitle = singleLineTitle,
+             )
+             HorizontalDivider(thickness = 0.5.dp, color = ChatColors.separator)
+             Box(modifier = Modifier.fillMaxSize()) {
+@@ -120,6 +127,7 @@ fun StandardChatSheetHeader(
+     title: String,
+     onDismiss: () -> Unit,
+     leadingAction: (@Composable () -> Unit)? = null,
++    singleLineTitle: Boolean = false,
+ ) {
+     Row(
+         modifier = Modifier
+@@ -132,14 +140,29 @@ fun StandardChatSheetHeader(
+         } else {
+             Spacer(modifier = Modifier.size(48.dp))
+         }
+-        Spacer(modifier = Modifier.weight(1f))
+-        Text(
+-            text = title,
+-            fontSize = 16.sp,
+-            fontWeight = FontWeight.SemiBold,
+-            color = ChatColors.primaryText,
+-        )
+-        Spacer(modifier = Modifier.weight(1f))
++        if (singleLineTitle) {
++            // [Mines-webpaint-38.4] smoke 44: coze.cn's 80-character title wrapped to 4 lines and pushed the X off
++            // the sheet. One line, ellipsis, centred between the two 48 dp slots; the X is measured first.
++            Text(
++                text = title,
++                fontSize = 16.sp,
++                fontWeight = FontWeight.SemiBold,
++                color = ChatColors.primaryText,
++                maxLines = 1,
++                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
++                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
++                modifier = Modifier.weight(1f).padding(horizontal = 4.dp),
++            )
++        } else {
++            Spacer(modifier = Modifier.weight(1f))
++            Text(
++                text = title,
++                fontSize = 16.sp,
++                fontWeight = FontWeight.SemiBold,
++                color = ChatColors.primaryText,
++            )
++            Spacer(modifier = Modifier.weight(1f))
++        }
+         IconButton(onClick = onDismiss) {
+             Icon(
+                 imageVector = Icons.Default.Close,
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/voice/SpeechPlayerCapsule.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/voice/SpeechPlayerCapsule.kt
 index 22b516e..286b133 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/voice/SpeechPlayerCapsule.kt
@@ -1821,7 +2120,7 @@ index 402ddfd..ef9bd0d 100644
      val a = maxOf(st.glassOpacity, 0.72f).coerceAtMost(0.95f)
      return Brush.verticalGradient(listOf(base.copy(alpha = a - 0.06f), base.copy(alpha = a)))
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/KeyAgentScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/KeyAgentScreen.kt
-index fe54879..cf6df5b 100644
+index fe54879..03d1149 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/KeyAgentScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/KeyAgentScreen.kt
 @@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Row
@@ -1869,16 +2168,26 @@ index fe54879..cf6df5b 100644
                  if (blanks >= 4) {
                      PlusVault.setExtra(kind.id, "login_external", "1")
                      com.openminis.app.browser.GoogleAuthRouter.openInCustomTab(context, recipe.url)
-@@ -183,10 +195,14 @@ fun KeyAgentDialog(kind: ConnectionKind, onFallback: ((candidate: String?) -> Un
+@@ -183,10 +195,23 @@ fun KeyAgentDialog(kind: ConnectionKind, onFallback: ((candidate: String?) -> Un
      DisposableEffect(Unit) { onDispose { runCatching { webView?.stopLoading(); webView?.destroy() } } }
      val load = remember { WebLoadState() }
  
 -    Dialog(onDismissRequest = { close(done != null) }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+-        Surface(Modifier.fillMaxSize()) {
 +    // [Mines-webfit-38.3] decorFitsSystemWindows = false: the dialog window is the full screen and the insets below are real.
 +    // With the default (true) the window was shorter than the content measured for it on the 1280x2800 emulator, and the
 +    // bottom 帮我注册 / 重试 / 浏览器打开 / 关闭 row was drawn below the window (unclipped, transparent, not tappable) — smoke 44.
 +    Dialog(onDismissRequest = { close(done != null) }, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
-         Surface(Modifier.fillMaxSize()) {
++        // [Mines-webpaint-38.4] smoke 44: the settings page behind showed through the bottom 帮我注册 / 重试 / 浏览器打开 / 关闭
++        // row: the theme's `surface` is Color.Transparent (pages sit on AppNavigation's porcelain backdrop), so this dialog's
++        // Surface was see-through wherever the WebView did not cover it. Now an opaque porcelain colour, and the dialog
++        // window is forced to the full screen (not wrap-content).
++        val dialogView = androidx.compose.ui.platform.LocalView.current
++        androidx.compose.runtime.SideEffect {
++            ((dialogView as? androidx.compose.ui.window.DialogWindowProvider) ?: (dialogView.parent as? androidx.compose.ui.window.DialogWindowProvider))
++                ?.window?.setLayout(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT)
++        }
++        Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.surfaceContainerLow) {
              SecureWindow()  // [Mines-privacy-35.3] the key is on this page
 -            Column(Modifier.fillMaxSize().statusBarsPadding()) {
 +            // [Mines-webfit-38.3] the page shrinks above the keyboard instead of hiding its input fields
@@ -1886,7 +2195,7 @@ index fe54879..cf6df5b 100644
                  Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.primaryContainer).padding(16.dp)) {
                      // [Mines-keys-35] softer wording (user, 2026-10-14)
                      Text(if (done != null) (if (fixing) "已修复 ${kind.name}" else "已接入 ${kind.name}") else if (fixing) "正在修复 ${kind.name}…" else "正在接入 ${kind.name}…", fontSize = 17.sp, fontWeight = FontWeight.SemiBold,
-@@ -199,6 +215,7 @@ fun KeyAgentDialog(kind: ConnectionKind, onFallback: ((candidate: String?) -> Un
+@@ -199,6 +224,7 @@ fun KeyAgentDialog(kind: ConnectionKind, onFallback: ((candidate: String?) -> Un
                      AndroidView(modifier = Modifier.fillMaxSize(), factory = { ctx ->
                          WebView(ctx).apply {
                              LoginWeb.configure(this, kind.id)
@@ -1894,6 +2203,18 @@ index fe54879..cf6df5b 100644
                              webChromeClient = object : android.webkit.WebChromeClient() {
                                  override fun onProgressChanged(view: WebView, newProgress: Int) { load.progress = newProgress }
                              }
+@@ -237,7 +263,10 @@ fun KeyAgentDialog(kind: ConnectionKind, onFallback: ((candidate: String?) -> Un
+                     WebLoadOverlay(load, webView, onRetry = { webView?.let { w -> if (w.url.isNullOrBlank() || w.url == "about:blank") w.loadUrl(recipe.url) else w.reload() } },
+                         onExternal = { com.openminis.app.browser.GoogleAuthRouter.openInCustomTab(context, webView?.url?.takeIf { it.startsWith("http") } ?: recipe.url) })
+                 }
+-                Row(Modifier.fillMaxWidth().navigationBarsPadding().padding(12.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
++                // [Mines-webpaint-38.4] the action row has its own opaque background and its own space below the page (never
++                // over it); it sits above the navigation bar, and above the keyboard through the column's imePadding
++                // (the nav-bar inset is not added twice while the keyboard is up).
++                Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceContainerLow).navigationBarsPadding().padding(12.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                     if (done != null) Button(onClick = { close(true) }, modifier = Modifier.weight(1f).heightIn(min = 56.dp)) { Text("完成", fontSize = 18.sp) }
+                     else {
+                         if (waitUser) Button(onClick = { resumeTick++ }, modifier = Modifier.weight(1f).heightIn(min = 56.dp)) { Text("继续", fontSize = 18.sp) }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt
 index fe38e21..aef7382 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt
