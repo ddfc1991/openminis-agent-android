@@ -1358,6 +1358,46 @@ def png_size(path):
         return None
 
 
+def screen_ink(path, box):
+    """[build-38.4] share (1/10000) of pixels inside box (x1,y1,x2,y2) of a screencap that differ from the box's most
+    common colour (5 bits/channel), on a 1/4 grid. 0 = one flat colour (nothing drawn). -1 if it cannot be read."""
+    try:
+        from PIL import Image
+        im = Image.open(path).convert("RGB")
+        x1, y1, x2, y2 = [int(v) for v in box]
+        x1, y1 = max(0, x1), max(0, y1); x2, y2 = min(im.width, x2), min(im.height, y2)
+        if x2 - x1 < 8 or y2 - y1 < 8: return -1
+        reg = im.crop((x1, y1, x2, y2)).resize(((x2 - x1) // 4, (y2 - y1) // 4))
+        counts = {}
+        for p in reg.getdata():
+            k = (p[0] & 0xF8, p[1] & 0xF8, p[2] & 0xF8); counts[k] = counts.get(k, 0) + 1
+        n = sum(counts.values()); top = max(counts.values())
+        return (n - top) * 10000 // n
+    except Exception as e:
+        print("screen_ink error", e, flush=True); return -1
+
+
+def node_bounds(root, pred):
+    for n in (root.iter("node") if root is not None else []):
+        if pred(n):
+            b = list(map(int, re.findall(r"\d+", n.get("bounds", ""))))
+            if len(b) == 4: return b
+    return None
+
+
+def wait_page_loaded(tag, limit=45):
+    """[build-38.4] screenshot only after the page finished: WebView progress 100, document complete, then 3 s settle."""
+    t0 = time.time(); j = {}
+    while time.time() - t0 < limit:
+        j = selftest_json("webfit", "probe", timeout=20) or {}
+        tx = j.get("text") or {}
+        if j.get("progress") == 100 and tx.get("rs") == "complete": break
+        time.sleep(3)
+    time.sleep(3)
+    print(f"B384 {tag} loaded after {time.time() - t0:.0f}s progress={j.get('progress')} rs={(j.get('text') or {}).get('rs')}", flush=True)
+    return j
+
+
 def screen_383():
     """[build-38.3] the emulator must BE the user's phone (1280x2800 px, 480 dpi), set at AVD creation (avd-fit.sh +
     -skin), not by `wm size` (clamped to a multiple of the old 320x640 panel -> 1080x1920)."""
@@ -1425,14 +1465,42 @@ def browser_probe(tag, want_dp=None):
     return j
 
 
+def b384_paint(tag, root, shot, j):
+    """[build-38.4] the page must really be drawn (smoke 44: coze.cn only its background colour), and the sheet title
+    must be one line with the close X on screen."""
+    j = j or {}
+    wv = node_bounds(root, lambda n: n.get("class", "").endswith("WebView"))
+    ink = screen_ink(shot, wv) if wv else -1
+    tx = j.get("text") or {}
+    print(f"B384 paint {tag} webview={wv} screencapInk={ink} appScreenInk={j.get('screenInk')} softwareInk={j.get('softwareInk')} "
+          f"layer={j.get('layer')} heal={j.get('heal')!r} text={json.dumps(tx, ensure_ascii=False)[:400]}", flush=True)
+    if ink >= 0 and ink < 10 and (tx.get("shown") or 0) >= 3:
+        selftest_fail.append(f"b384 {tag}: page not drawn (screen ink {ink}/10000, page shows {tx.get('shown')} text nodes; layer {j.get('layer')}; heal {j.get('heal')!r})")
+        # A/B evidence for the next fix: the same page with each layer type
+        for lt in ("hardware", "software", "none"):
+            selftest_json("webfit", "layer:" + lt, timeout=10); time.sleep(4)
+            rr = snap(f"b384-{tag}-layer-{lt}")
+            print(f"B384 A/B {tag} layer={lt} ink={screen_ink(f'{OUT}/{step_no:02d}-b384-{tag}-layer-{lt}.png', wv)}", flush=True)
+    title = (j.get("page") or {}).get("title") or ""
+    close = node_bounds(root, lambda n: (n.get("content-desc") or "") in ("关闭", "Close"))   # the header X (not M3's 「关闭工作表」 scrim action)
+    tb = node_bounds(root, lambda n: title and (n.get("text") or "") == title)
+    print(f"B384 title {tag} bounds={tb} close={close}", flush=True)
+    if not close or close[2] > SCREEN[0] or close[0] < 0:
+        page_missing.append(f"b384 {tag}: browser close X not on screen ({close})")
+    if tb and (tb[3] - tb[1]) > 110:
+        page_missing.append(f"b384 {tag}: browser title is more than one line ({tb[3] - tb[1]} px high)")
+
+
 def browser_case(url, tag, check_fit=True):
     if not browser_open(url, tag): return
+    wait_page_loaded(tag)
     r = snap("b383-browser-" + tag)
     shot = f"{OUT}/b383-browser-{tag}.png"
     subprocess.run(f"cp {OUT}/{step_no:02d}-b383-browser-{tag}.png {shot}", shell=True)
     BROWSER_SHOTS.append(shot)
     j = browser_probe(tag, want_dp=round(SCREEN[0] / 3.0))
     pg = (j or {}).get("page") or {}
+    b384_paint(tag, r, shot, j)
     if j and check_fit and not j.get("fits"):
         selftest_fail.append(f"b383 {tag}: page wider than the screen (scrollWidth {pg.get('scrollWidth')} > innerWidth {pg.get('innerWidth')})")
     if tag == "example":
@@ -1636,8 +1704,16 @@ def coze_382():
         weak = next((h for h in COZE_LOGIN[-2:] if any(x.strip() == h for x in t)), None)   # a bare 「登录」/「Sign in」 button
         if weak and i >= 4: res["login_text"] = weak; break
         if any("显示不出来" in x or "白屏" in x for x in t): res["white"] = True
-    snap("coze-keyagent")
+    wait_page_loaded("keyagent-coze", limit=30)
+    rk = snap("coze-keyagent")
     subprocess.run(f"cp {OUT}/{step_no:02d}-coze-keyagent.png {OUT}/b383-keyagent-coze.png", shell=True)
+    # [build-38.4] the action row sits below the page in its own opaque space, above the navigation bar
+    wvb = node_bounds(rk, lambda n: n.get("class", "").endswith("WebView"))
+    btn = node_bounds(rk, lambda n: (n.get("text") or "") in ("重试",))
+    print(f"B384 keyagent webview={wvb} retry={btn}", flush=True)
+    if wvb and btn and wvb[3] > btn[1] + 2: page_missing.append(f"b384 keyagent: buttons overlap the page (webview bottom {wvb[3]} > button top {btn[1]})")
+    if btn and btn[3] > SCREEN[1]: page_missing.append(f"b384 keyagent: buttons below the screen ({btn})")
+    if not btn: page_missing.append("b384 keyagent: 重试 button not found")
     jk = browser_probe("keyagent-coze", want_dp=round(SCREEN[0] / 3.0))
     if jk and jk.get("ok") and not jk.get("fits"): print("B383 keyagent-coze: page wider than the screen", flush=True)
     print(f"B382 coze texts={seen[:40]} focus={focus_pkg().strip()[:200]}", flush=True)

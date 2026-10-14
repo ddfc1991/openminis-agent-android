@@ -26,4 +26,5 @@ mv smoke-wall.png smoke-wall.jpg 2>/dev/null; ls -la smoke-wall.jpg
 adb push smoke-wall.jpg /sdcard/Pictures/smoke-wall.png
 adb shell am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d file:///sdcard/Pictures/smoke-wall.png
 adb shell content call --uri content://media/external/file --method scan_volume --arg external_primary 2>/dev/null
+python3 -m pip install -q --break-system-packages pillow 2>/dev/null || python3 -m pip install -q pillow 2>/dev/null || true   # [build-38.4] screenshot paint check
 python3 hark-build/smoke/vps_smoke.py
