@@ -23,6 +23,10 @@ try:
     VOICE352 = "voice" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
 except Exception:
     VOICE352 = False
+try:
+    B353 = "b353" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
+except Exception:
+    B353 = False
 step_no = 0
 crashed = []
 
@@ -1047,6 +1051,122 @@ def voice_352():
     for _ in range(3): sh("input keyevent KEYCODE_BACK"); time.sleep(1.2)
 
 
+def node_by_desc(root, prefix):
+    for t, d, x, y, n in nodes(root):
+        if (d or "").startswith(prefix) or (t or "").startswith(prefix):
+            return x, y
+    return None
+
+
+def tap_scrolled(prefix, tries=6, wait=4):
+    """tap a node whose text / content-description starts with prefix, scrolling the page up until it is on screen"""
+    for _ in range(tries):
+        r = dump()
+        p = node_by_desc(r, prefix)
+        if p and 150 < p[1] < SCREEN[1] - 150:
+            sh(f"input tap {p[0]} {p[1]}"); time.sleep(wait); return True
+        sh(f"input swipe {SCREEN[0]//2} {int(SCREEN[1]*0.75)} {SCREEN[0]//2} {int(SCREEN[1]*0.35)} 400"); time.sleep(1.5)
+    print(f"  (not reachable: {prefix})", flush=True)
+    return False
+
+
+def b353():
+    """[build-35.3] 消息 buttons really act; 「去官网获取」 fills + saves a key from a (fake) page; account page masked + collapsed."""
+    res = {}
+    # ---- 1. 值得关注 「帮我领」 → a Mines chat with the task, sent ----
+    j = selftest_json("feedinject", "both", timeout=30)
+    print(f"B353 inject {j}", flush=True)
+    go_home()
+    if tap_text("打开消息页", wait=8):
+        for attempt in range(2):
+            r = dump()
+            p = next(((x, y) for tx, d, x, y, n in nodes(r) if (tx or d).startswith("值得关注 ")), None)
+            if p: sh(f"input tap {p[0]} {p[1]}"); time.sleep(3)
+            snap("b353-deal-tab")
+            if tap_scrolled("帮我领：SmokeAI", wait=2):
+                snap("b353-deal-tapped")  # 「处理中…」 / toast
+                ok = False
+                for _ in range(10):
+                    time.sleep(2)
+                    r2 = dump(); t2 = " ".join(texts(r2)) if r2 is not None else ""
+                    if "帮我领取" in t2 or ("SmokeAI" in t2 and "打开消息页" not in t2 and "值得关注 " not in t2): ok = True; break
+                st = selftest_json("feedstate", "", timeout=20)
+                snap("b353-deal-chat")
+                res["deal_chat"] = ok and bool(st.get("session"))
+                print(f"B353 deal chat_shown={ok} state={st}", flush=True)
+                break
+            print("  retry deal tab", flush=True)
+        if not res.get("deal_chat"): selftest_fail.append("b353 帮我领 did not open a chat with the sent task")
+    else:
+        selftest_fail.append("b353 消息 bar missing")
+    # ---- 2. 账号异常 「一键修复」 → repair flow (KeyAgentDialog) ----
+    go_home()
+    if tap_text("打开消息页", wait=8):
+        r = dump()
+        p = next(((x, y) for tx, d, x, y, n in nodes(r) if (tx or d).startswith("账号异常 ")), None)
+        if p: sh(f"input tap {p[0]} {p[1]}"); time.sleep(3)
+        snap("b353-account-tab")
+        ok = False
+        if tap_scrolled("一键修复：", wait=2):
+            for _ in range(8):
+                time.sleep(2)
+                r2 = dump(); t2 = " ".join(texts(r2)) if r2 is not None else ""
+                if "正在接入 硅基流动" in t2 or "正在修复 硅基流动" in t2 or "不会点任何付费按钮" in t2: ok = True; break
+            snap("b353-fix-flow")
+        res["fix_flow"] = ok
+        print(f"B353 fix_flow={ok}", flush=True)
+        if not ok: selftest_fail.append("b353 一键修复 did not start the repair flow")
+        tap_text("关闭", exact=True, wait=2)
+    for _ in range(3): sh("input keyevent KEYCODE_BACK"); time.sleep(1.2)
+    # ---- 3. 「去官网获取」 on DeepSeek with a fake key page → key read, saved, tested ----
+    key = "sk-" + "d00dfeed" * 4
+    go_home()
+    selftest_json("keyfake", f"deepseek|http://10.0.2.2:8088/fakekeys|{key}", timeout=20)
+    selftest("openkind", "deepseek", timeout=20); time.sleep(5)
+    snap("b353-deepseek")
+    got = False
+    if tap_scrolled("去官网获取", wait=3):
+        for _ in range(20):
+            time.sleep(2)
+            r2 = dump()
+            if r2 is not None and find(r2, "已接入 DeepSeek"): break
+        snap("b353-key-dialog")
+        ks = selftest_json("keystate", "deepseek", timeout=20)
+        got = bool(ks.get("has")) and ks.get("tail") == key[-8:]
+        print(f"B353 keystate={ks}", flush=True)
+        tap_text("完成", exact=True, wait=2)
+    res["key_auto"] = got
+    if not got: selftest_fail.append("b353 去官网获取 did not fill + save the key from the page")
+    for _ in range(3): sh("input keyevent KEYCODE_BACK"); time.sleep(1.2)
+    # ---- 4. account page: masked, collapsed per service; expanded rows one line (font 1.3) ----
+    selftest_json("fakeaccounts", "", timeout=20)
+    sh("settings put system font_scale 1.3"); time.sleep(3)
+    go_home()
+    selftest("openkind", "", timeout=20); time.sleep(5)
+    full = "deningyang740@qq.com"
+    # bring the 已连接 section on screen without tapping
+    for _ in range(6):
+        r = dump(); p = node_by_desc(r, "商汤 SenseNova：")
+        if p and 150 < p[1] < SCREEN[1] - 150: break
+        sh(f"input swipe {SCREEN[0]//2} {int(SCREEN[1]*0.75)} {SCREEN[0]//2} {int(SCREEN[1]*0.35)} 400"); time.sleep(1.5)
+    r = snap("b353-accounts-collapsed")
+    subprocess.run(f"cp {OUT}/{step_no:02d}-b353-accounts-collapsed.png {OUT}/accounts-collapsed.png", shell=True)
+    t = "\n".join(texts(r)) if r is not None else ""
+    collapsed_ok = ("个账号" in t) and ("API Key · " not in t)
+    if full in t: selftest_fail.append("b353 full e-mail shown (collapsed)")
+    tap_scrolled("商汤 SenseNova：", wait=2)
+    tap_scrolled("QQ 邮箱：", wait=2)
+    r = snap("b353-accounts-expanded")
+    subprocess.run(f"cp {OUT}/{step_no:02d}-b353-accounts-expanded.png {OUT}/accounts-expanded.png", shell=True)
+    t = "\n".join(texts(r)) if r is not None else ""
+    if full in t: selftest_fail.append("b353 full e-mail shown (expanded)")
+    masked = "de***40@qq.com" in t
+    print(f"B353 collapsed_ok={collapsed_ok} masked={masked} full_absent={full not in t} res={res}", flush=True)
+    if not collapsed_ok: page_missing.append("b353 collapsed summary not seen")
+    if not masked: page_missing.append("b353 masked e-mail not seen in expanded rows")
+    sh("settings put system font_scale 1.0"); time.sleep(2)
+
+
 def main():
     m = re.search(r"(\d+)x(\d+)", sh("wm size"))
     if m: SCREEN[0], SCREEN[1] = int(m.group(1)), int(m.group(2))
@@ -1071,6 +1191,12 @@ def main():
         dump_fatal()
         user_like_state()
 
+    if B353:
+        try:
+            b353()
+        except Exception as e:
+            print("b353 error:", e, flush=True); selftest_fail.append(f"b353 error {e}")
+        return finish(lc)
     if VOICE352:
         try:
             voice_352()

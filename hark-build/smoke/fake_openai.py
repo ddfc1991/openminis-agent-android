@@ -52,6 +52,18 @@ class H(BaseHTTPRequestHandler):
                     b'<button>Verify</button></body></html>')
             self.send_response(200); self.send_header("Content-Type", "text/html")
             self.send_header("Content-Length", str(len(html))); self.end_headers(); self.wfile.write(html); return
+        # [build-35.3] fake provider key page for 「去官网获取」: an old key is already visible (must NOT be taken),
+        # 「Create new API key」 opens a name field + Create, then the new key is shown with a Copy button
+        if self.path.startswith("/fakekeys"):
+            html = ('<html><head><meta name="viewport" content="width=device-width"></head><body style="font-size:18px">'
+                    '<h2>API keys</h2><p>Existing: sk-' + 'a' * 32 + ' (old)</p>'
+                    '<button id="new" onclick="document.getElementById(\'dlg\').style.display=\'block\'">Create new API key</button>'
+                    '<div id="dlg" style="display:none;margin-top:20px"><input id="name" placeholder="Name" style="width:240px;height:40px">'
+                    '<button onclick="document.getElementById(\'out\').innerText=\'sk-' + 'd00dfeed' * 4 + '\';'
+                    'document.getElementById(\'dlg\').style.display=\'none\'">Create</button></div>'
+                    '<pre id="out" style="margin-top:20px"></pre></body></html>').encode()
+            self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html))); self.end_headers(); self.wfile.write(html); return
         if self.path.rstrip("/").endswith("/models"):
             return self._json({"object": "list", "data": [{"id": "smoke-model", "object": "model", "owned_by": "smoke"}]})
         self._json({"ok": True})
