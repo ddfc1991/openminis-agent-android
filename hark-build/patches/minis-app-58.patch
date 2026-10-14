@@ -1,5 +1,189 @@
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt b/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt
+index 652eaf5..3130adc 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt
+@@ -31,6 +31,8 @@ import kotlin.math.exp
+  */
+ object Digest {
+     enum class Cat(val label: String) { ACT("要处理"), DEAL("值得关注"), LEARN("可学"), HOT("飙升"), OTHER("其他") }
++    /** [Mines-feed-35.1] 消息 page tabs (user 2026-10-14): each item lives in exactly one, by source first. */
++    enum class Tab(val label: String) { ACCOUNT("账号异常"), FOLLOW("我关注的"), X("X"), GITHUB("GitHub"), DEAL("值得关注"), OTHER("其他") }
+ 
+     data class Item(
+         val id: String,
+@@ -45,6 +47,7 @@ object Digest {
+         val stars: String? = null,
+         var score: Double = 0.0,
+         var cat: Cat = Cat.OTHER,
++        var tab: Tab = Tab.OTHER,
+         var pinned: Boolean = false,
+         // [Mines-feed-32] takeaway headline + plain summary (cheap free model in batches, rule fallback), why it ranked
+         var headline: String? = null,
+@@ -100,6 +103,15 @@ object Digest {
+     fun notInterested(c: Context, it: Item) {
+         toggleSet(c, "hidden", it.id); bump(c, it.sourceKey, -0.8); bump(c, "sender:" + it.sender, -1.0); rerank(c)
+     }
++    /** [Mines-feed-35.1] 「忽略」 on the card: hide this one (persisted), undo puts it back. */
++    fun ignore(c: Context, it: Item) { editSet(c, "hidden", it.id, add = true); rerank(c) }
++    fun unignore(c: Context, it: Item) { editSet(c, "hidden", it.id, add = false); rerank(c) }
++    private fun editSet(c: Context, name: String, value: String, add: Boolean) {
++        val p = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++        val s = (p.getStringSet(name, emptySet()) ?: emptySet()).toMutableSet()
++        if (add) s.add(value) else s.remove(value)
++        p.edit().putStringSet(name, s).apply()
++    }
+     private fun bump(c: Context, k: String, d: Double) {
+         val w = weights(c); w.put(k, (w.optDouble(k, 0.0) + d).coerceIn(-5.0, 5.0)); saveWeights(c, w)
+     }
+@@ -111,6 +123,8 @@ object Digest {
+     private val learn = Regex("(?i)tutorial|guide|how to|course|paper|learn|thread|docs|教程|指南|学习|课程|论文|入门|干货|笔记")
+     // [Mines-patrol-32] security e-mails / notifications (new sign-in, password change) always go to 要处理
+     private val security = Regex("(?i)new sign-in|new login|security alert|password (was )?changed|unusual sign|suspicious|新设备登录|异地登录|登录提醒|安全提醒|安全警告|密码已(修改|更改|重置)|账号异常")
++    private val accountWords = Regex("(?i)余额|balance|欠费|充值|密钥|api ?key|token|quota|额度(用完|不足)|429|rate.?limit|账号|account|登录|sign-?in|login|password|密码|验证|2fa|billing|invoice|payment|扣款|账单|过期|expired|suspend|封禁|停用|权限")
++    private val failWords = Regex("(?i)fail|失败|error|cancel")
+     private val noise = Regex("(?i)newsletter|unsubscribe|digest|no-reply|noreply|marketing|bounty|claude-builders-bounty|weekly|推广|广告|订阅|退订|营销")
+ 
+     fun scoreAll(c: Context, raw: List<Item>): List<Item> {
+@@ -153,6 +167,22 @@ object Digest {
+                 learn.containsMatchIn(text) -> Cat.LEARN
+                 else -> Cat.OTHER
+             }
++            // [Mines-feed-35.1] tab: 账号异常 only for real account problems; then 我关注的 senders; then by source
++            val isX = it.source == "X"
++            val isGh = it.source == "GitHub" || it.source == "Trending"
++            val all = text + " " + (it.headline ?: "").lowercase()
++            val ciFail = isGh && it.summary.startsWith("CI 结果") && failWords.containsMatchIn(all)
++            val ghSec = isGh && it.summary.startsWith("安全警告")
++            val account = it.source == "账号巡查" || ciFail || ghSec || (sec && !isX) ||
++                (it.cat == Cat.ACT && !isX && !isGh && accountWords.containsMatchIn(text))
++            it.tab = when {
++                account -> Tab.ACCOUNT
++                sm -> Tab.FOLLOW
++                isX -> Tab.X
++                isGh -> Tab.GITHUB
++                it.source == "免费额度" || it.cat == Cat.DEAL -> Tab.DEAL
++                else -> Tab.OTHER
++            }
+             it
+         }.sortedByDescending { it.score }
+     }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
+index 46c4398..dcd8064 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
+@@ -75,7 +75,9 @@ fun DigestScreen(onBack: () -> Unit) {
+     val busy by Digest.busy.collectAsState()
+     val vault by com.openminis.app.plus.PlusVault.entries.collectAsState()
+     val scope = rememberCoroutineScope()
+-    var cat by remember { mutableStateOf<Digest.Cat?>(null) }
++    // [Mines-feed-35.1] tab by name ("ALL" = 全部); null = not chosen yet → X when it has items
++    var tabSel by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf<String?>(null) }
++    val snack = remember { androidx.compose.material3.SnackbarHostState() }
+     var menuFor by remember { mutableStateOf<Digest.Item?>(null) }
+     var whyFor by remember { mutableStateOf<Digest.Item?>(null) }
+     var detailFor by remember { mutableStateOf<Digest.Item?>(null) }
+@@ -99,11 +101,32 @@ fun DigestScreen(onBack: () -> Unit) {
+         }
+     }
+ 
++    val curTab = tabSel ?: when {
++        items.any { it.tab == Digest.Tab.X } -> Digest.Tab.X.name
++        items.any { it.tab == Digest.Tab.ACCOUNT } -> Digest.Tab.ACCOUNT.name
++        else -> (Digest.Tab.values().firstOrNull { t -> items.any { it.tab == t } } ?: Digest.Tab.X).name
++    }
++    fun ignore(m: Digest.Item) {
++        Digest.ignore(context, m)
++        scope.launch {
++            snack.currentSnackbarData?.dismiss()
++            val r = snack.showSnackbar("已忽略", actionLabel = "撤销", duration = androidx.compose.material3.SnackbarDuration.Short)
++            if (r == androidx.compose.material3.SnackbarResult.ActionPerformed) Digest.unignore(context, m)
++        }
++    }
++
+     // [Mines-design-34] 「暖瓷 · 毛玻璃」 backdrop (warm fog, or the user's photo with the readability scrim)
+     Box(Modifier.fillMaxSize()) {
+         MinesBackdrop(Modifier.fillMaxSize())
+         androidx.compose.material3.Scaffold(
+             containerColor = Color.Transparent,
++            snackbarHost = { androidx.compose.material3.SnackbarHost(snack) { d ->
++                androidx.compose.material3.Snackbar(
++                    modifier = Modifier.padding(12.dp),
++                    action = { androidx.compose.material3.TextButton(onClick = { d.performAction() }, modifier = Modifier.semantics { contentDescription = "撤销忽略" }) {
++                        Text("撤销", fontSize = 17.sp, fontWeight = FontWeight.SemiBold) } },
++                ) { Text(d.visuals.message, fontSize = 17.sp) }
++            } },
+             topBar = {
+                 androidx.compose.material3.TopAppBar(
+                     title = { Text("消息", fontWeight = FontWeight.Bold, fontSize = 22.sp, color = mines().ink) },
+@@ -149,20 +172,29 @@ fun DigestScreen(onBack: () -> Unit) {
+                         }
+                     }
+                 }
+-                // ---- category chips (home chip style) + 我关注的 ----
++                // ---- [Mines-feed-35.1] tabs: 账号异常 / 我关注的 / X / GitHub / 值得关注 (+ 其他, 全部), each with its count ----
+                 item(key = "chips") {
+                     Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 8.dp),
+                         horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+-                        FeedChip("全部 ${items.size}", cat == null) { cat = null }
+-                        listOf(Digest.Cat.ACT, Digest.Cat.DEAL, Digest.Cat.LEARN, Digest.Cat.HOT).filter { c -> items.any { it.cat == c } }.forEach { c ->
+-                            FeedChip("${c.label} ${items.count { it.cat == c }}", cat == c) { cat = if (cat == c) null else c }
++                        val main = listOf(Digest.Tab.ACCOUNT, Digest.Tab.FOLLOW, Digest.Tab.X, Digest.Tab.GITHUB, Digest.Tab.DEAL)
++                        main.forEach { t ->
++                            FeedChip("${t.label} ${items.count { it.tab == t }}", curTab == t.name) { tabSel = t.name }
+                         }
+-                        FeedChip("我关注的 ✎", false) { editFollows = true }
++                        val other = items.count { it.tab == Digest.Tab.OTHER }
++                        if (other > 0) FeedChip("其他 $other", curTab == Digest.Tab.OTHER.name) { tabSel = Digest.Tab.OTHER.name }
++                        FeedChip("全部 ${items.size}", curTab == "ALL") { tabSel = "ALL" }
++                        FeedChip("✎ 关注设置", false) { editFollows = true }
+                     }
+                     Digest.lastError?.let { Text(it, fontSize = 13.sp, color = readableSecondary(), modifier = Modifier.padding(horizontal = 16.dp)) }
+                 }
+-                val shown = items.filter { cat == null || it.cat == cat }.take(80)
+-                if (shown.isEmpty() && !busy) item(key = "empty") { Text("现在没有需要看的消息", fontSize = 18.sp, color = mines().ink, modifier = Modifier.padding(24.dp)) }
++                val shown = (if (curTab == "ALL") items else items.filter { it.tab.name == curTab }).take(80)
++                if (shown.isEmpty() && !busy) item(key = "empty") {
++                    Text(when (curTab) {
++                        Digest.Tab.FOLLOW.name -> "还没有你关注的人或账号的消息。点上面「✎ 关注设置」添加要关注的人"
++                        Digest.Tab.ACCOUNT.name -> "账号都正常，没有要你处理的异常"
++                        else -> "这里暂时没有消息，下拉刷新"
++                    }, fontSize = 18.sp, lineHeight = 26.sp, color = mines().ink, modifier = Modifier.padding(24.dp))
++                }
+                 val now = System.currentTimeMillis()
+                 val startOfDay = java.util.Calendar.getInstance().apply { set(java.util.Calendar.HOUR_OF_DAY, 0); set(java.util.Calendar.MINUTE, 0); set(java.util.Calendar.SECOND, 0) }.timeInMillis
+                 val groups = shown.groupBy { when { it.pinned -> "置顶"; it.at >= startOfDay -> "今天"; now - it.at < 7 * 86_400_000L -> "本周"; else -> "更早" } }
+@@ -182,6 +214,7 @@ fun DigestScreen(onBack: () -> Unit) {
+                                 onAct = { detailFor = m },
+                                 onShare = { shareItem(context, m) },
+                                 onMore = { menuFor = m },
++                                onIgnore = { ignore(m) },
+                             )
+                         }
+                     }
+@@ -266,7 +299,7 @@ private fun FeedChip(label: String, selected: Boolean, onClick: () -> Unit) {
+ 
+ @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+ @Composable
+-private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, onLike: () -> Unit, onDiscuss: () -> Unit, onAct: () -> Unit, onShare: () -> Unit, onMore: () -> Unit) {
++private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, onLike: () -> Unit, onDiscuss: () -> Unit, onAct: () -> Unit, onShare: () -> Unit, onMore: () -> Unit, onIgnore: () -> Unit = {}) {
+     // [Mines-design-34] design33 02-feed: source line, bold headline, plain summary, tone tag + one action pill + ⋯
+     val m = mines()
+     val tone = when (it.cat) {
+@@ -302,6 +335,12 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
+                 Text(it.cat.label, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = toneFg,
+                     modifier = Modifier.clip(RoundedCornerShape(50)).background(toneBg).padding(horizontal = 10.dp, vertical = 4.dp))
+                 Spacer(Modifier.weight(1f))
++                // [Mines-feed-35.1] 「忽略」 right on the card (not hidden in ⋯)
++                Text("忽略", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = m.ink,
++                    modifier = Modifier.heightIn(min = 40.dp).clip(RoundedCornerShape(50)).background(m.glassStrong)
++                        .border(1.dp, m.hairline, RoundedCornerShape(50))
++                        .clickable(onClick = onIgnore).semantics { contentDescription = "忽略这条" }.padding(horizontal = 14.dp, vertical = 9.dp))
++                Spacer(Modifier.width(8.dp))
+                 Text("✦ $actLabel", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = m.onContainer,
+                     modifier = Modifier.heightIn(min = 40.dp).clip(RoundedCornerShape(50)).background(m.container)
+                         .clickable(onClick = onAct).padding(horizontal = 14.dp, vertical = 9.dp))
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
-index 39ed904..77a5c50 100644
+index 39ed904..fa81fb3 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
 @@ -97,11 +97,10 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier) {
@@ -10,8 +194,9 @@ index 39ed904..77a5c50 100644
 +    // [Mines-home-35.1] status pills, one slim 消息 bar (→ own page), then 最近对话.
      val m = mines()
      val feed by com.openminis.app.plus.Digest.items.collectAsState()
-     val todo = feed.filter { it.cat == com.openminis.app.plus.Digest.Cat.ACT }
+-    val todo = feed.filter { it.cat == com.openminis.app.plus.Digest.Cat.ACT }
 -    val top = (todo + feed.filter { it.cat != com.openminis.app.plus.Digest.Cat.ACT }).take(3)
++    val todo = feed.filter { it.tab == com.openminis.app.plus.Digest.Tab.ACCOUNT }
      var shown by androidx.compose.runtime.saveable.rememberSaveable { androidx.compose.runtime.mutableStateOf(false) }
      LaunchedEffect(Unit) { shown = true }
      val appear by androidx.compose.animation.core.animateFloatAsState(if (shown) 1f else 0f, androidx.compose.animation.core.tween(280), label = "appear")
