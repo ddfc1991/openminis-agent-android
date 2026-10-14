@@ -1,0 +1,1558 @@
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt b/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt
+index 15ba95d..25d6809 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt
+@@ -177,9 +177,11 @@ object Digest {
+                 (it.cat == Cat.ACT && !isX && !isGh && accountWords.containsMatchIn(text))
+             it.tab = when {
+                 account -> Tab.ACCOUNT
+-                sm -> Tab.FOLLOW
++                // [Mines-warm-36] X = 「我关注的」 (people the user follows + X's picks): X posts stay in X even when
++                // they mention a GitHub repo or come from a followed sender; GitHub stays GitHub.
+                 isX -> Tab.X
+                 isGh -> Tab.GITHUB
++                sm -> Tab.FOLLOW
+                 it.source == "免费额度" || it.cat == Cat.DEAL -> Tab.DEAL
+                 else -> Tab.OTHER
+             }
+@@ -304,6 +306,10 @@ object Digest {
+         return out
+     }
+ 
++    /** [Mines-warm-36] never 「GitHub：null」: an empty/null reason becomes a plain sentence. */
++    private fun errLine(what: String, t: Throwable): String =
++        t.message?.trim()?.takeIf { it.isNotEmpty() && it != "null" }?.let { "$what：$it" } ?: "$what 暂时连不上"
++
+     private fun oneLine(s: String) = s.replace(Regex("\\s+"), " ").trim().take(140)
+ 
+     suspend fun refresh(c: Context) = withContext(Dispatchers.IO) {
+@@ -315,13 +321,13 @@ object Digest {
+             val parts = coroutineScope {
+                 listOf(
+                     async { notifications(c) },
+-                    async { runCatching { githubNotifications() }.getOrElse { errs += "GitHub：${it.message}"; emptyList() } },
+-                    async { runCatching { trending(c) }.getOrElse { errs += "Trending：${it.message}"; emptyList() } },
++                    async { runCatching { githubNotifications() }.getOrElse { errs += errLine("GitHub", it); emptyList() } },
++                    async { runCatching { trending(c) }.getOrElse { errs += errLine("Trending", it); emptyList() } },
+                     async { patrol() },
+                     async { DigestX.cached() },
+                     async { runCatching { FreeOffers.load(c); offers(c) }.getOrDefault(emptyList()) },
+                     // [Mines-sources-33] every signed-in source feeds the digest with no setup
+-                    async { runCatching { MailSources.digestItems(c) }.getOrElse { errs += "邮箱：${it.message}"; emptyList() } },
++                    async { runCatching { MailSources.digestItems(c) }.getOrElse { errs += errLine("邮箱", it); emptyList() } },
+                     async { runCatching { AutoSources.githubWebItems() }.getOrDefault(emptyList()) },
+                     async { injected.map { it.copy() } },
+                 ).awaitAll()
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
+index 8fca7c4..b565569 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
+@@ -39,6 +39,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+ import androidx.compose.material.icons.outlined.Add
++import androidx.compose.material.icons.outlined.Close
+ import androidx.compose.material.icons.outlined.ExpandLess
+ import androidx.compose.material.icons.outlined.ExpandMore
+ import androidx.compose.material.icons.outlined.Refresh
+@@ -211,7 +212,8 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+             balTick++
+         }
+     }
+-    PlusPage("应用", onBack) {
++    // [Mines-warm-36] design36conn: 「账号连接」 — search, clipboard card, 需要处理 on top, connected services by category
++    PlusPage("账号连接", onBack) {
+         // [Mines-apps-32] rounded search bar 「搜索应用」
+         OutlinedTextField(
+             query, { query = it },
+@@ -221,13 +223,41 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+             textStyle = MaterialTheme.typography.bodyLarge,
+             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(top = 8.dp).heightIn(min = 52.dp),
+         )
+-        // [Mines-digest-32] 消息汇总 is one tap from here too
+-        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+-            FilledTonalButton(onClick = { PlusNav.go(PlusRoutes.DIGEST) }, modifier = Modifier.heightIn(min = 48.dp)) {
+-                Text("消息汇总", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
++        Text("密钥和登录加密存在本机，列表里不显示任何账号信息", fontSize = 14.sp, color = mines().ink2, maxLines = 1,
++            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, modifier = Modifier.padding(horizontal = 24.dp, vertical = 6.dp))
++        // [Mines-warm-36] clipboard card: a key the user just copied is recognised here (on this phone only) → 连接
++        var clipTick by remember { mutableIntStateOf(0) }
++        val lifecycle = androidx.compose.ui.platform.LocalLifecycleOwner.current
++        androidx.compose.runtime.DisposableEffect(lifecycle) {
++            val obs = androidx.lifecycle.LifecycleEventObserver { _, e -> if (e == androidx.lifecycle.Lifecycle.Event.ON_RESUME) clipTick++ }
++            lifecycle.lifecycle.addObserver(obs); onDispose { lifecycle.lifecycle.removeObserver(obs) }
++        }
++        var clipKind by remember { mutableStateOf<ConnectionKind?>(null) }
++        var clipSeen by rememberSaveable { mutableStateOf("") }
++        LaunchedEffect(clipTick, entries.size) {
++            delay(400)  // Android 10+: the clipboard is readable only once the window has focus
++            clipKind = PlusVault.kinds.filter { it.keyRegex != null && it.id != "gmail" && !it.id.contains('#') }.firstNotNullOfOrNull { k ->
++                PlusConnect.keyOnClipboard(context, k)?.takeIf { v -> v.length >= 20 && v.hashCode().toString() != clipSeen &&
++                    PlusVault.accountsOf(k.id).none { PlusVault.secret(it) == v } }?.let { k }
++            }
++        }
++        clipKind?.let { ck ->
++            MinesCard(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), strong = true) {
++                Row(Modifier.fillMaxWidth().heightIn(min = 68.dp).padding(start = 14.dp, end = 6.dp, top = 8.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
++                    IconBubble(com.openminis.app.ui.brand.MinesIcons.named("copy")!!, size = 44.dp)
++                    Spacer(Modifier.width(12.dp))
++                    Column(Modifier.weight(1f)) {
++                        Text("${ck.name} 密钥", fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = mines().ink, maxLines = 1,
++                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
++                        Text("刚复制的 · 只在本机识别", fontSize = 15.sp, color = mines().ink2, maxLines = 1)
++                    }
++                    WarmPrimaryPill("连接", onClick = { clipKind = null; connect(PlusVault.kind(PlusVault.defaultAccount(ck.id) ?: ck.id) ?: ck) },
++                        height = 44.dp, fontSize = 16, description = "连接 ${ck.name}")
++                    androidx.compose.material3.IconButton(onClick = {
++                        clipSeen = PlusConnect.keyOnClipboard(context, ck)?.hashCode()?.toString() ?: ""; clipKind = null
++                    }, modifier = Modifier.size(48.dp)) { MinesIcon(Icons.Outlined.Close, contentDescription = "不用了", tint = mines().ink2) }
++                }
+             }
+-            Spacer(Modifier.weight(1f))
+-            Text("密钥和登录加密存在本机", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+         }
+         @Suppress("UNUSED_EXPRESSION") balTick
+         val q = query.trim().lowercase()
+@@ -254,6 +284,7 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+         }
+         val bases = entries.keys.map { PlusVault.baseId(it) }.distinct().sorted().mapNotNull { PlusVault.kind(it) }
+             .filter { k -> query.isBlank() || k.name.lowercase().contains(query.trim().lowercase()) || k.id.contains(query.trim().lowercase()) }
++            .sortedBy { connCategoryOrder.indexOf(connCategory(it)) }
+         val patrol by com.openminis.app.plus.AccountPatrol.status.collectAsState()
+         val patrolRunning by com.openminis.app.plus.AccountPatrol.running.collectAsState()
+         val checking by com.openminis.app.plus.AccountPatrol.checking.collectAsState()
+@@ -280,6 +311,40 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+                     }
+             }
+         }
++        // [Mines-warm-36] 需要处理: broken / expiring accounts on top, each with its one fixing action
++        val problems = entries.keys.filter { patrol[it]?.level == com.openminis.app.plus.AccountPatrol.Level.BAD || patrol[it]?.level == com.openminis.app.plus.AccountPatrol.Level.WARN }
++            .sortedBy { if (patrol[it]?.level == com.openminis.app.plus.AccountPatrol.Level.BAD) 0 else 1 }
++        if (problems.isNotEmpty() && query.isBlank()) {
++            WarmGroupLabel("需要处理", if (problems.size > 3) "还有 ${problems.size - 3} 个" else null)
++            MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
++                problems.take(3).forEachIndexed { i, id ->
++                    val k = PlusVault.kind(id) ?: return@forEachIndexed
++                    val base = PlusVault.kind(PlusVault.baseId(id)) ?: k
++                    val ps = patrol[id]
++                    val bad = ps?.level == com.openminis.app.plus.AccountPatrol.Level.BAD
++                    val (fg, _) = toneColors(if (bad) Tone.DANGER else Tone.WARNING)
++                    val canFix = bad && com.openminis.app.plus.KeyAgent.recipe(id)?.mode == com.openminis.app.plus.KeyAgent.Mode.WEBVIEW
++                    val why = ps?.reason?.let { r -> com.openminis.app.plus.AccountLabel.showText(r) }?.takeIf { it.isNotBlank() } ?: if (bad) "连不上" else "要注意"
++                    Row(Modifier.fillMaxWidth().heightIn(min = 68.dp).clickable { detailId = id }.padding(start = 14.dp, end = 10.dp, top = 8.dp, bottom = 8.dp)
++                        .semantics(mergeDescendants = true) { contentDescription = "${base.name}：$why" },
++                        verticalAlignment = Alignment.CenterVertically) {
++                        BrandIcon(base, 44.dp)
++                        Spacer(Modifier.width(12.dp))
++                        Column(Modifier.weight(1f)) {
++                            Text(base.name, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = mines().ink, maxLines = 1,
++                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
++                            Text(why, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = fg, maxLines = 1,
++                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
++                        }
++                        Spacer(Modifier.width(8.dp))
++                        if (canFix) WarmPrimaryPill("一键修复", onClick = { fixId = id }, height = 44.dp, fontSize = 16,
++                            icon = com.openminis.app.ui.brand.MinesIcons.named("wrench"), description = "一键修复 ${base.name}")
++                        else MinesIcon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = mines().ink3)
++                    }
++                    if (i < minOf(problems.size, 3) - 1) WarmDivider()
++                }
++            }
++        }
+         if (bases.isNotEmpty()) {
+             // [Mines-accounts-35.3] user 2026-10-14 「我点开才展示，你这样又长又难看」: one line per service (icon, name,
+             // 「N 个账号 · 全部正常」, status dot, chevron), no identity until it is opened; account rows are one line
+@@ -307,6 +372,13 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+                     }
+                 }
+                 bases.forEachIndexed { i, base ->
++                    // [Mines-warm-36] connected services grouped by kind (AI 服务商 / 邮箱 / 开发与服务器 / …)
++                    val cat = connCategory(base)
++                    if (i == 0 || connCategory(bases[i - 1]) != cat) {
++                        if (i > 0) PlusDivider()
++                        Text(cat, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = mines().ink2, maxLines = 1,
++                            modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 10.dp, bottom = 2.dp))
++                    }
+                     val ids = PlusVault.accountsOf(base.id)
+                     val def = PlusVault.defaultAccount(base.id)
+                     val isOpen = base.id in open
+@@ -472,6 +544,18 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+ 
+ }
+ 
++/** [Mines-warm-36] display category of a connected service (storage groups unchanged). */
++private val connCategoryOrder = listOf("AI 服务商", "邮箱", "开发与服务器", "社交与资讯", "金融与加密", "效率与办公", "其他")
++private fun connCategory(k: ConnectionKind): String = when {
++    k.id in setOf("gmail", "mail163", "qqmail", "outlook", "mail126", "icloudmail") -> "邮箱"
++    k.group == PlusVault.G_AI -> "AI 服务商"
++    k.group == PlusVault.G_DEV -> "开发与服务器"
++    k.group == PlusVault.G_SOCIAL || k.id == "x" -> "社交与资讯"
++    k.group == PlusVault.G_FIN -> "金融与加密"
++    k.group == PlusVault.G_COMMON -> "效率与办公"
++    else -> "其他"
++}
++
+ @Composable
+ fun BrandIcon(kind: ConnectionKind, size: Dp = 40.dp) {
+     Box(
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
+index 726f3d0..feb81e5 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
+@@ -22,6 +22,14 @@ import androidx.compose.ui.semantics.contentDescription
+ import androidx.compose.ui.semantics.semantics
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.automirrored.filled.ArrowBack
++import androidx.compose.material.icons.outlined.Tune
++import androidx.compose.material.icons.outlined.FavoriteBorder
++import androidx.compose.material.icons.outlined.Favorite
++import androidx.compose.material.icons.outlined.ChatBubbleOutline
++import androidx.compose.material.icons.outlined.VisibilityOff
++import androidx.compose.material.icons.outlined.Close
++import androidx.compose.foundation.layout.statusBarsPadding
++import androidx.compose.foundation.layout.navigationBarsPadding
+ import androidx.compose.foundation.verticalScroll
+ import androidx.compose.foundation.layout.heightIn
+ import androidx.compose.foundation.layout.padding
+@@ -101,18 +109,20 @@ fun DigestScreen(onBack: () -> Unit) {
+         doAction(context, it, it.steps.ifEmpty { com.openminis.app.plus.DigestWriter.fallbackSteps(it) })
+     }
+ 
++    // [Mines-warm-36] 「我关注的」 is part of X (user rule): FOLLOW items show under X
++    fun tabOf(it: Digest.Item) = if (it.tab == Digest.Tab.FOLLOW) Digest.Tab.X else it.tab
+     val curTab = tabSel ?: when {
+-        items.any { it.tab == Digest.Tab.X } -> Digest.Tab.X.name
++        items.any { tabOf(it) == Digest.Tab.X } -> Digest.Tab.X.name
+         items.any { it.tab == Digest.Tab.ACCOUNT } -> Digest.Tab.ACCOUNT.name
+         else -> (Digest.Tab.values().firstOrNull { t -> items.any { it.tab == t } } ?: Digest.Tab.X).name
+     }
++    // [Mines-warm-36] dark undo pill 「已忽略「…」 ↶ 撤销」 (5 s) instead of the stock snackbar
++    var undo by remember { mutableStateOf<Pair<String, () -> Unit>?>(null) }
++    LaunchedEffect(undo) { if (undo != null) { delay(5000); undo = null } }
+     fun ignore(m: Digest.Item) {
+         Digest.ignore(context, m)
+-        scope.launch {
+-            snack.currentSnackbarData?.dismiss()
+-            val r = snack.showSnackbar("已忽略", actionLabel = "撤销", duration = androidx.compose.material3.SnackbarDuration.Short)
+-            if (r == androidx.compose.material3.SnackbarResult.ActionPerformed) Digest.unignore(context, m)
+-        }
++        val (fh0, _) = com.openminis.app.plus.DigestWriter.fallback(m)
++        undo = "已忽略「${com.openminis.app.plus.AccountLabel.maskText(m.headline ?: fh0).take(18)}」" to { Digest.unignore(context, m); Unit }
+     }
+ 
+     // [Mines-design-34] 「暖瓷 · 毛玻璃」 backdrop (warm fog, or the user's photo with the readability scrim)
+@@ -128,13 +138,17 @@ fun DigestScreen(onBack: () -> Unit) {
+                 ) { Text(d.visuals.message, fontSize = 17.sp) }
+             } },
+             topBar = {
+-                androidx.compose.material3.TopAppBar(
+-                    title = { Text("消息", fontWeight = FontWeight.Bold, fontSize = 22.sp, color = mines().ink) },
+-                    navigationIcon = { androidx.compose.material3.IconButton(onClick = onBack) {
+-                        com.openminis.app.ui.brand.MinesIcon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回", tint = mines().ink) } },
+-                    colors = androidx.compose.material3.TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent, scrolledContainerColor = Color.Transparent),
++                // [Mines-warm-36] design36warm 03: back · face + name plate · 关注设置
++                WarmHeader(
++                    status = if (busy) "正在替你看 X 和 GitHub" else "替你看着 X 和 GitHub",
++                    modifier = Modifier.statusBarsPadding(),
++                    leading = { WarmRoundButton(Icons.AutoMirrored.Filled.ArrowBack, "返回", onClick = onBack) },
++                    trailing = { WarmRoundButton(Icons.Outlined.Tune, "关注设置", onClick = { editFollows = true }) },
+                 )
+             },
++            bottomBar = {
++                undo?.let { (t, u) -> UndoBar(t, onAction = { u(); undo = null }, modifier = Modifier.navigationBarsPadding()) }
++            },
+         ) { pad ->
+           // [Mines-feed-32] pull down to refresh (no big 刷新 button)
+           androidx.compose.material3.pulltorefresh.PullToRefreshBox(
+@@ -172,25 +186,25 @@ fun DigestScreen(onBack: () -> Unit) {
+                         }
+                     }
+                 }
+-                // ---- [Mines-feed-35.1] tabs: 账号异常 / 我关注的 / X / GitHub / 值得关注 (+ 其他, 全部), each with its count ----
++                // ---- [Mines-warm-36] 「N 件要处理」 strip + 4 tabs: 账号异常 / X / GitHub / 值得关注 (其他 only when it has items) ----
+                 item(key = "chips") {
+-                    Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 8.dp),
+-                        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+-                        val main = listOf(Digest.Tab.ACCOUNT, Digest.Tab.FOLLOW, Digest.Tab.X, Digest.Tab.GITHUB, Digest.Tab.DEAL)
+-                        main.forEach { t ->
+-                            FeedChip("${t.label} ${items.count { it.tab == t }}", curTab == t.name) { tabSel = t.name }
+-                        }
+-                        val other = items.count { it.tab == Digest.Tab.OTHER }
+-                        if (other > 0) FeedChip("其他 $other", curTab == Digest.Tab.OTHER.name) { tabSel = Digest.Tab.OTHER.name }
+-                        FeedChip("全部 ${items.size}", curTab == "ALL") { tabSel = "ALL" }
+-                        FeedChip("✎ 关注设置", false) { editFollows = true }
+-                    }
+-                    Digest.lastError?.let { Text(it, fontSize = 13.sp, color = readableSecondary(), modifier = Modifier.padding(horizontal = 16.dp)) }
++                    val todo = items.filter { it.tab == Digest.Tab.ACCOUNT }
++                    if (todo.isNotEmpty() && curTab != Digest.Tab.ACCOUNT.name) TodoSummaryBar(
++                        todo.size,
++                        todo.take(3).joinToString(" · ") { t -> feedClean(t.headline) ?: feedClean(t.title) ?: t.source },
++                        onClick = { tabSel = Digest.Tab.ACCOUNT.name },
++                    )
++                    val tabs = listOf(Digest.Tab.ACCOUNT, Digest.Tab.X, Digest.Tab.GITHUB, Digest.Tab.DEAL).map { t ->
++                        WarmTab(t.name, t.label, items.count { tabOf(it) == t }, danger = t == Digest.Tab.ACCOUNT)
++                    } + (items.count { it.tab == Digest.Tab.OTHER }.takeIf { it > 0 }?.let { listOf(WarmTab(Digest.Tab.OTHER.name, "其他", it)) } ?: emptyList())
++                    WarmTabs(tabs, curTab, onSelect = { k -> tabSel = k })
++                    feedClean(Digest.lastError)?.let { Text(it, fontSize = 14.sp, color = mines().ink3, maxLines = 1, overflow = TextOverflow.Ellipsis,
++                        modifier = Modifier.padding(horizontal = 24.dp)) }
+                 }
+-                val shown = (if (curTab == "ALL") items else items.filter { it.tab.name == curTab }).take(80)
++                val shown = (if (curTab == "ALL") items else items.filter { tabOf(it).name == curTab }).take(80)
+                 if (shown.isEmpty() && !busy) item(key = "empty") {
+                     Text(when (curTab) {
+-                        Digest.Tab.FOLLOW.name -> "还没有你关注的人或账号的消息。点上面「✎ 关注设置」添加要关注的人"
++                        Digest.Tab.X.name -> "X 上暂时没有新消息。右上角「关注设置」可以加要关注的人和话题"
+                         Digest.Tab.ACCOUNT.name -> "账号都正常，没有要你处理的异常"
+                         else -> "这里暂时没有消息，下拉刷新"
+                     }, fontSize = 18.sp, lineHeight = 26.sp, color = mines().ink, modifier = Modifier.padding(24.dp))
+@@ -241,11 +255,9 @@ fun DigestScreen(onBack: () -> Unit) {
+                 SheetRow("在对话里讨论") { menuFor = null; detailFor = null; discuss(context, m) }
+                 SheetRow(if (m.pinned) "取消置顶" else "置顶") { val was = m.pinned; Digest.pin(context, m); FeedTasks.toast(context, if (was) "已取消置顶" else "已置顶"); menuFor = null }
+                 SheetRow("静音此来源") { Digest.mute(context, m); menuFor = null; detailFor = null
+-                    scope.launch { snack.currentSnackbarData?.dismiss()
+-                        if (snack.showSnackbar("已静音「${m.source}」", actionLabel = "撤销", duration = androidx.compose.material3.SnackbarDuration.Short) == androidx.compose.material3.SnackbarResult.ActionPerformed) Digest.mute(context, m) } }
++                    undo = "已静音「${m.source}」" to { Digest.mute(context, m); Unit } }
+                 SheetRow("不感兴趣") { Digest.notInterested(context, m); menuFor = null; detailFor = null
+-                    scope.launch { snack.currentSnackbarData?.dismiss()
+-                        if (snack.showSnackbar("以后少推这类", actionLabel = "撤销", duration = androidx.compose.material3.SnackbarDuration.Short) == androidx.compose.material3.SnackbarResult.ActionPerformed) Digest.notInterested(context, m) } }
++                    undo = "以后少推这类" to { Digest.notInterested(context, m); Unit } }
+                 SheetRow("分享") { shareItem(context, m); menuFor = null }
+                 SheetRow("分享为图片") { shareImage(context, m); menuFor = null }
+                 if (m.url != null || m.pkg != null) SheetRow("查看原文 ↗") { openOriginal(context, m); menuFor = null }
+@@ -340,11 +352,32 @@ private fun FeedChip(label: String, selected: Boolean, onClick: () -> Unit) {
+             .semantics { contentDescription = label + if (selected) "（已选）" else "" })
+ }
+ 
++/** [Mines-warm-36] drop empty / placeholder values ("null", "undefined", a dangling colon) — never shown on a card. */
++internal fun feedClean(s: String?): String? = s?.replace(Regex("(?i)(?<![A-Za-z])(null|undefined)(?![A-Za-z])"), "")
++    ?.replace(Regex("[：:·\\s]+$"), "")?.replace(Regex("^[：:·\\s]+"), "")?.trim()?.takeIf { it.isNotBlank() && it != "—" }
++
++private val repoRe = Regex("github\\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)")
++/** owner/name of a GitHub repo an X post links to (null when it links none). */
++private fun repoOf(it: Digest.Item): String? = listOfNotNull(it.url, it.title, it.summary, it.brief).firstNotNullOfOrNull { t ->
++    repoRe.find(t)?.groupValues?.get(1)?.removeSuffix(".git")?.trimEnd('.', ')')
++}?.takeIf { r -> r.split('/').let { p -> p.size == 2 && p[0] !in setOf("orgs", "topics", "trending", "settings", "sponsors") } }
++
++/** What the card's / sheet's main button says (follows the action, not a generic 开始吧). */
++private fun actLabelOf(it: Digest.Item): String = when {
++    it.act?.startsWith("fix:") == true -> "一键修复"
++    it.act?.startsWith("kind:") == true && it.source == "免费额度" -> "帮我领"
++    it.act?.startsWith("kind:") == true || it.tab == Digest.Tab.ACCOUNT -> "去处理"
++    it.cat == Digest.Cat.DEAL -> "帮我领"
++    it.cat == Digest.Cat.LEARN -> "学一下"
++    else -> "开始吧"
++}
++
+ @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+ @Composable
+ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, onLike: () -> Unit, onDiscuss: () -> Unit, onAct: () -> Unit, onShare: () -> Unit, onMore: () -> Unit, onIgnore: () -> Unit = {},
+                      busy: Boolean = false, error: String? = null) {
+-    // [Mines-design-34] design33 02-feed: source line, bold headline, plain summary, tone tag + one action pill + ⋯
++    // [Mines-warm-36] design36warm 03: lead face/icon · meta + source mark · bold Chinese headline · one plain line ·
++    // (X: GitHub mini card / cover picture) · ♡ 讨论 忽略 ⋯ — account problems get the terracotta 一键修复 pill instead.
+     val m = mines()
+     val tone = when (it.cat) {
+         Digest.Cat.ACT -> Tone.DANGER; Digest.Cat.DEAL -> Tone.SUCCESS; Digest.Cat.LEARN -> Tone.INFO
+@@ -352,53 +385,89 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
+     }
+     val (toneFg, toneBg) = toneColors(tone)
+     val (fh, fs) = com.openminis.app.plus.DigestWriter.fallback(it)
+-    // [Mines-privacy-35.3] e-mails / phones / keys in card text are masked
+-    val headline = com.openminis.app.plus.AccountLabel.maskText(it.headline ?: fh)
+-    val brief = com.openminis.app.plus.AccountLabel.maskText(it.brief ?: fs)
+-    val actLabel = if (it.act?.startsWith("fix:") == true) "一键修复" else when (it.cat) { Digest.Cat.ACT -> "帮我看看"; Digest.Cat.DEAL -> "帮我领"; Digest.Cat.LEARN -> "学一下"; else -> "帮我处理" }
+-    MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp)) {
+-        Column(Modifier.fillMaxWidth().combinedClickable(onClick = onOpen, onLongClick = onLong).padding(start = 18.dp, end = 10.dp, top = 16.dp, bottom = 8.dp)) {
+-            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(end = 8.dp)) {
+-                TopicIcon(it, toneFg, 20.dp)
+-                Spacer(Modifier.width(8.dp))
+-                Text((if (it.pinned) "置顶 · " else "") + it.source + (if (it.sender.isNotBlank() && it.sender != it.source) " · " + com.openminis.app.plus.AccountLabel.maskText(it.sender) else "") + " · " + relTime(it.at),
+-                    fontSize = 15.sp, color = m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis)
+-            }
+-            Row(Modifier.padding(top = 8.dp, end = 8.dp), verticalAlignment = Alignment.Top) {
+-                Column(Modifier.weight(1f)) {
+-                    Text(headline, fontSize = 19.sp, lineHeight = 26.sp, fontWeight = FontWeight.SemiBold, color = m.ink, maxLines = 2, overflow = TextOverflow.Ellipsis)
+-                    Text(brief, fontSize = 16.sp, lineHeight = 24.sp, color = m.ink2, maxLines = 3, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 4.dp))
++    val headline = com.openminis.app.plus.AccountLabel.maskText(feedClean(it.headline) ?: feedClean(fh) ?: it.source)
++    val brief = feedClean(it.brief ?: fs)?.let { b -> com.openminis.app.plus.AccountLabel.maskText(b) }?.takeIf { b -> b != headline }
++    val isX = it.source == "X"
++    val isGh = it.tab == Digest.Tab.GITHUB
++    val isAcct = it.tab == Digest.Tab.ACCOUNT || it.act?.startsWith("fix:") == true
++    val actLabel = actLabelOf(it)
++    var liked by remember(it.id) { mutableStateOf(false) }
++    val sender = feedClean(com.openminis.app.plus.AccountLabel.maskText(it.sender))?.takeIf { s -> s != it.source }
++    MinesCard(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)) {
++        Row(Modifier.fillMaxWidth().combinedClickable(onClick = onOpen, onLongClick = onLong).padding(start = 14.dp, end = 6.dp, top = 14.dp, bottom = 4.dp),
++            verticalAlignment = Alignment.Top) {
++            if (isX && sender != null) {
++                Box(Modifier.size(46.dp).clip(androidx.compose.foundation.shape.CircleShape)
++                    .background(androidx.compose.ui.graphics.Brush.linearGradient(listOf(Color(0xFFE08A6B), Color(0xFFB5532F)))),
++                    contentAlignment = Alignment.Center) {
++                    Text(sender.trimStart('@').take(1).uppercase(), fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                 }
+-                it.image?.let { img ->
+-                    Spacer(Modifier.width(12.dp))
+-                    coil.compose.AsyncImage(model = img, contentDescription = null,
+-                        contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+-                        modifier = Modifier.size(36.dp).clip(RoundedCornerShape(10.dp)))  // [Mines-feed-35.1] was 64 dp; user: icons smaller
++            } else TopicIcon(it, toneFg, 46.dp)
++            Spacer(Modifier.width(12.dp))
++            Column(Modifier.weight(1f)) {
++                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(end = 8.dp)) {
++                    if (isAcct) {
++                        Text(if (it.act?.startsWith("fix:") == true) "已失效" else "要处理", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = toneColors(Tone.DANGER).first,
++                            maxLines = 1, softWrap = false,
++                            modifier = Modifier.clip(RoundedCornerShape(50)).background(toneColors(Tone.DANGER).second).padding(horizontal = 9.dp, vertical = 3.dp))
++                        Spacer(Modifier.width(8.dp))
++                    }
++                    Text((if (it.pinned) "置顶 · " else "") + listOfNotNull(sender ?: it.source.takeIf { s -> s.isNotBlank() }, relTime(it.at)).joinToString(" · "),
++                        fontSize = 15.sp, color = m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
++                    val mark = when { isX -> com.openminis.app.R.drawable.ic_brand_x; isGh -> com.openminis.app.R.drawable.ic_brand_github; else -> 0 }
++                    if (mark != 0) androidx.compose.foundation.Image(androidx.compose.ui.res.painterResource(mark), contentDescription = it.source,
++                        modifier = Modifier.padding(start = 6.dp).size(18.dp))
+                 }
++                Text(headline, fontSize = 19.sp, lineHeight = 26.sp, fontWeight = FontWeight.Bold, color = m.ink, maxLines = 3, overflow = TextOverflow.Ellipsis,
++                    modifier = Modifier.padding(top = 4.dp, end = 8.dp))
++                // GitHub: Chinese on top (big), the English name/description underneath in small print
++                if (isGh) feedClean(it.title)?.takeIf { t -> t != headline }?.let { en ->
++                    Text(en, fontSize = 15.sp, lineHeight = 20.sp, color = m.ink3, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 2.dp, end = 8.dp))
++                }
++                brief?.let { b -> Text(b, fontSize = 17.sp, lineHeight = 25.sp, color = m.ink2, maxLines = 3, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 4.dp, end = 8.dp)) }
++                if (isGh) feedClean(it.stars)?.let { st -> Text("★ $st", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = toneFg, maxLines = 1,
++                    modifier = Modifier.padding(top = 6.dp).clip(RoundedCornerShape(50)).background(toneBg).padding(horizontal = 10.dp, vertical = 3.dp)) }
++                if (isX) repoOf(it)?.let { r -> RepoMiniCard(r, null, null) }
++                if (isX) it.image?.let { img ->
++                    coil.compose.AsyncImage(model = img, contentDescription = null, contentScale = androidx.compose.ui.layout.ContentScale.Crop,
++                        modifier = Modifier.padding(top = 10.dp, end = 8.dp).fillMaxWidth().height(170.dp).clip(RoundedCornerShape(16.dp)))
++                }
++                Row(Modifier.fillMaxWidth().padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
++                    if (isAcct || it.cat == Digest.Cat.DEAL) {
++                        WarmPrimaryPill(if (busy) "处理中…" else actLabel, onClick = onAct, enabled = !busy, height = 44.dp, fontSize = 16,
++                            icon = if (actLabel == "一键修复") com.openminis.app.ui.brand.MinesIcons.named("wrench") else null,
++                            description = "$actLabel：$headline")
++                        Spacer(Modifier.width(4.dp))
++                    } else {
++                        androidx.compose.material3.IconButton(onClick = { liked = true; onLike() }, modifier = Modifier.size(48.dp).semantics { contentDescription = "喜欢，多推这类" }) {
++                            com.openminis.app.ui.brand.MinesIcon(if (liked) Icons.Outlined.Favorite else Icons.Outlined.FavoriteBorder, null,
++                                tint = if (liked) m.icon else m.ink, modifier = Modifier.size(24.dp))
++                        }
++                        TextAct(Icons.Outlined.ChatBubbleOutline, "讨论", "在对话里讨论这条", onDiscuss)
++                    }
++                    // [Mines-feed-35.1] 「忽略」 always visible on every card
++                    TextAct(Icons.Outlined.VisibilityOff, "忽略", "忽略这条", onIgnore)
++                    Spacer(Modifier.weight(1f))
++                    ActIcon("⋯", "更多", m.ink2, onMore)
++                }
++                error?.let { e -> Text("没能开始：$e", fontSize = 15.sp, lineHeight = 21.sp, color = toneColors(Tone.DANGER).first, modifier = Modifier.padding(top = 2.dp, bottom = 6.dp, end = 8.dp)) }
+             }
+-            Row(Modifier.fillMaxWidth().padding(top = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+-                Text(it.cat.label, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = toneFg,
+-                    modifier = Modifier.clip(RoundedCornerShape(50)).background(toneBg).padding(horizontal = 10.dp, vertical = 4.dp))
+-                Spacer(Modifier.weight(1f))
+-                // [Mines-feed-35.1] 「忽略」 right on the card (not hidden in ⋯)
+-                Text("忽略", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = m.ink,
+-                    modifier = Modifier.heightIn(min = 40.dp).clip(RoundedCornerShape(50)).background(m.glassStrong)
+-                        .border(1.dp, m.hairline, RoundedCornerShape(50))
+-                        .clickable(onClick = onIgnore).semantics { contentDescription = "忽略这条" }.padding(horizontal = 14.dp, vertical = 9.dp))
+-                Spacer(Modifier.width(8.dp))
+-                Text(if (busy) "处理中…" else "✦ $actLabel", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = m.onContainer,
+-                    modifier = Modifier.heightIn(min = 40.dp).clip(RoundedCornerShape(50)).background(m.container)
+-                        .clickable(enabled = !busy, onClick = onAct)
+-                        .semantics { contentDescription = (if (busy) "处理中：" else "$actLabel：") + headline }
+-                        .padding(horizontal = 14.dp, vertical = 9.dp))
+-                ActIcon("⋯", "更多", m.ink2, onMore)
+-            }
+-            // [Mines-feed-35.3] a failed start says why, right on the card
+-            error?.let { e -> Text("没能开始：$e", fontSize = 15.sp, lineHeight = 21.sp, color = Color(0xFFD93025), modifier = Modifier.padding(top = 6.dp, end = 8.dp)) }
+         }
+     }
+ }
+ 
++/** Icon + word action (48 dp tall), e.g. 讨论 / 忽略. */
++@Composable
++private fun TextAct(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, description: String, onClick: () -> Unit) {
++    val m = mines()
++    Row(Modifier.heightIn(min = 48.dp).clip(RoundedCornerShape(50)).clickable(onClick = onClick).semantics(mergeDescendants = true) { contentDescription = description }
++        .padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
++        com.openminis.app.ui.brand.MinesIcon(icon, null, tint = m.ink, modifier = Modifier.size(22.dp))
++        Spacer(Modifier.width(5.dp))
++        Text(label, fontSize = 16.sp, fontWeight = FontWeight.Medium, color = m.ink, maxLines = 1, softWrap = false)
++    }
++}
++
+ @Composable
+ private fun ActIcon(glyph: String, label: String, color: Color, onClick: () -> Unit) {
+     androidx.compose.material3.IconButton(onClick = onClick, modifier = Modifier.size(48.dp).semantics { contentDescription = label }) {
+@@ -440,83 +509,118 @@ private fun TopicIcon(it: Digest.Item, catColor: Color, size: androidx.compose.u
+  * 「包含的内容」 (what Mines will do; each row can be switched off), source preview,
+  * bottom bar ⋯ + wide 「✨ 开始吧」 that really starts the work in Mines; share and 原文 too.
+  */
+-@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
++@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class, androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+ @Composable
+ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pair<String, String>>) -> Unit, onMore: () -> Unit, onShare: () -> Unit, onWhy: () -> Unit,
+                         busy: Boolean = false, error: String? = null) {
++    // [Mines-warm-36] design36warm 04: source row + ✕, big headline, plain paragraph, small facts, 「包含的内容 N 项」
++    // (icon · bold title · one line · terracotta tick, each can be switched off), bottom bar: round ⋯ + terracotta pill
++    // whose word follows the action (一键修复 / 去处理 / 帮我领 / 开始吧).
+     val context = LocalContext.current
+     val steps = remember(m.id) { m.steps.ifEmpty { com.openminis.app.plus.DigestWriter.fallbackSteps(m) } }
+     val on = remember(m.id) { androidx.compose.runtime.mutableStateListOf<Boolean>().apply { repeat(steps.size) { add(true) } } }
+     val (fh, fs) = com.openminis.app.plus.DigestWriter.fallback(m)
+-    val catColor = when (m.cat) {
+-        Digest.Cat.ACT -> Color(0xFFE5484D); Digest.Cat.DEAL -> Color(0xFF30A46C); Digest.Cat.LEARN -> Color(0xFF3E83F8)
+-        Digest.Cat.HOT -> Color(0xFFF76B15); Digest.Cat.OTHER -> Color(0xFF8E8E93)
++    val tone = when (m.cat) {
++        Digest.Cat.ACT -> Tone.DANGER; Digest.Cat.DEAL -> Tone.SUCCESS; Digest.Cat.LEARN -> Tone.INFO
++        Digest.Cat.HOT -> Tone.WARNING; Digest.Cat.OTHER -> Tone.NEUTRAL
+     }
++    val (toneFg, toneBg) = toneColors(if (m.tab == Digest.Tab.ACCOUNT) Tone.DANGER else tone)
++    val isFix = m.act?.startsWith("fix:") == true
++    val label = actLabelOf(m)
+     val mc = mines()
++    val headline = com.openminis.app.plus.AccountLabel.maskText(feedClean(m.headline) ?: feedClean(fh) ?: m.source)
+     androidx.compose.material3.ModalBottomSheet(onDismissRequest = onDismiss, sheetState = androidx.compose.material3.rememberModalBottomSheetState(skipPartiallyExpanded = true),
+-        containerColor = mc.surface, shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp)) {
+-        // [Mines-design-34] design33 03-feed-detail: porcelain sheet, tone check rows, 不需要 + 开始吧 in the character colour
+-        // [Mines-feed-32] content scrolls; the ⋯ / ↗ / 开始吧 bar stays pinned at the bottom like the reference sheet
++        containerColor = if (mc.dark) mc.surface else Color(0xFFFFFDFA), shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp)) {
+         Column(Modifier.fillMaxWidth().weight(1f, fill = false).verticalScroll(rememberScrollState()).padding(horizontal = 22.dp)) {
+             Row(verticalAlignment = Alignment.CenterVertically) {
+-                TopicIcon(m, catColor, 40.dp)
+-                Spacer(Modifier.width(10.dp))
+-                Text(m.cat.label + " · " + m.source + " · " + relTime(m.at), fontSize = 15.sp, color = mc.ink2, maxLines = 1)
++                TopicIcon(m, toneFg, 40.dp)
++                Spacer(Modifier.width(12.dp))
++                Column(Modifier.weight(1f)) {
++                    Text(listOfNotNull(Digest.Tab.values().firstOrNull { it == m.tab }?.let { t -> if (t == Digest.Tab.FOLLOW) "X" else t.label }, m.source.takeIf { it.isNotBlank() })
++                        .distinct().joinToString(" · "), fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = mc.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
++                    Text(relTime(m.at), fontSize = 15.sp, color = mc.ink2, maxLines = 1)
++                }
++                androidx.compose.material3.IconButton(onClick = onDismiss, modifier = Modifier.size(48.dp).clip(androidx.compose.foundation.shape.CircleShape)
++                    .background(mc.surface2).semantics { contentDescription = "关闭" }) {
++                    com.openminis.app.ui.brand.MinesIcon(Icons.Outlined.Close, null, tint = mc.ink, modifier = Modifier.size(22.dp))
++                }
++            }
++            Text(headline, fontSize = 24.sp, fontWeight = FontWeight.Bold, lineHeight = 32.sp, color = mc.ink, modifier = Modifier.padding(top = 14.dp))
++            if (m.tab == Digest.Tab.GITHUB) feedClean(m.title)?.takeIf { it != headline }?.let { en ->
++                Text(en, fontSize = 15.sp, lineHeight = 20.sp, color = mc.ink3, modifier = Modifier.padding(top = 4.dp)) }
++            feedClean(m.brief ?: fs)?.let { b -> Text(com.openminis.app.plus.AccountLabel.maskText(b), fontSize = 17.sp, lineHeight = 26.sp, color = mc.ink2, modifier = Modifier.padding(top = 8.dp)) }
++            if (isFix) androidx.compose.foundation.layout.FlowRow(Modifier.padding(top = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                listOf("不花钱", "旧密钥留 7 天，随时可撤").forEach { f ->
++                    Text(f, fontSize = 15.sp, color = mc.ink2, maxLines = 1, modifier = Modifier.clip(RoundedCornerShape(50)).background(mc.surface2).padding(horizontal = 12.dp, vertical = 6.dp))
++                }
+             }
+-            Text(com.openminis.app.plus.AccountLabel.maskText(m.headline ?: fh), fontSize = 24.sp, fontWeight = FontWeight.Bold, lineHeight = 33.sp, color = mc.ink, modifier = Modifier.padding(top = 12.dp))
+-            Text(com.openminis.app.plus.AccountLabel.maskText(m.brief ?: fs), fontSize = 17.sp, lineHeight = 26.sp, color = mc.ink, modifier = Modifier.padding(top = 10.dp))
+             m.image?.let { img ->
+                 coil.compose.AsyncImage(model = img, contentDescription = null, contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                     modifier = Modifier.fillMaxWidth().padding(top = 14.dp).height(170.dp).clip(RoundedCornerShape(16.dp)))
+             }
+-            Row(Modifier.padding(top = 22.dp), verticalAlignment = Alignment.CenterVertically) {
+-                Text("包含的内容", fontSize = 19.sp, fontWeight = FontWeight.SemiBold, color = mc.ink)
+-            }
+-            Column(Modifier.padding(top = 8.dp).fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(mc.surface2)) {
+-                steps.forEachIndexed { i, (t, sub) ->
+-                    Row(Modifier.fillMaxWidth().clickable { on[i] = !on[i] }.heightIn(min = 64.dp).padding(horizontal = 16.dp, vertical = 12.dp),
+-                        verticalAlignment = Alignment.CenterVertically) {
+-                        Column(Modifier.weight(1f)) {
+-                            Text(t, fontSize = 17.sp, fontWeight = FontWeight.Bold, color = mc.ink)
+-                            if (sub.isNotBlank()) Text(sub, fontSize = 15.sp, color = mc.ink2, modifier = Modifier.padding(top = 2.dp))
++            if (steps.isNotEmpty()) {
++                Row(Modifier.padding(top = 22.dp).fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
++                    Text("包含的内容", fontSize = 19.sp, fontWeight = FontWeight.Bold, color = mc.ink, modifier = Modifier.weight(1f))
++                    Text("${on.count { it }} 项", fontSize = 15.sp, color = mc.ink2)
++                }
++                Column(Modifier.padding(top = 8.dp).fillMaxWidth().clip(RoundedCornerShape(20.dp)).background(mc.surface2.copy(alpha = if (mc.dark) 1f else 0.7f))) {
++                    steps.forEachIndexed { i, (t, sub) ->
++                        Row(Modifier.fillMaxWidth().clickable { on[i] = !on[i] }.heightIn(min = 68.dp).padding(horizontal = 14.dp, vertical = 12.dp)
++                            .semantics(mergeDescendants = true) { contentDescription = t + (if (sub.isNotBlank()) "，$sub" else "") + if (on[i]) "，已选" else "，未选" },
++                            verticalAlignment = Alignment.CenterVertically) {
++                            IconBubble(com.openminis.app.ui.brand.MinesIcons.named(stepIcon(t))!!, size = 40.dp)
++                            Spacer(Modifier.width(12.dp))
++                            Column(Modifier.weight(1f)) {
++                                Text(t, fontSize = 17.sp, lineHeight = 23.sp, fontWeight = FontWeight.Bold, color = mc.ink)
++                                if (sub.isNotBlank()) Text(sub, fontSize = 15.sp, lineHeight = 20.sp, color = mc.ink2, modifier = Modifier.padding(top = 2.dp))
++                            }
++                            Spacer(Modifier.width(8.dp))
++                            Box(Modifier.size(30.dp).clip(androidx.compose.foundation.shape.CircleShape)
++                                .background(if (on[i]) mc.primary else Color.Transparent)
++                                .border(2.dp, if (on[i]) mc.primary else mc.ink3, androidx.compose.foundation.shape.CircleShape),
++                                contentAlignment = Alignment.Center) { if (on[i]) Text("✓", color = mc.onPrimary, fontSize = 17.sp, fontWeight = FontWeight.Bold) }
+                         }
+-                        Box(Modifier.size(30.dp).clip(androidx.compose.foundation.shape.CircleShape)
+-                            .background(if (on[i]) mc.primary else Color.Transparent)
+-                            .border(2.dp, if (on[i]) mc.primary else mc.ink3, androidx.compose.foundation.shape.CircleShape)
+-                            .semantics { contentDescription = if (on[i]) "$t：已选" else "$t：未选" },
+-                            contentAlignment = Alignment.Center) { if (on[i]) Text("✓", color = mc.onPrimary, fontSize = 17.sp, fontWeight = FontWeight.Bold) }
++                        if (i < steps.lastIndex) Box(Modifier.fillMaxWidth().padding(start = 66.dp).height(1.dp).background(mc.hairline))
+                     }
+-                    if (i < steps.lastIndex) Box(Modifier.fillMaxWidth().padding(start = 16.dp).height(0.5.dp).background(mc.hairline))
+                 }
+             }
+-            // original source preview
+             if (m.url != null || m.pkg != null) {
+-                Row(Modifier.padding(top = 14.dp).fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(mc.surface2)
+-                    .clickable { openOriginal(context, m) }.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
++                Row(Modifier.padding(top = 14.dp).fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(mc.surface2.copy(alpha = if (mc.dark) 1f else 0.7f))
++                    .clickable { openOriginal(context, m) }.heightIn(min = 56.dp).padding(horizontal = 14.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                     Column(Modifier.weight(1f)) {
+-                        Text("原文 · " + com.openminis.app.plus.AccountLabel.maskText(m.sender), fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = mc.ink, maxLines = 1)
+-                        Text(m.title.ifBlank { m.summary }, fontSize = 14.sp, color = mc.ink2, maxLines = 2, overflow = TextOverflow.Ellipsis)
++                        Text("原文" + (feedClean(com.openminis.app.plus.AccountLabel.maskText(m.sender))?.let { " · $it" } ?: ""), fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = mc.ink, maxLines = 1)
++                        feedClean(m.title.ifBlank { m.summary })?.let { Text(it, fontSize = 15.sp, color = mc.ink2, maxLines = 2, overflow = TextOverflow.Ellipsis) }
+                     }
+                     Text("↗", fontSize = 20.sp, color = mc.ink2)
+                 }
+             }
+-            error?.let { e -> Text("没能开始：$e", fontSize = 16.sp, color = Color(0xFFD93025), modifier = Modifier.padding(top = 10.dp)) }
++            error?.let { e -> Text("没能开始：$e", fontSize = 16.sp, color = toneColors(Tone.DANGER).first, modifier = Modifier.padding(top = 10.dp)) }
+             Spacer(Modifier.height(8.dp))
+         }
+-        Row(Modifier.fillMaxWidth().padding(horizontal = 22.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+-                androidx.compose.material3.IconButton(onClick = onMore, modifier = Modifier.size(52.dp).clip(androidx.compose.foundation.shape.CircleShape).background(mc.surface2)
+-                    .semantics { contentDescription = "更多" }) { Text("⋯", fontSize = 22.sp, color = mc.ink) }
+-                androidx.compose.material3.IconButton(onClick = onShare, modifier = Modifier.size(52.dp).clip(androidx.compose.foundation.shape.CircleShape).background(mc.surface2)
+-                    .semantics { contentDescription = "分享" }) { Text("↗", fontSize = 20.sp, color = mc.ink) }
+-                Button(onClick = { onStart(steps.filterIndexed { i, _ -> on[i] }) }, enabled = on.any { it } && !busy,
+-                    colors = androidx.compose.material3.ButtonDefaults.buttonColors(containerColor = mc.primary, contentColor = mc.onPrimary),
+-                    shape = RoundedCornerShape(28.dp), modifier = Modifier.weight(1f).heightIn(min = 56.dp)) {
+-                    Text(if (busy) "处理中…" else "✦ 开始吧", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+-                }
++        Row(Modifier.fillMaxWidth().padding(horizontal = 22.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
++            androidx.compose.material3.IconButton(onClick = onMore, modifier = Modifier.size(56.dp).clip(androidx.compose.foundation.shape.CircleShape).background(mc.surface2)
++                .semantics { contentDescription = "更多：分享、置顶、静音、为什么推给我" }) {
++                com.openminis.app.ui.brand.MinesIcon(com.openminis.app.ui.brand.MinesIcons.named("ellipsis")!!, null, tint = mc.ink, modifier = Modifier.size(24.dp))
++            }
++            WarmPrimaryPill(if (busy) "处理中…" else label, onClick = { onStart(steps.filterIndexed { i, _ -> on[i] }) },
++                enabled = (steps.isEmpty() || on.any { it }) && !busy, modifier = Modifier.weight(1f), height = 58.dp,
++                icon = com.openminis.app.ui.brand.MinesIcons.named(if (isFix) "wrench" else "sparkles"), description = "$label：$headline")
+         }
+     }
+ }
+ 
++/** A line icon for a 「包含的内容」 row, picked from its words. */
++private fun stepIcon(t: String): String = when {
++    Regex("密钥|令牌|key|token|Key|Token").containsMatchIn(t) -> "key-round"
++    Regex("测试|检测|检查|验证").containsMatchIn(t) -> "shield-check"
++    Regex("找|看|读|查").containsMatchIn(t) -> "search"
++    Regex("领|注册|登录").containsMatchIn(t) -> "wallet"
++    Regex("删|清理").containsMatchIn(t) -> "trash"
++    Regex("提醒|通知").containsMatchIn(t) -> "clock"
++    Regex("聊|讨论|问").containsMatchIn(t) -> "messages-square"
++    else -> "check"
++}
++
+ private fun openOriginal(context: android.content.Context, m: Digest.Item) {
+     val u = m.url
+     // [Mines-feed-35.3] fall back to any browser, and say so when nothing can open it (was swallowed)
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt
+index a90ff36..fe38e21 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt
+@@ -41,8 +41,8 @@ object MinesDesign {
+     val Bg = Color(0xFFF6F2EC); val BgDark = Color(0xFF14110F)
+     val Surface = Color(0xFFFFFFFF); val SurfaceDark = Color(0xFF1F1B18)
+     val Surface2 = Color(0xFFEFEAE3); val Surface2Dark = Color(0xFF2A2521)
+-    val Glass = Color(0xB3FFFDFA); val GlassDark = Color(0x9E221D1A)          // .70 / .62
+-    val GlassStrong = Color(0xDBFFFDFA); val GlassStrongDark = Color(0xDB221D1A) // .86
++    val Glass = Color(0xE6FFFDFA); val GlassDark = Color(0xE6221D1A)          // [Mines-warm-36] .90 / .90 (cards 90 % opaque)
++    val GlassStrong = Color(0xEBFFFDFA); val GlassStrongDark = Color(0xEB221D1A) // .92
+     val GlassBorder = Color(0xBFFFFFFF); val GlassBorderDark = Color(0x1AFFFFFF)
+     val Hairline = Color(0x171C1915); val HairlineDark = Color(0x17FFFFFF)
+     val Ink = Color(0xFF1C1915); val InkDark = Color(0xFFF5F0EA)
+@@ -67,7 +67,7 @@ object MinesDesign {
+ 
+     val themes: Map<String, CharacterTheme> = mapOf(
+         "claude" to CharacterTheme("claude", Color(0xFFB5532F), Color(0xFFA84B2A), Color(0xFFFBE6DC), Color(0xFF7A2E14), Color(0xFFD97757),
+-            Color(0xFFEE9474), Color(0xFF2A1206), Color(0xFF4A2416), Color(0xFFFFD9CA),
++            Color(0xFFE08A6B), Color(0xFF2A1206), Color(0xFF4A2416), Color(0xFFFFD9CA),
+             listOf(Color(0xFFF9D9C6), Color(0xFFE9DDF3), Color(0xFFF6CDB8), Color(0xFFDCE9E1)), listOf(Color(0xFF4A2B20), Color(0xFF2E2440), Color(0xFF4A2618), Color(0xFF1C2E27)), Color(0xFFFFC4AA)),
+         "whale" to CharacterTheme("whale", Color(0xFF2E73C2), Color(0xFF2865AB), Color(0xFFD9E9FC), Color(0xFF1C4778), Color(0xFF3C8EEC),
+             Color(0xFF7FADE1), Color(0xFF0C1D32), Color(0xFF1D3249), Color(0xFFA0C2E9),
+@@ -101,6 +101,8 @@ data class MinesColors(
+     val hairline: Color, val ink: Color, val ink2: Color, val ink3: Color,
+     val primary: Color, val onPrimary: Color, val primaryText: Color, val container: Color, val onContainer: Color,
+     val brand: Color, val blobs: List<Color>, val ring: Color,
++    /** [Mines-warm-36] line-icon colour: light #B5532F, dark #E08A6B (Claude). */
++    val icon: Color = primaryText,
+ )
+ 
+ fun minesColors(style: String?, dark: Boolean): MinesColors {
+@@ -108,11 +110,12 @@ fun minesColors(style: String?, dark: Boolean): MinesColors {
+     return if (dark) MinesColors(
+         true, t, MinesDesign.BgDark, MinesDesign.SurfaceDark, MinesDesign.Surface2Dark, MinesDesign.GlassDark, MinesDesign.GlassStrongDark,
+         MinesDesign.GlassBorderDark, MinesDesign.HairlineDark, MinesDesign.InkDark, MinesDesign.Ink2Dark, MinesDesign.Ink3Dark,
+-        t.darkPrimary, t.darkOnPrimary, t.darkPrimary, t.darkContainer, t.darkOnContainer, t.brand, t.darkBlobs, t.ring,
++        // [Mines-warm-36] buttons keep the deep character colour with white text in dark mode too (#B5532F for Claude)
++        t.primary, Color.White, t.darkPrimary, t.darkContainer, t.darkOnContainer, t.brand, t.darkBlobs, t.ring, t.darkPrimary,
+     ) else MinesColors(
+         false, t, MinesDesign.Bg, MinesDesign.Surface, MinesDesign.Surface2, MinesDesign.Glass, MinesDesign.GlassStrong,
+         MinesDesign.GlassBorder, MinesDesign.Hairline, MinesDesign.Ink, MinesDesign.Ink2, MinesDesign.Ink3,
+-        t.primary, Color.White, t.primaryText, t.container, t.onContainer, t.brand, t.blobs, t.ring,
++        t.primary, Color.White, t.primaryText, t.container, t.onContainer, t.brand, t.blobs, t.ring, t.primary,
+     )
+ }
+ 
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
+index b7768b0..3ed42b8 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
+@@ -234,7 +234,7 @@ fun PetAvatar(
+ 
+ /** [Mines-design-34] Accent for icons and links: the character's link colour (≥ 5.3:1 on porcelain). */
+ @Composable
+-fun minesAccent(): Color = mines().primaryText
++fun minesAccent(): Color = mines().icon  // [Mines-warm-36] icons #B5532F / #E08A6B
+ 
+ @Composable
+ fun minesMuted(): Color = mines().ink2
+@@ -291,7 +291,8 @@ fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, action
+ fun minesGlassFill(strong: Boolean = false): Color {
+     val m = mines()
+     val photo = wallpaperOn(home = true)
+-    val a = when { photo -> 0.88f; strong -> 0.90f; else -> 0.78f }
++    val a = when { strong -> 0.92f; else -> 0.90f }  // [Mines-warm-36] cards 90 % opaque (photo wallpaper too)
++    @Suppress("UNUSED_EXPRESSION") photo
+     return (if (m.dark) Color(0xFF221D1A) else Color(0xFFFFFDFA)).copy(alpha = a)
+ }
+ 
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
+index fa81fb3..3c3ce64 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
+@@ -63,7 +63,7 @@ import java.util.Locale
+  * one-tap chips for where work runs, servers, and connected accounts.
+  */
+ @Composable
+-fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier) {
++fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier, onSearch: () -> Unit = {}) {
+     val context = LocalContext.current
+     PlusPrefs.init(context)
+     PlusVault.init(context)
+@@ -95,63 +95,52 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier) {
+         in 18..22 -> "晚上好"
+         else -> "夜深了"
+     }
+-    val weekday = SimpleDateFormat("EEEE", Locale.CHINA).format(cal.time).replace("星期", "周")
+-    // [Mines-design-34] 「暖瓷 · 毛玻璃」 home (design33 screen 01): greeting + one-line summary,
+-    // [Mines-home-35.1] status pills, one slim 消息 bar (→ own page), then 最近对话.
++    @Suppress("UNUSED_VARIABLE") val weekday = SimpleDateFormat("EEEE", Locale.CHINA).format(cal.time).replace("星期", "周")
++    // [Mines-warm-36] design36warm 01/02: home = 对话 only. Face + name plate, greeting, one status line,
++    // then 最近对话. No message card / bar here (user 13:01 「对话就对话，要处理放在消息嘛」); the
++    // count of things to handle is the red badge on the 消息 tab of the bottom bar.
+     val m = mines()
+     val feed by com.openminis.app.plus.Digest.items.collectAsState()
+     val todo = feed.filter { it.tab == com.openminis.app.plus.Digest.Tab.ACCOUNT }
++    val running by FeedTasks.running.collectAsState()
+     var shown by androidx.compose.runtime.saveable.rememberSaveable { androidx.compose.runtime.mutableStateOf(false) }
+     LaunchedEffect(Unit) { shown = true }
+     val appear by androidx.compose.animation.core.animateFloatAsState(if (shown) 1f else 0f, androidx.compose.animation.core.tween(280), label = "appear")
++    val eff = PlusVps.effectiveMode(st)
++    val vpsDown = st.isVps && eff == PlusState.MODE_LOCAL
++    val (statusText, statusColor) = when {
++        todo.isNotEmpty() -> "${todo.size} 件要处理，在「消息」里" to MinesDesign.Warning.takeIf { !m.dark }.let { it ?: MinesDesign.WarningDark }
++        vpsDown -> "服务器连不上，先在本机跑" to (if (m.dark) MinesDesign.WarningDark else MinesDesign.Warning)
++        else -> "都在正常跑" to (if (m.dark) MinesDesign.SuccessDark else MinesDesign.Success)
++    }
+     Column(
+-        modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)
++        modifier.fillMaxWidth().padding(vertical = 2.dp)
+             .graphicsLayer { alpha = appear; translationY = (1f - appear) * 8f },
+-        verticalArrangement = Arrangement.spacedBy(12.dp),
+     ) {
+-        // Greeting row
+-        Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+-            Column(Modifier.weight(1f).semantics(mergeDescendants = true) {}) {
+-                Text("$weekday$greet", fontSize = 15.sp, lineHeight = 20.sp, color = m.ink2, maxLines = 1,
+-                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+-                Text(if (todo.isEmpty()) "今天没有要你处理的事" else "有 ${todo.size} 件事等你看看", fontSize = 22.sp, lineHeight = 30.sp,
+-                    fontWeight = FontWeight.Bold, color = m.ink, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+-            }
+-            HeaderCircle(com.openminis.app.ui.brand.MinesIcons.named("layout-grid")!!, "应用与账号") { onOpen(PlusRoutes.CONNECTIONS) }
+-            Spacer(Modifier.width(8.dp))
+-            HeaderCircle(com.openminis.app.ui.brand.MinesIcons.named("mic")!!, "实时语音") { onOpen(PlusRoutes.VOICE) }
+-            Spacer(Modifier.width(8.dp))
+-            Box(Modifier.size(44.dp).clip(CircleShape).clickable { switcher = true }.semantics { contentDescription = "换角色" },
+-                contentAlignment = Alignment.Center) { PetAvatar(size = 40.dp) }
+-        }
+-        // Status pills (工作位置 / 服务器 / 账号), one slim row, collapsible
+-        AnimatedVisibility(!st.todayCollapsed) {
+-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+-                val eff = PlusVps.effectiveMode(st)
+-                val online = st.onlineServers.size
+-                Chip(Modifier.weight(1f), Icons.Outlined.Cloud, "工作位置",
+-                    when { !st.isVps -> "本机"; eff == PlusState.MODE_LOCAL -> "回本机"; else -> "VPS" },
+-                    dot = when { !st.isVps -> MinesDesign.Info; eff == PlusState.MODE_LOCAL -> MinesDesign.Warning; else -> MinesDesign.Success },
+-                ) { onOpen(PlusRoutes.WORK) }
+-                Chip(Modifier.weight(1f), Icons.Outlined.Dns, "服务器",
+-                    if (st.servers.isEmpty()) "无" else "$online/${st.servers.size}",
+-                    dot = if (st.servers.isEmpty()) m.ink3 else if (online > 0) MinesDesign.Success else MinesDesign.Danger,
+-                ) { onOpen(PlusRoutes.WORK) }
+-                Chip(Modifier.weight(1f), Icons.Outlined.Key, "账号",
+-                    if (vault.isEmpty()) "去连接" else "${vault.size}",
+-                    dot = if (vault.isEmpty()) m.ink3 else MinesDesign.Success,
+-                ) { onOpen(PlusRoutes.CONNECTIONS) }
++        WarmHeader(
++            status = if (running.isNotEmpty()) "后台在办 ${running.size} 件事" else "在线 · 随时叫我",
++            onFace = { switcher = true },
++        )
++        Row(Modifier.fillMaxWidth().padding(start = 24.dp, end = 16.dp), verticalAlignment = Alignment.CenterVertically) {
++            Column(Modifier.weight(1f)) {
++                Text(greet, fontSize = 28.sp, lineHeight = 36.sp, fontWeight = FontWeight.Bold, color = m.ink, maxLines = 1,
++                    modifier = Modifier.semantics { contentDescription = greet })
++                Row(Modifier.padding(top = 2.dp).clip(RoundedCornerShape(50)).clickable { onOpen(if (todo.isNotEmpty()) PlusRoutes.DIGEST else PlusRoutes.WORK) }
++                    .heightIn(min = 36.dp).padding(end = 8.dp)
++                    .semantics(mergeDescendants = true) { contentDescription = statusText },
++                    verticalAlignment = Alignment.CenterVertically) {
++                    Box(Modifier.size(8.dp).clip(CircleShape).background(statusColor))
++                    Spacer(Modifier.width(7.dp))
++                    Text(statusText, fontSize = 16.sp, color = m.ink2, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
++                }
+             }
++            WarmRoundButton(com.openminis.app.ui.brand.MinesIcons.named("search")!!, "搜索对话", onClick = onSearch)
+         }
+-        // [Mines-home-35.1] user 2026-10-14: home = recent conversations like before; messages are
+-        // one slim single-line entry that opens the full 消息 page as its own screen.
+-        MessagesBar(todo.size) { onOpen(PlusRoutes.DIGEST) }
+-        Row(Modifier.fillMaxWidth().padding(start = 8.dp, end = 4.dp, top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
++        Row(Modifier.fillMaxWidth().padding(start = 24.dp, end = 16.dp, top = 12.dp, bottom = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+             Text("最近对话", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = m.ink2, modifier = Modifier.weight(1f))
+-            Text(if (st.todayCollapsed) "状态 ›" else "收起状态", fontSize = 15.sp, color = m.primaryText,
+-                modifier = Modifier.clip(RoundedCornerShape(50)).clickable { PlusPrefs.update(context) { s -> s.copy(todayCollapsed = !s.todayCollapsed) } }
+-                    .padding(horizontal = 8.dp, vertical = 6.dp)
+-                    .semantics { contentDescription = if (st.todayCollapsed) "展开状态" else "收起状态" })
++            Text("语音", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = m.primaryText, maxLines = 1,
++                modifier = Modifier.clip(RoundedCornerShape(50)).clickable { onOpen(PlusRoutes.VOICE) }
++                    .padding(horizontal = 8.dp, vertical = 8.dp).semantics { contentDescription = "实时语音" })
+         }
+     }
+ }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WarmComponents.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WarmComponents.kt
+new file mode 100644
+index 0000000..1b05757
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WarmComponents.kt
+@@ -0,0 +1,310 @@
++package com.openminis.app.ui.plus
++
++import androidx.compose.foundation.background
++import androidx.compose.foundation.border
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.ExperimentalLayoutApi
++import androidx.compose.foundation.layout.FlowRow
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.offset
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.layout.widthIn
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.draw.shadow
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.vector.ImageVector
++import androidx.compose.ui.semantics.Role
++import androidx.compose.ui.semantics.contentDescription
++import androidx.compose.ui.semantics.role
++import androidx.compose.ui.semantics.selected
++import androidx.compose.ui.semantics.semantics
++import androidx.compose.ui.text.font.FontFamily
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.style.TextAlign
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.Dp
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import com.openminis.app.ui.brand.MinesIcon
++
++/**
++ * [Mines-warm-36] build-36 「Muse 结构 × 暖瓷毛玻璃」 components (design36warm, user-approved
++ * 2026-10-14): 90 % opaque porcelain glass, line icons #B5532F (dark #E08A6B), primary pills
++ * #B5532F + white. Sizes follow the user's yardstick (rows ≥ 64 dp, text ≥ 14 sp, touch ≥ 48 dp);
++ * key labels are single-line and never cut at font scale 1.3 (short labels, FlowRow where needed).
++ */
++object WarmIcons {
++    fun of(name: String): ImageVector? = com.openminis.app.ui.brand.MinesIcons.named(name)
++}
++
++/** 48 dp frosted round button (page bars, header corners). Optional red dot. */
++@Composable
++fun WarmRoundButton(icon: ImageVector, label: String, size: Dp = 48.dp, dot: Boolean = false, onClick: () -> Unit) {
++    val m = mines()
++    Box(Modifier.size(size)) {
++        Box(Modifier.size(size).shadow(if (m.dark) 0.dp else 2.dp, CircleShape, clip = false, ambientColor = Color(0x223C2814), spotColor = Color(0x223C2814))
++            .clip(CircleShape).background(minesGlassFill(strong = true)).border(1.dp, m.glassBorder, CircleShape)
++            .clickable(onClick = onClick).semantics { contentDescription = label; role = Role.Button },
++            contentAlignment = Alignment.Center) {
++            MinesIcon(icon, null, tint = m.ink, modifier = Modifier.size(size * 0.46f))
++        }
++        if (dot) Box(Modifier.align(Alignment.TopEnd).size(11.dp).clip(CircleShape).background(MinesDesign.DangerFill)
++            .border(2.dp, m.bg, CircleShape))
++    }
++}
++
++/**
++ * Page header of the Muse structure in the warm skin: round buttons in both top corners, the
++ * character's face in the middle with a glass name plate pressed under its chin
++ * (name + coloured status line).
++ */
++@Composable
++fun WarmHeader(
++    status: String,
++    modifier: Modifier = Modifier,
++    face: Dp = 72.dp,
++    onFace: (() -> Unit)? = null,
++    leading: (@Composable () -> Unit)? = null,
++    trailing: (@Composable () -> Unit)? = null,
++) {
++    val m = mines()
++    val name = com.openminis.app.plus.Avatars.name(currentCharacter())
++    Box(modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
++        Row(Modifier.fillMaxWidth().padding(top = 10.dp), verticalAlignment = Alignment.CenterVertically) {
++            leading?.invoke()
++            Spacer(Modifier.weight(1f))
++            trailing?.invoke()
++        }
++        Column(Modifier.align(Alignment.TopCenter).padding(horizontal = 64.dp), horizontalAlignment = Alignment.CenterHorizontally) {
++            Box(Modifier.size(face).clip(CircleShape)
++                .then(if (onFace != null) Modifier.clickable(onClick = onFace).semantics { contentDescription = "换角色" } else Modifier),
++                contentAlignment = Alignment.Center) { PetAvatar(size = face) }
++            Column(
++                Modifier.offset(y = (-10).dp).widthIn(max = 300.dp).clip(RoundedCornerShape(18.dp)).background(minesGlassFill(strong = true))
++                    .border(1.dp, m.glassBorder, RoundedCornerShape(18.dp)).padding(horizontal = 16.dp, vertical = 5.dp)
++                    .semantics(mergeDescendants = true) {},
++                horizontalAlignment = Alignment.CenterHorizontally,
++            ) {
++                Text(name, fontSize = 16.sp, lineHeight = 21.sp, fontWeight = FontWeight.SemiBold, color = m.ink, maxLines = 1)
++                Row(verticalAlignment = Alignment.CenterVertically) {
++                    Box(Modifier.size(7.dp).clip(CircleShape).background(m.icon))
++                    Spacer(Modifier.width(5.dp))
++                    Text(status, fontSize = 14.sp, lineHeight = 19.sp, color = m.primaryText, maxLines = 1, softWrap = false,
++                        overflow = TextOverflow.Ellipsis)
++                }
++            }
++        }
++    }
++}
++
++/** One entry of the bottom bar. */
++data class WarmNavItem(val label: String, val icon: ImageVector, val badge: Int = 0, val onClick: () -> Unit)
++
++/** Bottom bar: 对话 · 消息 · 灵感 · 任务 · 应用, a frosted pill; 消息 carries the red count of things to handle. */
++@Composable
++fun WarmNavBar(items: List<WarmNavItem>, current: Int, modifier: Modifier = Modifier) {
++    val m = mines()
++    val shape = RoundedCornerShape(30.dp)
++    Row(
++        modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp)
++            .shadow(if (m.dark) 0.dp else 6.dp, shape, clip = false, ambientColor = Color(0x333C2814), spotColor = Color(0x333C2814))
++            .clip(shape).background(minesGlassFill(strong = true)).border(1.dp, m.glassBorder, shape)
++            .heightIn(min = 68.dp).padding(horizontal = 4.dp, vertical = 6.dp),
++        verticalAlignment = Alignment.CenterVertically,
++    ) {
++        items.forEachIndexed { i, it ->
++            val on = i == current
++            val fg = if (on) m.primaryText else m.ink2
++            Column(
++                Modifier.weight(1f).heightIn(min = 56.dp).clip(RoundedCornerShape(18.dp)).clickable(onClick = it.onClick)
++                    .semantics(mergeDescendants = true) {
++                        contentDescription = it.label + (if (it.badge > 0) "，${it.badge} 件要处理" else ""); this.selected = on; role = Role.Tab
++                    },
++                horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center,
++            ) {
++                Box {
++                    MinesIcon(it.icon, null, tint = fg, modifier = Modifier.padding(top = 2.dp).size(26.dp))
++                    if (it.badge > 0) Box(Modifier.align(Alignment.TopEnd).offset(x = 12.dp, y = (-6).dp).heightIn(min = 20.dp).widthIn(min = 20.dp)
++                        .clip(RoundedCornerShape(50)).background(MinesDesign.DangerFill).border(1.5.dp, m.bg, RoundedCornerShape(50))
++                        .padding(horizontal = 5.dp), contentAlignment = Alignment.Center) {
++                        Text(if (it.badge > 99) "99+" else it.badge.toString(), fontSize = 12.sp, lineHeight = 14.sp, fontWeight = FontWeight.Bold, color = Color.White, maxLines = 1)
++                    }
++                }
++                Text(it.label, fontSize = 14.sp, lineHeight = 18.sp, fontWeight = if (on) FontWeight.Bold else FontWeight.Medium, color = fg,
++                    maxLines = 1, softWrap = false)
++            }
++        }
++    }
++}
++
++/** The 「N 件要处理」 strip at the top of 消息: shield, red count, what they are, 去看 ›. */
++@Composable
++fun TodoSummaryBar(count: Int, summary: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
++    val m = mines()
++    val (fg, bg) = toneColors(Tone.DANGER)
++    val shape = RoundedCornerShape(26.dp)
++    Row(
++        modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp).clip(shape).background(minesGlassFill(strong = true))
++            .border(1.dp, m.glassBorder, shape).clickable(onClick = onClick)
++            .semantics(mergeDescendants = true) { contentDescription = "$count 件要处理：$summary。点按去看" }
++            .heightIn(min = 60.dp).padding(start = 10.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
++        verticalAlignment = Alignment.CenterVertically,
++    ) {
++        Box(Modifier.size(40.dp).clip(CircleShape).background(bg), contentAlignment = Alignment.Center) {
++            MinesIcon(WarmIcons.of("shield")!!, null, tint = fg, modifier = Modifier.size(21.dp))
++        }
++        Spacer(Modifier.width(10.dp))
++        Text("$count 件要处理", fontSize = 17.sp, fontWeight = FontWeight.Bold, color = fg, maxLines = 1, softWrap = false)
++        Spacer(Modifier.width(8.dp))
++        Text(summary, fontSize = 15.sp, color = m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
++        Spacer(Modifier.width(6.dp))
++        Row(Modifier.heightIn(min = 44.dp).clip(RoundedCornerShape(50)).background(m.surface2).padding(horizontal = 14.dp),
++            verticalAlignment = Alignment.CenterVertically) {
++            Text("去看", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = m.ink, maxLines = 1, softWrap = false)
++            MinesIcon(WarmIcons.of("chevron-right")!!, null, tint = m.ink, modifier = Modifier.size(18.dp))
++        }
++    }
++}
++
++/** A category tab: label + count; selected = ink pill. Count of 账号异常 in red. */
++data class WarmTab(val key: String, val label: String, val count: Int, val danger: Boolean = false)
++
++/** Category pills. They wrap to a second line at large font sizes instead of being cut off. */
++@OptIn(ExperimentalLayoutApi::class)
++@Composable
++fun WarmTabs(tabs: List<WarmTab>, current: String, onSelect: (String) -> Unit, modifier: Modifier = Modifier) {
++    val m = mines()
++    FlowRow(modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
++        horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
++        tabs.forEach { t ->
++            val on = t.key == current
++            val shape = RoundedCornerShape(50)
++            Row(
++                Modifier.heightIn(min = 46.dp).clip(shape).background(if (on) m.ink else minesGlassFill(strong = true))
++                    .border(1.dp, if (on) Color.Transparent else m.glassBorder, shape).clickable { onSelect(t.key) }
++                    .semantics(mergeDescendants = true) { contentDescription = "${t.label}，${t.count} 条"; this.selected = on; role = Role.Tab }
++                    .padding(horizontal = 15.dp),
++                verticalAlignment = Alignment.CenterVertically,
++            ) {
++                Text(t.label, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = if (on) m.bg else m.ink, maxLines = 1, softWrap = false)
++                if (t.count > 0 || t.danger) {
++                    Spacer(Modifier.width(6.dp))
++                    Text(t.count.toString(), fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, softWrap = false,
++                        color = when { t.danger && t.count > 0 && !on -> MinesDesign.Danger.takeIf { !m.dark } ?: MinesDesign.DangerDark; on -> m.bg.copy(alpha = 0.85f); else -> m.ink2 })
++                }
++            }
++        }
++    }
++}
++
++/** Dark undo pill: 「已忽略「…」 ↶ 撤销」 floating over the bottom. */
++@Composable
++fun UndoBar(text: String, action: String = "撤销", onAction: () -> Unit, modifier: Modifier = Modifier) {
++    val bg = Color(0xFF2A2420)
++    Row(
++        modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp).shadow(8.dp, RoundedCornerShape(30.dp), clip = false)
++            .clip(RoundedCornerShape(30.dp)).background(bg).heightIn(min = 60.dp).padding(start = 22.dp, end = 8.dp),
++        verticalAlignment = Alignment.CenterVertically,
++    ) {
++        Text(text, fontSize = 17.sp, color = Color(0xFFF5F0EA), maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
++        Row(Modifier.heightIn(min = 48.dp).clip(RoundedCornerShape(50)).clickable(onClick = onAction).semantics { contentDescription = action }
++            .padding(horizontal = 14.dp), verticalAlignment = Alignment.CenterVertically) {
++            MinesIcon(WarmIcons.of("rotate-ccw")!!, null, tint = Color(0xFFF0A285), modifier = Modifier.size(18.dp))
++            Spacer(Modifier.width(6.dp))
++            Text(action, fontSize = 17.sp, fontWeight = FontWeight.Bold, color = Color(0xFFF0A285), maxLines = 1, softWrap = false)
++        }
++    }
++}
++
++/** Terracotta primary pill (#B5532F + white, 4.95:1). */
++@Composable
++fun WarmPrimaryPill(text: String, onClick: () -> Unit, modifier: Modifier = Modifier, icon: ImageVector? = null, enabled: Boolean = true,
++                    height: Dp = 56.dp, fontSize: Int = 18, description: String? = null) {
++    val m = mines()
++    Row(
++        modifier.heightIn(min = height).clip(RoundedCornerShape(50))
++            .background(if (enabled) m.primary else m.primary.copy(alpha = 0.45f))
++            .clickable(enabled = enabled, onClick = onClick)
++            .semantics(mergeDescendants = true) { contentDescription = description ?: text; role = Role.Button }
++            .padding(horizontal = 18.dp),
++        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center,
++    ) {
++        if (icon != null) { MinesIcon(icon, null, tint = m.onPrimary, modifier = Modifier.size((fontSize + 2).dp)); Spacer(Modifier.width(8.dp)) }
++        Text(text, fontSize = fontSize.sp, fontWeight = FontWeight.SemiBold, color = m.onPrimary, maxLines = 1, softWrap = false, textAlign = TextAlign.Center)
++    }
++}
++
++/** Small GitHub card inside an X post: Chinese one-liner big, repo path small, ★ stars. */
++@Composable
++fun RepoMiniCard(repo: String, zh: String?, stars: String?, onClick: (() -> Unit)? = null) {
++    val m = mines()
++    Row(
++        Modifier.fillMaxWidth().padding(top = 10.dp).clip(RoundedCornerShape(18.dp)).background(m.surface2.copy(alpha = 0.9f))
++            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
++            .semantics(mergeDescendants = true) {}.padding(horizontal = 14.dp, vertical = 12.dp),
++        verticalAlignment = Alignment.Top,
++    ) {
++        androidx.compose.foundation.Image(androidx.compose.ui.res.painterResource(com.openminis.app.R.drawable.ic_brand_github), contentDescription = "GitHub",
++            modifier = Modifier.padding(top = 2.dp).size(22.dp))
++        Spacer(Modifier.width(10.dp))
++        Column(Modifier.weight(1f)) {
++            if (!zh.isNullOrBlank()) Text(zh, fontSize = 16.sp, lineHeight = 23.sp, fontWeight = FontWeight.SemiBold, color = m.ink, maxLines = 3, overflow = TextOverflow.Ellipsis)
++            Row(Modifier.padding(top = if (zh.isNullOrBlank()) 0.dp else 4.dp), verticalAlignment = Alignment.CenterVertically) {
++                Text(repo, fontSize = 15.sp, fontFamily = FontFamily.Monospace, color = m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
++                if (!stars.isNullOrBlank()) { Spacer(Modifier.width(10.dp)); Text("★ $stars", fontSize = 15.sp, color = m.ink2, maxLines = 1, softWrap = false) }
++            }
++        }
++    }
++}
++
++/** Section label above a group card (16 sp SemiBold ink2) with an optional right-hand note/link. */
++@Composable
++fun WarmGroupLabel(title: String, meta: String? = null, onMeta: (() -> Unit)? = null) {
++    val m = mines()
++    Row(Modifier.fillMaxWidth().padding(start = 24.dp, end = 20.dp, top = 18.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
++        Text(title, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = m.ink2, modifier = Modifier.weight(1f), maxLines = 1)
++        if (meta != null) Text(meta, fontSize = 15.sp, color = if (onMeta != null) m.primaryText else m.ink2, maxLines = 1, softWrap = false,
++            modifier = (if (onMeta != null) Modifier.clip(RoundedCornerShape(50)).clickable(onClick = onMeta).padding(horizontal = 6.dp, vertical = 8.dp) else Modifier))
++    }
++}
++
++/** Thin divider inside a glass group, indented past the icon. */
++@Composable
++fun WarmDivider(start: Dp = 72.dp) {
++    Box(Modifier.fillMaxWidth().padding(start = start, end = 16.dp).height(1.dp).background(mines().hairline))
++}
++
++/** [Mines-warm-36] Home bottom bar: 对话 (here) · 消息 (red count = 账号异常) · 灵感 (知识库) · 任务 (定时任务) · 应用 (账号连接). */
++@Composable
++fun WarmHomeNav(modifier: Modifier = Modifier, onTasks: () -> Unit, onTop: () -> Unit = {}) {
++    val feed by com.openminis.app.plus.Digest.items.collectAsState()
++    val todo = feed.count { it.tab == com.openminis.app.plus.Digest.Tab.ACCOUNT }
++    fun icon(n: String) = WarmIcons.of(n)!!
++    WarmNavBar(
++        listOf(
++            WarmNavItem("对话", icon("messages-square"), onClick = onTop),
++            WarmNavItem("消息", icon("mail"), badge = todo) { PlusNav.go(PlusRoutes.DIGEST) },
++            WarmNavItem("灵感", icon("sparkles")) { PlusNav.go(PlusRoutes.KNOWLEDGE) },
++            WarmNavItem("任务", icon("list-checks"), onClick = onTasks),
++            WarmNavItem("应用", icon("layout-grid")) { PlusNav.go(PlusRoutes.CONNECTIONS) },
++        ),
++        current = 0, modifier = modifier,
++    )
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
+index 02718a1..c82aa8b 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
+@@ -166,6 +166,7 @@ import androidx.compose.ui.input.pointer.pointerInput
+ import androidx.compose.ui.layout.onSizeChanged
+ import androidx.compose.ui.semantics.onClick
+ import androidx.compose.ui.semantics.semantics
++import androidx.compose.ui.semantics.contentDescription
+ import androidx.compose.ui.platform.LocalContext
+ import androidx.compose.ui.platform.LocalDensity
+ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+@@ -864,10 +865,12 @@ fun SessionListScreen(
+                             fontSize = 20.sp,
+                         )
+                     } else {
++                        // [Mines-warm-36] the character's face + name plate below is the title now
+                         Text(
+-                            stringResource(R.string.app_name),
++                            "",
+                             fontWeight = FontWeight.Bold,
+                             fontSize = 20.sp,
++                            modifier = Modifier.semantics { contentDescription = "Mines" },
+                         )
+                     }
+                 },
+@@ -1060,6 +1063,7 @@ fun SessionListScreen(
+                     ) {
+                         com.openminis.app.ui.plus.TodayCard(
+                             onOpen = { route -> com.openminis.app.ui.plus.PlusNav.go(route) },
++                            onSearch = { viewModel.isSearchActive.value = true },
+                         )
+                         com.openminis.app.ui.plus.UpdateHomeCard(onOpen = { com.openminis.app.ui.plus.PlusNav.go(com.openminis.app.ui.plus.PlusRoutes.UPDATE) })
+                         com.openminis.app.ui.plus.LocalGatewayCards()
+@@ -1072,7 +1076,7 @@ fun SessionListScreen(
+                         state = listState,
+                         modifier = Modifier.fillMaxWidth().weight(1f).clipToBounds(),
+                         // Leave space for bottom FAB row; [Mines-compact-29] small top gap under the chips
+-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(top = 4.dp, bottom = 96.dp),
++                        contentPadding = androidx.compose.foundation.layout.PaddingValues(top = 4.dp, bottom = 184.dp),  // [Mines-warm-36] FAB row + bottom bar
+                     ) {
+                         // T25: search-active path used to flatten the list and skip
+                         // section headers entirely. Now reuses the same grouped
+@@ -1432,9 +1436,15 @@ fun SessionListScreen(
+                         viewModel.searchQuery.value = ""
+                         viewModel.isSearchActive.value = false
+                     },
+-                    modifier = Modifier.align(Alignment.BottomCenter),
++                    modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 76.dp),
+                 )
+             }
++            // [Mines-warm-36] bottom bar (对话 · 消息 · 灵感 · 任务 · 应用); 消息 shows the red count of things to handle
++            if (!isSelecting && isInitialLoadComplete && minesAllSessions.isNotEmpty()) com.openminis.app.ui.plus.WarmHomeNav(
++                modifier = Modifier.align(Alignment.BottomCenter),
++                onTasks = onScheduledTasksClick,
++                onTop = { scope.launch { listState.animateScrollToItem(0) } },
++            )
+         }
+     }
+     } // [Mines-wallpaper-edge] Box
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt
+index b7d4575..0260d35 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt
+@@ -68,6 +68,7 @@ import androidx.compose.material3.Text
+ import androidx.compose.material3.TopAppBar
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.getValue
++import androidx.compose.runtime.collectAsState
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.setValue
+@@ -130,6 +131,12 @@ fun SettingsScreen(
+ ) {
+     val context = LocalContext.current
+     var showFeedbackSheet by remember { mutableStateOf(false) }
++    // [Mines-warm-36] design36warm 05: settings merged into 6 groups (常用: 语音 / 账号与 AI 服务 / 网络;
++    // 其他: 数据 / 外观 / 测试与上报). Top level shows the 6 rows; a group opens its merged list in place.
++    var grp by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf<String?>(null) }
++    androidx.activity.compose.BackHandler(enabled = grp != null) { grp = null }
++    val grpTitle = when (grp) { "ai" -> "账号与 AI 服务"; "net" -> "网络"; "data" -> "数据"; "look" -> "外观"; "test" -> "测试与上报"; else -> null }
++    val acctTodo = com.openminis.app.plus.Digest.items.collectAsState().value.count { it.tab == com.openminis.app.plus.Digest.Tab.ACCOUNT }
+     // [Mines-design-34] 「暖瓷 · 毛玻璃」 settings (design33 06-settings): warm backdrop, 22 sp title,
+     // glass groups, accent line icons in tinted circles, 17 sp rows.
+     val mc = com.openminis.app.ui.plus.mines()
+@@ -139,9 +146,9 @@ fun SettingsScreen(
+         containerColor = Color.Transparent,
+         topBar = {
+             androidx.compose.material3.TopAppBar(
+-                title = { Text(stringResource(R.string.settings_title), fontSize = 22.sp, fontWeight = FontWeight.Bold, color = mc.ink) },
++                title = { Text(grpTitle ?: stringResource(R.string.settings_title), fontSize = 21.sp, fontWeight = FontWeight.Bold, color = mc.ink, maxLines = 1) },
+                 navigationIcon = {
+-                    IconButton(onClick = onBack) {
++                    IconButton(onClick = { if (grp != null) grp = null else onBack() }) {
+                         MinesIcon(
+                             Icons.AutoMirrored.Filled.ArrowBack,
+                             contentDescription = stringResource(R.string.settings_back),
+@@ -160,6 +167,7 @@ fun SettingsScreen(
+                 .verticalScroll(rememberScrollState())
+                 .padding(bottom = 32.dp),
+         ) {
++            if (grp == null) {
+             // [Mines-design-34] profile card: character + build
+             com.openminis.app.ui.plus.MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp).padding(top = 4.dp), onClick = onAboutClick) {
+                 Row(Modifier.fillMaxWidth().heightIn(min = 76.dp).padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+@@ -172,61 +180,57 @@ fun SettingsScreen(
+                     Text("›", fontSize = 26.sp, color = mc.ink3)
+                 }
+             }
+-            // -- Minis Plus --
+-            // [Mines-settings-32] group 1: the things used most, in plain words
+-            SettingsSection(
+-                title = "常用",
+-                footer = "密钥和登录加密保存在这台手机里，AI 看不到明文。",
+-            ) {
++            SettingsSection(title = "常用") {
++                SettingsItem(icon = Icons.Outlined.Mic, iconColor = Color(0xFF5856D6), title = "语音",
++                    subtitle = "实时语音 · 声纹 · 唤醒词 · 朗读声音",
++                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.VOICE) })
++                SettingsItem(icon = Icons.Outlined.Key, iconColor = Color(0xFFFF9500), title = "账号与 AI 服务",
++                    subtitle = "账号连接 · AI 服务商 · 模型 · 技能与插件",
++                    alert = if (acctTodo > 0) "$acctTodo 个要处理" else null,
++                    onClick = { grp = "ai" })
++                SettingsItem(icon = Icons.Outlined.Cloud, iconColor = Color(0xFF34C759), title = "网络",
++                    subtitle = "电脑与服务器 · 模型路由与分流 · 浏览器验证",
++                    onClick = { grp = "net" }, showDivider = false)
++            }
++            SettingsSection(title = "其他") {
++                SettingsItem(icon = Icons.Outlined.Book, iconColor = Color(0xFFAF52DE), title = "数据",
++                    subtitle = "知识库 · 对话整理 · 存储与备份 · 迁移",
++                    onClick = { grp = "data" })
++                SettingsItem(icon = Icons.Outlined.Palette, iconColor = Color(0xFF5856D6), title = "外观",
++                    subtitle = "壁纸与形象 · 文字大小 · 主题 · 桌宠",
++                    onClick = { grp = "look" })
++                SettingsItem(icon = Icons.Outlined.BugReport, iconColor = Color(0xFFFF9500), title = "测试与上报",
++                    subtitle = "自检 · 问题上报 · 更新 · 沙箱与权限 · 关于",
++                    onClick = { grp = "test" }, showDivider = false)
++            }
++            }
++
++            if (grp == "ai") {
++            SettingsSection(title = "账号", footer = "密钥和登录加密保存在这台手机里，AI 看不到明文。") {
+                 SettingsItem(
+                     icon = Icons.Outlined.Key,
+                     iconColor = Color(0xFFFF9500),
+-                    title = "应用",
++                    title = "账号连接",
+                     subtitle = "AI 模型、开发、办公、金融、社交账号和余额",
++                    alert = if (acctTodo > 0) "$acctTodo 个要处理" else null,
+                     onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.CONNECTIONS) },
+                 )
+                 SettingsItem(
+-                    icon = Icons.Outlined.Storefront,
+-                    iconColor = Color(0xFFFF2D55),
+-                    title = "技能与市场",
+-                    subtitle = "一键装技能、插件和 MCP 服务",
+-                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.MARKET) },
+-                )
+-                SettingsItem(
+-                    icon = Icons.Outlined.Cloud,
+-                    iconColor = Color(0xFF34C759),
+-                    title = "电脑与服务器",
+-                    subtitle = "本机 / 多台服务器，自动选最快的",
+-                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.WORK) },
+-                )
+-                SettingsItem(
+-                    icon = Icons.Outlined.Mic,
++                    icon = Icons.Outlined.VerifiedUser,
+                     iconColor = Color(0xFF5856D6),
+-                    title = "实时语音",
+-                    subtitle = "通话、说话的声音、只听我的声音（声纹）",
+-                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.VOICE) },
+-                )
+-                SettingsItem(
+-                    icon = Icons.Outlined.Wallpaper,
+-                    iconColor = Color(0xFFAF52DE),
+-                    title = "外观、壁纸与形象",
+-                    subtitle = "壁纸、卡片文字颜色、虚拟形象、桌宠",
+-                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.PERSONALIZE) },
++                    title = "支付卡",
++                    subtitle = "加密存在本机；网页付款时一键填卡，付款按钮由你自己点",
++                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.CARDS) },
+                     showDivider = false,
+                 )
+             }
+-
+-            // -- more Mines tools --
+-            SettingsSection(
+-                title = "更多 Mines 功能",
+-                footer = "工作位置决定任务在手机还是服务器上跑。",
+-            ) {
++            SettingsSection(title = "技能与插件") {
+                 SettingsItem(
+-                    icon = Icons.Outlined.Memory,
+-                    iconColor = Color(0xFF007AFF),
+-                    title = "沙箱与防杀",
+-                    subtitle = "看内存、一键清理、防止被系统杀掉",
+-                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.SANDBOX) },
++                    icon = Icons.Outlined.Storefront,
++                    iconColor = Color(0xFFFF2D55),
++                    title = "技能与市场",
++                    subtitle = "一键装技能、插件和 MCP 服务",
++                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.MARKET) },
+                 )
+                 SettingsItem(
+                     icon = Icons.Outlined.Extension,
+@@ -234,27 +238,19 @@ fun SettingsScreen(
+                     title = "插件",
+                     subtitle = "安装 dsh 插件，给 AI 加新工具",
+                     onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.PLUGINS) },
++                    showDivider = false,
+                 )
++            }
++            }
++
++            if (grp == "net") {
++            SettingsSection(title = "网络", footer = "工作位置决定任务在手机还是服务器上跑。") {
+                 SettingsItem(
+-                    icon = Icons.Outlined.VerifiedUser,
+-                    iconColor = Color(0xFF5856D6),
+-                    title = "支付卡",
+-                    subtitle = "加密存在本机；网页付款时一键填卡，付款按钮由你自己点",
+-                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.CARDS) },
+-                )
+-                SettingsItem(
+-                    icon = Icons.Outlined.Book,
+-                    iconColor = Color(0xFFAF52DE),
+-                    title = "知识库",
+-                    subtitle = "导入 PDF、文档、网页，AI 回答时先查你的资料",
+-                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.KNOWLEDGE) },
+-                )
+-                SettingsItem(
+-                    icon = Icons.Outlined.VerifiedUser,
+-                    iconColor = Color(0xFFFF9500),
+-                    title = "一键冒烟测试 + 上报",
+-                    subtitle = "检查语音、模型、权限、沙箱、MCP；有问题一键发给 Hark",
+-                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.REPORT) },
++                    icon = Icons.Outlined.Cloud,
++                    iconColor = Color(0xFF34C759),
++                    title = "电脑与服务器",
++                    subtitle = "本机 / 多台服务器，自动选最快的",
++                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.WORK) },
+                 )
+                 SettingsItem(
+                     icon = Icons.Outlined.Speed,
+@@ -269,6 +265,19 @@ fun SettingsScreen(
+                     title = "浏览器验证",
+                     subtitle = "遇到验证码叫你点一下；自动填短信验证码",
+                     onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.VERIFY) },
++                    showDivider = false,
++                )
++            }
++            }
++
++            if (grp == "data") {
++            SettingsSection(title = "资料与对话") {
++                SettingsItem(
++                    icon = Icons.Outlined.Book,
++                    iconColor = Color(0xFFAF52DE),
++                    title = "知识库",
++                    subtitle = "导入 PDF、文档、网页，AI 回答时先查你的资料",
++                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.KNOWLEDGE) },
+                 )
+                 SettingsItem(
+                     icon = Icons.Outlined.Inventory2,
+@@ -277,6 +286,39 @@ fun SettingsScreen(
+                     subtitle = "自动归档旧对话，按话题分组",
+                     onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.TIDY) },
+                 )
++                SettingsItem(
++                    icon = Icons.Outlined.Backup,
++                    iconColor = Color(0xFF8E8E93),
++                    title = "从旧版迁移",
++                    subtitle = "搬来旧版 Mines 的供应商、技能和其他内容",
++                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.MIGRATE) },
++                    showDivider = false,
++                )
++            }
++            }
++
++            if (grp == "look") {
++            SettingsSection(title = "形象") {
++                SettingsItem(
++                    icon = Icons.Outlined.Wallpaper,
++                    iconColor = Color(0xFFAF52DE),
++                    title = "壁纸与形象",
++                    subtitle = "壁纸、卡片文字颜色、虚拟形象、桌宠",
++                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.PERSONALIZE) },
++                    showDivider = false,
++                )
++            }
++            }
++
++            if (grp == "test") {
++            SettingsSection(title = "自检与更新") {
++                SettingsItem(
++                    icon = Icons.Outlined.VerifiedUser,
++                    iconColor = Color(0xFFFF9500),
++                    title = "一键自检 + 上报",
++                    subtitle = "检查语音、模型、权限、沙箱、MCP；有问题一键发给 Hark",
++                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.REPORT) },
++                )
+                 SettingsItem(
+                     icon = Icons.Outlined.SystemUpdate,
+                     iconColor = Color(0xFF007AFF),
+@@ -285,15 +327,17 @@ fun SettingsScreen(
+                     onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.UPDATE) },
+                 )
+                 SettingsItem(
+-                    icon = Icons.Outlined.Backup,
+-                    iconColor = Color(0xFF8E8E93),
+-                    title = "从旧版迁移",
+-                    subtitle = "搬来旧版 Mines 的供应商、技能和其他内容",
+-                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.MIGRATE) },
++                    icon = Icons.Outlined.Memory,
++                    iconColor = Color(0xFF007AFF),
++                    title = "沙箱与防杀",
++                    subtitle = "看内存、一键清理、防止被系统杀掉",
++                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.SANDBOX) },
+                     showDivider = false,
+                 )
+             }
++            }
+ 
++            if (grp == "ai") {
+             // -- LLM Providers --
+             SettingsSection(
+                 title = stringResource(R.string.settings_section_llm_providers),
+@@ -323,6 +367,9 @@ fun SettingsScreen(
+                 )
+             }
+ 
++            }
++
++            if (grp == "look") {
+             // -- Appearance --
+             SettingsSection(title = stringResource(R.string.settings_section_appearance)) {
+                 SettingsItem(
+@@ -335,6 +382,9 @@ fun SettingsScreen(
+                 )
+             }
+ 
++            }
++
++            if (grp == "ai") {
+             // -- Agent Runtime --
+             // [T-android-settings-runtime-order] Row order matches iOS
+             // (ContentView.swift, Section "Agent Runtime"): Agent Tools, Sub
+@@ -405,6 +455,9 @@ fun SettingsScreen(
+                 )
+             }
+ 
++            }
++
++            if (grp == "data") {
+             // -- Storage --
+             SettingsSection(title = stringResource(R.string.settings_section_storage)) {
+                 SettingsItem(
+@@ -438,6 +491,9 @@ fun SettingsScreen(
+                 )
+             }
+ 
++            }
++
++            if (grp == "test") {
+             // -- Permissions --
+             SettingsSection(title = stringResource(R.string.settings_section_permissions)) {
+                 SettingsItem(
+@@ -504,6 +560,8 @@ fun SettingsScreen(
+                 )
+             }
+ 
++            }
++
+             Spacer(Modifier.height(24.dp))
+         }
+     }
+@@ -700,6 +758,8 @@ private fun SettingsItem(
+     subtitle: String?,
+     onClick: () -> Unit,
+     showDivider: Boolean = true,
++    /** [Mines-warm-36] red one-liner under the subtitle, e.g. 「1 个要处理」. */
++    alert: String? = null,
+ ) {
+     // [Mines-design-34] accent line icon in a tinted circle (iconColor kept in the signature, not painted)
+     val mc = com.openminis.app.ui.plus.mines()
+@@ -715,6 +775,8 @@ private fun SettingsItem(
+                 Text(title, fontSize = 17.sp, lineHeight = 24.sp, fontWeight = FontWeight.Medium, color = mc.ink)
+                 if (subtitle != null) Text(subtitle, fontSize = 15.sp, lineHeight = 20.sp, color = mc.ink2, maxLines = 2,
+                     overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
++                if (alert != null) Text(alert, fontSize = 15.sp, lineHeight = 20.sp, fontWeight = FontWeight.SemiBold,
++                    color = if (mc.dark) com.openminis.app.ui.plus.MinesDesign.DangerDark else com.openminis.app.ui.plus.MinesDesign.Danger, maxLines = 1)
+             }
+             MinesIcon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null, tint = mc.ink3, modifier = Modifier.size(22.dp))
+         }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/theme/Theme.kt b/src/android/app/src/main/java/com/openminis/app/ui/theme/Theme.kt
+index 12d7837..2ecc45a 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/theme/Theme.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/theme/Theme.kt
+@@ -181,8 +181,10 @@ fun MinisTheme(
+ 
+ /** [Mines-design-34] Material scheme from the porcelain tokens + character accent. */
+ private fun porcelainScheme(base: androidx.compose.material3.ColorScheme, m: com.openminis.app.ui.plus.MinesColors) = base.copy(
+-    primary = m.primary,
+-    onPrimary = m.onPrimary,
++    // [Mines-warm-36] Material text buttons/links in dark mode keep the light accent (≥4.5:1 on dark);
++    // Mines' own primary pills use mines().primary (#B5532F + white) in both modes.
++    primary = if (m.dark) m.primaryText else m.primary,
++    onPrimary = if (m.dark) Color(0xFF2A1206) else m.onPrimary,
+     primaryContainer = m.container,
+     onPrimaryContainer = m.onContainer,
+     secondary = m.primaryText,
