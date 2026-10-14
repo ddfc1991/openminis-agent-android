@@ -19,6 +19,10 @@ try:
     QUICK = "quick" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
 except Exception:
     QUICK = False
+try:
+    VOICE352 = "voice" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
+except Exception:
+    VOICE352 = False
 step_no = 0
 crashed = []
 
@@ -1013,6 +1017,36 @@ def quick_home_351():
     print(f"B351 home_ok={'最近对话' in t and '打开消息页' in t} page_opened={bool(t2)} back_home={r3 is not None and bool(find(r3, '最近对话'))}", flush=True)
 
 
+def voice_352():
+    """[build-35.2] voice: page opens; 测试语音 with a fake key → KEY error (not config); 「设定好我的声音录入」 opens 声纹录入."""
+    j = selftest_json("voicediag", "AIzaSyDUMMYDUMMYDUMMYDUMMYDUMMYDUMMYDUM", timeout=120)
+    print(f"B352 voicediag kind={j.get('kind')} lines={j.get('lines')}", flush=True)
+    if j.get("kind") != "key": selftest_fail.append(f"b352 voicediag kind={j.get('kind')} (want key)")
+    go_home()
+    opened = tap_text("实时语音", wait=8)
+    if not opened:
+        sh(f"am start -n {PKG}/com.openminis.app.MainActivity --es mines_route plus_voice_live"); time.sleep(5)
+    time.sleep(4)
+    r = snap("v352-voice")
+    check("voice page opens")
+    t = " ".join(texts(r)) if r is not None else ""
+    if not any(w in t for w in ("开始语音", "Gemini", "通话", "普通语音", "账号连接")): page_missing.append("b352 voice page")
+    ji = selftest_json("voiceintent", "设定好我的声音录入", timeout=30)
+    print(f"B352 voiceintent {ji}", flush=True)
+    if ji.get("page") != "voiceprint_enroll": selftest_fail.append(f"b352 voiceintent page={ji.get('page')}")
+    if not ji.get("promise"): selftest_fail.append("b352 promise detector")
+    ok = False
+    for _ in range(8):
+        time.sleep(1.5)
+        r2 = dump()
+        if r2 is not None and find(r2, "录入你的声音"): ok = True; break
+    snap("v352-enrol")
+    check("voiceprint intent opens enrolment")
+    if not ok: selftest_fail.append("b352 声纹录入 page did not open from the voice intent")
+    print(f"B352 voice_page={bool(t)} enrol_opened={ok}", flush=True)
+    for _ in range(3): sh("input keyevent KEYCODE_BACK"); time.sleep(1.2)
+
+
 def main():
     m = re.search(r"(\d+)x(\d+)", sh("wm size"))
     if m: SCREEN[0], SCREEN[1] = int(m.group(1)), int(m.group(2))
@@ -1037,6 +1071,12 @@ def main():
         dump_fatal()
         user_like_state()
 
+    if VOICE352:
+        try:
+            voice_352()
+        except Exception as e:
+            print("voice352 error:", e, flush=True); selftest_fail.append(f"voice352 error {e}")
+        return finish(lc)
     if QUICK:
         try:
             quick_home_351()
