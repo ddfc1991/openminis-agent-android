@@ -1,5 +1,5 @@
 diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
-index 3b26b75..bb38b16 100644
+index 3b26b75..bc0f615 100644
 --- a/src/android/app/build.gradle.kts
 +++ b/src/android/app/build.gradle.kts
 @@ -38,8 +38,8 @@ android {
@@ -8,8 +8,8 @@ index 3b26b75..bb38b16 100644
          targetSdk = 35
 -        versionCode = 28
 -        versionName = "1.14"
-+        versionCode = 30
-+        versionName = "1.16"
++        versionCode = 31
++        versionName = "1.17"
  
          testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
  
@@ -68,6 +68,91 @@ index 44901c4..36a75e3 100644
                  else -> {
                      val month = cal.get(java.util.Calendar.MONTH) + 1
                      val day = cal.get(java.util.Calendar.DAY_OF_MONTH)
+diff --git a/src/android/app/src/main/java/com/openminis/app/browser/BrowserZoom.kt b/src/android/app/src/main/java/com/openminis/app/browser/BrowserZoom.kt
+index ed273ec..a5697e3 100644
+--- a/src/android/app/src/main/java/com/openminis/app/browser/BrowserZoom.kt
++++ b/src/android/app/src/main/java/com/openminis/app/browser/BrowserZoom.kt
+@@ -38,15 +38,26 @@ try{document.documentElement.style.touchAction='auto';}catch(e){}
+ 
+     private fun prefs(c: Context) = c.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+ 
+-    /** Default text size: the system font scale (the user runs a large font), 100–200 %. */
+-    fun defaultTextZoom(c: Context): Int =
+-        (c.resources.configuration.fontScale * 100).toInt().coerceIn(MIN, MAX)
++    /** Lowest default text size (a system font set smaller than normal). */
++    const val DEFAULT_MIN = 80
++
++    /**
++     * Default text size: [Mines-webfit-38.3] follows the system font size × Mines' own 字号 setting
++     * (设置 → 外观), like the rest of the app, 80–200 %. A size the user set for a site wins.
++     */
++    fun defaultTextZoom(c: Context): Int {
++        val app = runCatching {
++            val lvl = com.openminis.app.ui.settings.getAppearancePrefs(c).getInt(com.openminis.app.ui.settings.KEY_FONT_APP_BASE, 0)
++            com.openminis.app.ui.settings.fontScaleForLevel(lvl)
++        }.getOrDefault(1f)
++        return (c.resources.configuration.fontScale * app * 100).toInt().coerceIn(DEFAULT_MIN, MAX)
++    }
+ 
+     fun hostOf(url: String?): String = runCatching { Uri.parse(url ?: "").host.orEmpty().removePrefix("www.") }.getOrDefault("")
+ 
+     fun textZoomFor(c: Context, url: String?): Int {
+         val h = hostOf(url)
+-        return if (h.isEmpty()) defaultTextZoom(c) else prefs(c).getInt("t:$h", defaultTextZoom(c)).coerceIn(MIN, MAX)
++        return if (h.isEmpty()) defaultTextZoom(c) else prefs(c).getInt("t:$h", -1).let { if (it <= 0) defaultTextZoom(c) else it.coerceIn(MIN, MAX) }
+     }
+ 
+     fun setTextZoom(c: Context, url: String?, pct: Int) {
+diff --git a/src/android/app/src/main/java/com/openminis/app/browser/WebFit.kt b/src/android/app/src/main/java/com/openminis/app/browser/WebFit.kt
+new file mode 100644
+index 0000000..5561eb8
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/browser/WebFit.kt
+@@ -0,0 +1,44 @@
++package com.openminis.app.browser
++
++import android.content.Context
++import android.webkit.WebView
++import java.lang.ref.WeakReference
++
++/**
++ * [Mines-webfit-38.3] Every in-app WebView fits the phone screen (user 2026-10-14:
++ * 「所有内置浏览器/WebView 必须自适应屏幕」, realme Neo7 Turbo 1280×2800 / 480 dpi ≈ 427 dp wide).
++ *
++ * - wide viewport + overview: pages with `<meta viewport width=device-width>` lay out at the
++ *   screen width; pages without one lay out at 980 CSS px and are zoomed out to the screen width
++ *   (never cut off on the right)
++ * - pinch / double-tap zoom on, no floating +/- buttons, zoom-locking viewports unlocked ([BrowserZoom])
++ * - text size follows the system font size × Mines' own 字号 setting ([BrowserZoom.defaultTextZoom])
++ * - mobile user agent (contains "Mobile"); the in-app browser's 电脑 mode keeps its desktop UA and
++ *   is shrunk to the screen width by BrowserUseManager.applyShrinkToFit
++ *
++ * Callers host the WebView with fillMaxSize / MATCH_PARENT and pad for the keyboard (imePadding).
++ */
++object WebFit {
++    /** This phone's mobile Chrome UA (always contains "Mobile"). */
++    fun mobileUa(c: Context): String = com.openminis.app.plus.LoginWeb.userAgent(c)
++
++    /** Applies the fit-to-screen settings. [keepUa] leaves a UA the caller chose on purpose (电脑 mode). */
++    fun apply(wv: WebView, keepUa: Boolean = false) {
++        BrowserZoom.configure(wv)
++        if (!keepUa) {
++            val ua = wv.settings.userAgentString.orEmpty()
++            if (!ua.contains("Mobile")) wv.settings.userAgentString = mobileUa(wv.context)
++        }
++    }
++
++    /** The WebView the user is looking at in the in-app browser (for the smoke self-test). */
++    @Volatile var shown: WeakReference<WebView>? = null
++
++    /** Layout probe: CSS viewport vs screen, horizontal overflow, the page's meta viewport and UA. */
++    const val PROBE_JS = """(function(){try{var d=document.documentElement,b=document.body;
++var m=document.querySelector('meta[name=viewport]');
++return JSON.stringify({url:location.href,title:document.title,innerWidth:window.innerWidth,screenWidth:screen.width,
++dpr:window.devicePixelRatio,scrollWidth:Math.max(d?d.scrollWidth:0,b?b.scrollWidth:0),clientWidth:d?d.clientWidth:0,
++vvScale:window.visualViewport?visualViewport.scale:0,vvWidth:window.visualViewport?visualViewport.width:0,
++metaViewport:m?m.getAttribute('content'):'',ua:navigator.userAgent});}catch(e){return JSON.stringify({error:String(e)});}})()"""
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/CharacterVoices.kt b/src/android/app/src/main/java/com/openminis/app/plus/CharacterVoices.kt
 new file mode 100644
 index 0000000..a6969ba
@@ -473,6 +558,20 @@ index c4569f6..382df32 100644
              "zhipu" -> verdict(call(base, bearer("https://open.bigmodel.cn/api/paas/v4/models", key)))
              "xai" -> verdict(call(base, bearer("https://api.x.ai/v1/api-key", key))) { it.optString("name") }
              "anthropic" -> verdict(call(base, Request.Builder().url("https://api.anthropic.com/v1/models")
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/LoginWeb.kt b/src/android/app/src/main/java/com/openminis/app/plus/LoginWeb.kt
+index f14b997..1319c19 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/LoginWeb.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/LoginWeb.kt
+@@ -94,7 +94,8 @@ object LoginWeb {
+         s.mediaPlaybackRequiresUserGesture = true
+         s.userAgentString = userAgent(wv.context)
+         // [Mines-zoom-34] login pages are zoomable too (pinch / double-tap, unlocked viewport)
+-        com.openminis.app.browser.BrowserZoom.configure(wv)
++        // [Mines-webfit-38.3] same fit-to-screen settings as every in-app WebView (UA above is mobile)
++        com.openminis.app.browser.WebFit.apply(wv)
+         wv.setBackgroundColor(android.graphics.Color.WHITE)
+         runCatching {
+             if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) WebSettingsCompat.setAlgorithmicDarkeningAllowed(s, false)
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PayCards.kt b/src/android/app/src/main/java/com/openminis/app/plus/PayCards.kt
 index 406a84c..76f9951 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/PayCards.kt
@@ -541,8 +640,20 @@ index 406a84c..76f9951 100644
      // ---- filling ------------------------------------------------------------
      /** Payment-form iframes we may write into (cross-origin card fields). */
      val PAY_ORIGINS = setOf(
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusConnect.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusConnect.kt
+index 5c7f934..6e513f5 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/PlusConnect.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/PlusConnect.kt
+@@ -298,6 +298,7 @@ object PlusConnect {
+             wv.settings.javaScriptEnabled = true
+             wv.settings.domStorageEnabled = true
+             wv.settings.userAgentString = MINES_MOBILE_UA
++            com.openminis.app.browser.WebFit.apply(wv)  // [Mines-webfit-38.3]
+             CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
+             wv.webViewClient = object : WebViewClient() {
+                 override fun onPageFinished(view: WebView, u: String) {
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
-index 0b722dc..c5168ef 100644
+index 0b722dc..fbac6fc 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
 @@ -112,6 +112,38 @@ class SelfTestProvider : ContentProvider() {
@@ -610,6 +721,62 @@ index 0b722dc..c5168ef 100644
                                      .onFailure { j.put("error", it.message) }
                                  j.put("save_ms", System.currentTimeMillis() - t0).put("model", Voiceprint.hasModel(c))
                              }
+@@ -386,6 +421,55 @@ class SelfTestProvider : ContentProvider() {
+                 val k = arg ?: ""
+                 out.putString("result", org.json.JSONObject().put("has", PlusVault.hasSecret(k)).put("tail", PlusVault.secret(k)?.takeLast(8) ?: "").toString())
+             }
++            "webfit" -> {
++                // [Mines-webfit-38.3] arg "open:<url>": open the in-app browser (home ☰ → 打开浏览器) on <url>;
++                // "probe": layout of the page on screen (CSS viewport vs screen width, overflow, settings, UA);
++                // "secureoff": lift FLAG_SECURE for this self-test session so key pages can be screenshotted.
++                val c = context!!
++                val a = arg ?: ""
++                val main = android.os.Handler(android.os.Looper.getMainLooper())
++                when {
++                    a == "secureoff" -> { Privacy.secureOffForSelfTest = true; out.putString("result", "{\"ok\":true}") }
++                    a.startsWith("open:") -> {
++                        val l = java.util.concurrent.CountDownLatch(1)
++                        main.post {
++                            com.openminis.app.browser.WebFit.shown = null
++                            com.openminis.app.ui.plus.PlusNav.openBrowser.value = a.removePrefix("open:")
++                            l.countDown()
++                        }
++                        l.await(5, TimeUnit.SECONDS)
++                        out.putString("result", "{\"ok\":true}")
++                    }
++                    else -> {
++                        val res = java.util.concurrent.atomic.AtomicReference<String?>(null)
++                        val l = java.util.concurrent.CountDownLatch(1)
++                        main.post {
++                            val wv = com.openminis.app.browser.WebFit.shown?.get()
++                            if (wv == null) { res.set("{\"ok\":false,\"error\":\"no browser WebView on screen\"}"); l.countDown(); return@post }
++                            val dm = c.resources.displayMetrics
++                            val base = org.json.JSONObject()
++                                .put("viewW", wv.width).put("viewH", wv.height).put("attached", wv.isAttachedToWindow)
++                                .put("displayW", dm.widthPixels).put("displayH", dm.heightPixels).put("density", dm.density.toDouble())
++                                .put("densityDpi", dm.densityDpi).put("screenWidthDp", c.resources.configuration.screenWidthDp)
++                                .put("settings", com.openminis.app.browser.BrowserZoom.describe(wv))
++                                .put("settingsUa", wv.settings.userAgentString ?: "").put("scale", wv.scale.toDouble())
++                            wv.evaluateJavascript(com.openminis.app.browser.WebFit.PROBE_JS) { r ->
++                                val page = runCatching { org.json.JSONObject(org.json.JSONTokener(r ?: "\"\"").nextValue() as String) }.getOrNull()
++                                base.put("page", page ?: org.json.JSONObject())
++                                if (page != null) {
++                                    val iw = page.optInt("innerWidth"); val sw = page.optInt("scrollWidth"); val vw = (wv.width / dm.density).toInt()
++                                    // fits: no horizontal overflow beyond the CSS viewport, and that viewport (×zoom) spans the view
++                                    base.put("cssViewW", vw).put("fits", sw <= iw + 2 && iw > 0)
++                                        .put("mobileUa", page.optString("ua").contains("Mobile"))
++                                }
++                                res.set(base.put("ok", true).toString()); l.countDown()
++                            }
++                        }
++                        l.await(10, TimeUnit.SECONDS)
++                        out.putString("result", res.get() ?: "{\"ok\":false,\"error\":\"timeout\"}")
++                    }
++                }
++            }
+             "openkind" -> {
+                 // open 应用 → that service's page (smoke; the mines_route deep link does not navigate on the emulator)
+                 val l = java.util.concurrent.CountDownLatch(1)
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/VoiceDiag.kt b/src/android/app/src/main/java/com/openminis/app/plus/VoiceDiag.kt
 new file mode 100644
 index 0000000..1b8c82a
@@ -902,6 +1069,41 @@ index e7fb64c..d6a561a 100644
          "archive" to listOf("M3.0 3.0h18.0a1.0 1.0 0 0 1 1.0 1.0v3.0a1.0 1.0 0 0 1 -1.0 1.0h-18.0a1.0 1.0 0 0 1 -1.0 -1.0v-3.0a1.0 1.0 0 0 1 1.0 -1.0Z", "M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8", "M10 12h4"),
          "arrow-left" to listOf("m12 19-7-7 7-7", "M19 12H5"),
          "battery-full" to listOf("M10 10v4", "M14 10v4", "M22 14v-4", "M6 10v4", "M4.0 6.0h12.0a2.0 2.0 0 0 1 2.0 2.0v8.0a2.0 2.0 0 0 1 -2.0 2.0h-12.0a2.0 2.0 0 0 1 -2.0 -2.0v-8.0a2.0 2.0 0 0 1 2.0 -2.0Z"),
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserSheet.kt b/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserSheet.kt
+index 1b7e0af..3b64f27 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserSheet.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserSheet.kt
+@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.Spacer
+ import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.imePadding
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.height
+ import androidx.compose.foundation.layout.padding
+@@ -200,7 +201,8 @@ fun BrowserSheet(
+             }
+         },
+     ) {
+-        Column(modifier = Modifier.fillMaxSize()) {
++        // [Mines-webfit-38.3] the page shrinks above the keyboard (no-op when the sheet already consumed it)
++        Column(modifier = Modifier.fillMaxSize().imePadding()) {
+             // ── Tab Bar with leading "+" and trailing History icon ──
+             // (Add/History flank the tabs row so all tab-related controls
+             // sit on one line, leaving the URL bar uncluttered below.)
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserWebView.kt b/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserWebView.kt
+index 997796f..969ee40 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserWebView.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserWebView.kt
+@@ -55,6 +55,8 @@ fun BrowserWebView(
+                     }
+                     false
+                 }
++                // [Mines-webfit-38.3] the page the user is looking at, for the fit-to-screen self-test
++                com.openminis.app.browser.WebFit.shown = java.lang.ref.WeakReference(webView)
+                 container.addView(
+                     webView,
+                     FrameLayout.LayoutParams(
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatAssistantMessageUI.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatAssistantMessageUI.kt
 index e3c4c6f..2df1574 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatAssistantMessageUI.kt
@@ -1214,7 +1416,7 @@ index 3abd64e..b7d0adf 100644
      val ratio = contrastRatio(fg, bg)
      PlusSection("卡片文字颜色", footer = "首页「工作位置 / 服务器 / 账号」卡片和问候语的文字颜色。自动 = 按卡片明暗选白字或黑字，保证看得清。") {
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
-index feb81e5..9844e4c 100644
+index feb81e5..74ee93e 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
 @@ -78,6 +78,8 @@ import kotlin.coroutines.resume
@@ -1549,6 +1751,14 @@ index feb81e5..9844e4c 100644
              Spacer(Modifier.height(8.dp))
          }
          Row(Modifier.fillMaxWidth().padding(horizontal = 22.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+@@ -688,6 +711,7 @@ private fun XReader(tick: Int, onDone: () -> Unit) {
+         val wv = WebView(context).apply {
+             settings.javaScriptEnabled = true; settings.domStorageEnabled = true
+             settings.userAgentString = com.openminis.app.plus.MINES_MOBILE_UA
++            com.openminis.app.browser.WebFit.apply(this)  // [Mines-webfit-38.3]
+             webViewClient = WebViewClient()
+         }
+         suspend fun eval(js: String): String = suspendCancellableCoroutine { c ->
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/Glass.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/Glass.kt
 index 402ddfd..ef9bd0d 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/Glass.kt
@@ -1581,10 +1791,18 @@ index 402ddfd..ef9bd0d 100644
      val a = maxOf(st.glassOpacity, 0.72f).coerceAtMost(0.95f)
      return Brush.verticalGradient(listOf(base.copy(alpha = a - 0.06f), base.copy(alpha = a)))
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/KeyAgentScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/KeyAgentScreen.kt
-index fe54879..ceb3c99 100644
+index fe54879..eddda68 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/KeyAgentScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/KeyAgentScreen.kt
-@@ -121,6 +121,8 @@ fun KeyAgentDialog(kind: ConnectionKind, onFallback: ((candidate: String?) -> Un
+@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.imePadding
+ import androidx.compose.foundation.layout.navigationBarsPadding
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.layout.statusBarsPadding
+@@ -121,6 +122,8 @@ fun KeyAgentDialog(kind: ConnectionKind, onFallback: ((candidate: String?) -> Un
          var sawLogin = false
          var reopened = 0
          var blanks = 0
@@ -1593,7 +1811,7 @@ index fe54879..ceb3c99 100644
          val until = System.currentTimeMillis() + 5 * 60_000
          delay(2500)
          while (done == null && System.currentTimeMillis() < until) {
-@@ -129,15 +131,24 @@ fun KeyAgentDialog(kind: ConnectionKind, onFallback: ((candidate: String?) -> Un
+@@ -129,15 +132,24 @@ fun KeyAgentDialog(kind: ConnectionKind, onFallback: ((candidate: String?) -> Un
              if (step == 0) recipe.keyRegex.findAll(text).forEach { baseline += it.value }
              val key = captured.get()?.let { pick(it, false) } ?: pick(text, true)
              if (key != null && step > 0) { finishWith(key); if (done != null || waitUser) return@LaunchedEffect }
@@ -1621,6 +1839,24 @@ index fe54879..ceb3c99 100644
                  if (blanks >= 4) {
                      PlusVault.setExtra(kind.id, "login_external", "1")
                      com.openminis.app.browser.GoogleAuthRouter.openInCustomTab(context, recipe.url)
+@@ -186,7 +198,8 @@ fun KeyAgentDialog(kind: ConnectionKind, onFallback: ((candidate: String?) -> Un
+     Dialog(onDismissRequest = { close(done != null) }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+         Surface(Modifier.fillMaxSize()) {
+             SecureWindow()  // [Mines-privacy-35.3] the key is on this page
+-            Column(Modifier.fillMaxSize().statusBarsPadding()) {
++            // [Mines-webfit-38.3] the page shrinks above the keyboard instead of hiding its input fields
++            Column(Modifier.fillMaxSize().statusBarsPadding().imePadding()) {
+                 Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.primaryContainer).padding(16.dp)) {
+                     // [Mines-keys-35] softer wording (user, 2026-10-14)
+                     Text(if (done != null) (if (fixing) "已修复 ${kind.name}" else "已接入 ${kind.name}") else if (fixing) "正在修复 ${kind.name}…" else "正在接入 ${kind.name}…", fontSize = 17.sp, fontWeight = FontWeight.SemiBold,
+@@ -199,6 +212,7 @@ fun KeyAgentDialog(kind: ConnectionKind, onFallback: ((candidate: String?) -> Un
+                     AndroidView(modifier = Modifier.fillMaxSize(), factory = { ctx ->
+                         WebView(ctx).apply {
+                             LoginWeb.configure(this, kind.id)
++                            com.openminis.app.browser.WebFit.shown = java.lang.ref.WeakReference(this)  // [Mines-webfit-38.3] self-test probe
+                             webChromeClient = object : android.webkit.WebChromeClient() {
+                                 override fun onProgressChanged(view: WebView, newProgress: Int) { load.progress = newProgress }
+                             }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt
 index fe38e21..aef7382 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt
@@ -1683,7 +1919,7 @@ index fdcda6e..d4284a2 100644
      edit?.let { c -> CardEditor(c, onDone = { edit = null }) }
      if (askImport) AlertDialog(onDismissRequest = { askImport = false },
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
-index 3ed42b8..09b6355 100644
+index 3ed42b8..4372b46 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
 @@ -42,12 +42,13 @@ import androidx.compose.material3.IconButton
@@ -1701,7 +1937,16 @@ index 3ed42b8..09b6355 100644
  import androidx.compose.ui.draw.clip
  import androidx.compose.ui.graphics.graphicsLayer
  import androidx.compose.ui.graphics.Brush
-@@ -101,6 +102,7 @@ object PlusRoutes {
+@@ -81,6 +82,8 @@ object PlusNav {
+     @Volatile var fixAccount: String? = null
+     /** [Mines-feed-35.3] with openKind: start 帮我领 (一键接入) right away, as from the 应用 list */
+     @Volatile var autoClaim: Boolean = false
++    /** [Mines-webfit-38.3] open the in-app browser on this URL (home screen picks it up; smoke self-test). */
++    val openBrowser = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
+     fun go(route: String) { navigate?.invoke(route) ?: run { pending = route } }
+ }
+ 
+@@ -101,6 +104,7 @@ object PlusRoutes {
      const val REPORT = "plus_report"
      const val DIGEST = "plus_digest"
      const val CARDS = "plus_cards"
@@ -1709,7 +1954,7 @@ index 3ed42b8..09b6355 100644
      const val SERVER = "plus_server/{id}"
      fun server(id: String) = "plus_server/$id"
  }
-@@ -151,21 +153,28 @@ fun ChatWallpaperLayer(modifier: Modifier = Modifier, home: Boolean = false) {
+@@ -151,21 +155,28 @@ fun ChatWallpaperLayer(modifier: Modifier = Modifier, home: Boolean = false) {
      val st by PlusPrefs.state.collectAsState()
      val spec = st.wallpaper
      if (spec.isEmpty() || (home && !st.wallpaperOnHome)) return
@@ -1747,7 +1992,7 @@ index 3ed42b8..09b6355 100644
      }
  }
  
-@@ -176,8 +185,7 @@ fun ChatWallpaperLayer(modifier: Modifier = Modifier, home: Boolean = false) {
+@@ -176,8 +187,7 @@ fun ChatWallpaperLayer(modifier: Modifier = Modifier, home: Boolean = false) {
   */
  @Composable
  fun homeCardColor(base: Color): Color =
@@ -1757,7 +2002,7 @@ index 3ed42b8..09b6355 100644
  
  /** True when a wallpaper is drawn on this screen (bars then go translucent). */
  @Composable
-@@ -291,7 +299,7 @@ fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, action
+@@ -291,7 +301,7 @@ fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, action
  fun minesGlassFill(strong: Boolean = false): Color {
      val m = mines()
      val photo = wallpaperOn(home = true)
@@ -1766,7 +2011,7 @@ index 3ed42b8..09b6355 100644
      @Suppress("UNUSED_EXPRESSION") photo
      return (if (m.dark) Color(0xFF221D1A) else Color(0xFFFFFDFA)).copy(alpha = a)
  }
-@@ -334,11 +342,11 @@ fun PlusSection(title: String?, footer: String? = null, action: String? = null,
+@@ -334,11 +344,11 @@ fun PlusSection(title: String?, footer: String? = null, action: String? = null,
  
  /** Line icon in a tinted circle (40 dp; icon in the tint, circle in its light container). */
  @Composable
@@ -1780,7 +2025,7 @@ index 3ed42b8..09b6355 100644
      }
  }
  
-@@ -447,7 +455,7 @@ fun cardTextColor(fill: Color): Color {
+@@ -447,7 +457,7 @@ fun cardTextColor(fill: Color): Color {
      val ctx = LocalContext.current
      PlusPrefs.init(ctx)
      val st by PlusPrefs.state.collectAsState()
@@ -2838,10 +3083,19 @@ index 1b05757..cf063c7 100644
 +        .clickable(interactionSource = src, indication = androidx.compose.foundation.LocalIndication.current, onClick = onClick)
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
-index dbdf1e9..b2fdb9f 100644
+index dbdf1e9..376a723 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
-@@ -28,7 +28,7 @@ import androidx.compose.material3.MaterialTheme
+@@ -14,6 +14,8 @@ import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.consumeWindowInsets
++import androidx.compose.foundation.layout.imePadding
+ import androidx.compose.foundation.layout.navigationBarsPadding
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.shape.RoundedCornerShape
+@@ -28,7 +30,7 @@ import androidx.compose.material3.MaterialTheme
  import androidx.compose.material3.Scaffold
  import androidx.compose.material3.Surface
  import androidx.compose.material3.Text
@@ -2850,6 +3104,16 @@ index dbdf1e9..b2fdb9f 100644
  import androidx.compose.runtime.Composable
  import androidx.compose.runtime.DisposableEffect
  import androidx.compose.runtime.LaunchedEffect
+@@ -227,7 +229,8 @@ fun WebLoginScreen(
+             }
+         },
+     ) { padding ->
+-        Column(Modifier.fillMaxSize().padding(padding)) {
++        // [Mines-webfit-38.3] keyboard: the page shrinks above it (bottom bar height already counted)
++        Column(Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding).imePadding()) {
+           status?.let {
+               Surface(color = MaterialTheme.colorScheme.primaryContainer, modifier = Modifier.fillMaxWidth()) {
+                   Text(it, fontSize = 17.sp, color = MaterialTheme.colorScheme.onPrimaryContainer,
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/preview/WebPreviewBottomSheet.kt b/src/android/app/src/main/java/com/openminis/app/ui/preview/WebPreviewBottomSheet.kt
 index 9a08f7a..a6b8f14 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/preview/WebPreviewBottomSheet.kt
@@ -2872,6 +3136,35 @@ index 9a08f7a..a6b8f14 100644
              .let { if (topInsetPadding) it.windowInsetsPadding(WindowInsets.statusBars) else it }
              .padding(start = 4.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
          verticalAlignment = Alignment.CenterVertically,
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/preview/WebViewHolder.kt b/src/android/app/src/main/java/com/openminis/app/ui/preview/WebViewHolder.kt
+index 79d296f..b0634e6 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/preview/WebViewHolder.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/preview/WebViewHolder.kt
+@@ -96,6 +96,8 @@ class WebViewHolder(
+         // implicitly via WebViewAssetLoader's defaults.
+         settings.useWideViewPort = true
+         settings.loadWithOverviewMode = true
++        // [Mines-webfit-38.3] zoomable, text follows the font size, mobile UA
++        com.openminis.app.browser.WebFit.apply(this)
+         mobileUserAgent = settings.userAgentString
+         // T-android-webview-v3-port: enable first- + third-party cookies so
+         // the in-chat preview matches Chrome cookie semantics. Without
+@@ -385,8 +387,13 @@ class WebViewHolder(
+             applyShrinkToFit(DESKTOP_VIEWPORT_CSS_WIDTH)
+         } else {
+             webView.settings.userAgentString = mobileUserAgent
+-            webView.settings.useWideViewPort = false
+-            webView.settings.loadWithOverviewMode = false
++            // [Mines-webfit-38.3] mobile mode also keeps wide viewport + overview (fits the screen width;
++            // pages without a meta viewport are zoomed out to fit instead of cut off) and stays zoomable
++            webView.settings.useWideViewPort = true
++            webView.settings.loadWithOverviewMode = true
++            webView.settings.setSupportZoom(true)
++            webView.settings.builtInZoomControls = true
++            webView.settings.displayZoomControls = false
+             webView.setInitialScale(0)
+         }
+         AppLogger.info(TAG, "toggleDesktopMode → $desktopMode")
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/sandbox/FileBrowserScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/sandbox/FileBrowserScreen.kt
 index 2aab1ba..9576b0b 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/sandbox/FileBrowserScreen.kt
@@ -2886,7 +3179,7 @@ index 2aab1ba..9576b0b 100644
  import androidx.compose.runtime.collectAsState
  import androidx.compose.runtime.getValue
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/sandbox/FilePreviewScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/sandbox/FilePreviewScreen.kt
-index d3a3dbe..b5ed9c4 100644
+index d3a3dbe..18df8e8 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/sandbox/FilePreviewScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/sandbox/FilePreviewScreen.kt
 @@ -57,7 +57,7 @@ import androidx.compose.material3.ListItem
@@ -2898,6 +3191,15 @@ index d3a3dbe..b5ed9c4 100644
  import androidx.compose.runtime.Composable
  import androidx.compose.runtime.LaunchedEffect
  import androidx.compose.runtime.getValue
+@@ -502,6 +502,8 @@ private fun HtmlPreview(item: FileItem) {
+                 // viewport units.
+                 settings.useWideViewPort = true
+                 settings.loadWithOverviewMode = true
++                // [Mines-webfit-38.3] zoomable + text follows the font size, fits the screen width
++                com.openminis.app.browser.WebFit.apply(this)
+                 // [T-android-webview-render-process-gone] (GH#341) Was a bare
+                 // `WebViewClient()`; it has to be a subclass to override the
+                 // callback at all.
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/sandbox/MirrorSettingsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/sandbox/MirrorSettingsScreen.kt
 index 7fb701b..c788368 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/sandbox/MirrorSettingsScreen.kt
@@ -3227,7 +3529,7 @@ index 93d7159..2063d96 100644
 +
 +private fun Modifier.alphaCompat(a: Float): Modifier = this.then(Modifier.graphicsLayer { alpha = a })
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
-index c82aa8b..1c6d8e5 100644
+index c82aa8b..080a423 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
 @@ -119,14 +119,14 @@ import androidx.compose.material3.OutlinedTextField
@@ -3247,7 +3549,22 @@ index c82aa8b..1c6d8e5 100644
  import androidx.compose.runtime.Composable
  import androidx.compose.runtime.collectAsState
  import androidx.compose.runtime.derivedStateOf
-@@ -880,8 +880,37 @@ fun SessionListScreen(
+@@ -675,6 +675,14 @@ fun SessionListScreen(
+     var showBrowserSheet by remember { mutableStateOf(false) }
+     var showBrowserSettings by remember { mutableStateOf(false) }
+     val browserTabPool = remember { com.openminis.app.browser.BrowserTabPool(context) }
++    // [Mines-webfit-38.3] open the browser on a URL handed over from elsewhere (self-test / deep link)
++    val openBrowserUrl by com.openminis.app.ui.plus.PlusNav.openBrowser.collectAsState()
++    LaunchedEffect(openBrowserUrl) {
++        val u = openBrowserUrl ?: return@LaunchedEffect
++        com.openminis.app.ui.plus.PlusNav.openBrowser.value = null
++        if (browserTabPool.selectOrCreateTabForURL(u) == null) browserTabPool.ensureTabForUI()
++        showBrowserSheet = true
++    }
+ 
+     // [T-android-session-grouping] Groups are pulled out FIRST; only the
+     // leftovers go through date bucketing. Assembly order below is
+@@ -880,8 +888,37 @@ fun SessionListScreen(
                              Text(stringResource(R.string.cancel))
                          }
                      } else {
@@ -3287,7 +3604,7 @@ index c82aa8b..1c6d8e5 100644
                          }
                      }
                  },
-@@ -896,93 +925,9 @@ fun SessionListScreen(
+@@ -896,93 +933,9 @@ fun SessionListScreen(
                              )
                          }
                      } else {
@@ -3384,7 +3701,7 @@ index c82aa8b..1c6d8e5 100644
                      }
                  },
                  colors = androidx.compose.material3.TopAppBarDefaults.topAppBarColors(
-@@ -1064,10 +1009,11 @@ fun SessionListScreen(
+@@ -1064,10 +1017,11 @@ fun SessionListScreen(
                          com.openminis.app.ui.plus.TodayCard(
                              onOpen = { route -> com.openminis.app.ui.plus.PlusNav.go(route) },
                              onSearch = { viewModel.isSearchActive.value = true },
@@ -3397,7 +3714,7 @@ index c82aa8b..1c6d8e5 100644
                      }
                      com.openminis.app.ui.plus.DshModelsAutoStart()
                      LazyColumn(
-@@ -1076,7 +1022,7 @@ fun SessionListScreen(
+@@ -1076,7 +1030,7 @@ fun SessionListScreen(
                          state = listState,
                          modifier = Modifier.fillMaxWidth().weight(1f).clipToBounds(),
                          // Leave space for bottom FAB row; [Mines-compact-29] small top gap under the chips
@@ -3406,7 +3723,7 @@ index c82aa8b..1c6d8e5 100644
                      ) {
                          // T25: search-active path used to flatten the list and skip
                          // section headers entirely. Now reuses the same grouped
-@@ -1136,7 +1082,24 @@ fun SessionListScreen(
+@@ -1136,7 +1090,24 @@ fun SessionListScreen(
                                              },
                                          )
                                  } else {
@@ -3431,7 +3748,7 @@ index c82aa8b..1c6d8e5 100644
                                  }
                                  // animateItem gives the accordion its motion:
                                  // member rows fade+slide over 250ms instead of
-@@ -1193,8 +1156,7 @@ fun SessionListScreen(
+@@ -1193,8 +1164,7 @@ fun SessionListScreen(
                                      rowBackground = when {
                                          session.id == selectedSessionId ->
                                              MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
@@ -3441,7 +3758,7 @@ index c82aa8b..1c6d8e5 100644
                                      },
                                      isFolderMember = inFolder,
                                  )
-@@ -1257,19 +1219,9 @@ fun SessionListScreen(
+@@ -1257,19 +1227,9 @@ fun SessionListScreen(
                              }
                          }
  
@@ -3464,7 +3781,7 @@ index c82aa8b..1c6d8e5 100644
                      }
                      } // Plus: Today card column
                  }
-@@ -1398,7 +1350,19 @@ fun SessionListScreen(
+@@ -1398,7 +1358,19 @@ fun SessionListScreen(
                      onDelete = { showBulkDeleteDialog = true },
                      modifier = Modifier.align(Alignment.BottomCenter),
                  )
@@ -3485,7 +3802,7 @@ index c82aa8b..1c6d8e5 100644
                  // Dual FAB row (matching iOS: New Chat left + Search right, or vice versa).
                  // Hidden while the onboarding landing is showing — Step 3 provides the CTA.
                  // T46: stay visible while search is active even when the result
-@@ -1682,6 +1646,7 @@ private fun DualFabRow(
+@@ -1682,6 +1654,7 @@ private fun DualFabRow(
      onSearchQueryChange: (String) -> Unit,
      onSearchDismiss: () -> Unit,
      modifier: Modifier = Modifier,
@@ -3493,7 +3810,7 @@ index c82aa8b..1c6d8e5 100644
  ) {
      val context = LocalContext.current
      val prefs = remember { context.getSharedPreferences("ui_prefs", Context.MODE_PRIVATE) }
-@@ -1829,8 +1794,9 @@ private fun DualFabRow(
+@@ -1829,8 +1802,9 @@ private fun DualFabRow(
          horizontalArrangement = Arrangement.SpaceBetween,
          verticalAlignment = Alignment.CenterVertically,
      ) {
@@ -3505,7 +3822,7 @@ index c82aa8b..1c6d8e5 100644
  
          // Middle: Inline search bar (when active)
          AnimatedVisibility(
-@@ -1903,7 +1869,7 @@ private fun DualFabRow(
+@@ -1903,7 +1877,7 @@ private fun DualFabRow(
              )
          }
  
@@ -3514,7 +3831,7 @@ index c82aa8b..1c6d8e5 100644
      }
  }
  
-@@ -2142,7 +2108,7 @@ private fun SessionItemContent(
+@@ -2142,7 +2116,7 @@ private fun SessionItemContent(
                  Box(
                      modifier = Modifier
                          .matchParentSize()
@@ -3523,7 +3840,7 @@ index c82aa8b..1c6d8e5 100644
                      contentAlignment = Alignment.Center,
                  ) {
                      Row(
-@@ -2993,7 +2959,8 @@ private fun SessionRow(
+@@ -2993,7 +2967,8 @@ private fun SessionRow(
                  // tinted rectangle looked. Row metrics are left exactly as they
                  // were; the pill's proportions are handled by the inset of the
                  // drawn tint instead (see the drawBehind above).
@@ -3533,7 +3850,7 @@ index c82aa8b..1c6d8e5 100644
              ),
          verticalAlignment = Alignment.CenterVertically,
          horizontalArrangement = Arrangement.spacedBy(12.dp),
-@@ -3014,14 +2981,16 @@ private fun SessionRow(
+@@ -3014,14 +2989,16 @@ private fun SessionRow(
          // future ICLOUD_SYNCING uses the same anchor.
          val badgeMap by com.openminis.app.service.SessionBadgeStore.byId.collectAsState()
          val badgeHead = badgeMap[session.id]?.firstOrNull()
@@ -3553,7 +3870,7 @@ index c82aa8b..1c6d8e5 100644
                          shape = CircleShape,
                      ),
                  contentAlignment = Alignment.Center,
-@@ -3029,20 +2998,20 @@ private fun SessionRow(
+@@ -3029,20 +3006,20 @@ private fun SessionRow(
                  MinesIcon(
                      imageVector = style.icon,
                      contentDescription = null,
@@ -3579,7 +3896,7 @@ index c82aa8b..1c6d8e5 100644
                      )
                  }
              }
-@@ -3059,12 +3028,12 @@ private fun SessionRow(
+@@ -3059,12 +3036,12 @@ private fun SessionRow(
              modifier = Modifier.weight(1f),
              verticalArrangement = Arrangement.spacedBy(1.dp),
          ) {
@@ -3595,7 +3912,7 @@ index c82aa8b..1c6d8e5 100644
                      color = MaterialTheme.colorScheme.onSurface,
                      maxLines = 1,
                      overflow = TextOverflow.Ellipsis,
-@@ -3072,8 +3041,8 @@ private fun SessionRow(
+@@ -3072,8 +3049,8 @@ private fun SessionRow(
              } else {
                  Text(
                      text = titleText,
@@ -3606,7 +3923,7 @@ index c82aa8b..1c6d8e5 100644
                      color = MaterialTheme.colorScheme.onSurface,
                      maxLines = 1,
                      overflow = TextOverflow.Ellipsis,
-@@ -3085,15 +3054,15 @@ private fun SessionRow(
+@@ -3085,15 +3062,15 @@ private fun SessionRow(
              if (searchQuery.isNotBlank() && searchSnippet != null) {
                  Text(
                      text = highlightedAnnotatedString(searchSnippet, searchQuery),
@@ -3625,7 +3942,7 @@ index c82aa8b..1c6d8e5 100644
                      color = MaterialTheme.colorScheme.onSurfaceVariant,
                      maxLines = 1,
                      overflow = TextOverflow.Ellipsis,
-@@ -3104,7 +3073,10 @@ private fun SessionRow(
+@@ -3104,7 +3081,10 @@ private fun SessionRow(
          // Relative timestamp
          Text(
              text = timeText,
@@ -3637,7 +3954,7 @@ index c82aa8b..1c6d8e5 100644
              // [Mines-a11y-26] was colorScheme.outline (too dark to read)
              color = com.openminis.app.ui.plus.readableSecondary(),
          )
-@@ -3216,7 +3188,7 @@ private fun SessionBadgeOverlay(
+@@ -3216,7 +3196,7 @@ private fun SessionBadgeOverlay(
                      )
                      .border(
                          width = 1.5.dp,
@@ -3738,10 +4055,19 @@ index 88abe8a..84aa3a6 100644
  import androidx.compose.runtime.LaunchedEffect
  import androidx.compose.runtime.getValue
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/settings/MinisSkillsBrowserScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/settings/MinisSkillsBrowserScreen.kt
-index de03a61..ba8711e 100644
+index de03a61..5ca02c7 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/settings/MinisSkillsBrowserScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/settings/MinisSkillsBrowserScreen.kt
-@@ -37,7 +37,7 @@ import androidx.compose.material3.IconButton
+@@ -21,6 +21,8 @@ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.Spacer
+ import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.consumeWindowInsets
++import androidx.compose.foundation.layout.imePadding
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.layout.size
+ import androidx.compose.foundation.layout.width
+@@ -37,7 +39,7 @@ import androidx.compose.material3.IconButton
  import androidx.compose.material3.MaterialTheme
  import androidx.compose.material3.Scaffold
  import androidx.compose.material3.Text
@@ -3750,6 +4076,26 @@ index de03a61..ba8711e 100644
  import androidx.compose.material3.TopAppBarDefaults
  import androidx.compose.runtime.Composable
  import androidx.compose.runtime.getValue
+@@ -136,7 +138,9 @@ fun MinisSkillsBrowserScreen(
+         Box(
+             modifier = Modifier
+                 .fillMaxSize()
+-                .padding(padding),
++                .padding(padding)
++                .consumeWindowInsets(padding)
++                .imePadding(),  // [Mines-webfit-38.3]
+         ) {
+             // WebView
+             AndroidView(
+@@ -145,6 +149,8 @@ fun MinisSkillsBrowserScreen(
+                         settings.javaScriptEnabled = true
+                         settings.domStorageEnabled = true
+                         settings.userAgentString = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Mobile Safari/537.36"
++                        // [Mines-webfit-38.3] fit the screen width, zoomable, text follows the font size
++                        com.openminis.app.browser.WebFit.apply(this)
+ 
+                         webViewClient = object : WebViewClient() {
+                             // [T-android-webview-render-process-gone] (GH#341)
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/settings/ModelGroupDetailScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/settings/ModelGroupDetailScreen.kt
 index 7660474..faef869 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/settings/ModelGroupDetailScreen.kt
@@ -4349,10 +4695,18 @@ index 1660d69..c7c3b29 100644
          contentAlignment = Alignment.Center,
      ) {
 diff --git a/src/android/app/src/main/java/com/openminis/app/webapp/WebAppActivity.kt b/src/android/app/src/main/java/com/openminis/app/webapp/WebAppActivity.kt
-index bb2cb10..a4d589b 100644
+index bb2cb10..0539672 100644
 --- a/src/android/app/src/main/java/com/openminis/app/webapp/WebAppActivity.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/webapp/WebAppActivity.kt
-@@ -44,7 +44,7 @@ import androidx.compose.material3.IconButton
+@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.WindowInsets
+ import androidx.compose.foundation.layout.asPaddingValues
+ import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.imePadding
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.layout.statusBars
+ import androidx.compose.foundation.shape.RoundedCornerShape
+@@ -44,7 +45,7 @@ import androidx.compose.material3.IconButton
  import androidx.compose.material3.MaterialTheme
  import androidx.compose.material3.Scaffold
  import androidx.compose.material3.Text
@@ -4361,3 +4715,22 @@ index bb2cb10..a4d589b 100644
  import androidx.compose.runtime.Composable
  import androidx.compose.runtime.LaunchedEffect
  import androidx.compose.runtime.getValue
+@@ -285,7 +286,8 @@ class WebAppActivity : ComponentActivity() {
+             }
+         }
+ 
+-        Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
++        // [Mines-webfit-38.3] keyboard pushes the page up instead of covering its inputs
++        Box(modifier = Modifier.fillMaxSize().background(Color.Black).imePadding()) {
+             AndroidView(
+                 modifier = Modifier.fillMaxSize(),
+                 factory = { ctx ->
+@@ -490,6 +492,8 @@ class WebAppActivity : ComponentActivity() {
+             allowUniversalAccessFromFileURLs = false
+             mediaPlaybackRequiresUserGesture = false
+         }
++        // [Mines-webfit-38.3] fit the screen width, zoomable, text follows the font size
++        com.openminis.app.browser.WebFit.apply(webView)
+     }
+ 
+     private fun loadHtml(webView: WebView, file: File) {
