@@ -1,0 +1,1860 @@
+diff --git a/src/android/app/src/main/java/com/openminis/app/browser/WebTranslate.kt b/src/android/app/src/main/java/com/openminis/app/browser/WebTranslate.kt
+new file mode 100644
+index 0000000..322c5e2
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/browser/WebTranslate.kt
+@@ -0,0 +1,150 @@
++package com.openminis.app.browser
++
++import android.content.Context
++import android.util.Log
++import android.webkit.WebView
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.async
++import kotlinx.coroutines.awaitAll
++import kotlinx.coroutines.coroutineScope
++import kotlinx.coroutines.suspendCancellableCoroutine
++import kotlinx.coroutines.withContext
++import okhttp3.MediaType.Companion.toMediaType
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.RequestBody.Companion.toRequestBody
++import org.json.JSONArray
++import org.json.JSONObject
++import java.util.concurrent.TimeUnit
++import kotlin.coroutines.resume
++
++/**
++ * [Mines-translate-35] 网页翻译 for the in-app browser (user, 2026-10-14: 内置网页没有翻译功能). The user
++ * reads Chinese only.
++ *
++ * The page's visible text nodes are collected by JS (scripts/code/inputs skipped), translated in
++ * batches and written back in place, so layout, links and buttons keep working; 「显示原文」 restores
++ * them. Engines, most reliable first:
++ *  1. Google's free web translator (translate.googleapis.com, client=gtx; needs the VPN in mainland China);
++ *  2. the user's own model key (DeepSeek / 智谱 / 硅基流动, as 消息 uses — works on a domestic network).
++ * Pages already mostly Chinese are left alone; [detectForeign] drives the 「这页是外文，翻译成中文？」 hint.
++ */
++object WebTranslate {
++    private const val TAG = "WebTranslate"
++    private val http = OkHttpClient.Builder().connectTimeout(10, TimeUnit.SECONDS).readTimeout(25, TimeUnit.SECONDS)
++        .callTimeout(40, TimeUnit.SECONDS).build()
++
++    /** "foreign" when the page's visible text is mostly non-CJK letters, else "zh"/"empty". */
++    const val DETECT_JS = """(function(){try{var t=((document.body&&document.body.innerText)||'').slice(0,4000);
++var cjk=(t.match(/[\u4e00-\u9fff]/g)||[]).length;var lat=(t.match(/[A-Za-z\u00C0-\u024F\u0400-\u04FF\u3040-\u30ff\uac00-\ud7af]/g)||[]).length;
++if(cjk+lat<40)return 'empty';return (lat>cjk*3)?'foreign':'zh';}catch(e){return 'zh'}})()"""
++
++    /** Collects up to 600 translatable text nodes; returns a JSON array of strings (index = node id). */
++    private const val COLLECT_JS = """(function(){try{
++var skip={SCRIPT:1,STYLE:1,NOSCRIPT:1,CODE:1,PRE:1,TEXTAREA:1,INPUT:1,SELECT:1,OPTION:1,SVG:1,MATH:1,KBD:1,SAMP:1};
++var w=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,{acceptNode:function(n){
++ var p=n.parentNode;while(p&&p!==document.body){if(skip[p.nodeName])return NodeFilter.FILTER_REJECT;if(p.isContentEditable)return NodeFilter.FILTER_REJECT;p=p.parentNode;}
++ var s=n.nodeValue;if(!s||s.trim().length<2)return NodeFilter.FILTER_REJECT;
++ if(!/[A-Za-z\u00C0-\u024F\u0400-\u04FF\u3040-\u30ff\uac00-\ud7af]/.test(s))return NodeFilter.FILTER_REJECT;
++ if(/[\u4e00-\u9fff]/.test(s)&&!/[A-Za-z]{4,}/.test(s))return NodeFilter.FILTER_REJECT;
++ return NodeFilter.FILTER_ACCEPT;}});
++var nodes=[],out=[];while(w.nextNode()&&nodes.length<600){nodes.push(w.currentNode);}
++window.__minesTr={nodes:nodes,orig:nodes.map(function(n){return n.nodeValue})};
++for(var i=0;i<nodes.length;i++)out.push(nodes[i].nodeValue.replace(/\s+/g,' ').trim().slice(0,600));
++return JSON.stringify(out);}catch(e){return '[]'}})()"""
++
++    private fun applyJs(from: Int, arr: JSONArray) = """(function(){try{var t=window.__minesTr;if(!t)return 0;var a=${arr};var n=0;
++for(var i=0;i<a.length;i++){var node=t.nodes[$from+i];if(node&&a[i]){var o=t.orig[$from+i];var lead=(o.match(/^\s*/)||[''])[0],tail=(o.match(/\s*$/)||[''])[0];node.nodeValue=lead+a[i]+tail;n++;}}
++document.documentElement.setAttribute('data-mines-translated','1');return n;}catch(e){return -1}})()"""
++
++    const val RESTORE_JS = """(function(){try{var t=window.__minesTr;if(!t)return 0;for(var i=0;i<t.nodes.length;i++){t.nodes[i].nodeValue=t.orig[i];}
++document.documentElement.removeAttribute('data-mines-translated');return 1;}catch(e){return 0}})()"""
++
++    private suspend fun eval(wv: WebView, js: String): String = withContext(Dispatchers.Main) {
++        suspendCancellableCoroutine { c ->
++            runCatching {
++                wv.evaluateJavascript(js) { r ->
++                    val v = runCatching { org.json.JSONTokener(r ?: "\"\"").nextValue()?.toString() }.getOrNull() ?: ""
++                    if (c.isActive) c.resume(v)
++                }
++            }.onFailure { if (c.isActive) c.resume("") }
++        }
++    }
++
++    suspend fun detectForeign(wv: WebView): Boolean = eval(wv, DETECT_JS) == "foreign"
++
++    // ---- engine 1: Google's free web translator (translate_a/t, client=gtx, many pieces per call) ----
++    // (Edge's free endpoint edge.microsoft.com/translate/auth is gone — 404 as of 2026-10-14.)
++    fun googleTranslate(texts: List<String>): List<String> {
++        val form = okhttp3.FormBody.Builder().apply { texts.forEach { add("q", it) } }.build()
++        val req = Request.Builder().url("https://translate.googleapis.com/translate_a/t?client=gtx&sl=auto&tl=zh-CN&format=text")
++            .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0 Mobile Safari/537.36")
++            .post(form).build()
++        http.newCall(req).execute().use { r ->
++            if (!r.isSuccessful) throw IllegalStateException("翻译服务出错 HTTP ${r.code}")
++            val a = JSONArray(r.body?.string().orEmpty())
++            if (texts.size == 1) return listOf(a.opt(0).let { if (it is JSONArray) it.optString(0) else a.optString(0) })
++            return (0 until a.length()).map { i -> a.opt(i).let { if (it is JSONArray) it.optString(0) else it?.toString().orEmpty() } }
++        }
++    }
++
++    // ---- engine 2: the user's own model ----
++    private fun modelTranslate(texts: List<String>): List<String> {
++        val ep = listOfNotNull(
++            com.openminis.app.plus.PlusVault.defaultAccount("deepseek")?.let { com.openminis.app.plus.PlusVault.secret(it) }?.let { Triple("https://api.deepseek.com/chat/completions", it, "deepseek-chat") },
++            com.openminis.app.plus.PlusVault.defaultAccount("zhipu")?.let { com.openminis.app.plus.PlusVault.secret(it) }?.let { Triple("https://open.bigmodel.cn/api/paas/v4/chat/completions", it, "glm-4-flash") },
++            com.openminis.app.plus.PlusVault.defaultAccount("siliconflow")?.let { com.openminis.app.plus.PlusVault.secret(it) }?.let { Triple("https://api.siliconflow.cn/v1/chat/completions", it, "Qwen/Qwen2.5-7B-Instruct") },
++        ).firstOrNull() ?: throw IllegalStateException("没有可用的翻译服务")
++        val prompt = "把下面 JSON 数组里的每一项翻译成简体中文，保持顺序和条数，只输出 JSON 字符串数组：\n" + JSONArray(texts).toString()
++        val body = JSONObject().put("model", ep.third).put("temperature", 0.1)
++            .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
++        http.newCall(Request.Builder().url(ep.first).header("Authorization", "Bearer ${ep.second}")
++            .post(body.toString().toRequestBody("application/json".toMediaType())).build()).execute().use { r ->
++            if (!r.isSuccessful) throw IllegalStateException("模型翻译出错 HTTP ${r.code}")
++            val txt = JSONObject(r.body?.string().orEmpty()).getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content")
++            val a = JSONArray(txt.substring(txt.indexOf('['), txt.lastIndexOf(']') + 1))
++            return (0 until a.length()).map { a.optString(it) }
++        }
++    }
++
++    private fun translateBatch(texts: List<String>): List<String> =
++        try { googleTranslate(texts).also { if (it.size != texts.size) throw IllegalStateException("条数不对") } }
++        catch (e: Exception) {
++            Log.w(TAG, "google: ${e.message}")
++            try { modelTranslate(texts) } catch (m: Exception) {
++                throw IllegalStateException(if (m.message?.contains("没有可用") == true) "翻译服务连不上（Google 翻译要能访问外网；也可以在 账号连接 填 DeepSeek / 智谱 / 硅基流动 的密钥）" else (m.message ?: "翻译失败"))
++            }
++        }
++
++    /**
++     * Translates the page in place. Returns how many text pieces changed. Throws with a plain reason.
++     */
++    suspend fun translate(@Suppress("UNUSED_PARAMETER") c: Context, wv: WebView, onProgress: (String) -> Unit = {}): Int {
++        val raw = eval(wv, COLLECT_JS)
++        val arr = runCatching { JSONArray(raw) }.getOrNull() ?: throw IllegalStateException("读不到这页的文字")
++        val texts = (0 until arr.length()).map { arr.optString(it) }
++        if (texts.isEmpty()) return 0
++        // batches of ≤ 50 pieces / ≤ 4500 chars
++        val batches = ArrayList<IntRange>()
++        var start = 0; var chars = 0
++        for (i in texts.indices) {
++            if (i > start && (i - start >= 50 || chars + texts[i].length > 4500)) { batches += start until i; start = i; chars = 0 }
++            chars += texts[i].length
++        }
++        batches += start until texts.size
++        var done = 0; var applied = 0
++        coroutineScope {
++            batches.chunked(3).forEach { group ->
++                val results = group.map { r -> async(Dispatchers.IO) { r to translateBatch(texts.subList(r.first, r.last + 1)) } }.awaitAll()
++                for ((r, out) in results) {
++                    val n = eval(wv, applyJs(r.first, JSONArray(out))).toIntOrNull() ?: 0
++                    applied += n.coerceAtLeast(0); done += r.count()
++                    onProgress("正在翻译 ${done * 100 / texts.size}%")
++                }
++            }
++        }
++        return applied
++    }
++
++    suspend fun restore(wv: WebView) { eval(wv, RESTORE_JS) }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/data/repository/MCPRepository.kt b/src/android/app/src/main/java/com/openminis/app/data/repository/MCPRepository.kt
+index 38acd2f..1a94b49 100644
+--- a/src/android/app/src/main/java/com/openminis/app/data/repository/MCPRepository.kt
++++ b/src/android/app/src/main/java/com/openminis/app/data/repository/MCPRepository.kt
+@@ -165,13 +165,33 @@ class MCPRepository(private val context: Context) {
+         return sorted
+     }
+ 
+-    /** Write [list] (defaults to current [servers]) to servers.json in mcpServers format. */
++    /** [Mines-dsh-35] ids the app itself deleted (so the disk merge below doesn't resurrect them). */
++    private val deletedIds = java.util.Collections.synchronizedSet(HashSet<String>())
++
++    /**
++     * Write [list] (defaults to current [servers]) to servers.json in mcpServers format.
++     *
++     * [Mines-dsh-35] Root cause of 「DSH 插件装了又掉」 (user, 2026-10-14): `minis-dsh add` registers the
++     * plugin socket as server "dsh" by editing servers.json inside the sandbox, but the app kept its own
++     * in-memory copy and every later save (toggling any MCP server, an import, the createdAt
++     * normalisation on the next read) wrote that stale copy back — silently deleting "dsh", so the
++     * plugins' tools vanished. Now entries on disk that the app doesn't know (and didn't delete) are
++     * kept, and the in-memory list adopts them.
++     */
+     private fun save(list: List<MCPServerConfig> = _servers.value) {
+         mcpDir.mkdirs()
+         val mcpServers = JSONObject()
+         for (s in list) {
+             mcpServers.put(s.id, entryToJson(s))
+         }
++        runCatching {
++            if (serversFile.exists()) {
++                val disk = JSONObject(serversFile.readText()).optJSONObject("mcpServers")
++                if (disk != null) for (k in disk.keys()) {
++                    if (!mcpServers.has(k) && k !in deletedIds) disk.optJSONObject(k)?.let { mcpServers.put(k, it) }
++                }
++            }
++        }
+         val root = JSONObject().put("mcpServers", mcpServers)
+         try {
+             serversFile.writeText(root.toString(2))
+@@ -277,6 +297,7 @@ class MCPRepository(private val context: Context) {
+     /** Add or overwrite a server (rename/overwrite is last-write-wins by id). */
+     fun add(server: MCPServerConfig): Boolean {
+         if (server.id.isBlank()) return false
++        deletedIds.remove(server.id)
+         _servers.value = _servers.value.filter { it.id != server.id } + server
+         save()
+         Log.i(TAG, "Added MCP server: ${server.id}")
+@@ -291,6 +312,7 @@ class MCPRepository(private val context: Context) {
+     }
+ 
+     fun delete(id: String) {
++        deletedIds.add(id)
+         db.execSQL("DELETE FROM mcp_session_overrides WHERE mcp_id=?", arrayOf(id))
+         _servers.value = _servers.value.filter { it.id != id }
+         save()
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt b/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt
+index a622d50..652eaf5 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt
+@@ -30,7 +30,7 @@ import kotlin.math.exp
+  * Category: 要处理 / 可薅 / 可学 / 飙升 / 其他.
+  */
+ object Digest {
+-    enum class Cat(val label: String) { ACT("要处理"), DEAL("可薅"), LEARN("可学"), HOT("飙升"), OTHER("其他") }
++    enum class Cat(val label: String) { ACT("要处理"), DEAL("值得关注"), LEARN("可学"), HOT("飙升"), OTHER("其他") }
+ 
+     data class Item(
+         val id: String,
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/DigestWriter.kt b/src/android/app/src/main/java/com/openminis/app/plus/DigestWriter.kt
+index dc04471..08f9c1f 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/DigestWriter.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/DigestWriter.kt
+@@ -42,7 +42,7 @@ object DigestWriter {
+         val h = when {
+             it.source == "Trending" && it.stars != null -> "${it.title.substringAfter('/')} 今天涨了 ${it.stars} 星"
+             it.cat == Digest.Cat.ACT -> "要你处理：" + it.title
+-            it.cat == Digest.Cat.DEAL -> "可以薅：" + it.title
++            it.cat == Digest.Cat.DEAL -> "值得关注：" + it.title
+             it.cat == Digest.Cat.LEARN -> "值得一看：" + it.title
+             else -> it.title
+         }
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/DshWidgets.kt b/src/android/app/src/main/java/com/openminis/app/plus/DshWidgets.kt
+index a6f5350..cde53b3 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/DshWidgets.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/DshWidgets.kt
+@@ -144,6 +144,12 @@ class PluginWidgetService : Service() {
+ 
+         fun canShow(context: Context) = Settings.canDrawOverlays(context)
+ 
++        /** [Mines-dsh-35] app start: bring the widget back if the user had it on before the app was killed. */
++        fun resumeIfWanted(context: Context) {
++            if (running || !canShow(context)) return
++            if (context.getSharedPreferences("mines_dsh", Context.MODE_PRIVATE).getBoolean("widget_on", false)) runCatching { start(context) }
++        }
++
+         fun start(context: Context) {
+             val i = Intent(context, PluginWidgetService::class.java)
+             if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(i) else context.startService(i)
+@@ -164,10 +170,14 @@ class PluginWidgetService : Service() {
+     override fun onBind(intent: Intent?): IBinder? = null
+ 
+     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+-        if (intent?.action == ACTION_STOP) { stopSelf(); return START_NOT_STICKY }
++        if (intent?.action == ACTION_STOP) {
++            getSharedPreferences("mines_dsh", MODE_PRIVATE).edit().putBoolean("widget_on", false).apply()
++            stopSelf(); return START_NOT_STICKY
++        }
+         goForeground()
+         if (root == null && canShow(this)) addWindow()
+         running = true
++        getSharedPreferences("mines_dsh", MODE_PRIVATE).edit().putBoolean("widget_on", true).apply()
+         watch()
+         return START_STICKY
+     }
+@@ -181,6 +191,7 @@ class PluginWidgetService : Service() {
+     private var lastSet: Set<String>? = null
+     private var watching = false
+     private var emptyReads = 0
++    @Volatile private var lastRestart = 0L
+     /** null = can't tell (stale/missing status) → leave the window alone. */
+     private fun enabledWidgets(): Set<String>? = runCatching {
+         if (!DshWebHost.statusFresh(this)) return@runCatching null
+@@ -199,6 +210,14 @@ class PluginWidgetService : Service() {
+                 if (!running) { watching = false; return }
+                 Thread {
+                     val now = enabledWidgets()
++                    // [Mines-dsh-35] supervisor: the widget host is a sandbox process that dies with the app
++                    // process / battery saver; bring it back (every 3 s check, restart at most every 20 s)
++                    if (!now.isNullOrEmpty() && !DshWebHost.healthy() && System.currentTimeMillis() - lastRestart > 20_000) {
++                        lastRestart = System.currentTimeMillis()
++                        Log.i("PluginWidget", "web host down → restarting")
++                        val ok = runCatching { kotlinx.coroutines.runBlocking { DshWebHost.ensure(applicationContext) } }.getOrDefault(false)
++                        if (ok) watchHandler.post { runCatching { web?.reload() } }
++                    }
+                     watchHandler.post {
+                         if (now == null) return@post
+                         val prev = lastSet
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/EdgeDrm.kt b/src/android/app/src/main/java/com/openminis/app/plus/EdgeDrm.kt
+new file mode 100644
+index 0000000..a5b547f
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/EdgeDrm.kt
+@@ -0,0 +1,189 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-tts-35] Sec-MS-GEC v2 token for Microsoft Edge read-aloud, ported from
++ * edge-tts 7.3.1 (github.com/rany2/edge-tts, src/edge_tts/drm.py, LGPL-3.0 /
++ * GPL-3.0 compatible). build-34 still sent the v1 token (plain SHA-256,
++ * Sec-MS-GEC-Version=1-…); the service now closes such sockets right after the
++ * handshake → 「试听失败：Edge connection closed」 (user's realme, 2026-10-14).
++ *
++ * v2 = "<CS64 16 hex>-<SHA-256 64 hex>" of "<windows ticks rounded to 5 min><token>",
++ * where the SHA-256 starts from a token-derived pre-state, and the version
++ * parameter is "2-<chromium full version>". Pure Kotlin (no Android), unit
++ * tested against edge-tts' own output (EdgeDrmTest vectors in SelfTestProvider).
++ */
++object EdgeDrm {
++    const val TRUSTED_CLIENT_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
++    const val CHROMIUM_FULL_VERSION = "143.0.3650.75"
++    val CHROMIUM_MAJOR = CHROMIUM_FULL_VERSION.substringBefore('.')
++    val SEC_MS_GEC_VERSION = "2-$CHROMIUM_FULL_VERSION"
++    private const val WIN_EPOCH = 11644473600L
++    private const val M = 0xFFFFFFFFL
++
++    private val INITIAL = longArrayOf(0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19)
++    private val STATE = longArrayOf(0xFD9FBEA2, 0x91243CE7, 0xBE499094, 0xCD2E1E0A, 0x6C006F49, 0x04BD35AB, 0xFEB0A7E4, 0x03EFFBD2)
++    private val SCHEDULE = longArrayOf(0xEB24BF9E, 0x1558691F, 0xA0C09EE2, 0x0CFA32BA, 0xA622EE8C, 0xD1DD9491, 0xC0DD25A0,
++        0xF9E70AB6, 0xF0C31573, 0x7058CE4E, 0x7188E606, 0x00E5AB33, 0xD258B060, 0x72766564)
++    private val K = longArrayOf(
++        0x428A2F98, 0x71374491, 0xB5C0FBCF, 0xE9B5DBA5, 0x3956C25B, 0x59F111F1, 0x923F82A4, 0xAB1C5ED5,
++        0xD807AA98, 0x12835B01, 0x243185BE, 0x550C7DC3, 0x72BE5D74, 0x80DEB1FE, 0x9BDC06A7, 0xC19BF174,
++        0xE49B69C1, 0xEFBE4786, 0x0FC19DC6, 0x240CA1CC, 0x2DE92C6F, 0x4A7484AA, 0x5CB0A9DC, 0x76F988DA,
++        0x983E5152, 0xA831C66D, 0xB00327C8, 0xBF597FC7, 0xC6E00BF3, 0xD5A79147, 0x06CA6351, 0x14292967,
++        0x27B70A85, 0x2E1B2138, 0x4D2C6DFC, 0x53380D13, 0x650A7354, 0x766A0ABB, 0x81C2C92E, 0x92722C85,
++        0xA2BFE8A1, 0xA81A664B, 0xC24B8B70, 0xC76C51A3, 0xD192E819, 0xD6990624, 0xF40E3585, 0x106AA070,
++        0x19A4C116, 0x1E376C08, 0x2748774C, 0x34B0BCB5, 0x391C0CB3, 0x4ED8AA4A, 0x5B9CCA4F, 0x682E6FF3,
++        0x748F82EE, 0x78A5636F, 0x84C87814, 0x8CC70208, 0x90BEFFFA, 0xA4506CEB, 0xBEF9A3F7, 0xC67178F2)
++    private const val ADJ = 0xC9DC06A7L
++    private val BLOCK_K = K.copyOf().also { it[14] = ADJ }
++    private const val SIGMA0_ADJ = 0x059C0B80L
++    private const val SIGMA1_ADJ = 0x000B92C0L
++    private val CS64_CO = longArrayOf(0xE82E91B1L, 0x44DE24C6L, 0x3BEB65BCL, 0xC89C5933L, 0x8D1EC211L, 0x314EF5D5L, 0xE92491B1L, 0xF0A5B9D5L, 0x06064CF3L, 0xDA79FA60L, 0xBED20560L, 0x89F9C9F8L, 0x35FA38C6L, 0xCB49E3C6L)
++    private val CS64_OF = longArrayOf(0xB32700D0L, 0x88DFF51DL, 0x29514038L, 0xB328CBDFL, 0xD405B4D5L, 0x26E55F3CL, 0x607801C6L, 0x82B2C1FBL, 0xFA51A3DAL, 0x207CC464L, 0x3C3C74F3L, 0xD2D14B61L, 0xBB04A2C1L, 0xC5626167L)
++    private const val CS64_FACTOR = 0x82893933L
++    private const val CS64_ADJ0 = 0xF2F90B1AL
++    private const val CS64_ADJ1 = 0x0B1A0000L
++
++    private fun rol16(v: Long): Long { val x = v and M; return ((x shl 16) or (x ushr 16)) and M }
++    private fun sigma0(v: Long) = ((v ushr 7) xor (v shl 25) xor (v ushr 18) xor (v shl 14) xor (v ushr 3)) and M
++    private fun sigma1(v: Long) = ((v ushr 17) xor (v shl 15) xor (v ushr 19) xor (v shl 13) xor (v ushr 10)) and M
++    private fun rotr(x: Long, n: Int): Long = ((x ushr n) or (x shl (32 - n))) and M
++
++    private fun expand(w: MutableList<Long>, first: Int) {
++        for (i in first until 64) {
++            val x = w[i - 2]; val y = w[i - 15]
++            val s1 = (x ushr 17) xor (x shl 15) xor (x ushr 19) xor (x shl 13) xor (x ushr 10)
++            val s0 = (y ushr 7) xor (y shl 25) xor (y ushr 18) xor (y shl 14) xor (y ushr 3)
++            w.add((s1 + w[i - 7] + s0 + w[i - 16]) and M)
++        }
++    }
++
++    /** Plain SHA-256 rounds [first]..63 (edge-tts unrolls them; the arithmetic is identical). */
++    private fun rounds(state: LongArray, w: List<Long>, first: Int = 0): LongArray {
++        var a = state[0]; var b = state[1]; var c = state[2]; var d = state[3]
++        var e = state[4]; var f = state[5]; var g = state[6]; var h = state[7]
++        val k = if (first == 14) BLOCK_K else K
++        for (i in first until 64) {
++            val s1 = rotr(e, 6) xor rotr(e, 11) xor rotr(e, 25)
++            val ch = g xor (e and (f xor g))
++            val t1 = (h + s1 + ch + k[i] + w[i]) and M
++            val s0 = rotr(a, 2) xor rotr(a, 13) xor rotr(a, 22)
++            val maj = (a and b) or (c and (a or b))
++            val t2 = (s0 + maj) and M
++            h = g; g = f; f = e; e = (d + t1) and M; d = c; c = b; b = a; a = (t1 + t2) and M
++        }
++        return longArrayOf(a, b, c, d, e, f, g, h)
++    }
++
++    private fun be(data: ByteArray, from: Int, n: Int): Long { var v = 0L; for (i in 0 until n) v = (v shl 8) or (data[from + i].toLong() and 0xFF); return v }
++
++    private fun init(data7: ByteArray): LongArray {
++        val w = MutableList(14) { 0L }
++        w.add(be(data7, 0, 3)); w.add(be(data7, 3, 4))
++        for (i in 16 until 30) {
++            var v = SCHEDULE[i - 16]
++            if (i - 2 >= 14) v += if (i == 16) (sigma1(w[i - 2]) xor SIGMA1_ADJ) else sigma1(w[i - 2])
++            if (i - 7 >= 14) v += w[i - 7]
++            if (i - 15 >= 14) v += if (i == 29) (sigma0(w[i - 15]) xor SIGMA0_ADJ) else sigma0(w[i - 15])
++            w.add(v and M)
++        }
++        w.add((sigma1(w[28]) + w[23] + sigma0(w[15]) + w[14] + ADJ - K[14]) and M)
++        expand(w, 31)
++        val r = rounds(STATE, w, 14)
++        return LongArray(8) { (INITIAL[it] + r[it]) and M }
++    }
++
++    fun sha256(data: ByteArray): ByteArray {
++        require(data.size >= 7)
++        val length = 57 + data.size
++        val padLen = Math.floorMod(55 - length, 64)
++        val tail = data.copyOfRange(7, data.size)
++        val padded = ByteArray(tail.size + 1 + padLen + 8)
++        System.arraycopy(tail, 0, padded, 0, tail.size)
++        padded[tail.size] = 0x80.toByte()
++        val bits = length.toLong() * 8
++        for (i in 0 until 8) padded[padded.size - 1 - i] = ((bits ushr (8 * i)) and 0xFF).toByte()
++        var st = init(data.copyOfRange(0, 7))
++        var off = 0
++        while (off < padded.size) {
++            val w = MutableList(16) { be(padded, off + it * 4, 4) }
++            expand(w, 16)
++            val r = rounds(st, w)
++            st = LongArray(8) { (st[it] + r[it]) and M }
++            off += 64
++        }
++        val out = ByteArray(32)
++        for (i in 0 until 8) for (j in 0 until 4) out[i * 4 + j] = ((st[i] ushr (24 - 8 * j)) and 0xFF).toByte()
++        return out
++    }
++
++    private fun le(b: ByteArray, from: Int): Long { var v = 0L; for (i in 3 downTo 0) v = (v shl 8) or (b[from + i].toLong() and 0xFF); return v }
++
++    fun cs64(data: ByteArray, digest: ByteArray): Pair<Long, Long> {
++        val keyA = le(digest, 0) or 1L
++        val keyB = le(digest, 4) or 1L
++        val factors = longArrayOf((keyA * CS64_FACTOR) and M, (keyB * CS64_FACTOR) and M)
++        val terms = ArrayList<Long>(); val offsets = ArrayList<Long>()
++        for (i in CS64_CO.indices) { terms.add((CS64_CO[i] * factors[i % 2]) and M); offsets.add(CS64_OF[i]) }
++        val src = ByteArray(1) + data
++        val padded = src + ByteArray(Math.floorMod(-src.size, 4))
++        val words = ArrayList<Long>()
++        for (i in padded.indices step 4) words.add(le(padded, i))
++        if (words.size % 2 == 1) words.add(0L)
++        words.forEachIndexed { i, word ->
++            var term = word * (if (i % 2 == 0) keyA else keyB)
++            var offset = rol16(word) * (if (i % 2 == 0) 0xEF0569FBL else 0xC31713DBL)
++            if (i == 0) { term += CS64_ADJ0 * factors[0]; offset += CS64_ADJ1 }
++            terms.add(term and M); offsets.add(offset and M)
++        }
++        var swapAcc = 0L; var swapLast = 0L; var state = 0L; var acc = 0L
++        var i = 0
++        while (i < terms.size) {
++            val x = terms[i]; val y = terms[i + 1]
++            var t = rol16((offsets[i] + x) and M)
++            var q = (t * 0x76F50F34L) and M
++            swapAcc += (rol16(q) * 0xC3EFEA97L + q) and M
++            t = rol16((offsets[i + 1] + y) and M)
++            q = (t * 0x1881CE3CL) and M
++            swapLast = (rol16(q) * 0x35BD1EC9L + q) and M
++            swapAcc = (swapAcc + swapLast) and M
++            state = (state * keyA + x) and M
++            state = (rol16(state) * 0xCF98B111L) and M
++            state = (rol16(state) * 0x87085B9FL) and M
++            state = (rol16(state) * 0x12CEB96DL) and M
++            state = (rol16(state) * 0x257E1D83L) and M
++            acc += state
++            t = (state * keyB + y) and M
++            t = (rol16(t) * 0xA27416F5L) and M
++            t = (rol16(t) * 0xD38396FFL) and M
++            state = (rol16((rol16(t) * 0x7C932B89L) and M) * 0xBFA49F69L) and M
++            acc = (acc + state) and M
++            i += 2
++        }
++        return (swapLast xor state) to (swapAcc xor acc)
++    }
++
++    private fun hex(b: ByteArray) = b.joinToString("") { "%02X".format(it.toInt() and 0xFF) }
++
++    /** The v2 token for [unixSeconds] (already skew-corrected). */
++    fun secMsGec(unixSeconds: Double): String {
++        var ticks = Math.floor(unixSeconds).toLong() + WIN_EPOCH
++        ticks -= Math.floorMod(ticks, 300L)
++        val s = (ticks * 10_000_000L).toString() + TRUSTED_CLIENT_TOKEN
++        val data = s.toByteArray(Charsets.US_ASCII)
++        val d = sha256(data)
++        val (p, q) = cs64(data, d)
++        val cs = ByteArray(8)
++        for (j in 0 until 4) { cs[j] = ((p ushr (8 * j)) and 0xFF).toByte(); cs[4 + j] = ((q ushr (8 * j)) and 0xFF).toByte() }
++        return hex(cs) + "-" + hex(d)
++    }
++
++    /** Known answers from edge-tts 7.3.1 generate_sec_ms_gec_v2(t). */
++    val VECTORS = listOf(
++        1760400000.0 to "F3E7AA1D0E82AD85-0BB8E511444B3FA2EB3371B2B4255C4F9F702AB439E6F4F4055E708AB81FF422",
++        1700000000.0 to "2CD23A2CA0B2595A-F3C846C370E05F9CC83ACC5F995C5F5D87A4D0F14CE8936A0F902E64099E38A2",
++        1791945217.5 to "A295866DFB528721-35A18536E974C0FC7A817FBE70BE96A4DE9417347842659364F759AAF7DC0E58",
++        1234567890.0 to "BA405D1577B8E0CE-61F01E88539977A1A1E969572D82EECFA45FB1E5DEBD122D6ACBAF0054F959E5",
++    )
++
++    fun selfCheck(): Boolean = VECTORS.all { (t, v) -> secMsGec(t) == v }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ExternalTts.kt b/src/android/app/src/main/java/com/openminis/app/plus/ExternalTts.kt
+index 2509ff5..dc5a7b5 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/ExternalTts.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/ExternalTts.kt
+@@ -200,19 +200,13 @@ object ExternalTts {
+     }
+ 
+     // ── Edge read-aloud (free, no key) ───────────────────────────────────
+-    // Protocol as used by the open-source edge-tts project (github.com/rany2/edge-tts, 7.2.x):
+-    // wss …/edge/v1?TrustedClientToken=…&ConnectionId=…&Sec-MS-GEC=<sha256(ticks5min+token)>&Sec-MS-GEC-Version=1-<edge ver>
+-    private const val EDGE_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
+-    private const val EDGE_VER = "143.0.3650.75"
++    // [Mines-tts-35] Protocol as edge-tts 7.3.1 (github.com/rany2/edge-tts): Sec-MS-GEC v2 token
++    // (EdgeDrm) + Sec-MS-GEC-Version=2-<chromium>. build-34 sent the v1 token → the server closed the socket.
++    private const val EDGE_TOKEN = EdgeDrm.TRUSTED_CLIENT_TOKEN
+     private const val EDGE_URL = "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1"
+-    @Volatile private var edgeSkewSec = 0L
++    @Volatile private var edgeSkewSec = 0.0
+ 
+-    internal fun secMsGec(nowSec: Long): String {
+-        var ticks = nowSec + 11644473600L
+-        ticks -= ticks % 300
+-        val s = (ticks * 10_000_000L).toString() + EDGE_TOKEN
+-        return MessageDigest.getInstance("SHA-256").digest(s.toByteArray(Charsets.US_ASCII)).joinToString("") { "%02X".format(it) }
+-    }
++    internal fun secMsGec(nowSec: Double): String = EdgeDrm.secMsGec(nowSec)
+ 
+     private fun xmlEscape(t: String) = t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("'", "&apos;").replace("\"", "&quot;")
+ 
+@@ -221,21 +215,27 @@ object ExternalTts {
+         return decodeTo24k(mp3, "mp3")
+     }
+ 
+-    private fun edgeMp3(voice: String, text: String): ByteArray {
++    /** One retry after a 403 with the server's clock (edge-tts does the same on skew). */
++    private fun edgeMp3(voice: String, text: String): ByteArray = try { edgeMp3Once(voice, text) } catch (e: EdgeSkew) { edgeMp3Once(voice, text) }
++
++    private class EdgeSkew : Exception("Edge 403")
++
++    private fun edgeMp3Once(voice: String, text: String): ByteArray {
+         val conn = UUID.randomUUID().toString().replace("-", "")
+-        val now = System.currentTimeMillis() / 1000 + edgeSkewSec
+-        val url = "$EDGE_URL?TrustedClientToken=$EDGE_TOKEN&ConnectionId=$conn&Sec-MS-GEC=${secMsGec(now)}&Sec-MS-GEC-Version=1-$EDGE_VER"
+-        val major = EDGE_VER.substringBefore('.')
++        val now = System.currentTimeMillis() / 1000.0 + edgeSkewSec
++        val url = "$EDGE_URL?TrustedClientToken=$EDGE_TOKEN&ConnectionId=$conn&Sec-MS-GEC=${secMsGec(now)}&Sec-MS-GEC-Version=${EdgeDrm.SEC_MS_GEC_VERSION}"
++        val major = EdgeDrm.CHROMIUM_MAJOR
+         val req = Request.Builder().url(url)
+             .header("Pragma", "no-cache").header("Cache-Control", "no-cache")
+             .header("Origin", "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold")
+             .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$major.0.0.0 Safari/537.36 Edg/$major.0.0.0")
+             .header("Accept-Language", "en-US,en;q=0.9")
+-            .header("Cookie", "muid=" + UUID.randomUUID().toString().replace("-", "").uppercase())
++            .header("Cookie", "muid=" + UUID.randomUUID().toString().replace("-", "").uppercase() + ";")
+             .build()
+         val out = ByteArrayOutputStream()
+         val done = CountDownLatch(1)
+         var err: String? = null
++        var skew = false
+         val df = SimpleDateFormat("EEE MMM dd yyyy HH:mm:ss 'GMT+0000 (Coordinated Universal Time)'", Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") }
+         val ws = http.newWebSocket(req, object : WebSocketListener() {
+             override fun onOpen(webSocket: WebSocket, response: Response) {
+@@ -258,17 +258,19 @@ object ExternalTts {
+                 if (head.contains("Path:audio") && b.size > 2 + hl) synchronized(out) { out.write(b, 2 + hl, b.size - 2 - hl) }
+             }
+             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+-                err = "Edge ${response?.code ?: ""} ${t.message ?: ""}".trim()
++                err = "Edge ${response?.code ?: ""} ${t.message ?: ""}".replace(Regex("\\s+"), " ").trim()
++                Log.w(TAG, "edge failure: $err")
+                 // clock skew: follow the server's Date next time (as edge-tts does on 403)
+-                response?.header("Date")?.let { d ->
++                if (response?.code == 403) response.header("Date")?.let { d ->
+                     runCatching { SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss zzz", Locale.US).parse(d)?.time }.getOrNull()
+-                        ?.let { edgeSkewSec = it / 1000 - System.currentTimeMillis() / 1000 }
++                        ?.let { val adj = it / 1000.0 - System.currentTimeMillis() / 1000.0; if (Math.abs(adj - edgeSkewSec) > 30) { edgeSkewSec = adj; skew = true } }
+                 }
+                 done.countDown()
+             }
+             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { done.countDown() }
+         })
+         if (!done.await(25, TimeUnit.SECONDS)) { ws.cancel(); throw IllegalStateException("Edge 超时") }
++        if (skew) throw EdgeSkew()
+         err?.let { throw IllegalStateException(it) }
+         val bytes = synchronized(out) { out.toByteArray() }
+         if (bytes.size < 64) throw IllegalStateException("Edge 没有返回声音")
+@@ -305,19 +307,15 @@ object ExternalTts {
+         } finally { f.delete() }
+     }
+ 
+-    /** 试听: plays a sample with the given settings (speed / pitch on playback). Returns the engine that spoke. */
++    /**
++     * 试听: plays a sample with the given settings (speed / pitch on playback) through the
++     * same chain the call uses. [Mines-tts-35] build-34 only showed 「试听失败：Edge …」 and
++     * played nothing; now OpenRouter → Edge → the phone's own TTS, and whatever spoke is returned
++     * ("用的是：手机自带朗读（免费声音连不上：…）").
++     */
+     suspend fun preview(c: Context, s: Settings, text: String = "你好，我是 Mines。以后我就用这个声音和你聊天。"): String = withContext(Dispatchers.IO) {
+         lastNotice = null
+-        val pcm: ShortArray
+-        val used: String
+-        when (s.engine) {
+-            ENGINE_OPENROUTER -> {
+-                val key = openRouterKey(c) ?: throw IllegalStateException("没找到 OpenRouter Key（在 AI 服务商 或 账号连接 里填）")
+-                pcm = openRouterPcm(key, s.orModel, s.orVoice, text); used = "OpenRouter"
+-            }
+-            ENGINE_EDGE -> { pcm = edgePcm(s.edgeVoice, text); used = "免费 Edge 声音" }
+-            else -> throw IllegalStateException("Gemini 自带声音在通话里试听")
+-        }
++        val (pcm, used) = synthChain(c, s, text)
+         val track = VoiceClone.playbackTrack()
+         try {
+             if (s.speed != 1f || s.pitch != 1f) runCatching {
+@@ -328,4 +326,36 @@ object ExternalTts {
+         } finally { runCatching { track.stop() }; track.release() }
+         used
+     }
++
++    /** PCM + a plain description of which engine produced it (and why an earlier one was skipped). */
++    fun synthChain(c: Context, s: Settings, text: String): Pair<ShortArray, String> {
++        val skipped = ArrayList<String>()
++        if (s.engine == ENGINE_OPENROUTER) {
++            val key = openRouterKey(c)
++            if (key == null) skipped += "没找到 OpenRouter Key"
++            else try { return openRouterPcm(key, s.orModel, s.orVoice, text) to "OpenRouter" }
++            catch (e: Exception) { skipped += "OpenRouter 不行：" + plainError(e) }
++        }
++        try { return edgePcm(s.edgeVoice, text) to ("免费 Edge 声音" + note(skipped)) }
++        catch (e: Exception) { skipped += "免费声音连不上：" + plainError(e); Log.w(TAG, "preview edge: ${e.message}") }
++        val pcm = systemPcm(c, text)
++        lastNotice = "免费声音暂时连不上，先用手机自带朗读"
++        return pcm to ("手机自带朗读" + note(skipped))
++    }
++
++    private fun note(l: List<String>) = if (l.isEmpty()) "" else "（" + l.joinToString("；") + "）"
++
++    fun plainError(e: Throwable): String {
++        val m = e.message.orEmpty()
++        return when {
++            m.contains("403") -> "服务拒绝了（403）"
++            m.contains("timeout", true) || m.contains("超时") -> "超时"
++            m.contains("closed", true) || m.contains("reset", true) || m.contains("EOF", true) -> "连接被断开"
++            m.contains("Unable to resolve", true) || m.contains("UnknownHost", true) -> "网络不通"
++            else -> m.take(40)
++        }
++    }
++
++    /** Self-test: Edge only (no fallback). Returns PCM length in samples. */
++    fun edgeSelfTest(text: String = "你好"): Int = edgePcm(DEFAULT_EDGE_VOICE, text).size
+ }
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ModelFetch.kt b/src/android/app/src/main/java/com/openminis/app/plus/ModelFetch.kt
+new file mode 100644
+index 0000000..cef2719
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/ModelFetch.kt
+@@ -0,0 +1,163 @@
++package com.openminis.app.plus
++
++import android.util.Log
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import java.io.File
++import java.io.RandomAccessFile
++import java.net.Proxy
++import java.security.MessageDigest
++import java.util.concurrent.TimeUnit
++
++/**
++ * [Mines-models-35] One robust downloader for every on-device model (声纹 CAM++, 唤醒词 / 离线识别 Vosk).
++ *
++ * Why (user, 2026-10-14, realme on a China network with a VPN): the wake word said 「离线模型下载失败」 and
++ * 声纹录入 hung — both models came from a single overseas host each (alphacephei.com, GitHub releases),
++ * through one HTTP call with no resume, no checksum and no time limit, and the JVM's default proxy
++ * selector could send them into Mines' 分流代理 even when its upstream was dead.
++ *
++ * Now each model is split into ≤ 8 MB parts mirrored on the Mines repo's `hark-models` branch and fetched
++ * through several CDNs (jsDelivr cdn/fastly/gcore — reachable in mainland China — then GitHub raw and
++ * ghfast). Every part: try direct first, then through the system/split proxy; resume with HTTP Range;
++ * SHA-256 checked; 3 rounds over all sources. If every mirror fails, the original single-file URL is
++ * tried. Progress is reported in %, and the final error names the cause in plain Chinese.
++ */
++object ModelFetch {
++    private const val TAG = "ModelFetch"
++    private const val REPO = "ddfc1991/openminis-agent-android"
++    private const val BRANCH = "hark-models"
++
++    data class Model(val id: String, val size: Long, val sha256: String, val parts: List<Pair<String, String>>, val originals: List<String>)
++
++    val CAMPP = Model("campplus", 28281138, "f682b514c05d947ee3fa91cd6ec6c5c7543479a128373fa29b1faedccd21fd11", listOf(
++        "part-00" to "5d705855e024caa5baa0169f7557834be8dc1ee5deddd9762f853984f0866d4e", "part-01" to "67a75659b7797f98958b1be2f5db5f0495068da3d3a9bf9b94de47e311b9e3c0",
++        "part-02" to "339b1c38498adcb29e75f84b2cc660b874b51efc5b6928d87033308c197803bd", "part-03" to "a49678b86b87b12fec65fe98a2e360d121b5d9c22d15b1fe819e89e47e9b4126"),
++        listOf("https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx",
++            "https://hf-mirror.com/csukuangfj/speaker-embedding-models/resolve/main/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"))
++
++    val VOSK_CN = Model("vosk-small-cn-0.22", 43898754, "3af8b0e7e0f835ae9d414ce5df580237a3cfb08d586c9fbbb0f7ff29ad5b14ba", listOf(
++        "part-00" to "ffd87e52fc8efded5d3bad31dcee4d8fe094fdd8eec096538e20571e9f8cdd12", "part-01" to "0fc396a9f36517541752fe89ccedf0b0f4c975eb326ad9be8f1f8c5e75f13888",
++        "part-02" to "5750763cd9c59f2dd6badeedc74b4b39f9b4f0a7c90dc76e484e721a8518231d", "part-03" to "c1424c7233f39f9ef05bd1d9dd62a80e11ec31ac66f98ec3503a60e265bce26f",
++        "part-04" to "745ec7dec3744d059c438de674cab545ae2dee31f29dccae983bf9d904ca8da7", "part-05" to "674c8f50b6f8616067855e69ce62e613ec5badb279e48aee240eb98930e23a9a"),
++        listOf("https://alphacephei.com/vosk/models/vosk-model-small-cn-0.22.zip"))
++
++    private fun hosts(model: String, part: String): List<String> {
++        val path = "models/$model/$part"
++        return listOf(
++            "https://cdn.jsdelivr.net/gh/$REPO@$BRANCH/$path",
++            "https://fastly.jsdelivr.net/gh/$REPO@$BRANCH/$path",
++            "https://gcore.jsdelivr.net/gh/$REPO@$BRANCH/$path",
++            "https://raw.githubusercontent.com/$REPO/$BRANCH/$path",
++            "https://ghfast.top/https://raw.githubusercontent.com/$REPO/$BRANCH/$path",
++        )
++    }
++
++    private val direct = OkHttpClient.Builder().proxy(Proxy.NO_PROXY).connectTimeout(10, TimeUnit.SECONDS)
++        .readTimeout(20, TimeUnit.SECONDS).callTimeout(180, TimeUnit.SECONDS).build()
++    private val viaProxy = OkHttpClient.Builder().connectTimeout(10, TimeUnit.SECONDS)
++        .readTimeout(20, TimeUnit.SECONDS).callTimeout(180, TimeUnit.SECONDS).build()
++
++    class FetchError(msg: String) : Exception(msg)
++
++    fun sha256(f: File): String {
++        val md = MessageDigest.getInstance("SHA-256")
++        f.inputStream().use { i -> val b = ByteArray(256 * 1024); while (true) { val n = i.read(b); if (n < 0) break; md.update(b, 0, n) } }
++        return md.digest().joinToString("") { "%02x".format(it) }
++    }
++
++    /** Downloads [url] into [f], resuming from what [f] already holds. Returns bytes total in [f]. */
++    private fun get(client: OkHttpClient, url: String, f: File, onBytes: (Long) -> Unit) {
++        val have = if (f.exists()) f.length() else 0L
++        val rb = Request.Builder().url(url).header("User-Agent", "Mines/35 (Android)")
++        if (have > 0) rb.header("Range", "bytes=$have-")
++        client.newCall(rb.build()).execute().use { r ->
++            if (r.code == 416) return
++            if (!r.isSuccessful) throw FetchError("HTTP ${r.code}")
++            val append = have > 0 && r.code == 206
++            val body = r.body ?: throw FetchError("空的")
++            RandomAccessFile(f, "rw").use { raf ->
++                if (append) raf.seek(have) else raf.setLength(0)
++                val inp = body.byteStream(); val buf = ByteArray(64 * 1024)
++                var got = if (append) have else 0L
++                while (true) { val n = inp.read(buf); if (n < 0) break; raf.write(buf, 0, n); got += n; onBytes(got) }
++            }
++        }
++    }
++
++    private fun plain(e: Throwable?): String {
++        val m = (e?.message ?: e?.javaClass?.simpleName ?: "").lowercase()
++        return when {
++            m.contains("unable to resolve") || m.contains("unknownhost") -> "没有网络或 DNS 不通"
++            m.contains("timeout") || m.contains("timed out") -> "网络太慢或被拦截（超时）"
++            m.contains("http 403") || m.contains("http 451") -> "下载源拒绝访问"
++            m.contains("http 404") -> "下载源上找不到文件"
++            m.contains("校验") -> "下载的文件不完整（校验没通过）"
++            m.contains("refused") || m.contains("reset") || m.contains("closed") || m.contains("eof") -> "连接被断开（网络或代理问题）"
++            m.contains("space") -> "手机存储空间不够"
++            else -> e?.message?.take(40) ?: "未知原因"
++        }
++    }
++
++    /**
++     * Makes sure [dest] holds [model] (SHA-256 checked). Blocking; call on IO.
++     * [progress] gets (fraction 0..1, plain status line).
++     */
++    fun fetch(model: Model, dest: File, work: File, progress: (Float, String) -> Unit = { _, _ -> }) {
++        if (dest.exists() && dest.length() == model.size) return
++        work.mkdirs()
++        var last: Throwable? = null
++        val done = LongArray(model.parts.size)
++        fun report(i: Int, b: Long, how: String) {
++            done[i] = b
++            val f = (done.sum().toFloat() / model.size).coerceIn(0f, 1f)
++            progress(f, "下载中 ${(f * 100).toInt()}%（$how）")
++        }
++        var allParts = true
++        for ((i, p) in model.parts.withIndex()) {
++            val (name, sha) = p
++            val pf = File(work, "${model.id}.$name")
++            if (pf.exists() && runCatching { sha256(pf) }.getOrNull() == sha) { report(i, pf.length(), "已有"); continue }
++            var ok = false
++            round@ for (round in 0 until 3) {
++                for (url in hosts(model.id, name)) {
++                    for ((client, how) in listOf(direct to "直连", viaProxy to "经代理")) {
++                        try {
++                            get(client, url, pf) { b -> report(i, b, how) }
++                            if (sha256(pf) == sha) { ok = true; break@round }
++                            pf.delete(); throw FetchError("校验没通过")
++                        } catch (e: Throwable) {
++                            last = e; Log.w(TAG, "${model.id}/$name $how $url: ${e.message}")
++                        }
++                    }
++                }
++                Thread.sleep(1500L * (round + 1))
++            }
++            if (!ok) { allParts = false; break }
++        }
++        val tmp = File(work, "${model.id}.joined")
++        if (allParts) {
++            tmp.outputStream().use { out -> for ((name, _) in model.parts) File(work, "${model.id}.$name").inputStream().use { it.copyTo(out) } }
++            if (sha256(tmp) == model.sha256) {
++                dest.parentFile?.mkdirs(); dest.delete()
++                if (!tmp.renameTo(dest)) { tmp.copyTo(dest, overwrite = true); tmp.delete() }
++                for ((name, _) in model.parts) File(work, "${model.id}.$name").delete()
++                progress(1f, "下载完成"); return
++            }
++            tmp.delete(); last = FetchError("校验没通过")
++        }
++        // last resort: the original single file (resumable too)
++        for (url in model.originals) for ((client, how) in listOf(direct to "直连", viaProxy to "经代理")) {
++            try {
++                get(client, url, tmp) { b -> progress((b.toFloat() / model.size).coerceIn(0f, 1f), "下载中 ${(b * 100 / model.size)}%（备用源，$how）") }
++                if (tmp.length() == model.size && sha256(tmp) == model.sha256) {
++                    dest.parentFile?.mkdirs(); dest.delete()
++                    if (!tmp.renameTo(dest)) { tmp.copyTo(dest, overwrite = true); tmp.delete() }
++                    progress(1f, "下载完成"); return
++                }
++                tmp.delete(); last = FetchError("校验没通过")
++            } catch (e: Throwable) { last = e; Log.w(TAG, "${model.id} original $how $url: ${e.message}") }
++        }
++        throw FetchError("模型下载失败：" + plain(last) + "。已下载的部分会保留，联网后点「重试」接着下")
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PetStatus.kt b/src/android/app/src/main/java/com/openminis/app/plus/PetStatus.kt
+index b0a5a54..7c206af 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/PetStatus.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/PetStatus.kt
+@@ -44,6 +44,8 @@ object PetBus {
+     val wake = MutableStateFlow(0L)
+     /** [Mines-voice-26] The wake-word listener currently holds the microphone. */
+     val wakeMicHeld = MutableStateFlow(false)
++    /** [Mines-voiceprint-35] something else (声纹录入 / 试一下) needs the mic exclusively; the wake word lets go. */
++    val micExclusive = MutableStateFlow(false)
+ }
+ 
+ /**
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
+index aa059fc..ed9404b 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
+@@ -151,11 +151,116 @@ class SelfTestProvider : ContentProvider() {
+                     .put("name", Avatars.name(id)).put("primary", "%08X".format(t.primary.value.toLong() ushr 32)).toString())
+             }
+             "tts" -> {
+-                // [Mines-tts-34] engine choice + Sec-MS-GEC sanity (no network): "edge" | "openrouter" | "gemini"
++                // [Mines-tts-35] engine choice + Sec-MS-GEC v2 known answers (edge-tts 7.3.1); arg "live" also
++                // synthesises "你好" over the real Edge service and runs the full fallback chain.
+                 val c = context!!
+-                arg?.let { e -> ExternalTts.save(c, ExternalTts.settings(c).copy(engine = e)) }
+-                out.putString("result", org.json.JSONObject().put("engine", ExternalTts.settings(c).engine)
+-                    .put("gec", ExternalTts.secMsGec(1760000000L)).toString())
++                val a = arg ?: ""
++                if (a in setOf("edge", "openrouter", "gemini")) ExternalTts.save(c, ExternalTts.settings(c).copy(engine = a))
++                val j = org.json.JSONObject().put("engine", ExternalTts.settings(c).engine)
++                    .put("gec", ExternalTts.secMsGec(1760400000.0)).put("drm_ok", EdgeDrm.selfCheck())
++                if (a == "live") {
++                    j.put("edge_samples", runCatching { ExternalTts.edgeSelfTest() }.getOrElse { e -> j.put("edge_error", e.message); -1 })
++                    runCatching { ExternalTts.synthChain(c, ExternalTts.settings(c).copy(engine = ExternalTts.ENGINE_EDGE), "测试") }
++                        .onSuccess { (pcm, used) -> j.put("chain_used", used).put("chain_samples", pcm.size) }
++                        .onFailure { e -> j.put("chain_error", e.message) }
++                }
++                out.putString("result", j.toString())
++            }
++            "voiceprint" -> {
++                // [Mines-voiceprint-35] arg: "inject:speech" | "inject:silence" | "inject:off" (mic replaced for the
++                // enrolment page), "pipeline" (model download + 3 synthetic clips + enrol + score), "clear"
++                val c = context!!
++                val a = arg ?: ""
++                val j = org.json.JSONObject()
++                when {
++                    a.startsWith("inject:") -> { Voiceprint.inject = a.removePrefix("inject:").takeIf { it != "off" }; j.put("inject", Voiceprint.inject ?: "off") }
++                    a == "clear" -> { Voiceprint.clear(c); j.put("cleared", true) }
++                    a == "pipeline" -> {
++                        val t0 = System.currentTimeMillis()
++                        val prev = Voiceprint.inject
++                        Voiceprint.inject = "speech"
++                        try {
++                            kotlinx.coroutines.runBlocking {
++                                runCatching { Voiceprint.ensureModel(c) }.onFailure { j.put("model_error", it.message) }
++                                j.put("model", Voiceprint.hasModel(c)).put("model_ms", System.currentTimeMillis() - t0)
++                                val clips = (0 until 3).map { Voiceprint.recordUtterance() }
++                                j.put("clip_samples", clips.sumOf { it.size })
++                                if (Voiceprint.hasModel(c)) runCatching {
++                                    j.put("quality", Voiceprint.saveEnrolment(c, clips).toDouble())
++                                    j.put("score_self", (Voiceprint.score(c, clips[0]) ?: -1f).toDouble())
++                                }.onFailure { j.put("enrol_error", it.message) }
++                                Voiceprint.inject = "silence"
++                                j.put("silence_error", runCatching { Voiceprint.recordUtterance(waitSpeechMs = 1500); "none" }.getOrElse { it.message })
++                            }
++                        } finally { Voiceprint.inject = prev }
++                        j.put("enrolled", Voiceprint.settings(c).enrolled).put("ms", System.currentTimeMillis() - t0)
++                    }
++                    else -> j.put("settings", Voiceprint.settings(c).toString())
++                }
++                out.putString("result", j.toString())
++            }
++            "models" -> {
++                // [Mines-models-35] the wake-word / offline ASR model through ModelFetch (mirrors, resume, sha256)
++                val c = context!!
++                val t0 = System.currentTimeMillis()
++                if (arg == "fresh") runCatching { com.openminis.app.speech.OfflineAsrEngine.modelDir(c, com.openminis.app.speech.OfflineAsrEngine.MODEL_ZH).deleteRecursively() }
++                val ok = com.openminis.app.speech.OfflineAsrEngine.ensureModel(c, com.openminis.app.speech.OfflineAsrEngine.MODEL_ZH)
++                out.putString("result", org.json.JSONObject().put("vosk_ok", ok).put("ms", System.currentTimeMillis() - t0)
++                    .put("error", com.openminis.app.speech.OfflineAsrEngine.lastError ?: "").put("status", com.openminis.app.speech.OfflineAsrEngine.lastStatus ?: "").toString())
++            }
++            "translate" -> {
++                // [Mines-translate-35] page translation end to end on an English page (off-screen WebView)
++                val c = context!!
++                val j = org.json.JSONObject()
++                kotlinx.coroutines.runBlocking {
++                    val wv = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
++                        android.webkit.WebView(c.applicationContext).apply {
++                            settings.javaScriptEnabled = true
++                            loadDataWithBaseURL("https://example.com/", "<html lang=en><body><h1>Sign in to continue</h1><p>Editorial diagram design for your coding assistant. Free credits every day for new users.</p><a href='#'>Read the documentation</a></body></html>", "text/html", "utf-8", null)
++                        }
++                    }
++                    kotlinx.coroutines.delay(2500)
++                    j.put("foreign", com.openminis.app.browser.WebTranslate.detectForeign(wv))
++                    runCatching { com.openminis.app.browser.WebTranslate.translate(c, wv) }
++                        .onSuccess { j.put("applied", it) }.onFailure { j.put("error", it.message) }
++                    val txt = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
++                        kotlinx.coroutines.suspendCancellableCoroutine<String> { cc -> wv.evaluateJavascript("document.body.innerText") { v -> cc.resumeWith(Result.success(v ?: "")) } }
++                    }
++                    j.put("text", txt.take(200))
++                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) { wv.destroy() }
++                }
++                out.putString("result", j.toString())
++            }
++            "mcpmerge" -> {
++                // [Mines-dsh-35] 「装了又掉」 regression: a server written straight into servers.json by the
++                // sandbox (minis-dsh registers "dsh" this way) must survive the app's own saves.
++                val c = context!!
++                val repo = (c.applicationContext as com.openminis.app.MinisApp).mcpRepository
++                val f = java.io.File(c.filesDir, "minis-global/mcp-servers/servers.json")
++                f.parentFile?.mkdirs()
++                val root = runCatching { org.json.JSONObject(f.readText()) }.getOrDefault(org.json.JSONObject())
++                val ms = root.optJSONObject("mcpServers") ?: org.json.JSONObject().also { root.put("mcpServers", it) }
++                ms.put("smoke-dsh", org.json.JSONObject().put("command", "/usr/bin/node").put("args", org.json.JSONArray().put("/usr/local/lib/minis-dsh/socket.mjs")).put("note", "smoke"))
++                f.writeText(root.toString(2))
++                // the app saves from its stale in-memory list (what build-34 did on any MCP toggle)
++                repo.add(com.openminis.app.data.repository.MCPRepository.MCPServerConfig(id = "smoke-other", command = "/bin/true"))
++                val after = runCatching { org.json.JSONObject(f.readText()).optJSONObject("mcpServers") }.getOrNull()
++                val kept = after?.has("smoke-dsh") == true
++                repo.delete("smoke-other")
++                // clean up our fake entry by editing the file the same way
++                runCatching { val r2 = org.json.JSONObject(f.readText()); r2.optJSONObject("mcpServers")?.remove("smoke-dsh"); f.writeText(r2.toString(2)) }
++                repo.reloadFromDisk()
++                out.putString("result", org.json.JSONObject().put("kept", kept).toString())
++            }
++            "loginweb" -> {
++                // [Mines-web-35] the login / key-fetch WebView setup (LoginWeb.configure) renders real pages:
++                // visible text length of [arg] read off-screen, plus the zoom settings it ends up with.
++                val c = context!!
++                val u = arg ?: "https://example.com/"
++                val t0 = System.currentTimeMillis()
++                val txt = kotlinx.coroutines.runBlocking { HiddenWeb.text(c, u, 40_000L) }
++                out.putString("result", org.json.JSONObject().put("url", u).put("chars", txt?.length ?: -1)
++                    .put("head", (txt ?: "").replace(Regex("\\s+"), " ").take(120)).put("ms", System.currentTimeMillis() - t0).toString())
+             }
+             "zoom" -> {
+                 // [Mines-zoom-34] in-app browser zoom: settings for the tab profile ("mobile" | "desktop") and
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Voiceprint.kt b/src/android/app/src/main/java/com/openminis/app/plus/Voiceprint.kt
+index d1793e6..e7f3d98 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/Voiceprint.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/Voiceprint.kt
+@@ -73,37 +73,40 @@ object Voiceprint {
+     private val _progress = MutableStateFlow<String?>(null)
+     val progress: StateFlow<String?> = _progress.asStateFlow()
+ 
+-    /** Downloads the CAM++ model once (tries GitHub, then two mirrors). */
++    /**
++     * Downloads the CAM++ model once (tries GitHub, then two mirrors). [Mines-voiceprint-35]
++     * build-34 showed nothing while it connected (progress only after the first byte) and had no
++     * overall time limit, so on a slow/blocked GitHub link the enrolment page sat on
++     * 「正在听…」 for minutes. Now: progress from the first moment, 20 s stall limit per read,
++     * 150 s cap per source, and a plain reason at the end.
++     */
+     suspend fun ensureModel(c: Context) = withContext(Dispatchers.IO) {
+         if (hasModel(c)) return@withContext
+-        val http = OkHttpClient.Builder().connectTimeout(15, TimeUnit.SECONDS).readTimeout(60, TimeUnit.SECONDS).build()
+-        var last: Exception? = null
+-        for (u in MODEL_URLS) {
++        modelMutex.lock()
++        try {
++            if (hasModel(c)) return@withContext
++            // [Mines-models-35] mirrored, resumable, checksummed (ModelFetch); plain reason on failure
++            _progress.value = "首次使用：下载声纹模型（约 28 MB）…"
+             try {
+-                http.newCall(Request.Builder().url(u).build()).execute().use { r ->
+-                    if (!r.isSuccessful) throw IllegalStateException("HTTP ${r.code}")
+-                    val body = r.body ?: throw IllegalStateException("空的")
+-                    val total = body.contentLength()
+-                    val tmp = File(modelFile(c).path + ".part")
+-                    tmp.outputStream().use { out ->
+-                        val inp = body.byteStream(); val buf = ByteArray(64 * 1024); var got = 0L
+-                        while (true) {
+-                            val n = inp.read(buf); if (n < 0) break
+-                            out.write(buf, 0, n); got += n
+-                            _progress.value = if (total > 0) "下载声纹模型 ${got * 100 / total}%" else "下载声纹模型 ${got / 1_000_000} MB"
+-                        }
+-                    }
+-                    if (tmp.length() < 1_000_000) throw IllegalStateException("下载不完整")
+-                    tmp.renameTo(modelFile(c))
+-                }
++                ModelFetch.fetch(ModelFetch.CAMPP, modelFile(c), File(c.filesDir, "voiceprint/dl")) { _, line -> _progress.value = "声纹模型：$line" }
++            } catch (e: Exception) {
+                 _progress.value = null
+-                return@withContext
+-            } catch (e: Exception) { last = e; Log.w(TAG, "model $u: ${e.message}") }
+-        }
+-        _progress.value = null
+-        throw IllegalStateException("声纹模型下载失败：${last?.message}")
++                throw IllegalStateException((e.message ?: "声纹模型下载失败").replace("模型下载失败", "声纹模型下载失败") + "（录好的声音会保留）")
++            }
++            _progress.value = null
++        } finally { modelMutex.unlock() }
+     }
+ 
++    private val modelMutex = kotlinx.coroutines.sync.Mutex()
++
++    /** Mic level 0..1 while recording (enrolment page meter). */
++    val level = MutableStateFlow(0f)
++
++    /** adb self-test only: "speech" / "silence" replaces the microphone (emulators have no real mic input). */
++    @Volatile var inject: String? = null
++
++    class MicProblem(msg: String) : Exception(msg)
++
+     @Volatile private var extractor: com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractor? = null
+ 
+     private fun extractor(c: Context): com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractor {
+@@ -117,7 +120,12 @@ object Voiceprint {
+ 
+     /** Embedding of 16 kHz PCM (normalized to unit length), or null when too short. */
+     fun embed(c: Context, pcm: ShortArray, from: Int = 0, len: Int = pcm.size): FloatArray? {
+-        val ex = extractor(c)
++        val ex = try { extractor(c) } catch (t: Throwable) {
++            extractor = null
++            if (t is UnsatisfiedLinkError || t is NoClassDefFoundError) throw IllegalStateException("声纹引擎加载失败（这台手机的 CPU 不支持？）：${t.message?.take(60)}")
++            runCatching { modelFile(c).delete() }
++            throw IllegalStateException("声纹模型损坏，已删除，请重试（会重新下载）")
++        }
+         val st = ex.createStream()
+         try {
+             val f = FloatArray(len) { pcm[from + it] / 32768f }
+@@ -139,20 +147,97 @@ object Voiceprint {
+         return s
+     }
+ 
+-    /** Records [ms] of 16 kHz mono speech (enrolment / test). */
++    /** Records [ms] of 16 kHz mono audio (试一下). Never blocks longer than [ms] + 3 s. */
++    suspend fun record(ms: Int): ShortArray = recordUtterance(maxMs = ms, waitSpeechMs = ms, fixed = true)
++
++    /**
++     * [Mines-voiceprint-35] Records one utterance: waits ≤ [waitSpeechMs] for speech, stops after
++     * 0.7 s of silence once ≥ 1.2 s was spoken, or at [maxMs]. Publishes [level]. Never hangs:
++     * non-blocking reads with a deadline, and a plain reason for every failure (no permission /
++     * mic held by another app / only silence / nobody spoke).
++     */
+     @SuppressLint("MissingPermission")
+-    suspend fun record(ms: Int): ShortArray = withContext(Dispatchers.IO) {
+-        val min = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+-        val rec = AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, RATE, AudioFormat.CHANNEL_IN_MONO,
+-            AudioFormat.ENCODING_PCM_16BIT, maxOf(min, 3200) * 2)
+-        if (rec.state != AudioRecord.STATE_INITIALIZED) { rec.release(); throw IllegalStateException("麦克风打不开（可能正在通话）") }
+-        val out = ShortArray(RATE * ms / 1000)
++    suspend fun recordUtterance(maxMs: Int = 8000, waitSpeechMs: Int = 6000, fixed: Boolean = false): ShortArray = withContext(Dispatchers.IO) {
++        PetBus.micExclusive.value = true
+         try {
+-            rec.startRecording()
++            // let the wake-word listener release the mic (it checks every ~100 ms)
++            val until = System.currentTimeMillis() + 2000
++            while (PetBus.wakeMicHeld.value && System.currentTimeMillis() < until) kotlinx.coroutines.delay(50)
++            inject?.let { return@withContext injected(it, maxMs, waitSpeechMs) }
++            val min = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
++            val rec = try {
++                AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, RATE, AudioFormat.CHANNEL_IN_MONO,
++                    AudioFormat.ENCODING_PCM_16BIT, maxOf(min, 3200) * 2)
++            } catch (e: SecurityException) { throw MicProblem("没有麦克风权限：请在系统设置 → 应用 → Mines → 权限里允许「麦克风」") }
++            catch (e: Exception) { throw MicProblem("麦克风打不开：${e.message?.take(40)}") }
++            if (rec.state != AudioRecord.STATE_INITIALIZED) { rec.release(); throw MicProblem("麦克风打不开：可能正被通话或别的应用占用") }
++            val out = ShortArray(RATE * maxMs / 1000)
+             var got = 0
+-            while (got < out.size) { val n = rec.read(out, got, minOf(1600, out.size - got)); if (n <= 0) break; got += n }
+-        } finally { runCatching { rec.stop() }; rec.release() }
+-        out
++            try {
++                rec.startRecording()
++                if (rec.recordingState != AudioRecord.RECORDSTATE_RECORDING) throw MicProblem("麦克风被别的应用占用（例如正在通话或录音），先关掉它再试")
++                val t0 = System.currentTimeMillis()
++                var lastData = t0
++                var speechMs = 0; var silenceAfter = 0; var heardAny = false; var peak = 0
++                var noise = 200.0
++                val frame = ShortArray(1600)
++                while (got < out.size) {
++                    val now = System.currentTimeMillis()
++                    val n = rec.read(frame, 0, minOf(frame.size, out.size - got), AudioRecord.READ_NON_BLOCKING)
++                    if (n < 0) throw MicProblem("麦克风出错（代码 $n）")
++                    if (n == 0) {
++                        if (now - lastData > 2500) throw MicProblem("麦克风没有声音数据：可能被系统或别的应用占用，或权限被收回")
++                        kotlinx.coroutines.delay(15); continue
++                    }
++                    lastData = now
++                    System.arraycopy(frame, 0, out, got, n); got += n
++                    var sum = 0.0
++                    for (i in 0 until n) { val v = frame[i].toInt(); sum += v.toDouble() * v; if (Math.abs(v) > peak) peak = Math.abs(v) }
++                    val rms = sqrt(sum / n)
++                    level.value = (rms / 4000.0).toFloat().coerceIn(0f, 1f)
++                    val ms = n * 1000 / RATE
++                    val voiced = rms > maxOf(noise * 2.2, 300.0)
++                    if (!voiced && !heardAny) noise = noise * 0.9 + rms * 0.1
++                    if (voiced) { heardAny = true; speechMs += ms; silenceAfter = 0 } else if (heardAny) silenceAfter += ms
++                    if (fixed) continue
++                    if (!heardAny && now - t0 > waitSpeechMs) break
++                    if (heardAny && speechMs >= 1200 && silenceAfter >= 700) break
++                }
++                if (!fixed && !heardAny) throw MicProblem(if (peak == 0) "收到的全是静音：麦克风可能被别的应用占用（唤醒词、通话、录音），关掉后再试"
++                    else "没听到你说话（声音太小），靠近手机再读一遍")
++            } finally { runCatching { rec.stop() }; rec.release(); level.value = 0f }
++            out.copyOf(got)
++        } finally { PetBus.micExclusive.value = false }
++    }
++
++    /** Synthetic voice for the adb self-test: a gliding harmonic tone with syllable rhythm (or silence). */
++    private suspend fun injected(kind: String, maxMs: Int, waitSpeechMs: Int): ShortArray {
++        val ms = if (kind == "silence") waitSpeechMs else minOf(maxMs, 2600)
++        val out = ShortArray(RATE * ms / 1000)
++        val rnd = java.util.Random(kind.hashCode().toLong())
++        var ph = 0.0
++        for (i in out.indices) {
++            val t = i / RATE.toDouble()
++            if (kind == "silence") { out[i] = (rnd.nextGaussian() * 3).toInt().toShort(); continue }
++            val f0 = 160 + 40 * kotlin.math.sin(2 * Math.PI * 0.7 * t)
++            ph += 2 * Math.PI * f0 / RATE
++            val env = 0.5 + 0.5 * kotlin.math.sin(2 * Math.PI * 4.0 * t)
++            var v = 0.0
++            for (h in 1..8) v += kotlin.math.sin(h * ph) / h
++            out[i] = (v * env * 5000 + rnd.nextGaussian() * 80).toInt().coerceIn(-32000, 32000).toShort()
++        }
++        // play it out in real time so the level meter moves like a real recording
++        val chunk = RATE / 10
++        var i = 0
++        while (i < out.size) {
++            var sum = 0.0; val e = minOf(out.size, i + chunk)
++            for (k in i until e) sum += out[k].toDouble() * out[k]
++            level.value = (sqrt(sum / (e - i)) / 4000.0).toFloat().coerceIn(0f, 1f)
++            kotlinx.coroutines.delay(100); i = e
++        }
++        level.value = 0f
++        if (kind == "silence") throw MicProblem("收到的全是静音：麦克风可能被别的应用占用（唤醒词、通话、录音），关掉后再试")
++        return out
+     }
+ 
+     /** Saves the average of the phrase embeddings. Returns the self-similarity (quality hint). */
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/WakeWordService.kt b/src/android/app/src/main/java/com/openminis/app/plus/WakeWordService.kt
+index 4b90061..cebaa77 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/WakeWordService.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/WakeWordService.kt
+@@ -117,7 +117,7 @@ class WakeWordService : Service() {
+         try {
+             while (scope.isActive) {
+                 // Give the mic to the voice call while it is open.
+-                if (PetBus.inCall.value) { delay(1000); continue }
++                if (PetBus.inCall.value || PetBus.micExclusive.value) { delay(500); continue }
+                 val minBuf = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                 val rec = runCatching {
+                     AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, RATE, AudioFormat.CHANNEL_IN_MONO,
+@@ -129,7 +129,7 @@ class WakeWordService : Service() {
+                 try {
+                     rec.startRecording()
+                     PetBus.wakeMicHeld.value = true
+-                    while (scope.isActive && !PetBus.inCall.value) {
++                    while (scope.isActive && !PetBus.inCall.value && !PetBus.micExclusive.value) {
+                         val n = rec.read(buf, 0, buf.size)
+                         if (n <= 0) { delay(50); continue }
+                         val final = recognizer.acceptWaveForm(buf, n)
+diff --git a/src/android/app/src/main/java/com/openminis/app/speech/OfflineAsrEngine.kt b/src/android/app/src/main/java/com/openminis/app/speech/OfflineAsrEngine.kt
+index f0c6fd6..ee0c459 100644
+--- a/src/android/app/src/main/java/com/openminis/app/speech/OfflineAsrEngine.kt
++++ b/src/android/app/src/main/java/com/openminis/app/speech/OfflineAsrEngine.kt
+@@ -69,6 +69,7 @@ class OfflineAsrEngine(private val appContext: Context) : SpeechRecognitionEngin
+          */
+         fun ensureModel(context: Context, name: String, onProgress: (Float) -> Unit = {}): Boolean =
+             runCatching {
++                lastError = null
+                 // [Mines-offline-asr] vosk-android's StorageService only unpacks a
+                 // model bundled in assets; it cannot download. Fetch the zip
+                 // ourselves, unpack into a temp dir, then swap it in, so a
+@@ -77,6 +78,15 @@ class OfflineAsrEngine(private val appContext: Context) : SpeechRecognitionEngin
+                 val tmpZip = File(context.cacheDir, "$name.zip.part")
+                 val tmpDir = File(context.filesDir, "$name.unpacking")
+                 tmpDir.deleteRecursively()
++                if (name == MODEL_ZH) {
++                    // [Mines-models-35] mirrored + resumable + checksummed (ModelFetch); the user's realme got
++                    // 「离线模型下载失败」 from the single alphacephei.com URL
++                    val zip = File(context.filesDir, "models-dl/$name.zip")
++                    com.openminis.app.plus.ModelFetch.fetch(com.openminis.app.plus.ModelFetch.VOSK_CN, zip, File(context.filesDir, "models-dl")) { f, line ->
++                        lastStatus = line; onProgress(f * 0.9f)
++                    }
++                    zip.copyTo(tmpZip, overwrite = true); zip.delete()
++                } else {
+                 val conn = (java.net.URL("https://alphacephei.com/vosk/models/$name.zip").openConnection()
+                     as java.net.HttpURLConnection).apply {
+                     connectTimeout = 20_000; readTimeout = 60_000; instanceFollowRedirects = true
+@@ -92,6 +102,7 @@ class OfflineAsrEngine(private val appContext: Context) : SpeechRecognitionEngin
+                         }
+                     }
+                 }
++                }
+                 java.util.zip.ZipInputStream(tmpZip.inputStream().buffered()).use { zin ->
+                     val root = tmpDir.canonicalPath
+                     while (true) {
+@@ -110,7 +121,11 @@ class OfflineAsrEngine(private val appContext: Context) : SpeechRecognitionEngin
+                 if (!tmpDir.renameTo(dest)) { tmpDir.copyRecursively(dest, overwrite = true); tmpDir.deleteRecursively() }
+                 onProgress(1f)
+                 modelReady(context, name)
+-            }.onFailure { Log.w(TAG, "model download failed: ${it.message}") }.getOrDefault(false)
++            }.onFailure { Log.w(TAG, "model download failed: ${it.message}"); lastError = it.message }.getOrDefault(false)
++
++        /** [Mines-models-35] plain reason of the last failed download / current progress line, for the UI. */
++        @Volatile var lastError: String? = null
++        @Volatile var lastStatus: String? = null
+ 
+         private const val SAMPLE_RATE = 16_000
+         private const val MAX_RECORD_SECONDS = 120
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserSheet.kt b/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserSheet.kt
+index c6edbb7..5145c3c 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserSheet.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserSheet.kt
+@@ -39,6 +39,7 @@ import androidx.compose.material.icons.filled.Download
+ import androidx.compose.material.icons.filled.Edit
+ import androidx.compose.material.icons.filled.History
+ import androidx.compose.material.icons.filled.Language
++import androidx.compose.material.icons.filled.Translate
+ import androidx.compose.material.icons.filled.PhoneAndroid
+ import androidx.compose.material.icons.filled.FormatSize
+ import androidx.compose.material.icons.filled.Refresh
+@@ -118,6 +119,10 @@ fun BrowserSheet(
+     // [T-android-browser-download-ux] Downloads panel + badge state.
+     var showDownloads by remember { mutableStateOf(false) }
+     var showTextSize by remember { mutableStateOf(false) }
++    // [Mines-translate-35] 网页翻译: toolbar 「译」 + a one-time hint on foreign pages
++    var translating by remember { mutableStateOf(false) }
++    var translatedUrl by remember { mutableStateOf<String?>(null) }
++    val hinted = remember { mutableSetOf<String>() }
+     val downloadEntries by tabPool.downloads.collectAsState()
+ 
+     val accent = MaterialTheme.colorScheme.primary
+@@ -417,6 +422,33 @@ fun BrowserSheet(
+                     enabled = selectedTab != null,
+                     onClick = { showTextSize = true },
+                 )
++                // [Mines-translate-35] 翻译成中文 / 显示原文
++                ToolbarIcon(
++                    icon = Icons.Default.Translate,
++                    contentDesc = if (translatedUrl != null) "显示原文" else if (translating) "正在翻译" else "翻译成中文",
++                    enabled = selectedTab != null && !translating,
++                    tint = if (translatedUrl != null) accent else null,
++                    onClick = {
++                        val wv = selectedTab?.manager?.webView ?: return@ToolbarIcon
++                        if (translatedUrl != null && translatedUrl == wv.url) {
++                            scope.launch { com.openminis.app.browser.WebTranslate.restore(wv); translatedUrl = null }
++                        } else {
++                            translating = true
++                            android.widget.Toast.makeText(context, "正在翻译成中文…", android.widget.Toast.LENGTH_SHORT).show()
++                            scope.launch {
++                                runCatching { com.openminis.app.browser.WebTranslate.translate(context, wv) }
++                                    .onSuccess { n ->
++                                        translatedUrl = wv.url
++                                        android.widget.Toast.makeText(context, if (n > 0) "已翻译成中文（再点一次看原文）" else "这页没有需要翻译的外文", android.widget.Toast.LENGTH_SHORT).show()
++                                    }
++                                    .onFailure { e ->
++                                        android.widget.Toast.makeText(context, "翻译失败：${e.message?.take(60)}。再点「译」重试", android.widget.Toast.LENGTH_LONG).show()
++                                    }
++                                translating = false
++                            }
++                        }
++                    },
++                )
+                 // [T-android-browser-download-ux] Downloads entry: shows while
+                 // the session has ANY download records, disappears when the
+                 // user clears the last one; the badge counts in-flight +
+@@ -460,6 +492,19 @@ fun BrowserSheet(
+         }
+     }
+ 
++    // [Mines-translate-35] foreign page finished loading → one quiet hint per site
++    androidx.compose.runtime.LaunchedEffect(isLoading, selectedTab) {
++        if (isLoading) { translatedUrl = null; return@LaunchedEffect }
++        val wv = selectedTab?.manager?.webView ?: return@LaunchedEffect
++        kotlinx.coroutines.delay(1200)
++        val host = runCatching { android.net.Uri.parse(wv.url ?: "").host }.getOrNull() ?: return@LaunchedEffect
++        if (host in hinted) return@LaunchedEffect
++        if (com.openminis.app.browser.WebTranslate.detectForeign(wv)) {
++            hinted += host
++            android.widget.Toast.makeText(context, "这页是外文，点工具栏的「译」可以翻译成中文", android.widget.Toast.LENGTH_LONG).show()
++        }
++    }
++
+     if (showTextSize) {
+         selectedTab?.manager?.let { mgr -> BrowserTextSizeDialog(mgr.webView, onDismiss = { showTextSize = false }) }
+             ?: run { showTextSize = false }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
+index 5813f16..78e544c 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
+@@ -223,7 +223,7 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+         // [Mines-offers-32] free credits for services not connected yet (JSON list, no model)
+         val offerList by com.openminis.app.plus.FreeOffers.offers.collectAsState()
+         val offers = remember(offerList, entries) { com.openminis.app.plus.FreeOffers.relevant(context) }
+-        if (q.isEmpty() && offers.isNotEmpty()) PlusSection("免费额度 · 可薅", footer = "清单每天从 Mines 仓库更新。Mines 不会付钱、不会选付费套餐；要短信验证码、实名或人机验证时会停下来请你做那一步。") {
++        if (q.isEmpty() && offers.isNotEmpty()) PlusSection("免费额度 · 值得关注", footer = "清单每天从 Mines 仓库更新。Mines 不会付钱、不会选付费套餐；要短信验证码、实名或人机验证时会停下来请你做那一步。") {
+             offers.take(4).forEachIndexed { i, o ->
+                 val k = PlusVault.kind(o.kind)
+                 Row(Modifier.fillMaxWidth().clickable { if (k != null) { autoStart = false; detailId = k.id } }.padding(horizontal = 14.dp, vertical = 12.dp),
+@@ -868,7 +868,7 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
+     Column(Modifier.fillMaxWidth()) {
+         // [Mines-keys-31] Mines creates the key itself; the user only logs in.
+         if (com.openminis.app.plus.KeyAgent.recipe(kind.id) != null) KeyAgentButton(kind)
+-        if (kind.keyUrl != null) SecondaryAction("自己去官网拿${kind.keyLabel}") { openExternal(context, kind.keyUrl) }
++        if (kind.keyUrl != null) SecondaryAction("去官网获取") { openExternal(context, kind.keyUrl) }
+         val f = found
+         if (f != null) {
+             Column(
+@@ -893,7 +893,7 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
+             modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp))
+         OutlinedTextField(
+             manual, { manual = it },
+-            label = { Text(if (PlusVault.hasSecret(kind.id)) "或手动粘贴（已保存 ${PlusVault.preview(kind.id)}）" else "或手动粘贴${kind.keyLabel}") },
++            label = { Text(if (PlusVault.hasSecret(kind.id)) "或手动粘贴（已保存 ${PlusVault.preview(kind.id)}）" else "手动填写密钥") },
+             singleLine = true, visualTransformation = PasswordVisualTransformation(),
+             textStyle = MaterialTheme.typography.bodyMedium,
+             modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp),
+@@ -969,7 +969,7 @@ private fun KeyAgentButton(kind: ConnectionKind) {
+     var chromeStatus by remember { mutableStateOf<String?>(null) }
+     val scope = rememberCoroutineScope()
+     // [Mines-keys-32] a working key is already saved (or adopted from the 模型组): never ask again, only offer a new one
+-    BigAction(if (PlusVault.hasSecret(kind.id)) "已有可用的${kind.keyLabel} · 再拿一个新的" else "让 Mines 帮我拿${kind.keyLabel}") {
++    BigAction(if (PlusVault.hasSecret(kind.id)) "已接入 · 再生成一个新密钥" else "一键接入") {
+         if (recipe.mode == com.openminis.app.plus.KeyAgent.Mode.WEBVIEW) open = true
+         else {
+             openExternal(context, recipe.url)
+@@ -984,7 +984,7 @@ private fun KeyAgentButton(kind: ConnectionKind) {
+                     val r = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.KeyTester.test(PlusVault.baseId(kind.id), key) }
+                     if (r.ok) {
+                         PlusVault.save(context, kind, r.identity ?: "", key, share = kind.envKey != null, via = "key")
+-                        chromeStatus = "✓ 已拿到并保存：" + com.openminis.app.plus.AccountLabel.maskSecret(key)
++                        chromeStatus = "✓ 已接入：" + com.openminis.app.plus.AccountLabel.maskSecret(key)
+                         runCatching { context.startActivity(android.content.Intent(context, com.openminis.app.MainActivity::class.java)
+                             .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)) }
+                     } else chromeStatus = "拿到的密钥测试没通过：${r.message}"
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/KeyAgentScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/KeyAgentScreen.kt
+index 5b0ed25..8ded99c 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/KeyAgentScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/KeyAgentScreen.kt
+@@ -22,6 +22,7 @@ import androidx.compose.material3.OutlinedButton
+ import androidx.compose.material3.Surface
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
++import androidx.compose.runtime.collectAsState
+ import androidx.compose.runtime.DisposableEffect
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
+@@ -86,7 +87,7 @@ fun KeyAgentDialog(kind: ConnectionKind, onClose: (saved: Boolean) -> Unit) {
+         PlusVault.save(context, kind, r.identity ?: PlusVault.entries.value[kind.id]?.account ?: "", key,
+             share = PlusVault.entries.value[kind.id]?.shareWithAi ?: (kind.envKey != null), via = "key")
+         r.identity?.let { PlusVault.setExtra(kind.id, "identity", it) }
+-        done = "✓ 已拿到并保存：" + com.openminis.app.plus.AccountLabel.maskSecret(key) + "\n" + r.message
++        done = "✓ 已接入："  + com.openminis.app.plus.AccountLabel.maskSecret(key) + "\n" + r.message
+     }
+ 
+     LaunchedEffect(webView, resumeTick) {
+@@ -154,20 +155,26 @@ fun KeyAgentDialog(kind: ConnectionKind, onClose: (saved: Boolean) -> Unit) {
+     }
+ 
+     DisposableEffect(Unit) { onDispose { runCatching { webView?.stopLoading(); webView?.destroy() } } }
++    val load = remember { WebLoadState() }
+ 
+     Dialog(onDismissRequest = { onClose(done != null) }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+         Surface(Modifier.fillMaxSize()) {
+             Column(Modifier.fillMaxSize().statusBarsPadding()) {
+                 Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.primaryContainer).padding(16.dp)) {
+-                    Text("Mines 正在帮你拿 ${kind.name} 的${kind.keyLabel}", fontSize = 17.sp, fontWeight = FontWeight.SemiBold,
++                    // [Mines-keys-35] softer wording (user, 2026-10-14)
++                    Text(if (done != null) "已接入 ${kind.name}" else "正在接入 ${kind.name}…", fontSize = 17.sp, fontWeight = FontWeight.SemiBold,
+                         color = MaterialTheme.colorScheme.onPrimaryContainer)
+-                    Text(done ?: status, fontSize = 18.sp, color = if (done != null) Color(0xFF1F7A3F) else MaterialTheme.colorScheme.onPrimaryContainer,
++                    if (done == null) Text("不会点任何付费按钮", fontSize = 14.sp, color = MaterialTheme.colorScheme.onPrimaryContainer)
++                    Text(done ?: status, fontSize = 16.sp, color = if (done != null) Color(0xFF1F7A3F) else MaterialTheme.colorScheme.onPrimaryContainer,
+                         modifier = Modifier.padding(top = 6.dp))
+                 }
+                 Box(Modifier.weight(1f).fillMaxWidth()) {
+                     AndroidView(modifier = Modifier.fillMaxSize(), factory = { ctx ->
+                         WebView(ctx).apply {
+                             LoginWeb.configure(this)
++                            webChromeClient = object : android.webkit.WebChromeClient() {
++                                override fun onProgressChanged(view: WebView, newProgress: Int) { load.progress = newProgress }
++                            }
+                             addJavascriptInterface(object {
+                                 @JavascriptInterface fun found(t: String?) { if (!t.isNullOrBlank()) captured.set(t) }
+                             }, "MinesKey")
+@@ -183,7 +190,12 @@ fun KeyAgentDialog(kind: ConnectionKind, onClose: (saved: Boolean) -> Unit) {
+                                     }
+                                     return !u.startsWith("http")
+                                 }
++                                override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) { load.started(view, url) }
++                                override fun onReceivedError(view: WebView, request: android.webkit.WebResourceRequest?, error: android.webkit.WebResourceError?) { load.mainFrameError(request, error) }
++                                override fun onReceivedHttpError(view: WebView, request: android.webkit.WebResourceRequest?, r: android.webkit.WebResourceResponse?) { load.httpError(request, r?.statusCode ?: 0) }
++                                override fun onReceivedSslError(view: WebView, handler: android.webkit.SslErrorHandler, error: android.net.http.SslError?) { handler.cancel(); load.sslError(error) }
+                                 override fun onPageFinished(view: WebView, url: String) {
++                                    load.finished(view, url)
+                                     // Catch the page's own 「复制」 button: clipboard writes go to Mines too.
+                                     view.evaluateJavascript("""(function(){try{if(window.__minesClip)return;window.__minesClip=1;
+                                         var c=navigator.clipboard;if(c&&c.writeText){var o=c.writeText.bind(c);c.writeText=function(t){try{MinesKey.found(String(t))}catch(e){};return o(t)}}
+@@ -195,6 +207,8 @@ fun KeyAgentDialog(kind: ConnectionKind, onClose: (saved: Boolean) -> Unit) {
+                             webView = this
+                         }
+                     })
++                    WebLoadOverlay(load, webView, onRetry = { webView?.let { w -> if (w.url.isNullOrBlank() || w.url == "about:blank") w.loadUrl(recipe.url) else w.reload() } },
++                        onExternal = { com.openminis.app.browser.GoogleAuthRouter.openInCustomTab(context, webView?.url?.takeIf { it.startsWith("http") } ?: recipe.url) })
+                 }
+                 Row(Modifier.fillMaxWidth().navigationBarsPadding().padding(12.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                     if (done != null) Button(onClick = { onClose(true) }, modifier = Modifier.weight(1f).heightIn(min = 56.dp)) { Text("完成", fontSize = 18.sp) }
+@@ -207,3 +221,4 @@ fun KeyAgentDialog(kind: ConnectionKind, onClose: (saved: Boolean) -> Unit) {
+         }
+     }
+ }
++
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PersonalizeScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PersonalizeScreen.kt
+index 92c2f5c..e2ec21f 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/PersonalizeScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PersonalizeScreen.kt
+@@ -304,8 +304,11 @@ private fun WakeWordSection() {
+             else if (androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                 msg = "正在准备离线模型…"
+                 scope.launch {
++                    // [Mines-models-35] live % from the mirrored downloader, plain reason on failure
++                    val ticker = launch { while (true) { com.openminis.app.speech.OfflineAsrEngine.lastStatus?.let { msg = "离线模型：$it" }; kotlinx.coroutines.delay(500) } }
+                     val ok = withContext(Dispatchers.IO) { com.openminis.app.plus.WakeWordService.prepare(context) }
+-                    msg = if (ok) "" else "离线模型下载失败，检查网络后再试"
++                    ticker.cancel()
++                    msg = if (ok) "" else (com.openminis.app.speech.OfflineAsrEngine.lastError ?: "离线模型下载失败，检查网络后再试")
+                     if (ok) { PlusPrefs.update(context) { it.copy(wakeWord = true) }; com.openminis.app.plus.WakeWordService.start(context) }
+                 }
+             } else askMic.launch(android.Manifest.permission.RECORD_AUDIO)
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
+index 4194b7b..39ed904 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
+@@ -78,6 +78,8 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier) {
+         }
+         // [Mines-wake-25] Wake word resumes with the app (a mic service may only start while the app is in front).
+         if (PlusPrefs.state.value.wakeWord) com.openminis.app.plus.WakeWordService.start(context)
++        // [Mines-dsh-35] plugin widget survives app restarts / process kills
++        com.openminis.app.plus.PluginWidgetService.resumeIfWanted(context)
+     }
+ 
+     var switcher by androidx.compose.runtime.saveable.rememberSaveable { androidx.compose.runtime.mutableStateOf(false) }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/TtsSection.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/TtsSection.kt
+index 60b63a6..8d601c1 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/TtsSection.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/TtsSection.kt
+@@ -123,9 +123,7 @@ fun TtsSection(onChanged: () -> Unit) {
+                 busy = "正在合成…"; msg = null
+                 scope.launch {
+                     msg = runCatching { "用的是：" + ExternalTts.preview(c, s) }.getOrElse { e ->
+-                        if (s.engine == ExternalTts.ENGINE_OPENROUTER) runCatching { ExternalTts.preview(c, s.copy(engine = ExternalTts.ENGINE_EDGE)); "OpenRouter 不行（${e.message?.take(60)}），免费声音可以" }
+-                            .getOrElse { "试听失败：${e.message?.take(80)}" }
+-                        else "试听失败：${e.message?.take(80)}"
++                        "试听失败：" + ExternalTts.plainError(e) + "（手机自带朗读也不可用，可在系统设置里装一个朗读引擎）"
+                     }
+                     busy = null
+                 }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceprintSection.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceprintSection.kt
+index 361f084..08de468 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceprintSection.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceprintSection.kt
+@@ -82,7 +82,8 @@ fun VoiceprintSection() {
+                     busy = true; msg = "说一句话（3 秒）…"
+                     scope.launch {
+                         msg = runCatching {
+-                            val pcm = Voiceprint.record(3000)
++                            if (!Voiceprint.hasModel(c)) Voiceprint.ensureModel(c)
++                            val pcm = Voiceprint.recordUtterance(maxMs = 5000, waitSpeechMs = 5000)
+                             val sc = withContext(Dispatchers.Default) { Voiceprint.score(c, pcm) }
+                             when {
+                                 sc == null -> "声音太短，再说长一点"
+@@ -103,39 +104,95 @@ fun VoiceprintSection() {
+     if (enrol) VoiceprintEnrolDialog(onDone = { enrol = false; s = Voiceprint.settings(c) })
+ }
+ 
++/**
++ * [Mines-voiceprint-35] Enrolment page. build-34 hung on 「正在听…」: the button label said
++ * "listening" while it was really still connecting to GitHub for the 28 MB model (progress only
++ * appeared after the first byte, no overall limit), then recorded a fixed 4 s with no feedback.
++ * Now the model downloads in the background from the moment the page opens, each phrase records
++ * on its own (level meter, auto-stop after you finish, 6 s timeout with a plain reason), and the
++ * clips are kept if the model is still missing so a retry never asks you to read again.
++ */
+ @Composable
+ fun VoiceprintEnrolDialog(onDone: () -> Unit) {
+     val c = LocalContext.current
+     val m = mines()
++    val danger = toneColors(Tone.DANGER).first
+     val scope = rememberCoroutineScope()
+     val clips = remember { mutableStateListOf<ShortArray>() }
+-    var step by remember { mutableStateOf(0) }          // phrase index 0..2, 3 = saving/done
+     var recording by remember { mutableStateOf(false) }
++    var saving by remember { mutableStateOf(false) }
+     var msg by remember { mutableStateOf<String?>(null) }
++    var err by remember { mutableStateOf(false) }
+     var done by remember { mutableStateOf(false) }
++    var modelErr by remember { mutableStateOf<String?>(null) }
++    var modelReady by remember { mutableStateOf(Voiceprint.hasModel(c)) }
++    var denied by remember { mutableStateOf(false) }
+     val progress by Voiceprint.progress.collectAsState()
++    val level by Voiceprint.level.collectAsState()
+     var hasMic by remember {
+         mutableStateOf(ContextCompat.checkSelfPermission(c, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
+     }
+-    val ask = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { hasMic = it }
++    val ask = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
++        hasMic = ok; denied = !ok
++        msg = if (ok) "可以了，按「开始」读第 1 句" else "没有麦克风权限就录不了。点「去设置打开」，在 权限 → 麦克风 里选「允许」。"
++        err = !ok
++    }
++
++    fun fetchModel() {
++        if (modelReady) return
++        modelErr = null
++        scope.launch {
++            runCatching { Voiceprint.ensureModel(c) }.onSuccess { modelReady = true }.onFailure { modelErr = it.message ?: "声纹模型下载失败" }
++        }
++    }
++    androidx.compose.runtime.LaunchedEffect(Unit) { fetchModel() }
++
++    fun save() {
++        saving = true; msg = null; err = false
++        scope.launch {
++            runCatching {
++                if (!Voiceprint.hasModel(c)) Voiceprint.ensureModel(c)
++                modelReady = true
++                withContext(Dispatchers.Default) { Voiceprint.saveEnrolment(c, clips.toList()) }
++            }.onSuccess { q ->
++                msg = if (q > 0.6f) "录好了，以后通话只听你的声音。" else "录好了（声音有点不稳，安静的地方重录效果更好）。"
++                done = true
++            }.onFailure { e ->
++                msg = e.message ?: "没保存成功，再试一次"; err = true
++                if (e.message?.contains("太短") == true) clips.clear()
++            }
++            saving = false
++        }
++    }
+ 
+     fun recordOne() {
+-        if (!hasMic) { ask.launch(Manifest.permission.RECORD_AUDIO); return }
+-        recording = true; msg = null
++        if (!hasMic) {
++            if (denied) {
++                runCatching {
++                    c.startActivity(android.content.Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
++                        android.net.Uri.fromParts("package", c.packageName, null)).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
++                }
++                denied = false
++            } else ask.launch(Manifest.permission.RECORD_AUDIO)
++            return
++        }
++        if (clips.size >= Voiceprint.PHRASES.size) { save(); return }
++        recording = true; msg = null; err = false
+         scope.launch {
+             runCatching {
+-                Voiceprint.ensureModel(c)
+-                val pcm = Voiceprint.record(4000)
+-                var sum = 0.0; for (v in pcm) sum += v.toDouble() * v
+-                if (Math.sqrt(sum / pcm.size.coerceAtLeast(1)) < 250) throw IllegalStateException("没听清，靠近一点再读一遍")
++                kotlinx.coroutines.withTimeout(15_000) { Voiceprint.recordUtterance(maxMs = 8000, waitSpeechMs = 6000) }
++            }.onSuccess { pcm ->
+                 clips.add(pcm)
+-                if (clips.size >= Voiceprint.PHRASES.size) {
+-                    step = Voiceprint.PHRASES.size
+-                    val q = withContext(Dispatchers.Default) { Voiceprint.saveEnrolment(c, clips.toList()) }
+-                    msg = if (q > 0.6f) "录好了，以后通话只听你的声音。" else "录好了（声音有点不稳，安静的地方重录效果更好）。"
+-                    done = true
+-                } else step = clips.size
+-            }.onFailure { msg = it.message ?: "没录成，再试一次" }
++                if (clips.size >= Voiceprint.PHRASES.size) { recording = false; save() }
++                else msg = "好的 ✓ 接着读第 ${clips.size + 1} 句"
++            }.onFailure { e ->
++                msg = when (e) {
++                    is kotlinx.coroutines.TimeoutCancellationException -> "等了 15 秒没录完：麦克风可能被占用，关掉别的录音或通话后再试"
++                    else -> e.message ?: "没录成，再试一次"
++                }
++                err = true
++                if (ContextCompat.checkSelfPermission(c, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) { hasMic = false; denied = true }
++            }
+             recording = false
+         }
+     }
+@@ -143,27 +200,68 @@ fun VoiceprintEnrolDialog(onDone: () -> Unit) {
+     Dialog(onDismissRequest = { if (!recording) onDone() }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+         Box(Modifier.fillMaxSize().background(m.bg)) {
+             Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
+-                verticalArrangement = Arrangement.spacedBy(16.dp)) {
+-                Spacer(Modifier.height(24.dp))
+-                Text("录入你的声音", fontSize = 30.sp, fontWeight = FontWeight.Bold, color = m.ink)
+-                Text("在安静的地方，按「开始」后用平常的声音读出下面这句。一共三句。", fontSize = 17.sp, lineHeight = 24.sp, color = m.ink2)
+-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                verticalArrangement = Arrangement.spacedBy(14.dp)) {
++                Spacer(Modifier.height(20.dp))
++                Text("录入你的声音", fontSize = 24.sp, fontWeight = FontWeight.SemiBold, color = m.ink)
++                Text("在安静的地方，按「开始」后用平常的声音读出下面这句，读完会自动停。一共三句。", fontSize = 16.sp, lineHeight = 23.sp, color = m.ink2)
++                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                     Voiceprint.PHRASES.indices.forEach { i ->
+-                        Box(Modifier.size(12.dp).clip(CircleShape).background(if (i < clips.size) m.primary else m.hairline))
++                        Box(Modifier.size(10.dp).clip(CircleShape).background(if (i < clips.size) m.primary else m.hairline))
+                     }
++                    Spacer(Modifier.size(6.dp))
++                    Text("${clips.size}/${Voiceprint.PHRASES.size}", fontSize = 14.sp, color = m.ink3,
++                        modifier = Modifier.semantics { contentDescription = "已录 ${clips.size} 句，共 ${Voiceprint.PHRASES.size} 句" })
+                 }
+-                val phrase = Voiceprint.PHRASES.getOrNull(step)
+-                Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(22.dp)).background(m.glassStrong).padding(20.dp),
+-                    verticalArrangement = Arrangement.spacedBy(8.dp)) {
+-                    Text(if (phrase != null) "第 ${step + 1} 句" else "完成", fontSize = 15.sp, color = m.ink3)
+-                    Text(phrase ?: "三句都录好了", fontSize = 24.sp, lineHeight = 32.sp, fontWeight = FontWeight.SemiBold, color = m.ink)
++                val phrase = Voiceprint.PHRASES.getOrNull(clips.size)
++                Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp)).background(m.glassStrong).padding(18.dp),
++                    verticalArrangement = Arrangement.spacedBy(6.dp)) {
++                    Text(if (phrase != null) "第 ${clips.size + 1} 句" else "三句都录好了", fontSize = 14.sp, color = m.ink3)
++                    Text(phrase ?: if (done) "完成" else "正在保存你的声纹…", fontSize = 20.sp, lineHeight = 28.sp, fontWeight = FontWeight.Medium, color = m.ink)
++                }
++                LevelMeter(if (recording) level else 0f, recording)
++                msg?.let {
++                    Text(it, fontSize = 15.sp, lineHeight = 21.sp, color = if (err) danger else m.ink2,
++                        modifier = Modifier.semantics { contentDescription = "提示：$it" })
++                }
++                when {
++                    modelReady -> {}
++                    modelErr != null -> Row(verticalAlignment = Alignment.CenterVertically) {
++                        Text(modelErr ?: "", fontSize = 14.sp, lineHeight = 20.sp, color = danger, modifier = Modifier.weight(1f))
++                        PillButton("重试", Modifier, primary = false) { fetchModel() }
++                    }
++                    else -> Text(progress ?: "正在准备声纹模型…", fontSize = 14.sp, color = m.ink3)
+                 }
+-                (progress ?: msg)?.let { Text(it, fontSize = 16.sp, color = m.ink2) }
+                 if (!done) PillButton(
+-                    when { recording && progress != null -> "准备中…"; recording -> "正在听…读出上面这句"; !hasMic -> "允许使用麦克风"; else -> "开始" },
+-                    Modifier.fillMaxWidth(), primary = true, enabled = !recording) { recordOne() }
+-                PillButton(if (done) "完成" else "取消", Modifier.fillMaxWidth(), primary = done, enabled = !recording) { onDone() }
++                    when {
++                        saving -> "正在保存…"
++                        recording -> "正在听…读完会自动停"
++                        !hasMic && denied -> "去设置打开麦克风"
++                        !hasMic -> "允许使用麦克风"
++                        clips.size >= Voiceprint.PHRASES.size -> "重试保存"
++                        err -> "再试一次"
++                        clips.isEmpty() -> "开始"
++                        else -> "读第 ${clips.size + 1} 句"
++                    },
++                    Modifier.fillMaxWidth(), primary = true, enabled = !recording && !saving) { recordOne() }
++                PillButton(if (done) "完成" else "取消", Modifier.fillMaxWidth(), primary = done, enabled = !recording && !saving) { onDone() }
+             }
+         }
+     }
+ }
++
++/** [Mines-voiceprint-35] 16-bar mic level meter (accessible: announces 听到声音 / 没有声音). */
++@Composable
++private fun LevelMeter(level: Float, active: Boolean) {
++    val m = mines()
++    val bars = 16
++    val lit = (level * bars * 1.6f).toInt().coerceIn(0, bars)
++    Row(Modifier.fillMaxWidth().height(28.dp).semantics {
++        contentDescription = if (!active) "音量表：未在录音" else if (lit > 1) "音量表：听到声音" else "音量表：没有声音"
++    }, horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
++        for (i in 0 until bars) {
++            val h = 8 + (i % 4) * 4 + if (i < lit) 6 else 0
++            Box(Modifier.weight(1f).height(h.dp).clip(RoundedCornerShape(3.dp))
++                .background(if (active && i < lit) m.primary else m.hairline))
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoad.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoad.kt
+new file mode 100644
+index 0000000..51bb63a
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoad.kt
+@@ -0,0 +1,139 @@
++package com.openminis.app.ui.plus
++
++import android.graphics.Bitmap
++import android.net.http.SslError
++import android.webkit.WebResourceError
++import android.webkit.WebResourceRequest
++import android.webkit.WebView
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.material3.LinearProgressIndicator
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.mutableLongStateOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.semantics.contentDescription
++import androidx.compose.ui.semantics.semantics
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import kotlinx.coroutines.delay
++
++/**
++ * [Mines-web-35] Load watchdog for every in-app WebView that is not the agent browser
++ * (login, key-fetch 一键接入, 网站 ↗). User (2026-10-14, realme): the 通义千问 key page
++ * (bailian.console.aliyun.com) stayed pure white with only 「关闭」 — those WebViews had no
++ * error handler, no progress and no timeout, so a failed main-frame load (DNS / proxy / SSL /
++ * a console that never paints) looked like an empty page forever.
++ *
++ * Now: thin progress bar, main-frame errors turned into a plain reason, a 25 s watchdog that
++ * also checks the page for visible content (LoginWeb.BLANK_JS) after it "finishes", and a
++ * panel with 「重试」 / 「用外部浏览器打开」. Zoom: BrowserZoom.onPage on every start/finish.
++ */
++class WebLoadState {
++    var progress by mutableIntStateOf(0)
++    var error by mutableStateOf<String?>(null)
++    var startedAt by mutableLongStateOf(0L)
++    var finishedAt by mutableLongStateOf(0L)
++    var url by mutableStateOf("")
++    var blank by mutableStateOf(false)
++
++    fun started(view: WebView, u: String?) {
++        url = u.orEmpty(); startedAt = System.currentTimeMillis(); finishedAt = 0L; error = null; blank = false
++        com.openminis.app.browser.BrowserZoom.onPage(view, u, finished = false)
++    }
++
++    fun finished(view: WebView, u: String?) {
++        url = u.orEmpty(); finishedAt = System.currentTimeMillis()
++        com.openminis.app.browser.BrowserZoom.onPage(view, u, finished = true)
++        runCatching { view.evaluateJavascript(TOUCH_JS, null) }
++    }
++
++    fun mainFrameError(request: WebResourceRequest?, err: WebResourceError?) {
++        if (request?.isForMainFrame != true) return
++        error = plain(err?.errorCode ?: 0, err?.description?.toString().orEmpty())
++    }
++
++    fun httpError(request: WebResourceRequest?, code: Int) {
++        if (request?.isForMainFrame != true || code < 500) return
++        error = "网站暂时出错了（$code），稍后再试"
++    }
++
++    fun sslError(e: SslError?) { error = "网站的安全证书有问题（可能被代理或网络拦截），为了安全没有打开" + (e?.url?.let { "" } ?: "") }
++
++    companion object {
++        /** Lets pinch-zoom through pages that switch it off with CSS touch-action. */
++        const val TOUCH_JS = """(function(){try{if(document.getElementById('__minesTouch'))return;var s=document.createElement('style');s.id='__minesTouch';
++s.textContent='html,body{touch-action:auto!important;-ms-touch-action:auto!important}';(document.head||document.documentElement).appendChild(s);}catch(e){}})()"""
++
++        fun plain(code: Int, desc: String): String {
++            val d = desc.uppercase()
++            return when {
++                d.contains("PROXY") || d.contains("TUNNEL") -> "代理连不上（VPN 或 Mines 分流代理可能断了），关掉代理或换一条线路再试"
++                d.contains("NAME_NOT_RESOLVED") || code == android.webkit.WebViewClient.ERROR_HOST_LOOKUP -> "找不到这个网站（网络或 DNS 不通）"
++                d.contains("TIMED_OUT") || code == android.webkit.WebViewClient.ERROR_TIMEOUT -> "网站太久没响应（网络慢或被拦截）"
++                d.contains("INTERNET_DISCONNECTED") -> "手机没有网络"
++                d.contains("CONNECTION_REFUSED") || d.contains("CONNECTION_RESET") || d.contains("CONNECTION_CLOSED") -> "连接被断开了（网络或代理问题）"
++                d.contains("SSL") || d.contains("CERT") -> "网站的安全证书有问题（可能被代理或网络拦截）"
++                d.contains("TOO_MANY_REDIRECTS") -> "网站一直在跳转（登录状态可能失效），用外部浏览器打开试试"
++                else -> "页面没打开" + if (desc.isNotBlank()) "（${desc.take(40)}）" else ""
++            }
++        }
++    }
++}
++
++/** Progress bar + watchdog + error panel, drawn over the WebView. [onRetry] reloads, [onExternal] opens Chrome. */
++@Composable
++fun WebLoadOverlay(state: WebLoadState, webView: WebView?, onRetry: () -> Unit, onExternal: () -> Unit, modifier: Modifier = Modifier) {
++    val m = mines()
++    // watchdog: no finish after 25 s, or "finished" but nothing visible after 6 s more
++    LaunchedEffect(state.startedAt, state.finishedAt) {
++        val started = state.startedAt
++        if (started == 0L || state.error != null) return@LaunchedEffect
++        if (state.finishedAt == 0L) {
++            delay(25_000)
++            if (state.startedAt == started && state.finishedAt == 0L && state.error == null)
++                state.error = "等了 25 秒页面还没打开（网络慢、被拦截，或代理/VPN 有问题）"
++        } else {
++            delay(6_000)
++            val wv = webView ?: return@LaunchedEffect
++            val r = kotlinx.coroutines.suspendCancellableCoroutine<String> { c ->
++                runCatching { wv.evaluateJavascript(com.openminis.app.plus.LoginWeb.BLANK_JS) { v -> if (c.isActive) c.resumeWith(Result.success(v ?: "")) } }
++                    .onFailure { if (c.isActive) c.resumeWith(Result.success("")) }
++            }
++            if (r.contains("blank") && state.error == null && state.progress >= 100) state.blank = true
++        }
++    }
++    Box(modifier.fillMaxSize()) {
++        if (state.progress in 1..99 && state.error == null) LinearProgressIndicator(progress = { state.progress / 100f },
++            modifier = Modifier.fillMaxWidth().semantics { contentDescription = "正在加载 ${state.progress}%" })
++        val reason = state.error ?: if (state.blank) "页面打开了但什么都没显示（这个网站可能不支持在 App 里打开，或要先登录）" else null
++        if (reason != null) Column(Modifier.align(Alignment.Center).fillMaxWidth().padding(24.dp)
++            .background(m.surface, androidx.compose.foundation.shape.RoundedCornerShape(20.dp)).padding(20.dp),
++            verticalArrangement = Arrangement.spacedBy(12.dp)) {
++            Text("页面没打开", fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = m.ink)
++            Text(reason, fontSize = 15.sp, lineHeight = 22.sp, color = m.ink2)
++            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
++                PillButton("重试", Modifier.weight(1f), primary = true) { state.error = null; state.blank = false; onRetry() }
++                PillButton("用外部浏览器打开", Modifier.weight(1.4f), primary = false) { onExternal() }
++            }
++        }
++    }
++}
++
++/** Standard WebViewClient hooks for [WebLoadState]; call from a client's overrides. */
++object WebLoadHooks {
++    fun onStarted(s: WebLoadState, v: WebView, u: String?, @Suppress("UNUSED_PARAMETER") f: Bitmap?) = s.started(v, u)
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
+index c917306..eafb619 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
+@@ -77,6 +77,7 @@ fun WebLoginScreen(
+     var current by remember { mutableStateOf(url) }
+     val visited = remember { mutableSetOf(url) }
+     var webView by remember { mutableStateOf<WebView?>(null) }
++    val load = remember { WebLoadState() }
+     var finished by remember { mutableStateOf(false) }
+     val scope = androidx.compose.runtime.rememberCoroutineScope()
+     // [Mines-login-32] this provider's page did not render inside Mines → it is open in a Chrome Custom Tab
+@@ -241,7 +242,7 @@ fun WebLoginScreen(
+                         LoginWeb.configure(this)
+                         settings.setSupportMultipleWindows(false)
+                         webChromeClient = object : WebChromeClient() {
+-                            override fun onProgressChanged(view: WebView, newProgress: Int) { progress = newProgress }
++                            override fun onProgressChanged(view: WebView, newProgress: Int) { progress = newProgress; load.progress = newProgress }
+                         }
+                         webViewClient = object : WebViewClient() {
+                             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+@@ -261,10 +262,13 @@ fun WebLoginScreen(
+                                 return false
+                             }
+                             override fun onPageStarted(view: WebView, u: String, favicon: Bitmap?) {
+-                                current = u; visited.add(u)
++                                current = u; visited.add(u); load.started(view, u)
+                             }
++                            override fun onReceivedError(view: WebView, request: WebResourceRequest?, error: android.webkit.WebResourceError?) { load.mainFrameError(request, error) }
++                            override fun onReceivedHttpError(view: WebView, request: WebResourceRequest?, r: android.webkit.WebResourceResponse?) { load.httpError(request, r?.statusCode ?: 0) }
++                            override fun onReceivedSslError(view: WebView, handler: android.webkit.SslErrorHandler, error: android.net.http.SslError?) { handler.cancel(); load.sslError(error) }
+                             override fun onPageFinished(view: WebView, u: String) {
+-                                current = u; visited.add(u)
++                                current = u; visited.add(u); load.finished(view, u)
+                                 LoginWeb.flush()
+                             }
+                         }
+@@ -273,9 +277,9 @@ fun WebLoginScreen(
+                     }
+                 },
+             )
+-            if (progress in 1..99) LinearProgressIndicator(
+-                progress = { progress / 100f }, modifier = Modifier.fillMaxWidth(),
+-            )
++            // [Mines-web-35] progress + watchdog + plain reason with 重试 / 用外部浏览器打开
++            WebLoadOverlay(load, webView, onRetry = { webView?.let { w -> if (w.url.isNullOrBlank() || w.url == "about:blank") w.loadUrl(url) else w.reload() } },
++                onExternal = { GoogleAuthRouter.openInCustomTab(context, webView?.url?.takeIf { it.startsWith("http") } ?: url) })
+           }
+         }
+     }
