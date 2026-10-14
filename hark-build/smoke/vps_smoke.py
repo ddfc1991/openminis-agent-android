@@ -15,6 +15,10 @@ OUT = os.environ.get("OUT", "smoke-out")
 SSH_HOST = os.environ.get("SSH_HOST", "10.0.2.2")
 SSH_PASS = os.environ.get("SSH_PASS", "MinesSmoke-2026")
 os.makedirs(OUT, exist_ok=True)
+try:
+    QUICK = "quick" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
+except Exception:
+    QUICK = False
 step_no = 0
 crashed = []
 
@@ -893,6 +897,122 @@ def build31_pages():
     open_page("voice page", ["实时语音"], ["语音", "通话", "Gemini"], linger=6)
 
 
+def feed_351():
+    """[build-35.1] 消息 page: tabs 账号异常/我关注的/X/GitHub/值得关注 with counts, 「忽略」 on cards, tap hides + 撤销."""
+    go_home()
+    if not tap_text("打开消息页", wait=8):
+        selftest_fail.append("b351 feed: bar missing"); return
+    time.sleep(6)
+    r = snap("feed-tabs")
+    t = texts(r) if r is not None else []
+    for lab in ("账号异常", "我关注的", "X", "GitHub", "值得关注"):
+        if not any(re.match(rf"^{re.escape(lab)} \d+", x) for x in t): selftest_fail.append(f"b351 tab missing: {lab} N")
+    if any(x.startswith(("要处理 ", "飙升 ", "可学 ")) for x in t): selftest_fail.append("b351 old tabs still shown")
+    # pick a tab that has cards: 值得关注 (bundled free offers), else 全部
+    for lab in ("值得关注 ", "全部 "):
+        p = next(((tx, x, y) for tx, d, x, y, n in nodes(r) if (tx or d).startswith(lab) and not (tx or d).endswith(" 0")), None)
+        if p:
+            sh(f"input tap {p[1]} {p[2]}"); time.sleep(3)
+            if find(dump(), "忽略这条"): break
+    r = dump()
+    time.sleep(1)
+    r = snap("feed-35_1")
+    subprocess.run(f"cp {OUT}/{step_no:02d}-feed-35_1.png {OUT}/feed-35_1.png", shell=True)
+    if not find(r, "忽略这条"):
+        selftest_fail.append("b351 no 忽略 button on cards"); sh("input keyevent KEYCODE_BACK"); time.sleep(2); return
+    before = set(x for x in texts(r) if len(x) >= 8)
+    tap_text("忽略这条", wait=1.2, root=r)
+    r2 = snap("feed-after-ignore")
+    after = set(x for x in texts(r2) if len(x) >= 8) if r2 is not None else set()
+    gone = [x for x in before - after if "忽略" not in x]
+    snackbar = r2 is not None and bool(find(r2, "已忽略"))
+    if not snackbar: selftest_fail.append("b351 no 已忽略 · 撤销 bar")
+    if not gone: selftest_fail.append("b351 ignored card did not disappear")
+    undone = False
+    if snackbar and tap_text("撤销", wait=2):
+        r3 = snap("feed-after-undo")
+        undone = r3 is not None and any(g in set(texts(r3)) for g in gone)
+    check("消息 page ignore + undo")
+    print(f"B351 feed tabs={[x for x in t if re.match(r'^(账号异常|我关注的|X|GitHub|值得关注|其他|全部) ', x)]} ignore_gone={gone[:2]} snackbar={snackbar} undo_back={undone}", flush=True)
+    sh("input keyevent KEYCODE_BACK"); time.sleep(2)
+
+
+def keyagent_351():
+    """[build-35.1] 一键接入 硅基流动: the key-fetch WebView must not be a bare white page (progress / reason / 重试 / 浏览器打开)."""
+    sh(f"am start -n {PKG}/com.openminis.app.MainActivity --es mines_route plus_connections --es mines_open_kind siliconflow", timeout=60)
+    time.sleep(6)
+    snap("siliconflow-detail")
+    if not (tap_text("一键接入", wait=3) or tap_text("再生成一个新密钥", wait=3)):
+        scroll_down(); time.sleep(1)
+        if not (tap_text("一键接入", wait=3) or tap_text("再生成一个新密钥", wait=3)):
+            page_missing.append("b351 一键接入 button not found"); return
+    time.sleep(18)
+    r = snap("keyagent-siliconflow")
+    subprocess.run(f"cp {OUT}/{step_no:02d}-keyagent-siliconflow.png {OUT}/keyagent-35_1.png", shell=True)
+    time.sleep(14)
+    r2 = snap("keyagent-siliconflow-later")
+    check("一键接入 硅基流动 WebView")
+    t = texts(r2) if r2 is not None else []
+    if not any("重试" in x for x in t) or not any("浏览器打开" in x for x in t): selftest_fail.append("b351 keyagent: no 重试 / 浏览器打开")
+    print(f"B351 keyagent texts={t[:30]}", flush=True)
+    for _ in range(3): sh("input keyevent KEYCODE_BACK"); time.sleep(1.5)
+    if not alive(): relaunch()
+
+
+def cards_351():
+    """[build-35.1] 支付卡: fill JS on a local form, OCR parse, per-account profile; page opens (no lock screen → no prompt)."""
+    j = selftest_json("cardfill", "x", timeout=60)
+    print(f"  b351 cardfill: {j}", flush=True)
+    vals = str(j.get("values", "")).split("|")
+    if not (j.get("detect") == "1" and vals[:1] == ["4242424242424242"] and len(vals) >= 6 and vals[5] == "0"):
+        selftest_fail.append(f"b351 cardfill {j}")
+    if j.get("ocr_number") != "4242424242424242" or j.get("ocr_exp") != "08/29" or j.get("ocr_name") != "JOHN APPLESEED":
+        selftest_fail.append(f"b351 card OCR parse {j}")
+    if not j.get("locked"): selftest_fail.append("b351 agent lock after fill missing")
+    sh(f"am start -n {PKG}/com.openminis.app.MainActivity --es mines_route plus_cards", timeout=60)
+    time.sleep(6)
+    r = snap("pay-cards")
+    subprocess.run(f"cp {OUT}/{step_no:02d}-pay-cards.png {OUT}/cards-35_1.png", shell=True)
+    check("支付卡 page")
+    if r is None or not (find(r, "添加卡") or find(r, "验证")): page_missing.append("b351 支付卡 page")
+    sh("input keyevent KEYCODE_BACK"); time.sleep(2)
+
+
+def quick_home_351():
+    """[build-35.1] quick mode (target line 2 = quick): home = 最近对话 + one slim 消息 bar → own 消息 page, back returns."""
+    root = go_home()
+    if root is None: relaunch(); root = go_home()
+    time.sleep(3)
+    r = snap("home-35_1")
+    subprocess.run(f"cp {OUT}/{step_no:02d}-home-35_1.png {OUT}/home-35_1.png", shell=True)
+    t = "\n".join(texts(r)) if r is not None else ""
+    for want, label in (("最近对话", "最近对话 header"), ("打开消息页", "slim 消息 bar")):
+        if want not in t: page_missing.append(f"b351 home missing {label}")
+    for bad in ("要处理的消息", "对话（当前）"):
+        if bad in t: selftest_fail.append(f"b351 home still shows {bad}")
+    if not tap_text("打开消息页", wait=6, root=r):
+        selftest_fail.append("b351 slim 消息 bar not tappable"); return
+    time.sleep(3)
+    r2 = snap("digest-from-bar")
+    check("open 消息 page from slim bar")
+    t2 = "\n".join(texts(r2)) if r2 is not None else ""
+    if "打开消息页" in t2 or "最近对话" in t2: selftest_fail.append("b351 消息 page did not open as its own screen")
+    sh("input keyevent KEYCODE_BACK"); time.sleep(3)
+    r3 = snap("home-after-back")
+    check("back from 消息 page")
+    if r3 is None or not find(r3, "最近对话"): selftest_fail.append("b351 back did not return to home")
+    feed_351()
+    try:
+        cards_351()
+    except Exception as e:
+        print("cards error:", e, flush=True); selftest_fail.append(f"cards error {e}")
+    try:
+        keyagent_351()
+    except Exception as e:
+        print("keyagent error:", e, flush=True)
+    print(f"B351 home_ok={'最近对话' in t and '打开消息页' in t} page_opened={bool(t2)} back_home={r3 is not None and bool(find(r3, '最近对话'))}", flush=True)
+
+
 def main():
     m = re.search(r"(\d+)x(\d+)", sh("wm size"))
     if m: SCREEN[0], SCREEN[1] = int(m.group(1)), int(m.group(2))
@@ -917,6 +1037,12 @@ def main():
         dump_fatal()
         user_like_state()
 
+    if QUICK:
+        try:
+            quick_home_351()
+        except Exception as e:
+            print("quick error:", e, flush=True); selftest_fail.append(f"quick error {e}")
+        return finish(lc)
     # Home Today card → 工作位置
     if not tap_work(wait=6):
         # Today card may be collapsed: tap the greeting card to expand
@@ -1016,6 +1142,10 @@ def main():
         selftests()
     except Exception as e:
         print("selftests error:", e, flush=True); selftest_fail.append(f"selftests error {e}")
+    finish(lc)
+
+
+def finish(lc):
     lc.terminate()
     time.sleep(1)
     log = open(f"{OUT}/logcat.txt", errors="replace").read().splitlines()
