@@ -828,6 +828,365 @@ index fa81fb3..3c3ce64 100644
          }
      }
  }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/TtsSection.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/TtsSection.kt
+index 8d601c1..ffa3800 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/TtsSection.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/TtsSection.kt
+@@ -39,7 +39,7 @@ import kotlinx.coroutines.launch
+  * When OpenRouter fails or runs out of credit the call switches to the free voice by itself.
+  */
+ @Composable
+-fun TtsSection(onChanged: () -> Unit) {
++fun TtsSection(onChanged: () -> Unit, only: String? = null) {
+     val c = LocalContext.current
+     val m = mines()
+     var s by remember { mutableStateOf(ExternalTts.settings(c)) }
+@@ -50,15 +50,17 @@ fun TtsSection(onChanged: () -> Unit) {
+     var showModels by remember { mutableStateOf(false) }
+     val scope = rememberCoroutineScope()
+     fun save(n: ExternalTts.Settings) { s = n; ExternalTts.save(c, n); onChanged() }
+-    LaunchedEffect(s.engine) {
+-        if (s.engine == ExternalTts.ENGINE_OPENROUTER && models.isEmpty()) {
++    // [Mines-voice-36] only = one source's own list (語音设置 picks the source above; nothing else shown)
++    val eng = only ?: s.engine
++    LaunchedEffect(eng) {
++        if (eng == ExternalTts.ENGINE_OPENROUTER && models.isEmpty()) {
+             runCatching { ExternalTts.listOpenRouterModels() }.onSuccess { models = it; loadErr = null }
+                 .onFailure { loadErr = "模型列表拿不到，先用默认的（${it.message?.take(60)}）" }
+         }
+     }
+     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+-        Text("说话的声音", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = m.ink2)
+-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++        if (only == null) Text("说话的声音", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = m.ink2)
++        if (only == null) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+             listOf(ExternalTts.ENGINE_GEMINI to "Gemini 自带", ExternalTts.ENGINE_OPENROUTER to "OpenRouter", ExternalTts.ENGINE_EDGE to "免费声音")
+                 .forEach { (id, label) ->
+                     val sel = s.engine == id
+@@ -76,7 +78,7 @@ fun TtsSection(onChanged: () -> Unit) {
+                         textAlign = androidx.compose.ui.text.style.TextAlign.Center, maxLines = 1)
+                 }
+         }
+-        when (s.engine) {
++        when (eng) {
+             ExternalTts.ENGINE_GEMINI -> Text("用 Gemini 实时语音自己的声音（下面选声音）。", fontSize = 15.sp, color = m.ink3)
+             ExternalTts.ENGINE_OPENROUTER -> {
+                 Text("用你在 AI 服务商里的 OpenRouter Key。余额用完或出错时，自动换成免费声音。", fontSize = 15.sp, lineHeight = 20.sp, color = m.ink3)
+@@ -114,7 +116,7 @@ fun TtsSection(onChanged: () -> Unit) {
+                 }
+             }
+         }
+-        if (s.engine != ExternalTts.ENGINE_GEMINI) {
++        if (eng != ExternalTts.ENGINE_GEMINI) {
+             Text("语速 ${"%.1f".format(s.speed)}×", fontSize = 16.sp, color = m.ink)
+             Slider(s.speed, { save(s.copy(speed = (it * 10).toInt() / 10f)) }, valueRange = 0.6f..1.8f)
+             Text("音调 ${"%.1f".format(s.pitch)}", fontSize = 16.sp, color = m.ink)
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
+index 62d4426..16852b6 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
+@@ -404,61 +404,34 @@ private fun VoiceSettingsSheet(onDismiss: () -> Unit, onChanged: () -> Unit) {
+     var speed by remember { mutableStateOf(PlusVault.extra("gemini", "speed")?.toFloatOrNull() ?: 1f) }
+     var pitch by remember { mutableStateOf(PlusVault.extra("gemini", "pitch")?.toFloatOrNull() ?: 1f) }
+     var phone by remember { mutableStateOf(PlusVault.extra("gemini", "phone") != "0") }
+-    androidx.compose.material3.ModalBottomSheet(onDismissRequest = { onChanged(); onDismiss() }) {
++    // [Mines-voice-36] one source at a time, one tick on the page, 「现在用：…」 + 试听 on top (user 13:31)
++    val wm = mines()
++    androidx.compose.material3.ModalBottomSheet(onDismissRequest = { onChanged(); onDismiss() },
++        containerColor = if (wm.dark) wm.surface else Color(0xFFFFFDFA), shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp)) {
+         Column(Modifier.fillMaxWidth().verticalScroll(androidx.compose.foundation.rememberScrollState()).padding(horizontal = 20.dp).padding(bottom = 28.dp),
+             verticalArrangement = Arrangement.spacedBy(10.dp)) {
+-            Text("语音设置", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+-            val ctxV = androidx.compose.ui.platform.LocalContext.current
+-            // [Mines-voice-33] connection details moved here from the call screen
+-            com.openminis.app.plus.VoiceSession.live.collectAsState().value?.let { lv ->
+-                val r by lv.route.collectAsState(); val m by lv.modelInUse.collectAsState(); val e by lv.error.collectAsState()
+-                val ev by lv.events.collectAsState()
+-                Text("连接详情", fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+-                Text("当前声音：" + lv.voiceName + "\n线路：" + r.ifBlank { "未连接" } + "\n模型：" + m + (e?.takeIf { it.isNotBlank() }?.let { "\n最近的问题：$it" } ?: "") +
+-                    (if (ev.isNotEmpty()) "\n\n最近的连接记录：\n" + ev.takeLast(10).joinToString("\n") else ""),
+-                    fontSize = 14.sp, modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+-                        .background(MaterialTheme.colorScheme.surfaceVariant).padding(12.dp))
+-            }
+-            Text("声音", fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+-            GeminiLive.voiceLabels.forEach { (id, label) ->
+-                Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+-                    .background(if (voice == id) MaterialTheme.colorScheme.primary.copy(alpha = 0.14f) else Color.Transparent)
+-                    .clickable {
+-                        voice = id; PlusVault.setExtra("gemini", "voice", id); PlusVault.setExtra("gemini", "voice_user", "1")
+-                        // [Mines-voice-33] a Gemini voice only plays when the cloned voice is off (it mutes Gemini audio)
+-                        com.openminis.app.plus.VoiceClone.setEnabled(ctxV, false)
+-                    }
+-                    .padding(horizontal = 12.dp, vertical = 10.dp),
+-                    verticalAlignment = Alignment.CenterVertically) {
+-                    Text(label, fontSize = 16.sp, modifier = Modifier.weight(1f))
+-                    Text(id, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+-                    if (voice == id) Text("  ✓", fontSize = 16.sp, color = MaterialTheme.colorScheme.primary)
+-                }
+-            }
+-            // [Mines-tts-34] external voice: OpenRouter / free Edge, speed + pitch + 试听
+-            TtsSection(onChanged = {})
++            Text("语音设置", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = wm.ink)
++            VoiceSourceSection(onChanged = {})
+             // [Mines-voiceprint-34] only answer the enrolled voice
+             VoiceprintSection()
+-
+-            // [Mines-voice-33] Gemini Live has no pitch / speed control: only for the external (cloned) voice
+-            if (com.openminis.app.plus.VoiceClone.settings(ctxV).enabled) {
+-            Text("语速 ${"%.1f".format(speed)}×（自定义声音）", fontSize = 15.sp)
+-            androidx.compose.material3.Slider(speed, { speed = (it * 10).toInt() / 10f; PlusVault.setExtra("gemini", "speed", speed.toString()) },
+-                valueRange = 0.7f..1.5f)
+-            Text("音调 ${"%.1f".format(pitch)}（自定义声音）", fontSize = 15.sp)
+-            androidx.compose.material3.Slider(pitch, { pitch = (it * 10).toInt() / 10f; PlusVault.setExtra("gemini", "pitch", pitch.toString()) },
+-                valueRange = 0.7f..1.4f)
+-            }
+-            Row(verticalAlignment = Alignment.CenterVertically) {
++            Row(Modifier.heightIn(min = 64.dp), verticalAlignment = Alignment.CenterVertically) {
+                 Column(Modifier.weight(1f)) {
+-                    Text("通话里可以操作手机", fontSize = 16.sp)
+-                    Text("打开应用、点按钮、输入文字；付款和发消息前会先口头问你", fontSize = 13.sp,
+-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
++                    Text("通话里可以操作手机", fontSize = 17.sp, color = wm.ink)
++                    Text("打开应用、点按钮、输入文字；付款和发消息前会先口头问你", fontSize = 15.sp, color = wm.ink2)
+                 }
+                 androidx.compose.material3.Switch(phone, { phone = it; PlusVault.setExtra("gemini", "phone", if (it) "1" else "0") })
+             }
+-            CustomVoiceSection()
+-            Text("关掉这个面板后会用新设置重新连接。", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
++            // [Mines-voice-33] connection details (for problem reports), at the bottom
++            com.openminis.app.plus.VoiceSession.live.collectAsState().value?.let { lv ->
++                val r by lv.route.collectAsState(); val mo by lv.modelInUse.collectAsState(); val e by lv.error.collectAsState()
++                val ev by lv.events.collectAsState()
++                Text("连接详情", fontSize = 15.sp, color = wm.ink2)
++                Text("线路：" + r.ifBlank { "未连接" } + "\n模型：" + mo + (e?.takeIf { it.isNotBlank() }?.let { "\n最近的问题：$it" } ?: "") +
++                    (if (ev.isNotEmpty()) "\n\n最近的连接记录：\n" + ev.takeLast(10).joinToString("\n") else ""),
++                    fontSize = 14.sp, color = wm.ink2, modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
++                        .background(wm.surface2).padding(12.dp))
++            }
++            Text("关掉这个面板后会用新设置重新连接。", fontSize = 15.sp, color = wm.ink2)
+         }
+     }
+ }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceSourceSection.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceSourceSection.kt
+new file mode 100644
+index 0000000..fd8238e
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceSourceSection.kt
+@@ -0,0 +1,214 @@
++package com.openminis.app.ui.plus
++
++import androidx.compose.foundation.background
++import androidx.compose.foundation.border
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.saveable.rememberSaveable
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.semantics.Role
++import androidx.compose.ui.semantics.contentDescription
++import androidx.compose.ui.semantics.role
++import androidx.compose.ui.semantics.semantics
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import com.openminis.app.plus.ExternalTts
++import com.openminis.app.plus.GeminiLive
++import com.openminis.app.plus.PlusVault
++import com.openminis.app.plus.VoiceClone
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
++
++/**
++ * [Mines-voice-36] 语音设置 rebuilt (user 2026-10-14 13:31: 「这个页面太乱了，应该选哪个就用那个的页面。
++ * 这样选了也不知道用谁」 — a Gemini voice and a free voice were both ticked).
++ *
++ * One line on top says exactly what the call speaks with (「现在用：免费声音 · 晓晓 女声 温暖」 + 试听);
++ * below it the voice SOURCE is picked first (Gemini 自带 / OpenRouter / 免费声音 / 我的克隆声音); only that
++ * source's own voices and settings are shown, the others are hidden. A source that cannot work (no key)
++ * is greyed with 「去连接」. The whole page carries a single tick.
++ */
++@Composable
++fun VoiceSourceSection(onChanged: () -> Unit) {
++    val c = LocalContext.current
++    val m = mines()
++    val scope = rememberCoroutineScope()
++    var tick by remember { mutableIntStateOf(0) }
++    // the clone section toggles its own switch; re-read the stored choice now and then so the top line stays true
++    LaunchedEffect(Unit) { while (true) { delay(1500); tick++ } }
++    val tts = remember(tick) { ExternalTts.settings(c) }
++    val clone = remember(tick) { VoiceClone.settings(c) }
++    val active = if (clone.enabled) SRC_CLONE else tts.engine
++    var tab by rememberSaveable { mutableStateOf(active) }
++    val geminiVoice = remember(tick) {
++        PlusVault.extra("gemini", "voice").takeIf { PlusVault.extra("gemini", "voice_user") == "1" } ?: GeminiLive.DEFAULT_VOICE
++    }
++    val hasGemini = PlusVault.accountsOf("gemini").any { PlusVault.hasSecret(it) } || PlusVault.hasSecret("gemini")
++    val hasOr = ExternalTts.openRouterKey(c) != null
++    val hasSf = VoiceClone.apiKey() != null
++    var busy by remember { mutableStateOf(false) }
++    var msg by remember { mutableStateOf<String?>(null) }
++
++    fun activate(id: String) {
++        if (id == SRC_CLONE) {
++            VoiceClone.setEnabled(c, true)
++            ExternalTts.save(c, ExternalTts.settings(c).copy(engine = ExternalTts.ENGINE_GEMINI))
++        } else {
++            VoiceClone.setEnabled(c, false)
++            ExternalTts.save(c, ExternalTts.settings(c).copy(engine = id))
++        }
++        tick++; onChanged()
++    }
++
++    val nowText = when (active) {
++        ExternalTts.ENGINE_OPENROUTER -> "OpenRouter · " + tts.orVoice.substringBefore(':')
++        ExternalTts.ENGINE_EDGE -> "免费声音 · " + (ExternalTts.edgeVoices[tts.edgeVoice] ?: tts.edgeVoice).replace(" · ", " ")
++        SRC_CLONE -> "我的克隆声音"
++        else -> "Gemini 自带 · " + (GeminiLive.voiceLabels[geminiVoice]?.replace(" · ", " ") ?: geminiVoice)
++    }
++
++    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
++        // ---- what the call uses right now ----
++        Row(
++            Modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp)).background(m.container).heightIn(min = 68.dp)
++                .padding(start = 16.dp, end = 8.dp, top = 8.dp, bottom = 8.dp)
++                .semantics(mergeDescendants = true) { contentDescription = "现在用：$nowText" },
++            verticalAlignment = Alignment.CenterVertically,
++        ) {
++            Column(Modifier.weight(1f)) {
++                Text("现在用", fontSize = 15.sp, color = m.onContainer.copy(alpha = 0.85f), maxLines = 1)
++                Text(nowText, fontSize = 18.sp, lineHeight = 24.sp, fontWeight = FontWeight.Bold, color = m.onContainer, maxLines = 2,
++                    overflow = TextOverflow.Ellipsis)
++            }
++            if (active != ExternalTts.ENGINE_GEMINI) {
++                Spacer(Modifier.width(8.dp))
++                WarmPrimaryPill(if (busy) "播放中…" else "试听", enabled = !busy, height = 48.dp, fontSize = 16,
++                    icon = com.openminis.app.ui.brand.MinesIcons.named("volume-2"), description = "试听现在用的声音", onClick = {
++                        busy = true; msg = null
++                        scope.launch {
++                            msg = runCatching {
++                                if (active == SRC_CLONE) { VoiceClone.preview(c); null } else "用的是：" + ExternalTts.preview(c, ExternalTts.settings(c))
++                            }.getOrElse { e -> "试听失败：" + ExternalTts.plainError(e) }
++                            busy = false
++                        }
++                    })
++            }
++        }
++        if (active == ExternalTts.ENGINE_GEMINI) Text("Gemini 自带的声音接通后就能听到。", fontSize = 15.sp, color = m.ink2)
++        msg?.let { Text(it, fontSize = 15.sp, color = m.ink2) }
++
++        // ---- 1. pick the source ----
++        Text("声音来源", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = m.ink2, modifier = Modifier.padding(top = 6.dp))
++        val sources = listOf(
++            Src(ExternalTts.ENGINE_GEMINI, "Gemini 自带", "实时通话原声", hasGemini, "gemini"),
++            Src(ExternalTts.ENGINE_OPENROUTER, "OpenRouter", "用你的 Key", hasOr, "openrouter"),
++            Src(ExternalTts.ENGINE_EDGE, "免费声音", "不用 Key", true, null),
++            Src(SRC_CLONE, "我的克隆声音", if (VoiceClone.hasReference(c)) "已录好" else "先导入一段录音", hasSf, "siliconflow"),
++        )
++        sources.chunked(2).forEach { row ->
++            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
++                row.forEach { s ->
++                    SourceCard(s, shown = tab == s.id, using = active == s.id, modifier = Modifier.weight(1f)) {
++                        tab = s.id
++                        val ready = s.available && (s.id != SRC_CLONE || VoiceClone.hasReference(c))
++                        if (ready && active != s.id) activate(s.id)
++                    }
++                }
++            }
++        }
++
++        // ---- 2. only that source's own voices + settings ----
++        val cur = sources.first { it.id == tab }
++        if (!cur.available) {
++            Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(m.surface2).heightIn(min = 64.dp).padding(horizontal = 14.dp, vertical = 10.dp),
++                verticalAlignment = Alignment.CenterVertically) {
++                Text(when (cur.id) {
++                    ExternalTts.ENGINE_GEMINI -> "还没有 Gemini Key，连上后才能用它的声音"
++                    ExternalTts.ENGINE_OPENROUTER -> "还没有 OpenRouter Key，连上后才能用"
++                    else -> "克隆声音要用硅基流动的 Key"
++                }, fontSize = 16.sp, color = m.ink, modifier = Modifier.weight(1f))
++                cur.connect?.let { k ->
++                    Spacer(Modifier.width(8.dp))
++                    WarmPrimaryPill("去连接", height = 44.dp, fontSize = 16, onClick = { PlusNav.openKind = k; PlusNav.go(PlusRoutes.CONNECTIONS) })
++                }
++            }
++            if (cur.id == SRC_CLONE) CustomVoiceSection()
++        } else when (cur.id) {
++            ExternalTts.ENGINE_GEMINI -> Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(m.surface2.copy(alpha = 0.6f))) {
++                GeminiLive.voiceLabels.entries.forEachIndexed { i, (id, label) ->
++                    val on = active == ExternalTts.ENGINE_GEMINI && geminiVoice == id
++                    Row(Modifier.fillMaxWidth().heightIn(min = 60.dp).background(if (on) m.container else Color.Transparent)
++                        .clickable {
++                            PlusVault.setExtra("gemini", "voice", id); PlusVault.setExtra("gemini", "voice_user", "1")
++                            if (active != ExternalTts.ENGINE_GEMINI) activate(ExternalTts.ENGINE_GEMINI) else { tick++; onChanged() }
++                        }
++                        .semantics(mergeDescendants = true) { contentDescription = label + (if (on) "，正在用" else ""); role = Role.RadioButton }
++                        .padding(horizontal = 14.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
++                        Column(Modifier.weight(1f)) {
++                            Text(label, fontSize = 17.sp, fontWeight = if (on) FontWeight.SemiBold else FontWeight.Normal, color = if (on) m.onContainer else m.ink, maxLines = 1)
++                            Text(id, fontSize = 14.sp, color = if (on) m.onContainer.copy(alpha = 0.8f) else m.ink2, maxLines = 1)
++                        }
++                        if (on) Text("✓", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = m.onContainer)
++                    }
++                    if (i < GeminiLive.voiceLabels.size - 1) WarmDivider(start = 14.dp)
++                }
++            }
++            ExternalTts.ENGINE_OPENROUTER, ExternalTts.ENGINE_EDGE -> TtsSection(onChanged = { tick++; onChanged() }, only = cur.id)
++            SRC_CLONE -> CustomVoiceSection()
++        }
++    }
++}
++
++private const val SRC_CLONE = "clone"
++
++private data class Src(val id: String, val title: String, val sub: String, val available: Boolean, val connect: String?)
++
++@Composable
++private fun SourceCard(s: Src, shown: Boolean, using: Boolean, modifier: Modifier, onClick: () -> Unit) {
++    val m = mines()
++    val shape = RoundedCornerShape(18.dp)
++    val alpha = if (s.available) 1f else 0.55f
++    Column(
++        modifier.heightIn(min = 72.dp).clip(shape).background(if (shown) m.container else minesGlassFill(strong = true))
++            .border(if (shown) 2.dp else 1.dp, if (shown) m.primary else m.hairline, shape).clickable(onClick = onClick)
++            .semantics(mergeDescendants = true) {
++                contentDescription = s.title + "，" + (if (!s.available) "不可用，要先连接" else s.sub) + (if (using) "，正在用" else ""); role = Role.Tab
++            }
++            .padding(horizontal = 12.dp, vertical = 10.dp),
++        verticalArrangement = Arrangement.Center,
++    ) {
++        Row(verticalAlignment = Alignment.CenterVertically) {
++            Text(s.title, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = (if (shown) m.onContainer else m.ink).copy(alpha = alpha), maxLines = 1,
++                overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
++            if (using) { Spacer(Modifier.width(6.dp)); Box(Modifier.size(8.dp).clip(CircleShape).background(m.icon)) }
++        }
++        Text(if (!s.available) "要先连接" else if (using) "正在用" else s.sub, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
++            color = (if (shown) m.onContainer else m.ink2).copy(alpha = if (s.available) 0.9f else 0.7f))
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WarmComponents.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WarmComponents.kt
 new file mode 100644
 index 0000000..1b05757
