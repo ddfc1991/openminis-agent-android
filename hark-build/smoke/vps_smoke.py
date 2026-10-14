@@ -1403,6 +1403,10 @@ def browser_open(url, tag):
         sh(f"input text '{url}'"); time.sleep(0.5); sh("input keyevent 66"); time.sleep(1)
         sh("input keyevent KEYCODE_ESCAPE")   # close the keyboard so the page is fully visible
     time.sleep(14)   # page load (coze.cn's SPA takes ~10 s)
+    for _ in range(8):   # smoke 43: coze.cn still showed its 「Loading...」 splash after 14 s on the emulator
+        r = dump(); t = texts(r) if r is not None else []
+        if not any(x.strip() in ("Loading...", "加载中", "加载中...") for x in t): break
+        time.sleep(5)
     return True
 
 
@@ -1597,7 +1601,12 @@ def coze_382():
     page and not a jump to Chrome. Token capture itself needs a real sign-in (phone + SMS) and is NOT tested here."""
     res = {"opened": False, "login_text": None, "chrome": False, "white": False}
     sh(f"am force-stop com.android.chrome")
-    sh(f"am start -n {PKG}/com.openminis.app.MainActivity --es mines_route plus_connections --es mines_open_kind coze", timeout=60)
+    # smoke 43: after the browser checks the deep link left the app on a chat (it does not navigate on the emulator);
+    # go home first and open 应用 → 扣子 through the self-test hook
+    b381_home()
+    selftest("openkind", "coze", timeout=20); time.sleep(5)
+    if not any("扣子" in x for x in (texts(dump()) or [])):
+        sh(f"am start -n {PKG}/com.openminis.app.MainActivity --es mines_route plus_connections --es mines_open_kind coze", timeout=60)
     time.sleep(7)
     r = snap("coze-detail")
     t = texts(r) if r is not None else []
