@@ -1070,6 +1070,32 @@ def tap_scrolled(prefix, tries=6, wait=4):
     return False
 
 
+def open_tab(label):
+    for _ in range(4):
+        r = dump()
+        p = next(((x, y) for tx, d, x, y, n in nodes(r) if (tx or d).startswith(label)), None)
+        if p and p[0] < SCREEN[0] - 40:
+            sh(f"input tap {p[0]} {p[1]}"); time.sleep(3); return True
+        a = next(((x, y) for tx, d, x, y, n in nodes(r) if (tx or d).startswith("账号异常 ")), None)
+        if not a: return False
+        sh(f"input swipe {int(SCREEN[0]*0.85)} {a[1]} {int(SCREEN[0]*0.15)} {a[1]} 300"); time.sleep(1.5)
+    return False
+
+
+def tap_pill_under(headline, pill):
+    """tap the action pill (text startswith pill) of the card whose headline contains [headline]"""
+    for _ in range(5):
+        r = dump()
+        h = next(((x, y) for tx, d, x, y, n in nodes(r) if headline in (tx or d)), None)
+        if h:
+            cand = sorted(((y, x) for tx, d, x, y, n in nodes(r) if (tx or d).startswith(pill) and y > h[1]), key=lambda v: v[0])
+            if cand and cand[0][0] < SCREEN[1] - 120:
+                sh(f"input tap {cand[0][1]} {cand[0][0]}"); return True
+        sh(f"input swipe {SCREEN[0]//2} {int(SCREEN[1]*0.7)} {SCREEN[0]//2} {int(SCREEN[1]*0.4)} 400"); time.sleep(1.5)
+    print(f"  (pill not reachable: {pill} under {headline})", flush=True)
+    return False
+
+
 def b353():
     """[build-35.3] 消息 buttons really act; 「去官网获取」 fills + saves a key from a (fake) page; account page masked + collapsed."""
     res = {}
@@ -1080,10 +1106,9 @@ def b353():
     if tap_text("打开消息页", wait=8):
         for attempt in range(2):
             r = dump()
-            p = next(((x, y) for tx, d, x, y, n in nodes(r) if (tx or d).startswith("值得关注 ")), None)
-            if p: sh(f"input tap {p[0]} {p[1]}"); time.sleep(3)
+            open_tab("值得关注 ")
             snap("b353-deal-tab")
-            if tap_scrolled("帮我领：SmokeAI", wait=2):
+            if tap_pill_under("SmokeAI", "✦ 帮我领"):
                 snap("b353-deal-tapped")  # 「处理中…」 / toast
                 ok = False
                 for _ in range(10):
@@ -1102,12 +1127,10 @@ def b353():
     # ---- 2. 账号异常 「一键修复」 → repair flow (KeyAgentDialog) ----
     go_home()
     if tap_text("打开消息页", wait=8):
-        r = dump()
-        p = next(((x, y) for tx, d, x, y, n in nodes(r) if (tx or d).startswith("账号异常 ")), None)
-        if p: sh(f"input tap {p[0]} {p[1]}"); time.sleep(3)
+        open_tab("账号异常 ")
         snap("b353-account-tab")
         ok = False
-        if tap_scrolled("一键修复：", wait=2):
+        if tap_pill_under("SmokeKey", "✦ 一键修复"):
             for _ in range(8):
                 time.sleep(2)
                 r2 = dump(); t2 = " ".join(texts(r2)) if r2 is not None else ""
@@ -1143,10 +1166,12 @@ def b353():
     sh("settings put system font_scale 1.3"); time.sleep(3)
     go_home()
     selftest("openkind", "", timeout=20); time.sleep(5)
+    if not find(dump(), "搜索应用"):
+        tap_text("应用与账号", wait=6)
     full = "deningyang740@qq.com"
     # bring the 已连接 section on screen without tapping
     for _ in range(6):
-        r = dump(); p = node_by_desc(r, "商汤 SenseNova：")
+        r = dump(); p = node_by_desc(r, "商汤 SenseNova")
         if p and 150 < p[1] < SCREEN[1] - 150: break
         sh(f"input swipe {SCREEN[0]//2} {int(SCREEN[1]*0.75)} {SCREEN[0]//2} {int(SCREEN[1]*0.35)} 400"); time.sleep(1.5)
     r = snap("b353-accounts-collapsed")
@@ -1154,8 +1179,8 @@ def b353():
     t = "\n".join(texts(r)) if r is not None else ""
     collapsed_ok = ("个账号" in t) and ("API Key · " not in t)
     if full in t: selftest_fail.append("b353 full e-mail shown (collapsed)")
-    tap_scrolled("商汤 SenseNova：", wait=2)
-    tap_scrolled("QQ 邮箱：", wait=2)
+    tap_scrolled("商汤 SenseNova", wait=2)
+    tap_scrolled("QQ 邮箱", wait=2)
     r = snap("b353-accounts-expanded")
     subprocess.run(f"cp {OUT}/{step_no:02d}-b353-accounts-expanded.png {OUT}/accounts-expanded.png", shell=True)
     t = "\n".join(texts(r)) if r is not None else ""
