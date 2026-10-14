@@ -27,6 +27,10 @@ try:
     B353 = "b353" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
 except Exception:
     B353 = False
+try:
+    B36 = "b36" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
+except Exception:
+    B36 = False
 step_no = 0
 crashed = []
 
@@ -1192,6 +1196,128 @@ def b353():
     sh("settings put system font_scale 1.0"); time.sleep(2)
 
 
+def b36_home():
+    for _ in range(4):
+        r = dump()
+        if r is not None and find(r, "最近对话"): return r
+        if r is not None and (find(r, "Google search") or find(r, "At a glance")): break
+        sh("input keyevent KEYCODE_BACK"); time.sleep(2)
+    sh(f"monkey -p {PKG} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1"); time.sleep(8)
+    return dump()
+
+
+def shot36(name):
+    r = snap("b36-" + name)
+    subprocess.run(f"cp {OUT}/{step_no:02d}-b36-{name}.png {OUT}/b36-{name}.png", shell=True)
+    return r
+
+
+def b36():
+    """[build-36] warm UI: home = conversations + bottom bar (消息 badge); 消息 = 4 tabs + 「N 件要处理」 strip + detail
+    sheet with a working main pill; settings = 6 groups; 账号连接 masked at font 1.3; voice page + voice settings."""
+    res = {}
+    j = selftest_json("feedinject", "both", timeout=30)
+    print(f"B36 inject {j}", flush=True)
+    selftest_json("fakeaccounts", "", timeout=20)
+    r = b36_home(); time.sleep(3)
+    r = shot36("home")
+    t = "\n".join(texts(r)) if r is not None else ""
+    res["home"] = "最近对话" in t and "消息" in t
+    for bad in ("打开消息页", "要处理的消息", "工作位置："):
+        if bad in t: selftest_fail.append(f"b36 home still shows {bad}")
+    if not res["home"]: page_missing.append("b36 home (最近对话 + 消息 tab)")
+    # ---- 消息 from the bottom bar ----
+    if not tap_text("消息", exact=True, wait=5): tap_text("消息，", wait=5)
+    time.sleep(4)
+    r = shot36("messages")
+    tx = texts(r) if r is not None else []
+    res["tabs"] = all(any(x.startswith(lab) for x in tx) for lab in ("账号异常", "X", "GitHub", "值得关注"))
+    res["old_tabs_gone"] = not any(x.startswith(("我关注的", "全部 ", "✎")) for x in tx)
+    res["summary"] = any("件要处理" in x for x in tx)
+    if not res["tabs"]: selftest_fail.append("b36 消息 tabs missing")
+    if not res["old_tabs_gone"]: selftest_fail.append("b36 old tabs (我关注的/全部/✎) still shown")
+    if any(x.endswith(": null") or "：null" in x for x in tx): selftest_fail.append("b36 null shown on 消息 page")
+    # ---- 「去看」 → 账号异常, open the SmokeKey card's detail sheet ----
+    if not tap_text("去看", wait=3): open_tab("账号异常")
+    time.sleep(2)
+    shot36("account-tab")
+    opened = False
+    for _ in range(4):
+        r = dump()
+        h = next(((x, y) for tx_, d, x, y, n in nodes(r) if "SmokeKey" in (tx_ or d) and not (tx_ or d).startswith(("一键修复", "去处理"))), None)
+        if h and h[1] < SCREEN[1] - 200:
+            sh(f"input tap {h[0]} {h[1]}"); time.sleep(3)
+            if find(dump(), "包含的内容") or find(dump(), "关闭"): opened = True; break
+        sh(f"input swipe {SCREEN[0]//2} {int(SCREEN[1]*0.7)} {SCREEN[0]//2} {int(SCREEN[1]*0.4)} 400"); time.sleep(1.5)
+    r = shot36("detail")
+    res["detail"] = opened
+    if not opened: selftest_fail.append("b36 detail sheet did not open")
+    else:
+        pill = None
+        for lab in ("一键修复：", "去处理：", "开始吧：", "帮我领："):
+            pill = find(r, lab)
+            if pill: break
+        res["pill"] = bool(pill)
+        if pill:
+            sh(f"input tap {pill[0]} {pill[1]}")
+            ok = False
+            for _ in range(8):
+                time.sleep(2)
+                t2 = " ".join(texts(dump()) or [])
+                if any(w in t2 for w in ("正在修复", "正在接入", "不会点任何付费按钮", "处理中", "账号连接", "重新检测")): ok = True; break
+            shot36("detail-pill-tapped")
+            res["pill_acts"] = ok
+            if not ok: selftest_fail.append("b36 detail main pill did nothing")
+            tap_text("关闭", exact=True, wait=2)
+        else: selftest_fail.append("b36 detail main pill not found")
+    for _ in range(4): sh("input keyevent KEYCODE_BACK"); time.sleep(1.2)
+    # ---- settings: 6 groups ----
+    b36_home()
+    if not (tap_text("设置", exact=True, wait=4) or tap_text("Settings", exact=True, wait=4)):
+        sh(f"am start -n {PKG}/com.openminis.app.MainActivity --es mines_route settings"); time.sleep(4)
+    r = shot36("settings")
+    t = "\n".join(texts(r)) if r is not None else ""
+    res["settings6"] = all(w in t for w in ("语音", "账号与 AI 服务", "网络", "数据", "外观", "测试与上报"))
+    if not res["settings6"]: selftest_fail.append("b36 settings 6 groups not all shown")
+    if tap_text("账号与 AI 服务", wait=3): shot36("settings-ai"); sh("input keyevent KEYCODE_BACK"); time.sleep(1.5)
+    for _ in range(3): sh("input keyevent KEYCODE_BACK"); time.sleep(1.2)
+    # ---- 账号连接 at font 1.3: masked, one line per service ----
+    sh("settings put system font_scale 1.3"); time.sleep(3)
+    b36_home()
+    if not tap_text("应用", exact=True, wait=5): selftest("openkind", "", timeout=20); time.sleep(5)
+    time.sleep(3)
+    r = shot36("connections")
+    t = "\n".join(texts(r)) if r is not None else ""
+    res["conn_title"] = "账号连接" in t
+    if "deningyang740@qq.com" in t: selftest_fail.append("b36 full e-mail shown on 账号连接")
+    for _ in range(2):
+        sh(f"input swipe {SCREEN[0]//2} {int(SCREEN[1]*0.75)} {SCREEN[0]//2} {int(SCREEN[1]*0.35)} 400"); time.sleep(1.5)
+    shot36("connections-lower")
+    sh("settings put system font_scale 1.0"); time.sleep(2)
+    for _ in range(3): sh("input keyevent KEYCODE_BACK"); time.sleep(1.2)
+    # ---- voice page + its settings sheet ----
+    b36_home()
+    if not tap_text("实时语音", wait=6):
+        sh(f"am start -n {PKG}/com.openminis.app.MainActivity --es mines_route plus_voice_live"); time.sleep(5)
+    time.sleep(3)
+    r = shot36("voice")
+    t = " ".join(texts(r)) if r is not None else ""
+    res["voice"] = bool(t)
+    if find(r, "线路") or find(r, "模型："): selftest_fail.append("b36 voice page shows route/model")
+    if tap_text("语音设置", wait=3) or tap_text("设置", wait=3):
+        r = shot36("voice-settings")
+        t = " ".join(texts(r)) if r is not None else ""
+        res["voice_now"] = "现在用" in t and "声音来源" in t
+        if not res["voice_now"]: page_missing.append("b36 voice settings 现在用 / 声音来源")
+    # ---- 60v2: voiceprint save from the bundled model within 5 s ----
+    jv = selftest_json("voiceprint", "assetsave", timeout=90)
+    print(f"B36 voiceprint assetsave {jv}", flush=True)
+    res["vp_save_ms"] = jv.get("save_ms")
+    if not jv.get("enrolled") or (jv.get("save_ms") or 99999) > 5000: selftest_fail.append(f"b36 voiceprint save {jv}")
+    print(f"B36 {res}", flush=True)
+    for _ in range(3): sh("input keyevent KEYCODE_BACK"); time.sleep(1.2)
+
+
 def main():
     m = re.search(r"(\d+)x(\d+)", sh("wm size"))
     if m: SCREEN[0], SCREEN[1] = int(m.group(1)), int(m.group(2))
@@ -1216,6 +1342,12 @@ def main():
         dump_fatal()
         user_like_state()
 
+    if B36:
+        try:
+            b36()
+        except Exception as e:
+            print("b36 error:", e, flush=True); selftest_fail.append(f"b36 error {e}")
+        return finish(lc)
     if B353:
         try:
             b353()
