@@ -1,0 +1,1030 @@
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt b/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt
+index bb41913..3762d50 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/DeskPetService.kt
+@@ -248,6 +248,7 @@ class DeskPetService : Service() {
+         petLp = lp
+         val view = PetView(this)
+         petView = view
++        if (PetBus.voicePageOpen.value) { view.visibility = android.view.View.GONE; lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE }
+         view.alpha = if (st.petPassThrough) 0.55f else 1f
+ 
+         var downX = 0f; var downY = 0f; var startX = 0; var startY = 0; var dragging = false
+@@ -471,6 +472,13 @@ class DeskPetService : Service() {
+         }
+         scope.launch { MinesJobs.jobs.collect { petView?.thinking = it.any { j -> j.running && !j.silent } } }
+         scope.launch { PetBus.talking.collect { petView?.talking = it } }
++        // [Mines-voice-35.2] the call page shows the character full size: hide the pet (and its bubble)
++        // while it is open so there are never two of them on screen; back when the page closes.
++        scope.launch {
++            PetBus.voicePageOpen.collect { open ->
++                applyVoicePageHide(open)
++            }
++        }
+         // [Mines-pet-32] charging → happy stretch then sits; late night → yawns now and then
+         scope.launch {
+             var wasCharging = false
+@@ -489,6 +497,7 @@ class DeskPetService : Service() {
+             var lastShown = 0L
+             VoiceSession.transcriptTick.collect {
+                 if (!VoiceSession.active) { if (lastShown > 0) { lastShown = 0; hideBubble() }; return@collect }
++                if (PetBus.voicePageOpen.value) return@collect
+                 val now = System.currentTimeMillis()
+                 if (now - lastShown < 350) delay(350 - (now - lastShown))
+                 lastShown = System.currentTimeMillis()
+@@ -587,6 +596,16 @@ class DeskPetService : Service() {
+         Overlays.update(wm, tv, lp)
+     }
+ 
++    /** [Mines-voice-35.2] Hidden = invisible AND not touchable, so the empty window can't eat taps on the call page. */
++    private fun applyVoicePageHide(hide: Boolean) {
++        val v = petView ?: return; val lp = petLp ?: return
++        v.visibility = if (hide) android.view.View.GONE else android.view.View.VISIBLE
++        val f = if (hide) lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
++            else if (st.petPassThrough) lp.flags else lp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
++        if (f != lp.flags) { lp.flags = f; runCatching { Overlays.update(wm, v, lp) } }
++        if (hide) { hideBubble(); runCatching { closePanel() } }
++    }
++
+     private fun hideBubble() {
+         bubble?.let { v -> Overlays.remove(wm, v) }
+         bubble = null; bubbleLp = null
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ExternalTts.kt b/src/android/app/src/main/java/com/openminis/app/plus/ExternalTts.kt
+index dc5a7b5..fd072d4 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/ExternalTts.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/ExternalTts.kt
+@@ -131,6 +131,12 @@ object ExternalTts {
+         return ChainSpeaker(c.applicationContext, s)
+     }
+ 
++    /** [Mines-voice-35.2] Voice for the backup channel: the user's external voice, else free Edge (→ phone TTS). */
++    fun backupSpeaker(c: Context): TtsSpeaker {
++        val s = settings(c)
++        return ChainSpeaker(c.applicationContext, if (s.engine == ENGINE_GEMINI) s.copy(engine = ENGINE_EDGE) else s)
++    }
++
+     /** Engine chain with automatic fallback. */
+     private class ChainSpeaker(private val c: Context, private val s: Settings) : TtsSpeaker {
+         override fun stream(text: String, cancelled: () -> Boolean, sink: (ByteArray, Int) -> Unit): Boolean {
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt b/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
+index 5aa40c2..6414be2 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/GeminiLive.kt
+@@ -79,8 +79,11 @@ class GeminiLive(
+          * setup → server closed with 1007 「Unknown name "responseModalities"
+          * at 'setup'」 on every route. Shared by the call and 测试语音.
+          */
++        /** [Mines-voice-35.2] Words the input transcription should prefer (they were misheard on the phone). */
++        val VOCAB = listOf("Mines", "声纹", "录入", "桌宠", "Gemini", "语音", "设置", "硅基流动", "DeepSeek", "OpenRouter", "服务器")
++
+         fun buildSetup(model: String, voice: String?, prompt: String?, tools: JSONArray? = null,
+-                       resumeHandle: String? = null, resumption: Boolean = false): JSONObject {
++                       resumeHandle: String? = null, resumption: Boolean = false, safe: Boolean = false): JSONObject {
+             val gen = JSONObject().put("responseModalities", JSONArray().put("AUDIO"))
+             if (!voice.isNullOrBlank()) gen.put("speechConfig", JSONObject().put("voiceConfig",
+                 JSONObject().put("prebuiltVoiceConfig", JSONObject().put("voiceName", voice))))
+@@ -89,9 +92,16 @@ class GeminiLive(
+             if (!prompt.isNullOrBlank()) setup.put("systemInstruction",
+                 JSONObject().put("parts", JSONArray().put(JSONObject().put("text", prompt))))
+             if (tools != null && tools.length() > 0) setup.put("tools", tools)
+-            setup.put("inputAudioTranscription", JSONObject())
++            // [Mines-voice-35.2] The user's words were transcribed with automatic language detection
++            // (「冷不冷交通管制」): hint Chinese first + a small vocabulary (AudioTranscriptionConfig
++            // languageCodes / customVocabulary, ai.google.dev/api/live). [safe] = the minimal setup
++            // used once after a rejection, without these extras.
++            setup.put("inputAudioTranscription", if (safe) JSONObject() else JSONObject()
++                .put("languageCodes", JSONArray().put("zh-CN").put("en-US"))
++                .put("customVocabulary", JSONArray(VOCAB)))
+             setup.put("outputAudioTranscription", JSONObject())
+             if (resumption) setup.put("sessionResumption", JSONObject().apply { resumeHandle?.let { put("handle", it) } })
++            if (safe) return JSONObject().put("setup", setup)
+             // [Mines-voice-31] Without context-window compression an audio
+             // session is capped (~15 min) and the server ends it; the sliding
+             // window keeps the system prompt and drops the oldest turns.
+@@ -100,12 +110,41 @@ class GeminiLive(
+             return JSONObject().put("setup", setup)
+         }
+ 
++            fun phoneTools(): JSONArray {
++            fun obj(vararg props: Pair<String, JSONObject>, required: List<String> = emptyList()) = JSONObject()
++                .put("type", "OBJECT")
++                .put("properties", JSONObject().apply { props.forEach { (k, v) -> put(k, v) } })
++                .apply { if (required.isNotEmpty()) put("required", JSONArray(required)) }
++            fun str(d: String) = JSONObject().put("type", "STRING").put("description", d)
++            fun bool(d: String) = JSONObject().put("type", "BOOLEAN").put("description", d)
++            return JSONArray()
++                .put(JSONObject().put("name", "phone_screen").put("description", "读取手机当前屏幕，返回带编号的可操作元素列表"))
++                .put(JSONObject().put("name", "phone_do")
++                    .put("description", "在手机上按顺序执行多步操作，最后返回新的屏幕列表。步骤用分号分隔：tap N | tap \"文字\" | type N 文字 | key back/home/enter | scroll down/up [次数] | wait 毫秒 | open 包名")
++                    .put("parameters", obj("steps" to str("要执行的步骤"), "confirmed" to bool("付款/下单/发送类操作：用户已口头确认时为 true"), required = listOf("steps"))))
++                .put(JSONObject().put("name", "phone_open_app").put("description", "按名字打开手机上的应用（如 微信、支付宝、美团）")
++                    .put("parameters", obj("name" to str("应用名或包名"), required = listOf("name"))))
++        }
++
++        /** [Mines-voice-35.2] The call's tool list (also used by 测试语音, so it tests what the call really sends). */
++        fun callTools(withPhone: Boolean): JSONArray {
++            val decls = if (withPhone) phoneTools() else JSONArray()
++            decls.put(MinesVoiceBridge.toolDeclaration())
++            decls.put(VoiceIntents.toolDeclaration())
++            return JSONArray().put(JSONObject().put("functionDeclarations", decls))
++        }
++
+         /** [Mines-voice-30] Server rejected the request itself (not the network): never fail over on this. */
+         fun isConfigError(code: Int, reason: String): Boolean {
++            // [Mines-voice-35.2] A bad key also closes with 1007 ("API key not valid"): that is a key error.
++            if (isKeyError(code, reason)) return false
+             if (code in listOf(1003, 1007, 1008)) return true
+             return listOf("Invalid JSON", "Unknown name", "Cannot find field", "INVALID_ARGUMENT", "invalid argument",
+                 "HTTP 400").any { reason.contains(it, true) }
+         }
++        fun isKeyError(code: Int, reason: String): Boolean =
++            reason.contains("API key", true) || reason.contains("API_KEY", true) || (code == 1008 && reason.contains("key", true))
++
+         /** [Mines-voice-29] Full passes over every route before falling back to 普通语音模式. */
+         const val MAX_ROUNDS = 3
+         const val DEFAULT_PROMPT =
+@@ -145,6 +184,23 @@ class GeminiLive(
+     val allFailed: StateFlow<Boolean> = _allFailed.asStateFlow()
+     private var netCb: android.net.ConnectivityManager.NetworkCallback? = null
+     @Volatile private var modelChecked = false
++    // [Mines-voice-35.2] What the server said last and what we sent last (besides mic audio):
++    // shown when the server closes without a reason, so the screen never ends in an empty 「：」.
++    @Volatile private var lastServerMsg = ""
++    @Volatile private var lastSent = ""
++    @Volatile private var configRetries = 0
++    @Volatile private var safeMode = false
++    private val cancelledCalls = java.util.Collections.synchronizedSet(HashSet<String>())
++    @Volatile private var lastToolAt = 0L
++    @Volatile private var handledUser = ""
++    @Volatile private var lastUserLineAt = 0L
++    private val _fallback = MutableStateFlow<String?>(null)
++    /**
++     * [Mines-voice-35.2] Set (with a plain reason) when Gemini can't carry the call: the server
++     * rejected the setup/model/key or no route works. VoiceSession then switches the call to the
++     * backup channel (phone speech recognition + Mines agent + external/Edge voice) by itself.
++     */
++    val fallback: StateFlow<String?> = _fallback.asStateFlow()
+     /** Off as soon as the cloned voice fails: Gemini's own audio plays again. */
+     @Volatile private var cloneOk = cloneVoice != null
+ 
+@@ -266,6 +322,7 @@ class GeminiLive(
+         routeSel = null
+         badRoutes.clear(); rounds = 0; sameRouteDrops = 0
+         _allFailed.value = false
++        configRetries = 0; safeMode = false; _fallback.value = null; lastServerMsg = ""; lastSent = ""
+         connect()
+     }
+ 
+@@ -280,6 +337,7 @@ class GeminiLive(
+         _error.value = GeminiRoute.plainSummary(tried) + "。\n可以先用「普通语音模式」（本机识别 + 你平时的聊天模型 + 朗读），网络变化时会自动再试 Gemini。" +
+             "\n（详细：" + report.takeLast(6).joinToString("；") + "）"
+         _phase.value = Phase.ERROR
++        _fallback.value = GeminiRoute.plainSummary(tried)
+         watchNetwork()
+     }
+ 
+@@ -348,12 +406,16 @@ class GeminiLive(
+                 val pick = GeminiRoute.pick(appContext, apiKey, model, badRoutes.keys.toSet()) { step -> _error.value = step }
+                 if (stopped) return@launch
+                 if (pick.keyProblem != null) {
+-                    _error.value = "Gemini 拒绝了这个 API Key：${pick.keyProblem}\n请在 账号连接 → Gemini 重新填写"
+-                    _phase.value = Phase.ERROR; return@launch
++                    _error.value = "Gemini 拒绝了这个 API Key：${pick.keyProblem}（请在 账号连接 → Gemini 重新填写）"
++                    _phase.value = Phase.ERROR
++                    _fallback.value = "Gemini Key 不对"
++                    return@launch
+                 }
+                 if (pick.configProblem != null) {
+-                    _error.value = "Gemini 拒绝了通话设置（配置错误，不是网络问题，线路是通的）：\n${pick.configProblem}"
+-                    _phase.value = Phase.ERROR; return@launch
++                    _error.value = "Gemini 拒绝了通话设置（配置错误，不是网络问题）：${pick.configProblem}"
++                    _phase.value = Phase.ERROR
++                    _fallback.value = "Gemini 拒绝了通话设置：${pick.configProblem}"
++                    return@launch
+                 }
+                 val r = pick.route
+                 if (r == null) {
+@@ -386,6 +448,7 @@ class GeminiLive(
+         val req = Request.Builder().url("$WS_URL?key=$apiKey").build()
+         ws = wsClient().newWebSocket(req, object : WebSocketListener() {
+             override fun onOpen(webSocket: WebSocket, response: Response) {
++                lastSent = if (safeMode) "setup（精简）" else "setup"
+                 webSocket.send(setupMessage().toString())
+             }
+             override fun onMessage(webSocket: WebSocket, text: String) = handle(text)
+@@ -440,10 +503,11 @@ class GeminiLive(
+             }
+             return
+         }
+-        val keyProblem = reason.contains("API key", true) || code == 1008 && reason.contains("key", true)
++        val keyProblem = GeminiLive.isKeyError(code, reason)
+         if (keyProblem) {
+             _error.value = "Gemini API Key 不对（服务器：$reason），请在 账号连接 里重新填写"
+             _phase.value = Phase.ERROR
++            _fallback.value = "Gemini Key 不对"
+             return
+         }
+         // [Mines-voice-30] A protocol/config rejection (1007 invalid payload,
+@@ -452,8 +516,32 @@ class GeminiLive(
+         // server's own words. Only socket-level errors fail over.
+         if (GeminiLive.isConfigError(code, reason)) {
+             retryJob?.cancel()
+-            _error.value = "Gemini 拒绝了通话设置（配置错误，不是网络问题）：\n" + reason.ifBlank { "代码 $code" }
++            val detail = closeDetail(code, reason)
++            logEvent("服务器拒绝：$detail")
++            // [Mines-voice-35.2] build-35.1 on the phone: the call ran 2 min, then 「Gemini 拒绝了通话设置…：」
++            // with nothing after the colon — the reason sat on a 2nd line the call screen never shows.
++            // The setup had been accepted on this call, so it is not the setup: open a fresh session
++            // (no resumption handle) once or twice; then try the minimal setup; only then give up on
++            // Gemini and let VoiceSession move the call to the backup channel.
++            if (setupAt > 0 && configRetries < 2) {
++                configRetries++
++                resumeHandle = null
++                _phase.value = Phase.CONNECTING
++                _error.value = "刚才断了一下，正在重新接上…"
++                retryJob = scope.launch { kotlinx.coroutines.delay(300); if (!stopped) openSocket() }
++                return
++            }
++            if (!safeMode) {
++                safeMode = true
++                resumeHandle = null
++                logEvent("改用精简设置再试一次")
++                _phase.value = Phase.CONNECTING
++                retryJob = scope.launch { kotlinx.coroutines.delay(300); if (!stopped) openSocket() }
++                return
++            }
++            _error.value = "Gemini 拒绝了通话（$detail）"
+             _phase.value = Phase.ERROR
++            _fallback.value = "Gemini 拒绝了通话（$detail）"
+             return
+         }
+         // [Mines-voice-29] Route failover. A socket that dies before setup, or
+@@ -486,69 +574,120 @@ class GeminiLive(
+         }
+     }
+ 
++    /** [Mines-voice-35.2] 「代码 1007：<server reason>」, or the last server message when the reason is empty. */
++    private fun closeDetail(code: Int, reason: String): String {
++        val r = reason.trim()
++        if (r.isNotEmpty()) return "代码 $code：$r"
++        return "代码 $code，服务器没写原因" +
++            (lastServerMsg.takeIf { it.isNotBlank() }?.let { "；最后一条服务器消息：$it" } ?: "") +
++            (lastSent.takeIf { it.isNotBlank() }?.let { "；最后发出：$it" } ?: "")
++    }
++
+     private fun setupMessage(): JSONObject {
+         val prompt = if (appContext != null) systemPrompt + "\n" + PHONE_PROMPT else systemPrompt
+         // [Mines-voice-34] mines_task (hand the request to the Mines agent) is always there; phone tools when allowed.
+-        val decls = if (appContext != null) phoneTools() else JSONArray()
+-        decls.put(MinesVoiceBridge.toolDeclaration())
+-        return buildSetup(_modelInUse.value, voice, prompt,
+-            tools = JSONArray().put(JSONObject().put("functionDeclarations", decls)),
+-            resumeHandle = resumeHandle, resumption = true)
++        return buildSetup(_modelInUse.value, voice, prompt + "\n" + VoiceIntents.PROMPT,
++            tools = callTools(appContext != null),
++            resumeHandle = resumeHandle, resumption = true, safe = safeMode)
+     }
+ 
+     /** [Mines-voice-34] A note the model reads (not shown as the user's words), e.g. a finished Mines task. */
+     fun sendNote(text: String) {
+         if (text.isBlank() || stopped) return
++        lastSent = "备注文字（${text.take(20)}…）"
+         (liveWs ?: ws)?.send(JSONObject().put("realtimeInput", JSONObject().put("text", text)).toString())
+     }
+ 
+-    private fun phoneTools(): JSONArray {
+-        fun obj(vararg props: Pair<String, JSONObject>, required: List<String> = emptyList()) = JSONObject()
+-            .put("type", "OBJECT")
+-            .put("properties", JSONObject().apply { props.forEach { (k, v) -> put(k, v) } })
+-            .apply { if (required.isNotEmpty()) put("required", JSONArray(required)) }
+-        fun str(d: String) = JSONObject().put("type", "STRING").put("description", d)
+-        fun bool(d: String) = JSONObject().put("type", "BOOLEAN").put("description", d)
+-        return JSONArray()
+-            .put(JSONObject().put("name", "phone_screen").put("description", "读取手机当前屏幕，返回带编号的可操作元素列表"))
+-            .put(JSONObject().put("name", "phone_do")
+-                .put("description", "在手机上按顺序执行多步操作，最后返回新的屏幕列表。步骤用分号分隔：tap N | tap \"文字\" | type N 文字 | key back/home/enter | scroll down/up [次数] | wait 毫秒 | open 包名")
+-                .put("parameters", obj("steps" to str("要执行的步骤"), "confirmed" to bool("付款/下单/发送类操作：用户已口头确认时为 true"), required = listOf("steps"))))
+-            .put(JSONObject().put("name", "phone_open_app").put("description", "按名字打开手机上的应用（如 微信、支付宝、美团）")
+-                .put("parameters", obj("name" to str("应用名或包名"), required = listOf("name"))))
+-    }
+-
+-    /** Execute the model's phone-control calls and send the results back. */
++    /** Execute the model's tool calls (Mines task, open a page, phone control) and send the results back. */
+     private fun handleToolCall(calls: JSONArray) {
+         // [Mines-voice-34] mines_task works without phone control (uses the app context of the bridge)
+-        val ctx = appContext ?: bridgeContext ?: return
++        val ctx = appContext ?: bridgeContext
++        lastToolAt = System.currentTimeMillis()
+         scope.launch {
+             val responses = JSONArray()
+             for (i in 0 until calls.length()) {
+                 val c = calls.optJSONObject(i) ?: continue
++                val name = c.optString("name")
+                 val args = c.optJSONObject("args") ?: JSONObject()
+-                val ui = com.openminis.app.sandbox.offload.FastUi(ctx)
+-                val out = runCatching {
+-                    when (c.optString("name")) {
++                logEvent("工具调用 $name " + args.toString().take(80))
++                var failed = false
++                val out = if (ctx == null) { failed = true; "没办成：Mines 还没准备好（没有应用上下文）" } else runCatching {
++                    when (name) {
+                         "mines_task" -> MinesVoiceBridge.start(ctx, args.optString("task")) { result ->
+-                            sendNote("（Mines 刚完成你交给它的任务，结果如下，请用一两句口语告诉用户）\n" + result)
+-                            append(false, "✓ " + result.take(120))
++                            val bad = result.startsWith("没办成")
++                            sendNote("（Mines 刚完成你交给它的任务，结果如下，请用一两句口语告诉用户" +
++                                (if (bad) "；任务失败了，要直说没办成和原因" else "") + "）\n" + result)
++                            append(false, (if (bad) "✗ " else "✓ ") + result.take(120))
+                         }
+-                        "phone_screen" -> ui.voiceScreen()
+-                        "phone_do" -> ui.voiceDo(args.optString("steps"), args.optBoolean("confirmed", false))
+-                        "phone_open_app" -> ui.voiceOpenApp(args.optString("name"))
+-                        else -> "未知工具"
++                        VoiceIntents.TOOL -> VoiceIntents.open(ctx, args.optString("page")).also { append(false, "→ $it") }
++                        "phone_screen" -> com.openminis.app.sandbox.offload.FastUi(ctx).voiceScreen()
++                        "phone_do" -> com.openminis.app.sandbox.offload.FastUi(ctx).voiceDo(args.optString("steps"), args.optBoolean("confirmed", false))
++                        "phone_open_app" -> com.openminis.app.sandbox.offload.FastUi(ctx).voiceOpenApp(args.optString("name"))
++                        else -> { failed = true; "没办成：没有叫 $name 的工具" }
+                     }
+-                }.getOrElse { "出错：${it.message}" }
+-                responses.put(JSONObject().put("id", c.optString("id")).put("name", c.optString("name"))
++                }.getOrElse { failed = true; "没办成：${it.message ?: it.javaClass.simpleName}" }
++                // [Mines-voice-35.2] a failed tool is said out loud, never silently swallowed
++                if (failed) append(false, "✗ $name：" + out.removePrefix("没办成：").take(100))
++                val id = c.optString("id")
++                if (id.isNotBlank() && cancelledCalls.remove(id)) { logEvent("工具 $name 已被服务器取消，不回结果"); continue }
++                responses.put(JSONObject().apply { if (id.isNotBlank()) put("id", id) }.put("name", name)
+                     .put("response", JSONObject().put("result", out.take(6000))))
+             }
+-            (liveWs ?: ws)?.send(JSONObject().put("toolResponse", JSONObject().put("functionResponses", responses)).toString())
++            if (responses.length() == 0) return@launch
++            lastSent = "toolResponse（" + (0 until responses.length()).joinToString { responses.getJSONObject(it).optString("name") } + "）"
++            val w = liveWs ?: ws
++            if (w == null) logEvent("工具结果没发出去：连接已断")
++            else w.send(JSONObject().put("toolResponse", JSONObject().put("functionResponses", responses)).toString())
++            logEvent("已回工具结果 " + lastSent)
++        }
++    }
++
++    /**
++     * [Mines-voice-35.2] Safety net for "答应了却没做" (phone, build-35.1: 「设定好我的声音录入」 →
++     * 「我马上为您设置」 and nothing happened). When the user's turn names something Mines can
++     * open directly (声纹录入 …) it opens here, whatever the model does. When the model only
++     * promised out loud (「我去办 / 马上 / 现在就」) and called no tool in that turn, the request
++     * goes to the Mines agent anyway and the transcript says so.
++     */
++    private fun afterTurn() {
++        val ctx = appContext ?: bridgeContext ?: return
++        val ls = _lines.value
++        val user = ls.lastOrNull { it.user }?.text?.trim().orEmpty()
++        val answer = ls.lastOrNull()?.takeIf { !it.user }?.text.orEmpty()
++        if (user.isBlank() || user == handledUser) return
++        handledUser = user
++        val userAt = lastUserLineAt
++        val page = VoiceIntents.match(user)
++        if (page != null) {
++            if (VoiceIntents.recentlyOpened(page)) return
++            val r = VoiceIntents.open(ctx, page)
++            append(false, "→ $r")
++            sendNote("（系统备注：已经替用户打开了「${VoiceIntents.label(page)}」，请简短告诉用户照屏幕提示做，不要再说你会去设置）")
++            return
++        }
++        if (!VoiceIntents.isPromise(answer) || System.currentTimeMillis() - userAt > 60_000) return
++        scope.launch {
++            // the model may still send its tool call right after the spoken promise (async calling)
++            kotlinx.coroutines.delay(2500)
++            if (stopped || lastToolAt >= userAt) return@launch
++            logEvent("只口头答应、没调用工具 → 直接交给 Mines：" + user.take(40))
++            append(false, "（刚才只是口头答应，现在真的交给 Mines 去办）")
++            MinesVoiceBridge.start(ctx, user) { result ->
++                val bad = result.startsWith("没办成")
++                sendNote("（Mines 刚完成用户刚才的请求，结果如下，请用一两句口语告诉用户）\n" + result)
++                append(false, (if (bad) "✗ " else "✓ ") + result.take(120))
++            }
+         }
+     }
+ 
+     private fun handle(text: String) {
+         val msg = runCatching { JSONObject(text) }.getOrNull() ?: return
++        lastServerMsg = summarize(msg)
++        msg.optJSONObject("toolCallCancellation")?.optJSONArray("ids")?.let { ids ->
++            for (i in 0 until ids.length()) cancelledCalls.add(ids.optString(i))
++            logEvent("服务器取消了工具调用 " + (0 until ids.length()).joinToString { ids.optString(it) })
++            return
++        }
+         msg.optJSONObject("toolCall")?.optJSONArray("functionCalls")?.let { handleToolCall(it); return }
+         msg.optJSONObject("sessionResumptionUpdate")?.let { u ->
+             if (u.optBoolean("resumable", true)) u.optString("newHandle").takeIf { it.isNotBlank() }?.let { resumeHandle = it }
+@@ -600,7 +739,7 @@ class GeminiLive(
+             track?.let { runCatching { it.pause(); it.flush(); it.play() } }
+             _phase.value = Phase.LISTENING
+         }
+-        sc.optJSONObject("inputTranscription")?.optString("text")?.let { if (it.isNotBlank()) appendStream(true, it) }
++        sc.optJSONObject("inputTranscription")?.optString("text")?.let { if (it.isNotBlank()) { appendStream(true, it); lastUserLineAt = System.currentTimeMillis() } }
+         sc.optJSONObject("outputTranscription")?.optString("text")?.let { if (it.isNotBlank()) { appendStream(false, it); queueSpeech(it) } }
+         val parts = sc.optJSONObject("modelTurn")?.optJSONArray("parts")
+         if (parts != null) for (i in 0 until parts.length()) {
+@@ -615,6 +754,7 @@ class GeminiLive(
+         }
+         if (sc.optBoolean("turnComplete")) {
+             queueSpeech("", flush = true)
++            runCatching { afterTurn() }.onFailure { Log.w(TAG, "afterTurn", it) }
+             if (cloneOk) return
+             scope.launch {
+                 kotlinx.coroutines.delay(600)
+@@ -623,6 +763,20 @@ class GeminiLive(
+         }
+     }
+ 
++    /** Short description of a server message for the error line (never the audio payload). */
++    private fun summarize(m: JSONObject): String {
++        val k = m.keys().asSequence().toList()
++        val sc = m.optJSONObject("serverContent")
++        val body = when {
++            m.has("error") -> m.optJSONObject("error")?.toString()?.take(160)
++            sc != null -> sc.keys().asSequence().filter { it != "modelTurn" }.joinToString(",") +
++                (if (sc.has("modelTurn")) ",modelTurn" else "")
++            m.has("toolCall") -> m.optJSONObject("toolCall")?.toString()?.take(120)
++            else -> m.toString().take(120)
++        }
++        return k.joinToString(",") + (body?.let { " $it" } ?: "")
++    }
++
+     private fun append(user: Boolean, text: String) {
+         _lines.value = (_lines.value + Line(user, text)).takeLast(60)
+     }
+@@ -662,26 +816,32 @@ class GeminiLive(
+         // wait for it so the call doesn't record silence.
+         val until = System.currentTimeMillis() + 2500
+         while (PetBus.wakeMicHeld.value && System.currentTimeMillis() < until) Thread.sleep(100)
+-        val inMin = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+-        val rec = AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, 16000,
+-            AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(inMin, 3200) * 2)
+-        record = rec
+-        if (rec.state != AudioRecord.STATE_INITIALIZED) {
++        val rec = openMic()
++        if (rec == null) {
+             _error.value = "麦克风打不开（可能被别的应用占用），点 测试语音 看看"
+             _phase.value = Phase.ERROR
+             return
+         }
+-        if (AcousticEchoCanceler.isAvailable()) aec = AcousticEchoCanceler.create(rec.audioSessionId)?.apply { enabled = true }
+-        if (NoiseSuppressor.isAvailable()) ns = NoiseSuppressor.create(rec.audioSessionId)?.apply { enabled = true }
+-        rec.startRecording()
+         // [Mines-voiceprint-34] only the enrolled voice reaches Gemini when 声纹 is on
+         val vpCtx = appContext ?: bridgeContext
+         val vpGate = vpCtx?.let { runCatching { Voiceprint.gate(it) }.getOrNull() }
+         _voiceprintOn.value = vpGate != null
+         micJob = scope.launch {
+             val buf = ByteArray(3200) // 100 ms
++            var r: AudioRecord? = rec
+             while (isActive && !stopped) {
+-                val n = rec.read(buf, 0, buf.size)
++                // [Mines-voice-35.2] 声纹录入 (opened from the call) needs the mic: let go of it
++                // while it records, take it back afterwards; the call itself stays up.
++                if (PetBus.micExclusive.value || PetBus.enrolling.value) {
++                    if (r != null) { releaseMic(); r = null; _level.value = 0f; logEvent("麦克风让给声纹录入") }
++                    kotlinx.coroutines.delay(200); continue
++                }
++                if (r == null) {
++                    r = openMic()
++                    if (r == null) { kotlinx.coroutines.delay(500); continue }
++                    logEvent("麦克风已拿回")
++                }
++                val n = r.read(buf, 0, buf.size)
+                 if (n <= 0) continue
+                 var sum = 0.0
+                 var i = 0
+@@ -702,11 +862,28 @@ class GeminiLive(
+         }
+     }
+ 
+-    private fun stopAudio() {
+-        micJob?.cancel(); micJob = null
++    @SuppressLint("MissingPermission")
++    private fun openMic(): AudioRecord? {
++        val inMin = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
++        val rec = runCatching { AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, 16000,
++            AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(inMin, 3200) * 2) }.getOrNull() ?: return null
++        if (rec.state != AudioRecord.STATE_INITIALIZED) { runCatching { rec.release() }; return null }
++        record = rec
++        if (AcousticEchoCanceler.isAvailable()) aec = AcousticEchoCanceler.create(rec.audioSessionId)?.apply { enabled = true }
++        if (NoiseSuppressor.isAvailable()) ns = NoiseSuppressor.create(rec.audioSessionId)?.apply { enabled = true }
++        rec.startRecording()
++        return rec
++    }
++
++    private fun releaseMic() {
+         runCatching { record?.stop() }; runCatching { record?.release() }; record = null
+         runCatching { aec?.release() }; aec = null
+         runCatching { ns?.release() }; ns = null
++    }
++
++    private fun stopAudio() {
++        micJob?.cancel(); micJob = null
++        releaseMic()
+         runCatching { track?.stop() }; runCatching { track?.release() }; track = null
+         _level.value = 0f
+     }
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/GeminiRoute.kt b/src/android/app/src/main/java/com/openminis/app/plus/GeminiRoute.kt
+index cea0eb3..039a904 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/GeminiRoute.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/GeminiRoute.kt
+@@ -179,8 +179,9 @@ object GeminiRoute {
+             if (hs.startsWith("✓")) { lastGood = r.label; return Pick(r, p.models, report, model = model, tried = tried + Tried(r, Fail.NONE, "ok")) }
+             // [Mines-voice-30] The route works (HTTPS ok, socket opened) but the server rejected the setup:
+             // every other route would get the same answer, so stop and report it as a config error.
+-            if (hs.startsWith(CONFIG_MARK) && hs.contains("API key", true))
+-                return Pick(null, emptyList(), report, hs.removePrefix(CONFIG_MARK), tried = tried)
++            // [Mines-voice-35.2] a bad key closes with 1007 "API key not valid": key problem, not config
++            if (hs.contains("API key", true) || hs.contains("API_KEY", true))
++                return Pick(null, emptyList(), report, hs.removePrefix(CONFIG_MARK).removePrefix("✗ "), tried = tried)
+             if (hs.startsWith(CONFIG_MARK)) return Pick(null, p.models, report, model = model,
+                 tried = tried + Tried(r, Fail.NONE, "config"), configProblem = hs.removePrefix(CONFIG_MARK))
+             tried += Tried(r, Fail.LIVE, hs.removePrefix("✗ "))
+@@ -217,9 +218,9 @@ object GeminiRoute {
+      * microphone and speaker. Blocking (≈10–30 s); IO thread. One line per check.
+      */
+     @SuppressLint("MissingPermission")
+-    fun diagnose(context: Context, wantedModel: String): List<String> {
++    fun diagnose(context: Context, wantedModel: String, keyOverride: String? = null): List<String> {
+         val out = ArrayList<String>()
+-        val key = apiKey()
++        val key = keyOverride ?: apiKey()
+         if (key == null) { out += "✗ 没有 Gemini API Key：账号连接 → Gemini 里填写"; return out }
+         out += "✓ API Key：…${key.takeLast(4)}"
+         // [Mines-voice-29] Same selection as the call: proxy port check, HTTPS, Live handshake per route.
+@@ -276,7 +277,9 @@ object GeminiRoute {
+         val ws = client(route, 0).newWebSocket(Request.Builder().url(GeminiLive.WS_URL + "?key=" + key).build(), object : WebSocketListener() {
+             override fun onOpen(webSocket: WebSocket, response: Response) {
+                 // [Mines-voice-30] Same setup shape as the call (generationConfig.responseModalities).
+-                webSocket.send(GeminiLive.buildSetup(model, GeminiLive.DEFAULT_VOICE, null).toString())
++                // [Mines-voice-35.2] the call's full setup (tools, transcription hints, resumption, compression)
++                webSocket.send(GeminiLive.buildSetup(model, GeminiLive.DEFAULT_VOICE, GeminiLive.DEFAULT_PROMPT,
++                    tools = GeminiLive.callTools(true), resumption = true).toString())
+             }
+             override fun onMessage(webSocket: WebSocket, text: String) {
+                 if (text.contains("setupComplete")) { result = "✓ Live 实时通道握手成功（$model）"; done.countDown() }
+@@ -284,7 +287,7 @@ object GeminiRoute {
+             override fun onMessage(webSocket: WebSocket, bytes: okio.ByteString) = onMessage(webSocket, bytes.utf8())
+             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                 result = (if (GeminiLive.isConfigError(code, reason)) CONFIG_MARK else "✗ ") +
+-                    "服务器关闭了连接（$code）：${reason.ifBlank { "没有说明" }}"; done.countDown()
++                    "服务器关闭了连接（代码 $code）：${reason.ifBlank { "服务器没写原因" }}"; done.countDown()
+             }
+             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                 result = "✗ Live 连接失败：" + (response?.let { "HTTP ${it.code} ${it.message} " } ?: "") + shortErr(t); done.countDown()
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PetStatus.kt b/src/android/app/src/main/java/com/openminis/app/plus/PetStatus.kt
+index 7c206af..1eb2cf1 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/PetStatus.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/PetStatus.kt
+@@ -46,6 +46,10 @@ object PetBus {
+     val wakeMicHeld = MutableStateFlow(false)
+     /** [Mines-voiceprint-35] something else (声纹录入 / 试一下) needs the mic exclusively; the wake word lets go. */
+     val micExclusive = MutableStateFlow(false)
++    /** [Mines-voice-35.2] The 声纹录入 page is open: calls keep their hands off the mic. */
++    val enrolling = MutableStateFlow(false)
++    /** [Mines-voice-35.2] The full-screen call page is showing: the desk pet hides (no second character). */
++    val voicePageOpen = MutableStateFlow(false)
+ }
+ 
+ /**
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlainVoice.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlainVoice.kt
+index a4d7a81..fcf799c 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/PlainVoice.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/PlainVoice.kt
+@@ -29,7 +29,14 @@ import java.util.concurrent.TimeUnit
+  * system TTS → listen again. Offered by the Live screen when every Gemini
+  * route failed.
+  */
+-class PlainVoice(private val context: Context) {
++class PlainVoice(private val context: Context, initialNote: String? = null) {
++    /**
++     * [Mines-voice-35.2] Small line on the call screen saying the backup channel is in use and
++     * why (e.g. 「Gemini 拒绝了通话（代码 1007：…）」); null when the user chose this mode.
++     */
++    private val _note = MutableStateFlow(initialNote)
++    val note: StateFlow<String?> = _note.asStateFlow()
++    fun setNote(n: String?) { _note.value = n }
+     enum class Phase { IDLE, LISTENING, THINKING, SPEAKING, ERROR }
+ 
+     private val _phase = MutableStateFlow(Phase.IDLE)
+@@ -83,6 +90,8 @@ class PlainVoice(private val context: Context) {
+     private suspend fun loop() {
+         var misses = 0
+         while (currentCoroutineContextActive()) {
++            // [Mines-voice-35.2] 声纹录入 is recording: don't fight it for the mic
++            if (PetBus.enrolling.value || PetBus.micExclusive.value) { _status.value = "正在录入声纹，录完继续"; delay(400); continue }
+             _phase.value = Phase.LISTENING
+             _status.value = "请说话…"
+             val heard = withContext(Dispatchers.IO) { Listen.once(context, maxSec = 20) }
+@@ -98,6 +107,16 @@ class PlainVoice(private val context: Context) {
+             }
+             misses = 0
+             add(true, heard.text)
++            // [Mines-voice-35.2] 「录入我的声音」 etc.: open the page, don't just talk about it
++            val page = VoiceIntents.match(heard.text)
++            if (page != null) {
++                val r = VoiceIntents.open(context, page)
++                add(false, "→ $r")
++                _phase.value = Phase.SPEAKING
++                speak(if (page == VoiceIntents.VOICEPRINT) "好，已经打开声纹录入，照屏幕提示读三句话就行。" else "好，已经打开${VoiceIntents.label(page)}。")
++                delay(1500)
++                continue
++            }
+             _phase.value = Phase.THINKING
+             _status.value = "正在想…"
+             val sid = ensureSession()
+@@ -126,7 +145,35 @@ class PlainVoice(private val context: Context) {
+     private fun clean(t: String) = t.replace(Regex("```[\\s\\S]*?```"), "（代码略）")
+         .replace(Regex("[*#>`|_]+"), "").replace(Regex("\\[(.*?)]\\(.*?\\)"), "$1").take(1500)
+ 
++    /**
++     * [Mines-voice-35.2] Read the answer with the user's voice choice: cloned voice → external
++     * (OpenRouter) → free Edge → phone TTS, the same chain as a Gemini call with an external voice.
++     */
+     private fun speak(text: String) {
++        if (text.isBlank()) return
++        val sp = runCatching { VoiceClone.speaker(context) ?: ExternalTts.backupSpeaker(context) }.getOrNull()
++        if (sp != null) {
++            val ok = runCatching {
++                val min = android.media.AudioTrack.getMinBufferSize(24000, android.media.AudioFormat.CHANNEL_OUT_MONO, android.media.AudioFormat.ENCODING_PCM_16BIT)
++                val track = android.media.AudioTrack.Builder()
++                    .setAudioAttributes(android.media.AudioAttributes.Builder().setUsage(android.media.AudioAttributes.USAGE_ASSISTANT)
++                        .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH).build())
++                    .setAudioFormat(android.media.AudioFormat.Builder().setSampleRate(24000).setEncoding(android.media.AudioFormat.ENCODING_PCM_16BIT)
++                        .setChannelMask(android.media.AudioFormat.CHANNEL_OUT_MONO).build())
++                    .setBufferSizeInBytes(maxOf(min * 4, 48000)).setTransferMode(android.media.AudioTrack.MODE_STREAM).build()
++                var bytes = 0L
++                try {
++                    track.play()
++                    for (part in text.split(Regex("(?<=[。！？!?；;\\n])")).map { it.trim() }.filter { it.isNotEmpty() }) {
++                        if (job?.isActive != true) break
++                        sp.stream(part, { job?.isActive != true }) { b, n -> track.write(b, 0, n); bytes += n; PetBus.feedPcm(b, n) }
++                    }
++                    // let the buffer play out
++                    Thread.sleep(minOf(1500L, 200L + bytes / 48))
++                } finally { runCatching { track.stop() }; track.release() }
++            }.isSuccess
++            if (ok) return
++        }
+         val t = tts ?: return
+         if (!ttsReady) return
+         val done = CountDownLatch(1)
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
+index 60deff6..2fa1dc8 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
+@@ -324,6 +324,35 @@ class SelfTestProvider : ContentProvider() {
+                 }
+                 out.putString("result", r ?: "{\"ok\":false,\"error\":\"timeout\"}")
+             }
++            "voicediag" -> {
++                // [Mines-voice-35.2] 测试语音 with the given (fake) key: must say KEY error, never config error
++                val c = context!!
++                PlusVault.init(c)
++                val lines = GeminiRoute.diagnose(c, GeminiLive.DEFAULT_MODEL, arg?.takeIf { it.isNotBlank() } ?: "AIzaSyDUMMYDUMMYDUMMYDUMMYDUMMYDUMMYDUM")
++                val all = lines.joinToString("\n")
++                val kind = when {
++                    all.contains("配置错误") -> "config"
++                    all.contains("Key 被拒") || all.contains("API key", true) || all.contains("换一个有效的 Key") -> "key"
++                    all.contains("握手成功") -> "ok"
++                    else -> "network"
++                }
++                out.putString("result", org.json.JSONObject().put("kind", kind).put("lines", org.json.JSONArray(lines)).toString())
++            }
++            "voiceintent" -> {
++                // [Mines-voice-35.2] arg = what the user said; a match opens the page (声纹录入 on the voice screen)
++                val c = context!!
++                val text = arg ?: "设定好我的声音录入"
++                val page = VoiceIntents.match(text)
++                val j = org.json.JSONObject().put("page", page ?: "").put("promise", VoiceIntents.isPromise("好，我马上为您设置录入声音"))
++                if (page != null) {
++                    val r = java.util.concurrent.atomic.AtomicReference<String>()
++                    val l = java.util.concurrent.CountDownLatch(1)
++                    android.os.Handler(android.os.Looper.getMainLooper()).post { r.set(runCatching { VoiceIntents.open(c, page) }.getOrElse { "ERR " + it.message }); l.countDown() }
++                    l.await(5, TimeUnit.SECONDS)
++                    j.put("opened", r.get())
++                }
++                out.putString("result", j.toString())
++            }
+             "cardfill" -> {
+                 // [Mines-cards-35.1] 填卡 JS on a local payment form (test card 4242…), OCR parsing, Luhn, and
+                 // the per-account WebView profile (多账号隔离). Never uses a real card.
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/VoiceIntents.kt b/src/android/app/src/main/java/com/openminis/app/plus/VoiceIntents.kt
+new file mode 100644
+index 0000000..3d7d640
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/VoiceIntents.kt
+@@ -0,0 +1,91 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import android.content.Intent
++import kotlinx.coroutines.flow.MutableStateFlow
++import org.json.JSONArray
++import org.json.JSONObject
++
++/**
++ * [Mines-voice-35.2] Things said in a call that Mines can just DO on the phone, instead of the
++ * voice only promising them (phone, build-35.1: 「设定好我的声音录入」 → 「我马上为您设置」, nothing
++ * opened). Used three ways: the `open_mines_page` tool the Live model can call, a keyword match on
++ * the user's own words after each turn (works even when the model forgets the tool), and the
++ * backup channel ([PlainVoice]) before the request goes to the agent.
++ */
++object VoiceIntents {
++    const val TOOL = "open_mines_page"
++    const val VOICEPRINT = "voiceprint_enroll"
++    const val VOICE_SETTINGS = "voice_settings"
++    const val CONNECTIONS = "connections"
++
++    const val PROMPT = "用户要录入/设置自己的声音或声纹、改语音设置、打开账号连接时，直接调用 open_mines_page 打开对应页面，" +
++        "不要只口头答应。任何工具失败都要直说没办成和原因。"
++
++    /** Page the voice screen should open now (consumed and cleared by VoiceLiveScreen). */
++    val request = MutableStateFlow<String?>(null)
++    private val openedAt = HashMap<String, Long>()
++
++    fun label(page: String) = when (page) {
++        VOICEPRINT -> "声纹录入"
++        VOICE_SETTINGS -> "语音设置"
++        CONNECTIONS -> "账号连接"
++        else -> page
++    }
++
++    fun toolDeclaration(): JSONObject = JSONObject()
++        .put("name", TOOL)
++        .put("description", "在手机上直接打开 Mines 的某个页面：voiceprint_enroll=录入用户的声音/声纹（只听用户的声音），" +
++            "voice_settings=语音设置（换声音、语速），connections=账号连接（填 API Key）。")
++        .put("parameters", JSONObject().put("type", "OBJECT")
++            .put("properties", JSONObject().put("page", JSONObject().put("type", "STRING")
++                .put("enum", JSONArray().put(VOICEPRINT).put(VOICE_SETTINGS).put(CONNECTIONS))
++                .put("description", "要打开的页面")))
++            .put("required", JSONArray().put("page")))
++
++    private val notMine = Regex("你的声音|换.{0,3}(个)?声音|声音.{0,3}(大|小|快|慢|好听)|音色")
++    private val voiceprint = listOf(
++        Regex("(录|设|定|登记|注册|采集|添加|建立|弄|做|存).{0,6}(声纹|我的声音|我自己的声音|我的嗓音)"),
++        Regex("(声纹|我的声音|声音录入).{0,4}(录入|录一下|录一遍|登记|设置|设定|弄好|搞好)"),
++        Regex("只听我(的声音|说话)"),
++    )
++    private val voiceSettings = Regex("(打开|进入|去|开).{0,3}语音设置|(换|改).{0,4}(声音|音色)")
++    private val connections = Regex("(打开|进入|去).{0,3}(账号连接|账号管理|填.{0,3}(key|密钥))", RegexOption.IGNORE_CASE)
++
++    /** The page the user's words ask for, or null. */
++    fun match(userText: String): String? {
++        val t = userText.replace(Regex("[\\s，。！？,.!?]"), "")
++        if (t.isEmpty()) return null
++        if (voiceprint.any { it.containsMatchIn(t) } && !notMine.containsMatchIn(t.replace("我的声音", ""))) return VOICEPRINT
++        if (connections.containsMatchIn(t)) return CONNECTIONS
++        if (voiceSettings.containsMatchIn(t)) return VOICE_SETTINGS
++        return null
++    }
++
++    private val promise = Regex("我去办|我这就|(帮你|为您|给你)去|马上(为您|为你|帮你|给你|去|就)|现在就(去|帮|为)|我来(帮你|为您)?(设置|处理|办|弄)|这就去|正在为您|稍等(一下)?我")
++
++    /** True when the answer only promised to act (「好，我马上为您设置」). */
++    fun isPromise(answer: String) = promise.containsMatchIn(answer)
++
++    @Synchronized fun recentlyOpened(page: String): Boolean {
++        val t = openedAt[page] ?: return false
++        return System.currentTimeMillis() - t < 15_000
++    }
++
++    /** Opens [page]; returns one plain line for the transcript / the tool result. */
++    @Synchronized fun open(c: Context, page: String): String {
++        val p = when (page) { VOICEPRINT, VOICE_SETTINGS, CONNECTIONS -> page; else -> return "没办成：没有「$page」这个页面" }
++        openedAt[p] = System.currentTimeMillis()
++        val ui = com.openminis.app.ui.plus.PlusNav
++        val routes = com.openminis.app.ui.plus.PlusRoutes
++        if (p == CONNECTIONS) ui.go(routes.CONNECTIONS) else { request.value = p; ui.go(routes.VOICE) }
++        // bring Mines to the front when the call runs in the background (may be refused by Android;
++        // then the page is opened the next time Mines is shown)
++        val front = runCatching {
++            c.startActivity(Intent(c, com.openminis.app.MainActivity::class.java)
++                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT))
++        }.isSuccess
++        android.util.Log.i("MinesVoice", "open page $p front=$front")
++        return "已打开「${label(p)}」" + if (p == VOICEPRINT) "，照屏幕提示读三句话就行" else ""
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/VoiceSession.kt b/src/android/app/src/main/java/com/openminis/app/plus/VoiceSession.kt
+index c4d400c..6c89f0a 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/VoiceSession.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/VoiceSession.kt
+@@ -47,7 +47,40 @@ object VoiceSession {
+     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+     private var watchJobs: List<Job> = emptyList()
+ 
+-    val active: Boolean get() = _live.value != null
++    /**
++     * [Mines-voice-35.2] Backup channel of the same call (phone speech recognition → Mines agent
++     * → external / Edge voice). Started by itself when Gemini rejects the setup, model or key or
++     * no route works, so the user is never left on an error; or by the user (普通语音模式).
++     */
++    private val _backup = MutableStateFlow<PlainVoice?>(null)
++    val backup: StateFlow<PlainVoice?> = _backup.asStateFlow()
++
++    val active: Boolean get() = _live.value != null || _backup.value != null
++
++    /** Moves the call to the backup channel; [why] is shown in small text (null = user's choice). */
++    fun startBackup(context: Context, why: String?) {
++        val c = context.applicationContext
++        val g = _live.value
++        _live.value = null
++        watchJobs.forEach { it.cancel() }; watchJobs = emptyList()
++        g?.stop()
++        _backup.value?.let { it.setNote(why); it.start(); return }
++        val p = PlainVoice(c, why?.let { "备用通道（手机识别 + Mines + 朗读）· $it" })
++        _backup.value = p
++        PetBus.inCall.value = true
++        runCatching { ContextCompat.startForegroundService(c, Intent(c, VoiceCallService::class.java)) }
++        watchJobs = listOf(
++            scope.launch { p.phase.collect { PetBus.talking.value = it == PlainVoice.Phase.SPEAKING } },
++            scope.launch {
++                p.lines.collect { ls ->
++                    ls.lastOrNull { it.user }?.let { lastUser.value = it.text.trim() }
++                    ls.lastOrNull { !it.user }?.let { lastAnswer.value = it.text.trim() }
++                    transcriptTick.value = System.currentTimeMillis()
++                }
++            },
++        )
++        if (hasMic(c)) p.start()
++    }
+ 
+     fun hasMic(c: Context) = ContextCompat.checkSelfPermission(c, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+ 
+@@ -58,6 +91,7 @@ object VoiceSession {
+     fun start(context: Context): StartResult {
+         val c = context.applicationContext
+         if (_live.value != null) return StartResult.ALREADY
++        _backup.value?.let { it.stop(); _backup.value = null }
+         PlusVault.init(c)
+         val key = GeminiRoute.apiKey() ?: return StartResult.NO_KEY
+         if (!hasMic(c)) return StartResult.NO_MIC
+@@ -84,6 +118,15 @@ object VoiceSession {
+         watchJobs.forEach { it.cancel() }
+         watchJobs = listOf(
+             scope.launch { g.phase.collect { PetBus.talking.value = it == GeminiLive.Phase.SPEAKING } },
++            // [Mines-voice-35.2] Gemini can't carry the call → continue on the backup channel by itself
++            scope.launch {
++                g.fallback.collect { why ->
++                    if (why != null && _live.value === g) {
++                        android.util.Log.i("MinesVoice", "fallback to backup channel: $why")
++                        startBackup(c, why)
++                    }
++                }
++            },
+             scope.launch {
+                 g.lines.collect { ls ->
+                     ls.lastOrNull { it.user }?.let { lastUser.value = it.text.trim() }
+@@ -99,6 +142,7 @@ object VoiceSession {
+     fun stop(context: Context) {
+         val g = _live.value
+         _live.value = null
++        _backup.value?.stop(); _backup.value = null
+         watchJobs.forEach { it.cancel() }; watchJobs = emptyList()
+         g?.stop()
+         PetBus.inCall.value = false
+@@ -114,7 +158,7 @@ object VoiceSession {
+     }
+ 
+     fun toggle(context: Context): StartResult =
+-        if (_live.value != null) { stop(context); StartResult.ALREADY } else start(context)
++        if (active) { stop(context); StartResult.ALREADY } else start(context)
+ }
+ 
+ /** [Mines-voice-31] Keeps the call (and the mic) alive when Mines is not on screen. */
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Voiceprint.kt b/src/android/app/src/main/java/com/openminis/app/plus/Voiceprint.kt
+index e7f3d98..656f6fc 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/Voiceprint.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/Voiceprint.kt
+@@ -274,6 +274,11 @@ object Voiceprint {
+         private enum class St { SILENT, PENDING, PASS, BLOCK }
+         private var st = St.SILENT
+         private val pending = ArrayList<ByteArray>()
++        // [Mines-voice-35.2] Speech held back while blocked. build-34/35 replaced it with silence
++        // for good, so when a later check said "it IS you" the first 1–2 s were already gone and
++        // Gemini heard the sentence without its start (phone: 「冷不冷交通管制…」). Now it is kept
++        // (≤ 2.5 s) and sent first when a re-check passes.
++        private val held = ArrayList<ByteArray>()
+         private val ring = ShortArray(RATE * 2)
+         private var ringPos = 0
+         private var ringFill = 0
+@@ -319,7 +324,7 @@ object Voiceprint {
+                     if (voicedSinceCheck < 800 && pending.size < 12) return emptyList()
+                     val s = score(); voicedSinceCheck = 0
+                     return if (s >= threshold) { st = St.PASS; val out = ArrayList(pending); pending.clear(); out }
+-                    else { st = St.BLOCK; lastRejectAt.value = System.currentTimeMillis(); val k = pending.size; pending.clear(); List(k) { silence.copyOf(n) } }
++                    else { st = St.BLOCK; lastRejectAt.value = System.currentTimeMillis(); held.clear(); held.addAll(pending); val k = pending.size; pending.clear(); List(k) { silence.copyOf(n) } }
+                 }
+                 St.PASS -> {
+                     if (silentMs >= 1200) st = St.SILENT
+@@ -330,10 +335,11 @@ object Voiceprint {
+                     return listOf(copy)
+                 }
+                 St.BLOCK -> {
+-                    if (silentMs >= 800) { st = St.SILENT; return listOf(copy) }
+-                    if (voicedSinceCheck >= 1000) {
++                    if (silentMs >= 800) { st = St.SILENT; held.clear(); return listOf(copy) }
++                    held.add(copy); while (held.size > 25) held.removeAt(0)
++                    if (voicedSinceCheck >= 600) {
+                         voicedSinceCheck = 0
+-                        if (score() >= threshold + 0.05f) { st = St.PASS; return listOf(copy) }
++                        if (score() >= threshold + 0.05f) { st = St.PASS; val out = ArrayList(held); held.clear(); return out }
+                     }
+                     return listOf(silence.copyOf(n))
+                 }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
+index f84253d..62d4426 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
+@@ -134,10 +134,27 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+         )
+     }
+     // [Mines-voice-29] 普通语音模式 (no Google): local STT → normal chat model → TTS.
+-    var plainMode by remember { mutableStateOf(false) }
+-    val plain = remember { com.openminis.app.plus.PlainVoice(context.applicationContext) }
+-    DisposableEffect(plain) { onDispose { plain.stop() } }
+-    fun enterPlain() { hungUp = true; com.openminis.app.plus.VoiceSession.stop(context); plainMode = true; if (hasMic) plain.start() else askMic.launch(Manifest.permission.RECORD_AUDIO) }
++    // [Mines-voice-35.2] It is now the call's backup channel, held by VoiceSession: Gemini
++    // rejecting the setup / model / key or no route working switches to it by itself.
++    val backupState by com.openminis.app.plus.VoiceSession.backup.collectAsState()
++    val plainMode = backupState != null
++    fun enterPlain() { hungUp = true; if (hasMic) com.openminis.app.plus.VoiceSession.startBackup(context, null) else askMic.launch(Manifest.permission.RECORD_AUDIO) }
++    // [Mines-voice-35.2] the desk pet hides while this page shows the character (no second figure)
++    DisposableEffect(Unit) {
++        com.openminis.app.plus.PetBus.voicePageOpen.value = true
++        onDispose { com.openminis.app.plus.PetBus.voicePageOpen.value = false }
++    }
++    // [Mines-voice-35.2] pages asked for by voice (「录入我的声音」 → 声纹录入)
++    var showEnrol by remember { mutableStateOf(false) }
++    val intentReq by com.openminis.app.plus.VoiceIntents.request.collectAsState()
++    LaunchedEffect(intentReq) {
++        when (intentReq) {
++            com.openminis.app.plus.VoiceIntents.VOICEPRINT -> showEnrol = true
++            com.openminis.app.plus.VoiceIntents.VOICE_SETTINGS -> showSettings = true
++        }
++        if (intentReq != null) com.openminis.app.plus.VoiceIntents.request.value = null
++    }
++    if (showEnrol) VoiceprintEnrolDialog(onDone = { showEnrol = false })
+     if (showSettings) VoiceSettingsSheet(onDismiss = { showSettings = false }, onChanged = { com.openminis.app.plus.VoiceSession.restart(context) })
+     // [Mines-design-34] Showcase voice page (design33 screen 09): frosted haze over the blurred
+     // character, voice-reactive rings in the character colour, glass transcript bubbles, a glass
+@@ -169,9 +186,10 @@ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+                 Spacer(Modifier.weight(1f))
+                 GlassCircle(com.openminis.app.ui.brand.MinesIcons.named("ellipsis")!!, "语音设置") { showSettings = true }
+             }
+-            if (plainMode) {
+-                PlainVoiceContent(plain, onBackToLive = if (key != null) ({ plain.stop(); plainMode = false; hungUp = false; com.openminis.app.plus.VoiceSession.start(context) }) else null,
+-                    onHangUp = { plain.stop(); onBack() })
++            val plain = backupState
++            if (plain != null) {
++                PlainVoiceContent(plain, onBackToLive = if (key != null) ({ hungUp = false; com.openminis.app.plus.VoiceSession.start(context) }) else null,
++                    onHangUp = { hungUp = true; com.openminis.app.plus.VoiceSession.stop(context); onBack() })
+                 return@Column
+             }
+             if (live == null) {
+@@ -489,12 +507,15 @@ private fun PlainVoiceContent(plain: com.openminis.app.plus.PlainVoice, onBackTo
+     val phase by plain.phase.collectAsState()
+     val status by plain.status.collectAsState()
+     val lines by plain.lines.collectAsState()
++    val note by plain.note.collectAsState()
+     Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
+         Spacer(Modifier.height(24.dp))
+         PetAvatar(size = 96.dp)
+         Spacer(Modifier.height(12.dp))
+-        Text("普通语音模式", color = Color.White, style = MaterialTheme.typography.titleMedium)
+-        Text("本机识别 → 你平时的聊天模型 → 朗读", color = Color(0xFFB8C2D6), fontSize = 13.sp)
++        Text(com.openminis.app.plus.Avatars.name(currentCharacter()), color = Color.White, style = MaterialTheme.typography.titleMedium)
++        // [Mines-voice-35.2] small print only: which channel and why
++        Text(note ?: "普通语音模式（手机识别 + Mines + 朗读）", color = Color(0xFFB8C2D6), fontSize = 13.sp, textAlign = TextAlign.Center,
++            modifier = Modifier.padding(horizontal = 24.dp))
+         Spacer(Modifier.height(8.dp))
+         Text(
+             status ?: when (phase) {
+@@ -539,6 +560,8 @@ internal fun plainVoiceError(raw: String): String {
+     val first = raw.lineSequence().firstOrNull { it.isNotBlank() }.orEmpty()
+         .replace(Regex("[（(]线路[：:][^）)]*[）)]"), "").replace(Regex("线路[：:].*"), "").trim().trimEnd('，', ',', '·')
+     return when {
++        // [Mines-voice-35.2] a rejection keeps the server's own words (build-35.1 showed only 「…：」)
++        first.contains("拒绝") -> if (first.length > 140) first.take(140) + "…" else first
+         first.contains("重连") -> "连接断了，正在重连…"
+         first.isBlank() -> "连不上，点「重新连接」"
+         first.length > 40 -> first.take(40) + "…"
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceprintSection.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceprintSection.kt
+index 08de468..667c46b 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceprintSection.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceprintSection.kt
+@@ -128,6 +128,11 @@ fun VoiceprintEnrolDialog(onDone: () -> Unit) {
+     var modelReady by remember { mutableStateOf(Voiceprint.hasModel(c)) }
+     var denied by remember { mutableStateOf(false) }
+     val progress by Voiceprint.progress.collectAsState()
++    // [Mines-voice-35.2] a running call lets go of the mic while this page is open
++    androidx.compose.runtime.DisposableEffect(Unit) {
++        com.openminis.app.plus.PetBus.enrolling.value = true
++        onDispose { com.openminis.app.plus.PetBus.enrolling.value = false }
++    }
+     val level by Voiceprint.level.collectAsState()
+     var hasMic by remember {
+         mutableStateOf(ContextCompat.checkSelfPermission(c, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
