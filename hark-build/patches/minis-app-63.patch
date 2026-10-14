@@ -36,6 +36,22 @@ index 9d16beb..179fd7d 100644
      <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
      <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
      <!-- [Mines-wake-25] offline wake word listens with the mic in a foreground service -->
+diff --git a/src/android/app/src/main/java/com/openminis/app/MainActivity.kt b/src/android/app/src/main/java/com/openminis/app/MainActivity.kt
+index 68fe7ee..0b3f6af 100644
+--- a/src/android/app/src/main/java/com/openminis/app/MainActivity.kt
++++ b/src/android/app/src/main/java/com/openminis/app/MainActivity.kt
+@@ -725,7 +725,10 @@ class MainActivity : ComponentActivity() {
+         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+         val code = getSharedPreferences(PREF_APPEARANCE, MODE_PRIVATE).getString(KEY_LANGUAGE, "") ?: ""
+         val localeManager = getSystemService(LocaleManager::class.java) ?: return
+-        val desired = if (code.isEmpty()) LocaleList.getEmptyLocaleList() else LocaleList.forLanguageTags(code)
++        // [Mines-38.1b] 「跟随系统」 (empty) must not wipe a language picked for Mines in Android's own per-app
++        // language settings (it did: every launch reset it, so system Settings → Apps → Mines → 语言 never stuck)
++        if (code.isEmpty()) return
++        val desired = LocaleList.forLanguageTags(code)
+         if (localeManager.applicationLocales.toLanguageTags() != desired.toLanguageTags()) {
+             localeManager.applicationLocales = desired
+         }
 diff --git a/src/android/app/src/main/java/com/openminis/app/browser/BrowserHistory.kt b/src/android/app/src/main/java/com/openminis/app/browser/BrowserHistory.kt
 index 44901c4..36a75e3 100644
 --- a/src/android/app/src/main/java/com/openminis/app/browser/BrowserHistory.kt
@@ -477,7 +493,7 @@ index 406a84c..76f9951 100644
      /** Payment-form iframes we may write into (cross-origin card fields). */
      val PAY_ORIGINS = setOf(
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
-index 0b722dc..b9eb32d 100644
+index 0b722dc..c5168ef 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
 @@ -112,6 +112,38 @@ class SelfTestProvider : ContentProvider() {
@@ -519,6 +535,15 @@ index 0b722dc..b9eb32d 100644
              "degen" -> {
                  // [Mines-degen-34] detector on built-in samples: garbage must trip, normal text must not
                  val rnd = java.util.Random(7)
+@@ -183,7 +215,7 @@ class SelfTestProvider : ContentProvider() {
+                             kotlinx.coroutines.runBlocking {
+                                 runCatching { Voiceprint.ensureModel(c) }.onFailure { j.put("model_error", it.message) }
+                                 j.put("model", Voiceprint.hasModel(c)).put("model_ms", System.currentTimeMillis() - t0)
+-                                val clips = (0 until 3).map { Voiceprint.recordUtterance() }
++                                val clips = (0 until 3).map { Voiceprint.recordUtterance().also { cl -> Voiceprint.prepare(c, cl) } }
+                                 j.put("clip_samples", clips.sumOf { it.size })
+                                 if (Voiceprint.hasModel(c)) runCatching {
+                                     j.put("quality", Voiceprint.saveEnrolment(c, clips).toDouble())
 @@ -201,11 +233,14 @@ class SelfTestProvider : ContentProvider() {
                          Voiceprint.inject = "speech"
                          try {
@@ -528,7 +553,7 @@ index 0b722dc..b9eb32d 100644
 +                                // while the three phrases are recorded, then 保存 is timed
                                  runCatching { Voiceprint.modelFile(c).delete() }
 +                                Voiceprint.warm(c)
-+                                val clips = (0 until 3).map { Voiceprint.recordUtterance() }
++                                val clips = (0 until 3).map { Voiceprint.recordUtterance().also { cl -> Voiceprint.prepare(c, cl) } }
                                  j.put("asset", Voiceprint.hasAsset(c))
                                  val t0 = System.currentTimeMillis()
 -                                runCatching { Voiceprint.ensureModel(c); j.put("quality", Voiceprint.saveEnrolment(c, clips).toDouble()) }
@@ -642,10 +667,18 @@ index 6c89f0a..98722c2 100644
          if (!hasMic(c)) return StartResult.NO_MIC
          val userVoice = PlusVault.extra("gemini", "voice").takeIf { PlusVault.extra("gemini", "voice_user") == "1" }
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Voiceprint.kt b/src/android/app/src/main/java/com/openminis/app/plus/Voiceprint.kt
-index e0b99ef..c345bd8 100644
+index e0b99ef..90a2318 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/Voiceprint.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/Voiceprint.kt
-@@ -82,7 +82,7 @@ object Voiceprint {
+@@ -10,6 +10,7 @@ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.async
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withContext
+ import okhttp3.OkHttpClient
+@@ -82,7 +83,7 @@ object Voiceprint {
       * 150 s cap per source, and a plain reason at the end.
       */
      suspend fun ensureModel(c: Context) = withContext(Dispatchers.IO) {
@@ -654,7 +687,7 @@ index e0b99ef..c345bd8 100644
          modelMutex.lock()
          try {
              if (hasModel(c)) return@withContext
-@@ -102,6 +102,23 @@ object Voiceprint {
+@@ -102,6 +103,23 @@ object Voiceprint {
  
      private val modelMutex = kotlinx.coroutines.sync.Mutex()
  
@@ -678,16 +711,130 @@ index e0b99ef..c345bd8 100644
      const val ASSET = "models/campplus.onnx"
      fun hasAsset(c: Context): Boolean = runCatching { c.assets.open(ASSET).use { true } }.getOrDefault(false)
  
-@@ -311,7 +328,8 @@ object Voiceprint {
+@@ -187,6 +205,8 @@ object Voiceprint {
+         }
+     }
  
++    private val embedLock = Any()
++
+     /** Embedding of 16 kHz PCM (normalized to unit length), or null when too short. */
+     fun embed(c: Context, pcm: ShortArray, from: Int = 0, len: Int = pcm.size): FloatArray? {
+         val ex = try { extractor(c) } catch (t: Throwable) {
+@@ -195,14 +215,16 @@ object Voiceprint {
+             runCatching { modelFile(c).delete() }
+             throw IllegalStateException("声纹模型损坏，已删除，请重试（会重新下载）")
+         }
+-        val st = ex.createStream()
+-        try {
+-            val f = FloatArray(len) { pcm[from + it] / 32768f }
+-            st.acceptWaveform(f, RATE)
+-            st.inputFinished()
+-            if (!ex.isReady(st)) return null
+-            return normalize(ex.compute(st))
+-        } finally { st.release() }
++        val f = FloatArray(len) { pcm[from + it] / 32768f }
++        synchronized(embedLock) {   // [Mines-38.1b] phrases are now embedded in the background; one at a time
++            val st = ex.createStream()
++            try {
++                st.acceptWaveform(f, RATE)
++                st.inputFinished()
++                if (!ex.isReady(st)) return null
++                return normalize(ex.compute(st))
++            } finally { st.release() }
++        }
+     }
+ 
+     fun normalize(v: FloatArray): FloatArray {
+@@ -309,9 +331,28 @@ object Voiceprint {
+         return out
+     }
+ 
++    /**
++     * [Mines-38.1b] Each phrase is embedded in the background as soon as it is recorded, so 「保存」 only waits for
++     * the last one (smoke run 36: all three embeddings at save time took 9.4 s on the emulator).
++     */
++    private val pre = java.util.Collections.synchronizedMap(java.util.IdentityHashMap<ShortArray, kotlinx.coroutines.Deferred<FloatArray?>>())
++    fun prepare(c: Context, clip: ShortArray) {
++        val app = c.applicationContext
++        if (pre.size > 8) pre.clear()
++        pre[clip] = bgScope.async(Dispatchers.Default) {
++            runCatching { awaitWarm(); embed(app, clip) }.getOrNull()
++        }
++    }
++
      /** Saves the average of the phrase embeddings. Returns the self-similarity (quality hint). */
      fun saveEnrolment(c: Context, clips: List<ShortArray>): Float {
 -        val embs = clips.mapNotNull { embed(c, it) }
 +        _progress.value = "正在保存你的声纹…"
-+        val embs = try { clips.mapNotNull { embed(c, it) } } finally { _progress.value = null }
++        val embs = try {
++            clips.mapNotNull { clip ->
++                val d = pre.remove(clip)
++                (if (d != null) runCatching { kotlinx.coroutines.runBlocking { d.await() } }.getOrNull() else null) ?: embed(c, clip)
++            }
++        } finally { _progress.value = null }
          if (embs.size < 2) throw IllegalStateException("录到的声音太短或太小，再录一次")
          val dim = embs[0].size
          val sum = FloatArray(dim)
+diff --git a/src/android/app/src/main/java/com/openminis/app/service/SessionActivityTracker.kt b/src/android/app/src/main/java/com/openminis/app/service/SessionActivityTracker.kt
+index 0b07d15..92d71e6 100644
+--- a/src/android/app/src/main/java/com/openminis/app/service/SessionActivityTracker.kt
++++ b/src/android/app/src/main/java/com/openminis/app/service/SessionActivityTracker.kt
+@@ -893,6 +893,7 @@ object SessionActivityTracker {
+                 return
+             }
+             serviceWanted = true
++            cancelPendingStop()
+             AgentForegroundService.startService(
+                 context,
+                 sessionCountForNotification(),
+@@ -912,6 +913,7 @@ object SessionActivityTracker {
+                 return
+             }
+             serviceWanted = true
++            cancelPendingStop()
+             AgentForegroundService.startService(
+                 context,
+                 sessionCountForNotification(),
+@@ -968,15 +970,36 @@ object SessionActivityTracker {
+         }
+     }
+ 
++    /**
++     * [Mines-38.1b] Stops are debounced. Smoke run 36 (API 34): the chat route was left and re-entered three times
++     * within 100 ms, so startForegroundService() was followed by stopService() before the new instance reached
++     * startForeground() → "Bringing down service while still waiting for start foreground" →
++     * ForegroundServiceDidNotStartInTimeException killed the process. Now a stop waits [STOP_DEBOUNCE_MS]; any
++     * start/update in between cancels it, and the delayed stop re-checks under the lock.
++     */
++    private val stopHandler by lazy { android.os.Handler(android.os.Looper.getMainLooper()) }
++    private const val STOP_DEBOUNCE_MS = 1500L
++    private val pendingStop = Runnable {
++        val context = appContext ?: return@Runnable
++        synchronized(serviceLock) {
++            if (shouldRunService()) return@Runnable
++            serviceWanted = false
++            AgentForegroundService.stopService(context)
++            Log.d(TAG, "All sessions complete, service stopped")
++        }
++    }
++
++    private fun cancelPendingStop() { runCatching { stopHandler.removeCallbacks(pendingStop) } }
++
+     private fun stopService() {
+-        val context = appContext ?: run {
++        if (appContext == null) {
+             Log.w(TAG, "Context not initialized, cannot stop service")
+             return
+         }
+         synchronized(serviceLock) {
+             serviceWanted = false
+-            AgentForegroundService.stopService(context)
+-            Log.d(TAG, "All sessions complete, service stopped")
++            stopHandler.removeCallbacks(pendingStop)
++            stopHandler.postDelayed(pendingStop, STOP_DEBOUNCE_MS)
+         }
+     }
+ }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/brand/MinesIcons.kt b/src/android/app/src/main/java/com/openminis/app/ui/brand/MinesIcons.kt
 index e7fb64c..d6a561a 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/brand/MinesIcons.kt
@@ -1004,7 +1151,7 @@ index 3abd64e..b7d0adf 100644
      val ratio = contrastRatio(fg, bg)
      PlusSection("卡片文字颜色", footer = "首页「工作位置 / 服务器 / 账号」卡片和问候语的文字颜色。自动 = 按卡片明暗选白字或黑字，保证看得清。") {
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
-index feb81e5..9c44cdb 100644
+index feb81e5..9844e4c 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
 @@ -78,6 +78,8 @@ import kotlin.coroutines.resume
@@ -1162,7 +1309,7 @@ index feb81e5..9c44cdb 100644
      if (editFollows) {
          var text by remember { mutableStateOf(Digest.follows(context).joinToString("\n")) }
          var who by remember { mutableStateOf(Digest.senders(context).joinToString("\n")) }
-@@ -393,55 +416,56 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
+@@ -393,55 +416,55 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
      val actLabel = actLabelOf(it)
      var liked by remember(it.id) { mutableStateOf(false) }
      val sender = feedClean(com.openminis.app.plus.AccountLabel.maskText(it.sender))?.takeIf { s -> s != it.source }
@@ -1196,8 +1343,7 @@ index feb81e5..9c44cdb 100644
                      }
                      Text((if (it.pinned) "置顶 · " else "") + listOfNotNull(sender ?: it.source.takeIf { s -> s.isNotBlank() }, relTime(it.at)).joinToString(" · "),
 -                        fontSize = 15.sp, color = m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-+                        fontSize = 12.sp, color = m.ink2, maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
-+                    Spacer(Modifier.weight(1f))
++                        fontSize = 12.sp, color = m.ink2, maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))   // [38.1b] was weight(fill=false)+Spacer(weight): text got half the row and cut 「1 小时前」
                      val mark = when { isX -> com.openminis.app.R.drawable.ic_brand_x; isGh -> com.openminis.app.R.drawable.ic_brand_github; else -> 0 }
                      if (mark != 0) androidx.compose.foundation.Image(androidx.compose.ui.res.painterResource(mark), contentDescription = it.source,
 -                        modifier = Modifier.padding(start = 6.dp).size(18.dp))
@@ -1240,7 +1386,7 @@ index feb81e5..9c44cdb 100644
                          }
                          TextAct(Icons.Outlined.ChatBubbleOutline, "讨论", "在对话里讨论这条", onDiscuss)
                      }
-@@ -450,7 +474,7 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
+@@ -450,7 +473,7 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
                      Spacer(Modifier.weight(1f))
                      ActIcon("⋯", "更多", m.ink2, onMore)
                  }
@@ -1249,7 +1395,7 @@ index feb81e5..9c44cdb 100644
              }
          }
      }
-@@ -464,20 +488,20 @@ private fun TextAct(icon: androidx.compose.ui.graphics.vector.ImageVector, label
+@@ -464,20 +487,20 @@ private fun TextAct(icon: androidx.compose.ui.graphics.vector.ImageVector, label
          .padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
          com.openminis.app.ui.brand.MinesIcon(icon, null, tint = m.ink, modifier = Modifier.size(22.dp))
          Spacer(Modifier.width(5.dp))
@@ -1273,7 +1419,7 @@ index feb81e5..9c44cdb 100644
  }
  
  /** Brand logo of the source when there is one, else a soft 3D-looking gradient orb with an emoji. */
-@@ -537,21 +561,21 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
+@@ -537,21 +560,21 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
                  Spacer(Modifier.width(12.dp))
                  Column(Modifier.weight(1f)) {
                      Text(listOfNotNull(Digest.Tab.values().firstOrNull { it == m.tab }?.let { t -> if (t == Digest.Tab.FOLLOW) "X" else t.label }, m.source.takeIf { it.isNotBlank() })
@@ -1301,7 +1447,7 @@ index feb81e5..9c44cdb 100644
                  }
              }
              m.image?.let { img ->
-@@ -560,8 +584,8 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
+@@ -560,8 +583,8 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
              }
              if (steps.isNotEmpty()) {
                  Row(Modifier.padding(top = 22.dp).fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -1312,7 +1458,7 @@ index feb81e5..9c44cdb 100644
                  }
                  Column(Modifier.padding(top = 8.dp).fillMaxWidth().clip(RoundedCornerShape(20.dp)).background(mc.surface2.copy(alpha = if (mc.dark) 1f else 0.7f))) {
                      steps.forEachIndexed { i, (t, sub) ->
-@@ -571,8 +595,8 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
+@@ -571,8 +594,8 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
                              IconBubble(com.openminis.app.ui.brand.MinesIcons.named(stepIcon(t))!!, size = 40.dp)
                              Spacer(Modifier.width(12.dp))
                              Column(Modifier.weight(1f)) {
@@ -1323,7 +1469,7 @@ index feb81e5..9c44cdb 100644
                              }
                              Spacer(Modifier.width(8.dp))
                              Box(Modifier.size(30.dp).clip(androidx.compose.foundation.shape.CircleShape)
-@@ -588,13 +612,13 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
+@@ -588,13 +611,13 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
                  Row(Modifier.padding(top = 14.dp).fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(mc.surface2.copy(alpha = if (mc.dark) 1f else 0.7f))
                      .clickable { openOriginal(context, m) }.heightIn(min = 56.dp).padding(horizontal = 14.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
                      Column(Modifier.weight(1f)) {
@@ -1433,7 +1579,7 @@ index fdcda6e..d4284a2 100644
      edit?.let { c -> CardEditor(c, onDone = { edit = null }) }
      if (askImport) AlertDialog(onDismissRequest = { askImport = false },
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
-index 3ed42b8..09d41df 100644
+index 3ed42b8..09b6355 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
 @@ -42,12 +42,13 @@ import androidx.compose.material3.IconButton
@@ -1490,8 +1636,8 @@ index 3ed42b8..09d41df 100644
 -        )
 +        val veil = if (dark) Color(0xFF14110F) else Color(0xFFF6F2EC)
 +        val userDim = st.wallpaperDim.coerceIn(0f, 0.95f)
-+        val top = maxOf(if (canBlur) 0.70f else 0.86f, userDim)
-+        val body = maxOf(if (canBlur) 0.88f else 0.93f, userDim)
++        val top = maxOf(if (canBlur) 0.85f else 0.88f, userDim)   // [38.1b] user rule: 85–92 % veil even behind the header (was 70 %)
++        val body = maxOf(if (canBlur) 0.90f else 0.93f, userDim)
 +        Box(Modifier.fillMaxSize().background(Brush.verticalGradient(
 +            0f to veil.copy(alpha = top), 0.16f to veil.copy(alpha = top), 0.30f to veil.copy(alpha = body), 1f to veil.copy(alpha = body))))
      }
@@ -1769,7 +1915,7 @@ index ffa3800..33e0407 100644
                      .background(if (sel) m.ink else m.glassStrong).border(1.dp, m.hairline, RoundedCornerShape(50))
                      .clickable { onPick(v) }.padding(horizontal = 14.dp, vertical = 9.dp))
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
-index 16852b6..b9823e6 100644
+index 16852b6..6e83aef 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceLiveScreen.kt
 @@ -52,7 +52,7 @@ import androidx.compose.material3.IconButton
@@ -1781,7 +1927,26 @@ index 16852b6..b9823e6 100644
  import androidx.compose.runtime.Composable
  import androidx.compose.runtime.DisposableEffect
  import androidx.compose.runtime.LaunchedEffect
-@@ -398,40 +398,26 @@ private fun VoiceSecondary(text: String, modifier: Modifier = Modifier.fillMaxWi
+@@ -82,6 +82,18 @@ import com.openminis.app.plus.PlusVault
+ @Composable
+ fun VoiceLiveScreen(onBack: () -> Unit, onOpenConnections: () -> Unit) {
+     val context = LocalContext.current
++    // [Mines-38.1b] the call page is dark: light status-bar icons while it shows (smoke run 36: dark clock on dark)
++    val sbView = androidx.compose.ui.platform.LocalView.current
++    androidx.compose.runtime.DisposableEffect(Unit) {
++        val win = (sbView.context as? android.app.Activity)?.window
++        val ctl = win?.let { androidx.core.view.WindowInsetsControllerCompat(it, sbView) }
++        val prev = ctl?.isAppearanceLightStatusBars
++        ctl?.isAppearanceLightStatusBars = false
++        onDispose { if (prev != null) ctl?.isAppearanceLightStatusBars = prev }
++    }
++    androidx.compose.runtime.SideEffect {
++        (sbView.context as? android.app.Activity)?.window?.let { androidx.core.view.WindowInsetsControllerCompat(it, sbView).isAppearanceLightStatusBars = false }
++    }
+     PlusVault.init(context)
+     // [Mines-voice-26] Default account under 账号连接 → Gemini first, then the plain entry.
+     val key = remember { com.openminis.app.plus.GeminiRoute.apiKey() }
+@@ -398,40 +410,26 @@ private fun VoiceSecondary(text: String, modifier: Modifier = Modifier.fillMaxWi
  @OptIn(ExperimentalMaterial3Api::class)
  @Composable
  private fun VoiceSettingsSheet(onDismiss: () -> Unit, onChanged: () -> Unit) {
@@ -1837,7 +2002,7 @@ index 16852b6..b9823e6 100644
          }
      }
  }
-@@ -535,7 +521,9 @@ internal fun plainVoiceError(raw: String): String {
+@@ -535,7 +533,9 @@ internal fun plainVoiceError(raw: String): String {
      return when {
          // [Mines-voice-35.2] a rejection keeps the server's own words (build-35.1 showed only 「…：」)
          first.contains("拒绝") -> if (first.length > 140) first.take(140) + "…" else first
@@ -1985,10 +2150,10 @@ index 0000000..54d0e97
 +}
 +
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceSourceSection.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceSourceSection.kt
-index fd8238e..ca93cfe 100644
+index fd8238e..823a18a 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceSourceSection.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceSourceSection.kt
-@@ -55,11 +55,17 @@ import kotlinx.coroutines.launch
+@@ -55,17 +55,27 @@ import kotlinx.coroutines.launch
   * is greyed with 「去连接」. The whole page carries a single tick.
   */
  @Composable
@@ -2002,12 +2167,23 @@ index fd8238e..ca93cfe 100644
 +    // live settings, and store every change back for that character only.
 +    val ch = character ?: com.openminis.app.plus.CharacterVoices.current()
 +    val chName = com.openminis.app.plus.Avatars.name(ch)
-+    LaunchedEffect(ch) { com.openminis.app.plus.CharacterVoices.apply(c, ch); tick++ }
++    // [Mines-38.1b] apply the character's voice BEFORE the first read, so the highlighted source card is the one
++    // in use (smoke run 36: 「Gemini 自带」 was outlined while 免费声音 said 正在用 — two selections at once)
++    remember(ch) { runCatching { com.openminis.app.plus.CharacterVoices.apply(c, ch) }; ch }
 +    fun changed() { com.openminis.app.plus.CharacterVoices.saveFromGlobals(c, ch); tick++; onChanged() }
      // the clone section toggles its own switch; re-read the stored choice now and then so the top line stays true
      LaunchedEffect(Unit) { while (true) { delay(1500); tick++ } }
      val tts = remember(tick) { ExternalTts.settings(c) }
-@@ -83,7 +89,7 @@ fun VoiceSourceSection(onChanged: () -> Unit) {
+     val clone = remember(tick) { VoiceClone.settings(c) }
+     val active = if (clone.enabled) SRC_CLONE else tts.engine
+-    var tab by rememberSaveable { mutableStateOf(active) }
++    var tab by rememberSaveable(ch) { mutableStateOf(active) }
++    // an unavailable source is never the starting card
++    LaunchedEffect(ch) { if (tab != active) tab = active }
+     val geminiVoice = remember(tick) {
+         PlusVault.extra("gemini", "voice").takeIf { PlusVault.extra("gemini", "voice_user") == "1" } ?: GeminiLive.DEFAULT_VOICE
+     }
+@@ -83,7 +93,7 @@ fun VoiceSourceSection(onChanged: () -> Unit) {
              VoiceClone.setEnabled(c, false)
              ExternalTts.save(c, ExternalTts.settings(c).copy(engine = id))
          }
@@ -2016,7 +2192,7 @@ index fd8238e..ca93cfe 100644
      }
  
      val nowText = when (active) {
-@@ -96,19 +102,19 @@ fun VoiceSourceSection(onChanged: () -> Unit) {
+@@ -96,19 +106,19 @@ fun VoiceSourceSection(onChanged: () -> Unit) {
      Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
          // ---- what the call uses right now ----
          Row(
@@ -2041,7 +2217,7 @@ index fd8238e..ca93cfe 100644
                      icon = com.openminis.app.ui.brand.MinesIcons.named("volume-2"), description = "试听现在用的声音", onClick = {
                          busy = true; msg = null
                          scope.launch {
-@@ -120,11 +126,11 @@ fun VoiceSourceSection(onChanged: () -> Unit) {
+@@ -120,11 +130,11 @@ fun VoiceSourceSection(onChanged: () -> Unit) {
                      })
              }
          }
@@ -2056,7 +2232,7 @@ index fd8238e..ca93cfe 100644
          val sources = listOf(
              Src(ExternalTts.ENGINE_GEMINI, "Gemini 自带", "实时通话原声", hasGemini, "gemini"),
              Src(ExternalTts.ENGINE_OPENROUTER, "OpenRouter", "用你的 Key", hasOr, "openrouter"),
-@@ -152,10 +158,10 @@ fun VoiceSourceSection(onChanged: () -> Unit) {
+@@ -152,10 +162,10 @@ fun VoiceSourceSection(onChanged: () -> Unit) {
                      ExternalTts.ENGINE_GEMINI -> "还没有 Gemini Key，连上后才能用它的声音"
                      ExternalTts.ENGINE_OPENROUTER -> "还没有 OpenRouter Key，连上后才能用"
                      else -> "克隆声音要用硅基流动的 Key"
@@ -2069,7 +2245,7 @@ index fd8238e..ca93cfe 100644
                  }
              }
              if (cur.id == SRC_CLONE) CustomVoiceSection()
-@@ -163,23 +169,23 @@ fun VoiceSourceSection(onChanged: () -> Unit) {
+@@ -163,23 +173,23 @@ fun VoiceSourceSection(onChanged: () -> Unit) {
              ExternalTts.ENGINE_GEMINI -> Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(m.surface2.copy(alpha = 0.6f))) {
                  GeminiLive.voiceLabels.entries.forEachIndexed { i, (id, label) ->
                      val on = active == ExternalTts.ENGINE_GEMINI && geminiVoice == id
@@ -2099,7 +2275,7 @@ index fd8238e..ca93cfe 100644
              SRC_CLONE -> CustomVoiceSection()
          }
      }
-@@ -195,8 +201,8 @@ private fun SourceCard(s: Src, shown: Boolean, using: Boolean, modifier: Modifie
+@@ -195,8 +205,8 @@ private fun SourceCard(s: Src, shown: Boolean, using: Boolean, modifier: Modifie
      val shape = RoundedCornerShape(18.dp)
      val alpha = if (s.available) 1f else 0.55f
      Column(
@@ -2110,7 +2286,7 @@ index fd8238e..ca93cfe 100644
              .semantics(mergeDescendants = true) {
                  contentDescription = s.title + "，" + (if (!s.available) "不可用，要先连接" else s.sub) + (if (using) "，正在用" else ""); role = Role.Tab
              }
-@@ -204,11 +210,11 @@ private fun SourceCard(s: Src, shown: Boolean, using: Boolean, modifier: Modifie
+@@ -204,11 +214,11 @@ private fun SourceCard(s: Src, shown: Boolean, using: Boolean, modifier: Modifie
          verticalArrangement = Arrangement.Center,
      ) {
          Row(verticalAlignment = Alignment.CenterVertically) {
@@ -2125,7 +2301,7 @@ index fd8238e..ca93cfe 100644
      }
  }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceprintSection.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceprintSection.kt
-index a26e1e6..74061dc 100644
+index a26e1e6..33fd903 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceprintSection.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceprintSection.kt
 @@ -157,7 +157,8 @@ fun VoiceprintEnrolDialog(onDone: () -> Unit) {
@@ -2138,6 +2314,14 @@ index a26e1e6..74061dc 100644
  
      fun save() {
          saving = true; msg = null; err = false
+@@ -204,6 +205,7 @@ fun VoiceprintEnrolDialog(onDone: () -> Unit) {
+                 kotlinx.coroutines.withTimeout(15_000) { Voiceprint.recordUtterance(maxMs = 8000, waitSpeechMs = 6000) }
+             }.onSuccess { pcm ->
+                 clips.add(pcm)
++                Voiceprint.prepare(c, pcm)
+                 if (clips.size >= Voiceprint.PHRASES.size) { recording = false; save() }
+                 else msg = "好的 ✓ 接着读第 ${clips.size + 1} 句"
+             }.onFailure { e ->
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WarmComponents.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WarmComponents.kt
 index 1b05757..62fd7ce 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/WarmComponents.kt
