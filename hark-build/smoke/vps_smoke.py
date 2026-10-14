@@ -35,6 +35,11 @@ try:
     B381 = "b381" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
 except Exception:
     B381 = False
+try:
+    B385 = "b385" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
+except Exception:
+    B385 = False
+FONT_SCALE = "1.18"
 step_no = 0
 crashed = []
 
@@ -1656,6 +1661,193 @@ def b381():
     print(f"B381 {res}", flush=True)
 
 
+# ======================= [build-38.5] redesign smoke at the user's real rendering =======================
+
+def shot385(name):
+    r = snap("b385-" + name)
+    subprocess.run(f"cp {OUT}/{step_no:02d}-b385-{name}.png {OUT}/b385-{name}.png", shell=True)
+    return r
+
+
+def result_json(method, arg, timeout=120):
+    out = selftest(method, arg, timeout=timeout)
+    i = out.find("result=")
+    if i < 0: return None
+    raw = out[i + 7:].strip()
+    try:
+        return json.JSONDecoder().raw_decode(raw)[0]
+    except Exception:
+        return raw.split("}]")[0].strip()
+
+
+def route(r, wait=4):
+    selftest("route", r, timeout=20); time.sleep(wait)
+
+
+def screen_385():
+    sh("wm size reset"); sh("wm density reset"); time.sleep(2)
+    ws, wd = sh("wm size").strip(), sh("wm density").strip()
+    m = re.search(r"Physical size: (\d+)x(\d+)", ws)
+    if m: SCREEN[0], SCREEN[1] = int(m.group(1)), int(m.group(2))
+    dpi = re.search(r"Physical density: (\d+)", wd)
+    sh(f"settings put system font_scale {FONT_SCALE}"); time.sleep(2)
+    fs = sh("settings get system font_scale").strip()
+    print(f"B385 screen {SCREEN} dpi={dpi.group(1) if dpi else '?'} font_scale={fs}", flush=True)
+    if SCREEN != [1080, 2362]: selftest_fail.append(f"b385 emulator size {ws!r} (want 1080x2362)")
+    if not dpi or dpi.group(1) != "405": selftest_fail.append(f"b385 emulator density {wd!r} (want 405)")
+
+
+def group_385(res):
+    """G + I: 3-member group with one broken model and one rate-limited member; @only; structured summary;
+    a 账号连接-saved key makes the partner usable with no 缺 key."""
+    B = "http://10.0.2.2:8088"
+    result_json("group", "reset")
+    a = result_json("group", f"custom 成员A|{B}/a/v1|k|smoke-model")
+    b = result_json("group", f"custom 坏模型|{B}/b/v1|k|smoke-bad-model")
+    c = result_json("group", f"custom 限流|{B}/c/v1|k|smoke-429")
+    print("B385 customs", a, b, c, flush=True)
+    gid = result_json("group", f"make 冒烟群|{a},{b},{c}")
+    res["gid"] = gid
+    r1 = result_json("group", f"send {gid}|大家好，各说一句", timeout=150) or []
+    print("B385 round1", json.dumps(r1, ensure_ascii=False)[:1500], flush=True)
+    if not isinstance(r1, list): selftest_fail.append(f"b385 group send not a list: {r1}"); return gid
+    st = {x.get("name"): x for x in r1 if x.get("who") != "user"}
+    if any(x.get("status") == "stopped" for x in r1): selftest_fail.append("b385 group: 已停止 in a normal round")
+    bad = next((x for x in r1 if x.get("name") == "坏模型"), {})
+    if bad.get("status") != "ok" or "smoke-model" not in (bad.get("detail", "") + bad.get("model", "")):
+        selftest_fail.append(f"b385 group: broken model not auto-switched {bad}")
+    rl = next((x for x in r1 if x.get("name") == "限流"), {})
+    if rl.get("status") != "ok": selftest_fail.append(f"b385 group: 429 member not retried {rl}")
+    if not any(x.get("who") == "host" and x.get("kind") == "wrap" and x.get("status") == "ok" for x in r1):
+        selftest_fail.append("b385 group: host did not wrap up the round")
+    r2 = result_json("group", f"send {gid}|@成员A 只问你一个", timeout=90) or []
+    who2 = [x.get("name") for x in r2 if isinstance(x, dict) and x.get("who") != "user"]
+    print("B385 round2", who2, flush=True)
+    if who2 != ["成员A"]: selftest_fail.append(f"b385 group @mention answered by {who2}")
+    r3 = result_json("group", f"summary {gid}", timeout=90) or []
+    print("B385 summary", json.dumps(r3, ensure_ascii=False)[:600], flush=True)
+    if not any(isinstance(x, dict) and x.get("kind") == "summary" and x.get("status") == "ok" and "结论" in x.get("text", "") for x in r3):
+        selftest_fail.append(f"b385 group summary not structured {r3}")
+    # I: a key saved by 账号连接 → partner usable at once, no 「缺 key」
+    v = result_json("group", f"vaultkey deepseek|sk-smoke-0123456789abcdef0123456789|{B}/v1") or {}
+    print("B385 vaultkey", v, flush=True)
+    res["vaultkey"] = v
+    if not isinstance(v, dict) or v.get("state") != "READY" or v.get("dupes") != 1:
+        selftest_fail.append(f"b385 connected key not READY {v}")
+    g2 = result_json("group", "make 账号连接群|deepseek")
+    r4 = result_json("group", f"send {g2}|你好", timeout=90) or []
+    ds = next((x for x in r4 if isinstance(x, dict) and x.get("who") == "deepseek"), {})
+    print("B385 deepseek reply", ds, flush=True)
+    if ds.get("status") != "ok" or "密钥" in ds.get("text", "") or "连接" in ds.get("text", ""):
+        selftest_fail.append(f"b385 connected deepseek chat failed {ds}")
+    return gid
+
+
+def b385():
+    res = {}
+    sh(f"cmd locale set-app-locales {PKG} --locales zh-CN"); time.sleep(1)
+    screen_385()
+    print("B385 inject", selftest_json("feedinject", "both", timeout=30), flush=True)
+    selftest_json("fakeaccounts", "", timeout=20)
+    print("B385 uiprep", selftest_json("uiprep", "杨arling|gen", timeout=20), flush=True)
+    sh(f"am force-stop {PKG}"); time.sleep(2)
+    sh(f"monkey -p {PKG} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1"); time.sleep(10)
+    b381_home(); time.sleep(2)
+    r = shot385("home")
+    t = "\n".join(texts(r)) if r is not None else ""
+    for want in ("最近对话", "电量", "网络", "存储", "运行", "开个新对话"):
+        if want not in t: page_missing.append(f"b385 home missing {want}")
+    # ---- 消息 + 为你推荐 + long press + sources ----
+    if not tap_text("消息", exact=True, wait=5): tap_text("消息，", wait=5)
+    time.sleep(4)
+    r = shot385("messages")
+    tx = texts(r) if r is not None else []
+    if not any(x.startswith("为你推荐") for x in tx): page_missing.append("b385 为你推荐 tab missing")
+    if any(x.startswith("账号异常，0") for x in tx) or "账号异常 0" in tx: page_missing.append("b385 zero count still shown")
+    if any(x == "帮我领" for x in tx): print("B385 note: 帮我领 visible (claimable offer?)", flush=True)
+    # detail sheet: first card headline
+    r = dump()
+    card = next(((x, y) for tx_, d, x, y, n in nodes(r) if y > SCREEN[1] * 0.3 and y < SCREEN[1] * 0.8 and len(tx_ or "") >= 8), None)
+    if card:
+        sh(f"input tap {card[0]} {card[1]}"); time.sleep(3); shot385("detail"); back()
+        sh(f"input swipe {card[0]} {card[1]} {card[0]} {card[1]} 900"); time.sleep(2.5)
+        r = shot385("longpress-glass")
+        t = " ".join(texts(r)) if r is not None else ""
+        if "分享为图片" not in t: page_missing.append("b385 long-press: 分享为图片 not visible (cut under the bar?)")
+        back()
+    # sources (⚙ → 消息来源)
+    if tap_text("关注设置和消息来源", wait=2) and tap_text("消息来源", exact=True, wait=3):
+        r = shot385("sources")
+        t = " ".join(texts(r)) if r is not None else ""
+        if "都接好了" in t: selftest_fail.append("b385 sources still says 都接好了")
+        if "添加账号" not in t: page_missing.append("b385 sources: 添加账号 list missing")
+        back()
+    if tap_text("关注设置和消息来源", wait=2) and tap_text("关注设置", exact=True, wait=3):
+        shot385("follows"); back()
+    back(2)
+    # ---- chat ----
+    b381_home()
+    r = dump()
+    row = next(((x, y) for tx_, d, x, y, n in nodes(r) if y > SCREEN[1] * 0.45 and y < SCREEN[1] * 0.72 and len(tx_ or "") > 3
+                and not any(k in (tx_ or "") for k in ("开个新对话", "最近对话", "电量", "网络", "存储", "运行"))), None)
+    if row:
+        sh(f"input tap {row[0]} {row[1]}"); time.sleep(5); shot385("chat"); back()
+    # ---- group (G) + partners (I, J) ----
+    try:
+        gid = group_385(res)
+    except Exception as e:
+        print("group_385 error:", e, flush=True); selftest_fail.append(f"b385 group error {e}"); gid = None
+    if gid:
+        route(f"plus_group_chat/{gid}", 5); r = shot385("group-chat")
+        t = " ".join(texts(r)) if r is not None else ""
+        if "does not exist" in t: selftest_fail.append("b385 group chat shows raw English error")
+        back()
+    route("plus_group", 4); shot385("group-list"); back()
+    route("plus_group_partners", 8)
+    r = shot385("partners")
+    t = " ".join(texts(r)) if r is not None else ""
+    if "余额 余额" in t: selftest_fail.append("b385 partners: 余额 余额")
+    if "还差智能体 Bot ID" in t: selftest_fail.append("b385 partners: old 还差智能体 Bot ID")
+    sh(f"input swipe {SCREEN[0]//2} {int(SCREEN[1]*0.8)} {SCREEN[0]//2} {int(SCREEN[1]*0.25)} 500"); time.sleep(1.5)
+    r = shot385("partners-2")
+    # J: a 一键连接 button enters the connect flow
+    hit = None
+    for _ in range(4):
+        r = dump()
+        hit = find(r, "一键连接", exact=True)
+        if hit: break
+        sh(f"input swipe {SCREEN[0]//2} {int(SCREEN[1]*0.8)} {SCREEN[0]//2} {int(SCREEN[1]*0.35)} 500"); time.sleep(1.5)
+    if hit:
+        sh(f"input tap {hit[0]} {hit[1]}"); time.sleep(6)
+        r = shot385("partner-connect")
+        t = " ".join(texts(r)) if r is not None else ""
+        res["connect_flow"] = any(k in t for k in ("一键接入", "正在接入", "去官网获取", "手动填写密钥", "登录", "账号连接"))
+        if not res["connect_flow"]: selftest_fail.append(f"b385 一键连接 did not open the connect flow: {t[:200]}")
+        back(2)
+    else:
+        selftest_fail.append("b385 partners: no 一键连接 button found")
+    back()
+    # ---- scheduled, knowledge (+ 脑图), settings, voice settings, plugins ----
+    b381_home()
+    if tap_text("任务", exact=True, wait=5): time.sleep(2); shot385("scheduled"); back()
+    route("plus_knowledge", 5); shot385("knowledge")
+    if tap_text("脑图", exact=True, wait=4): shot385("knowledge-map"); tap_text("列表", exact=True, wait=2)
+    back()
+    b381_home()
+    if tap_text("设置", exact=True, wait=4) or tap_text("设置", wait=4):
+        shot385("settings")
+        if tap_text("语音", exact=True, wait=4):
+            shot385("voice-settings")
+            sh(f"input swipe {SCREEN[0]//2} {int(SCREEN[1]*0.8)} {SCREEN[0]//2} {int(SCREEN[1]*0.25)} 500"); time.sleep(1.5)
+            r = shot385("voice-settings-2")
+            t = " ".join(texts(r)) if r is not None else ""
+            if "0.38" in t or "0.3" in t.split(): page_missing.append("b385 voice: numeric sensitivity still shown")
+            back()
+        back()
+    route("plus_plugins", 4); shot385("plugins"); back()
+    print(f"B385 {res}", flush=True)
+
+
 COZE_LOGIN = ["账号登录-火山引擎", "火山引擎", "账号登录", "手机号登录", "欢迎使用扣子", "欢迎来到扣子", "登录扣子", "登录 / 注册", "登录/注册", "验证码", "获取验证码", "手机号", "抖音登录", "Welcome to Coze", "Sign in", "登录"]
 
 
@@ -1750,6 +1942,12 @@ def main():
         dump_fatal()
         user_like_state()
 
+    if B385:
+        try:
+            b385()
+        except Exception as e:
+            print("b385 error:", e, flush=True); selftest_fail.append(f"b385 error {e}")
+        return finish(lc)
     if B381:
         try:
             b381()

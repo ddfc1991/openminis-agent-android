@@ -72,6 +72,17 @@ class H(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(n) or b"{}")
         text = "你好，我是测试模型。"
         msgs = body.get("messages") or []
+        # [build-38.5] group chat self-test: a member whose model is gone (Ark-style 404) and one that is rate-limited twice
+        mdl = str(body.get("model") or "")
+        if mdl == "smoke-bad-model":
+            STATS["bad_model_posts"] = STATS.get("bad_model_posts", 0) + 1
+            return self._json({"error": {"code": "InvalidEndpointOrModel.NotFound", "message": "The model or endpoint smoke-bad-model does not exist or you do not have access to it. Request id: 0217"}}, 404)
+        if mdl == "smoke-429":
+            STATS["rl_posts"] = STATS.get("rl_posts", 0) + 1
+            if STATS["rl_posts"] % 3 != 0:
+                return self._json({"error": {"message": "Rate limit reached, please retry"}}, 429)
+        if "结构化总结" in last_user_text(msgs):
+            text = "## 结论\n测试结论。\n## 共识\n都能回复。\n## 分歧\n无。\n## 各成员要点\n成员A：在线\n## 下一步\n继续。"
         if "GARBAGETEST" in last_user_text(msgs) and body.get("stream"):
             # [build-34 smoke] a model whose output degenerates into garbage (user's Gemma report)
             STATS["garbage_posts"] += 1
