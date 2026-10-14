@@ -1,0 +1,1744 @@
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt
+index 4778b17..66ceed1 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt
+@@ -205,6 +205,16 @@ object PlusVault {
+         ConnectionKind("groq", "Groq", "超快推理（开源模型）", G_AI, R.drawable.ic_brand_groq, ConnMethod.KEY, PermProfile.AI,
+             keyUrl = "https://console.groq.com/keys", keyRegex = Regex("""gsk_[A-Za-z0-9]{40,}"""), envKey = "GROQ_API_KEY",
+             site = "https://groq.com", docs = "https://console.groq.com/docs", privacy = "https://groq.com/privacy-policy/"),
++        // [Mines-group-37] 群聊成员：元宝（混元）、Manus、扣子
++        ConnectionKind("hunyuan", "腾讯混元 · 元宝", "元宝背后的混元大模型", G_AI, 0, ConnMethod.KEY, PermProfile.AI,
++            keyUrl = "https://console.cloud.tencent.com/hunyuan/start", keyRegex = Regex("""sk-[A-Za-z0-9]{40,}"""), envKey = "HUNYUAN_API_KEY",
++            site = "https://hunyuan.tencent.com", docs = "https://cloud.tencent.com/document/product/1729/111007"),
++        ConnectionKind("manus", "Manus", "通用智能体：发任务、收结果", G_AI, 0, ConnMethod.KEY, PermProfile.AI,
++            keyUrl = "https://manus.im/app?show_settings=integrations&app_name=api", envKey = "MANUS_API_KEY",
++            site = "https://manus.im", docs = "https://open.manus.ai/docs"),
++        ConnectionKind("coze", "扣子 Coze", "调用你自己的智能体", G_AI, 0, ConnMethod.KEY, PermProfile.AI,
++            keyUrl = "https://www.coze.cn/open/oauth/pats", keyRegex = Regex("""pat_[A-Za-z0-9]{30,}"""), keyLabel = "个人访问令牌", envKey = "COZE_API_TOKEN",
++            site = "https://www.coze.cn", docs = "https://www.coze.cn/open/docs/developer_guides/chat_v3"),
+         ConnectionKind("elevenlabs", "ElevenLabs", "语音合成与克隆", G_AI, R.drawable.ic_brand_elevenlabs, ConnMethod.KEY, PermProfile.AI,
+             keyUrl = "https://elevenlabs.io/app/settings/api-keys", keyRegex = Regex("""sk_[a-f0-9]{40,}"""), envKey = "ELEVENLABS_API_KEY",
+             site = "https://elevenlabs.io", docs = "https://elevenlabs.io/docs", privacy = "https://elevenlabs.io/privacy-policy"),
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ProviderKeys.kt b/src/android/app/src/main/java/com/openminis/app/plus/ProviderKeys.kt
+index 2a8da0c..7888eab 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/ProviderKeys.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/ProviderKeys.kt
+@@ -38,6 +38,7 @@ object ProviderKeys {
+         "volcengine" to listOf("volces.com", "volcengineapi.com"),
+         "sensenova" to listOf("sensenova", "sensetime", "sensecore"),
+         "perplexity" to listOf("api.perplexity.ai"),
++        "hunyuan" to listOf("hunyuan.cloud.tencent.com"), // [Mines-group-37]
+     )
+ 
+     fun kindFor(baseUrl: String?, type: ProviderType): String? {
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
+index 2fa1dc8..bac6d94 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
+@@ -398,6 +398,7 @@ class SelfTestProvider : ContentProvider() {
+                 main.post { runCatching { held?.destroy() }; held = null }
+                 out.putString("result", res.get() ?: "{\"ok\":false,\"error\":\"timeout\"}")
+             }
++            "group" -> out.putString("result", com.openminis.app.plus.group.GroupSelfTest.handle(context!!, arg ?: "")) // [Mines-group-37]
+             else -> out.putString("result", "unknown method")
+         }
+         return out
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/AiCatalog.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/AiCatalog.kt
+new file mode 100644
+index 0000000..a689304
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/group/AiCatalog.kt
+@@ -0,0 +1,93 @@
++package com.openminis.app.plus.group
++
++import com.openminis.app.R
++
++/**
++ * [Mines-group-37] Every AI the 群聊 / AI 伙伴 pages know.
++ *
++ * API partners reuse the keys the user already has in 账号连接 (PlusVault, same
++ * kind ids) or in 模型组 (provider instances); nothing new is stored for them.
++ * Phone-only apps (no public API) are driven by the accessibility / Shizuku
++ * FastUi path ("代打字"): slow, can break when the app changes, default off.
++ */
++enum class Proto { OPENAI, ANTHROPIC, MANUS, COZE, PHONE }
++
++data class AiSpec(
++    val id: String,
++    val name: String,
++    /** PlusVault kind id the key lives under (also the 账号连接 row to open for 「连接」). */
++    val vaultKind: String?,
++    val proto: Proto,
++    val baseUrl: String,
++    val defaultModel: String,
++    /** Model ids tried in order when the endpoint lists its models (first prefix match wins). */
++    val prefer: List<String> = emptyList(),
++    val icon: Int = 0,
++    val color: Long = 0xFF8A7F74,
++    val domestic: Boolean = false,
++    val note: String = "",
++    /** Hosts that identify this service in a 模型组 provider's base URL. */
++    val hosts: List<String> = emptyList(),
++    /** Needs no key (local gateway / own relay that may be open). */
++    val keyOptional: Boolean = false,
++)
++
++object AiCatalog {
++    const val NANOMUSE_BASE = "http://8.217.89.133:8787/v1"
++    const val WORKBUDDY_BASE = "http://127.0.0.1:8788/v1"
++
++    val specs: List<AiSpec> = listOf(
++        AiSpec("anthropic", "Claude", "anthropic", Proto.ANTHROPIC, "https://api.anthropic.com/v1", "claude-sonnet-4-5",
++            listOf("claude-sonnet-4", "claude-haiku-4", "claude-3-5-haiku"), R.drawable.ic_brand_anthropic, 0xFFD97757, hosts = listOf("api.anthropic.com")),
++        AiSpec("openai", "ChatGPT", "openai", Proto.OPENAI, "https://api.openai.com/v1", "gpt-4o-mini",
++            listOf("gpt-5-mini", "gpt-4.1-mini", "gpt-4o-mini"), R.drawable.ic_brand_openai, 0xFF10A37F, hosts = listOf("api.openai.com")),
++        AiSpec("xai", "Grok", "xai", Proto.OPENAI, "https://api.x.ai/v1", "grok-3-mini",
++            listOf("grok-4-fast", "grok-4", "grok-3-mini"), R.drawable.ic_brand_xai, 0xFF3A3F4B, hosts = listOf("api.x.ai")),
++        AiSpec("deepseek", "DeepSeek", "deepseek", Proto.OPENAI, "https://api.deepseek.com/v1", "deepseek-chat",
++            listOf("deepseek-chat"), R.drawable.ic_brand_deepseek, 0xFF4D6BFE, domestic = true, hosts = listOf("api.deepseek.com")),
++        AiSpec("gemini", "Gemini", "gemini", Proto.OPENAI, "https://generativelanguage.googleapis.com/v1beta/openai", "gemini-2.5-flash",
++            listOf("models/gemini-2.5-flash", "gemini-2.5-flash", "models/gemini-flash-latest"), R.drawable.ic_brand_gemini, 0xFF4285F4,
++            hosts = listOf("generativelanguage.googleapis.com")),
++        AiSpec("kimi", "Kimi", "kimi", Proto.OPENAI, "https://api.moonshot.cn/v1", "moonshot-v1-8k",
++            listOf("kimi-k2", "kimi-latest", "moonshot-v1-8k"), R.drawable.ic_brand_kimi, 0xFF1F1F1F, domestic = true, hosts = listOf("api.moonshot.cn", "api.moonshot.ai")),
++        AiSpec("zhipu", "智谱 GLM", "zhipu", Proto.OPENAI, "https://open.bigmodel.cn/api/paas/v4", "glm-4-flash",
++            listOf("glm-4.5-flash", "glm-4-flash"), R.drawable.ic_brand_zhipu, 0xFF3859FF, domestic = true, hosts = listOf("open.bigmodel.cn")),
++        AiSpec("siliconflow", "硅基流动", "siliconflow", Proto.OPENAI, "https://api.siliconflow.cn/v1", "deepseek-ai/DeepSeek-V3",
++            listOf("deepseek-ai/DeepSeek-V3", "Qwen/Qwen3", "Qwen/Qwen2.5-7B-Instruct"), R.drawable.ic_brand_siliconflow, 0xFF7C3AED, domestic = true,
++            hosts = listOf("api.siliconflow.cn", "api.siliconflow.com")),
++        AiSpec("sensenova", "商汤日日新", "sensenova", Proto.OPENAI, "https://api.sensenova.cn/compatible-mode/v1", "SenseChat-5",
++            listOf("SenseNova", "SenseChat-5"), R.drawable.ic_brand_sensenova, 0xFF6B4EFF, domestic = true, hosts = listOf("sensenova", "sensetime", "sensecore"),
++            note = "优先用你模型组里配好的商汤地址"),
++        AiSpec("volcengine", "豆包", "volcengine", Proto.OPENAI, "https://ark.cn-beijing.volces.com/api/v3", "doubao-seed-1-6-flash-250828",
++            listOf("doubao-seed-1-6-flash", "doubao-seed", "doubao-1-5-pro", "doubao"), R.drawable.ic_brand_volcengine, 0xFF3370FF, domestic = true,
++            hosts = listOf("volces.com", "volcengineapi.com"), note = "火山方舟 API，同一模型，但没有 App 里的记忆"),
++        AiSpec("hunyuan", "元宝", "hunyuan", Proto.OPENAI, "https://api.hunyuan.cloud.tencent.com/v1", "hunyuan-turbos-latest",
++            listOf("hunyuan-turbos-latest", "hunyuan-lite"), 0, 0xFF1F8B4C, domestic = true, hosts = listOf("hunyuan.cloud.tencent.com"),
++            note = "腾讯混元 API，同一模型，但没有 App 里的记忆"),
++        AiSpec("minimax", "MiniMax", "minimax", Proto.OPENAI, "https://api.minimaxi.com/v1", "MiniMax-M2",
++            listOf("MiniMax-M2", "MiniMax-Text-01"), R.drawable.ic_brand_minimax, 0xFFE2165E, domestic = true,
++            hosts = listOf("api.minimaxi.com", "api.minimax.chat", "api.minimax.io")),
++        AiSpec("qwen", "通义千问", "qwen", Proto.OPENAI, "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus",
++            listOf("qwen-plus", "qwen-turbo"), R.drawable.ic_brand_qwen, 0xFF615CED, domestic = true, hosts = listOf("dashscope.aliyuncs.com")),
++        AiSpec("openrouter", "OpenRouter", "openrouter", Proto.OPENAI, "https://openrouter.ai/api/v1", "openrouter/auto",
++            emptyList(), R.drawable.ic_brand_openrouter, 0xFF6467F2, hosts = listOf("openrouter.ai"), note = "默认自动选模型，可在成员设置里改"),
++        AiSpec("perplexity", "Perplexity", "perplexity", Proto.OPENAI, "https://api.perplexity.ai", "sonar",
++            listOf("sonar"), R.drawable.ic_brand_perplexity, 0xFF20808D, hosts = listOf("api.perplexity.ai")),
++        AiSpec("manus", "Manus", "manus", Proto.MANUS, "https://api.manus.ai/v2", "standard",
++            emptyList(), 0, 0xFF2B2B2B, note = "按任务执行，慢（几十秒到几分钟），按积分计费"),
++        AiSpec("coze", "扣子", "coze", Proto.COZE, "https://api.coze.cn/v3", "",
++            emptyList(), 0, 0xFF4E40E5, domestic = true, note = "需要填你的智能体 Bot ID"),
++        AiSpec("nanomuse", "Muse（nanoMuse 中继）", null, Proto.OPENAI, NANOMUSE_BASE, "",
++            emptyList(), 0, 0xFF8E6CEF, hosts = listOf("8.217.89.133:8787"), keyOptional = true,
++            note = "你自己的中继（阿里云）；Muse 官方 App 没有接口"),
++        AiSpec("workbuddy", "WorkBuddy", null, Proto.OPENAI, WORKBUDDY_BASE, "",
++            emptyList(), 0, 0xFF0E9F6E, hosts = listOf("127.0.0.1:8788", "localhost:8788"), keyOptional = true,
++            note = "本机网关 127.0.0.1:8788"),
++    )
++
++    fun spec(id: String): AiSpec? = specs.firstOrNull { it.id == id } ?: PhoneApps.specFor(id)
++
++    /** Host order for 主持人 (Mines itself): cheap, fast, domestic first. */
++    val hostOrder = listOf("deepseek", "zhipu", "siliconflow", "kimi", "qwen", "volcengine", "hunyuan", "sensenova",
++        "openrouter", "openai", "gemini", "anthropic", "xai", "minimax", "nanomuse", "workbuddy")
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/AiClient.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/AiClient.kt
+new file mode 100644
+index 0000000..6dad4cf
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/group/AiClient.kt
+@@ -0,0 +1,256 @@
++package com.openminis.app.plus.group
++
++import com.openminis.app.plus.SplitProxy
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.suspendCancellableCoroutine
++import okhttp3.Call
++import okhttp3.Callback
++import okhttp3.MediaType.Companion.toMediaType
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.RequestBody.Companion.toRequestBody
++import okhttp3.Response
++import org.json.JSONArray
++import org.json.JSONObject
++import java.io.IOException
++import java.net.InetSocketAddress
++import java.net.Proxy
++import java.util.concurrent.TimeUnit
++import kotlin.coroutines.resume
++import kotlin.coroutines.resumeWithException
++
++/** A plain-words failure shown under the member's name; never blocks the others. */
++class MemberError(message: String) : Exception(message)
++
++/**
++ * [Mines-group-37] One reply from one member. OpenAI-compatible chat
++ * (most vendors), Anthropic Messages, Manus tasks (create → poll → last
++ * assistant message) and Coze v3 chat (create → poll → answer). Calls are
++ * cancellable (「停止」 cancels the HTTP call). Overseas vendors try direct,
++ * then Mines' 分流代理 and the configured upstream proxies, like KeyTester.
++ */
++object AiClient {
++    data class Turn(val role: String, val text: String)
++    data class Reply(val text: String, val inTok: Int = 0, val outTok: Int = 0, val model: String = "")
++    data class Probe(val reachable: Boolean, val firstModel: String?, val needsKey: Boolean)
++
++    private val json = "application/json".toMediaType()
++
++    private fun client(p: Proxy, readSec: Long) = OkHttpClient.Builder().proxy(p).connectTimeout(10, TimeUnit.SECONDS)
++        .readTimeout(readSec, TimeUnit.SECONDS).callTimeout(readSec + 20, TimeUnit.SECONDS).build()
++
++    private fun clients(spec: AiSpec, base: String, readSec: Long = 120): List<OkHttpClient> {
++        val out = arrayListOf(client(Proxy.NO_PROXY, readSec))
++        val local = base.contains("127.0.0.1") || base.contains("localhost") || base.contains("10.0.2.2")
++        if (!spec.domestic && !local) {
++            if (SplitProxy.active) out += client(Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", SplitProxy.PORT)), readSec)
++            SplitProxy.settings.value.all.take(2).forEach { u ->
++                runCatching { out += client(Proxy(if (u.type == "socks5") Proxy.Type.SOCKS else Proxy.Type.HTTP, InetSocketAddress(u.host, u.port)), readSec) }
++            }
++        }
++        return out
++    }
++
++    private data class Http(val code: Int, val body: String)
++
++    private suspend fun Call.await(): Response = suspendCancellableCoroutine { cont ->
++        cont.invokeOnCancellation { runCatching { cancel() } }
++        enqueue(object : Callback {
++            override fun onFailure(call: Call, e: IOException) { if (cont.isActive) cont.resumeWithException(e) }
++            override fun onResponse(call: Call, response: Response) { cont.resume(response) }
++        })
++    }
++
++    private suspend fun exec(spec: AiSpec, base: String, req: Request, readSec: Long = 120): Http {
++        var last: Exception? = null
++        for (cl in clients(spec, base, readSec)) {
++            try {
++                cl.newCall(req).await().use { r -> return Http(r.code, r.body?.string().orEmpty()) }
++            } catch (e: IOException) { last = e }
++        }
++        throw MemberError(plainNet(last))
++    }
++
++    private fun plainNet(e: Exception?): String {
++        val m = (e?.message ?: "").lowercase()
++        return when {
++            m.contains("timeout") || m.contains("timed out") -> "等太久没回复（超时）"
++            m.contains("unable to resolve") || m.contains("no address") -> "连不上（域名解析失败，可能要开代理）"
++            m.contains("refused") -> "连不上（对方拒绝连接）"
++            m.contains("canceled") -> "已停止"
++            else -> "连不上（网络问题，可能要开代理）"
++        }
++    }
++
++    private fun check(h: Http) {
++        if (h.code in 200..299) return
++        val msg = runCatching {
++            val o = JSONObject(h.body)
++            o.optJSONObject("error")?.optString("message")?.takeIf { it.isNotBlank() } ?: o.optString("message").takeIf { it.isNotBlank() } ?: o.optString("msg")
++        }.getOrNull()?.take(120) ?: h.body.take(120)
++        val low = h.body.lowercase()
++        throw MemberError(when {
++            h.code == 401 || h.code == 403 -> "密钥无效或没有权限（HTTP ${h.code}）"
++            h.code == 402 || low.contains("insufficient") || low.contains("balance") || h.body.contains("余额") -> "账户余额不足，需要充值"
++            h.code == 429 -> "被限流了，稍后再试（HTTP 429）"
++            h.code == 404 && (low.contains("model") || h.body.contains("模型")) -> "模型不存在：$msg（可在成员设置里换模型）"
++            h.code >= 500 -> "服务器出错（HTTP ${h.code}）"
++            else -> "服务器回复 HTTP ${h.code}：$msg"
++        })
++    }
++
++    private fun bearer(b: Request.Builder, key: String?) = if (key.isNullOrBlank()) b else b.header("Authorization", "Bearer $key")
++
++    /** Reachability for key-optional endpoints (WorkBuddy, nanoMuse). */
++    suspend fun probe(base: String): Probe = runCatching {
++        val c = OkHttpClient.Builder().connectTimeout(2, TimeUnit.SECONDS).readTimeout(3, TimeUnit.SECONDS).callTimeout(5, TimeUnit.SECONDS).build()
++        c.newCall(Request.Builder().url(base.trimEnd('/') + "/models").build()).await().use { r ->
++            val body = r.body?.string().orEmpty()
++            val first = runCatching { JSONObject(body).optJSONArray("data")?.optJSONObject(0)?.optString("id") }.getOrNull()?.takeIf { it.isNotBlank() }
++            Probe(true, first, r.code == 401 || r.code == 403)
++        }
++    }.getOrDefault(Probe(false, null, false))
++
++    /** Picks a model from the endpoint's list by [AiSpec.prefer] when the user/模型组 gave none. Cached. */
++    private suspend fun ensureModel(p: Partner): String {
++        GroupPrefs.model(p.id)?.let { return it }
++        if (p.spec.prefer.isEmpty()) return p.model
++        GroupPrefs.autoModel(p.id)?.let { return it }
++        if (p.model.isNotBlank() && p.model != p.spec.defaultModel) return p.model
++        val ids = runCatching {
++            val req = bearer(Request.Builder().url(p.base.trimEnd('/') + "/models"), p.key).build()
++            val h = exec(p.spec, p.base, req, 20)
++            if (h.code !in 200..299) return@runCatching emptyList<String>()
++            val a = JSONObject(h.body).optJSONArray("data") ?: JSONArray()
++            (0 until a.length()).mapNotNull { a.optJSONObject(it)?.optString("id")?.takeIf { s -> s.isNotBlank() } }
++        }.getOrDefault(emptyList())
++        val pick = p.spec.prefer.firstNotNullOfOrNull { pre -> ids.firstOrNull { it.startsWith(pre) || it.removePrefix("models/").startsWith(pre.removePrefix("models/")) } }
++            ?.removePrefix("models/")
++        if (pick != null) GroupPrefs.setAutoModel(p.id, pick)
++        return pick ?: p.model.ifBlank { p.spec.defaultModel }
++    }
++
++    suspend fun reply(p: Partner, system: String, turns: List<Turn>, maxTokens: Int = 700): Reply = when (p.spec.proto) {
++        Proto.OPENAI -> openai(p, system, turns, maxTokens)
++        Proto.ANTHROPIC -> anthropic(p, system, turns, maxTokens)
++        Proto.MANUS -> manus(p, system, turns)
++        Proto.COZE -> coze(p, system, turns)
++        Proto.PHONE -> PhoneTyping.ask(p, turns.lastOrNull { it.role == "user" }?.text ?: "")
++    }
++
++    /** OpenAI wants alternating roles; merge neighbours with the same role. */
++    private fun merged(turns: List<Turn>): List<Turn> {
++        val out = ArrayList<Turn>()
++        for (t in turns) {
++            val last = out.lastOrNull()
++            if (last != null && last.role == t.role) out[out.lastIndex] = Turn(t.role, last.text + "\n\n" + t.text) else out += t
++        }
++        if (out.firstOrNull()?.role == "assistant") out.add(0, Turn("user", "（群聊开始）"))
++        return out
++    }
++
++    private suspend fun openai(p: Partner, system: String, turns: List<Turn>, maxTokens: Int): Reply {
++        val model = ensureModel(p)
++        val msgs = JSONArray().put(JSONObject().put("role", "system").put("content", system))
++        merged(turns).forEach { msgs.put(JSONObject().put("role", it.role).put("content", it.text)) }
++        val body = JSONObject().put("messages", msgs).put(if (p.spec.id == "openai") "max_completion_tokens" else "max_tokens", maxTokens).put("stream", false)
++        if (model.isNotBlank()) body.put("model", model)
++        val req = bearer(Request.Builder().url(p.base.trimEnd('/') + "/chat/completions"), p.key)
++            .post(body.toString().toRequestBody(json)).build()
++        val h = exec(p.spec, p.base, req)
++        check(h)
++        val o = runCatching { JSONObject(h.body) }.getOrElse { throw MemberError("回复看不懂（不是 JSON）") }
++        val msg = o.optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("message")
++        val text = msg?.optString("content")?.takeIf { it.isNotBlank() && it != "null" }
++            ?: msg?.optString("reasoning_content")?.takeIf { it.isNotBlank() && it != "null" }
++            ?: throw MemberError("回复是空的")
++        val u = o.optJSONObject("usage")
++        return Reply(stripThink(text), u?.optInt("prompt_tokens") ?: 0, u?.optInt("completion_tokens") ?: 0, o.optString("model", model))
++    }
++
++    private fun stripThink(s: String) = s.replace(Regex("(?s)<think>.*?</think>"), "").trim()
++
++    private suspend fun anthropic(p: Partner, system: String, turns: List<Turn>, maxTokens: Int): Reply {
++        val model = ensureModel(p)
++        val msgs = JSONArray()
++        merged(turns).forEach { msgs.put(JSONObject().put("role", it.role).put("content", it.text)) }
++        val body = JSONObject().put("model", model).put("max_tokens", maxTokens).put("system", system).put("messages", msgs)
++        val b = Request.Builder().url(p.base.trimEnd('/') + "/messages").header("anthropic-version", "2023-06-01")
++        if (!p.key.isNullOrBlank()) b.header("x-api-key", p.key)
++        val h = exec(p.spec, p.base, b.post(body.toString().toRequestBody(json)).build())
++        check(h)
++        val o = JSONObject(h.body)
++        val parts = o.optJSONArray("content") ?: JSONArray()
++        val text = (0 until parts.length()).mapNotNull { parts.optJSONObject(it)?.takeIf { x -> x.optString("type") == "text" }?.optString("text") }
++            .joinToString("").ifBlank { throw MemberError("回复是空的") }
++        val u = o.optJSONObject("usage")
++        return Reply(text, u?.optInt("input_tokens") ?: 0, u?.optInt("output_tokens") ?: 0, o.optString("model", model))
++    }
++
++    /** Group context squeezed into one prompt for task-style agents (Manus / 扣子). */
++    private fun flat(system: String, turns: List<Turn>, cap: Int = 6000): String {
++        val sb = StringBuilder(system).append("\n\n群聊记录：\n")
++        turns.dropLast(1).takeLast(12).forEach { sb.append(if (it.role == "assistant") "（你）" else "").append(it.text).append('\n') }
++        sb.append("\n请回复最新一条：\n").append(turns.lastOrNull()?.text ?: "")
++        return sb.toString().takeLast(cap)
++    }
++
++    // Manus: POST /v2/task.create → GET /v2/task.detail until stopped/waiting/error → task.listMessages (open.manus.ai/docs/v2)
++    private suspend fun manus(p: Partner, system: String, turns: List<Turn>): Reply {
++        val key = p.key ?: throw MemberError("缺 Manus 密钥")
++        fun r(path: String) = Request.Builder().url(p.base.trimEnd('/') + path).header("x-manus-api-key", key)
++        val body = JSONObject().put("message", JSONObject().put("content", flat(system, turns)))
++            .put("agent_profile", GroupPrefs.model(p.id) ?: "lite").put("hide_in_task_list", true).put("locale", "zh-CN")
++        val h = exec(p.spec, p.base, r("/task.create").post(body.toString().toRequestBody(json)).build(), 60)
++        check(h)
++        val id = JSONObject(h.body).optString("task_id").ifBlank { throw MemberError("Manus 没有返回任务号") }
++        val t0 = System.currentTimeMillis()
++        var status = "running"
++        while (System.currentTimeMillis() - t0 < 8 * 60_000) {
++            delay(5000)
++            val d = exec(p.spec, p.base, r("/task.detail?task_id=$id").build(), 30)
++            if (d.code !in 200..299) continue
++            status = JSONObject(d.body).optJSONObject("task")?.optString("status") ?: status
++            if (status != "running") break
++        }
++        if (status == "running") throw MemberError("Manus 8 分钟还没做完，可在 Manus 里看任务")
++        if (status == "error") throw MemberError("Manus 任务出错")
++        val m = exec(p.spec, p.base, r("/task.listMessages?task_id=$id&order=desc&limit=20").build(), 30)
++        check(m)
++        val arr = JSONObject(m.body).optJSONArray("messages") ?: JSONArray()
++        val text = (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
++            .firstOrNull { it.optString("type") == "assistant_message" }?.optJSONObject("assistant_message")?.optString("content")
++            ?: throw MemberError("Manus 没有给出回复")
++        return Reply(text + if (status == "waiting") "\n（Manus 在等你补充信息）" else "", model = "Manus ${GroupPrefs.model(p.id) ?: "lite"}")
++    }
++
++    // Coze v3: POST /v3/chat (stream=false) → GET /v3/chat/retrieve until completed → /v3/chat/message/list (type=answer)
++    private suspend fun coze(p: Partner, system: String, turns: List<Turn>): Reply {
++        val key = p.key ?: throw MemberError("缺扣子令牌")
++        val bot = GroupPrefs.bot(p.id) ?: throw MemberError("还差智能体 Bot ID")
++        fun r(path: String) = Request.Builder().url(p.base.trimEnd('/') + path).header("Authorization", "Bearer $key")
++        val body = JSONObject().put("bot_id", bot).put("user_id", "mines").put("stream", false).put("auto_save_history", true)
++            .put("additional_messages", JSONArray().put(JSONObject().put("role", "user").put("content", flat(system, turns)).put("content_type", "text")))
++        val h = exec(p.spec, p.base, r("/chat").post(body.toString().toRequestBody(json)).build(), 60)
++        check(h)
++        val o = JSONObject(h.body)
++        if (o.optInt("code", 0) != 0) throw MemberError("扣子：" + o.optString("msg").take(100))
++        val data = o.optJSONObject("data") ?: throw MemberError("扣子没有返回对话")
++        val chatId = data.optString("id"); val conv = data.optString("conversation_id")
++        val t0 = System.currentTimeMillis()
++        var status = data.optString("status")
++        while (status !in setOf("completed", "failed", "requires_action", "canceled") && System.currentTimeMillis() - t0 < 3 * 60_000) {
++            delay(1500)
++            val d = exec(p.spec, p.base, r("/chat/retrieve?conversation_id=$conv&chat_id=$chatId").build(), 30)
++            status = runCatching { JSONObject(d.body).optJSONObject("data")?.optString("status") }.getOrNull() ?: status
++        }
++        if (status != "completed") throw MemberError("扣子对话没完成（$status）")
++        val m = exec(p.spec, p.base, r("/chat/message/list?conversation_id=$conv&chat_id=$chatId").build(), 30)
++        check(m)
++        val arr = JSONObject(m.body).optJSONArray("data") ?: JSONArray()
++        val text = (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
++            .filter { it.optString("role") == "assistant" && it.optString("type") == "answer" }.joinToString("\n") { it.optString("content") }
++            .ifBlank { throw MemberError("扣子没有给出回复") }
++        return Reply(text, model = "Bot $bot")
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupRunner.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupRunner.kt
+new file mode 100644
+index 0000000..22661da
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupRunner.kt
+@@ -0,0 +1,156 @@
++package com.openminis.app.plus.group
++
++import android.content.Context
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.async
++import kotlinx.coroutines.awaitAll
++import kotlinx.coroutines.coroutineScope
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.flow.update
++import kotlinx.coroutines.launch
++import java.util.concurrent.ConcurrentHashMap
++
++/**
++ * [Mines-group-37] One round of a group chat: the user speaks, then every
++ * member (or only the @-mentioned ones) answers, one after another (each sees
++ * the earlier answers) or all at once. Everyone sees the shared history, with
++ * other speakers' lines labelled 【名字】. One member failing shows its reason
++ * on its own bubble and never stops the others. 「停止」 cancels the round.
++ */
++object GroupRunner {
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++    private val jobs = ConcurrentHashMap<String, Job>()
++    private val _running = MutableStateFlow<Set<String>>(emptySet())
++    val running: StateFlow<Set<String>> = _running.asStateFlow()
++
++    const val HOST_NAME = "Mines"
++
++    fun shortName(name: String) = name.substringBefore('（').substringBefore(" (").trim()
++
++    /** Member ids @-mentioned in [text] (host = [GroupStore.HOST]). Empty = everyone answers. */
++    fun mentions(text: String, members: List<Partner>): List<String> {
++        if (!text.contains('@') && !text.contains('＠')) return emptyList()
++        val t = text.replace('＠', '@').lowercase()
++        val out = ArrayList<String>()
++        for (p in members) {
++            val names = listOf(p.spec.name, shortName(p.spec.name), p.spec.id.substringAfter(':')).map { it.lowercase() }.filter { it.isNotBlank() }
++            if (names.any { t.contains("@$it") }) out += p.id
++        }
++        if (t.contains("@mines") || t.contains("@主持")) out += GroupStore.HOST
++        return out
++    }
++
++    private fun system(me: String, model: String, others: List<String>, host: Boolean): String = buildString {
++        append("你在一个多 AI 群聊里，你的名字是「").append(me).append("」")
++        if (model.isNotBlank()) append("（模型 ").append(model).append("）")
++        append("。群里还有：").append((others + "群主（用户）").joinToString("、")).append("。")
++        append("别人的发言会以【名字】开头。直接用中文回答群主最新的话，简洁（一般不超过 200 字，除非群主要长内容），")
++        append("可以补充、引用或反驳其他成员的观点，不要重复别人已经说过的，不要在开头写自己的名字。")
++        if (host) append("你是主持人 Mines：负责梳理分歧、给出结论和下一步。")
++    }
++
++    private fun turnsFor(gid: String, me: String): List<AiClient.Turn> =
++        GroupStore.messages(gid).value.filter { it.status == "ok" }.takeLast(24).map { m ->
++            when (m.who) {
++                me -> AiClient.Turn("assistant", m.text)
++                "user" -> AiClient.Turn("user", "【群主】" + m.text)
++                else -> AiClient.Turn("user", "【" + m.name + "】" + m.text)
++            }
++        }
++
++    fun stop(gid: String) {
++        jobs.remove(gid)?.cancel(CancellationException("stopped"))
++    }
++
++    private fun launchRound(gid: String, block: suspend () -> Unit) {
++        stop(gid)
++        val job = scope.launch {
++            _running.update { it + gid }
++            try { block() } finally {
++                _running.update { it - gid }
++                // anything still pending was stopped
++                GroupStore.messages(gid).value.filter { it.status == "pending" }.forEach {
++                    GroupStore.replace(gid, it.copy(status = "stopped", text = "已停止"))
++                }
++            }
++        }
++        jobs[gid] = job
++    }
++
++    fun send(context: Context, gid: String, text: String) {
++        val g = GroupStore.group(gid) ?: return
++        GroupStore.add(gid, GroupMsg(GroupStore.newId(), "user", "我", "", text.trim()))
++        launchRound(gid) {
++            if (Partners.list.value.isEmpty()) Partners.refresh(context)
++            val members = g.members.mapNotNull { Partners.find(it) }
++            val asked = mentions(text, members)
++            val who = if (asked.isEmpty()) members.map { it.id } else asked
++            answer(gid, g, who, members)
++        }
++    }
++
++    /** Retry one failed member with the current history. */
++    fun retry(context: Context, gid: String, memberId: String) {
++        val g = GroupStore.group(gid) ?: return
++        launchRound(gid) {
++            if (Partners.list.value.isEmpty()) Partners.refresh(context)
++            answer(gid, g, listOf(memberId), g.members.mapNotNull { Partners.find(it) })
++        }
++    }
++
++    fun summarize(context: Context, gid: String) {
++        val g = GroupStore.group(gid) ?: return
++        launchRound(gid) {
++            if (Partners.list.value.isEmpty()) Partners.refresh(context)
++            answer(gid, g, listOf(GroupStore.HOST), g.members.mapNotNull { Partners.find(it) }, summary = true)
++        }
++    }
++
++    private suspend fun answer(gid: String, g: AiGroup, who: List<String>, members: List<Partner>, summary: Boolean = false) {
++        val names = members.map { shortName(it.spec.name) } + (if (g.host) listOf(HOST_NAME) else emptyList())
++        suspend fun one(id: String) {
++            val isHost = id == GroupStore.HOST
++            val p = if (isHost) Partners.host() else members.firstOrNull { it.id == id }
++            val name = if (isHost) HOST_NAME else p?.spec?.name ?: id
++            val placeholder = GroupMsg(GroupStore.newId(), if (isHost) GroupStore.HOST else id, name, p?.model ?: "", "", "pending")
++            GroupStore.add(gid, placeholder)
++            val t0 = System.currentTimeMillis()
++            val done = try {
++                if (p == null) throw MemberError(if (isHost) "主持需要至少一个能用的模型密钥" else "这个成员现在不可用（密钥被删或 App 被卸载）")
++                if (!p.ready) throw MemberError(p.reason ?: "还没连接")
++                val me = if (isHost) HOST_NAME else p.spec.name
++                var turns = turnsFor(gid, if (isHost) GroupStore.HOST else id)
++                if (summary) turns = turns + AiClient.Turn("user", "【群主】请你作为主持人，总结上面各位的观点：共识、分歧、你的结论和建议的下一步。")
++                val sys = system(me, p.model, names.filter { it != shortName(me) }, isHost)
++                val r = AiClient.reply(p, sys, turns, if (summary) 1000 else 700)
++                placeholder.copy(text = r.text, status = "ok", model = r.model.ifBlank { p.model } + if (isHost) " · ${p.spec.name}" else "",
++                    inTok = r.inTok, outTok = r.outTok, ms = System.currentTimeMillis() - t0)
++            } catch (e: CancellationException) {
++                GroupStore.replace(gid, placeholder.copy(status = "stopped", text = "已停止"))
++                throw e
++            } catch (e: MemberError) {
++                placeholder.copy(status = "error", text = e.message ?: "失败", ms = System.currentTimeMillis() - t0)
++            } catch (e: Exception) {
++                placeholder.copy(status = "error", text = "出错：${e.javaClass.simpleName} ${e.message?.take(80) ?: ""}", ms = System.currentTimeMillis() - t0)
++            }
++            GroupStore.replace(gid, done)
++        }
++        // 代打字 members drive the phone UI: always one at a time, after the API members.
++        val (phone, api) = who.partition { PhoneApps.isPhone(it) }
++        if (g.sequential) {
++            for (id in api) one(id)
++        } else coroutineScope {
++            api.map { id -> async { one(id) } }.awaitAll()
++        }
++        for (id in phone) one(id)
++    }
++
++    /** Tokens used in a group (shown under the title). */
++    fun tokens(msgs: List<GroupMsg>): Int = msgs.sumOf { it.inTok + it.outTok }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
+new file mode 100644
+index 0000000..8e5984b
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
+@@ -0,0 +1,53 @@
++package com.openminis.app.plus.group
++
++import android.content.Context
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.runBlocking
++import org.json.JSONArray
++import org.json.JSONObject
++
++/**
++ * [Mines-group-37] adb-only smoke hooks (via SelfTestProvider, uid 2000/0):
++ *   content call … --method group --arg 'partners'
++ *   … --arg 'custom 名字|http://10.0.2.2:8088/a/v1|key|smoke-model'
++ *   … --arg 'make 群名|id1,id2'            → group id
++ *   … --arg 'send <gid>|text'              → waits for the round, returns the replies
++ *   … --arg 'reset'
++ */
++object GroupSelfTest {
++    fun handle(context: Context, arg: String): String = runBlocking {
++        GroupStore.init(context)
++        val cmd = arg.substringBefore(' ')
++        val rest = arg.substringAfter(' ', "")
++        val parts = rest.split('|')
++        when (cmd) {
++            "partners" -> {
++                val l = Partners.refresh(context, rescanApps = true)
++                JSONArray(l.map { JSONObject().put("id", it.id).put("name", it.spec.name).put("state", it.state.name).put("model", it.model).put("via", it.via) }).toString()
++            }
++            "custom" -> GroupPrefs.addCustom(parts.getOrElse(0) { "smoke" }, parts.getOrElse(1) { "" }, parts.getOrNull(2), parts.getOrElse(3) { "" })
++                .also { Partners.refresh(context) }
++            "make" -> {
++                Partners.refresh(context)
++                val ids = parts.getOrElse(1) { "" }.split(',').map { it.trim() }.filter { it.isNotEmpty() }
++                GroupStore.create(parts.getOrElse(0) { "smoke" }, ids, host = true, sequential = parts.getOrNull(2) != "par").id
++            }
++            "send" -> {
++                val gid = parts.getOrElse(0) { "" }
++                val before = GroupStore.messages(gid).value.size
++                GroupRunner.send(context, gid, parts.drop(1).joinToString("|"))
++                delay(300)
++                val t0 = System.currentTimeMillis()
++                while (gid in GroupRunner.running.value && System.currentTimeMillis() - t0 < 90_000) delay(250)
++                val round = GroupStore.messages(gid).value.drop(before)
++                JSONArray(round.map { JSONObject().put("who", it.who).put("name", it.name).put("status", it.status).put("text", it.text.take(200)) }).toString()
++            }
++            "reset" -> {
++                GroupStore.groups.value.forEach { GroupStore.delete(it.id) }
++                GroupPrefs.customs().forEach { GroupPrefs.removeCustom(it.id) }
++                "ok"
++            }
++            else -> "unknown group command"
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupStore.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupStore.kt
+new file mode 100644
+index 0000000..cfc5f49
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupStore.kt
+@@ -0,0 +1,121 @@
++package com.openminis.app.plus.group
++
++import android.content.Context
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.flow.update
++import org.json.JSONArray
++import org.json.JSONObject
++import java.io.File
++import java.util.UUID
++
++/** [Mines-group-37] Groups and their messages, one small JSON file per group (filesDir/mines_groups). */
++data class AiGroup(
++    val id: String,
++    val name: String,
++    val members: List<String>,
++    /** Mines itself sits in the group as 主持 (can be @'d, summarises). */
++    val host: Boolean = true,
++    /** true = members answer one after another (each sees the earlier answers); false = all at once. */
++    val sequential: Boolean = true,
++    val createdAt: Long = System.currentTimeMillis(),
++)
++
++data class GroupMsg(
++    val id: String,
++    /** "user", "host" or a member id. */
++    val who: String,
++    val name: String,
++    val model: String,
++    val text: String,
++    /** ok / pending / error / stopped */
++    val status: String = "ok",
++    val inTok: Int = 0,
++    val outTok: Int = 0,
++    val ms: Long = 0,
++    val at: Long = System.currentTimeMillis(),
++)
++
++object GroupStore {
++    const val HOST = "host"
++    private var dir: File? = null
++    private val _groups = MutableStateFlow<List<AiGroup>>(emptyList())
++    val groups: StateFlow<List<AiGroup>> = _groups.asStateFlow()
++    private val msgFlows = HashMap<String, MutableStateFlow<List<GroupMsg>>>()
++
++    fun init(context: Context) {
++        if (dir != null) return
++        synchronized(this) {
++            if (dir != null) return
++            val d = File(context.applicationContext.filesDir, "mines_groups").apply { mkdirs() }
++            dir = d
++            _groups.value = (d.listFiles { f -> f.name.endsWith(".json") } ?: emptyArray()).mapNotNull { f ->
++                runCatching { groupOf(JSONObject(f.readText()).getJSONObject("group")) }.getOrNull()
++            }.sortedByDescending { it.createdAt }
++            PhoneTyping.appContext = context.applicationContext
++            GroupPrefs.init(context)
++        }
++    }
++
++    private fun groupOf(o: JSONObject) = AiGroup(o.getString("id"), o.getString("name"),
++        o.optJSONArray("members")?.let { a -> (0 until a.length()).map { a.getString(it) } } ?: emptyList(),
++        o.optBoolean("host", true), o.optBoolean("seq", true), o.optLong("at"))
++
++    private fun json(g: AiGroup) = JSONObject().put("id", g.id).put("name", g.name).put("members", JSONArray(g.members))
++        .put("host", g.host).put("seq", g.sequential).put("at", g.createdAt)
++
++    private fun msgJson(m: GroupMsg) = JSONObject().put("id", m.id).put("who", m.who).put("name", m.name).put("model", m.model)
++        .put("text", m.text).put("st", m.status).put("in", m.inTok).put("out", m.outTok).put("ms", m.ms).put("at", m.at)
++
++    private fun msgOf(o: JSONObject) = GroupMsg(o.getString("id"), o.getString("who"), o.optString("name"), o.optString("model"),
++        o.optString("text"), o.optString("st", "ok"), o.optInt("in"), o.optInt("out"), o.optLong("ms"), o.optLong("at"))
++
++    fun group(id: String): AiGroup? = _groups.value.firstOrNull { it.id == id }
++
++    fun messages(id: String): StateFlow<List<GroupMsg>> = flow(id)
++
++    private fun flow(id: String): MutableStateFlow<List<GroupMsg>> = synchronized(msgFlows) {
++        msgFlows.getOrPut(id) {
++            val f = File(dir ?: return@getOrPut MutableStateFlow<List<GroupMsg>>(emptyList()), "$id.json")
++            MutableStateFlow<List<GroupMsg>>(runCatching {
++                val a = JSONObject(f.readText()).optJSONArray("msgs") ?: JSONArray()
++                (0 until a.length()).map { msgOf(a.getJSONObject(it)) }.map { if (it.status == "pending") it.copy(status = "stopped", text = "（已中断）") else it }
++            }.getOrDefault(emptyList()))
++        }
++    }
++
++    @Synchronized
++    private fun save(id: String) {
++        val g = group(id) ?: return
++        val d = dir ?: return
++        val arr = JSONArray(); messages(id).value.takeLast(400).forEach { arr.put(msgJson(it)) }
++        runCatching { File(d, "$id.json").writeText(JSONObject().put("group", json(g)).put("msgs", arr).toString()) }
++    }
++
++    fun create(name: String, members: List<String>, host: Boolean, sequential: Boolean): AiGroup {
++        val g = AiGroup("g" + UUID.randomUUID().toString().take(8), name.ifBlank { "AI 群聊" }, members, host, sequential)
++        _groups.value = listOf(g) + _groups.value
++        save(g.id)
++        return g
++    }
++
++    fun update(g: AiGroup) { _groups.value = _groups.value.map { if (it.id == g.id) g else it }; save(g.id) }
++
++    fun delete(id: String) {
++        _groups.value = _groups.value.filter { it.id != id }
++        synchronized(msgFlows) { msgFlows.remove(id) }
++        dir?.let { File(it, "$id.json").delete() }
++    }
++
++    fun add(groupId: String, m: GroupMsg) { flow(groupId).update { it + m }; save(groupId) }
++
++    fun replace(groupId: String, m: GroupMsg) {
++        flow(groupId).update { l -> l.map { if (it.id == m.id) m else it } }
++        if (m.status != "pending") save(groupId)
++    }
++
++    fun clear(groupId: String) { flow(groupId).value = emptyList(); save(groupId) }
++
++    fun newId() = UUID.randomUUID().toString().take(12)
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/Partners.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/Partners.kt
+new file mode 100644
+index 0000000..7aec8fb
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/group/Partners.kt
+@@ -0,0 +1,203 @@
++package com.openminis.app.plus.group
++
++import android.content.Context
++import android.content.SharedPreferences
++import com.openminis.app.MinisApp
++import com.openminis.app.data.model.ProviderType
++import com.openminis.app.plus.KeyBalance
++import com.openminis.app.plus.PlusConnect
++import com.openminis.app.plus.PlusVault
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.async
++import kotlinx.coroutines.awaitAll
++import kotlinx.coroutines.coroutineScope
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.withContext
++import org.json.JSONArray
++import org.json.JSONObject
++import java.util.UUID
++
++/** One AI that can (or could) sit in a group. */
++data class Partner(
++    val spec: AiSpec,
++    val state: State,
++    val base: String,
++    val key: String?,
++    val model: String,
++    /** Where the key came from: 账号连接 / 模型组 / 本机 / 中继 / 自定义 / 代打字. */
++    val via: String,
++    val balance: String? = null,
++    val lowBalance: Boolean = false,
++    val reason: String? = null,
++) {
++    enum class State { READY, NEED_KEY, OFF, UNREACHABLE }
++    val id: String get() = spec.id
++    val ready: Boolean get() = state == State.READY
++}
++
++/** Per-member settings the user changed (model, Bot ID, 代打字 on/off, custom endpoints). */
++object GroupPrefs {
++    private var p: SharedPreferences? = null
++    fun init(context: Context) {
++        if (p == null) p = context.applicationContext.getSharedPreferences("mines_group_prefs", Context.MODE_PRIVATE)
++        PlusVault.init(context)
++    }
++    fun get(k: String): String? = p?.getString(k, null)?.takeIf { it.isNotBlank() }
++    fun put(k: String, v: String?) { p?.edit()?.apply { if (v.isNullOrBlank()) remove(k) else putString(k, v.trim()) }?.apply() }
++
++    fun model(id: String) = get("model_$id")
++    fun setModel(id: String, m: String?) = put("model_$id", m)
++    fun autoModel(id: String) = get("auto_$id")
++    fun setAutoModel(id: String, m: String?) = put("auto_$id", m)
++    fun bot(id: String) = get("bot_$id")
++    fun setBot(id: String, b: String?) = put("bot_$id", b)
++
++    fun phoneOn(id: String) = get("phone_$id") == "1"
++    fun setPhoneOn(id: String, on: Boolean) = put("phone_$id", if (on) "1" else null)
++
++    data class Custom(val id: String, val name: String, val base: String, val model: String)
++    fun customs(): List<Custom> = runCatching {
++        val a = JSONArray(get("customs") ?: "[]")
++        (0 until a.length()).map { a.getJSONObject(it).let { o -> Custom(o.getString("id"), o.getString("name"), o.getString("base"), o.optString("model")) } }
++    }.getOrDefault(emptyList())
++    fun addCustom(name: String, base: String, key: String?, model: String): String {
++        val id = "custom:" + UUID.randomUUID().toString().take(8)
++        val a = JSONArray(get("customs") ?: "[]")
++        a.put(JSONObject().put("id", id).put("name", name).put("base", base.trimEnd('/')).put("model", model))
++        put("customs", a.toString())
++        if (!key.isNullOrBlank()) PlusVault.setSecretExtra("group_member", id, key.trim())
++        return id
++    }
++    fun removeCustom(id: String) {
++        val a = JSONArray(get("customs") ?: "[]"); val b = JSONArray()
++        for (i in 0 until a.length()) if (a.getJSONObject(i).optString("id") != id) b.put(a.getJSONObject(i))
++        put("customs", b.toString())
++        PlusVault.setSecretExtra("group_member", id, null)
++    }
++    fun customKey(id: String): String? = PlusVault.secretExtra("group_member", id)
++}
++
++/**
++ * Finds every usable AI: keys in 账号连接, providers in 模型组 (matched by host,
++ * key and first model reused), the nanoMuse relay and the WorkBuddy gateway
++ * (probed), user-added endpoints, and enabled 代打字 apps.
++ */
++object Partners {
++    private val _list = MutableStateFlow<List<Partner>>(emptyList())
++    val list: StateFlow<List<Partner>> = _list.asStateFlow()
++    private val _apps = MutableStateFlow<List<PhoneApps.Found>>(emptyList())
++    val apps: StateFlow<List<PhoneApps.Found>> = _apps.asStateFlow()
++    @Volatile private var lastScan = 0L
++
++    fun find(id: String): Partner? = _list.value.firstOrNull { it.id == id }
++
++    private data class Inst(val id: String, val label: String, val base: String?, val type: ProviderType, val key: String?, val model: String?)
++
++    private fun instances(context: Context): List<Inst> {
++        val repo = (context.applicationContext as? MinisApp)?.providerRepositoryOrNull ?: return emptyList()
++        return runCatching {
++            val cfg = repo.config.value
++            cfg.instances.filter { it.isEnabled }.map { inst ->
++                val model = cfg.modelEntries.firstOrNull { it.providerInstanceId == inst.id && !it.isHidden }?.baseModel?.id
++                Inst(inst.id, inst.label, inst.effectiveBaseURL, inst.providerType, runCatching { repo.loadApiKey(inst.id) }.getOrNull()?.trim(), model)
++            }
++        }.getOrDefault(emptyList())
++    }
++
++    private fun hostPort(url: String?): String {
++        if (url.isNullOrBlank()) return ""
++        return runCatching { val u = java.net.URI(url.trim()); if (u.port > 0) "${u.host}:${u.port}" else (u.host ?: "") }.getOrDefault("")
++    }
++
++    private fun matches(spec: AiSpec, inst: Inst): Boolean {
++        val hp = hostPort(inst.base)
++        val host = PlusConnect.hostOf(inst.base ?: "")
++        if (hp.isNotEmpty()) return spec.hosts.any { h -> if (h.contains(':')) hp == h else host == h || host.endsWith(".$h") || host.contains(h) }
++        return when (spec.id) {
++            "openai" -> inst.type == ProviderType.openAI
++            "anthropic" -> inst.type == ProviderType.anthropic
++            "gemini" -> inst.type == ProviderType.gemini
++            "openrouter" -> inst.type == ProviderType.openRouter
++            "xai" -> inst.type == ProviderType.xAI
++            else -> false
++        }
++    }
++
++    private fun modelFor(spec: AiSpec, instModel: String?): String =
++        GroupPrefs.model(spec.id) ?: instModel ?: GroupPrefs.autoModel(spec.id) ?: spec.defaultModel
++
++    suspend fun refresh(context: Context, rescanApps: Boolean = false): List<Partner> = withContext(Dispatchers.IO) {
++        GroupPrefs.init(context)
++        val insts = instances(context)
++        val used = HashSet<String>()
++        val out = ArrayList<Partner>()
++        if (rescanApps || System.currentTimeMillis() - lastScan > 60_000) {
++            val found = PhoneApps.scan(context); PhoneApps.remember(found); _apps.value = found; lastScan = System.currentTimeMillis()
++        }
++        val probes = coroutineScope {
++            AiCatalog.specs.filter { it.keyOptional }.map { s -> async { s.id to AiClient.probe(s.baseUrl) } }.awaitAll().toMap()
++        }
++        for (spec in AiCatalog.specs) {
++            val inst = insts.firstOrNull { it.id !in used && matches(spec, it) }
++            if (inst != null) used += inst.id
++            val vaultKey = spec.vaultKind?.let { k -> PlusVault.defaultAccount(k)?.let { PlusVault.secret(it) } }
++            val key = vaultKey ?: inst?.key?.takeIf { it.isNotBlank() }
++            val base = inst?.base?.trimEnd('/') ?: spec.baseUrl
++            val via = when { vaultKey != null -> "账号连接"; inst != null -> "模型组"; spec.id == "nanomuse" -> "中继"; spec.id == "workbuddy" -> "本机"; else -> "" }
++            val bal = spec.vaultKind?.let { k -> PlusVault.defaultAccount(k) }
++            val p = if (spec.keyOptional) {
++                val probe = if (inst != null) AiClient.Probe(true, inst.model, false) else probes[spec.id] ?: AiClient.Probe(false, null, false)
++                when {
++                    inst != null || (probe.reachable && !probe.needsKey) ->
++                        Partner(spec, Partner.State.READY, base, key, modelFor(spec, inst?.model ?: probe.firstModel), via)
++                    probe.reachable && probe.needsKey ->
++                        Partner(spec, Partner.State.NEED_KEY, base, null, "", via, reason = "连得上，但要密钥：在模型组添加这个地址和密钥")
++                    else -> Partner(spec, Partner.State.UNREACHABLE, base, null, "", via,
++                        reason = if (spec.id == "workbuddy") "本机 8788 端口没有响应（WorkBuddy 没开？）" else "中继没有响应")
++                }
++            } else if (key != null && (spec.proto != Proto.COZE || GroupPrefs.bot(spec.id) != null)) {
++                Partner(spec, Partner.State.READY, base, key, modelFor(spec, inst?.model), via,
++                    balance = bal?.let { KeyBalance.text(it) }, lowBalance = bal?.let { KeyBalance.low(it) } == true)
++            } else if (key != null) {
++                Partner(spec, Partner.State.NEED_KEY, base, key, "", via, reason = "还差智能体 Bot ID")
++            } else Partner(spec, Partner.State.NEED_KEY, base, null, "", "")
++            out += p
++        }
++        // other OpenAI-compatible providers in 模型组
++        for (inst in insts) {
++            if (inst.id in used || inst.base.isNullOrBlank()) continue
++            if (inst.type != ProviderType.openAI && inst.type != ProviderType.anthropic) continue
++            val spec = AiSpec("model:${inst.id}", inst.label, null, if (inst.type == ProviderType.anthropic) Proto.ANTHROPIC else Proto.OPENAI,
++                inst.base.trimEnd('/'), inst.model ?: "", keyOptional = true, note = "模型组里的服务")
++            out += Partner(spec, Partner.State.READY, spec.baseUrl, inst.key, modelFor(spec, inst.model), "模型组")
++        }
++        for (c in GroupPrefs.customs()) {
++            val spec = AiSpec(c.id, c.name, null, Proto.OPENAI, c.base, c.model, keyOptional = true, note = "自定义接口")
++            out += Partner(spec, Partner.State.READY, c.base, GroupPrefs.customKey(c.id), modelFor(spec, c.model), "自定义")
++        }
++        for (f in _apps.value.filter { it.known.verdict == PhoneApps.Verdict.TYPING }) {
++            val spec = PhoneApps.specFor(PhoneApps.idFor(f.pkg)) ?: continue
++            out += Partner(spec, if (GroupPrefs.phoneOn(spec.id)) Partner.State.READY else Partner.State.OFF, f.pkg, null, "App", "代打字",
++                reason = "慢、可能断：Mines 替你在 ${f.label} 里打字、读回复")
++        }
++        _list.value = out
++        out
++    }
++
++    /** Balance refresh for members with a balance API (DeepSeek / 硅基 / Kimi / OpenRouter). */
++    suspend fun refreshBalances(ids: Collection<String>) = withContext(Dispatchers.IO) {
++        for (id in ids) {
++            val kind = AiCatalog.spec(id)?.vaultKind ?: continue
++            if (!KeyBalance.hasApi(kind)) continue
++            PlusVault.defaultAccount(kind)?.let { runCatching { KeyBalance.refresh(it) } }
++        }
++    }
++
++    /** Mines' own voice in the group (主持): the first ready API member by [AiCatalog.hostOrder]. */
++    fun host(): Partner? {
++        val ready = _list.value.filter { it.ready && it.spec.proto in setOf(Proto.OPENAI, Proto.ANTHROPIC) }
++        return AiCatalog.hostOrder.firstNotNullOfOrNull { id -> ready.firstOrNull { it.id == id } } ?: ready.firstOrNull()
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/PhoneApps.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/PhoneApps.kt
+new file mode 100644
+index 0000000..f0a91fa
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/group/PhoneApps.kt
+@@ -0,0 +1,102 @@
++package com.openminis.app.plus.group
++
++import android.content.Context
++import android.content.Intent
++import android.content.pm.PackageManager
++
++/**
++ * [Mines-group-37] Which AI apps on the phone can join a group chat, and why.
++ * Installed apps are found with PackageManager (QUERY_ALL_PACKAGES is already
++ * granted to Mines); nothing leaves the phone.
++ */
++object PhoneApps {
++    enum class Verdict(val label: String) { API("能接"), TYPING("代打字"), INDIRECT("间接"), NO("不能接") }
++
++    data class Known(
++        val name: String,
++        val packages: List<String>,
++        val labelHints: List<String>,
++        val verdict: Verdict,
++        val reason: String,
++        /** AiCatalog id that replaces the app (API verdict). */
++        val partner: String? = null,
++    )
++
++    data class Found(val known: Known, val pkg: String, val label: String)
++
++    val known = listOf(
++        Known("ChatGPT", listOf("com.openai.chatgpt"), listOf("ChatGPT"), Verdict.API, "官方 API，填 OpenAI 密钥即可", "openai"),
++        Known("Claude", listOf("com.anthropic.claude"), listOf("Claude"), Verdict.API, "官方 API，填 Anthropic 密钥即可", "anthropic"),
++        Known("Grok", listOf("ai.x.grok"), listOf("Grok"), Verdict.API, "xAI 官方 API", "xai"),
++        Known("DeepSeek", listOf("com.deepseek.chat"), listOf("DeepSeek"), Verdict.API, "官方 API，便宜稳定", "deepseek"),
++        Known("Gemini", listOf("com.google.android.apps.bard"), listOf("Gemini"), Verdict.API, "Google AI Studio 密钥", "gemini"),
++        Known("Kimi", listOf("com.moonshot.kimichat"), listOf("Kimi"), Verdict.API, "月之暗面开放平台 API", "kimi"),
++        Known("智谱清言", listOf("com.zhipuai.qingyan"), listOf("智谱清言", "清言"), Verdict.API, "BigModel 开放平台 API", "zhipu"),
++        Known("豆包", listOf("com.larus.nova"), listOf("豆包"), Verdict.API, "走火山方舟 API，同一模型，但没有 App 里的记忆", "volcengine"),
++        Known("元宝", listOf("com.tencent.hunyuan.app.chat"), listOf("元宝"), Verdict.API, "走腾讯混元 API，同一模型，但没有 App 里的记忆", "hunyuan"),
++        Known("海螺 / MiniMax", listOf("com.minimax.ai", "com.hailuo.ai"), listOf("海螺", "MiniMax"), Verdict.API, "MiniMax 开放平台 API", "minimax"),
++        Known("Perplexity", listOf("ai.perplexity.app.android"), listOf("Perplexity"), Verdict.API, "官方 API", "perplexity"),
++        Known("Manus", listOf("tech.butterfly.app", "im.manus.app"), listOf("Manus"), Verdict.API, "开放 API：发任务、等结果（慢）", "manus"),
++        Known("扣子", listOf("com.coze.space", "com.larus.coze"), listOf("扣子", "Coze"), Verdict.API, "开放 API：调用你自己的智能体", "coze"),
++        Known("WorkBuddy", emptyList(), listOf("WorkBuddy"), Verdict.API, "本机网关 127.0.0.1:8788，自动探测", "workbuddy"),
++        Known("Muse", listOf("ai.muse.app", "com.muse.ai"), listOf("Muse"), Verdict.TYPING,
++            "官方 App 没有公开接口，只能无障碍代打字（慢、可能断）；你的 nanoMuse 中继可以直接进群"),
++        Known("Genspark", listOf("ai.genspark.app", "com.genspark.app"), listOf("Genspark"), Verdict.TYPING, "没有公开接口，只能无障碍代打字（慢、可能断）"),
++        Known("Cue", listOf("com.cue.app", "ai.cue.app"), listOf("Cue"), Verdict.TYPING, "没有公开接口，只能无障碍代打字（慢、可能断）"),
++        Known("Operit AI", listOf("com.ai.assistance.operit"), listOf("Operit"), Verdict.TYPING, "没有对外接口，只能无障碍代打字（慢、可能断）"),
++        Known("Meta AI", listOf("com.facebook.stella", "com.meta.ai"), listOf("Meta AI"), Verdict.TYPING, "国内没有可用 API，只能无障碍代打字（慢、可能断）"),
++        Known("MNN Chat", listOf("com.alibaba.mnnllm.android"), listOf("MNN"), Verdict.INDIRECT, "本地模型，直接加载进 Mines 更省事"),
++        Known("PocketPal", listOf("com.pocketpalai"), listOf("PocketPal"), Verdict.INDIRECT, "本地模型，直接加载进 Mines 更省事"),
++        Known("Edge Gallery", listOf("com.google.ai.edge.gallery"), listOf("Edge Gallery", "AI Edge"), Verdict.INDIRECT, "本地模型，直接加载进 Mines 更省事"),
++        Known("飞书 / Telegram / Slack", listOf("com.ss.android.lark", "org.telegram.messenger", "com.Slack"), listOf("飞书", "Telegram", "Slack"),
++            Verdict.INDIRECT, "有机器人接口，可当群聊场地；本版群聊开在 Mines 里"),
++        Known("小布助手", listOf("com.heytap.speechassist", "com.coloros.speechassist"), listOf("小布"), Verdict.NO, "系统语音助手，没有接口，界面也读不出回复"),
++        Known("夸克", listOf("com.quark.browser"), listOf("夸克"), Verdict.NO, "搜索/浏览器 App，没有对话接口，界面不好读"),
++        Known("微信", listOf("com.tencent.mm"), listOf("微信"), Verdict.NO, "没有个人号官方接口；自动化收发消息会触发风控，可能封号"),
++        Known("QQ", listOf("com.tencent.mobileqq"), listOf("QQ"), Verdict.NO, "没有个人号官方接口；自动化收发消息会触发风控，可能封号"),
++    )
++
++    private val aiWords = Regex("""(?i)\bAI\b|GPT|Chat|助手|智能体|大模型""")
++
++    /** Installed launcher apps matched against [known]; unknown AI-looking apps become 代打字 candidates. */
++    fun scan(context: Context): List<Found> = runCatching {
++        val pm = context.packageManager
++        val launch = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
++        @Suppress("DEPRECATION")
++        val acts = pm.queryIntentActivities(launch, PackageManager.MATCH_ALL)
++        val seen = HashSet<String>()
++        val out = ArrayList<Found>()
++        for (ri in acts) {
++            val pkg = ri.activityInfo?.packageName ?: continue
++            if (pkg == context.packageName || !seen.add(pkg)) continue
++            val label = runCatching { ri.loadLabel(pm).toString() }.getOrDefault(pkg)
++            val k = known.firstOrNull { pkg in it.packages } ?: known.firstOrNull { kn ->
++                kn.labelHints.any { h -> label.equals(h, true) || (h.length >= 3 && label.contains(h, true)) }
++            }
++            when {
++                k != null -> out += Found(k, pkg, label)
++                aiWords.containsMatchIn(label) -> out += Found(
++                    Known(label, listOf(pkg), emptyList(), Verdict.TYPING, "没找到公开接口，只能无障碍代打字（慢、可能断）"), pkg, label)
++            }
++        }
++        out.sortedBy { it.known.verdict.ordinal }
++    }.getOrDefault(emptyList())
++
++    // ── 代打字 partners ─────────────────────────────────────────────────
++
++    private const val PREFIX = "phone:"
++    fun idFor(pkg: String) = PREFIX + pkg
++    fun pkgOf(id: String) = id.removePrefix(PREFIX)
++    fun isPhone(id: String) = id.startsWith(PREFIX)
++
++    @Volatile private var labels: Map<String, String> = emptyMap()
++    fun remember(found: List<Found>) { labels = labels + found.associate { it.pkg to it.label } }
++
++    fun specFor(id: String): AiSpec? {
++        if (!isPhone(id)) return null
++        val pkg = pkgOf(id)
++        val name = labels[pkg] ?: known.firstOrNull { pkg in it.packages }?.name ?: pkg.substringAfterLast('.')
++        return AiSpec(id, name, null, Proto.PHONE, pkg, "App", icon = 0, color = 0xFF8A7F74,
++            note = "代打字：慢、可能断", keyOptional = true)
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/PhoneTyping.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/PhoneTyping.kt
+new file mode 100644
+index 0000000..344b694
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/group/PhoneTyping.kt
+@@ -0,0 +1,79 @@
++package com.openminis.app.plus.group
++
++import android.content.Context
++import android.content.Intent
++import com.openminis.app.sandbox.offload.FastUi
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
++import kotlinx.coroutines.withContext
++
++/**
++ * [Mines-group-37] 「代打字」 for AI apps without an API (Genspark, Cue, Operit,
++ * Meta AI, Muse official app …): Mines opens the app, types the message into
++ * its last input box, presses send, waits until the screen stops changing and
++ * takes the new text as the reply, then comes back to the group. Uses the
++ * same accessibility / Shizuku FastUi path as the agent's phone control.
++ * Slow (20–90 s) and fragile when the app changes its layout — default off,
++ * one app at a time. Never used for WeChat / QQ (risk control, account bans).
++ */
++object PhoneTyping {
++    @Volatile var appContext: Context? = null
++    private val lock = Mutex()
++    private val blocked = setOf("com.tencent.mm", "com.tencent.mobileqq")
++    /** Route to come back to after typing (the open group). */
++    @Volatile var returnRoute: String? = null
++
++    suspend fun ask(p: Partner, text: String): AiClient.Reply = lock.withLock {
++        val ctx = appContext ?: throw MemberError("代打字没准备好")
++        val pkg = p.base
++        if (pkg in blocked) throw MemberError("微信 / QQ 不做代打字：会触发风控封号")
++        withContext(Dispatchers.IO) {
++            val ui = FastUi(ctx)
++            if (!ui.ready()) throw MemberError("要先开 Mines 的无障碍（或 Shizuku）才能代打字")
++            try {
++                val opened = ui.voiceOpenApp(pkg)
++                delay(2500)
++                var screen = ui.voiceScreen()
++                var input = lastInput(screen)
++                if (input == null) { delay(2500); screen = ui.voiceScreen(); input = lastInput(screen) }
++                if (input == null) throw MemberError(if (opened.contains("✗") || opened.contains("失败")) "打不开 ${p.spec.name}" else "${p.spec.name} 里找不到输入框（可能要先登录或换到对话页）")
++                val before = ui.allText().lines().map { it.trim() }.filter { it.isNotEmpty() }.toHashSet()
++                val clean = text.replace(Regex("[\\r\\n;；\"]+"), "，").take(1500)
++                ui.voiceDo("type $input \"$clean\"", true)
++                delay(400)
++                val sent = ui.tapText("发送") || ui.tapText("Send") || ui.tapText("send") ||
++                    ui.voiceDo("key enter", true).contains("✓")
++                if (!sent) throw MemberError("${p.spec.name} 里没找到发送按钮")
++                val t0 = System.currentTimeMillis()
++                var last = ""; var stable = 0; var reply = ""
++                while (System.currentTimeMillis() - t0 < 120_000) {
++                    delay(2000)
++                    val now = ui.allText()
++                    val fresh = now.lines().map { it.trim() }.filter { it.isNotEmpty() && it !in before && !clean.contains(it) && it.length > 1 }
++                    val cand = fresh.joinToString("\n")
++                    if (cand.isNotEmpty() && cand == last) { stable++; if (stable >= 3) { reply = cand; break } } else stable = 0
++                    last = cand
++                }
++                if (reply.isBlank()) reply = last
++                if (reply.isBlank()) throw MemberError("等了 2 分钟没读到 ${p.spec.name} 的回复（代打字可能断了）")
++                AiClient.Reply(reply.take(4000), model = "App 代打字")
++            } finally {
++                comeBack(ctx)
++            }
++        }
++    }
++
++    private fun lastInput(list: String): Int? =
++        list.lines().mapNotNull { l -> Regex("""^(\d+) \[输入框]""").find(l.trim())?.groupValues?.get(1)?.toIntOrNull() }.lastOrNull()
++
++    private fun comeBack(ctx: Context) {
++        runCatching {
++            val i = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName) ?: return
++            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
++            returnRoute?.let { i.putExtra("mines_route", it) }
++            ctx.startActivity(i)
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/group/GroupScreens.kt b/src/android/app/src/main/java/com/openminis/app/ui/group/GroupScreens.kt
+new file mode 100644
+index 0000000..2dbee20
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/group/GroupScreens.kt
+@@ -0,0 +1,550 @@
++package com.openminis.app.ui.group
++
++import androidx.compose.foundation.Image
++import androidx.compose.foundation.background
++import androidx.compose.foundation.border
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.imePadding
++import androidx.compose.foundation.layout.navigationBarsPadding
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.statusBarsPadding
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.layout.widthIn
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.LazyRow
++import androidx.compose.foundation.lazy.items
++import androidx.compose.foundation.lazy.rememberLazyListState
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.foundation.text.selection.SelectionContainer
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.Checkbox
++import androidx.compose.material3.CircularProgressIndicator
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.Switch
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.res.painterResource
++import androidx.compose.ui.semantics.contentDescription
++import androidx.compose.ui.semantics.semantics
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.Dp
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import androidx.navigation.NavGraphBuilder
++import androidx.navigation.NavHostController
++import androidx.navigation.NavType
++import androidx.navigation.compose.composable
++import androidx.navigation.navArgument
++import com.openminis.app.plus.group.AiGroup
++import com.openminis.app.plus.group.GroupMsg
++import com.openminis.app.plus.group.GroupPrefs
++import com.openminis.app.plus.group.GroupRunner
++import com.openminis.app.plus.group.GroupStore
++import com.openminis.app.plus.group.Partner
++import com.openminis.app.plus.group.Partners
++import com.openminis.app.plus.group.PhoneApps
++import com.openminis.app.plus.group.PhoneTyping
++import com.openminis.app.plus.group.Proto
++import com.openminis.app.ui.brand.MinesIcon
++import com.openminis.app.ui.brand.MinesIcons
++import com.openminis.app.ui.plus.InfoLine
++import com.openminis.app.ui.plus.MinesBackdrop
++import com.openminis.app.ui.plus.MinesCard
++import com.openminis.app.ui.plus.MinesDesign
++import com.openminis.app.ui.plus.PetAvatar
++import com.openminis.app.ui.plus.PillButton
++import com.openminis.app.ui.plus.PlusNav
++import com.openminis.app.ui.plus.PlusPage
++import com.openminis.app.ui.plus.PlusRoutes
++import com.openminis.app.ui.plus.PlusRow
++import com.openminis.app.ui.plus.PlusSection
++import com.openminis.app.ui.plus.StatusPill
++import com.openminis.app.ui.plus.mines
++import com.openminis.app.ui.plus.minesGlassFill
++import kotlinx.coroutines.launch
++
++/** [Mines-group-37] 「AI 群聊」 + 「AI 伙伴」 routes, mounted by AppNavigation with one line. */
++object GroupRoutes {
++    const val HOME = "plus_group"
++    const val PARTNERS = "plus_group_partners"
++    const val NEW = "plus_group_new"
++    const val CHAT = "plus_group_chat/{id}"
++    fun chat(id: String) = "plus_group_chat/$id"
++}
++
++fun NavGraphBuilder.groupRoutes(nav: NavHostController) {
++    val back: () -> Unit = { nav.popBackStack() }
++    composable(GroupRoutes.HOME) { GroupHomeScreen(back, { nav.navigate(it) }) }
++    composable(GroupRoutes.PARTNERS) { PartnersScreen(back) }
++    composable(GroupRoutes.NEW) {
++        NewGroupScreen(back) { id -> nav.navigate(GroupRoutes.chat(id)) { popUpTo(GroupRoutes.NEW) { inclusive = true } } }
++    }
++    composable(GroupRoutes.CHAT, arguments = listOf(navArgument("id") { type = NavType.StringType })) { e ->
++        GroupChatScreen(e.arguments?.getString("id") ?: "", back) { nav.navigate(GroupRoutes.PARTNERS) }
++    }
++}
++
++private fun icon(name: String) = MinesIcons.named(name)!!
++
++// ── avatar ───────────────────────────────────────────────────────────────
++
++@Composable
++fun PartnerAvatar(p: Partner?, who: String, name: String, size: Dp = 36.dp) {
++    val m = mines()
++    if (who == GroupStore.HOST) {
++        Box(Modifier.size(size).clip(CircleShape), contentAlignment = Alignment.Center) { PetAvatar(size = size, animated = false) }
++        return
++    }
++    val spec = p?.spec
++    val tint = Color(spec?.color ?: 0xFF8A7F74)
++    Box(
++        Modifier.size(size).clip(CircleShape).background(if (spec != null && spec.icon != 0) Color.White else tint.copy(alpha = 0.16f))
++            .border(1.dp, m.hairline, CircleShape),
++        contentAlignment = Alignment.Center,
++    ) {
++        if (spec != null && spec.icon != 0) Image(painterResource(spec.icon), contentDescription = null, modifier = Modifier.size(size * 0.6f))
++        else Text(GroupRunner.shortName(name).take(1).uppercase(), fontSize = (size.value * 0.42f).sp, fontWeight = FontWeight.Bold, color = tint)
++    }
++}
++
++@Composable
++private fun Tag(text: String, tone: Color) {
++    Text(text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = tone,
++        modifier = Modifier.clip(RoundedCornerShape(50)).background(tone.copy(alpha = 0.12f)).padding(horizontal = 8.dp, vertical = 2.dp))
++}
++
++// ── 群聊 home ─────────────────────────────────────────────────────────────
++
++@Composable
++fun GroupHomeScreen(onBack: () -> Unit, go: (String) -> Unit) {
++    val ctx = LocalContext.current
++    GroupStore.init(ctx)
++    val groups by GroupStore.groups.collectAsState()
++    val partners by Partners.list.collectAsState()
++    LaunchedEffect(Unit) { Partners.refresh(ctx) }
++    val ready = partners.filter { it.ready }
++    PlusPage("AI 群聊", onBack, subtitle = "把几个 AI 拉进一个群，一起讨论、互相补充，Mines 来主持") {
++        PlusSection(null) {
++            PlusRow(icon("sparkles"), "AI 伙伴", if (partners.isEmpty()) "正在识别…" else "${ready.size} 个能直接用 · 看看手机上哪些能接") { go(GroupRoutes.PARTNERS) }
++        }
++        PlusSection("我的群") {
++            if (groups.isEmpty()) InfoLine("还没有群。点下面「新建群聊」，选几个 AI 就能开聊")
++            groups.forEach { g ->
++                val names = g.members.mapNotNull { id -> partners.firstOrNull { it.id == id }?.spec?.name?.let(GroupRunner::shortName) }
++                PlusRow(icon("users"), g.name, (if (g.host) listOf("Mines") else emptyList<String>()).plus(names).joinToString("、").ifBlank { "没有成员" }) {
++                    go(GroupRoutes.chat(g.id))
++                }
++            }
++        }
++        Spacer(Modifier.heightIn(min = 16.dp))
++        PillButton("新建群聊", Modifier.fillMaxWidth().padding(horizontal = 20.dp), enabled = true) { go(GroupRoutes.NEW) }
++    }
++}
++
++// ── 新建群 ───────────────────────────────────────────────────────────────
++
++@Composable
++fun NewGroupScreen(onBack: () -> Unit, onCreated: (String) -> Unit) {
++    val ctx = LocalContext.current
++    GroupStore.init(ctx)
++    val partners by Partners.list.collectAsState()
++    LaunchedEffect(Unit) { Partners.refresh(ctx) }
++    var name by remember { mutableStateOf("") }
++    var picked by remember { mutableStateOf(setOf<String>()) }
++    var host by remember { mutableStateOf(true) }
++    var seq by remember { mutableStateOf(true) }
++    val m = mines()
++    PlusPage("新建群聊", onBack) {
++        OutlinedTextField(name, { name = it }, label = { Text("群名（可不填）") }, singleLine = true,
++            modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp))
++        PlusSection("选成员", footer = "代打字的 App 很慢（每条 20–90 秒），会切到那个 App 里操作，可能中途断") {
++            val ready = partners.filter { it.ready }
++            if (ready.isEmpty()) InfoLine("还没有能用的 AI。去「AI 伙伴」连接一个")
++            ready.forEach { p ->
++                Row(Modifier.fillMaxWidth().heightIn(min = 60.dp).clickable { picked = if (p.id in picked) picked - p.id else picked + p.id }
++                    .padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
++                    PartnerAvatar(p, p.id, p.spec.name, 36.dp)
++                    Spacer(Modifier.width(12.dp))
++                    Column(Modifier.weight(1f)) {
++                        Text(p.spec.name, fontSize = 17.sp, fontWeight = FontWeight.Medium, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
++                        Text(listOf(p.model, p.via).filter { it.isNotBlank() }.joinToString(" · "), fontSize = 14.sp, color = m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis)
++                    }
++                    if (p.spec.proto == Proto.PHONE) { Tag("慢", MinesDesign.Warning); Spacer(Modifier.width(6.dp)) }
++                    Checkbox(p.id in picked, { picked = if (it) picked + p.id else picked - p.id })
++                }
++            }
++        }
++        PlusSection("群设置") {
++            PlusRow(null, "Mines 当主持", "可以 @Mines，也能一键总结大家的观点", chevron = false,
++                trailing = { Switch(host, { host = it }) })
++            PlusRow(null, "回复方式", if (seq) "依次回复：后面的能看到前面的回答" else "同时回复：更快，互相看不到这一轮", chevron = false,
++                trailing = { Switch(seq, { seq = it }) })
++        }
++        Spacer(Modifier.heightIn(min = 16.dp))
++        PillButton("创建（${picked.size} 位成员）", Modifier.fillMaxWidth().padding(horizontal = 20.dp), enabled = picked.isNotEmpty()) {
++            val order = partners.map { it.id }.filter { it in picked }
++            val g = GroupStore.create(name.trim().ifBlank { order.mapNotNull { id -> partners.firstOrNull { it.id == id }?.spec?.name?.let(GroupRunner::shortName) }.take(3).joinToString("、") + " 群" },
++                order, host, seq)
++            onCreated(g.id)
++        }
++    }
++}
++
++// ── AI 伙伴 ──────────────────────────────────────────────────────────────
++
++@Composable
++fun PartnersScreen(onBack: () -> Unit) {
++    val ctx = LocalContext.current
++    GroupStore.init(ctx)
++    val partners by Partners.list.collectAsState()
++    val apps by Partners.apps.collectAsState()
++    val scope = rememberCoroutineScope()
++    var edit by remember { mutableStateOf<Partner?>(null) }
++    var askPhone by remember { mutableStateOf<Partner?>(null) }
++    var addCustom by remember { mutableStateOf(false) }
++    var busy by remember { mutableStateOf(true) }
++    LaunchedEffect(Unit) { Partners.refresh(ctx, rescanApps = true); busy = false }
++    val m = mines()
++    fun reload() = scope.launch { Partners.refresh(ctx) }
++
++    PlusPage("AI 伙伴", onBack, subtitle = "已连接的密钥自动识别；没有的点「连接」，Mines 帮你去官网一键获取",
++        actions = { if (busy) CircularProgressIndicator(Modifier.size(22.dp).padding(end = 4.dp), strokeWidth = 2.dp) }) {
++        val api = partners.filter { it.spec.proto != Proto.PHONE }
++        val ready = api.filter { it.ready }
++        val notYet = api.filter { !it.ready }
++        PlusSection("能直接用（${ready.size}）", footer = "点一个可以换模型") {
++            if (ready.isEmpty() && !busy) InfoLine("还没有。下面点「连接」，或在模型组里加一个服务")
++            ready.forEach { p -> PartnerRow(p, onClick = { edit = p }) }
++        }
++        PlusSection("还没连接") {
++            notYet.forEach { p ->
++                PartnerRow(p, trailing = {
++                    Text(if (p.spec.vaultKind != null) "连接" else "去设置", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = m.onPrimary,
++                        modifier = Modifier.clip(RoundedCornerShape(50)).background(m.primary)
++                            .clickable {
++                                when {
++                                    p.spec.proto == Proto.COZE && p.key != null -> edit = p
++                                    p.spec.vaultKind != null -> { PlusNav.openKind = p.spec.vaultKind; PlusNav.go(PlusRoutes.CONNECTIONS) }
++                                    else -> PlusNav.go("providers")
++                                }
++                            }.padding(horizontal = 14.dp, vertical = 8.dp))
++                })
++            }
++        }
++        PlusSection("手机上的 AI App", footer = "「代打字」= Mines 用无障碍替你在那个 App 里打字、读回复。慢、可能断，默认关闭。微信、QQ 不做：没有个人号官方接口，自动收发会触发风控封号。") {
++            if (apps.isEmpty()) InfoLine(if (busy) "正在扫描…" else "没找到已安装的 AI App")
++            apps.forEach { f ->
++                val v = f.known.verdict
++                val tone = when (v) {
++                    PhoneApps.Verdict.API -> MinesDesign.Success
++                    PhoneApps.Verdict.TYPING -> MinesDesign.Warning
++                    PhoneApps.Verdict.INDIRECT -> MinesDesign.Info
++                    PhoneApps.Verdict.NO -> MinesDesign.Danger
++                }
++                val phoneId = PhoneApps.idFor(f.pkg)
++                val on = partners.firstOrNull { it.id == phoneId }?.ready == true
++                Row(Modifier.fillMaxWidth().heightIn(min = 64.dp).padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
++                    Column(Modifier.weight(1f)) {
++                        Row(verticalAlignment = Alignment.CenterVertically) {
++                            Text(f.label, fontSize = 17.sp, fontWeight = FontWeight.Medium, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis,
++                                modifier = Modifier.weight(1f, fill = false))
++                            Spacer(Modifier.width(8.dp)); Tag(v.label, tone)
++                        }
++                        Text(f.known.reason, fontSize = 14.sp, lineHeight = 19.sp, color = m.ink2)
++                    }
++                    if (v == PhoneApps.Verdict.TYPING) {
++                        Spacer(Modifier.width(8.dp))
++                        Switch(on, { want ->
++                            if (want) askPhone = partners.firstOrNull { it.id == phoneId }
++                            else { GroupPrefs.setPhoneOn(phoneId, false); reload() }
++                        })
++                    }
++                }
++            }
++        }
++        PlusSection("自定义") {
++            PlusRow(icon("plus"), "添加 OpenAI 兼容接口", "自建中继、公司网关等：填地址、密钥和模型") { addCustom = true }
++        }
++    }
++
++    edit?.let { p ->
++        var model by remember(p.id) { mutableStateOf(GroupPrefs.model(p.id) ?: "") }
++        var bot by remember(p.id) { mutableStateOf(GroupPrefs.bot(p.id) ?: "") }
++        AlertDialog(onDismissRequest = { edit = null }, title = { Text(p.spec.name) },
++            text = {
++                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                    if (p.spec.note.isNotBlank()) Text(p.spec.note, fontSize = 15.sp, color = m.ink2)
++                    if (p.spec.proto == Proto.COZE) OutlinedTextField(bot, { bot = it }, label = { Text("智能体 Bot ID") }, singleLine = true)
++                    if (p.spec.proto != Proto.PHONE && p.spec.proto != Proto.COZE)
++                        OutlinedTextField(model, { model = it }, label = { Text(if (p.spec.proto == Proto.MANUS) "档位（lite / standard / max）" else "模型（空 = 自动：${p.model.ifBlank { "默认" }}）") }, singleLine = true)
++                }
++            },
++            confirmButton = { TextButton({
++                GroupPrefs.setModel(p.id, model.ifBlank { null }); if (p.spec.proto == Proto.COZE) GroupPrefs.setBot(p.id, bot.ifBlank { null })
++                edit = null; reload()
++            }) { Text("保存") } },
++            dismissButton = {
++                if (p.id.startsWith("custom:")) TextButton({ GroupPrefs.removeCustom(p.id); edit = null; reload() }) { Text("删除") }
++                else TextButton({ edit = null }) { Text("取消") }
++            })
++    }
++    askPhone?.let { p ->
++        AlertDialog(onDismissRequest = { askPhone = null }, title = { Text("开启「${p.spec.name}」代打字？") },
++            text = { Text("轮到它发言时，Mines 会打开 ${p.spec.name}，在输入框里替你打字、发送，等它回完再读回来，然后回到群聊。每条 20–90 秒，App 改版或弹窗时可能断。需要 Mines 的无障碍或 Shizuku。", fontSize = 16.sp) },
++            confirmButton = { TextButton({ GroupPrefs.setPhoneOn(p.id, true); askPhone = null; reload() }) { Text("开启") } },
++            dismissButton = { TextButton({ askPhone = null }) { Text("先不用") } })
++    }
++    if (addCustom) {
++        var n by remember { mutableStateOf("") }
++        var b by remember { mutableStateOf("") }
++        var k by remember { mutableStateOf("") }
++        var md by remember { mutableStateOf("") }
++        AlertDialog(onDismissRequest = { addCustom = false }, title = { Text("添加接口") },
++            text = {
++                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
++                    OutlinedTextField(n, { n = it }, label = { Text("名字") }, singleLine = true)
++                    OutlinedTextField(b, { b = it }, label = { Text("地址，如 https://x.com/v1") }, singleLine = true)
++                    OutlinedTextField(k, { k = it }, label = { Text("密钥（可空）") }, singleLine = true)
++                    OutlinedTextField(md, { md = it }, label = { Text("模型") }, singleLine = true)
++                }
++            },
++            confirmButton = { TextButton({
++                if (b.startsWith("http")) { GroupPrefs.addCustom(n.ifBlank { "自定义" }, b, k, md); addCustom = false; reload() }
++            }) { Text("添加") } },
++            dismissButton = { TextButton({ addCustom = false }) { Text("取消") } })
++    }
++}
++
++@Composable
++private fun PartnerRow(p: Partner, onClick: (() -> Unit)? = null, trailing: (@Composable () -> Unit)? = null) {
++    val m = mines()
++    Row(Modifier.fillMaxWidth().heightIn(min = 64.dp).then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
++        .padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
++        PartnerAvatar(p, p.id, p.spec.name, 40.dp)
++        Spacer(Modifier.width(12.dp))
++        Column(Modifier.weight(1f)) {
++            Text(p.spec.name, fontSize = 17.sp, fontWeight = FontWeight.Medium, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
++            val sub = when (p.state) {
++                Partner.State.READY -> listOfNotNull(p.model.ifBlank { null }, p.via.ifBlank { null }, p.balance?.let { "余额 $it" }).joinToString(" · ")
++                else -> p.reason ?: p.spec.note.ifBlank { "还没有密钥" }
++            }
++            Text(sub, fontSize = 14.sp, lineHeight = 19.sp, color = if (p.lowBalance) MinesDesign.Warning else m.ink2, maxLines = 2, overflow = TextOverflow.Ellipsis)
++        }
++        if (trailing != null) { Spacer(Modifier.width(8.dp)); trailing() }
++        else if (p.ready) StatusPill(if (p.lowBalance) "余额低" else "能用", if (p.lowBalance) null else true)
++    }
++}
++
++// ── 群聊 ─────────────────────────────────────────────────────────────────
++
++@Composable
++fun GroupChatScreen(gid: String, onBack: () -> Unit, onPartners: () -> Unit) {
++    val ctx = LocalContext.current
++    GroupStore.init(ctx)
++    val groups by GroupStore.groups.collectAsState()
++    val g: AiGroup = groups.firstOrNull { it.id == gid } ?: run {
++        PlusPage("群聊", onBack) { InfoLine("这个群已经不存在了") }
++        return
++    }
++    val msgs by remember(gid) { GroupStore.messages(gid) }.collectAsState()
++    val partners by Partners.list.collectAsState()
++    val running by GroupRunner.running.collectAsState()
++    val busy = gid in running
++    val members = g.members.mapNotNull { id -> partners.firstOrNull { it.id == id } }
++    var input by remember { mutableStateOf("") }
++    var menu by remember { mutableStateOf(false) }
++    val list = rememberLazyListState()
++    val m = mines()
++    LaunchedEffect(gid) {
++        PhoneTyping.returnRoute = GroupRoutes.chat(gid)
++        if (Partners.list.value.isEmpty()) Partners.refresh(ctx)
++        Partners.refreshBalances(g.members); Partners.refresh(ctx)
++    }
++    LaunchedEffect(msgs.size, msgs.lastOrNull()?.status) { if (msgs.isNotEmpty()) list.animateScrollToItem(msgs.size - 1) }
++
++    Box(Modifier.fillMaxSize()) {
++        MinesBackdrop(Modifier.fillMaxSize())
++        Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().imePadding()) {
++            // top bar
++            Row(Modifier.fillMaxWidth().heightIn(min = 60.dp).padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
++                Box(Modifier.size(48.dp).clip(CircleShape).clickable(onClick = onBack).semantics { contentDescription = "返回" }, contentAlignment = Alignment.Center) {
++                    MinesIcon(icon("arrow-left"), null, tint = m.ink)
++                }
++                Column(Modifier.weight(1f)) {
++                    Text(g.name, fontSize = 20.sp, fontWeight = FontWeight.Bold, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
++                    val tok = GroupRunner.tokens(msgs)
++                    Text("${members.size + if (g.host) 1 else 0} 位成员" + (if (tok > 0) " · 已用 ${fmtTok(tok)} tokens" else ""),
++                        fontSize = 14.sp, color = m.ink2, maxLines = 1)
++                }
++                if (g.host) Text("总结", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = if (busy) m.ink3 else m.primaryText,
++                    modifier = Modifier.clip(RoundedCornerShape(50)).clickable(enabled = !busy && msgs.isNotEmpty()) { GroupRunner.summarize(ctx, gid) }
++                        .padding(horizontal = 12.dp, vertical = 10.dp))
++                Box(Modifier.size(48.dp).clip(CircleShape).clickable { menu = true }.semantics { contentDescription = "更多" }, contentAlignment = Alignment.Center) {
++                    MinesIcon(icon("ellipsis"), null, tint = m.ink)
++                }
++            }
++            // member strip + balance warnings
++            LazyRow(Modifier.fillMaxWidth(), contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 16.dp),
++                horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                if (g.host) item { MemberChip(null, GroupStore.HOST, "Mines", "主持") { input = mention(input, "Mines") } }
++                items(members, key = { it.id }) { p ->
++                    MemberChip(p, p.id, GroupRunner.shortName(p.spec.name), when {
++                        !p.ready -> "不可用"; p.lowBalance -> "余额低"; p.spec.proto == Proto.PHONE -> "代打字"; else -> null
++                    }) { input = mention(input, GroupRunner.shortName(p.spec.name)) }
++                }
++            }
++            LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = list,
++                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 14.dp, vertical = 12.dp),
++                verticalArrangement = Arrangement.spacedBy(12.dp)) {
++                if (msgs.isEmpty()) item {
++                    MinesCard(Modifier.fillMaxWidth()) {
++                        Column(Modifier.padding(18.dp)) {
++                            Text("说点什么，大家都会回你", fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = m.ink)
++                            Text("用 @名字 只让某一位回答；点上面的头像可以快速 @。右上「总结」让 Mines 梳理大家的观点。", fontSize = 15.sp, lineHeight = 21.sp, color = m.ink2)
++                        }
++                    }
++                }
++                items(msgs, key = { it.id }) { msg ->
++                    Bubble(msg, partners.firstOrNull { it.id == msg.who }, onRetry = { GroupRunner.retry(ctx, gid, msg.who) },
++                        onFix = onPartners, canRetry = !busy)
++                }
++            }
++            // input
++            Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)
++                .clip(RoundedCornerShape(26.dp)).background(minesGlassFill(strong = true)).border(1.dp, m.glassBorder, RoundedCornerShape(26.dp))
++                .padding(start = 16.dp, end = 6.dp, top = 4.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
++                androidx.compose.foundation.text.BasicTextField(input, { input = it },
++                    textStyle = androidx.compose.ui.text.TextStyle(fontSize = 17.sp, color = m.ink),
++                    cursorBrush = androidx.compose.ui.graphics.SolidColor(m.primary),
++                    modifier = Modifier.weight(1f).heightIn(min = 44.dp).padding(vertical = 10.dp).semantics { contentDescription = "群聊输入框" },
++                    maxLines = 5,
++                    decorationBox = { inner -> Box { if (input.isEmpty()) Text("发给大家，或 @某个 AI", fontSize = 17.sp, color = m.ink3); inner() } })
++                val canSend = input.isNotBlank()
++                Box(Modifier.size(44.dp).clip(CircleShape).background(if (busy) MinesDesign.DangerFill else if (canSend) m.primary else m.ink3.copy(alpha = 0.3f))
++                    .clickable(enabled = busy || canSend) {
++                        if (busy) GroupRunner.stop(gid) else { GroupRunner.send(ctx, gid, input); input = "" }
++                    }.semantics { contentDescription = if (busy) "停止" else "发送" }, contentAlignment = Alignment.Center) {
++                    if (busy) Box(Modifier.size(14.dp).clip(RoundedCornerShape(3.dp)).background(Color.White))
++                    else MinesIcon(icon("send"), null, tint = Color.White, modifier = Modifier.size(22.dp))
++                }
++            }
++        }
++    }
++    if (menu) {
++        AlertDialog(onDismissRequest = { menu = false }, title = { Text(g.name) },
++            text = {
++                Column {
++                    TextButton({ GroupStore.update(g.copy(sequential = !g.sequential)); menu = false }) {
++                        Text(if (g.sequential) "改成：同时回复（更快）" else "改成：依次回复（能看到前面的回答）")
++                    }
++                    TextButton({ GroupStore.update(g.copy(host = !g.host)); menu = false }) { Text(if (g.host) "不要 Mines 主持" else "让 Mines 主持") }
++                    TextButton({ menu = false; onPartners() }) { Text("AI 伙伴与成员设置") }
++                    TextButton({ GroupRunner.stop(gid); GroupStore.clear(gid); menu = false }) { Text("清空聊天记录") }
++                    TextButton({ GroupRunner.stop(gid); GroupStore.delete(gid); menu = false; onBack() }) { Text("删除这个群", color = MinesDesign.Danger) }
++                }
++            },
++            confirmButton = { TextButton({ menu = false }) { Text("关闭") } })
++    }
++}
++
++private fun mention(input: String, name: String): String {
++    val tag = "@$name "
++    return if (input.contains(tag)) input else (if (input.isBlank() || input.endsWith(" ")) input else "$input ") + tag
++}
++
++private fun fmtTok(n: Int) = if (n >= 10_000) String.format("%.1f万", n / 10_000.0) else n.toString()
++
++@Composable
++private fun MemberChip(p: Partner?, who: String, name: String, badge: String?, onClick: () -> Unit) {
++    val m = mines()
++    Row(Modifier.clip(RoundedCornerShape(50)).background(minesGlassFill(strong = true)).border(1.dp, m.glassBorder, RoundedCornerShape(50))
++        .clickable(onClick = onClick).padding(start = 4.dp, end = 12.dp, top = 4.dp, bottom = 4.dp)
++        .semantics { contentDescription = "@$name" }, verticalAlignment = Alignment.CenterVertically) {
++        PartnerAvatar(p, who, name, 28.dp)
++        Spacer(Modifier.width(6.dp))
++        Text(name, fontSize = 15.sp, fontWeight = FontWeight.Medium, color = m.ink, maxLines = 1)
++        if (badge != null) {
++            Spacer(Modifier.width(6.dp))
++            Text(badge, fontSize = 12.sp, color = if (badge == "不可用" || badge == "余额低") MinesDesign.Warning else m.ink2)
++        }
++    }
++}
++
++@Composable
++private fun Bubble(msg: GroupMsg, p: Partner?, onRetry: () -> Unit, onFix: () -> Unit, canRetry: Boolean) {
++    val m = mines()
++    if (msg.who == "user") {
++        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
++            SelectionContainer {
++                Text(msg.text, fontSize = 17.sp, lineHeight = 25.sp, color = m.onPrimary,
++                    modifier = Modifier.widthIn(max = 300.dp).clip(RoundedCornerShape(20.dp, 20.dp, 6.dp, 20.dp)).background(m.primary)
++                        .padding(horizontal = 14.dp, vertical = 10.dp))
++            }
++        }
++        return
++    }
++    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
++        PartnerAvatar(p, msg.who, msg.name, 36.dp)
++        Spacer(Modifier.width(8.dp))
++        Column(Modifier.weight(1f, fill = false).widthIn(max = 320.dp)) {
++            Row(verticalAlignment = Alignment.CenterVertically) {
++                Text(if (msg.who == GroupStore.HOST) "Mines · 主持" else msg.name, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = m.ink, maxLines = 1)
++                if (msg.model.isNotBlank()) {
++                    Spacer(Modifier.width(6.dp))
++                    Text(msg.model, fontSize = 12.sp, color = m.ink3, maxLines = 1, overflow = TextOverflow.Ellipsis)
++                }
++            }
++            Spacer(Modifier.heightIn(min = 4.dp))
++            val shape = RoundedCornerShape(6.dp, 20.dp, 20.dp, 20.dp)
++            val err = msg.status == "error"
++            Column(Modifier.clip(shape).background(if (err) MinesDesign.DangerC else minesGlassFill(strong = true))
++                .border(1.dp, if (err) MinesDesign.Danger.copy(alpha = 0.25f) else m.glassBorder, shape).padding(horizontal = 14.dp, vertical = 10.dp)) {
++                when (msg.status) {
++                    "pending" -> Row(verticalAlignment = Alignment.CenterVertically) {
++                        CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
++                        Spacer(Modifier.width(8.dp))
++                        Text(if (p?.spec?.proto == Proto.PHONE) "正在 ${p.spec.name} 里代打字…" else "正在想…", fontSize = 15.sp, color = m.ink2)
++                    }
++                    "error" -> {
++                        Text("没回上：" + msg.text, fontSize = 15.sp, lineHeight = 21.sp, color = MinesDesign.Danger)
++                        Row {
++                            if (canRetry) TextButton(onRetry) { Text("重试") }
++                            if (msg.text.contains("密钥") || msg.text.contains("连接") || msg.text.contains("余额") || msg.text.contains("模型")) TextButton(onFix) { Text("去设置") }
++                        }
++                    }
++                    "stopped" -> Text(msg.text.ifBlank { "已停止" }, fontSize = 15.sp, color = m.ink3)
++                    else -> SelectionContainer { Text(msg.text, fontSize = 17.sp, lineHeight = 25.sp, color = m.ink) }
++                }
++            }
++            if (msg.status == "ok" && (msg.outTok > 0 || msg.ms > 0)) {
++                Text(listOfNotNull(if (msg.ms > 0) "%.1f 秒".format(msg.ms / 1000.0) else null,
++                    if (msg.inTok + msg.outTok > 0) "${msg.inTok + msg.outTok} tokens" else null).joinToString(" · "),
++                    fontSize = 12.sp, color = m.ink3, modifier = Modifier.padding(start = 6.dp, top = 2.dp))
++            }
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt b/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
+index b984e36..606d6ce 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
+@@ -77,6 +77,7 @@ import com.openminis.app.sandbox.RootfsManager
+ import com.openminis.app.sandbox.TerminalSession
+ import com.openminis.app.ui.terminal.TerminalScreen
+ import com.openminis.app.ui.onboarding.OnboardingModelSelectionScreen
++import com.openminis.app.ui.group.groupRoutes // [Mines-group-37]
+ 
+ // T342: Material 3 motion easing curves. Compose-Material3 (1.3.x) ships
+ // `MotionScheme` only in 1.4-alpha; mirror the spec values directly so we
+@@ -682,6 +683,7 @@ fun AppNavigation(
+         composable(com.openminis.app.ui.plus.PlusRoutes.MIGRATE) {
+             com.openminis.app.ui.plus.MigrateScreen(onBack = { navController.safePopBackStack() })
+         }
++        groupRoutes(navController) // [Mines-group-37] AI 群聊 / AI 伙伴
+         composable(com.openminis.app.ui.plus.PlusRoutes.CONNECTIONS) {
+             com.openminis.app.ui.plus.ConnectionsScreen(onBack = { navController.safePopBackStack() })
+         }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
+index fa81fb3..969604a 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
+@@ -120,6 +120,7 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier) {
+             HeaderCircle(com.openminis.app.ui.brand.MinesIcons.named("layout-grid")!!, "应用与账号") { onOpen(PlusRoutes.CONNECTIONS) }
+             Spacer(Modifier.width(8.dp))
+             HeaderCircle(com.openminis.app.ui.brand.MinesIcons.named("mic")!!, "实时语音") { onOpen(PlusRoutes.VOICE) }
++            Spacer(Modifier.width(8.dp)); HeaderCircle(com.openminis.app.ui.brand.MinesIcons.named("users")!!, "AI 群聊") { onOpen(com.openminis.app.ui.group.GroupRoutes.HOME) } // [Mines-group-37]
+             Spacer(Modifier.width(8.dp))
+             Box(Modifier.size(44.dp).clip(CircleShape).clickable { switcher = true }.semantics { contentDescription = "换角色" },
+                 contentAlignment = Alignment.Center) { PetAvatar(size = 40.dp) }
