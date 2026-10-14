@@ -31,6 +31,10 @@ try:
     B36 = "b36" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
 except Exception:
     B36 = False
+try:
+    B381 = "b381" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
+except Exception:
+    B381 = False
 step_no = 0
 crashed = []
 
@@ -1322,6 +1326,136 @@ def b36():
     for _ in range(3): sh("input keyevent KEYCODE_BACK"); time.sleep(1.2)
 
 
+def shot381(name):
+    r = snap("b381-" + name)
+    subprocess.run(f"cp {OUT}/{step_no:02d}-b381-{name}.png {OUT}/b381-{name}.png", shell=True)
+    return r
+
+
+def back(n=1):
+    for _ in range(n): sh("input keyevent KEYCODE_BACK"); time.sleep(1.3)
+
+
+def b381_home():
+    for _ in range(5):
+        r = dump()
+        if r is not None and find(r, "最近对话"): return r
+        sh("input keyevent KEYCODE_BACK"); time.sleep(1.5)
+    sh(f"monkey -p {PKG} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1"); time.sleep(8)
+    return dump()
+
+
+def b381():
+    """[build-38.1] board-accurate screens at 1080x2400 / 480 dpi, Chinese app locale, a loud wallpaper set:
+    home, 消息, detail, chat, settings, 语音设置, call + 声音 sheet, 账号连接, 定时任务 and old pages."""
+    res = {}
+    sh(f"cmd locale set-app-locales {PKG} --locales zh-CN"); time.sleep(1)
+    sh("wm size 1080x2400"); sh("wm density 480"); time.sleep(3)
+    m = re.search(r"Override size: (\d+)x(\d+)", sh("wm size")) or re.search(r"(\d+)x(\d+)", sh("wm size"))
+    if m: SCREEN[0], SCREEN[1] = int(m.group(1)), int(m.group(2))
+    print("b381 screen", SCREEN, flush=True)
+    print("B381 biometric", selftest_json("biometric", "", timeout=20), flush=True)
+    jb = selftest_json("biometric", "", timeout=20)
+    if not jb.get("manifest"): selftest_fail.append(f"b381 USE_BIOMETRIC missing {jb}")
+    if str(jb.get("can", "")).startswith("error"): selftest_fail.append(f"b381 canAuthenticate threw {jb}")
+    print("B381 inject", selftest_json("feedinject", "both", timeout=30), flush=True)
+    selftest_json("fakeaccounts", "", timeout=20)
+    print("B381 uiprep", selftest_json("uiprep", "杨arling|gen", timeout=20), flush=True)
+    sh(f"am force-stop {PKG}"); time.sleep(2)
+    sh(f"monkey -p {PKG} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1"); time.sleep(10)
+    r = b381_home(); time.sleep(2)
+    r = shot381("home")
+    t = "\n".join(texts(r)) if r is not None else ""
+    res["home"] = "最近对话" in t
+    for bad in ("件要处理", "Today", "min ago", "语音，", "服务器 2"):
+        if bad in t: page_missing.append(f"b381 home still shows {bad}")
+    if "开个新对话" not in t: selftest_fail.append("b381 home input bar missing")
+    # ☰ developer menu
+    if tap_text("更多", exact=True, wait=2): shot381("menu"); back()
+    # ---- 消息 ----
+    if not tap_text("消息", exact=True, wait=5): tap_text("消息，", wait=5)
+    time.sleep(4)
+    r = shot381("messages")
+    tx = texts(r) if r is not None else []
+    if any("接入更多来源" in x for x in tx): selftest_fail.append("b381 sources card still on 消息")
+    ys = [y for tx_, d, x, y, n in nodes(r) if (tx_ or d).startswith(("账号异常", "X，", "GitHub", "值得关注"))]
+    res["tabs_one_row"] = len(set(y // 20 for y in ys)) <= 1 if ys else False
+    if ys and not res["tabs_one_row"]: selftest_fail.append(f"b381 tabs wrap {ys}")
+    # detail sheet
+    for _ in range(3):
+        r = dump()
+        h = next(((x, y) for tx_, d, x, y, n in nodes(r) if "SmokeKey" in (tx_ or d) and not (tx_ or d).startswith(("一键修复", "去处理"))), None)
+        if h: sh(f"input tap {h[0]} {h[1]}"); time.sleep(3); break
+        if not tap_text("去看", wait=2): open_tab("账号异常")
+    shot381("detail"); back()
+    back(2)
+    # ---- chat: first conversation ----
+    b381_home()
+    r = dump()
+    row = next(((x, y) for tx_, d, x, y, n in nodes(r) if y > SCREEN[1] * 0.35 and y < SCREEN[1] * 0.75 and (tx_ or "") and len(tx_ or "") > 3 and "开个新对话" not in tx_ and "最近对话" not in tx_), None)
+    if row: sh(f"input tap {row[0]} {row[1]}"); time.sleep(5); shot381("chat"); back()
+    # ---- settings + 语音设置 ----
+    b381_home()
+    if tap_text("设置", exact=True, wait=4) or tap_text("设置", wait=4):
+        shot381("settings")
+        if tap_text("语音", exact=True, wait=4):
+            r = shot381("voice-settings")
+            t = " ".join(texts(r)) if r is not None else ""
+            if "每个 AI 的声音" not in t: selftest_fail.append("b381 voice settings: 每个 AI 的声音 missing")
+            back()
+        if tap_text("账号与 AI 服务", wait=3):
+            shot381("settings-ai")
+            if tap_text("支付卡", wait=4): shot381("paycards"); back()
+            for lab in ("模型组", "Model Groups"):
+                if tap_text(lab, wait=4): shot381("modelgroups"); back(); break
+            else:
+                sh(f"input swipe {SCREEN[0]//2} {int(SCREEN[1]*0.8)} {SCREEN[0]//2} {int(SCREEN[1]*0.3)} 400"); time.sleep(1.5)
+                if tap_text("模型组", wait=4): shot381("modelgroups"); back()
+            back()
+        if tap_text("外观", exact=True, wait=3):
+            if tap_text("外观", wait=4): shot381("appearance"); back()
+            back()
+        if tap_text("测试与上报", wait=3):
+            if tap_text("一键自检", wait=4): shot381("report"); back()
+            back()
+        if tap_text("数据", exact=True, wait=3):
+            if tap_text("知识库", wait=4): shot381("knowledge"); back()
+            back()
+        back()
+    # ---- 定时任务 (bottom bar 任务) ----
+    b381_home()
+    if tap_text("任务", exact=True, wait=5): time.sleep(2); shot381("scheduled"); back()
+    # ---- 账号连接 ----
+    b381_home()
+    if tap_text("应用", exact=True, wait=5): time.sleep(3); shot381("connections"); back()
+    # ---- voice call + ⋯ 声音 sheet ----
+    b381_home()
+    if tap_text("实时语音", exact=True, wait=6):
+        time.sleep(5)
+        r = shot381("voice")
+        t = " ".join(texts(r)) if r is not None else ""
+        if "正在试" in t or "直连" in t: selftest_fail.append("b381 voice page shows route names")
+        if tap_text("语音设置", wait=3) or tap_text("更多", wait=3):
+            r = shot381("voice-sheet")
+            t = " ".join(texts(r)) if r is not None else ""
+            if "的声音" not in t: page_missing.append("b381 voice sheet 「X 的声音」 line missing")
+            back()
+        back(2)
+    # ---- voiceprint save < 5 s ----
+    jv = selftest_json("voiceprint", "assetsave", timeout=90)
+    print(f"B381 voiceprint assetsave {jv}", flush=True)
+    res["vp_save_ms"] = jv.get("save_ms")
+    if not jv.get("enrolled"): selftest_fail.append(f"b381 voiceprint save {jv}")
+    elif (jv.get("save_ms") or 99999) > 5000: page_missing.append(f"b381 voiceprint save slower than 5 s ({jv.get('save_ms')} ms)")
+    # ---- home at font 1.3 ----
+    sh("settings put system font_scale 1.3"); time.sleep(3)
+    b381_home(); shot381("home-fs130")
+    if tap_text("消息", exact=True, wait=5) or tap_text("消息，", wait=5):
+        time.sleep(3); shot381("messages-fs130"); back()
+    sh("settings put system font_scale 1.0"); time.sleep(2)
+    print(f"B381 {res}", flush=True)
+
+
 def main():
     m = re.search(r"(\d+)x(\d+)", sh("wm size"))
     if m: SCREEN[0], SCREEN[1] = int(m.group(1)), int(m.group(2))
@@ -1346,6 +1480,12 @@ def main():
         dump_fatal()
         user_like_state()
 
+    if B381:
+        try:
+            b381()
+        except Exception as e:
+            print("b381 error:", e, flush=True); selftest_fail.append(f"b381 error {e}")
+        return finish(lc)
     if B36:
         try:
             b36()
