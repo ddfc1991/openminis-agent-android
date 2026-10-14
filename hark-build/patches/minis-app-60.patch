@@ -1,3 +1,16 @@
+diff --git a/src/android/app/src/main/java/com/openminis/app/MainActivity.kt b/src/android/app/src/main/java/com/openminis/app/MainActivity.kt
+index 6434338..68fe7ee 100644
+--- a/src/android/app/src/main/java/com/openminis/app/MainActivity.kt
++++ b/src/android/app/src/main/java/com/openminis/app/MainActivity.kt
+@@ -159,6 +159,8 @@ class MainActivity : ComponentActivity() {
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+         handleMinesRoute(intent)
++        // [Mines-voiceprint-35.3] a voiceprint recorded while its model was still missing finishes in the background
++        runCatching { if (com.openminis.app.plus.Voiceprint.hasPending(this)) com.openminis.app.plus.Voiceprint.finishInBackground(this) }
+ 
+         // Register the crash-share "Save to..." launcher BEFORE the
+         // safe-mode early-return below — ActivityResultLauncher must be
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/AccountLabel.kt b/src/android/app/src/main/java/com/openminis/app/plus/AccountLabel.kt
 index 0859d81..51a9182 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/AccountLabel.kt
@@ -308,6 +321,124 @@ index 93ee3e7..c4569f6 100644
          .getOrElse { Result(false, "测试时连不上服务器：${it.message?.take(80)}") }
  
      private fun testInner(base: String, key: String): Result {
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ModelFetch.kt b/src/android/app/src/main/java/com/openminis/app/plus/ModelFetch.kt
+index cef2719..8ab4bdf 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/ModelFetch.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/ModelFetch.kt
+@@ -53,10 +53,29 @@ object ModelFetch {
+         )
+     }
+ 
+-    private val direct = OkHttpClient.Builder().proxy(Proxy.NO_PROXY).connectTimeout(10, TimeUnit.SECONDS)
+-        .readTimeout(20, TimeUnit.SECONDS).callTimeout(180, TimeUnit.SECONDS).build()
+-    private val viaProxy = OkHttpClient.Builder().connectTimeout(10, TimeUnit.SECONDS)
+-        .readTimeout(20, TimeUnit.SECONDS).callTimeout(180, TimeUnit.SECONDS).build()
++    /**
++     * [Mines-models-35.3] user 2026-10-14 (VPN on): 声纹 sat on 「首次使用：下载声纹模型…」 with no number at all.
++     * OkHttp's connect/read timeouts do not cover DNS (InetAddress blocks), so one dead source could hold an
++     * attempt until the 180 s call timeout — ×5 hosts ×2 routes ×3 rounds ×4 parts with nothing on screen.
++     * Now: DNS has its own 8 s limit, a watchdog cancels any attempt that receives no byte for 15 s and moves to the
++     * next source, two rounds only, and progress always names the source plus speed.
++     */
++    private object TimedDns : okhttp3.Dns {
++        private val pool = java.util.concurrent.Executors.newCachedThreadPool { r -> Thread(r, "mines-dns").apply { isDaemon = true } }
++        override fun lookup(hostname: String): List<java.net.InetAddress> {
++            val f = pool.submit<List<java.net.InetAddress>> { okhttp3.Dns.SYSTEM.lookup(hostname) }
++            return try { f.get(8, TimeUnit.SECONDS) } catch (e: java.util.concurrent.TimeoutException) {
++                f.cancel(true); throw java.net.UnknownHostException("DNS timeout: $hostname")
++            } catch (e: java.util.concurrent.ExecutionException) { throw (e.cause as? java.io.IOException) ?: java.net.UnknownHostException(hostname) }
++        }
++    }
++    private val direct = OkHttpClient.Builder().proxy(Proxy.NO_PROXY).dns(TimedDns).connectTimeout(10, TimeUnit.SECONDS)
++        .readTimeout(15, TimeUnit.SECONDS).callTimeout(600, TimeUnit.SECONDS).build()
++    private val viaProxy = OkHttpClient.Builder().dns(TimedDns).connectTimeout(10, TimeUnit.SECONDS)
++        .readTimeout(15, TimeUnit.SECONDS).callTimeout(600, TimeUnit.SECONDS).build()
++    /** no byte for this long → the attempt is cancelled and the next source is tried */
++    @Volatile var stallMs = 15_000L
++    private val watchdog = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "mines-fetch-wd").apply { isDaemon = true } }
+ 
+     class FetchError(msg: String) : Exception(msg)
+ 
+@@ -71,7 +90,19 @@ object ModelFetch {
+         val have = if (f.exists()) f.length() else 0L
+         val rb = Request.Builder().url(url).header("User-Agent", "Mines/35 (Android)")
+         if (have > 0) rb.header("Range", "bytes=$have-")
+-        client.newCall(rb.build()).execute().use { r ->
++        val call = client.newCall(rb.build())
++        val lastByte = java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis())
++        val stalled = java.util.concurrent.atomic.AtomicBoolean(false)
++        val wd = watchdog.scheduleWithFixedDelay({
++            if (System.currentTimeMillis() - lastByte.get() > stallMs) { stalled.set(true); call.cancel() }
++        }, 1, 1, TimeUnit.SECONDS)
++        try { getInner(call, have, f) { b -> lastByte.set(System.currentTimeMillis()); onBytes(b) } }
++        catch (e: Throwable) { if (stalled.get()) throw FetchError("${stallMs / 1000} 秒没有收到数据（timeout）"); throw e }
++        finally { wd.cancel(false) }
++    }
++
++    private fun getInner(call: okhttp3.Call, have: Long, f: File, onBytes: (Long) -> Unit) {
++        call.execute().use { r ->
+             if (r.code == 416) return
+             if (!r.isSuccessful) throw FetchError("HTTP ${r.code}")
+             val append = have > 0 && r.code == 206
+@@ -108,10 +139,22 @@ object ModelFetch {
+         work.mkdirs()
+         var last: Throwable? = null
+         val done = LongArray(model.parts.size)
++        var t0 = System.currentTimeMillis(); var b0 = -1L; var speed = ""
+         fun report(i: Int, b: Long, how: String) {
+             done[i] = b
+-            val f = (done.sum().toFloat() / model.size).coerceIn(0f, 1f)
+-            progress(f, "下载中 ${(f * 100).toInt()}%（$how）")
++            val sum = done.sum()
++            val now = System.currentTimeMillis()
++            if (b0 < 0) { b0 = sum; t0 = now } else if (now - t0 >= 1000) {
++                val bps = (sum - b0) * 1000.0 / (now - t0); b0 = sum; t0 = now
++                speed = if (bps >= 1_000_000) " · %.1f MB/s".format(bps / 1_000_000) else " · %d KB/s".format((bps / 1000).toInt())
++            }
++            val f = (sum.toFloat() / model.size).coerceIn(0f, 1f)
++            progress(f, "下载中 ${(f * 100).toInt()}%$speed（$how）")
++        }
++        fun src(url: String) = when {
++            url.contains("cdn.jsdelivr") -> "jsDelivr"; url.contains("fastly.jsdelivr") -> "jsDelivr fastly"; url.contains("gcore.jsdelivr") -> "jsDelivr gcore"
++            url.contains("ghfast") -> "ghfast"; url.contains("raw.githubusercontent") -> "GitHub"; url.contains("hf-mirror") -> "hf-mirror"; url.contains("github.com") -> "GitHub 发布页"
++            else -> "备用源"
+         }
+         var allParts = true
+         for ((i, p) in model.parts.withIndex()) {
+@@ -119,11 +162,12 @@ object ModelFetch {
+             val pf = File(work, "${model.id}.$name")
+             if (pf.exists() && runCatching { sha256(pf) }.getOrNull() == sha) { report(i, pf.length(), "已有"); continue }
+             var ok = false
+-            round@ for (round in 0 until 3) {
++            round@ for (round in 0 until 2) {
+                 for (url in hosts(model.id, name)) {
+                     for ((client, how) in listOf(direct to "直连", viaProxy to "经代理")) {
+                         try {
+-                            get(client, url, pf) { b -> report(i, b, how) }
++                            progress((done.sum().toFloat() / model.size).coerceIn(0f, 1f), "正在连接 ${src(url)}（$how）… 已下载 ${(done.sum() * 100 / model.size)}%")
++                            get(client, url, pf) { b -> report(i, b, "${src(url)} $how") }
+                             if (sha256(pf) == sha) { ok = true; break@round }
+                             pf.delete(); throw FetchError("校验没通过")
+                         } catch (e: Throwable) {
+@@ -131,7 +175,7 @@ object ModelFetch {
+                         }
+                     }
+                 }
+-                Thread.sleep(1500L * (round + 1))
++                Thread.sleep(1500L)
+             }
+             if (!ok) { allParts = false; break }
+         }
+@@ -149,7 +193,8 @@ object ModelFetch {
+         // last resort: the original single file (resumable too)
+         for (url in model.originals) for ((client, how) in listOf(direct to "直连", viaProxy to "经代理")) {
+             try {
+-                get(client, url, tmp) { b -> progress((b.toFloat() / model.size).coerceIn(0f, 1f), "下载中 ${(b * 100 / model.size)}%（备用源，$how）") }
++                progress(0f, "正在连接 ${src(url)}（$how）…")
++                get(client, url, tmp) { b -> progress((b.toFloat() / model.size).coerceIn(0f, 1f), "下载中 ${(b * 100 / model.size)}%（${src(url)}，$how）") }
+                 if (tmp.length() == model.size && sha256(tmp) == model.sha256) {
+                     dest.parentFile?.mkdirs(); dest.delete()
+                     if (!tmp.renameTo(dest)) { tmp.copyTo(dest, overwrite = true); tmp.delete() }
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusConnect.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusConnect.kt
 index 34b124f..5c7f934 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/PlusConnect.kt
@@ -322,10 +453,34 @@ index 34b124f..5c7f934 100644
              ?: PlusVault.capabilities(kind.profile).firstOrNull { it.id == "publish" && capId in setOf("send", "post", "write", "deploy", "push") }
              ?: return NativeOffloadResult(2, "unknown capability '$capId' for ${kind.id}; known: " +
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
-index 2fa1dc8..855c325 100644
+index 2fa1dc8..9f1e677 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
-@@ -338,6 +338,75 @@ class SelfTestProvider : ContentProvider() {
+@@ -195,6 +195,23 @@ class SelfTestProvider : ContentProvider() {
+                         } finally { Voiceprint.inject = prev }
+                         j.put("enrolled", Voiceprint.settings(c).enrolled).put("ms", System.currentTimeMillis() - t0)
+                     }
++                    a == "assetsave" -> {
++                        // [Mines-voiceprint-35.3] model deleted → save must finish from the bundled asset within 5 s
++                        val prev = Voiceprint.inject
++                        Voiceprint.inject = "speech"
++                        try {
++                            kotlinx.coroutines.runBlocking {
++                                val clips = (0 until 3).map { Voiceprint.recordUtterance() }
++                                runCatching { Voiceprint.modelFile(c).delete() }
++                                j.put("asset", Voiceprint.hasAsset(c))
++                                val t0 = System.currentTimeMillis()
++                                runCatching { Voiceprint.ensureModel(c); j.put("quality", Voiceprint.saveEnrolment(c, clips).toDouble()) }
++                                    .onFailure { j.put("error", it.message) }
++                                j.put("save_ms", System.currentTimeMillis() - t0).put("model", Voiceprint.hasModel(c))
++                            }
++                        } finally { Voiceprint.inject = prev }
++                        j.put("enrolled", Voiceprint.settings(c).enrolled)
++                    }
+                     else -> j.put("settings", Voiceprint.settings(c).toString())
+                 }
+                 out.putString("result", j.toString())
+@@ -338,6 +355,75 @@ class SelfTestProvider : ContentProvider() {
                  }
                  out.putString("result", org.json.JSONObject().put("kind", kind).put("lines", org.json.JSONArray(lines)).toString())
              }
@@ -401,6 +556,100 @@ index 2fa1dc8..855c325 100644
              "voiceintent" -> {
                  // [Mines-voice-35.2] arg = what the user said; a match opens the page (声纹录入 on the voice screen)
                  val c = context!!
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Voiceprint.kt b/src/android/app/src/main/java/com/openminis/app/plus/Voiceprint.kt
+index 656f6fc..e0b99ef 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/Voiceprint.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/Voiceprint.kt
+@@ -10,6 +10,7 @@ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withContext
+ import okhttp3.OkHttpClient
+ import okhttp3.Request
+@@ -85,6 +86,8 @@ object Voiceprint {
+         modelMutex.lock()
+         try {
+             if (hasModel(c)) return@withContext
++            // [Mines-voiceprint-35.3] the model ships inside the APK (assets/models/campplus.onnx): copy, no download
++            if (fromAssets(c)) return@withContext
+             // [Mines-models-35] mirrored, resumable, checksummed (ModelFetch); plain reason on failure
+             _progress.value = "首次使用：下载声纹模型（约 28 MB）…"
+             try {
+@@ -99,6 +102,72 @@ object Voiceprint {
+ 
+     private val modelMutex = kotlinx.coroutines.sync.Mutex()
+ 
++    const val ASSET = "models/campplus.onnx"
++    fun hasAsset(c: Context): Boolean = runCatching { c.assets.open(ASSET).use { true } }.getOrDefault(false)
++
++    /** Copies the bundled model to filesDir (well under a second). False when this build has no bundled model. */
++    private fun fromAssets(c: Context): Boolean {
++        val dest = modelFile(c)
++        val tmp = File(dest.parentFile, "$MODEL_NAME.part")
++        return runCatching {
++            _progress.value = "正在准备声纹模型…"
++            c.assets.open(ASSET).use { i -> tmp.outputStream().use { o -> i.copyTo(o, 256 * 1024) } }
++            if (tmp.length() != ModelFetch.CAMPP.size) { tmp.delete(); return false }
++            dest.delete(); if (!tmp.renameTo(dest)) { tmp.copyTo(dest, true); tmp.delete() }
++            _progress.value = null
++            true
++        }.getOrElse { Log.w(TAG, "asset model: ${it.message}"); tmp.delete(); _progress.value = null; false }
++    }
++
++    // ---- [Mines-voiceprint-35.3] recorded but model not ready yet: keep the clips, finish in the background ----
++    private fun pendingFile(c: Context) = File(File(c.filesDir, "voiceprint").apply { mkdirs() }, "pending.pcm")
++    fun hasPending(c: Context) = pendingFile(c).exists()
++    private val bgScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + Dispatchers.IO)
++    private val _bgState = MutableStateFlow<String?>(null)
++    /** null = idle; otherwise a plain line about the background finish (shown on the voice settings) */
++    val bgState: StateFlow<String?> = _bgState.asStateFlow()
++
++    fun savePending(c: Context, clips: List<ShortArray>) {
++        java.io.DataOutputStream(pendingFile(c).outputStream().buffered()).use { o ->
++            o.writeInt(clips.size)
++            clips.forEach { cl -> o.writeInt(cl.size); cl.forEach { v -> o.writeShort(v.toInt()) } }
++        }
++    }
++
++    private fun loadPending(c: Context): List<ShortArray>? = runCatching {
++        java.io.DataInputStream(pendingFile(c).inputStream().buffered()).use { i ->
++            List(i.readInt()) { ShortArray(i.readInt()) { i.readShort() } }
++        }
++    }.getOrNull()
++
++    /** Downloads the model (if needed) and turns the kept clips into the voiceprint; notifies 「声纹已开启」. */
++    fun finishInBackground(c: Context) {
++        val app = c.applicationContext
++        if (!hasPending(app) || _bgState.value?.startsWith("正在") == true) return
++        _bgState.value = "正在后台准备声纹…"
++        bgScope.launch {
++            try {
++                ensureModel(app)
++                val clips = loadPending(app) ?: throw IllegalStateException("录音文件读不出来，请重新录一次")
++                val q = saveEnrolment(app, clips)
++                pendingFile(app).delete()
++                _bgState.value = null
++                notify(app, "声纹已开启", if (q > 0.6f) "以后通话只听你的声音。" else "已开启（声音有点不稳，安静的地方重录效果更好）。")
++            } catch (e: Throwable) {
++                _bgState.value = "声纹还没完成：" + (e.message ?: "出错了").take(120)
++                if (e.message?.contains("太短") == true || e.message?.contains("读不出来") == true) pendingFile(app).delete()
++            }
++        }
++    }
++
++    private fun notify(c: Context, title: String, text: String) = runCatching {
++        val nm = c.getSystemService(android.app.NotificationManager::class.java) ?: return@runCatching
++        if (nm.getNotificationChannel("mines_voiceprint") == null)
++            nm.createNotificationChannel(android.app.NotificationChannel("mines_voiceprint", "声纹", android.app.NotificationManager.IMPORTANCE_DEFAULT))
++        nm.notify(73140, android.app.Notification.Builder(c, "mines_voiceprint").setSmallIcon(com.openminis.app.R.drawable.ic_launcher_monochrome)
++            .setContentTitle(title).setContentText(text).setAutoCancel(true).build())
++    }
++
+     /** Mic level 0..1 while recording (enrolment page meter). */
+     val level = MutableStateFlow(0f)
+ 
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt b/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
 index b984e36..149b603 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
@@ -1372,3 +1621,37 @@ index a864371..b7768b0 100644
      fun go(route: String) { navigate?.invoke(route) ?: run { pending = route } }
  }
  
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceprintSection.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceprintSection.kt
+index 667c46b..a26e1e6 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceprintSection.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/VoiceprintSection.kt
+@@ -100,6 +100,13 @@ fun VoiceprintSection() {
+             }
+         }
+         (progress ?: msg)?.let { Text(it, fontSize = 15.sp, color = m.ink2) }
++        // [Mines-voiceprint-35.3] background finish of a recorded voiceprint: state + 重试
++        val bg by Voiceprint.bgState.collectAsState()
++        androidx.compose.runtime.LaunchedEffect(bg) { s = Voiceprint.settings(c) }
++        bg?.let { b ->
++            Text(b, fontSize = 15.sp, lineHeight = 21.sp, color = m.ink2)
++            if (b.startsWith("声纹还没完成") && Voiceprint.hasPending(c)) PillButton("重试", Modifier.fillMaxWidth(), primary = false) { Voiceprint.finishInBackground(c) }
++        }
+     }
+     if (enrol) VoiceprintEnrolDialog(onDone = { enrol = false; s = Voiceprint.settings(c) })
+ }
+@@ -154,6 +161,15 @@ fun VoiceprintEnrolDialog(onDone: () -> Unit) {
+ 
+     fun save() {
+         saving = true; msg = null; err = false
++        // [Mines-voiceprint-35.3] user 2026-10-14 「声纹一直不动」: never wait on the download here. Without the model
++        // (a build without the bundled one), the clips are kept and the voiceprint finishes in the background.
++        if (!Voiceprint.hasModel(c) && !Voiceprint.hasAsset(c)) {
++            runCatching { Voiceprint.savePending(c, clips.toList()); Voiceprint.finishInBackground(c) }
++                .onSuccess { msg = "已录好 ✓ 声纹模型下载完会自动完成，可以关掉这个页面，好了会通知你「声纹已开启」。"; done = true }
++                .onFailure { msg = "录音没存下来：${it.message}"; err = true }
++            saving = false
++            return
++        }
+         scope.launch {
+             runCatching {
+                 if (!Voiceprint.hasModel(c)) Voiceprint.ensureModel(c)
