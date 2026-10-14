@@ -98,7 +98,10 @@ def snap(name):
     global step_no
     step_no += 1
     tag = f"{step_no:02d}-{name}"
-    subprocess.run(f"adb exec-out screencap -p > {OUT}/{tag}.png", shell=True)
+    for _ in range(3):   # screencap sometimes returns an empty file (smoke run 36: b381-connections.png 0 bytes)
+        subprocess.run(f"adb exec-out screencap -p > {OUT}/{tag}.png", shell=True)
+        if os.path.exists(f"{OUT}/{tag}.png") and os.path.getsize(f"{OUT}/{tag}.png") > 1000: break
+        time.sleep(1.5)
     root = dump()
     t = texts(root)
     with open(f"{OUT}/{tag}.txt", "w") as f:
@@ -140,7 +143,9 @@ selftest_fail = []
 
 
 def selftest(method, arg, timeout=90):
-    out = sh(f"content call --uri {SELFTEST_URI} --method {method} --arg '{arg}'", timeout=timeout)
+    # an empty --arg '' is dropped by adb shell → 'content' printed its usage (smoke run 36); omit it instead
+    a = f" --arg '{arg}'" if arg != "" else ""
+    out = sh(f"content call --uri {SELFTEST_URI} --method {method}{a}", timeout=timeout)
     print(f"  selftest {method} {arg!r} -> {out.strip()[:600]}", flush=True)
     return out
 
@@ -1396,7 +1401,7 @@ def b381():
     if row: sh(f"input tap {row[0]} {row[1]}"); time.sleep(5); shot381("chat"); back()
     # ---- settings + 语音设置 ----
     b381_home()
-    if tap_text("设置", exact=True, wait=4) or tap_text("设置", wait=4):
+    if tap_text("设置", exact=True, wait=4) or tap_text("设置", wait=4) or tap_text("Settings", exact=True, wait=4):
         shot381("settings")
         if tap_text("语音", exact=True, wait=4):
             r = shot381("voice-settings")
