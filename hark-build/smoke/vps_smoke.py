@@ -8,7 +8,7 @@ shipped): launch -> home Today card -> 工作位置 -> add a reachable SSH serve
 工作位置. After every step it checks the app process is still alive and at the
 end prints every FATAL EXCEPTION from logcat. Exit 1 when the app crashed.
 """
-import json, os, re, subprocess, sys, time, xml.etree.ElementTree as ET
+import json, os, re, struct, subprocess, sys, time, xml.etree.ElementTree as ET
 
 PKG = os.environ.get("PKG", "com.openminis.mines.plus")
 OUT = os.environ.get("OUT", "smoke-out")
@@ -1350,16 +1350,124 @@ def b381_home():
     return dump()
 
 
+def png_size(path):
+    try:
+        with open(path, "rb") as f: h = f.read(24)
+        return struct.unpack(">II", h[16:24]) if h[:8] == b"\x89PNG\r\n\x1a\n" else None
+    except Exception:
+        return None
+
+
+def screen_383():
+    """[build-38.3] the emulator must BE the user's phone (1280x2800 px, 480 dpi), set at AVD creation (avd-fit.sh +
+    -skin), not by `wm size` (clamped to a multiple of the old 320x640 panel -> 1080x1920)."""
+    sh("wm size reset"); sh("wm density reset"); time.sleep(2)
+    ws, wd = sh("wm size").strip(), sh("wm density").strip()
+    print("B383 wm size ->", ws.replace("\n", " / "), "| wm density ->", wd.replace("\n", " / "), flush=True)
+    print("B383 props", sh("getprop ro.sf.lcd_density; getprop qemu.sf.lcd_density; getprop ro.boot.qemu.skin; getprop androidboot.qemu.skin").split(), flush=True)
+    print("B383 display", sh("dumpsys display | grep -m3 -E 'mBaseDisplayInfo|DisplayDeviceInfo'")[:600], flush=True)
+    m = re.search(r"Physical size: (\d+)x(\d+)", ws)
+    if m: SCREEN[0], SCREEN[1] = int(m.group(1)), int(m.group(2))
+    dpi = re.search(r"Physical density: (\d+)", wd)
+    snap("b383-screen-check")
+    shot = f"{OUT}/{step_no:02d}-b383-screen-check.png"
+    ps = png_size(shot)
+    print(f"B383 screen {SCREEN} dpi={dpi.group(1) if dpi else '?'} screencap={ps}", flush=True)
+    if SCREEN != [1280, 2800] or "Override" in ws: selftest_fail.append(f"b383 emulator size {ws!r} (want Physical 1280x2800, no override)")
+    if not dpi or dpi.group(1) != "480" or "Override" in wd: selftest_fail.append(f"b383 emulator density {wd!r} (want 480)")
+    if ps != (1280, 2800): selftest_fail.append(f"b383 screencap is {ps} (want 1280x2800)")
+
+
+BROWSER_SHOTS = []
+
+
+def browser_open(url, tag):
+    """Open the in-app browser on url: self-test hook on 38.3+, else home ☰ 更多 → 打开浏览器 → type the URL."""
+    b381_home()
+    j = selftest_json("webfit", "open:" + url, timeout=20)
+    if j.get("ok"):
+        time.sleep(3)
+    else:
+        if not tap_text("更多", exact=True, wait=2): tap_text("更多", wait=2)
+        if not (tap_text("打开浏览器", wait=4) or tap_text("Open Browser", wait=4)):
+            selftest_fail.append(f"b383 browser: 打开浏览器 not found ({tag})"); return False
+        r = dump()
+        ed_ = next(((x, y) for t, d, x, y, n in nodes(r) if n.get("class", "").endswith("EditText")), None)
+        if not ed_:
+            selftest_fail.append(f"b383 browser: URL field not found ({tag})"); return False
+        sh(f"input tap {ed_[0]} {ed_[1]}"); time.sleep(1)
+        sh("input keyevent KEYCODE_MOVE_END"); sh("input keyevent --longpress KEYCODE_DEL"); 
+        for _ in range(3): sh("input keyevent KEYCODE_DEL")
+        sh(f"input text '{url}'"); time.sleep(0.5); sh("input keyevent 66")
+    time.sleep(14)   # page load (coze.cn's SPA takes ~10 s)
+    return True
+
+
+def browser_probe(tag, want_dp=None):
+    j = selftest_json("webfit", "probe", timeout=20)
+    print(f"B383 probe {tag} {json.dumps(j, ensure_ascii=False)[:900]}", flush=True)
+    if not j:
+        return j  # APK without the probe (38.2)
+    if not j.get("ok"):
+        selftest_fail.append(f"b383 probe {tag}: {j.get('error')}"); return j
+    pg = j.get("page") or {}
+    if not j.get("mobileUa"): selftest_fail.append(f"b383 {tag}: UA without 'Mobile' ({pg.get('ua', '')[:80]})")
+    if "wide=true overview=true" not in j.get("settings", ""): selftest_fail.append(f"b383 {tag}: settings {j.get('settings')}")
+    if "builtIn=true display=false" not in j.get("settings", ""): selftest_fail.append(f"b383 {tag}: zoom settings {j.get('settings')}")
+    if want_dp and abs((j.get("cssViewW") or 0) - want_dp) > 12: selftest_fail.append(f"b383 {tag}: WebView is {j.get('cssViewW')} dp wide (want ~{want_dp}, fillMaxWidth)")
+    return j
+
+
+def browser_case(url, tag, check_fit=True):
+    if not browser_open(url, tag): return
+    r = snap("b383-browser-" + tag)
+    shot = f"{OUT}/b383-browser-{tag}.png"
+    subprocess.run(f"cp {OUT}/{step_no:02d}-b383-browser-{tag}.png {shot}", shell=True)
+    BROWSER_SHOTS.append(shot)
+    j = browser_probe(tag, want_dp=round(SCREEN[0] / 3.0))
+    pg = (j or {}).get("page") or {}
+    if j and check_fit and not j.get("fits"):
+        selftest_fail.append(f"b383 {tag}: page wider than the screen (scrollWidth {pg.get('scrollWidth')} > innerWidth {pg.get('innerWidth')})")
+    if tag == "example":
+        # landscape, then the old 1080x1920 size, same page
+        sh("settings put system accelerometer_rotation 0; settings put system user_rotation 1"); time.sleep(5)
+        snap("b383-browser-example-land")
+        subprocess.run(f"cp {OUT}/{step_no:02d}-b383-browser-example-land.png {OUT}/b383-browser-example-land.png", shell=True)
+        jl = browser_probe("example-land") if j else {}
+        if jl and jl.get("ok"): print(f"B383 landscape WebView {jl.get('cssViewW')} dp of screen {jl.get('screenWidthDp')} dp", flush=True)
+        if jl and not jl.get("fits"): selftest_fail.append("b383 example landscape: page wider than the screen")
+        sh("settings put system user_rotation 0"); time.sleep(4)
+        sh("wm size 1080x1920"); time.sleep(5)
+        print("B383 wm size (1080x1920 check) ->", sh("wm size").strip().replace("\n", " / "), flush=True)
+        snap("b383-browser-example-1080x1920")
+        subprocess.run(f"cp {OUT}/{step_no:02d}-b383-browser-example-1080x1920.png {OUT}/b383-browser-example-1080x1920.png", shell=True)
+        print("B383 1080x1920 screencap", png_size(f"{OUT}/b383-browser-example-1080x1920.png"), flush=True)
+        jm = browser_probe("example-1080x1920", want_dp=360) if j else {}
+        if jm and not jm.get("fits"): selftest_fail.append("b383 example at 1080x1920: page wider than the screen")
+        sh("wm size reset"); time.sleep(5)
+    back(2)
+
+
+def b383_browser():
+    """[build-38.3] in-app browser pages fit the phone width (example.com, www.coze.cn) at 1280x2800 / 480 dpi."""
+    selftest_json("webfit", "secureoff", timeout=10)
+    try:
+        browser_case("https://example.com/", "example")
+    except Exception as e:
+        print("b383 example error:", e, flush=True); selftest_fail.append(f"b383 example error {e}")
+    try:
+        browser_case("https://www.coze.cn/", "coze")
+    except Exception as e:
+        print("b383 coze error:", e, flush=True); selftest_fail.append(f"b383 coze error {e}")
+    if not alive(): relaunch()
+
+
 def b381():
     """[build-38.1] board-accurate screens at 1080x2400 / 480 dpi, Chinese app locale, a loud wallpaper set:
     home, 消息, detail, chat, settings, 语音设置, call + 声音 sheet, 账号连接, 定时任务 and old pages."""
     res = {}
     sh(f"cmd locale set-app-locales {PKG} --locales zh-CN"); time.sleep(1)
-    sh("wm size 1080x2400"); sh("wm density 480"); time.sleep(3)
-    print("b381 wm size ->", sh("wm size").strip().replace("\n", " / "), flush=True)
-    m = re.search(r"Override size: (\d+)x(\d+)", sh("wm size")) or re.search(r"(\d+)x(\d+)", sh("wm size"))
-    if m: SCREEN[0], SCREEN[1] = int(m.group(1)), int(m.group(2))
-    print("b381 screen", SCREEN, flush=True)
+    screen_383()
     print("B381 biometric", selftest_json("biometric", "", timeout=20), flush=True)
     jb = selftest_json("biometric", "", timeout=20)
     if not jb.get("manifest"): selftest_fail.append(f"b381 USE_BIOMETRIC missing {jb}")
@@ -1463,6 +1571,10 @@ def b381():
         time.sleep(3); shot381("messages-fs130"); back()
     sh("settings put system font_scale 1.0"); time.sleep(2)
     try:
+        b383_browser()
+    except Exception as e:
+        print("b383 browser error:", e, flush=True); selftest_fail.append(f"b383 browser error {e}")
+    try:
         res["coze"] = coze_382()
     except Exception as e:
         print("b382 coze error:", e, flush=True); selftest_fail.append(f"b382 coze error {e}")
@@ -1513,6 +1625,9 @@ def coze_382():
         if weak and i >= 4: res["login_text"] = weak; break
         if any("显示不出来" in x or "白屏" in x for x in t): res["white"] = True
     snap("coze-keyagent")
+    subprocess.run(f"cp {OUT}/{step_no:02d}-coze-keyagent.png {OUT}/b383-keyagent-coze.png", shell=True)
+    jk = browser_probe("keyagent-coze", want_dp=round(SCREEN[0] / 3.0))
+    if jk and jk.get("ok") and not jk.get("fits"): print("B383 keyagent-coze: page wider than the screen", flush=True)
     print(f"B382 coze texts={seen[:40]} focus={focus_pkg().strip()[:200]}", flush=True)
     if res["chrome"]: selftest_fail.append("b382 coze: jumped to Chrome instead of showing the sign-in page")
     elif not res["login_text"]: selftest_fail.append("b382 coze: sign-in page text not found (white page?)")
