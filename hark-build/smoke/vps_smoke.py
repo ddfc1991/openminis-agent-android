@@ -1398,7 +1398,10 @@ def b381():
     b381_home()
     r = dump()
     row = next(((x, y) for tx_, d, x, y, n in nodes(r) if y > SCREEN[1] * 0.35 and y < SCREEN[1] * 0.75 and (tx_ or "") and len(tx_ or "") > 3 and "开个新对话" not in tx_ and "最近对话" not in tx_), None)
-    if row: sh(f"input tap {row[0]} {row[1]}"); time.sleep(5); shot381("chat"); back()
+    if row:
+        sh(f"input tap {row[0]} {row[1]}"); time.sleep(5); rc = shot381("chat")
+        if rc is not None and any(x.startswith("Provider error") for x in texts(rc)): page_missing.append("b381 chat banner still starts with 'Provider error'")
+        back()
     # ---- settings + 语音设置 ----
     b381_home()
     if tap_text("设置", exact=True, wait=4) or tap_text("设置", wait=4) or tap_text("Settings", exact=True, wait=4):
