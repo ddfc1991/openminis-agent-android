@@ -1356,6 +1356,7 @@ def b381():
     res = {}
     sh(f"cmd locale set-app-locales {PKG} --locales zh-CN"); time.sleep(1)
     sh("wm size 1080x2400"); sh("wm density 480"); time.sleep(3)
+    print("b381 wm size ->", sh("wm size").strip().replace("\n", " / "), flush=True)
     m = re.search(r"Override size: (\d+)x(\d+)", sh("wm size")) or re.search(r"(\d+)x(\d+)", sh("wm size"))
     if m: SCREEN[0], SCREEN[1] = int(m.group(1)), int(m.group(2))
     print("b381 screen", SCREEN, flush=True)
@@ -1461,7 +1462,63 @@ def b381():
     if tap_text("消息", exact=True, wait=5) or tap_text("消息，", wait=5):
         time.sleep(3); shot381("messages-fs130"); back()
     sh("settings put system font_scale 1.0"); time.sleep(2)
+    try:
+        res["coze"] = coze_382()
+    except Exception as e:
+        print("b382 coze error:", e, flush=True); selftest_fail.append(f"b382 coze error {e}")
     print(f"B381 {res}", flush=True)
+
+
+COZE_LOGIN = ["手机号登录", "欢迎使用扣子", "欢迎来到扣子", "登录扣子", "登录 / 注册", "登录/注册", "验证码", "获取验证码", "手机号", "抖音登录", "Welcome to Coze", "Sign in", "登录"]
+
+
+def focus_pkg():
+    o = sh("dumpsys window | grep -E 'mCurrentFocus|mFocusedApp' | head -2")
+    return o
+
+
+def coze_382():
+    """[build-38.2] 一键接入 扣子: the key-fetch WebView must show coze.cn's sign-in (手机号登录 / 欢迎使用扣子 …), not a white
+    page and not a jump to Chrome. Token capture itself needs a real sign-in (phone + SMS) and is NOT tested here."""
+    res = {"opened": False, "login_text": None, "chrome": False, "white": False}
+    sh(f"am force-stop com.android.chrome")
+    sh(f"am start -n {PKG}/com.openminis.app.MainActivity --es mines_route plus_connections --es mines_open_kind coze", timeout=60)
+    time.sleep(7)
+    r = snap("coze-detail")
+    t = texts(r) if r is not None else []
+    print(f"B382 coze detail texts={t[:25]}", flush=True)
+    if not any("扣子" in x or "Coze" in x for x in t):
+        # the deep link sometimes lands on the 应用 list: search for 扣子 there
+        if tap_text("扣子", wait=4): r = snap("coze-detail-2"); t = texts(r) if r is not None else []
+    if not (tap_text("一键接入", exact=True, wait=3) or tap_text("再生成一个新密钥", wait=3)):
+        scroll_down(); time.sleep(1)
+        if not (tap_text("一键接入", exact=True, wait=3) or tap_text("再生成一个新密钥", wait=3)):
+            selftest_fail.append("b382 coze: 一键接入 button not found")
+            print(f"B382 coze {res}", flush=True); return res
+    res["opened"] = True
+    seen = []
+    for i in range(10):          # up to ~60 s for coze.cn → signin.volcengine.com to render
+        time.sleep(6)
+        r = dump()
+        t = texts(r) if r is not None else []
+        seen = t
+        fp = focus_pkg()
+        if "com.android.chrome" in fp: res["chrome"] = True; break
+        if any("已改用 Chrome" in x for x in t): res["chrome"] = True; break
+        hit = next((h for h in COZE_LOGIN[:-2] if any(h in x for x in t)), None)
+        if hit: res["login_text"] = hit; break
+        weak = next((h for h in COZE_LOGIN[-2:] if any(x.strip() == h for x in t)), None)   # a bare 「登录」/「Sign in」 button
+        if weak and i >= 4: res["login_text"] = weak; break
+        if any("显示不出来" in x or "白屏" in x for x in t): res["white"] = True
+    snap("coze-keyagent")
+    print(f"B382 coze texts={seen[:40]} focus={focus_pkg().strip()[:200]}", flush=True)
+    if res["chrome"]: selftest_fail.append("b382 coze: jumped to Chrome instead of showing the sign-in page")
+    elif not res["login_text"]: selftest_fail.append("b382 coze: sign-in page text not found (white page?)")
+    print(f"B382 coze {res}", flush=True)
+    for _ in range(3): sh("input keyevent KEYCODE_BACK"); time.sleep(1.5)
+    sh("am force-stop com.android.chrome")
+    if not alive(): relaunch()
+    return res
 
 
 def main():
