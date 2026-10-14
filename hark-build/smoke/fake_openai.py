@@ -72,6 +72,14 @@ class H(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(n) or b"{}")
         text = "你好，我是测试模型。"
         msgs = body.get("messages") or []
+        # [build-37 smoke] two group-chat members on one server: /a/v1 and /b/v1
+        for tag in ("a", "b"):
+            if self.path.startswith(f"/{tag}/"):
+                STATS[f"grp_{tag}"] = STATS.get(f"grp_{tag}", 0) + 1
+                who = "成员A" if tag == "a" else "成员B"
+                return self._json({"id": "x", "object": "chat.completion", "created": int(time.time()), "model": "smoke-model",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": f"{who}收到：{last_user_text(msgs)[-40:]}"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20}})
         if "GARBAGETEST" in last_user_text(msgs) and body.get("stream"):
             # [build-34 smoke] a model whose output degenerates into garbage (user's Gemma report)
             STATS["garbage_posts"] += 1

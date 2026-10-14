@@ -27,6 +27,10 @@ try:
     B353 = "b353" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
 except Exception:
     B353 = False
+try:
+    GROUP37 = "group" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
+except Exception:
+    GROUP37 = False
 step_no = 0
 crashed = []
 
@@ -1192,6 +1196,76 @@ def b353():
     sh("settings put system font_scale 1.0"); time.sleep(2)
 
 
+def group_37():
+    """[build-37] AI 群聊: two fake OpenAI-compatible members (/a/v1, /b/v1); a message to all → both answer,
+    @成员A → only A answers. Screens: AI 伙伴 page + group chat."""
+    import urllib.request
+    def stats():
+        try: return json.loads(urllib.request.urlopen("http://127.0.0.1:8088/stats", timeout=5).read())
+        except Exception as e: print("stats error", e); return {}
+    def res(out):
+        m = re.search(r"result=(.*?)\}\]", out, re.S); return (m.group(1) if m else out).strip()
+    selftest("allow", "a11y_cli")
+    selftest("group", "reset")
+    a = res(selftest("group", "custom 成员A|http://10.0.2.2:8088/a/v1|k-a|smoke-model"))
+    b = res(selftest("group", "custom 成员B|http://10.0.2.2:8088/b/v1|k-b|smoke-model"))
+    print("members", a, b, flush=True)
+    print(res(selftest("group", "partners", timeout=120))[:1500], flush=True)
+    gid = res(selftest("group", f"make smoke群|{a},{b}"))
+    print("group", gid, flush=True)
+    sh(f"am start -n {PKG}/com.openminis.app.MainActivity --es mines_route plus_group_partners"); time.sleep(7)
+    r = snap("group-partners")
+    subprocess.run(f"cp {OUT}/{step_no:02d}-group-partners.png {OUT}/group-partners.png", shell=True)
+    if not find(r, "AI 伙伴"): page_missing.append("group partners page")
+    check("AI 伙伴 page")
+    sh(f"am start -n {PKG}/com.openminis.app.MainActivity --es mines_route plus_group_chat/{gid}"); time.sleep(6)
+    r = snap("group-chat-empty")
+    check("group chat page")
+    s0 = stats()
+    ui_ok = False
+    inp = find(r, "群聊输入框")
+    if inp:
+        sh(f"input tap {inp[0]} {inp[1]}"); time.sleep(1); type_text("hello everyone"); time.sleep(1)
+        r = dump(); snd = find(r, "发送", exact=True)
+        if snd: sh(f"input tap {snd[0]} {snd[1]}"); ui_ok = True
+    if not ui_ok:
+        print("UI send not possible, using selftest", flush=True)
+        print(selftest("group", f"send {gid}|hello everyone", timeout=120))
+    time.sleep(10)
+    r = snap("group-chat-all")
+    s1 = stats()
+    da = s1.get("grp_a", 0) - s0.get("grp_a", 0); db = s1.get("grp_b", 0) - s0.get("grp_b", 0)
+    t = texts(r)
+    print("round1 posts a/b:", da, db, flush=True)
+    if not (da >= 1 and db >= 1): selftest_fail.append(f"group: message to all -> a={da} b={db}")
+    if not any("成员A收到" in x for x in t) or not any("成员B收到" in x for x in t): page_missing.append("group: both replies not visible")
+    # @成员A only
+    ui_ok = False
+    chip = find(r, "@成员A")
+    if chip:
+        sh(f"input tap {chip[0]} {chip[1]}"); time.sleep(1)
+        r = dump(); inp = find(r, "群聊输入框")
+        if inp: sh(f"input tap {inp[0]} {inp[1]}"); time.sleep(1)
+        type_text("only you"); time.sleep(1)
+        r = dump(); snd = find(r, "发送", exact=True)
+        if snd: sh(f"input tap {snd[0]} {snd[1]}"); ui_ok = True
+    if not ui_ok:
+        print("UI @ not possible, using selftest", flush=True)
+        print(selftest("group", f"send {gid}|@成员A only you", timeout=120))
+    time.sleep(10)
+    r = snap("group-chat-mention")
+    subprocess.run(f"cp {OUT}/{step_no:02d}-group-chat-mention.png {OUT}/group-chat.png", shell=True)
+    s2 = stats()
+    da = s2.get("grp_a", 0) - s1.get("grp_a", 0); db = s2.get("grp_b", 0) - s1.get("grp_b", 0)
+    print("round2 posts a/b:", da, db, flush=True)
+    if not (da >= 1 and db == 0): selftest_fail.append(f"group: @成员A -> a={da} b={db}")
+    # summary by the host (Mines) and stop button don't crash
+    hst = find(r, "总结", exact=True)
+    if hst: sh(f"input tap {hst[0]} {hst[1]}"); time.sleep(8); snap("group-summary")
+    check("group rounds")
+    dump_fatal()
+
+
 def main():
     m = re.search(r"(\d+)x(\d+)", sh("wm size"))
     if m: SCREEN[0], SCREEN[1] = int(m.group(1)), int(m.group(2))
@@ -1216,6 +1290,12 @@ def main():
         dump_fatal()
         user_like_state()
 
+    if GROUP37:
+        try:
+            group_37()
+        except Exception as e:
+            print("group37 error:", e, flush=True); selftest_fail.append(f"group37 error {e}")
+        return finish(lc)
     if B353:
         try:
             b353()
