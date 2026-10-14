@@ -108,6 +108,20 @@ class H(BaseHTTPRequestHandler):
                  "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10}}
             self.wfile.write(b"data: " + json.dumps(d).encode() + b"\n\ndata: [DONE]\n\n"); self.wfile.flush()
             return
+        # [build-35] 消息 cards: Mines asks for Chinese 介绍 / 点评 as a JSON array (non-stream)
+        ut = last_user_text(msgs)
+        if "中文卡片" in ut and not body.get("stream"):
+            STATS["digest_posts"] = STATS.get("digest_posts", 0) + 1
+            try:
+                items = json.loads(ut[ut.rindex("\n[") + 1:])
+            except Exception:
+                items = []
+            arr = [{"i": it.get("i"), "h": "测试标题：" + str(it.get("src", ""))[:6], "s": "一句话摘要",
+                    "intro": "这是 Mines 写的中文介绍：它是一个测试条目，用来检查翻译和介绍。",
+                    "review": "点评：对你来说可以看看，因为这是冒烟测试。", "v": "可以看看",
+                    "help": "Mines 会帮你总结要点并告诉你下一步。",
+                    "d": [{"t": "总结要点", "s": "用大白话说清楚"}]} for it in items]
+            text = json.dumps(arr, ensure_ascii=False)
         if body.get("stream"):
             self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
             for ch in [text[:3], text[3:]]:

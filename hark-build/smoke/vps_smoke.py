@@ -721,8 +721,7 @@ def build34():
     j = selftest_json("failguard", "x")
     if not j.get("ok"): selftest_fail.append(f"b34 failguard selftest {j}")
     j = selftest_json("tts", "gemini")
-    if j.get("gec") != "70AED27457006C255086B4F079B9FE44A4D10827C4AFDFC3C45583B6F40D7DDF":
-        selftest_fail.append(f"b34 edge token {j}")
+    # [build-35] v2 token (edge-tts 7.3.1) for t=1760400000 is checked in build35()
     # per-character theme: home + voice page per character
     for cid, want in [("claude", "B5532F"), ("whale", "2E73C2"), ("gemini", "835EC2")]:
         j = selftest_json("theme", cid)
@@ -820,6 +819,71 @@ def build34():
         selftest("pet", "mode:" + mo, timeout=20); time.sleep(0.6)
         snap(f"v34-pet-{mo.lower()}-a"); time.sleep(0.9); snap(f"v34-pet-{mo.lower()}-b")
     relaunch()
+
+
+def build35():
+    """[build-35] Edge TTS v2 token + live synthesis + fallback, voiceprint pipeline + enrolment UI (injected mic),
+    offline model mirrors, MCP merge (DSH 装了又掉), login WebViews."""
+    j = selftest_json("tts", "edge")
+    print(f"  b35 tts: {j}", flush=True)
+    if not j.get("drm_ok") or not str(j.get("gec", "")).startswith("F3E7AA1D0E82AD85-"): selftest_fail.append(f"b35 edge v2 token {j}")
+    j = selftest_json("tts", "live", timeout=120)
+    print(f"  b35 tts live: {j}", flush=True)
+    if (j.get("edge_samples") or -1) <= 0: selftest_fail.append(f"b35 edge live synthesis {j}")
+    if not j.get("chain_used") or (j.get("chain_samples") or 0) <= 0: selftest_fail.append(f"b35 tts chain {j}")
+    selftest("tts", "gemini")
+    j = selftest_json("mcpmerge", "x")
+    print(f"  b35 mcpmerge: {j}", flush=True)
+    if not j.get("kept"): selftest_fail.append(f"b35 dsh server entry lost on app save {j}")
+    j = selftest_json("voiceprint", "pipeline", timeout=300)
+    print(f"  b35 voiceprint pipeline: {j}", flush=True)
+    if (j.get("clip_samples") or 0) <= 0: selftest_fail.append(f"b35 voiceprint clips {j}")
+    if "静音" not in str(j.get("silence_error", "")): selftest_fail.append(f"b35 voiceprint silence not reported {j}")
+    if not j.get("model"): selftest_fail.append(f"b35 voiceprint model download {j}")
+    elif not j.get("enrolled") or (j.get("score_self") or 0) < 0.5: selftest_fail.append(f"b35 voiceprint enrol {j}")
+    selftest("voiceprint", "clear")
+    # web page translation (English page → Chinese, in place)
+    j = selftest_json("translate", "x", timeout=120)
+    print(f"  b35 translate: {json.dumps(j, ensure_ascii=False)[:300]}", flush=True)
+    if not j.get("foreign") or (j.get("applied") or 0) <= 0 or not re.search(r"[\u4e00-\u9fff]", str(j.get("text", ""))):
+        selftest_fail.append(f"b35 page translation {json.dumps(j, ensure_ascii=False)[:200]}")
+    # offline model (wake word / ASR) through the mirrored downloader
+    j = selftest_json("models", "fresh", timeout=400)
+    print(f"  b35 models: {j}", flush=True)
+    if not j.get("vosk_ok"): selftest_fail.append(f"b35 vosk model download {j}")
+    # voiceprint enrolment page with the injected mic: three phrases → saved; then silence → plain reason
+    for kind, want in (("speech", "录好了"), ("silence", "静音")):
+        selftest("voiceprint", "inject:" + kind)
+        go_home()
+        ok = False
+        if tap_text("实时语音", wait=6):
+            time.sleep(3)
+            if tap_text("语音设置", wait=4):
+                for _ in range(4):
+                    r = dump()
+                    if r is not None and find(r, "录入声纹"): break
+                    scroll_down(); time.sleep(1)
+                if tap_text("录入声纹", wait=3) or tap_text("重新录入声纹", wait=3):
+                    time.sleep(2); snap(f"v35-vp-{kind}-open")
+                    for i in range(3 if kind == "speech" else 1):
+                        tap_text("开始", wait=2) or tap_text("读第", wait=2) or tap_text("再试一次", wait=2)
+                        time.sleep(1.2); snap(f"v35-vp-{kind}-listening-{i}")
+                        time.sleep(5 if kind == "speech" else 8)
+                    for _ in range(40):
+                        r = dump()
+                        if r is not None and find(r, want): ok = True; break
+                        time.sleep(3)
+                    snap(f"v35-vp-{kind}-result")
+        if not ok: selftest_fail.append(f"b35 voiceprint enrol page ({kind}) never showed 「{want}」")
+        for _ in range(4): sh("input keyevent KEYCODE_BACK"); time.sleep(1)
+        if not alive(): relaunch()
+    selftest("voiceprint", "inject:off"); selftest("voiceprint", "clear")
+    # login / key-fetch WebView setup renders real pages
+    for u in ("https://bailian.console.aliyun.com/", "https://signin.aliyun.com/", "https://www.vulbox.com/", "https://github.com/login"):
+        j = selftest_json("loginweb", u, timeout=70)
+        print(f"  b35 loginweb {u}: {json.dumps(j, ensure_ascii=False)[:300]}", flush=True)
+        if (j.get("chars") or -1) < 20: page_missing.append(f"b35 loginweb blank {u}")
+    relaunch(); go_home(); time.sleep(2)
 
 
 def build31_pages():
@@ -927,6 +991,10 @@ def main():
         build34()
     except Exception as e:
         print("build34 error:", e, flush=True); selftest_fail.append(f"b34 error {e}")
+    try:
+        build35()
+    except Exception as e:
+        print("build35 error:", e, flush=True); selftest_fail.append(f"b35 error {e}")
 
     # Cold start with VPS mode + servers saved (the user's state)
     sh(f"am force-stop {PKG}"); time.sleep(2)
