@@ -1469,7 +1469,7 @@ def b381():
     print(f"B381 {res}", flush=True)
 
 
-COZE_LOGIN = ["手机号登录", "欢迎使用扣子", "欢迎来到扣子", "登录扣子", "登录 / 注册", "登录/注册", "验证码", "获取验证码", "手机号", "抖音登录", "Welcome to Coze", "Sign in", "登录"]
+COZE_LOGIN = ["账号登录-火山引擎", "火山引擎", "账号登录", "手机号登录", "欢迎使用扣子", "欢迎来到扣子", "登录扣子", "登录 / 注册", "登录/注册", "验证码", "获取验证码", "手机号", "抖音登录", "Welcome to Coze", "Sign in", "登录"]
 
 
 def focus_pkg():
@@ -1502,6 +1502,8 @@ def coze_382():
         r = dump()
         t = texts(r) if r is not None else []
         seen = t
+        # smoke 40: the dialog's own note 「扣子要先用手机号登录（火山引擎账号）…Mines…」 matched 「手机号登录」 — only page text counts
+        t = [x for x in t if "Mines" not in x and not x.startswith("正在接入") and "付费按钮" not in x]
         fp = focus_pkg()
         if "com.android.chrome" in fp: res["chrome"] = True; break
         if any("已改用 Chrome" in x for x in t): res["chrome"] = True; break
