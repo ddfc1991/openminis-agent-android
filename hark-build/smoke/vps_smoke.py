@@ -1396,9 +1396,12 @@ def browser_open(url, tag):
         if not ed_:
             selftest_fail.append(f"b383 browser: URL field not found ({tag})"); return False
         sh(f"input tap {ed_[0]} {ed_[1]}"); time.sleep(1)
-        sh("input keyevent KEYCODE_MOVE_END"); sh("input keyevent --longpress KEYCODE_DEL"); 
-        for _ in range(3): sh("input keyevent KEYCODE_DEL")
-        sh(f"input text '{url}'"); time.sleep(0.5); sh("input keyevent 66")
+        # select all + delete (smoke 42: MOVE_END + DEL left "https://example" in the field)
+        sh("input keycombination 113 29"); time.sleep(0.3); sh("input keyevent KEYCODE_DEL")
+        sh("input keyevent KEYCODE_MOVE_END")
+        for _ in range(40): sh("input keyevent KEYCODE_DEL")
+        sh(f"input text '{url}'"); time.sleep(0.5); sh("input keyevent 66"); time.sleep(1)
+        sh("input keyevent KEYCODE_ESCAPE")   # close the keyboard so the page is fully visible
     time.sleep(14)   # page load (coze.cn's SPA takes ~10 s)
     return True
 
