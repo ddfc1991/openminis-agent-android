@@ -1866,7 +1866,8 @@ def b385():
         except Exception as e:
             print("b386 error:", e, flush=True); selftest_fail.append(f"b386 error {e}")
     if B387:
-        for fn in (b387_greeting, b387_orbit, b387_daynight, b387_fog, b387_sms, b387_linkall, b387_perms, b387_knowledge, b387_multiacct, b387_leftovers, b387_realweb):
+        anim(True)
+        for fn in (b387_greeting, b387_orbit, b387_daynight, b387_fog, b387_still, b387_xlogin, b387_pwfill, b387_sms, b387_linkall, b387_ignore, b387_perms, b387_noblack, b387_vps, b387_typing, b387_regress, b387_knowledge, b387_multiacct, b387_leftovers, b387_realweb):
             try:
                 fn(res)
             except Exception as e:
@@ -2505,6 +2506,14 @@ def _grid_score(path, box):
         return f"err {e}"
 
 
+def anim(on):
+    """the smoke emulator runs with animations off; the orbit / fog / day-night checks need them on (app relaunched)"""
+    v = "1" if on else "0"
+    sh(f"settings put global window_animation_scale {v}; settings put global transition_animation_scale {v}; settings put global animator_duration_scale {v}")
+    adb("shell", "am", "force-stop", PKG); time.sleep(1)
+    adb("shell", "monkey", "-p", PKG, "-c", "android.intent.category.LAUNCHER", "1"); time.sleep(8)
+
+
 def b387_orbit(res):
     """sun / rain / night: the sprite circles the face (two frames differ in position), a tap on the face brings the big
     picture to the top of the head with the °-pill, then it goes back to the orbit."""
@@ -2596,7 +2605,8 @@ def b387_linkall(res):
         back(); time.sleep(1.2)
         r = shot387("linkall-next"); t = " ".join(texts(r)) if r is not None else ""
         o["next"] = t[:200]
-        if "下一个" not in t: selftest_fail.append(f"b387 linkall: no next step after coming back {t[:160]}")
+        # coming back counts the platform and (3 s later) opens the next one by itself
+        if "下一个" not in t and "登录 元宝" in t: selftest_fail.append(f"b387 linkall: did not move on after coming back {t[:160]}")
         tap_text("停一下", exact=True, wait=1.5)
         tap_text("结束，看结果", exact=True, wait=3)
     else: page_missing.append("b387 linkall: 开始 not tappable")
@@ -2660,6 +2670,200 @@ def b387_daynight(res):
         if not (L[2] + 5 < L[1] < L[0] - 5): page_missing.append(f"b387 daynight: mid frame not between day and night {L}")
     r7["daynight"] = o
     result_json("group", "daynight off"); result_json("group", "greet off"); result_json("group", "thememode 1")
+
+
+
+def b387_still(res):
+    """animations off: sprite parked at the face's upper right, a tap shows the pill (no flight)"""
+    r7 = R7(res)
+    anim(False)
+    result_json("group", "greet " + json.dumps({"hour": 15, "weather": "clear", "weekday": 1}).replace(" ", ""), timeout=20)
+    b381_home(); time.sleep(3)
+    r = shot387("still-1"); time.sleep(1.5); r2 = shot387("still-2")
+    b1 = _bounds_desc(r, "天气："); b2 = _bounds_desc(r2, "天气：")
+    r7["still"] = {"b1": b1, "b2": b2}
+    if b1 != b2: selftest_fail.append(f"b387 still: sprite moves with animations off {b1} {b2}")
+    result_json("group", "greet off")
+    anim(True)
+
+
+def b387_xlogin(res):
+    """X in 账号连接: the in-app sign-in page opens x.com/i/flow/login, never crashes the app; no-connection hint."""
+    r7 = R7(res); o = {}
+    sh("logcat -c")
+    result_json("group", "openlogin x"); time.sleep(14)
+    r = shot387("x-login"); t = " ".join(texts(r)) if r is not None else ""
+    o["alive"] = alive(); o["text"] = t[:300]
+    lc = sh("logcat -d -b crash | tail -40", timeout=30)
+    o["crash"] = lc[-600:] if "FATAL" in lc or "AndroidRuntime" in lc else ""
+    if not o["alive"]: selftest_fail.append("b387 x: app died on the X login page")
+    if o["crash"]: selftest_fail.append(f"b387 x: crash {o['crash'][:300]}")
+    if "外部浏览器" not in t: page_missing.append("b387 x: 外部浏览器 button / note missing")
+    o["login_seen"] = any(w in t for w in ("登录 X", "Sign in to X", "登录到 X", "Phone, email", "手机号码、邮件地址", "电子邮件", "连不上 X"))
+    if not o["login_seen"]: page_missing.append(f"b387 x: no X sign-in form or connection hint {t[:200]}")
+    r7["xlogin"] = o
+    print("B387 xlogin", json.dumps(o, ensure_ascii=False)[:900], flush=True)
+    back(); back()
+
+
+def b387_pwfill(res):
+    """saved login (Edge CSV import) is typed into an in-app sign-in page + submitted in 一键关联 mode."""
+    r7 = R7(res)
+    B = "http://10.0.2.2:8088"
+    print(selftest("group", "savedlogins name,url,username,password\\n10.0.2.2," + B + "/pwlogin,smoke_user,smoke_pass"), flush=True)
+    result_json("group", f"setbase web:kimi|{B}/pwlogin")
+    result_json("group", "weblogin web:kimi|0")
+    route("plus_group_weblogin/web%3Akimi", 10)
+    r = shot387("pw-filled"); t = " ".join(texts(r)) if r is not None else ""
+    ok = "已填好保存的账号密码" in t or "smoke_user" in t
+    r7["pwfill"] = {"ok": ok, "text": t[:300]}
+    print("B387 pwfill", r7["pwfill"], flush=True)
+    if not ok: selftest_fail.append(f"b387 pwfill: saved login not filled {t[:200]}")
+    back(); result_json("group", "setbase web:kimi|")
+
+
+def b387_noblack(res):
+    """FLAG_SECURE gone: screencap of 账号连接 / key page / chat / settings is not black."""
+    r7 = R7(res); out = {}
+    for tag, rt in (("connections", "plus_connections"), ("settings", "settings"), ("cards", "plus_cards"), ("linkall", "plus_linkall")):
+        route(rt, 4)
+        snap_ = shot387("noblack-" + tag)
+        W, H = (SCREEN[0], SCREEN[1]) if SCREEN and SCREEN[0] else (1080, 2362)
+        try:
+            from PIL import Image
+            im = Image.open(f"{OUT}/b387-noblack-{tag}.png").convert("L").crop((0, int(H * .1), W, int(H * .8))); h = im.histogram()
+            mean = sum(i * v for i, v in enumerate(h)) / max(1, sum(h))
+        except Exception as e:
+            mean = -1
+        out[tag] = round(mean, 1)
+        if 0 <= mean < 8: selftest_fail.append(f"b387 noblack: {tag} screenshot is black")
+        back()
+    r7["noblack"] = out
+    print("B387 noblack", out, flush=True)
+    route("plus_routing", 4); r = shot387("routing"); t = " ".join(texts(r)) if r is not None else ""
+    r7["routing_text"] = t[:200]
+    if "同模型自动成组" in t: selftest_fail.append("b387 routing: 同模型自动成组 still shown")
+    back()
+
+
+
+def b387_vps(res):
+    """快速线路 code read hangs (simulated): retries, auto-configure, then red 「快速线路未就绪」 + notification with 重试."""
+    r7 = R7(res); o = {}
+    sid = (result_json("group", "vpscodesim") or "")
+    sid = sid if isinstance(sid, str) else str(sid)
+    o["server"] = sid
+    route("plus_server/" + sid.strip(), 3)
+    shot387("vps-reading")
+    t = ""
+    for _ in range(12):
+        time.sleep(3)
+        r = dump(); t = " ".join(texts(r)) if r is not None else ""
+        if "快速线路未就绪：" in t and "正在读取" not in t: break
+    shot387("vps-notready")
+    o["text"] = t[:300]
+    if "快速线路未就绪" not in t: selftest_fail.append(f"b387 vps: no 快速线路未就绪 after timeouts {t[:200]}")
+    if "已连接" in t and "未就绪" in t: selftest_fail.append("b387 vps: shows 已连接 while not ready")
+    sh("cmd statusbar expand-notifications"); time.sleep(2.5)
+    r = shot387("vps-notification"); tn = " ".join(texts(r)) if r is not None else ""
+    o["notification"] = tn[:300]
+    if "快速线路未就绪" not in tn: selftest_fail.append(f"b387 vps: notification missing {tn[:200]}")
+    if "重试" not in tn: page_missing.append("b387 vps: 重试 action not seen in the shade")
+    sh("cmd statusbar collapse"); time.sleep(1)
+    result_json("group", "vpscodesim off")
+    r7["vps"] = o
+    print("B387 vps", json.dumps(o, ensure_ascii=False)[:800], flush=True)
+    back()
+
+
+def b387_ignore(res):
+    r7 = R7(res)
+    route("plus_linkall_summary", 4)
+    r = dump()
+    ok = tap_text("忽略", exact=True, wait=2)
+    r = shot387("linkall-ignored"); t = " ".join(texts(r)) if r is not None else ""
+    r7["ignore"] = {"tapped": ok, "text": t[:300]}
+    if ok and "已忽略" not in t: selftest_fail.append(f"b387 ignore: no 已忽略 section after 忽略 {t[:200]}")
+    if ok and tap_text("恢复", exact=True, wait=2): r7["ignore"]["restored"] = True
+    back()
+
+
+
+def _type_into_first_edit(digits):
+    r = dump()
+    eds = []
+    if r is not None:
+        for n in r.iter("node"):
+            if n.get("class") == "android.widget.EditText":
+                b = re.findall(r"\d+", n.get("bounds") or "")
+                if len(b) == 4: eds.append(tuple(map(int, b)))
+    if not eds: return None, ""
+    x1, y1, x2, y2 = eds[0]
+    adb("shell", "input", "tap", str((x1 + x2) // 2), str((y1 + y2) // 2)); time.sleep(1.5)
+    adb("shell", "input", "text", digits); time.sleep(2)
+    r = dump(); val = ""
+    if r is not None:
+        for n in r.iter("node"):
+            if n.get("class") == "android.widget.EditText":
+                b = tuple(map(int, re.findall(r"\d+", n.get("bounds") or "0 0 0 0")))
+                if b == eds[0]: val = n.get("text") or ""
+    return eds[0], val
+
+
+def b387_typing(res):
+    """DeepSeek-style phone field: typed digits must come out in order (user saw 123 → 321)."""
+    r7 = R7(res); out = {}
+    B = "http://10.0.2.2:8088"
+    cases = [("fake-sms", "web:kimi", f"{B}/smslogin"), ("fake-pw", "web:kimi", f"{B}/pwlogin"), ("deepseek", "web:deepseek", ""), ("kimi", "web:kimi", ""), ("doubao", "web:doubao", "")]
+    for tag, sid, base in cases:
+        result_json("group", f"setbase {sid}|{base}")
+        result_json("group", f"weblogin {sid}|0")
+        route("plus_group_weblogin/" + sid.replace(":", "%3A"), 14)
+        if tag == "deepseek":   # its phone tab may need a tap first
+            tap_any(["手机号登录", "验证码登录", "Phone"], wait=2)
+        b, val = _type_into_first_edit("13800138000")
+        shot387("typing-" + tag)
+        digits = re.sub(r"\D", "", val or "")
+        out[tag] = {"field": b, "value": val}
+        if b is None: page_missing.append(f"b387 typing {tag}: no input field found")
+        elif "13800138000" not in digits and digits:
+            selftest_fail.append(f"b387 typing {tag}: typed 13800138000, field shows {val!r}")
+        back(); time.sleep(1)
+    result_json("group", "setbase web:kimi|")
+    r7["typing"] = out
+    print("B387 typing", json.dumps(out, ensure_ascii=False), flush=True)
+
+
+REGRESS_ROUTES = ["settings", "plus_connections", "plus_personalize", "plus_voice_settings", "plus_sandbox", "plus_plugins", "plus_market",
+                  "plus_routing", "plus_tidy", "plus_knowledge", "plus_verify", "plus_update", "plus_report", "plus_digest", "plus_cards",
+                  "plus_work_location", "plus_group", "plus_group_partners", "plus_group_new", "plus_linkall", "plus_linkall_summary",
+                  "plus_permissions_guide", "plus_migrate"]
+
+
+def b387_regress(res):
+    """every page opens (screenshot), app alive, not black; chat input takes letters + digits."""
+    r7 = R7(res); rows = []
+    for rt in REGRESS_ROUTES:
+        sh("logcat -c")
+        route(rt, 4)
+        r = shot387("reg-" + rt)
+        t = " ".join(texts(r)) if r is not None else ""
+        lc = sh("logcat -d -b crash | tail -20", timeout=20)
+        ok = alive() and bool(t.strip()) and "FATAL" not in lc
+        rows.append({"page": rt, "ok": ok, "shot": f"b387-reg-{rt}.png", "text": t[:80]})
+        if not ok: selftest_fail.append(f"b387 regress: {rt} failed (alive={alive()}, crash={'FATAL' in lc})")
+        if not alive(): relaunch()
+        back(); time.sleep(0.8)
+    # chat input
+    b381_home(); time.sleep(2)
+    tap_any(["开个新对话…", "开个新对话"], wait=3)
+    b, val = _type_into_first_edit("Hello123")
+    shot387("reg-chat-typing")
+    rows.append({"page": "chat input", "ok": "Hello123" in (val or ""), "shot": "b387-reg-chat-typing.png", "text": val})
+    if "Hello123" not in (val or ""): page_missing.append(f"b387 regress: chat input shows {val!r}")
+    back()
+    r7["regress"] = rows
+    print("B387 REGRESS " + json.dumps(rows, ensure_ascii=False), flush=True)
 
 
 

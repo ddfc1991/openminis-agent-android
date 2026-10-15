@@ -159,6 +159,16 @@ class H(BaseHTTPRequestHandler):
                     '<p>请登录后使用</p></body></html>').encode()
             self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(html))); self.end_headers(); self.wfile.write(html); return
+        if self.path.startswith("/pwlogin"):
+            # [build-38.7] account + password login: filled from the imported (CSV) saved login
+            html = ('<html><head><meta name="viewport" content="width=device-width"><meta charset="utf-8"><title>账号登录</title></head>'
+                    '<body style="font-family:sans-serif;font-size:20px;padding:16px"><h2>账号登录</h2>'
+                    '<input id="u" name="username" autocomplete="username" placeholder="账号" style="width:90%;height:48px;font-size:20px"><br><br>'
+                    '<input id="p" name="password" type="password" autocomplete="current-password" placeholder="密码" style="width:90%;height:48px;font-size:20px"><br><br>'
+                    '<button onclick="document.getElementById(\'r\').innerText=\'登录中：\'+document.getElementById(\'u\').value">登录</button>'
+                    '<p id="r">请登录后使用</p></body></html>').encode()
+            self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html))); self.end_headers(); self.wfile.write(html); return
         if self.path.startswith("/otp"):
             html = (b'<html><body><h3>Enter the code we e-mailed you</h3>'
                     b'<input id="code" name="otp" autocomplete="one-time-code" inputmode="numeric" style="width:200px;height:40px">'
