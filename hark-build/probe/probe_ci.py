@@ -12,7 +12,7 @@ async def one(b, k, url):
     pg = await ctx.new_page(); r = {"site": k}
     try:
         await pg.goto(url, timeout=45000, wait_until="domcontentloaded")
-        await pg.wait_for_timeout(10000)
+        await pg.wait_for_timeout(25000 if k in ("deepseek","chatgpt","chatglm") else 12000)
         r["before"] = await pg.evaluate(DUMP)
         r["cookies"] = [c["name"] + "@" + c["domain"] for c in await ctx.cookies()]
         await pg.screenshot(path=f"{OUT}/{k}-1.png")
