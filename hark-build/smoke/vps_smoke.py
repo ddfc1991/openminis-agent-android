@@ -39,6 +39,10 @@ try:
     B385 = "b385" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
 except Exception:
     B385 = False
+try:
+    B386 = "b386" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
+except Exception:
+    B386 = False
 FONT_SCALE = "1.18"
 step_no = 0
 crashed = []
@@ -1845,7 +1849,147 @@ def b385():
             back()
         back()
     route("plus_plugins", 4); shot385("plugins"); back()
+    if B386:
+        try:
+            b386_extra(res)
+        except Exception as e:
+            print("b386 error:", e, flush=True); selftest_fail.append(f"b386 error {e}")
     print(f"B385 {res}", flush=True)
+
+
+# ======================= [build-38.6] agents / web apps in the group, reply cards, avatar level =======================
+
+def home_avatar_386(res):
+    """1: the face sits in the top bar, its upper half level with ☰ and ⚙, never overlapping them."""
+    b381_home(); time.sleep(2)
+    r = dump()
+    av = node_bounds(r, lambda n: (n.get("content-desc") or "").startswith("换角色"))
+    menu = node_bounds(r, lambda n: (n.get("content-desc") or "") == "更多")
+    gear = node_bounds(r, lambda n: (n.get("content-desc") or "") in ("设置", "Settings"))
+    res["avatar"] = {"avatar": av, "menu": menu, "gear": gear}
+    print("B386 avatar", res["avatar"], flush=True)
+    if not (av and menu and gear):
+        page_missing.append(f"b386 home: avatar/☰/⚙ bounds missing {res['avatar']}"); return
+    icon_cy = (menu[1] + menu[3]) / 2
+    if not (av[1] <= icon_cy <= (av[1] + av[3]) / 2 + 4):
+        selftest_fail.append(f"b386 home: avatar not level with ☰/⚙ (avatar {av}, icon centre y {icon_cy})")
+    if av[0] < menu[2] or av[2] > gear[0]:
+        selftest_fail.append(f"b386 home: avatar overlaps ☰/⚙ horizontally {res['avatar']}")
+
+
+def fake_stats():
+    try:
+        import urllib.request
+        return json.loads(urllib.request.urlopen("http://127.0.0.1:8088/stats", timeout=5).read())
+    except Exception as e:
+        return {"err": str(e)}
+
+
+def group_386(res):
+    """Group of agents + apps: fake 扣子 (list → auto-publish → chat), fake Manus task, fake web chat page (豆包 selectors),
+    one bad member (Kimi web page behind a login wall); @only; summary; 1:1 chat with a 扣子 bot and with Mines' own agent."""
+    B = "http://10.0.2.2:8088"
+    v = result_json("group", f"vaultkey coze|pat_smoke_0123456789abcdef0123|{B}/v3") or {}
+    cs = result_json("group", "cozesync", timeout=60) or {}
+    print("B386 cozesync", json.dumps(cs, ensure_ascii=False)[:800], flush=True)
+    res["coze"] = cs
+    if not isinstance(cs, dict) or len(cs.get("bots", [])) != 2: selftest_fail.append(f"b386 coze: bots not listed {cs}")
+    elif "bot2" not in cs.get("published", []) and "bot2" not in fake_stats().get("coze_published", []):
+        selftest_fail.append(f"b386 coze: unpublished bot not auto-published {cs} {fake_stats()}")
+    elif sorted(m.get("state") for m in cs.get("members", []) if m.get("id", "").startswith("coze:")) != ["READY", "READY"]:
+        selftest_fail.append(f"b386 coze: bots not READY members {cs}")
+    result_json("group", f"vaultkey manus|sk-manus-smoke-0123456789abcdef|{B}/manus/v2")
+    result_json("group", f"base web:doubao|{B}/webchat"); result_json("group", "weblogin web:doubao|1")
+    result_json("group", f"base web:kimi|{B}/webchat-login"); result_json("group", "weblogin web:kimi|1")
+    gid = result_json("group", "make 智能体群|coze:bot1,manus,web:doubao,web:kimi")
+    res["gid386"] = gid
+    t0 = time.time()
+    r1 = result_json("group", f"send {gid}|大家好，各说一句你的看法", timeout=200) or []
+    res["round_s"] = round(time.time() - t0, 1)
+    print("B386 round1", res["round_s"], "s", json.dumps(r1, ensure_ascii=False)[:2000], flush=True)
+    if not isinstance(r1, list): selftest_fail.append(f"b386 group send not a list: {r1}"); return gid
+    by = {x.get("who"): x for x in r1 if isinstance(x, dict)}
+    for who, want in (("coze:bot1", "冒烟助手"), ("manus", "Manus 做完了"), ("web:doubao", "网页成员收到")):
+        x = by.get(who, {})
+        if x.get("status") != "ok" or want not in (x.get("text", "") + x.get("name", "")):
+            selftest_fail.append(f"b386 group: {who} did not answer {x}")
+    k = by.get("web:kimi", {})
+    if k.get("status") not in ("error", "skip") or ("登录" not in (k.get("text", "") + k.get("detail", ""))):
+        selftest_fail.append(f"b386 group: login-wall member not reported plainly {k}")
+    if any(x.get("status") == "stopped" for x in r1 if isinstance(x, dict)): selftest_fail.append("b386 group: 已停止 in a normal round")
+    if not any(x.get("who") == "host" and x.get("kind") == "wrap" and x.get("status") == "ok" for x in r1 if isinstance(x, dict)):
+        selftest_fail.append("b386 group: host did not wrap up the round")
+    r2 = result_json("group", f"send {gid}|@冒烟助手 只问你一个", timeout=120) or []
+    who2 = [x.get("who") for x in r2 if isinstance(x, dict) and x.get("who") != "user"]
+    print("B386 round2", who2, flush=True)
+    if who2 != ["coze:bot1"]: selftest_fail.append(f"b386 group @mention answered by {who2}")
+    r3 = result_json("group", f"summary {gid}", timeout=120) or []
+    if not any(isinstance(x, dict) and x.get("kind") == "summary" and x.get("status") == "ok" for x in r3):
+        selftest_fail.append(f"b386 group summary failed {r3}")
+    # 1:1 with a bot that Mines published itself, and with Mines' own agent
+    d = result_json("group", "direct coze:bot2")
+    r4 = result_json("group", f"send {d}|你好", timeout=90) or []
+    x = next((y for y in r4 if isinstance(y, dict) and y.get("who") == "coze:bot2"), {})
+    print("B386 direct coze", x, flush=True)
+    if x.get("status") != "ok" or "写作搭子" not in x.get("text", ""): selftest_fail.append(f"b386 direct 扣子 chat failed {x}")
+    res["direct_coze"] = d
+    dm = result_json("group", "direct mines")
+    r5 = result_json("group", f"send {dm}|你好，简单介绍一下你自己", timeout=200) or []
+    x = next((y for y in r5 if isinstance(y, dict) and y.get("who") == "mines"), {})
+    print("B386 direct mines", x, flush=True)
+    res["mines_agent"] = x.get("status")
+    if x.get("status") != "ok": selftest_fail.append(f"b386 Mines agent member failed {x}")
+    return gid
+
+
+def b386_extra(res):
+    home_avatar_386(res)
+    shot385("home-avatar")
+    try:
+        gid = group_386(res)
+    except Exception as e:
+        print("group_386 error:", e, flush=True); selftest_fail.append(f"b386 group error {e}"); gid = None
+    if gid:
+        route(f"plus_group_chat/{gid}", 5)
+        r = shot385("agents-group")
+        t = " ".join(texts(r)) if r is not None else ""
+        if "讨论总结" not in t: page_missing.append("b386 agents group: summary bubble not on screen")
+        back()
+    route("plus_group_partners", 8)
+    r = shot385("partners386")
+    t = " ".join(texts(r)) if r is not None else ""
+    for want in ("智能体", "冒烟助手", "聊天"):
+        if want not in t: page_missing.append(f"b386 partners: {want} missing")
+    for bad in ("Bot ID", "pat_", "10.0.2.2"):
+        if bad in t: selftest_fail.append(f"b386 partners shows technical field {bad}")
+    sh(f"input swipe {SCREEN[0]//2} {int(SCREEN[1]*0.8)} {SCREEN[0]//2} {int(SCREEN[1]*0.25)} 500"); time.sleep(1.5)
+    r = shot385("partners386-2")
+    t2 = " ".join(texts(r)) if r is not None else ""
+    if "App 账号" not in t + t2: page_missing.append("b386 partners: App 账号 section missing")
+    if "高级" not in t + t2:
+        sh(f"input swipe {SCREEN[0]//2} {int(SCREEN[1]*0.8)} {SCREEN[0]//2} {int(SCREEN[1]*0.25)} 500"); time.sleep(1.5)
+        r = shot385("partners386-3"); t3 = " ".join(texts(r)) if r is not None else ""
+        if "高级" not in t3: page_missing.append("b386 partners: 高级：直接用模型 fold missing")
+    back()
+    route("plus_group_new", 6); shot385("new-group386"); back()
+    # 1:1 扣子 chat screen
+    if res.get("direct_coze"):
+        route(f"plus_group_chat/{res['direct_coze']}", 5); shot385("direct-coze"); back()
+    # E: reply card in a normal chat (the smoke chat has a reply from the fake model)
+    b381_home()
+    r = dump()
+    row = next(((x, y) for tx_, d, x, y, n in nodes(r) if y > SCREEN[1] * 0.35 and y < SCREEN[1] * 0.75 and len(tx_ or "") > 3
+                and not any(k in (tx_ or "") for k in ("开个新对话", "最近对话", "电量", "网络", "存储", "运行", "Claude", "在线"))), None)
+    if row:
+        sh(f"input tap {row[0]} {row[1]}"); time.sleep(5); shot385("chat-card"); back()
+    # F: real reads of 微博 / B站 / 知乎 from the emulator (no session) + one public endpoint each
+    sc = result_json("sourcecheck", "", timeout=90)
+    print("B386 sourcecheck", json.dumps(sc, ensure_ascii=False)[:1500], flush=True)
+    res["sourcecheck"] = sc
+    if not isinstance(sc, list) or len(sc) != 3: selftest_fail.append(f"b386 sourcecheck not run {sc}")
+    else:
+        for x in sc:
+            if not x.get("own") or not x.get("public"): selftest_fail.append(f"b386 sourcecheck blank result {x}")
 
 
 COZE_LOGIN = ["账号登录-火山引擎", "火山引擎", "账号登录", "手机号登录", "欢迎使用扣子", "欢迎来到扣子", "登录扣子", "登录 / 注册", "登录/注册", "验证码", "获取验证码", "手机号", "抖音登录", "Welcome to Coze", "Sign in", "登录"]

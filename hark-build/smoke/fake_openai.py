@@ -26,13 +26,57 @@ def pick_tool(tools):
     req = (f.get("parameters") or {}).get("required") or []
     return f.get("name", "memory_get"), {k: "smoke-loop" for k in req}
 
+
+# [build-38.6] fake 扣子 (list bots → auto-publish to the API channel → v3 chat), fake Manus tasks, fake AI web chat
+COZE = {"published": {"bot1"}, "bots": [("bot1", "冒烟助手"), ("bot2", "写作搭子")], "chats": {}}
+WEBCHAT = """<html><head><meta name="viewport" content="width=device-width"><meta charset="utf-8"><title>假豆包</title></head>
+<body style="font-family:sans-serif;margin:0"><div id="log" style="padding:12px"></div>
+<div style="position:fixed;bottom:0;left:0;right:0;padding:8px;background:#eee">
+<textarea data-testid="chat_input_input" id="q" style="width:75%;height:60px"></textarea>
+<button data-testid="chat_input_send_button" aria-label="发送" id="send">发送</button></div>
+<script>
+document.getElementById('send').onclick=function(){var q=document.getElementById('q').value;if(!q)return;
+var log=document.getElementById('log');var u=document.createElement('div');u.setAttribute('data-testid','send_message');u.innerText=q;log.appendChild(u);
+document.getElementById('q').value='';
+var a=document.createElement('div');a.setAttribute('data-testid','receive_message');var c=document.createElement('div');c.setAttribute('data-testid','message_text_content');a.appendChild(c);log.appendChild(a);
+var full='网页成员收到：我是假豆包，看到了群里的问题。';var i=0;var t=setInterval(function(){i+=3;c.innerText=full.slice(0,i);if(i>=full.length)clearInterval(t);},300);};
+</script></body></html>"""
+WEBLOGIN = """<html><head><meta name="viewport" content="width=device-width"><meta charset="utf-8"></head><body style="font-family:sans-serif">
+<h2>登录 Kimi</h2><p>手机号登录后才能聊天</p><button>登录</button></body></html>"""
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): print("fake-openai", self.command, self.path, flush=True)
+    def _html(self, html):
+        b = html.encode()
+        self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
     def _json(self, obj, code=200):
         b = json.dumps(obj).encode()
         self.send_response(code); self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
     def do_GET(self):
+        if self.path.startswith("/webchat-login"):
+            return self._html(WEBLOGIN)
+        if self.path.startswith("/webchat"):
+            return self._html(WEBCHAT)
+        if self.path.startswith("/v1/workspaces"):
+            STATS["coze_list"] = STATS.get("coze_list", 0) + 1
+            return self._json({"code": 0, "msg": "", "data": {"workspaces": [{"id": "ws1", "name": "个人空间"}]}})
+        if self.path.startswith("/v1/bots"):
+            api = "published_online" in self.path and "connector_id=1024" in self.path
+            items = [{"id": b, "name": n, "icon_url": "", "is_published": b in COZE["published"]} for b, n in COZE["bots"] if (b in COZE["published"] or not api)]
+            return self._json({"code": 0, "msg": "", "data": {"items": items, "total": len(items)}})
+        if self.path.startswith("/v3/chat/retrieve"):
+            return self._json({"code": 0, "data": {"status": "completed"}})
+        if self.path.startswith("/v3/chat/message/list"):
+            cid = self.path.split("chat_id=")[-1].split("&")[0]
+            bot = COZE["chats"].get(cid, "bot1")
+            name = dict(COZE["bots"]).get(bot, "?")
+            return self._json({"code": 0, "data": [{"role": "assistant", "type": "answer", "content": f"扣子智能体「{name}」收到：这是我的看法。"}]})
+        if "/manus/v2/task.detail" in self.path:
+            return self._json({"task": {"status": "stopped"}})
+        if "/manus/v2/task.listMessages" in self.path:
+            return self._json({"messages": [{"type": "assistant_message", "assistant_message": {"content": "Manus 做完了：任务已完成，结论如下。"}}]})
         if self.path.startswith("/stats"):
             return self._json(STATS)
         # [build-33] simulated Gmail Atom feed with a fresh code mail + a page with a one-time-code field
@@ -68,6 +112,18 @@ class H(BaseHTTPRequestHandler):
             return self._json({"object": "list", "data": [{"id": "smoke-model", "object": "model", "owned_by": "smoke"}]})
         self._json({"ok": True})
     def do_POST(self):
+        if self.path.startswith("/v1/bot/publish") or self.path.startswith("/v3/chat") or "/manus/v2/task.create" in self.path:
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(n) or b"{}")
+            if self.path.startswith("/v1/bot/publish"):
+                COZE["published"].add(body.get("bot_id")); STATS.setdefault("coze_published", []).append(body.get("bot_id"))
+                return self._json({"code": 0, "msg": "", "data": {"bot_id": body.get("bot_id"), "version": "1"}})
+            if self.path.startswith("/v3/chat"):
+                cid = "c%d" % (len(COZE["chats"]) + 1); COZE["chats"][cid] = body.get("bot_id")
+                STATS["coze_chats"] = STATS.get("coze_chats", 0) + 1
+                return self._json({"code": 0, "data": {"id": cid, "conversation_id": "v" + cid, "status": "in_progress"}})
+            STATS["manus_tasks"] = STATS.get("manus_tasks", 0) + 1
+            return self._json({"task_id": "t%d" % STATS["manus_tasks"]})
         n = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(n) or b"{}")
         text = "你好，我是测试模型。"
