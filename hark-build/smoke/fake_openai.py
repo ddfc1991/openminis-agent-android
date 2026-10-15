@@ -44,6 +44,46 @@ var full='网页成员收到：我是假豆包，看到了群里的问题。';va
 WEBLOGIN = """<html><head><meta name="viewport" content="width=device-width"><meta charset="utf-8"></head><body style="font-family:sans-serif">
 <h2>登录 Kimi</h2><p>手机号登录后才能聊天</p><button>登录</button></body></html>"""
 
+# [build-38.7] fake web AI with real accounts: session cookie + localStorage per account (multi-account isolation smoke)
+WEBACCT_WALL = """<html><head><meta name="viewport" content="width=device-width"><meta charset="utf-8"><title>假豆包 登录</title></head>
+<body style="font-family:sans-serif"><h2>请先登录再使用</h2><p>手机号码登录</p><button>登录</button></body></html>"""
+WEBACCT_LOGIN = """<html><head><meta name="viewport" content="width=device-width"><meta charset="utf-8"><title>登录成功</title></head>
+<body style="font-family:sans-serif"><h2>已登录 %s</h2><script>localStorage.setItem('fuser','ls%s');</script></body></html>"""
+WEBACCT_CHAT = """<html><head><meta name="viewport" content="width=device-width"><meta charset="utf-8"><title>假豆包</title></head>
+<body style="font-family:sans-serif;margin:0"><div id="log" style="padding:12px"></div>
+<div style="position:fixed;bottom:0;left:0;right:0;padding:8px;background:#eee">
+<textarea data-testid="chat_input_input" id="q" style="width:75%;height:60px"></textarea>
+<button data-testid="chat_input_send_button" aria-label="发送" id="send">发送</button></div>
+<script>
+document.getElementById('send').onclick=function(){var q=document.getElementById('q').value;if(!q)return;
+var log=document.getElementById('log');var u=document.createElement('div');u.setAttribute('data-testid','send_message');u.innerText=q;log.appendChild(u);
+document.getElementById('q').value='';
+var a=document.createElement('div');a.setAttribute('data-testid','receive_message');var c=document.createElement('div');c.setAttribute('data-testid','message_text_content');a.appendChild(c);log.appendChild(a);
+fetch('/webacct/reply?ls='+encodeURIComponent(localStorage.getItem('fuser')||'none')+'&q='+encodeURIComponent(q.slice(0,40)),{credentials:'same-origin'}).then(function(r){return r.text()}).then(function(t){c.innerText=t;});};
+</script></body></html>"""
+
+def cookie_of(h, name):
+    for part in (h.headers.get("Cookie") or "").split(";"):
+        k, _, v = part.strip().partition("=")
+        if k == name: return v
+    return None
+
+KB_JSON = {"topic": "测试主题", "summary": "模型整理：这是假模型写的摘要。", "facts": ["模型要点一"], "decisions": ["模型结论：照办"], "todos": ["模型待办：明天检查"], "links": [], "files": []}
+MULTIPART = """## 第一部分：结论
+这是第一段，说明结论。
+
+## 第二部分：步骤
+1. 打开设置
+2. 点「账号连接」
+3. 登录一次
+
+## 第三部分：代码
+```python
+print("hello mines")
+```
+
+最后一段：如果还有问题，随时问我。"""
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): print("fake-openai", self.command, self.path, flush=True)
     def _html(self, html):
@@ -55,6 +95,25 @@ class H(BaseHTTPRequestHandler):
         self.send_response(code); self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
     def do_GET(self):
+        if self.path.startswith("/webacct/login"):
+            from urllib.parse import urlparse, parse_qs
+            u = (parse_qs(urlparse(self.path).query).get("u") or ["A"])[0]
+            b = (WEBACCT_LOGIN % (u, u)).encode()
+            self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Set-Cookie", "fsess=%s; Path=/; Max-Age=86400" % u)
+            self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+            STATS.setdefault("webacct_logins", []).append(u); return
+        if self.path.startswith("/webacct/reply"):
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            who = cookie_of(self, "fsess")
+            ls = (qs.get("ls") or ["none"])[0]
+            STATS.setdefault("webacct_replies", []).append({"cookie": who, "ls": ls})
+            b = ("我是账号%s（本地存储 %s）：收到" % (who or "未登录", ls)).encode()
+            self.send_response(200); self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+        if self.path.startswith("/webacct"):
+            return self._html(WEBACCT_CHAT if cookie_of(self, "fsess") else WEBACCT_WALL)
         if self.path.startswith("/webchat-login"):
             return self._html(WEBLOGIN)
         if self.path.startswith("/webchat"):
@@ -90,6 +149,16 @@ class H(BaseHTTPRequestHandler):
                    '<author><name>Supabase</name><email>noreply@mail.app.supabase.io</email></author></entry></feed>').encode()
             self.send_response(200); self.send_header("Content-Type", "application/atom+xml")
             self.send_header("Content-Length", str(len(xml))); self.end_headers(); self.wfile.write(xml); return
+        if self.path.startswith("/smslogin"):
+            # [build-38.7] phone + SMS code login (the code arrives by `adb emu sms send`)
+            html = ('<html><head><meta name="viewport" content="width=device-width"><meta charset="utf-8"><title>手机号登录</title></head>'
+                    '<body style="font-family:sans-serif;font-size:20px;padding:16px"><h2>手机号登录</h2>'
+                    '<p>手机号</p><input id="phone" type="tel" placeholder="请输入手机号" style="width:90%;height:48px;font-size:20px">'
+                    '<p>短信验证码</p><input id="code" name="smscode" placeholder="请输入短信验证码" inputmode="numeric" autocomplete="one-time-code" style="width:60%;height:48px;font-size:22px">'
+                    '<button style="height:48px">获取验证码</button><br><br><button style="width:90%;height:52px">登录</button>'
+                    '<p>请登录后使用</p></body></html>').encode()
+            self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html))); self.end_headers(); self.wfile.write(html); return
         if self.path.startswith("/otp"):
             html = (b'<html><body><h3>Enter the code we e-mailed you</h3>'
                     b'<input id="code" name="otp" autocomplete="one-time-code" inputmode="numeric" style="width:200px;height:40px">'
@@ -137,6 +206,12 @@ class H(BaseHTTPRequestHandler):
             STATS["rl_posts"] = STATS.get("rl_posts", 0) + 1
             if STATS["rl_posts"] % 3 != 0:
                 return self._json({"error": {"message": "Rate limit reached, please retry"}}, 429)
+        if "整理成用户以后能查的知识" in last_user_text(msgs):
+            STATS["kb_posts"] = STATS.get("kb_posts", 0) + 1
+            text = json.dumps(KB_JSON, ensure_ascii=False)
+        if "MULTIPART" in last_user_text(msgs):
+            STATS["multipart"] = STATS.get("multipart", 0) + 1
+            text = MULTIPART
         if "结构化总结" in last_user_text(msgs):
             text = "## 结论\n测试结论。\n## 共识\n都能回复。\n## 分歧\n无。\n## 各成员要点\n成员A：在线\n## 下一步\n继续。"
         if "GARBAGETEST" in last_user_text(msgs) and body.get("stream"):
@@ -203,7 +278,7 @@ class H(BaseHTTPRequestHandler):
             text = json.dumps(arr, ensure_ascii=False)
         if body.get("stream"):
             self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
-            for ch in [text[:3], text[3:]]:
+            for ch in [text[i:i + 24] for i in range(0, len(text), 24)] or [""]:
                 d = {"id": "x", "object": "chat.completion.chunk", "created": int(time.time()), "model": "smoke-model",
                      "choices": [{"index": 0, "delta": {"role": "assistant", "content": ch}, "finish_reason": None}]}
                 self.wfile.write(b"data: " + json.dumps(d).encode() + b"\n\n"); self.wfile.flush()

@@ -43,6 +43,10 @@ try:
     B386 = "b386" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
 except Exception:
     B386 = False
+try:
+    B387 = "b387" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
+except Exception:
+    B387 = False
 FONT_SCALE = "1.18"
 step_no = 0
 crashed = []
@@ -1814,9 +1818,16 @@ def b385():
     if "还差智能体 Bot ID" in t: selftest_fail.append("b385 partners: old 还差智能体 Bot ID")
     sh(f"input swipe {SCREEN[0]//2} {int(SCREEN[1]*0.8)} {SCREEN[0]//2} {int(SCREEN[1]*0.25)} 500"); time.sleep(1.5)
     r = shot385("partners-2")
-    # J: a 一键连接 button enters the connect flow
+    # J: a 一键连接 button enters the connect flow — [build-38.7] bare-model rows live under the folded 「高级」 section,
+    # so the fold is opened first (smoke 38.6 failed here because it searched a closed fold)
+    for _ in range(5):
+        r = dump()
+        if r is not None and find(r, "高级：直接用模型"):
+            tap_text("高级：直接用模型", wait=3); res["advanced_opened"] = True; break
+        sh(f"input swipe {SCREEN[0]//2} {int(SCREEN[1]*0.8)} {SCREEN[0]//2} {int(SCREEN[1]*0.35)} 500"); time.sleep(1.5)
+    if res.get("advanced_opened"): shot385("partners-advanced")
     hit = None
-    for _ in range(4):
+    for _ in range(6):
         r = dump()
         hit = find(r, "一键连接", exact=True)
         if hit: break
@@ -1854,6 +1865,14 @@ def b385():
             b386_extra(res)
         except Exception as e:
             print("b386 error:", e, flush=True); selftest_fail.append(f"b386 error {e}")
+    if B387:
+        for fn in (b387_greeting, b387_orbit, b387_daynight, b387_fog, b387_sms, b387_linkall, b387_perms, b387_knowledge, b387_multiacct, b387_leftovers, b387_realweb):
+            try:
+                fn(res)
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                print(f"{fn.__name__} error:", e, flush=True); selftest_fail.append(f"{fn.__name__} error {e}")
+        print("B387 RESULT " + json.dumps(res.get("b387", {}), ensure_ascii=False), flush=True)
     print(f"B385 {res}", flush=True)
 
 
@@ -1871,8 +1890,9 @@ def home_avatar_386(res):
     if not (av and menu and gear):
         page_missing.append(f"b386 home: avatar/☰/⚙ bounds missing {res['avatar']}"); return
     icon_cy = (menu[1] + menu[3]) / 2
-    if not (av[1] <= icon_cy <= (av[1] + av[3]) / 2 + 4):
-        selftest_fail.append(f"b386 home: avatar not level with ☰/⚙ (avatar {av}, icon centre y {icon_cy})")
+    # [build-38.7] design387: ☰ / ⚙ sit on the face's middle line (38.6: upper half)
+    if abs(icon_cy - (av[1] + av[3]) / 2) > 24:
+        selftest_fail.append(f"b386 home: ☰/⚙ not on the face's middle line (avatar {av}, icon centre y {icon_cy})")
     if av[0] < menu[2] or av[2] > gear[0]:
         selftest_fail.append(f"b386 home: avatar overlaps ☰/⚙ horizontally {res['avatar']}")
 
@@ -1992,6 +2012,397 @@ def b386_extra(res):
             if not x.get("own") or not x.get("public"): selftest_fail.append(f"b386 sourcecheck blank result {x}")
 
 
+# ======================= [build-38.7] 知识库 / 多账号隔离 / 38.6 遗留 / 真实网页 AI =======================
+
+def shot387(name):
+    r = snap("b387-" + name)
+    subprocess.run(f"cp {OUT}/{step_no:02d}-b387-{name}.png {OUT}/b387-{name}.png", shell=True)
+    return r
+
+
+def R7(res):
+    return res.setdefault("b387", {})
+
+
+def all_desc(root, prefix):
+    out = []
+    if root is None: return out
+    for n in root.iter("node"):
+        d = n.get("content-desc") or ""
+        if d.startswith(prefix):
+            b = re.findall(r"\d+", n.get("bounds") or "")
+            if len(b) == 4:
+                x1, y1, x2, y2 = map(int, b); out.append(((x1 + x2) // 2, (y1 + y2) // 2, d))
+    return out
+
+
+def b387_knowledge(res):
+    """知识库: three conversations (chat / 群聊 / 单聊 with 豆包) → organised with local rules (no key) → 脑图 nodes →
+    point detail with its source → 「回到对话」 opens that chat; a new message + leaving the window updates it;
+    with a (fake) model key the summary comes from the model."""
+    r7 = R7(res)
+    B = "http://10.0.2.2:8088"
+    result_json("group", "kbep ")                    # no model endpoint: local rules
+    result_json("group", f"base web:doubao|{B}/webchat")
+    seed = result_json("group", "kbseed ") or {}
+    print("B387 kbseed", seed, flush=True)
+    result_json("group", "kbrun", timeout=120)
+    st = result_json("group", "kbstate", timeout=30) or []
+    print("B387 kbstate", json.dumps(st, ensure_ascii=False)[:2500], flush=True)
+    r7["kb_rules"] = st
+    kinds = {e.get("kind") for e in st if isinstance(e, dict)}
+    for k in ("chat", "group", "direct"):
+        if k not in kinds: selftest_fail.append(f"b387 kb: no {k} conversation organised {kinds}")
+    for e in st if isinstance(st, list) else []:
+        if e.get("id") == "kbseed-chat" or e.get("source") == "交易复盘群":
+            if not e.get("summary") or not e.get("decisions"): selftest_fail.append(f"b387 kb: rules digest empty {e}")
+    if not any(isinstance(e, dict) and e.get("kind") == "direct" and "豆包" in e.get("source", "") for e in st):
+        selftest_fail.append("b387 kb: 单聊 source label missing")
+    # 脑图 = knowledge home
+    route("plus_knowledge", 6)
+    r = shot387("kb-map")
+    t = " ".join(texts(r)) if r is not None else ""
+    if "立即整理" not in t: page_missing.append("b387 kb: 立即整理 button missing")
+    topics = [d for d in all_desc(r, "脑图节点：") if " · " in d[2]]
+    r7["kb_topics"] = [d[2] for d in topics]
+    if not topics: selftest_fail.append("b387 kb: no topic nodes on the map")
+    tp = next((d for d in topics if "交易" in d[2]), topics[0] if topics else None)
+    if tp:
+        sh(f"input tap {tp[0]} {tp[1]}"); time.sleep(2.5)
+        r = shot387("kb-branch")
+        leaves = [d for d in all_desc(r, "脑图节点：") if " · " not in d[2] and d[2] != "脑图节点：我"]
+        r7["kb_leaves"] = [d[2] for d in leaves]
+        on = [d for d in leaves if 0 < d[0] < SCREEN[0] and 300 < d[1] < SCREEN[1] - 150]
+        if not leaves: selftest_fail.append("b387 kb: branch shows no 要点 leaves")
+        elif on:
+            lf = next((d for d in on if "✓" in d[2]), on[0])
+            sh(f"input tap {lf[0]} {lf[1]}"); time.sleep(2.5)
+            r = shot387("kb-point")
+            t = " ".join(texts(r)) if r is not None else ""
+            r7["kb_point"] = t[:400]
+            if "来自" not in t: selftest_fail.append(f"b387 kb: point detail has no source line {t[:200]}")
+            if tap_text("回到对话", exact=True, wait=5):
+                r = shot387("kb-back-to-chat")
+                t = " ".join(texts(r)) if r is not None else ""
+                r7["kb_back"] = t[:300]
+                if not any(k in t for k in ("仓位", "BTC", "交易复盘群", "止损")):
+                    selftest_fail.append(f"b387 kb: 回到对话 did not open the source chat {t[:200]}")
+                back()
+            else: selftest_fail.append("b387 kb: 回到对话 button missing")
+        else: page_missing.append(f"b387 kb: leaves off screen {leaves[:3]}")
+    back()
+    # leaving a window updates it (no idle wait)
+    gid = seed.get("group") if isinstance(seed, dict) else None
+    if gid:
+        before = next((e.get("chatAt") for e in st if isinstance(e, dict) and e.get("id") == "g:" + gid), 0) or 0
+        result_json("group", f"kbadd {gid}|再补充：止盈设 6%|host|好的，结论：止盈 6%。")
+        route(f"plus_group_chat/{gid}", 4); back(); time.sleep(9)
+        st2 = result_json("group", "kbstate", timeout=30) or []
+        after = next((e for e in st2 if isinstance(e, dict) and e.get("id") == "g:" + gid), {})
+        r7["kb_leave_update"] = {"before": before, "after": after.get("chatAt"), "decisions": after.get("decisions")}
+        if not after or (after.get("chatAt") or 0) <= before: selftest_fail.append(f"b387 kb: leaving the group did not re-organise it {r7['kb_leave_update']}")
+    # with a model key (fake model) → model summary, via the 立即整理 button
+    result_json("group", f"kbep {B}/v1|sk-smoke|smoke-model")
+    result_json("group", "kbseed v2")
+    route("plus_knowledge", 5)
+    if tap_text("立即整理", exact=True, wait=8):
+        time.sleep(4); shot387("kb-organised")
+    else: page_missing.append("b387 kb: could not tap 立即整理")
+    st3 = result_json("group", "kbstate", timeout=30) or []
+    r7["kb_model"] = [e.get("model") for e in st3 if isinstance(e, dict)]
+    if not any(isinstance(e, dict) and e.get("model") for e in st3): selftest_fail.append("b387 kb: model endpoint not used for organising")
+    print("B387 fake stats kb_posts", fake_stats().get("kb_posts"), flush=True)
+    back()
+    route("plus_knowledge", 4)
+    if tap_text("列表", exact=True, wait=3): shot387("kb-list"); tap_text("脑图", exact=True, wait=2)
+    back()
+    result_json("group", "kbep ")
+
+
+def b387_multiacct_round(res, mode_tag):
+    r7 = R7(res)
+    B = "http://10.0.2.2:8088"
+    result_json("group", "webacctreset web:doubao")
+    result_json("group", f"base web:doubao|{B}/webacct/")
+    a2 = result_json("group", "webacctadd web:doubao")
+    la = result_json("group", f"webacctlogin web:doubao|{B}/webacct/login?u=A", timeout=60)
+    lb = result_json("group", f"webacctlogin {a2}|{B}/webacct/login?u=B", timeout=60)
+    ws = result_json("group", "webstates") or []
+    print(f"B387 multi[{mode_tag}] logins", la, lb, json.dumps(ws, ensure_ascii=False)[:800], flush=True)
+    names = {w.get("id"): w for w in ws if isinstance(w, dict)}
+    a, b = names.get("web:doubao", {}), names.get(a2, {})
+    if a.get("state") != "READY" or b.get("state") != "READY": selftest_fail.append(f"b387 multi[{mode_tag}]: both accounts not online {a} {b}")
+    if "账号A" not in a.get("name", "") or "账号B" not in b.get("name", ""): selftest_fail.append(f"b387 multi[{mode_tag}]: names not 豆包·账号A/B {a.get('name')} {b.get('name')}")
+    gid = result_json("group", f"make 双账号群{mode_tag}|web:doubao,{a2}|par")
+    r1 = result_json("group", f"send {gid}|你是谁", timeout=200) or []
+    by = {x.get("who"): x for x in r1 if isinstance(x, dict)}
+    ra, rb = by.get("web:doubao", {}), by.get(a2, {})
+    print(f"B387 multi[{mode_tag}] round1", json.dumps([ra, rb], ensure_ascii=False)[:800], flush=True)
+    ok1 = "账号A" in ra.get("text", "") and "lsA" in ra.get("text", "") and "账号B" in rb.get("text", "") and "lsB" in rb.get("text", "")
+    if not ok1: selftest_fail.append(f"b387 multi[{mode_tag}]: replies crossed / missing A={ra} B={rb}")
+    result_json("group", "websignout web:doubao")
+    r2 = result_json("group", f"send {gid}|再说一次你是谁", timeout=200) or []
+    by2 = {x.get("who"): x for x in r2 if isinstance(x, dict)}
+    ra2, rb2 = by2.get("web:doubao", {}), by2.get(a2, {})
+    print(f"B387 multi[{mode_tag}] after signout A", json.dumps([ra2, rb2], ensure_ascii=False)[:800], flush=True)
+    if not ("账号B" in rb2.get("text", "") and "lsB" in rb2.get("text", "")): selftest_fail.append(f"b387 multi[{mode_tag}]: B broke after A signed out {rb2}")
+    if ra2.get("status") == "ok": selftest_fail.append(f"b387 multi[{mode_tag}]: A still answers after sign-out {ra2}")
+    r7[f"multi_{mode_tag}"] = {"names": [a.get("name"), b.get("name")], "round1": [ra.get("text"), rb.get("text")],
+                               "after_signout": [ra2.get("status"), ra2.get("detail"), rb2.get("text")], "ok": ok1}
+    return gid, a2
+
+
+def b387_multiacct(res):
+    r7 = R7(res)
+    info = result_json("group", "jarinfo") or {}
+    print("B387 jarinfo", info, flush=True)
+    r7["jar"] = info
+    mode = info.get("mode", "x") if isinstance(info, dict) else "x"
+    gid, a2 = b387_multiacct_round(res, mode)
+    route("plus_group_partners", 8)
+    for _ in range(4):
+        r = dump()
+        if r is not None and find(r, "豆包·账号"): break
+        sh(f"input swipe {SCREEN[0]//2} {int(SCREEN[1]*0.8)} {SCREEN[0]//2} {int(SCREEN[1]*0.35)} 500"); time.sleep(1.5)
+    r = shot387("partners-two-accounts")
+    t = " ".join(texts(r)) if r is not None else ""
+    if "豆包·账号A" not in t and "豆包·账号B" not in t: page_missing.append("b387 partners: 豆包·账号A/B rows not on screen")
+    back()
+    if gid:
+        route(f"plus_group_chat/{gid}", 5); shot387("two-accounts-group"); back()
+    if mode == "profile":
+        result_json("group", "jarmode swap")
+        b387_multiacct_round(res, "swap")
+        result_json("group", "jarmode auto")
+    result_json("group", "webacctreset web:doubao")
+
+
+def b387_leftovers(res):
+    """38.6 leftovers: summary bubble full width, ☰ round like ⚙, Manus line, 新建群聊 怎么接 → AI 伙伴, no orphan 它,
+    单聊 without 发给大家 / member strip, multi-part reply card, glass backdrop without grid."""
+    r7 = R7(res)
+    b381_home(); time.sleep(2)
+    r = dump()
+    menu = node_bounds(r, lambda n: (n.get("content-desc") or "") == "更多")
+    gear = node_bounds(r, lambda n: (n.get("content-desc") or "") in ("设置", "Settings"))
+    r7["menu_gear"] = [menu, gear]
+    shot387("home")
+    if menu and gear:
+        mw, gw = menu[2] - menu[0], gear[2] - gear[0]
+        if abs(mw - gw) > 8 or abs((menu[1] + menu[3]) - (gear[1] + gear[3])) > 16:
+            selftest_fail.append(f"b387 home: ☰ {menu} and ⚙ {gear} differ in size / level")
+    else: page_missing.append(f"b387 home: ☰/⚙ bounds {menu} {gear}")
+    g = res.get("gid386")
+    if g:
+        route(f"plus_group_chat/{g}", 5)
+        for _ in range(4):
+            r = dump()
+            if r is not None and find(r, "讨论总结"): break
+            sh(f"input swipe {SCREEN[0]//2} {int(SCREEN[1]*0.7)} {SCREEN[0]//2} {int(SCREEN[1]*0.35)} 400"); time.sleep(1)
+        r = shot387("summary-bubble")
+        r7["summary_title"] = node_bounds(r, lambda n: (n.get("text") or "") == "讨论总结")
+        if r7["summary_title"] is None: page_missing.append("b387 summary bubble not on screen")
+        back()
+    d = res.get("direct_coze") or result_json("group", "direct mines")
+    if d:
+        route(f"plus_group_chat/{d}", 5)
+        r = shot387("direct-chat")
+        t = " ".join(texts(r)) if r is not None else ""
+        r7["direct_texts"] = t[:300]
+        if "发给大家" in t: selftest_fail.append("b387 单聊 still says 发给大家")
+        if "位成员" in t or "@Mines" in t: selftest_fail.append(f"b387 单聊 still shows the member strip / count {t[:160]}")
+        back()
+    route("plus_group_partners", 8)
+    r = shot387("partners")
+    t = " ".join(texts(r)) if r is not None else ""
+    r7["partners_texts"] = t[:600]
+    if "standard" in t: selftest_fail.append("b387 partners: Manus still shows its tier/model 'standard'")
+    if "Manus" in t and "自己做完再回你" not in t: page_missing.append("b387 partners: Manus plain description not seen")
+    back()
+    route("plus_group_new", 6)
+    r = shot387("new-group")
+    tx = texts(r) if r is not None else []
+    if any(x.strip() == "它" for x in tx): selftest_fail.append("b387 新建群聊: orphan 它 line")
+    hit = find(r, "怎么接", exact=True)
+    if hit:
+        sh(f"input tap {hit[0]} {hit[1]}"); time.sleep(5)
+        r = shot387("howto-opens-partners")
+        t = " ".join(texts(r)) if r is not None else ""
+        r7["howto"] = t[:300]
+        if "AI 伙伴" not in t: selftest_fail.append(f"b387 怎么接 did not open AI 伙伴 {t[:160]}")
+        back(2)
+    else:
+        r7["howto"] = "no 怎么接 row"
+        back()
+    # multi-part reply card in a normal chat
+    b381_home()
+    r = dump()
+    row = next(((x, y) for tx_, d_, x, y, n in nodes(r) if y > SCREEN[1] * 0.35 and y < SCREEN[1] * 0.75 and len(tx_ or "") > 3
+                and not any(k in (tx_ or "") for k in ("开个新对话", "最近对话", "电量", "网络", "存储", "运行", "Claude", "在线", "家里网络升级"))), None)
+    if row:
+        sh(f"input tap {row[0]} {row[1]}"); time.sleep(5)
+        r = dump(); e = edits(r)
+        if e:
+            sh(f"input tap {e[-1][0]} {e[-1][1]}"); time.sleep(0.6); type_text("MULTIPART")
+            sh("input keyevent KEYCODE_BACK"); time.sleep(0.6)
+            tap_any(["发送", "Send"], wait=12) or sh("input keyevent KEYCODE_ENTER")
+            time.sleep(10)
+            r = shot387("multipart-reply")
+            t = " ".join(texts(r)) if r is not None else ""
+            r7["multipart"] = t[-500:]
+            if not any(k in t for k in ("第一部分", "第二部分", "第三部分", "最后一段")):
+                selftest_fail.append(f"b387 multi-part reply not rendered {t[-200:]}")
+            sh(f"input swipe {SCREEN[0]//2} {int(SCREEN[1]*0.75)} {SCREEN[0]//2} {int(SCREEN[1]*0.4)} 400"); time.sleep(1.5)
+            shot387("multipart-reply-2")
+        else: page_missing.append("b387 multipart: no chat input")
+        back()
+    else: page_missing.append("b387 multipart: no chat row on home")
+    # glass sheet backdrop: no grid
+    b381_home()
+    if not tap_text("消息", exact=True, wait=5): tap_text("消息，", wait=5)
+    time.sleep(3)
+    r = dump()
+    card = next(((x, y) for tx_, d_, x, y, n in nodes(r) if y > SCREEN[1] * 0.3 and y < SCREEN[1] * 0.8 and len(tx_ or "") >= 8), None)
+    if card:
+        sh(f"input swipe {card[0]} {card[1]} {card[0]} {card[1]} 900"); time.sleep(3)
+        shot387("glass-sheet")
+        gs = glass_grid_score(f"{OUT}/b387-glass-sheet.png")
+        r7["glass_grid"] = gs
+        print("B387 glass grid score", gs, flush=True)
+        if gs is not None and gs > 2.0: selftest_fail.append(f"b387 glass backdrop still shows a grid (score {gs})")
+        back()
+    else: page_missing.append("b387 glass: no 消息 card to long-press")
+    back()
+
+
+def glass_grid_score(path):
+    """Mean |pixel - 3x3 mean| over the top band (blurred backdrop): smooth blur < 1, the 38.6 grid clearly higher."""
+    try:
+        from PIL import Image
+        im = Image.open(path).convert("L")
+        w, h = im.size
+        reg = im.crop((40, int(h * 0.08), w - 40, int(h * 0.30)))
+        px = reg.load(); W, H = reg.size
+        tot = 0; n = 0
+        for y in range(1, H - 1, 3):
+            for x in range(1, W - 1, 3):
+                m = sum(px[x + dx, y + dy] for dx in (-1, 0, 1) for dy in (-1, 0, 1)) / 9.0
+                tot += abs(px[x, y] - m); n += 1
+        return round(tot / max(n, 1), 3)
+    except Exception as e:
+        print("glass score error", e, flush=True)
+        return None
+
+
+REAL_SITES = ["web:doubao", "web:yuanbao", "web:kimi", "web:deepseek", "web:tongyi", "web:chatglm", "web:chatgpt", "web:gemini", "web:grok"]
+
+
+def b387_realweb(res):
+    """Real sites (emulator network, never signed in): each login page opens; not-signed-in is recognised and shown as
+    「先登录」; sites that let visitors chat answer one real question."""
+    r7 = R7(res)
+    for sid in REAL_SITES:
+        result_json("group", f"base {sid}|")
+        result_json("group", f"weblogin {sid}|0")
+    out = {}
+    for sid in REAL_SITES:
+        c = result_json("group", f"webcheck {sid}|30", timeout=90) or {}
+        print("B387 webcheck", json.dumps(c, ensure_ascii=False)[:500], flush=True)
+        out[sid] = {"check": c}
+        if not isinstance(c, dict): selftest_fail.append(f"b387 real {sid}: check failed {c}"); continue
+        if c.get("state") == "SIGNED_IN": selftest_fail.append(f"b387 real {sid}: never-signed-in page classified as SIGNED_IN {c}")
+        if c.get("partner") != "NEED_LOGIN" or "登录" not in c.get("reason", ""): selftest_fail.append(f"b387 real {sid}: partner not 「先登录」 {c}")
+    for sid in REAL_SITES:
+        c = out[sid].get("check")
+        st = c.get("state") if isinstance(c, dict) else None
+        if st == "GUEST":
+            a = result_json("group", f"webask {sid}|你好，请用一句话介绍你自己|guest", timeout=160) or {}
+            print("B387 webask", json.dumps(a, ensure_ascii=False)[:600], flush=True)
+            out[sid]["ask"] = a
+            if not (isinstance(a, dict) and a.get("ok") and len(a.get("text", "")) >= 2):
+                selftest_fail.append(f"b387 real {sid}: guest chat got no reply {a}")
+        elif st in ("LOGIN", "VERIFY"):
+            a = result_json("group", f"webask {sid}|你好", timeout=130) or {}
+            print("B387 webask-wall", json.dumps(a, ensure_ascii=False)[:400], flush=True)
+            out[sid]["ask"] = a
+            if isinstance(a, dict) and a.get("ok"): selftest_fail.append(f"b387 real {sid}: answered although the page wanted a login {a}")
+    r7["realweb"] = out
+    for sid in REAL_SITES:
+        name = sid.split(":")[1]
+        route("plus_group_weblogin/" + sid.replace(":", "%3A"), 16)
+        r = shot387("login-" + name)
+        t = " ".join(texts(r)) if r is not None else ""
+        ink = screen_ink(f"{OUT}/b387-login-{name}.png", (0, int(SCREEN[1] * 0.2), SCREEN[0], int(SCREEN[1] * 0.9)))
+        out[sid]["login_screen"] = {"title_ok": "登录" in t, "ink": ink, "texts": t[:200]}
+        if "登录" not in t: page_missing.append(f"b387 real {sid}: login screen title missing")
+        back()
+    route("plus_group_partners", 8)
+    for _ in range(3):
+        r = dump()
+        if r is not None and find(r, "App 账号"): break
+        sh(f"input swipe {SCREEN[0]//2} {int(SCREEN[1]*0.8)} {SCREEN[0]//2} {int(SCREEN[1]*0.35)} 500"); time.sleep(1.5)
+    shot387("partners-real-need-login")
+    back()
+
+
+GREET_CASES = [
+    ("late-night", {"hour": 23, "weather": "clear", "weekday": 1}, ("夜深", "很晚", "深夜"), ("睡", "休息", "到这儿")),
+    ("dawn", {"hour": 3, "weather": "clear", "weekday": 1}, ("凌晨", "夜很深", "还没睡"), ("睡", "休息", "累")),
+    ("morning", {"hour": 7, "weather": "clear", "weekday": 1}, ("早上好", "上午好", "新的一天"), ("早饭", "慢慢来", "喝杯水")),
+    ("rain", {"hour": 15, "weather": "rain", "weekday": 1}, ("下午", "午后"), ("雨", "伞")),
+    ("battery-low", {"hour": 10, "weather": "clear", "battery": 9, "weekday": 1}, ("早上好", "上午好", "新的一天"), ("电",)),
+    ("temp-drop", {"hour": 18, "weather": "drop", "weekday": 1}, ("傍晚", "黄昏"), ("降温", "冷", "加件", "着凉", "多穿")),
+    ("weekend", {"hour": 10, "weather": "clear", "weekend": True}, ("上午", "早上", "新的一天", "周末"), ("周末",)),
+    ("away", {"hour": 20, "weather": "clear", "away": 6, "weekday": 1}, ("晚上", "好久不见", "忙完"), ("好久不见", "没见", "欢迎回来")),
+]
+
+
+def b387_greeting(res):
+    """Home greeting changes with time / weather / battery / weekend / absence (injected), no sentence twice a day."""
+    r7 = R7(res)
+    real = selftest("group", "greetweather", timeout=40)
+    r7["greet_real_weather"] = real.strip()[-200:]
+    out = {}
+    for tag, inj, want_t, want_c in GREET_CASES:
+        g = result_json("group", "greet " + json.dumps(inj, ensure_ascii=False).replace(" ", ""), timeout=20) or {}
+        b381_home(); time.sleep(2.5)
+        r = shot387("greet-" + tag)
+        t = " ".join(texts(r)) if r is not None else ""
+        ok_api = isinstance(g, dict) and any(w in g.get("title", "") for w in want_t) and any(w in g.get("care", "") for w in want_c)
+        ok_ui = isinstance(g, dict) and g.get("title", "#") in t and g.get("care", "#") in t
+        out[tag] = {"greeting": g, "ui": ok_ui}
+        print("B387 greet", tag, json.dumps(g, ensure_ascii=False), "ui", ok_ui, flush=True)
+        if not ok_api: selftest_fail.append(f"b387 greeting {tag}: wrong text {g}")
+        if not ok_ui: selftest_fail.append(f"b387 greeting {tag}: home does not show it ({t[:160]})")
+        # weather line above the face (same source); the rain case must say so
+        wx = next((d[2] for d in all_desc(r, "天气：")), None)
+        out[tag]["weather_chip"] = wx
+        if inj.get("weather") == "rain" and not (wx and "雨" in wx): selftest_fail.append(f"b387 weather chip missing / wrong on rain {wx}")
+        if wx:
+            # [38.7 orbit] the sprite circles the face: never over ☰ / ⚙
+            ch = node_bounds(r, lambda n: (n.get("content-desc") or "").startswith("天气："))
+            menu = node_bounds(r, lambda n: (n.get("content-desc") or "") == "更多")
+            gear = node_bounds(r, lambda n: (n.get("content-desc") or "") in ("设置", "Settings"))
+            out[tag]["sprite_bounds"] = [ch, menu, gear]
+            if ch and menu and gear and (ch[0] < menu[2] or ch[2] > gear[0]): selftest_fail.append(f"b387 weather sprite over ☰/⚙ {ch} {menu} {gear}")
+    # no weather → the line is gone (no empty pill)
+    result_json("group", "greet " + json.dumps({"hour": 15, "weather": "none", "weekday": 1}).replace(" ", ""), timeout=20)
+    b381_home(); time.sleep(2.5)
+    r = shot387("greet-no-weather")
+    out["no_weather_chip"] = next((d[2] for d in all_desc(r, "天气：")), None)
+    if out["no_weather_chip"]: selftest_fail.append(f"b387 weather chip shown without weather {out['no_weather_chip']}")
+    # same category, same day: three different sentences
+    seen = []
+    for i in range(3):
+        g = result_json("group", "greet " + json.dumps({"hour": 22, "weather": "clear", "weekday": 1, "n": i}).replace(" ", ""), timeout=20) or {}
+        seen.append(g.get("care") if isinstance(g, dict) else None)
+    out["no_repeat"] = seen
+    if len(set(seen)) != 3: selftest_fail.append(f"b387 greeting repeats a sentence on the same day {seen}")
+    result_json("group", "greet off")
+    b381_home(); time.sleep(2); shot387("greet-real-now")
+    r7["greeting"] = out
+
+
 COZE_LOGIN = ["账号登录-火山引擎", "火山引擎", "账号登录", "手机号登录", "欢迎使用扣子", "欢迎来到扣子", "登录扣子", "登录 / 注册", "登录/注册", "验证码", "获取验证码", "手机号", "抖音登录", "Welcome to Coze", "Sign in", "登录"]
 
 
@@ -2060,6 +2471,196 @@ def coze_382():
     sh("am force-stop com.android.chrome")
     if not alive(): relaunch()
     return res
+
+
+# ======================= [build-38.7 v2] weather orbit / fog backdrop / SMS autofill / 一键关联 / 手机权限 =======================
+
+def _bounds_desc(r, prefix):
+    return node_bounds(r, lambda n: (n.get("content-desc") or "").startswith(prefix))
+
+
+def _crop_diff(a, b, box):
+    try:
+        from PIL import Image, ImageChops
+        ia = Image.open(a).convert("RGB").crop(box); ib = Image.open(b).convert("RGB").crop(box)
+        d = ImageChops.difference(ia, ib).convert("L")
+        hist = d.histogram(); n = sum(hist)
+        changed = sum(hist[12:]) / max(1, n)
+        return round(changed, 4)
+    except Exception as e:
+        return f"err {e}"
+
+
+def _grid_score(path, box):
+    """stripes / grid check: mean absolute 2nd difference along rows and columns of a smooth background crop (higher = patterned)."""
+    try:
+        from PIL import Image
+        im = Image.open(path).convert("L").crop(box)
+        w, h = im.size; px = im.load(); tot = 0; n = 0
+        for y in range(2, h - 2, 7):
+            for x in range(2, w - 2, 7):
+                tot += abs(px[x - 1, y] - 2 * px[x, y] + px[x + 1, y]) + abs(px[x, y - 1] - 2 * px[x, y] + px[x, y + 1]); n += 2
+        return round(tot / max(1, n), 3)
+    except Exception as e:
+        return f"err {e}"
+
+
+def b387_orbit(res):
+    """sun / rain / night: the sprite circles the face (two frames differ in position), a tap on the face brings the big
+    picture to the top of the head with the °-pill, then it goes back to the orbit."""
+    r7 = R7(res); out = {}
+    for tag, inj in (("sun", {"hour": 15, "weather": "clear", "weekday": 1}), ("rain", {"hour": 15, "weather": "rain", "weekday": 1}),
+                     ("night", {"hour": 23, "weather": "clear", "weekday": 1})):
+        result_json("group", "greet " + json.dumps(inj).replace(" ", ""), timeout=20)
+        b381_home(); time.sleep(3)
+        r1 = shot387(f"orbit-{tag}-1"); b1 = _bounds_desc(r1, "天气：")
+        time.sleep(1.6)
+        r2 = shot387(f"orbit-{tag}-2"); b2 = _bounds_desc(r2, "天气：")
+        av = _bounds_desc(r2, "换角色")
+        o = {"sprite1": b1, "sprite2": b2, "avatar": av}
+        if not b1 or not b2: selftest_fail.append(f"b387 orbit {tag}: sprite not found {b1} {b2}")
+        elif b1 == b2: selftest_fail.append(f"b387 orbit {tag}: sprite did not move {b1}")
+        if av:
+            adb("shell", "input", "tap", str((av[0] + av[2]) // 2), str((av[1] + av[3]) // 2)); time.sleep(1.3)
+            r3 = shot387(f"orbit-{tag}-open")
+            t3 = " ".join(texts(r3)) if r3 is not None else ""
+            big = [d for d in all_desc(r3, "天气：")]
+            o["open_desc"] = big[:3]
+            above = [d for d in big if d[1] < av[1] + (av[3] - av[1]) * 0.15]
+            o["open_above"] = bool(above)
+            if not above: selftest_fail.append(f"b387 orbit {tag}: big picture not above the head {big} {av}")
+            if "°" not in t3: selftest_fail.append(f"b387 orbit {tag}: temperature pill not shown")
+            time.sleep(5.5)
+            r4 = shot387(f"orbit-{tag}-back")
+            o["back"] = _bounds_desc(r4, "天气：")
+        else: page_missing.append(f"b387 orbit {tag}: avatar bounds missing")
+        out[tag] = o
+        print("B387 orbit", tag, json.dumps(o), flush=True)
+    for a, b in (("sun", "home"),):
+        subprocess.run(f"cp {OUT}/b387-orbit-sun-1.png {OUT}/home.png", shell=True)
+    result_json("group", "greet off")
+    r7["orbit"] = out
+
+
+def b387_fog(res):
+    """the backdrop fog moves: same page, two frames 3 s apart differ in an empty background area; no stripes / grid."""
+    r7 = R7(res)
+    route("plus_permissions_guide", 4)
+    a = f"{OUT}/b387-fog-1.png"; b = f"{OUT}/b387-fog-2.png"
+    shot387("fog-1"); time.sleep(3); shot387("fog-2")
+    W, H = (SCREEN[0], SCREEN[1]) if SCREEN and SCREEN[0] else (1080, 2362)
+    box = (0, int(H * 0.86), W, H - 10)   # under the card list (empty backdrop)
+    d = _crop_diff(a, b, box); g = _grid_score(a, (0, int(H * 0.86), W, H - 10))
+    r7["fog"] = {"changed": d, "grid": g, "box": box}
+    print("B387 fog", r7["fog"], flush=True)
+    if not isinstance(d, float) or d < 0.01: selftest_fail.append(f"b387 fog: backdrop did not move {d}")
+    if isinstance(g, float) and g > 6: selftest_fail.append(f"b387 fog: patterned backdrop (grid score {g})")
+    back()
+
+
+def b387_sms(res):
+    """phone + SMS login page (fake): `adb emu sms send` → the code is filled in by itself, 「已自动填好验证码」 shown."""
+    r7 = R7(res)
+    B = "http://10.0.2.2:8088"
+    result_json("group", f"setbase web:kimi|{B}/smslogin")
+    result_json("group", "weblogin web:kimi|0")
+    route("plus_group_weblogin/web%3Akimi", 9)
+    shot387("sms-page")
+    sh('emu sms send 10690000 "【Kimi】您的验证码是482913，5分钟内有效，请勿泄露。"') if False else subprocess.run(
+        ['adb', 'emu', 'sms', 'send', '10690000', '【Kimi】您的验证码是482913，5分钟内有效，请勿泄露。'], capture_output=True, timeout=30)
+    ok = False; t = ""
+    for _ in range(8):
+        time.sleep(2.5)
+        r = dump(); t = " ".join(texts(r)) if r is not None else ""
+        if "482913" in t or "已自动填好验证码" in t: ok = True; break
+    shot387("sms-filled")
+    r7["sms"] = {"ok": ok, "text": t[:300]}
+    print("B387 sms", r7["sms"], flush=True)
+    if not ok: selftest_fail.append(f"b387 sms: code not auto-filled {t[:200]}")
+    back(); result_json("group", "setbase web:kimi|")
+
+
+def b387_linkall(res):
+    """一键关联: start page, start → first login page opens by itself, back → next step, stop → 关联结果 groups."""
+    r7 = R7(res); o = {}
+    result_json("group", "linknote web:yuanbao|扫码")
+    result_json("group", "linkmark web:deepseek|0")
+    result_json("group", "linkmark web:gemini|1")
+    route("plus_linkall", 4)
+    r = shot387("linkall-start"); t = " ".join(texts(r)) if r is not None else ""
+    if "一键关联" not in t or "开始" not in t: page_missing.append(f"b387 linkall start page {t[:160]}")
+    if tap_text("开始", exact=True, wait=7):
+        r = shot387("linkall-login"); t = " ".join(texts(r)) if r is not None else ""
+        o["login"] = t[:200]
+        if "登录" not in t: selftest_fail.append(f"b387 linkall: login page did not open {t[:160]}")
+        back(); time.sleep(1.2)
+        r = shot387("linkall-next"); t = " ".join(texts(r)) if r is not None else ""
+        o["next"] = t[:200]
+        if "下一个" not in t: selftest_fail.append(f"b387 linkall: no next step after coming back {t[:160]}")
+        tap_text("停一下", exact=True, wait=1.5)
+        tap_text("结束，看结果", exact=True, wait=3)
+    else: page_missing.append("b387 linkall: 开始 not tappable")
+    r = dump(); t = " ".join(texts(r)) if r is not None else ""
+    if "关联结果" not in t:
+        route("plus_linkall_summary", 4); r = dump(); t = " ".join(texts(r)) if r is not None else ""
+    shot387("linkall-summary")
+    o["summary"] = t[:400]
+    for want in ("关联结果", "已关联", "需要你操作", "过期了"):
+        if want not in t: selftest_fail.append(f"b387 linkall summary: missing {want}")
+    o["states"] = result_json("group", "linkstates")
+    r7["linkall"] = o
+    print("B387 linkall", json.dumps(o, ensure_ascii=False)[:800], flush=True)
+    back(); back()
+
+
+def b387_perms(res):
+    r7 = R7(res)
+    route("plus_permissions_guide", 4)
+    r = shot387("perms"); t = " ".join(texts(r)) if r is not None else ""
+    o = {"text": t[:400]}
+    for want in ("手机权限", "短信验证码", "麦克风"):
+        if want not in t: page_missing.append(f"b387 perms: {want} missing")
+    if tap_text("读取通知", wait=2):
+        r = shot387("perms-step"); t2 = " ".join(texts(r)) if r is not None else ""
+        o["step"] = t2[:200]
+        if "去设置" not in t2 and "打开" not in t2: selftest_fail.append(f"b387 perms: no one-step guide {t2[:160]}")
+        tap_text("先不开", exact=True, wait=1.5)
+    r7["perms"] = o
+    back()
+
+
+def b387_daynight(res):
+    """day → night while the app is open: fake clock crosses the sunset; frames before / mid-transition / after."""
+    r7 = R7(res); o = {}
+    result_json("group", "thememode 3")
+    result_json("group", "greet " + json.dumps({"weather": "clear", "weekday": 1}).replace(" ", ""), timeout=20)
+    result_json("group", "daynight 15:00:00|18:30"); b381_home(); time.sleep(4)
+    o["sim"] = selftest("group", "daynight 18:29:58|18:30", timeout=20).strip()[-120:]
+    t0 = time.time()
+    shot387("daynight-0-day")
+    while time.time() - t0 < 3.2: time.sleep(0.1)
+    rm = shot387("daynight-1-mid")
+    time.sleep(4.5)
+    re_ = shot387("daynight-2-night")
+    W, H = (SCREEN[0], SCREEN[1]) if SCREEN and SCREEN[0] else (1080, 2362)
+    box = (0, int(H * 0.9), W, H - 10)
+    try:
+        from PIL import Image
+        def mean(pth):
+            im = Image.open(pth).convert("L").crop(box); h = im.histogram(); n = sum(h)
+            return round(sum(i * v for i, v in enumerate(h)) / max(1, n), 1)
+        o["lum"] = [mean(f"{OUT}/b387-daynight-{k}.png") for k in ("0-day", "1-mid", "2-night")]
+    except Exception as e:
+        o["lum"] = f"err {e}"
+    o["sprite_night"] = next((d[2] for d in all_desc(re_, "天气：")), None)
+    print("B387 daynight", json.dumps(o, ensure_ascii=False), flush=True)
+    L = o["lum"]
+    if isinstance(L, list):
+        if not (L[0] - L[2] > 40): selftest_fail.append(f"b387 daynight: did not turn dark {L}")
+        if not (L[2] + 5 < L[1] < L[0] - 5): page_missing.append(f"b387 daynight: mid frame not between day and night {L}")
+    r7["daynight"] = o
+    result_json("group", "daynight off"); result_json("group", "greet off"); result_json("group", "thememode 1")
+
 
 
 def main():
@@ -2247,3 +2848,4 @@ def finish(lc):
 
 if __name__ == "__main__":
     main()
+
