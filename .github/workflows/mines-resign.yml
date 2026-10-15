@@ -1,0 +1,65 @@
+name: Verify and re-sign Mines APK (v1+v2+v3)
+
+on:
+  push:
+    branches: [hark-sign]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  SRC_RUN: "38626360095"
+  MINES_CERT_SHA256: 001814fb258110b003c851aeeac930fd3d803224eb9acdcab0a383edcb740e2b
+
+jobs:
+  resign:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch run artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download "$SRC_RUN" --repo "${{ github.repository }}" -n mines-apk -D in
+          ls -la in
+          for f in in/*.apk; do sha256sum "$f"; stat -c '%s bytes' "$f"; done
+      - name: Verify original
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1); echo "BT=$BT"
+          ls "$ANDROID_HOME/build-tools"
+          f=$(ls in/*.apk | head -1)
+          echo "=== apksigner verify (original) ==="
+          "$BT/apksigner" verify --verbose --print-certs "$f" 2>&1 | tee orig-verify.txt || echo "VERIFY EXIT $?"
+          echo "=== zipalign -c (original) ==="
+          "$BT/zipalign" -c -P 16 -v 4 "$f" | tail -3 || echo "ZIPALIGN CHECK FAILED"
+          unzip -tq "$f"
+          "$BT/aapt2" dump badging "$f" | head -1
+      - name: Re-sign v1+v2+v3 with the fixed Mines key
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1); echo "BT=$BT"
+          f=$(ls in/*.apk | head -1)
+          mkdir -p out
+          "$BT/zipalign" -f -P 16 4 "$f" out/aligned.apk
+          "$BT/apksigner" sign --ks hark-build/mines-debug.keystore --ks-key-alias androiddebugkey \
+            --ks-pass pass:android --key-pass pass:android \
+            --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true \
+            --out out/mines-38.5-signed.apk out/aligned.apk
+          rm -f out/aligned.apk out/*.idsig
+          echo "=== apksigner verify (signed) ==="
+          "$BT/apksigner" verify --verbose --print-certs out/mines-38.5-signed.apk | tee new-verify.txt
+          "$BT/zipalign" -c -P 16 4 out/mines-38.5-signed.apk && echo "zipalign OK"
+          grep -q "Verified using v1 scheme (JAR signing): true" new-verify.txt
+          grep -q "Verified using v2 scheme (APK Signature Scheme v2): true" new-verify.txt
+          grep -q "Verified using v3 scheme (APK Signature Scheme v3): true" new-verify.txt
+          cert=$(sed -n 's/.*certificate SHA-256 digest: //p' new-verify.txt | head -1)
+          [ "$cert" = "$MINES_CERT_SHA256" ] || { echo "::error::wrong cert $cert"; exit 1; }
+          "$BT/aapt2" dump badging out/mines-38.5-signed.apk | head -1
+          sha256sum out/mines-38.5-signed.apk; stat -c '%s bytes' out/mines-38.5-signed.apk
+          cp orig-verify.txt new-verify.txt out/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mines-38.5-signed
+          path: out/*
+          retention-days: 14
