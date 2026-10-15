@@ -1,0 +1,183 @@
+name: Mines 38.8 compile check (hark-mines-388, no release)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [hark-mines-388]
+    paths-ignore:
+      - 'hark-build/smoke/**'
+      - '.github/workflows/vps-smoke.yml'
+      - 'hark-build/probe/**'
+      - '.github/workflows/web-probe.yml'
+      - '.github/workflows/mines-release-387.yml'
+      - 'hark-build/release/**'
+
+env:
+  UPSTREAM: https://github.com/OpenMinis/OpenMinis
+  UPSTREAM_REF: b4c0661          # the commit the patches were written and compiled against
+  NDK_R28: 28.0.12433566
+  NDK_AGP: 27.0.12077973         # the version Gradle asks for at configure time
+  MINES_PACKAGE: com.openminis.mines.plus
+  # SHA-256 of the fixed Mines signing cert (hark-build/mines-debug.keystore).
+  MINES_CERT_SHA256: 001814fb258110b003c851aeeac930fd3d803224eb9acdcab0a383edcb740e2b
+
+permissions:
+  contents: write
+
+# Queue builds instead of running them side by side; a newer push replaces a
+# queued (not a running) one.
+concurrency:
+  group: mines-388-compile
+  cancel-in-progress: false
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch OpenMinis at the pinned commit
+        run: |
+          git clone "$UPSTREAM" om
+          cd om
+          git checkout "$UPSTREAM_REF"
+          git submodule update --init deps/proot
+
+      - name: Apply patches
+        run: |
+          cd om
+          for p in ../hark-build/patches/minis-app-*.patch; do echo "applying $p"; git apply --whitespace=nowarn "$p"; done
+          (cd deps/proot && git apply --whitespace=nowarn ../../../hark-build/patches/proot-real-ifaces.patch)
+          git -C . status --short
+
+      - name: Overlay window audit (no leftover / touch-eating floating windows)
+        # [Mines-pet-26] Every floating window must go through plus/Overlays.kt, which forces
+        # NOT_TOUCHABLE on windows that show nothing and tracks them for cleanup.
+        run: |
+          cd om/src/android/app/src/main/java/com/openminis/app
+          if grep -rnE '(manager|wm|windowManager)\??\.addView\(' --include=*.kt plus ui | grep -v 'plus/Overlays.kt'; then
+            echo "::error::floating window added without Overlays.add"; exit 1; fi
+          grep -q 'Overlays.removeAll("dsh-widget")' plus/DshWidgets.kt || { echo "::error::widget overlay cleanup missing"; exit 1; }
+          grep -q 'Overlays.removeAll(it)' plus/DeskPetService.kt || { echo "::error::pet overlay cleanup missing"; exit 1; }
+          echo "overlay audit ok"
+          # [Mines-brand-26] settings rows: single-colour line icons, no coloured badge
+          if grep -n 'color = iconColor' ui/settings/SettingsScreen.kt; then echo "::error::coloured icon badge is back in settings"; exit 1; fi
+          grep -q 'object MinesIcons' ui/brand/MinesIcons.kt || { echo "::error::icon set missing"; exit 1; }
+
+      - name: Readability audit (home cards + list timestamps)
+        # [Mines-a11y-26] The user is partially sighted. Home status chips must colour their
+        # text with the contrast helpers, and list timestamps must not use colorScheme.outline.
+        run: |
+          cd om/src/android/app/src/main/java/com/openminis/app
+          grep -q 'cardTextColor(fill)' ui/plus/TodayCard.kt || { echo "::error::home chips lost cardTextColor"; exit 1; }
+          if grep -nE 'Text\(value, [^)]*\)' ui/plus/TodayCard.kt | grep -v 'color = '; then echo "::error::chip value text without explicit colour"; exit 1; fi
+          if grep -nB3 'color = MaterialTheme.colorScheme.outline,' ui/sessions/SessionListScreen.kt | grep -E 'timeText|dateText'; then
+            echo "::error::conversation list timestamp uses the low-contrast outline colour"; exit 1; fi
+          [ "$(grep -c 'readableSecondary()' ui/sessions/SessionListScreen.kt)" -ge 2 ] || { echo "::error::timestamps not using readableSecondary()"; exit 1; }
+          echo "readability audit ok"
+
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "21" }
+
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.25.x", cache: false }
+
+      - name: Android NDKs
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$NDK_R28" "ndk;$NDK_AGP" "platforms;android-36" "build-tools;36.0.0" >/dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_R28" >> "$GITHUB_ENV"
+
+      - name: gomobile
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+          "$HOME/go/bin/gomobile" init
+
+      - name: Native deps (proot, rootfs, rclone)
+        run: |
+          cd om
+          ./deps/build_proot.sh
+          ./scripts/prepare_android_sandbox.sh
+          ./deps/build_rclone_android.sh
+          mkdir -p src/android/app/libs
+          cp deps/build/rclone/rclone.aar src/android/app/libs/
+          # [Mines-voiceprint-34] sherpa-onnx (speaker verification, CAM++), pinned by SHA-256
+          curl -fsSL --retry 3 -o src/android/app/libs/sherpa-onnx.aar https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/sherpa-onnx-static-link-onnxruntime-1.13.8.aar
+          echo "b22c3fc1b6a45666d28892bb2f7694beeb77a8362d7ebd77c1a5431ec9435471  src/android/app/libs/sherpa-onnx.aar" | sha256sum -c -
+          # [Mines-voiceprint-35.3] CAM++ voiceprint model bundled in the APK (no first-use download), pinned by SHA-256
+          mkdir -p src/android/app/src/main/assets/models
+          curl -fsSL --retry 3 -o src/android/app/src/main/assets/models/campplus.onnx https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx \
+            || curl -fsSL --retry 3 -o src/android/app/src/main/assets/models/campplus.onnx https://hf-mirror.com/csukuangfj/speaker-embedding-models/resolve/main/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx
+          echo "f682b514c05d947ee3fa91cd6ec6c5c7543479a128373fa29b1faedccd21fd11  src/android/app/src/main/assets/models/campplus.onnx" | sha256sum -c -
+
+      - name: Release number
+        run: |
+          # hark-build/RELEASE holds the public build number (build-<n>), so
+          # failed CI runs no longer burn release numbers. Falls back to the
+          # run number when the file is missing.
+          # 「38.1」 = point release: integer part is the build number (update checks), the full text is the label
+          n=$(cut -d. -f1 < hark-build/RELEASE 2>/dev/null | tr -dc '0-9' || true)
+          label=$(tr -dc '0-9.' < hark-build/RELEASE 2>/dev/null || true)
+          echo "MINES_BUILD_NUMBER=${n:-${{ github.run_number }}}" >> "$GITHUB_ENV"
+          echo "MINES_BUILD_LABEL=388ci-${{ github.run_number }}" >> "$GITHUB_ENV"
+
+      - name: Assemble APK
+        timeout-minutes: 40
+        run: |
+          # Fixed signing key so each new build installs over the last one.
+          # build.gradle.kts reads MINES_KEYSTORE explicitly; the copy into
+          # ~/.android alone was not picked up on the runner (build-12 came
+          # out signed with a random key).
+          export MINES_KEYSTORE="$GITHUB_WORKSPACE/hark-build/mines-debug.keystore"
+          mkdir -p ~/.android && cp hark-build/mines-debug.keystore ~/.android/debug.keystore
+          cd om/src/android
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleRelease
+          mkdir -p ../../../out
+          find app/build/outputs/apk -name '*.apk' -exec cp {} ../../../out/ \;
+          ls -la ../../../out
+
+      - name: Sign v1 + v2 + v3 with the fixed Mines key
+        # [build-38.6] minSdk 26 makes AGP drop the v1 (JAR) scheme; re-sign the aligned APK with apksigner so it carries
+        # v1 + v2 + v3, same key and certificate.
+        run: |
+          BT="$ANDROID_HOME/build-tools/36.0.0"
+          for f in out/*.apk; do
+            "$BT/apksigner" sign --ks hark-build/mines-debug.keystore --ks-pass pass:android --key-pass pass:android --ks-key-alias androiddebugkey \
+              --min-sdk-version 21 --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true "$f"
+          done
+
+      - name: Verify package and signing certificate
+        run: |
+          BT="$ANDROID_HOME/build-tools/36.0.0"
+          for f in out/*.apk; do
+            pkg=$("$BT/aapt2" dump badging "$f" | sed -n "s/^package: name='\([^']*\)'.*/\1/p")
+            cert=$("$BT/apksigner" verify --print-certs "$f" | sed -n 's/.*certificate SHA-256 digest: //p' | head -1)
+            echo "$f package=$pkg cert=$cert"
+            [ "$pkg" = "$MINES_PACKAGE" ] || { echo "::error::wrong package $pkg"; exit 1; }
+            [ "$cert" = "$MINES_CERT_SHA256" ] || { echo "::error::APK not signed with the fixed Mines key ($cert)"; exit 1; }
+            # [build-38.6] every scheme: v1 (JAR) + v2 + v3, so any installer / checker accepts it
+            "$BT/apksigner" verify -v --min-sdk-version 21 "$f" | tee /tmp/sigv.txt
+            for v in 1 2 3; do grep -q "Verified using v$v scheme (.*): true" /tmp/sigv.txt || { echo "::error::APK lacks the v$v signature"; exit 1; }; done
+          done
+          mv out/app-release.apk out/mines-${MINES_BUILD_LABEL}.apk 2>/dev/null || true
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          # Mines — continued development of OpenMinis (https://github.com/OpenMinis/OpenMinis)
+          name: mines-388-apk
+          path: out/*.apk
+          retention-days: 14
+
+      - name: Preset unit tests (38.8, informational)
+        continue-on-error: true
+        timeout-minutes: 25
+        run: |
+          cd om/src/android
+          ./gradlew --no-daemon :app:testReleaseUnitTest --tests 'com.openminis.app.plus.group.PresetRegistryTest' 2>&1 | tail -60
+          exit ${PIPESTATUS[0]}
