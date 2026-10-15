@@ -1,5 +1,5 @@
 diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
-index 3b26b75..dbd2d54 100644
+index 3b26b75..92bdf86 100644
 --- a/src/android/app/build.gradle.kts
 +++ b/src/android/app/build.gradle.kts
 @@ -38,8 +38,8 @@ android {
@@ -8,8 +8,8 @@ index 3b26b75..dbd2d54 100644
          targetSdk = 35
 -        versionCode = 28
 -        versionName = "1.14"
-+        versionCode = 33
-+        versionName = "1.19"
++        versionCode = 34
++        versionName = "1.20"
  
          testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
  
@@ -22,6 +22,18 @@ index 3b26b75..dbd2d54 100644
          buildConfigField("int", "MINES_BUILD", (System.getenv("MINES_BUILD_NUMBER")?.toIntOrNull() ?: System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 0).toString())
  
          // System prompt prefix required by Anthropic for Claude Code OAuth
+@@ -91,6 +93,11 @@ android {
+                 keyAlias = "androiddebugkey"
+                 keyPassword = "android"
+             }
++            // [Mines-38.6] minSdk 26 makes AGP drop the v1 (JAR) scheme by default; sign v1 + v2 + v3 so
++            // every installer / checker sees a signature it knows.
++            enableV1Signing = true
++            enableV2Signing = true
++            enableV3Signing = true
+         }
+     }
+ 
 diff --git a/src/android/app/src/main/AndroidManifest.xml b/src/android/app/src/main/AndroidManifest.xml
 index 9d16beb..179fd7d 100644
 --- a/src/android/app/src/main/AndroidManifest.xml
@@ -922,7 +934,7 @@ index 5c7f934..6e513f5 100644
              wv.webViewClient = object : WebViewClient() {
                  override fun onPageFinished(view: WebView, u: String) {
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
-index 0b722dc..b13e994 100644
+index 0b722dc..787c5f7 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
 @@ -13,6 +13,7 @@ import com.openminis.app.sandbox.NativeOffloadServer
@@ -1087,12 +1099,26 @@ index 0b722dc..b13e994 100644
              "openkind" -> {
                  // open 应用 → that service's page (smoke; the mines_route deep link does not navigate on the emulator)
                  val l = java.util.concurrent.CountDownLatch(1)
+@@ -485,6 +603,13 @@ class SelfTestProvider : ContentProvider() {
+                 out.putString("result", res.get() ?: "{\"ok\":false,\"error\":\"timeout\"}")
+             }
+             "group" -> out.putString("result", com.openminis.app.plus.group.GroupSelfTest.handle(context!!, arg ?: "")) // [Mines-group-37]
++            // [Mines-38.6] F: one real read of 微博 / B站 / 知乎 (own session + a public endpoint each)
++            "sourcecheck" -> out.putString("result", kotlinx.coroutines.runBlocking {
++                org.json.JSONArray(SourceAccounts.check(context!!.applicationContext).map { (own, pub) ->
++                    org.json.JSONObject().put("kind", own.kind).put("own", own.text).put("own_http", own.http).put("own_ok", own.ok).put("own_detail", own.detail.take(100))
++                        .put("public", pub.text).put("public_http", pub.http).put("public_count", pub.count).put("public_detail", pub.detail.take(100))
++                }).toString()
++            })
+             else -> out.putString("result", "unknown method")
+         }
+         return out
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SourceAccounts.kt b/src/android/app/src/main/java/com/openminis/app/plus/SourceAccounts.kt
 new file mode 100644
-index 0000000..eefd804
+index 0000000..71c01ed
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/SourceAccounts.kt
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,211 @@
 +package com.openminis.app.plus
 +
 +import android.content.Context
@@ -1146,8 +1172,10 @@ index 0000000..eefd804
 +                        val signed = kind?.let { runCatching { LoginWeb.signedIn(it) }.getOrDefault(false) } == true || PlusVault.secret(id) != null
 +                        val prob = problems[id]
 +                        val acct = e?.account?.takeIf { it.isNotBlank() }?.let { AccountLabel.maskText(it) } ?: "账号 ${i + 1}"
-+                        out += Row(p, id, p.name, acct, when { prob != null -> "要处理：${prob.reason.take(30)}"; signed -> "正常"; else -> "登录过期，点一下重新登录" },
-+                            if (prob != null || !signed) false else true)
++                        // [Mines-38.6] 微博 / B站 / 知乎: the last real read says what happened (never a silent blank)
++                        val rr = lastResult[p.kind]
++                        out += Row(p, id, p.name, acct, when { prob != null -> "要处理：${prob.reason.take(30)}"; signed && rr != null -> rr.text; signed -> "正常"; else -> "登录过期，点一下重新登录" },
++                            if (prob != null || !signed || (rr != null && !rr.ok)) false else true)
 +                    }
 +                    if (ids.isEmpty() && (p.kind == "x" && AutoSources.xSignedIn() || p.kind == "github" && (AutoSources.githubSession() || AutoSources.githubToken() != null)))
 +                        out += Row(p, null, p.name, "已登录", "正常", true)
@@ -1178,66 +1206,128 @@ index 0000000..eefd804
 +
 +    private suspend fun cookie(url: String): String = withContext(Dispatchers.Main) { runCatching { CookieManager.getInstance().getCookie(url) }.getOrNull().orEmpty() }
 +
-+    private fun getJson(url: String, cookie: String, referer: String): JSONObject? = runCatching {
-+        http.newCall(Request.Builder().url(url).header("Cookie", cookie).header("Referer", referer)
-+            .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36").build())
-+            .execute().use { r -> if (!r.isSuccessful) null else JSONObject(r.body?.string().orEmpty()) }
-+    }.getOrNull()
++    /** [Mines-38.6] one HTTP read: (status, body); status 0 = no connection. */
++    private fun fetch(url: String, cookie: String, referer: String): Pair<Int, String> = runCatching {
++        val b = Request.Builder().url(url).header("Referer", referer)
++            .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36")
++            .header("Accept", "application/json, text/plain, */*")
++        if (cookie.isNotBlank()) b.header("Cookie", cookie)
++        http.newCall(b.build()).execute().use { r -> r.code to (r.body?.string().orEmpty().take(400_000)) }
++    }.getOrElse { 0 to (it.message ?: "") }
++
++    private fun json(body: String): JSONObject? = runCatching { JSONObject(body) }.getOrNull()
++
++    /**
++     * [Mines-38.6] What the last read of 微博 / B站 / 知乎 gave, in one plain line (shown in 消息来源 instead of a silent
++     * empty list): 「读到 N 条」, 「需要登录」, 「被风控拦了，稍后再试」 or 「连不上（网络）」.
++     */
++    data class ReadResult(val kind: String, val ok: Boolean, val count: Int, val text: String, val http: Int, val detail: String = "")
++    val lastResult = java.util.concurrent.ConcurrentHashMap<String, ReadResult>()
++
++    private fun verdict(kind: String, name: String, code: Int, body: String, count: Int, loginCodes: Boolean): ReadResult {
++        val o = json(body)
++        val low = body.take(2000).lowercase()
++        return when {
++            code == 0 -> ReadResult(kind, false, 0, "连不上$name（网络问题）", 0, body.take(80))
++            count > 0 -> ReadResult(kind, true, count, "读到 $count 条", code)
++            loginCodes || code == 401 || low.contains("passport") || low.contains("login") || low.startsWith("<") ->
++                ReadResult(kind, false, 0, "需要登录$name：点一下登录", code, (o?.optString("message") ?: o?.optString("msg") ?: body.take(80)).take(120))
++            code == 403 || code == 412 || code == 429 || low.contains("risk") || low.contains("风控") || low.contains("-352") || low.contains("-412") ->
++                ReadResult(kind, false, 0, "$name 暂时拦了自动读取，稍后再试", code, body.take(120))
++            else -> ReadResult(kind, true, 0, "$name 暂时没有新内容", code, body.take(120))
++        }
++    }
++
++    private fun readBili(c: String, out: MutableList<Digest.Item>?): ReadResult {
++        val (code, body) = fetch("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all?type=all", c, "https://t.bilibili.com/")
++        val o = json(body)
++        var n = 0
++        o?.optJSONObject("data")?.optJSONArray("items")?.let { a ->
++            for (i in 0 until minOf(a.length(), 15)) {
++                val it = a.optJSONObject(i) ?: continue
++                val mod = it.optJSONObject("modules") ?: continue
++                val author = mod.optJSONObject("module_author")
++                val dyn = mod.optJSONObject("module_dynamic")
++                val arc = dyn?.optJSONObject("major")?.optJSONObject("archive")
++                val title = arc?.optString("title")?.takeIf { s -> s.isNotBlank() } ?: dyn?.optJSONObject("desc")?.optString("text")?.take(80) ?: continue
++                val name = author?.optString("name").orEmpty()
++                val ts = (author?.optLong("pub_ts") ?: 0L) * 1000
++                n++
++                out?.add(Digest.Item("bili:" + it.optString("id_str"), "B站", "bilibili:$name", name, title,
++                    arc?.optString("desc")?.take(120).orEmpty(), if (ts > 0) ts else System.currentTimeMillis(),
++                    url = arc?.optString("jump_url")?.let { u -> if (u.startsWith("//")) "https:$u" else u }))
++            }
++        }
++        return verdict("bilibili", "B站", code, body, n, o?.optInt("code") == -101)
++    }
++
++    private fun readWeibo(c: String, out: MutableList<Digest.Item>?): ReadResult {
++        val (code, body) = fetch("https://m.weibo.cn/feed/friends?", c, "https://m.weibo.cn/")
++        val o = json(body)
++        var n = 0
++        o?.optJSONObject("data")?.optJSONArray("statuses")?.let { a ->
++            for (i in 0 until minOf(a.length(), 15)) {
++                val st = a.optJSONObject(i) ?: continue
++                val name = st.optJSONObject("user")?.optString("screen_name").orEmpty()
++                val text = st.optString("text").replace(Regex("<[^>]+>"), "").trim().take(140)
++                if (text.isBlank()) continue
++                n++
++                out?.add(Digest.Item("wb:" + st.optString("id"), "微博", "weibo:$name", name, text.take(60), text, System.currentTimeMillis(),
++                    url = "https://m.weibo.cn/status/" + st.optString("id")))
++            }
++        }
++        return verdict("weibo", "微博", code, body, n, o != null && o.optInt("ok", 1) != 1 && (o.optString("url").contains("passport") || o.optInt("ok") == -100))
++    }
++
++    private fun readZhihu(c: String, out: MutableList<Digest.Item>?): ReadResult {
++        val (code, body) = fetch("https://www.zhihu.com/api/v3/feed/topstory/recommend?desktop=true&limit=10", c, "https://www.zhihu.com/")
++        val o = json(body)
++        var n = 0
++        o?.optJSONArray("data")?.let { a ->
++            for (i in 0 until minOf(a.length(), 10)) {
++                val t = a.optJSONObject(i)?.optJSONObject("target") ?: continue
++                val q = t.optJSONObject("question")?.optString("title") ?: t.optString("title")
++                if (q.isNullOrBlank()) continue
++                val name = t.optJSONObject("author")?.optString("name").orEmpty()
++                n++
++                out?.add(Digest.Item("zh:" + t.optString("id"), "知乎", "zhihu:$name", name, q, t.optString("excerpt").take(120),
++                    (t.optLong("updated_time").takeIf { it > 0 } ?: (System.currentTimeMillis() / 1000)) * 1000,
++                    url = t.optString("url").takeIf { it.startsWith("http") }?.replace("api.zhihu.com/answers", "www.zhihu.com/answer")))
++            }
++        }
++        return verdict("site:www.zhihu.com", "知乎", code, body, n, code == 401 || o?.optJSONObject("error")?.optInt("code") == 100)
++    }
 +
 +    suspend fun items(context: Context): List<Digest.Item> = withContext(Dispatchers.IO) {
 +        if (System.currentTimeMillis() - lastRead < 10 * 60_000L) return@withContext cache
 +        lastRead = System.currentTimeMillis()
 +        val out = ArrayList<Digest.Item>()
-+        runCatching {
-+            val c = cookie("https://api.bilibili.com")
-+            if (c.contains("SESSDATA")) getJson("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all?type=all", c, "https://t.bilibili.com/")
-+                ?.optJSONObject("data")?.optJSONArray("items")?.let { a ->
-+                    for (i in 0 until minOf(a.length(), 15)) {
-+                        val it = a.optJSONObject(i) ?: continue
-+                        val mod = it.optJSONObject("modules") ?: continue
-+                        val author = mod.optJSONObject("module_author")
-+                        val dyn = mod.optJSONObject("module_dynamic")
-+                        val arc = dyn?.optJSONObject("major")?.optJSONObject("archive")
-+                        val title = arc?.optString("title")?.takeIf { s -> s.isNotBlank() } ?: dyn?.optJSONObject("desc")?.optString("text")?.take(80) ?: continue
-+                        val name = author?.optString("name").orEmpty()
-+                        val ts = (author?.optLong("pub_ts") ?: 0L) * 1000
-+                        out += Digest.Item("bili:" + it.optString("id_str"), "B站", "bilibili:$name", name, title,
-+                            arc?.optString("desc")?.take(120).orEmpty(), if (ts > 0) ts else System.currentTimeMillis(),
-+                            url = arc?.optString("jump_url")?.let { u -> if (u.startsWith("//")) "https:$u" else u })
-+                    }
-+                }
-+        }
-+        runCatching {
-+            val c = cookie("https://m.weibo.cn")
-+            if (c.contains("SUB=")) getJson("https://m.weibo.cn/feed/friends?", c, "https://m.weibo.cn/")
-+                ?.optJSONObject("data")?.optJSONArray("statuses")?.let { a ->
-+                    for (i in 0 until minOf(a.length(), 15)) {
-+                        val st = a.optJSONObject(i) ?: continue
-+                        val name = st.optJSONObject("user")?.optString("screen_name").orEmpty()
-+                        val text = st.optString("text").replace(Regex("<[^>]+>"), "").trim().take(140)
-+                        if (text.isBlank()) continue
-+                        out += Digest.Item("wb:" + st.optString("id"), "微博", "weibo:$name", name, text.take(60), text, System.currentTimeMillis(),
-+                            url = "https://m.weibo.cn/status/" + st.optString("id"))
-+                    }
-+                }
-+        }
-+        runCatching {
-+            val c = cookie("https://www.zhihu.com")
-+            if (c.contains("z_c0")) getJson("https://www.zhihu.com/api/v3/feed/topstory/recommend?desktop=true&limit=10", c, "https://www.zhihu.com/")
-+                ?.optJSONArray("data")?.let { a ->
-+                    for (i in 0 until minOf(a.length(), 10)) {
-+                        val t = a.optJSONObject(i)?.optJSONObject("target") ?: continue
-+                        val q = t.optJSONObject("question")?.optString("title") ?: t.optString("title")
-+                        if (q.isNullOrBlank()) continue
-+                        val name = t.optJSONObject("author")?.optString("name").orEmpty()
-+                        out += Digest.Item("zh:" + t.optString("id"), "知乎", "zhihu:$name", name, q, t.optString("excerpt").take(120),
-+                            (t.optLong("updated_time").takeIf { it > 0 } ?: (System.currentTimeMillis() / 1000)) * 1000,
-+                            url = t.optString("url").takeIf { it.startsWith("http") }?.replace("api.zhihu.com/answers", "www.zhihu.com/answer"))
-+                    }
-+                }
-+        }
++        runCatching { val c = cookie("https://api.bilibili.com"); if (c.contains("SESSDATA")) lastResult["bilibili"] = readBili(c, out) }
++        runCatching { val c = cookie("https://m.weibo.cn"); if (c.contains("SUB=")) lastResult["weibo"] = readWeibo(c, out) }
++        runCatching { val c = cookie("https://www.zhihu.com"); if (c.contains("z_c0")) lastResult["site:www.zhihu.com"] = readZhihu(c, out) }
 +        cache = out
 +        out
++    }
++
++    /**
++     * [Mines-38.6] Self-test / 消息来源 「检查」: one real request per platform with whatever session the app has (none in
++     * the smoke test) plus one public endpoint each (B站 热门, 微博 热搜, 知乎 热榜), so a broken reader shows a reason
++     * instead of an empty list.
++     */
++    suspend fun check(context: Context): List<Pair<ReadResult, ReadResult>> = withContext(Dispatchers.IO) {
++        val bc = cookie("https://api.bilibili.com"); val wc = cookie("https://m.weibo.cn"); val zc = cookie("https://www.zhihu.com")
++        val own = listOf(readBili(bc, null), readWeibo(wc, null), readZhihu(zc, null))
++        own.forEach { lastResult[it.kind] = it }
++        fun pub(kind: String, name: String, url: String, ref: String, count: (JSONObject?) -> Int): ReadResult {
++            val (code, body) = fetch(url, "", ref)
++            return verdict(kind, name, code, body, count(json(body)), false)
++        }
++        val public = listOf(
++            pub("bilibili", "B站", "https://api.bilibili.com/x/web-interface/popular?ps=5&pn=1", "https://www.bilibili.com/") { it?.optJSONObject("data")?.optJSONArray("list")?.length() ?: 0 },
++            pub("weibo", "微博", "https://weibo.com/ajax/side/hotSearch", "https://weibo.com/") { it?.optJSONObject("data")?.optJSONArray("realtime")?.length() ?: 0 },
++            pub("site:www.zhihu.com", "知乎", "https://www.zhihu.com/api/v3/feed/topstory/hot-lists/total?limit=5", "https://www.zhihu.com/hot") { it?.optJSONArray("data")?.length() ?: 0 },
++        )
++        own.zip(public)
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/VoiceDiag.kt b/src/android/app/src/main/java/com/openminis/app/plus/VoiceDiag.kt
@@ -1455,22 +1545,99 @@ index e0b99ef..90a2318 100644
          val dim = embs[0].size
          val sum = FloatArray(dim)
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/AiCatalog.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/AiCatalog.kt
-index a689304..dc05da3 100644
+index a689304..ffac60e 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/AiCatalog.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/AiCatalog.kt
-@@ -76,8 +76,8 @@ object AiCatalog {
+@@ -10,7 +10,14 @@ import com.openminis.app.R
+  * Phone-only apps (no public API) are driven by the accessibility / Shizuku
+  * FastUi path ("代打字"): slow, can break when the app changes, default off.
+  */
+-enum class Proto { OPENAI, ANTHROPIC, MANUS, COZE, PHONE }
++enum class Proto { OPENAI, ANTHROPIC, MANUS, COZE, PHONE, WEBAPP, MINES }
++
++/**
++ * [Mines-38.6] user 2026-10-15 「群聊我是要 app、AI agent 这些群聊，不是模型群聊」: members are grouped as
++ * AGENT (Manus, 扣子 bots, WorkBuddy, Muse 中继, Mines itself), APP (an AI app's web chat driven with the user's
++ * signed-in session, no key) and MODEL (a bare model API — only under 「高级：直接用模型」).
++ */
++enum class Kind { AGENT, APP, MODEL }
+ 
+ data class AiSpec(
+     val id: String,
+@@ -30,13 +37,20 @@ data class AiSpec(
+     val hosts: List<String> = emptyList(),
+     /** Needs no key (local gateway / own relay that may be open). */
+     val keyOptional: Boolean = false,
++    val kind: Kind = Kind.MODEL,
++    /** [Mines-38.6] WEBAPP: the chat page the member is driven on (signed-in session of the shared WebView store). */
++    val webUrl: String = "",
++    /** [Mines-38.6] WEBAPP: session cookie names that mean 「已登录」 (best guess per site; a successful run also marks it). */
++    val cookies: List<String> = emptyList(),
++    /** [Mines-38.6] remote avatar (扣子 bot icon). */
++    val iconUrl: String? = null,
+ )
+ 
+ object AiCatalog {
+     const val NANOMUSE_BASE = "http://8.217.89.133:8787/v1"
+     const val WORKBUDDY_BASE = "http://127.0.0.1:8788/v1"
+ 
+-    val specs: List<AiSpec> = listOf(
++    val specs: List<AiSpec> by lazy { listOf(
+         AiSpec("anthropic", "Claude", "anthropic", Proto.ANTHROPIC, "https://api.anthropic.com/v1", "claude-sonnet-4-5",
+             listOf("claude-sonnet-4", "claude-haiku-4", "claude-3-5-haiku"), R.drawable.ic_brand_anthropic, 0xFFD97757, hosts = listOf("api.anthropic.com")),
+         AiSpec("openai", "ChatGPT", "openai", Proto.OPENAI, "https://api.openai.com/v1", "gpt-4o-mini",
+@@ -74,18 +88,43 @@ object AiCatalog {
+         AiSpec("perplexity", "Perplexity", "perplexity", Proto.OPENAI, "https://api.perplexity.ai", "sonar",
+             listOf("sonar"), R.drawable.ic_brand_perplexity, 0xFF20808D, hosts = listOf("api.perplexity.ai")),
          AiSpec("manus", "Manus", "manus", Proto.MANUS, "https://api.manus.ai/v2", "standard",
-             emptyList(), 0, 0xFF2B2B2B, note = "按任务执行，慢（几十秒到几分钟），按积分计费"),
+-            emptyList(), 0, 0xFF2B2B2B, note = "按任务执行，慢（几十秒到几分钟），按积分计费"),
++            emptyList(), 0, 0xFF2B2B2B, note = "按任务执行，慢（几十秒到几分钟），按积分计费", kind = Kind.AGENT),
          AiSpec("coze", "扣子", "coze", Proto.COZE, "https://api.coze.cn/v3", "",
 -            emptyList(), 0, 0xFF4E40E5, domestic = true, note = "需要填你的智能体 Bot ID"),
 -        AiSpec("nanomuse", "Muse（nanoMuse 中继）", null, Proto.OPENAI, NANOMUSE_BASE, "",
-+            emptyList(), 0, 0xFF4E40E5, domestic = true, note = "用你在扣子发布的智能体聊天，Mines 会自动找到它"),
++            emptyList(), 0, 0xFF4E40E5, domestic = true, note = "登录扣子后，你的每个智能体都会自动出现在这里", kind = Kind.AGENT),
 +        AiSpec("nanomuse", "Muse 中继", null, Proto.OPENAI, NANOMUSE_BASE, "",
              emptyList(), 0, 0xFF8E6CEF, hosts = listOf("8.217.89.133:8787"), keyOptional = true,
-             note = "你自己的中继（阿里云）；Muse 官方 App 没有接口"),
+-            note = "你自己的中继（阿里云）；Muse 官方 App 没有接口"),
++            note = "你自己的中继（阿里云）；Muse 官方 App 没有接口", kind = Kind.AGENT),
          AiSpec("workbuddy", "WorkBuddy", null, Proto.OPENAI, WORKBUDDY_BASE, "",
+             emptyList(), 0, 0xFF0E9F6E, hosts = listOf("127.0.0.1:8788", "localhost:8788"), keyOptional = true,
+-            note = "本机网关 127.0.0.1:8788"),
++            note = "本机网关 127.0.0.1:8788", kind = Kind.AGENT),
++        // [Mines-38.6] Mines itself as a member: the real agent (tools, files, web), not a bare model call
++        AiSpec(MINES_ID, "Mines 智能体", null, Proto.MINES, "", "", emptyList(), 0, 0xFFB5532F, keyOptional = true,
++            note = "Mines 自己：能用工具、查资料、读文件", kind = Kind.AGENT),
++    ) + webApps }
++
++    const val MINES_ID = "mines"
++
++    /**
++     * [Mines-38.6] AI apps joined through their web chat with the user's own sign-in (no key). Cookie names are best guesses
++     * from each site's public behaviour; a page that shows its chat box (no login wall) also counts as signed in.
++     */
++    val webApps: List<AiSpec> = listOf(
++        web("doubao", "豆包", "https://www.doubao.com/chat/", listOf("sessionid", "sessionid_ss", "sid_tt"), R.drawable.ic_brand_volcengine, 0xFF3370FF),
++        web("yuanbao", "元宝", "https://yuanbao.tencent.com/chat", listOf("hy_token", "hy_user"), 0, 0xFF1F8B4C),
++        web("kimi", "Kimi", "https://www.kimi.com/", listOf("kimi-auth", "access_token"), R.drawable.ic_brand_kimi, 0xFF1F1F1F),
++        web("deepseek", "DeepSeek", "https://chat.deepseek.com/", listOf("ds_session_id"), R.drawable.ic_brand_deepseek, 0xFF4D6BFE),
++        web("tongyi", "通义", "https://www.tongyi.com/qianwen/", listOf("tongyi_sso_ticket", "login_tongyi_ticket"), R.drawable.ic_brand_qwen, 0xFF615CED),
++        web("chatglm", "智谱清言", "https://chatglm.cn/main/alltoolsdetail", listOf("chatglm_token", "chatglm_refresh_token"), R.drawable.ic_brand_zhipu, 0xFF3859FF),
++        web("chatgpt", "ChatGPT", "https://chatgpt.com/", listOf("__Secure-next-auth.session-token"), R.drawable.ic_brand_openai, 0xFF10A37F, domestic = false),
++        web("gemini", "Gemini", "https://gemini.google.com/app", listOf("__Secure-1PSID"), R.drawable.ic_brand_gemini, 0xFF4285F4, domestic = false),
++        web("grok", "Grok", "https://grok.com/", listOf("sso", "sso-rw"), R.drawable.ic_brand_xai, 0xFF3A3F4B, domestic = false),
+     )
+ 
+-    fun spec(id: String): AiSpec? = specs.firstOrNull { it.id == id } ?: PhoneApps.specFor(id)
++    private fun web(id: String, name: String, url: String, cookies: List<String>, icon: Int, color: Long, domestic: Boolean = true) =
++        AiSpec("web:$id", name, null, Proto.WEBAPP, url, "", emptyList(), icon, color, domestic = domestic, keyOptional = true,
++            note = "用你的 $name 账号登录网页版，Mines 替你提问、读回复", kind = Kind.APP, webUrl = url, cookies = cookies)
++
++    fun spec(id: String): AiSpec? = specs.firstOrNull { it.id == id } ?: CozeBots.spec(id) ?: PhoneApps.specFor(id)
+ 
+     /** Host order for 主持人 (Mines itself): cheap, fast, domestic first. */
+     val hostOrder = listOf("deepseek", "zhipu", "siliconflow", "kimi", "qwen", "volcengine", "hunyuan", "sensenova",
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/AiClient.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/AiClient.kt
-index 6dad4cf..5a2cdeb 100644
+index 6dad4cf..7a7ebb5 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/AiClient.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/AiClient.kt
 @@ -19,8 +19,12 @@ import java.util.concurrent.TimeUnit
@@ -1544,7 +1711,7 @@ index 6dad4cf..5a2cdeb 100644
      }
  
      private fun bearer(b: Request.Builder, key: String?) = if (key.isNullOrBlank()) b else b.header("Authorization", "Bearer $key")
-@@ -130,7 +141,65 @@ object AiClient {
+@@ -130,12 +141,93 @@ object AiClient {
          return pick ?: p.model.ifBlank { p.spec.defaultModel }
      }
  
@@ -1611,8 +1778,211 @@ index 6dad4cf..5a2cdeb 100644
          Proto.OPENAI -> openai(p, system, turns, maxTokens)
          Proto.ANTHROPIC -> anthropic(p, system, turns, maxTokens)
          Proto.MANUS -> manus(p, system, turns)
+         Proto.COZE -> coze(p, system, turns)
+         Proto.PHONE -> PhoneTyping.ask(p, turns.lastOrNull { it.role == "user" }?.text ?: "")
++        Proto.WEBAPP -> WebChat.ask(PhoneTyping.appContext ?: throw MemberError("还没准备好"), p, flat(webIntro(system), turns, 1800))
++        Proto.MINES -> minesAgent(p, system, turns)
++    }
++
++    /** Web chats get a short plain intro (their own persona stays); the group context follows. */
++    private fun webIntro(system: String) = system.substringBefore("别人的发言") + "别人的发言以【名字】开头。请直接回答最后一条，200 字以内。"
++
++    /**
++     * [Mines-38.6] Mines itself as a member: the real agent loop (tools, files, web) in its own background chat, one per
++     * member, found later under 对话. Slow turns are fine — other members do not wait for it.
++     */
++    private suspend fun minesAgent(p: Partner, system: String, turns: List<Turn>): Reply {
++        val ctx = PhoneTyping.appContext ?: throw MemberError("还没准备好")
++        val key = "mines_sid"
++        val saved = GroupPrefs.get(key)
++        val alive = saved != null && runCatching { (ctx as? com.openminis.app.MinisApp)?.chatRepository?.getSession(saved) != null }.getOrDefault(true)
++        val sid = if (alive && saved != null) saved else com.openminis.app.debug.HeadlessChatRunner.ensureSession(ctx).also { GroupPrefs.put(key, it) }
++        val r = com.openminis.app.debug.HeadlessChatRunner.prompt(ctx, sid, "（来自 AI 群聊）" + flat(system, turns, 4000), wait = true, timeoutMs = 5 * 60_000L)
++        val text = r.responseText?.trim().orEmpty()
++        if (r.timedOut) throw MemberError("Mines 智能体 5 分钟还没做完，结果会留在它的对话里")
++        if (r.status == "Error" || r.status == "Rejected") throw MemberError("Mines 智能体没能开始（${r.responseText?.take(60) ?: r.status}）")
++        if (text.isBlank()) throw MemberError("Mines 智能体没有给出回复")
++        return Reply(text.take(4000), model = "带工具")
+     }
+ 
+     /** OpenAI wants alternating roles; merge neighbours with the same role. */
+@@ -227,14 +319,17 @@ object AiClient {
+     // Coze v3: POST /v3/chat (stream=false) → GET /v3/chat/retrieve until completed → /v3/chat/message/list (type=answer)
+     private suspend fun coze(p: Partner, system: String, turns: List<Turn>): Reply {
+         val key = p.key ?: throw MemberError("缺扣子令牌")
+-        val bot = GroupPrefs.bot(p.id) ?: throw MemberError("还差智能体 Bot ID")
++        val bot = CozeBots.botIdOf(p) ?: throw MemberError("扣子里还没有智能体")
+         fun r(path: String) = Request.Builder().url(p.base.trimEnd('/') + path).header("Authorization", "Bearer $key")
+         val body = JSONObject().put("bot_id", bot).put("user_id", "mines").put("stream", false).put("auto_save_history", true)
+             .put("additional_messages", JSONArray().put(JSONObject().put("role", "user").put("content", flat(system, turns)).put("content_type", "text")))
+         val h = exec(p.spec, p.base, r("/chat").post(body.toString().toRequestBody(json)).build(), 60)
+         check(h)
+         val o = JSONObject(h.body)
+-        if (o.optInt("code", 0) != 0) throw MemberError("扣子：" + o.optString("msg").take(100))
++        val cc = o.optInt("code", 0)
++        if (cc == 4100) throw MemberError("扣子登录过期了，点「重新登录」", o.optString("msg"))
++        if (cc == 4101) throw MemberError("扣子令牌少了权限，点「重新登录」", o.optString("msg"))
++        if (cc != 0) throw MemberError("扣子：" + o.optString("msg").take(100))
+         val data = o.optJSONObject("data") ?: throw MemberError("扣子没有返回对话")
+         val chatId = data.optString("id"); val conv = data.optString("conversation_id")
+         val t0 = System.currentTimeMillis()
+@@ -251,6 +346,6 @@ object AiClient {
+         val text = (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
+             .filter { it.optString("role") == "assistant" && it.optString("type") == "answer" }.joinToString("\n") { it.optString("content") }
+             .ifBlank { throw MemberError("扣子没有给出回复") }
+-        return Reply(text, model = "Bot $bot")
++        return Reply(text, model = "扣子智能体")
+     }
+ }
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/CozeBots.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/CozeBots.kt
+new file mode 100644
+index 0000000..a51c966
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/group/CozeBots.kt
+@@ -0,0 +1,141 @@
++package com.openminis.app.plus.group
++
++import okhttp3.MediaType.Companion.toMediaType
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.RequestBody.Companion.toRequestBody
++import org.json.JSONArray
++import org.json.JSONObject
++import java.util.concurrent.TimeUnit
++
++/**
++ * [Mines-38.6] 扣子 with no technical fields (user 2026-10-15 「扣子接入后，有直接调用的办法吗？不然给我接口用不了没啥用」).
++ * With the token 账号连接 saved, Mines lists the user's bots (GET /v1/workspaces → GET /v1/bots?workspace_id=…&publish_status=all,
++ * docs.coze.cn/developer_guides/bots_list_draft_published), finds which ones are on the API channel
++ * (publish_status=published_online&connector_id=1024) and publishes the rest there (POST /v1/bot/publish
++ * {bot_id, connector_ids:["1024"]}, docs.coze.cn/developer_guides/publish_bot). Every bot then is its own member
++ * "coze:<bot id>" with its name and icon; Bot ID / token / address only appear under 「详情」.
++ * Old tokens without listBot fall back to the deprecated /v1/space/published_bots_list.
++ */
++object CozeBots {
++    data class Bot(val id: String, val name: String, val icon: String?, val ready: Boolean, val problem: String? = null)
++    data class Sync(val bots: List<Bot>, val problem: String? = null, val relogin: Boolean = false, val published: List<String> = emptyList())
++
++    private val json = "application/json".toMediaType()
++    private val http = OkHttpClient.Builder().connectTimeout(8, TimeUnit.SECONDS).readTimeout(15, TimeUnit.SECONDS).build()
++
++    /** api.coze.cn root from the member base (".../v3"). */
++    fun root(base: String) = base.trimEnd('/').removeSuffix("/v3").removeSuffix("/v1")
++
++    private class Res(val http: Int, val o: JSONObject?) {
++        val code: Int get() = o?.optInt("code", if (http in 200..299) 0 else -1) ?: -1
++        val msg: String get() = o?.optString("msg").orEmpty()
++        val ok: Boolean get() = http in 200..299 && code == 0
++    }
++
++    private fun call(url: String, key: String, body: JSONObject? = null): Res = runCatching {
++        val b = Request.Builder().url(url).header("Authorization", "Bearer $key").header("Content-Type", "application/json")
++        if (body != null) b.post(body.toString().toRequestBody(json))
++        http.newCall(b.build()).execute().use { r -> Res(r.code, runCatching { JSONObject(r.body?.string().orEmpty()) }.getOrNull()) }
++    }.getOrElse { Res(0, null) }
++
++    /** One plain line for a failed call; relogin = the token is bad / missing a permission → 「重新登录」. */
++    private fun problem(r: Res): Pair<String, Boolean> = when {
++        r.http == 0 -> "连不上扣子（网络问题）" to false
++        r.http == 401 || r.code == 4100 || r.msg.contains("token", true) && r.msg.contains("invalid", true) ->
++            "扣子登录过期了，点「重新登录」" to true
++        r.http == 403 || r.code == 4101 || r.msg.contains("permission", true) || r.msg.contains("权限") ->
++            "扣子令牌少了权限，点「重新登录」重新拿" to true
++        else -> "扣子暂时没回应，稍后会再试" to false
++    }
++
++    @Volatile private var cache: Sync? = null
++    @Volatile private var cacheAt = 0L
++
++    fun cached(): Sync? = cache ?: GroupPrefs.get("coze_bots")?.let { decode(it) }?.also { cache = it }
++
++    /** Lists, auto-publishes to the API channel, remembers. Cached for 10 min unless [force]. */
++    fun sync(base: String, key: String, force: Boolean = false): Sync {
++        if (!force && System.currentTimeMillis() - cacheAt < 600_000) cache?.let { return it }
++        val root = root(base)
++        val ws = call("$root/v1/workspaces?page_num=1&page_size=20", key)
++        if (!ws.ok) {
++            val (p, re) = problem(ws)
++            return remember(Sync(cached()?.bots ?: emptyList(), p, re))
++        }
++        val spaces = ws.o?.optJSONObject("data")?.optJSONArray("workspaces") ?: JSONArray()
++        val bots = LinkedHashMap<String, Bot>()
++        val published = ArrayList<String>()
++        var lastProblem: Pair<String, Boolean>? = null
++        for (i in 0 until spaces.length()) {
++            val wid = spaces.optJSONObject(i)?.optString("id")?.takeIf { it.isNotBlank() } ?: continue
++            val all = call("$root/v1/bots?workspace_id=$wid&publish_status=all&page_num=1&page_size=50", key)
++            if (!all.ok) {
++                lastProblem = problem(all)
++                // old token without listBot: the deprecated list of API-published bots still works
++                val old = call("$root/v1/space/published_bots_list?space_id=$wid&page_size=50", key)
++                old.o?.optJSONObject("data")?.optJSONArray("space_bots")?.let { a ->
++                    for (j in 0 until a.length()) a.optJSONObject(j)?.let { b ->
++                        val id = b.optString("bot_id"); if (id.isNotBlank()) bots[id] = Bot(id, b.optString("bot_name").ifBlank { "扣子智能体" }, b.optString("icon_url").ifBlank { null }, true)
++                    }
++                }
++                continue
++            }
++            val items = all.o?.optJSONObject("data")?.optJSONArray("items") ?: JSONArray()
++            val onApi = call("$root/v1/bots?workspace_id=$wid&publish_status=published_online&connector_id=1024&page_num=1&page_size=50", key)
++            val apiIds = HashSet<String>()
++            onApi.o?.optJSONObject("data")?.optJSONArray("items")?.let { a -> for (j in 0 until a.length()) a.optJSONObject(j)?.optString("id")?.let { apiIds += it } }
++            for (j in 0 until items.length()) {
++                val b = items.optJSONObject(j) ?: continue
++                val id = b.optString("id").ifBlank { b.optString("bot_id") }.takeIf { it.isNotBlank() } ?: continue
++                val name = b.optString("name").ifBlank { "扣子智能体" }
++                val icon = b.optString("icon_url").ifBlank { null }
++                if (id in apiIds) { bots[id] = Bot(id, name, icon, true); continue }
++                // not on the API channel yet → publish it there for the user
++                val pub = call("$root/v1/bot/publish", key, JSONObject().put("bot_id", id).put("connector_ids", JSONArray().put("1024")))
++                if (pub.ok) { published += id; bots[id] = Bot(id, name, icon, true) }
++                else {
++                    val (p, re) = problem(pub)
++                    bots[id] = Bot(id, name, icon, false, if (re) p else "没能自动发布到 API（${pub.msg.take(40).ifBlank { "扣子拒绝" }}）")
++                }
++            }
++        }
++        val list = bots.values.toList()
++        val pr = if (list.isEmpty()) (lastProblem ?: ("扣子里还没有智能体：在扣子建一个，回来自动出现" to false)) else null
++        return remember(Sync(list, pr?.first, pr?.second == true, published))
++    }
++
++    private fun remember(s: Sync): Sync {
++        cache = s; cacheAt = System.currentTimeMillis()
++        GroupPrefs.put("coze_bots", encode(s))
++        return s
++    }
++
++    private fun encode(s: Sync) = JSONObject().put("problem", s.problem ?: "").put("relogin", s.relogin)
++        .put("bots", JSONArray(s.bots.map { JSONObject().put("id", it.id).put("name", it.name).put("icon", it.icon ?: "").put("ready", it.ready).put("problem", it.problem ?: "") }))
++        .toString()
++
++    private fun decode(t: String): Sync? = runCatching {
++        val o = JSONObject(t)
++        val a = o.optJSONArray("bots") ?: JSONArray()
++        Sync((0 until a.length()).map { a.getJSONObject(it) }.map { Bot(it.getString("id"), it.optString("name"), it.optString("icon").ifBlank { null }, it.optBoolean("ready"), it.optString("problem").ifBlank { null }) },
++            o.optString("problem").ifBlank { null }, o.optBoolean("relogin"))
++    }.getOrNull()
++
++    /** The member spec of one bot (id "coze:<bot id>"). */
++    fun spec(id: String): AiSpec? {
++        if (!id.startsWith("coze:")) return null
++        val b = cached()?.bots?.firstOrNull { "coze:" + it.id == id }
++        return specFor(id.removePrefix("coze:"), b?.name ?: "扣子智能体", b?.icon)
++    }
++
++    fun specFor(botId: String, name: String, icon: String?): AiSpec {
++        val base = AiCatalog.specs.first { it.id == "coze" }
++        return base.copy(id = "coze:$botId", name = name, iconUrl = icon, note = "你在扣子的智能体", kind = Kind.AGENT)
++    }
++
++    /** (bot id, name) pairs for the old member dialog. */
++    fun list(key: String): List<Pair<String, String>> = sync(GroupPrefs.get("base_coze") ?: AiCatalog.specs.first { it.id == "coze" }.baseUrl, key).bots.map { it.id to it.name }
++
++    fun botIdOf(p: Partner): String? = if (p.id.startsWith("coze:")) p.id.removePrefix("coze:") else GroupPrefs.bot(p.id)
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupRunner.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupRunner.kt
-index 22661da..b7271d2 100644
+index 22661da..1db9e86 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupRunner.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupRunner.kt
 @@ -39,11 +39,14 @@ object GroupRunner {
@@ -1700,7 +2070,7 @@ index 22661da..b7271d2 100644
          }
      }
  
-@@ -112,32 +135,53 @@ object GroupRunner {
+@@ -112,41 +135,72 @@ object GroupRunner {
          }
      }
  
@@ -1721,7 +2091,7 @@ index 22661da..b7271d2 100644
 +            // [Mines-38.5] a member that is not connected is skipped with one quiet line, not a red error bubble
 +            if (!isHost && (p0 == null || !p0.ready)) {
 +                GroupStore.add(gid, GroupMsg(GroupStore.newId(), id, name, p0?.model ?: "", "", "skip",
-+                    detail = p0?.reason ?: "没连接或已被移除"))
++                    detail = if (p0?.state == Partner.State.NEED_LOGIN) "需登录" else p0?.reason ?: "没连接或已被移除"))
 +                return
 +            }
 +            val placeholder = GroupMsg(GroupStore.newId(), if (isHost) GroupStore.HOST else id, name, p0?.model ?: "", "", "pending",
@@ -1770,24 +2140,40 @@ index 22661da..b7271d2 100644
              }
              GroupStore.replace(gid, done)
          }
-@@ -146,7 +190,9 @@ object GroupRunner {
-         if (g.sequential) {
-             for (id in api) one(id)
-         } else coroutineScope {
+         // 代打字 members drive the phone UI: always one at a time, after the API members.
+-        val (phone, api) = who.partition { PhoneApps.isPhone(it) }
+-        if (g.sequential) {
+-            for (id in api) one(id)
+-        } else coroutineScope {
 -            api.map { id -> async { one(id) } }.awaitAll()
-+            // parallel mode: at most 3 requests at once (11 members at once tripped 429 limits)
-+            val gate = kotlinx.coroutines.sync.Semaphore(3)
-+            api.map { id -> async { gate.acquire(); try { one(id) } finally { gate.release() } } }.awaitAll()
++        val (phone, rest) = who.partition { PhoneApps.isPhone(it) }
++        // [Mines-38.6] slow agents (Manus tasks, web-chat apps, Mines' own agent loop) start at once in the background and
++        // never hold up the quick members; each shows 「正在思考…」 with its own time until it answers or times out.
++        val slowProtos = setOf(Proto.MANUS, Proto.WEBAPP, Proto.MINES)
++        val (slow, api) = rest.partition { id -> id != GroupStore.HOST && members.firstOrNull { it.id == id }?.let { it.ready && it.spec.proto in slowProtos } == true }
++        coroutineScope {
++            val bg = slow.map { id -> async { one(id) } }
++            if (g.sequential) {
++                for (id in api) one(id)
++            } else {
++                // parallel mode: at most 3 requests at once (11 members at once tripped 429 limits)
++                val gate = kotlinx.coroutines.sync.Semaphore(3)
++                api.map { id -> async { gate.acquire(); try { one(id) } finally { gate.release() } } }.awaitAll()
++            }
++            bg.awaitAll()
          }
          for (id in phone) one(id)
      }
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-index 8e5984b..950b3f7 100644
+index 8e5984b..6b7201a 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-@@ -40,7 +40,31 @@ object GroupSelfTest {
+@@ -38,9 +38,50 @@ object GroupSelfTest {
+                 GroupRunner.send(context, gid, parts.drop(1).joinToString("|"))
+                 delay(300)
                  val t0 = System.currentTimeMillis()
-                 while (gid in GroupRunner.running.value && System.currentTimeMillis() - t0 < 90_000) delay(250)
+-                while (gid in GroupRunner.running.value && System.currentTimeMillis() - t0 < 90_000) delay(250)
++                while (gid in GroupRunner.running.value && System.currentTimeMillis() - t0 < 170_000) delay(250)
                  val round = GroupStore.messages(gid).value.drop(before)
 -                JSONArray(round.map { JSONObject().put("who", it.who).put("name", it.name).put("status", it.status).put("text", it.text.take(200)) }).toString()
 +                JSONArray(round.map { JSONObject().put("who", it.who).put("name", it.name).put("status", it.status).put("kind", it.kind)
@@ -1805,6 +2191,23 @@ index 8e5984b..950b3f7 100644
 +                JSONObject().put("state", p?.state?.name).put("via", p?.via).put("model", p?.model).put("reason", p?.reason)
 +                    .put("dupes", l.count { it.id == kind }).toString()
 +            }
++            // [Mines-38.6] smoke: point a member at the runner's fake service / mark a web app signed in / list 扣子 bots
++            "base" -> { GroupPrefs.put("base_${parts.getOrElse(0) { "" }}", parts.getOrNull(1)); Partners.refresh(context); "ok" }
++            "weblogin" -> { WebChat.markSignedIn(parts.getOrElse(0) { "" }, parts.getOrNull(1) != "0"); Partners.refresh(context); "ok" }
++            "cozesync" -> {
++                val key = Partners.vaultKey("coze") ?: return@runBlocking "no coze key"
++                val s = CozeBots.sync(GroupPrefs.get("base_coze") ?: "https://api.coze.cn/v3", key, force = true)
++                val l = Partners.refresh(context)
++                JSONObject().put("bots", JSONArray(s.bots.map { JSONObject().put("id", it.id).put("name", it.name).put("ready", it.ready) }))
++                    .put("published", JSONArray(s.published)).put("problem", s.problem ?: "")
++                    .put("members", JSONArray(l.filter { it.id.startsWith("coze") }.map { JSONObject().put("id", it.id).put("name", it.spec.name).put("state", it.state.name).put("reason", it.reason ?: "") }))
++                    .toString()
++            }
++            "direct" -> {
++                Partners.refresh(context)
++                val id = parts.getOrElse(0) { "" }
++                GroupStore.direct(id, Partners.find(id)?.spec?.name ?: id).id
++            }
 +            "setmodel" -> { GroupPrefs.setModel(parts.getOrElse(0) { "" }, parts.getOrNull(1)); Partners.refresh(context); "ok" }
 +            "summary" -> {
 +                val gid = parts.getOrElse(0) { "" }
@@ -1812,14 +2215,14 @@ index 8e5984b..950b3f7 100644
 +                GroupRunner.summarize(context, gid)
 +                delay(300)
 +                val t0 = System.currentTimeMillis()
-+                while (gid in GroupRunner.running.value && System.currentTimeMillis() - t0 < 90_000) delay(250)
++                while (gid in GroupRunner.running.value && System.currentTimeMillis() - t0 < 170_000) delay(250)
 +                val round = GroupStore.messages(gid).value.drop(before)
 +                JSONArray(round.map { JSONObject().put("who", it.who).put("kind", it.kind).put("status", it.status).put("text", it.text.take(300)) }).toString()
              }
              "reset" -> {
                  GroupStore.groups.value.forEach { GroupStore.delete(it.id) }
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupStore.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupStore.kt
-index dcfa45c..d13028d 100644
+index dcfa45c..46bf779 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupStore.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupStore.kt
 @@ -35,6 +35,10 @@ data class GroupMsg(
@@ -1855,8 +2258,19 @@ index dcfa45c..d13028d 100644
              }.getOrDefault(emptyList()))
          }
      }
+@@ -100,6 +104,10 @@ object GroupStore {
+         return g
+     }
+ 
++    /** [Mines-38.6] a 1:1 chat with one agent / app (tapping it in AI 伙伴): reused, no host. */
++    fun direct(memberId: String, name: String): AiGroup =
++        _groups.value.firstOrNull { it.members == listOf(memberId) && !it.host && it.name == name } ?: create(name, listOf(memberId), host = false, sequential = true)
++
+     fun update(g: AiGroup) { _groups.value = _groups.value.map { if (it.id == g.id) g else it }; save(g.id) }
+ 
+     fun delete(id: String) {
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/Partners.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/Partners.kt
-index 7aec8fb..6eb3dc3 100644
+index 7aec8fb..fd67290 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/Partners.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/Partners.kt
 @@ -15,6 +15,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
@@ -1867,13 +2281,21 @@ index 7aec8fb..6eb3dc3 100644
  import org.json.JSONArray
  import org.json.JSONObject
  import java.util.UUID
-@@ -128,7 +129,24 @@ object Partners {
+@@ -32,7 +33,7 @@ data class Partner(
+     val lowBalance: Boolean = false,
+     val reason: String? = null,
+ ) {
+-    enum class State { READY, NEED_KEY, OFF, UNREACHABLE }
++    enum class State { READY, NEED_KEY, OFF, UNREACHABLE, NEED_LOGIN }
+     val id: String get() = spec.id
+     val ready: Boolean get() = state == State.READY
+ }
+@@ -128,7 +129,23 @@ object Partners {
      private fun modelFor(spec: AiSpec, instModel: String?): String =
          GroupPrefs.model(spec.id) ?: instModel ?: GroupPrefs.autoModel(spec.id) ?: spec.defaultModel
  
 -    suspend fun refresh(context: Context, rescanApps: Boolean = false): List<Partner> = withContext(Dispatchers.IO) {
 +    private val gate = kotlinx.coroutines.sync.Mutex()
-+    @Volatile private var cozeTried = 0L
 +
 +    /** [Mines-38.5] the key for a vault kind: the default account first, then any other account of that service that has one. */
 +    fun vaultKey(kind: String): String? {
@@ -1893,8 +2315,26 @@ index 7aec8fb..6eb3dc3 100644
          GroupPrefs.init(context)
          val insts = instances(context)
          val used = HashSet<String>()
-@@ -142,9 +160,13 @@ object Partners {
+@@ -137,14 +154,43 @@ object Partners {
+             val found = PhoneApps.scan(context); PhoneApps.remember(found); _apps.value = found; lastScan = System.currentTimeMillis()
+         }
+         val probes = coroutineScope {
+-            AiCatalog.specs.filter { it.keyOptional }.map { s -> async { s.id to AiClient.probe(s.baseUrl) } }.awaitAll().toMap()
++            AiCatalog.specs.filter { it.keyOptional && it.proto == Proto.OPENAI }.map { s -> async { s.id to AiClient.probe(s.baseUrl) } }.awaitAll().toMap()
+         }
          for (spec in AiCatalog.specs) {
++            // [Mines-38.6] Mines itself and the web-chat apps need no key
++            if (spec.proto == Proto.MINES) {
++                out += if (insts.isNotEmpty()) Partner(spec, Partner.State.READY, "", null, "", "本机")
++                else Partner(spec, Partner.State.NEED_KEY, "", null, "", "", reason = "Mines 还没有能用的模型：先在设置里加一个")
++                continue
++            }
++            if (spec.proto == Proto.WEBAPP) {
++                val url = GroupPrefs.get("base_${spec.id}") ?: spec.webUrl
++                out += if (WebChat.signedIn(spec)) Partner(spec, Partner.State.READY, url, null, "网页版", "已登录")
++                else Partner(spec, Partner.State.NEED_LOGIN, url, null, "", "", reason = "需登录：点一下登录${spec.name}，只要一次")
++                continue
++            }
              val inst = insts.firstOrNull { it.id !in used && matches(spec, it) }
              if (inst != null) used += inst.id
 -            val vaultKey = spec.vaultKind?.let { k -> PlusVault.defaultAccount(k)?.let { PlusVault.secret(it) } }
@@ -1902,20 +2342,37 @@ index 7aec8fb..6eb3dc3 100644
              val key = vaultKey ?: inst?.key?.takeIf { it.isNotBlank() }
 -            val base = inst?.base?.trimEnd('/') ?: spec.baseUrl
 +            val base = GroupPrefs.get("base_${spec.id}")?.trimEnd('/') ?: inst?.base?.trimEnd('/') ?: spec.baseUrl  // base_<id>: smoke override
-+            if (spec.proto == Proto.COZE && key != null && GroupPrefs.bot(spec.id) == null && System.currentTimeMillis() - cozeTried > 600_000) {
-+                cozeTried = System.currentTimeMillis()
-+                runCatching { CozeBots.list(key).firstOrNull()?.let { GroupPrefs.setBot(spec.id, it.first) } }
++            // [Mines-38.6] 扣子: every bot of the user is its own member (listed, auto-published to the API channel)
++            if (spec.proto == Proto.COZE) {
++                if (key == null) {
++                    out += Partner(spec, Partner.State.NEED_KEY, base, null, "", "", reason = "登录扣子，你的智能体会自动出现")
++                    continue
++                }
++                val sync = runCatching { CozeBots.sync(base, key) }.getOrNull()
++                val bots = sync?.bots.orEmpty()
++                for (b in bots) {
++                    val bs = CozeBots.specFor(b.id, b.name, b.icon)
++                    out += if (b.ready && sync?.relogin != true) Partner(bs, Partner.State.READY, base, key, "", "扣子")
++                    else Partner(bs, Partner.State.NEED_KEY, base, key, "", "扣子", reason = sync?.problem?.takeIf { sync.relogin } ?: b.problem ?: "还不能用")
++                }
++                if (bots.isEmpty()) out += Partner(spec, Partner.State.NEED_KEY, base, key, "", "扣子",
++                    reason = sync?.problem ?: "扣子里还没有智能体：在扣子建一个，回来自动出现")
++                continue
 +            }
              val via = when { vaultKey != null -> "账号连接"; inst != null -> "模型组"; spec.id == "nanomuse" -> "中继"; spec.id == "workbuddy" -> "本机"; else -> "" }
              val bal = spec.vaultKind?.let { k -> PlusVault.defaultAccount(k) }
              val p = if (spec.keyOptional) {
-@@ -161,8 +183,11 @@ object Partners {
+@@ -157,12 +203,13 @@ object Partners {
+                     else -> Partner(spec, Partner.State.UNREACHABLE, base, null, "", via,
+                         reason = if (spec.id == "workbuddy") "本机 8788 端口没有响应（WorkBuddy 没开？）" else "中继没有响应")
+                 }
+-            } else if (key != null && (spec.proto != Proto.COZE || GroupPrefs.bot(spec.id) != null)) {
++            } else if (key != null) {
                  Partner(spec, Partner.State.READY, base, key, modelFor(spec, inst?.model), via,
                      balance = bal?.let { KeyBalance.text(it) }, lowBalance = bal?.let { KeyBalance.low(it) } == true)
-             } else if (key != null) {
+-            } else if (key != null) {
 -                Partner(spec, Partner.State.NEED_KEY, base, key, "", via, reason = "还差智能体 Bot ID")
 -            } else Partner(spec, Partner.State.NEED_KEY, base, null, "", "")
-+                Partner(spec, Partner.State.NEED_KEY, base, key, "", via, reason = "扣子里还没有发布的智能体，点「选智能体」")
 +            } else Partner(spec, Partner.State.NEED_KEY, base, null, "", "",
 +                // [Mines-38.5] 账号连接 shows 「已连接」 for a website sign-in (secret = null), but a group call needs the API key:
 +                // say so plainly and let 一键连接 fetch the key with that session, instead of 「还没有密钥」.
@@ -1923,7 +2380,7 @@ index 7aec8fb..6eb3dc3 100644
              out += p
          }
          // other OpenAI-compatible providers in 模型组
-@@ -182,8 +207,10 @@ object Partners {
+@@ -182,8 +229,10 @@ object Partners {
              out += Partner(spec, if (GroupPrefs.phoneOn(spec.id)) Partner.State.READY else Partner.State.OFF, f.pkg, null, "App", "代打字",
                  reason = "慢、可能断：Mines 替你在 ${f.label} 里打字、读回复")
          }
@@ -1936,7 +2393,7 @@ index 7aec8fb..6eb3dc3 100644
      }
  
      /** Balance refresh for members with a balance API (DeepSeek / 硅基 / Kimi / OpenRouter). */
-@@ -196,8 +223,41 @@ object Partners {
+@@ -196,8 +245,16 @@ object Partners {
      }
  
      /** Mines' own voice in the group (主持): the first ready API member by [AiCatalog.hostOrder]. */
@@ -1949,38 +2406,13 @@ index 7aec8fb..6eb3dc3 100644
 +    fun hostCandidates(): List<Partner> {
 +        val ready = _list.value.filter { it.ready && it.spec.proto in setOf(Proto.OPENAI, Proto.ANTHROPIC) && it.spec.id != "workbuddy" }
 +        val ordered = AiCatalog.hostOrder.mapNotNull { id -> ready.firstOrNull { it.id == id } }
-+        return (ordered + ready).distinctBy { it.id }
-+    }
-+}
-+
-+
-+/** [Mines-38.5] 扣子: find the user's published bots with the token Mines already has (no Bot ID typing). */
-+object CozeBots {
-+    private fun get(url: String, key: String): org.json.JSONObject? = runCatching {
-+        val c = okhttp3.OkHttpClient.Builder().connectTimeout(6, java.util.concurrent.TimeUnit.SECONDS)
-+            .readTimeout(8, java.util.concurrent.TimeUnit.SECONDS).build()
-+        c.newCall(okhttp3.Request.Builder().url(url).header("Authorization", "Bearer $key").build()).execute().use { r ->
-+            if (!r.isSuccessful) null else org.json.JSONObject(r.body?.string().orEmpty())
-+        }
-+    }.getOrNull()
-+
-+    /** (bot id, name) pairs, newest workspaces first; empty when the token has no workspace / bot scope. */
-+    fun list(key: String): List<Pair<String, String>> {
-+        val ws = get("https://api.coze.cn/v1/workspaces?page_num=1&page_size=20", key)?.optJSONObject("data")?.optJSONArray("workspaces") ?: return emptyList()
-+        val out = ArrayList<Pair<String, String>>()
-+        for (i in 0 until ws.length()) {
-+            val id = ws.optJSONObject(i)?.optString("id")?.takeIf { it.isNotBlank() } ?: continue
-+            get("https://api.coze.cn/v1/bots?workspace_id=$id&page_num=1&page_size=20", key)?.optJSONObject("data")?.optJSONArray("items")?.let { a ->
-+                for (j in 0 until a.length()) a.optJSONObject(j)?.let { b -> b.optString("id").ifBlank { b.optString("bot_id") }.takeIf { it.isNotBlank() }?.let { out += it to b.optString("name") } }
-+            }
-+            if (out.isEmpty()) get("https://api.coze.cn/v1/space/published_bots_list?space_id=$id&page_size=20", key)?.optJSONObject("data")?.optJSONArray("space_bots")?.let { a ->
-+                for (j in 0 until a.length()) a.optJSONObject(j)?.let { b -> b.optString("bot_id").takeIf { it.isNotBlank() }?.let { out += it to b.optString("bot_name") } }
-+            }
-+            if (out.isNotEmpty()) break
-+        }
-+        return out
++        // [Mines-38.6] no bare model API at all → Mines' own agent hosts (its model group)
++        val mines = _list.value.filter { it.ready && it.spec.proto == Proto.MINES }
++        return (ordered + ready + mines).distinctBy { it.id }
      }
  }
++
++
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/PhoneApps.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/PhoneApps.kt
 index f0a91fa..7e0303f 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/PhoneApps.kt
@@ -2020,6 +2452,205 @@ index f0a91fa..7e0303f 100644
          Known("Muse", listOf("ai.muse.app", "com.muse.ai"), listOf("Muse"), Verdict.TYPING,
              "官方 App 没有公开接口，只能无障碍代打字（慢、可能断）；你的 nanoMuse 中继可以直接进群"),
          Known("Genspark", listOf("ai.genspark.app", "com.genspark.app"), listOf("Genspark"), Verdict.TYPING, "没有公开接口，只能无障碍代打字（慢、可能断）"),
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/WebChat.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/WebChat.kt
+new file mode 100644
+index 0000000..891904e
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/group/WebChat.kt
+@@ -0,0 +1,193 @@
++package com.openminis.app.plus.group
++
++import android.annotation.SuppressLint
++import android.content.Context
++import android.webkit.CookieManager
++import android.webkit.WebView
++import android.webkit.WebViewClient
++import com.openminis.app.plus.LoginWeb
++import com.openminis.app.plus.MailParse
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.suspendCancellableCoroutine
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
++import kotlinx.coroutines.withContext
++import org.json.JSONObject
++import kotlin.coroutines.resume
++
++/**
++ * [Mines-38.6] An AI app as a group member through its web chat, signed in with the user's own account (the app-wide
++ * WebView cookie store, the same one 账号连接 / the in-app browser use). No key: Mines types the question into the
++ * page's chat box, presses send and reads the reply when it stops growing.
++ *
++ * One off-screen WebView per member is kept for 10 minutes so a group keeps talking in the same web conversation.
++ * Sites change their pages; the driver therefore looks for the chat box / send button / reply by a few per-site
++ * selectors first and generic rules after (largest visible textarea or contenteditable, a send-looking button or
++ * Enter, the new text that appears after the question). Verified only against the smoke test's local chat page;
++ * the real sites need the user's sign-in and are best-effort.
++ */
++object WebChat {
++    private class Site(val input: String = "", val send: String = "", val reply: String = "")
++
++    private val sites = mapOf(
++        "web:doubao" to Site("textarea[data-testid='chat_input_input'],textarea", "button[data-testid='chat_input_send_button'],#flow-end-msg-send",
++            "[data-testid='receive_message'] [data-testid='message_text_content'],[data-testid='receive_message']"),
++        "web:yuanbao" to Site(".ql-editor[contenteditable='true'],[contenteditable='true']", "#yuanbao-send-btn,a[class*='send-btn'],[class*='send-btn']",
++            ".agent-chat__list__item--ai .hyc-content-md,.agent-chat__list__item--ai"),
++        "web:kimi" to Site(".chat-input-editor[contenteditable='true'],[contenteditable='true'],textarea", ".send-button-container,.send-button,[class*='send-button']",
++            ".segment-assistant .markdown,.chat-content-item-assistant .markdown,.segment-assistant"),
++        "web:deepseek" to Site("textarea#chat-input,textarea", "div[role='button'][aria-disabled='false']:last-of-type", ".ds-markdown"),
++        "web:tongyi" to Site("textarea", "[class*='operateBtn'],[class*='sendBtn']", "[class*='answerItem'] [class*='markdown'],[class*='answerItem']"),
++        "web:chatglm" to Site("textarea", ".enter,[class*='send']", ".answer-content,.markdown-body"),
++        "web:chatgpt" to Site("#prompt-textarea,[contenteditable='true'],textarea", "button[data-testid='send-button'],#composer-submit-button",
++            "[data-message-author-role='assistant']"),
++        "web:gemini" to Site(".ql-editor[contenteditable='true'],rich-textarea [contenteditable='true'],textarea", "button.send-button,button[aria-label*='Send'],button[aria-label*='发送']",
++            "model-response message-content,model-response"),
++        "web:grok" to Site("textarea,[contenteditable='true']", "button[type='submit'],button[aria-label*='Submit'],button[aria-label*='提交']",
++            ".message-bubble .response-content-markdown,.message-bubble"),
++    )
++
++    /** True when the user is signed in to this app's web chat (session cookie seen, or the last run got past the login wall). */
++    fun signedIn(spec: AiSpec): Boolean {
++        if (GroupPrefs.get("weblogin_${spec.id}") == "1") return true
++        if (spec.cookies.isEmpty()) return false
++        val url = GroupPrefs.get("base_${spec.id}") ?: spec.webUrl
++        val host = runCatching { java.net.URI(url).host }.getOrNull() ?: return false
++        val parts = host.split('.')
++        val root = if (parts.size > 2) parts.takeLast(2).joinToString(".") else host
++        val cm = CookieManager.getInstance()
++        return listOf(url, "https://$host/", "https://$root/", "https://www.$root/").any { u ->
++            MailParse.cookieHas(runCatching { cm.getCookie(u) }.getOrNull().orEmpty(), spec.cookies)
++        }
++    }
++
++    fun markSignedIn(id: String, on: Boolean) = GroupPrefs.put("weblogin_$id", if (on) "1" else null)
++
++    private class Held(val wv: WebView, var used: Long, val url: String)
++    private val held = HashMap<String, Held>()
++    private val locks = HashMap<String, Mutex>()
++    private fun lock(id: String) = synchronized(locks) { locks.getOrPut(id) { Mutex() } }
++
++    /** JS state probe: input found / login wall / page text length. */
++    private fun probeJs(site: Site) = """(function(){try{
++var W=innerWidth,H=innerHeight;function vis(e){if(!e)return false;var r=e.getBoundingClientRect();if(r.width<2||r.height<2)return false;var s=getComputedStyle(e);return s.display!='none'&&s.visibility!='hidden';}
++function pick(sel){if(!sel)return null;var l=document.querySelectorAll(sel),b=null;for(var i=0;i<l.length;i++){if(vis(l[i])&&!l[i].disabled){var r=l[i].getBoundingClientRect();if(!b||r.bottom>=b.getBoundingClientRect().bottom)b=l[i];}}return b;}
++var inp=pick(${JSONObject.quote(site.input)})||pick('textarea')||pick('[contenteditable="true"]');
++var t=(document.body&&document.body.innerText)||'';
++var login=!inp&&/登录|注册|Log in|Sign in|Sign up|手机号/.test(t.slice(0,4000));
++return JSON.stringify({input:!!inp,login:login,len:t.length});}catch(e){return JSON.stringify({input:false,login:false,len:0,err:String(e)})}})()"""
++
++    private fun sendJs(site: Site, q: String) = """(function(){try{
++function vis(e){if(!e)return false;var r=e.getBoundingClientRect();if(r.width<2||r.height<2)return false;var s=getComputedStyle(e);return s.display!='none'&&s.visibility!='hidden';}
++function pick(sel){if(!sel)return null;var l=document.querySelectorAll(sel),b=null;for(var i=0;i<l.length;i++){if(vis(l[i])&&!l[i].disabled){var r=l[i].getBoundingClientRect();if(!b||r.bottom>=b.getBoundingClientRect().bottom)b=l[i];}}return b;}
++var q=${JSONObject.quote(q)};
++var rs=${JSONObject.quote(site.reply)};window.__minesReplyCount=rs?document.querySelectorAll(rs).length:0;
++var inp=pick(${JSONObject.quote(site.input)})||pick('textarea')||pick('[contenteditable="true"]');
++if(!inp)return 'noinput';
++inp.focus();
++if(inp.tagName=='TEXTAREA'||inp.tagName=='INPUT'){var proto=inp.tagName=='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;
++Object.getOwnPropertyDescriptor(proto,'value').set.call(inp,q);inp.dispatchEvent(new Event('input',{bubbles:true}));inp.dispatchEvent(new Event('change',{bubbles:true}));}
++else{document.execCommand('selectAll',false,null);document.execCommand('insertText',false,q);if((inp.innerText||'').trim().length<2){inp.innerText=q;inp.dispatchEvent(new InputEvent('input',{bubbles:true,data:q}));}}
++window.__minesQ=q;
++setTimeout(function(){
++var b=pick(${JSONObject.quote(site.send)});
++if(!b){var bs=document.querySelectorAll('button,[role=button]');for(var i=bs.length-1;i>=0;i--){var x=bs[i];var a=((x.getAttribute('aria-label')||'')+' '+(x.getAttribute('data-testid')||'')+' '+(x.className||'')+' '+(x.innerText||'')).toLowerCase();
++if(vis(x)&&!x.disabled&&/send|发送|submit|提交/.test(a)){b=x;break;}}}
++if(b){b.click();}else{['keydown','keypress','keyup'].forEach(function(t){inp.dispatchEvent(new KeyboardEvent(t,{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true}));});}
++},400);
++return 'ok';}catch(e){return 'err:'+e}})()"""
++
++    private fun readJs(site: Site) = """(function(){try{
++var rs=${JSONObject.quote(site.reply)};var out='';
++if(rs){var l=document.querySelectorAll(rs);if(l.length>(window.__minesReplyCount||0))out=l[l.length-1].innerText||'';}
++if(!out){var t=(document.body&&document.body.innerText)||'';var q=window.__minesQ||'';var key=q.slice(-24);var i=key?t.lastIndexOf(key):-1;
++if(i>=0)out=t.slice(i+key.length);}
++var busy=!!document.querySelector('[aria-label*="停止"],[aria-label*="Stop"],[data-testid*="stop"],[class*="stop-button"],[class*="stopBtn"]');
++return JSON.stringify({text:out,busy:busy});}catch(e){return JSON.stringify({text:'',busy:false})}})()"""
++
++    private val uiNoise = setOf("复制", "重新生成", "分享", "点赞", "点踩", "编辑", "朗读", "Copy", "Regenerate", "Share", "Edit", "发送", "停止", "内容由 AI 生成")
++
++    private fun clean(t: String): String = t.lines().map { it.trim() }
++        .filter { it.isNotEmpty() && it !in uiNoise && !it.startsWith("内容由") && !it.contains("AI 生成") }
++        .joinToString("\n").trim()
++
++    @SuppressLint("SetJavaScriptEnabled")
++    private fun newView(context: Context): WebView {
++        val wv = WebView(context.applicationContext)
++        LoginWeb.configure(wv)
++        wv.webViewClient = WebViewClient()
++        // laid out off screen at a phone size so the page's own visibility checks see real boxes
++        val w = 1080; val h = 2200
++        wv.measure(android.view.View.MeasureSpec.makeMeasureSpec(w, android.view.View.MeasureSpec.EXACTLY),
++            android.view.View.MeasureSpec.makeMeasureSpec(h, android.view.View.MeasureSpec.EXACTLY))
++        wv.layout(0, 0, w, h)
++        return wv
++    }
++
++    private suspend fun eval(wv: WebView, js: String): String = suspendCancellableCoroutine { c ->
++        runCatching {
++            wv.evaluateJavascript(js) { r ->
++                val v = runCatching { org.json.JSONTokener(r ?: "\"\"").nextValue() as? String }.getOrNull().orEmpty()
++                if (c.isActive) c.resume(v)
++            }
++        }.onFailure { if (c.isActive) c.resume("") }
++    }
++
++    /** Asks [question] on the member's web chat; throws [MemberError] with a plain reason on a login wall / no reply. */
++    suspend fun ask(context: Context, p: Partner, question: String, timeoutMs: Long = 180_000): AiClient.Reply = lock(p.id).withLock {
++        val site = sites[p.id] ?: Site()
++        val url = p.base.ifBlank { p.spec.webUrl }
++        withContext(Dispatchers.Main) {
++            sweep()
++            var h = held[p.id]
++            if (h == null || h.url != url) {
++                h?.let { runCatching { it.wv.destroy() } }
++                val wv = newView(context)
++                wv.loadUrl(url)
++                h = Held(wv, System.currentTimeMillis(), url); held[p.id] = h
++            }
++            h.used = System.currentTimeMillis()
++            val wv = h.wv
++            // 1. wait for the chat box (or a login wall)
++            val t0 = System.currentTimeMillis()
++            var ready = false
++            var login = false
++            while (System.currentTimeMillis() - t0 < 30_000) {
++                delay(1000)
++                val o = runCatching { JSONObject(eval(wv, probeJs(site))) }.getOrNull() ?: continue
++                if (o.optBoolean("input")) { ready = true; break }
++                if (o.optBoolean("login") && System.currentTimeMillis() - t0 > 8000) { login = true; break }
++            }
++            if (!ready) {
++                held.remove(p.id)?.let { runCatching { it.wv.destroy() } }
++                if (login) { markSignedIn(p.id, false); throw MemberError("${p.spec.name} 要先登录：在「AI 伙伴」里点「登录」") }
++                throw MemberError("${p.spec.name} 网页没打开聊天框（可能改版或网络慢），这轮跳过")
++            }
++            markSignedIn(p.id, true)
++            // 2. type + send
++            val s = eval(wv, sendJs(site, question))
++            if (s != "ok") throw MemberError("${p.spec.name} 网页没法输入（$s）")
++            // 3. read until the reply stops growing
++            var last = ""; var same = 0
++            val t1 = System.currentTimeMillis()
++            while (System.currentTimeMillis() - t1 < timeoutMs) {
++                delay(1500)
++                val o = runCatching { JSONObject(eval(wv, readJs(site))) }.getOrNull() ?: continue
++                val txt = clean(o.optString("text"))
++                if (txt.isNotEmpty() && txt == last && !o.optBoolean("busy")) { same++; if (same >= 3) break } else same = 0
++                last = txt
++            }
++            h.used = System.currentTimeMillis()
++            LoginWeb.flush()
++            if (last.isBlank()) throw MemberError("${p.spec.name} ${timeoutMs / 60_000} 分钟内没回复，这轮跳过")
++            AiClient.Reply(last, model = "网页版")
++        }
++    }
++
++    /** Drops WebViews idle for 10 minutes (main thread). */
++    private fun sweep() {
++        val now = System.currentTimeMillis()
++        held.entries.filter { now - it.value.used > 600_000 }.forEach { runCatching { it.value.wv.destroy() }; held.remove(it.key) }
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/service/SessionActivityTracker.kt b/src/android/app/src/main/java/com/openminis/app/service/SessionActivityTracker.kt
 index 0b07d15..92d71e6 100644
 --- a/src/android/app/src/main/java/com/openminis/app/service/SessionActivityTracker.kt
@@ -2253,7 +2884,7 @@ index c4dada2..21417ad 100644
  import androidx.compose.runtime.DisposableEffect
  import androidx.compose.runtime.LaunchedEffect
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt
-index acf54a6..7f2dd2d 100644
+index acf54a6..5d853f5 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt
 @@ -2864,6 +2864,8 @@ fun ChatScreen(
@@ -2287,6 +2918,41 @@ index acf54a6..7f2dd2d 100644
              )
          },
          snackbarHost = { SnackbarHost(snackbarHostState) },
+@@ -4325,6 +4331,16 @@ fun ChatScreen(
+                             })
+                         }
+                     }
++                    // [Mines-38.6] item E: one AI reply = one design card. The reply is split into one list item per
++                    // markdown block; each block draws its own slice of the card (first = rounded top, last = rounded
++                    // bottom, middle = straight edges) so selection and per-item measuring are untouched.
++                    val minesCardSeg = HashMap<String, Int>()
++                    for (ci in flatItems.indices) {
++                        val cur = flatItems[ci] as? FlatChatItem.AssistantMarkdownBlock ?: continue
++                        val prev = flatItems.getOrNull(ci - 1) as? FlatChatItem.AssistantMarkdownBlock
++                        val next = flatItems.getOrNull(ci + 1) as? FlatChatItem.AssistantMarkdownBlock
++                        minesCardSeg[cur.key] = (if (prev?.messageId == cur.messageId) 0 else 1) or (if (next?.messageId == cur.messageId) 0 else 2)
++                    }
+                     items(
+                         items = flatItems.asReversed(),
+                         key = { it.key },
+@@ -4549,7 +4565,7 @@ fun ChatScreen(
+                                     )
+                                 }
+                             }
+-                            is FlatChatItem.AssistantMarkdownBlock -> BoundsTrackedBlock(
++                            is FlatChatItem.AssistantMarkdownBlock -> com.openminis.app.ui.plus.ReplyCardSlice(minesCardSeg[item.key] ?: 3) { BoundsTrackedBlock(
+                                 messageId = item.messageId,
+                                 slotKey = "mdblock:${item.parentBlockId}:${item.blockIndex}",
+                                 markdown = item.messageMarkdown,
+@@ -4571,7 +4587,7 @@ fun ChatScreen(
+                                         ),
+                                     )
+                                 }
+-                            }
++                            } }
+                             is FlatChatItem.AssistantThinking -> {
+                                 // T300: hide Deep Thinking block when the user
+                                 // currently has thinking turned off — even if
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreenHelpers.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreenHelpers.kt
 index 10d49aa..c97aac5 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreenHelpers.kt
@@ -2555,10 +3221,20 @@ index dc5c875..9480c27 100644
              modifier = Modifier.fillMaxWidth(),
          ) {
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/group/GroupScreens.kt b/src/android/app/src/main/java/com/openminis/app/ui/group/GroupScreens.kt
-index 2dbee20..27061ef 100644
+index 2dbee20..9aa92b3 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/group/GroupScreens.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/group/GroupScreens.kt
-@@ -84,6 +84,8 @@ import com.openminis.app.ui.plus.PlusRow
+@@ -69,6 +69,9 @@ import com.openminis.app.plus.group.Partners
+ import com.openminis.app.plus.group.PhoneApps
+ import com.openminis.app.plus.group.PhoneTyping
+ import com.openminis.app.plus.group.Proto
++import com.openminis.app.plus.group.Kind
++import com.openminis.app.plus.group.WebChat
++import com.openminis.app.plus.group.AiCatalog
+ import com.openminis.app.ui.brand.MinesIcon
+ import com.openminis.app.ui.brand.MinesIcons
+ import com.openminis.app.ui.plus.InfoLine
+@@ -84,6 +87,8 @@ import com.openminis.app.ui.plus.PlusRow
  import com.openminis.app.ui.plus.PlusSection
  import com.openminis.app.ui.plus.StatusPill
  import com.openminis.app.ui.plus.mines
@@ -2567,15 +3243,49 @@ index 2dbee20..27061ef 100644
  import com.openminis.app.ui.plus.minesGlassFill
  import kotlinx.coroutines.launch
  
-@@ -147,15 +149,16 @@ fun GroupHomeScreen(onBack: () -> Unit, go: (String) -> Unit) {
+@@ -94,14 +99,19 @@ object GroupRoutes {
+     const val NEW = "plus_group_new"
+     const val CHAT = "plus_group_chat/{id}"
+     fun chat(id: String) = "plus_group_chat/$id"
++    const val WEBLOGIN = "plus_group_weblogin/{id}"
++    fun webLogin(id: String) = "plus_group_weblogin/" + android.net.Uri.encode(id)
+ }
+ 
+ fun NavGraphBuilder.groupRoutes(nav: NavHostController) {
+     val back: () -> Unit = { nav.popBackStack() }
+     composable(GroupRoutes.HOME) { GroupHomeScreen(back, { nav.navigate(it) }) }
+-    composable(GroupRoutes.PARTNERS) { PartnersScreen(back) }
++    composable(GroupRoutes.PARTNERS) { PartnersScreen(back) { nav.navigate(it) } }
++    composable(GroupRoutes.WEBLOGIN, arguments = listOf(navArgument("id") { type = NavType.StringType })) { e ->
++        WebAppLoginScreen(e.arguments?.getString("id") ?: "", back)
++    }
+     composable(GroupRoutes.NEW) {
+-        NewGroupScreen(back) { id -> nav.navigate(GroupRoutes.chat(id)) { popUpTo(GroupRoutes.NEW) { inclusive = true } } }
++        NewGroupScreen(back, go = { nav.navigate(it) }) { id -> nav.navigate(GroupRoutes.chat(id)) { popUpTo(GroupRoutes.NEW) { inclusive = true } } }
+     }
+     composable(GroupRoutes.CHAT, arguments = listOf(navArgument("id") { type = NavType.StringType })) { e ->
+         GroupChatScreen(e.arguments?.getString("id") ?: "", back) { nav.navigate(GroupRoutes.PARTNERS) }
+@@ -126,7 +136,9 @@ fun PartnerAvatar(p: Partner?, who: String, name: String, size: Dp = 36.dp) {
+             .border(1.dp, m.hairline, CircleShape),
+         contentAlignment = Alignment.Center,
+     ) {
+-        if (spec != null && spec.icon != 0) Image(painterResource(spec.icon), contentDescription = null, modifier = Modifier.size(size * 0.6f))
++        if (spec?.iconUrl != null) coil.compose.AsyncImage(spec.iconUrl, contentDescription = null, modifier = Modifier.size(size).clip(CircleShape),
++            contentScale = androidx.compose.ui.layout.ContentScale.Crop)
++        else if (spec != null && spec.icon != 0) Image(painterResource(spec.icon), contentDescription = null, modifier = Modifier.size(size * 0.6f))
+         else Text(GroupRunner.shortName(name).take(1).uppercase(), fontSize = (size.value * 0.42f).sp, fontWeight = FontWeight.Bold, color = tint)
+     }
+ }
+@@ -147,15 +159,17 @@ fun GroupHomeScreen(onBack: () -> Unit, go: (String) -> Unit) {
      val partners by Partners.list.collectAsState()
      LaunchedEffect(Unit) { Partners.refresh(ctx) }
      val ready = partners.filter { it.ready }
 -    PlusPage("AI 群聊", onBack, subtitle = "把几个 AI 拉进一个群，一起讨论、互相补充，Mines 来主持") {
-+    PlusPage("AI 群聊", onBack, subtitle = "几个 AI 一起讨论，Mines 主持并总结") {
++    PlusPage("AI 群聊", onBack, subtitle = "智能体和 AI App 一起讨论，Mines 主持并总结") {
          PlusSection(null) {
 -            PlusRow(icon("sparkles"), "AI 伙伴", if (partners.isEmpty()) "正在识别…" else "${ready.size} 个能直接用 · 看看手机上哪些能接") { go(GroupRoutes.PARTNERS) }
-+            PlusRow(icon("sparkles"), "AI 伙伴", if (partners.isEmpty()) "正在识别…" else "${ready.size} 个能直接用") { go(GroupRoutes.PARTNERS) }
++            val readyMembers = ready.filter { it.spec.kind != Kind.MODEL }
++            PlusRow(icon("sparkles"), "AI 伙伴", if (partners.isEmpty()) "正在识别…" else "${readyMembers.size} 个智能体和 App 能直接用") { go(GroupRoutes.PARTNERS) }
          }
          PlusSection("我的群") {
              if (groups.isEmpty()) InfoLine("还没有群。点下面「新建群聊」，选几个 AI 就能开聊")
@@ -2587,19 +3297,126 @@ index 2dbee20..27061ef 100644
                      go(GroupRoutes.chat(g.id))
                  }
              }
-@@ -190,8 +193,8 @@ fun NewGroupScreen(onBack: () -> Unit, onCreated: (String) -> Unit) {
-                     PartnerAvatar(p, p.id, p.spec.name, 36.dp)
-                     Spacer(Modifier.width(12.dp))
-                     Column(Modifier.weight(1f)) {
+@@ -167,8 +181,13 @@ fun GroupHomeScreen(onBack: () -> Unit, go: (String) -> Unit) {
+ 
+ // ── 新建群 ───────────────────────────────────────────────────────────────
+ 
++/**
++ * [Mines-38.6] user 2026-10-15 「群聊我是要 app、AI agent 这些群聊，不是模型群聊」: members are picked from 智能体 and
++ * App 账号; bare model APIs sit folded under 「高级：直接用模型」. Members that still need a sign-in are listed with
++ * one tap to sign in.
++ */
+ @Composable
+-fun NewGroupScreen(onBack: () -> Unit, onCreated: (String) -> Unit) {
++fun NewGroupScreen(onBack: () -> Unit, go: (String) -> Unit = {}, onCreated: (String) -> Unit) {
+     val ctx = LocalContext.current
+     GroupStore.init(ctx)
+     val partners by Partners.list.collectAsState()
+@@ -177,25 +196,29 @@ fun NewGroupScreen(onBack: () -> Unit, onCreated: (String) -> Unit) {
+     var picked by remember { mutableStateOf(setOf<String>()) }
+     var host by remember { mutableStateOf(true) }
+     var seq by remember { mutableStateOf(true) }
+-    val m = mines()
++    var advanced by remember { mutableStateOf(false) }
+     PlusPage("新建群聊", onBack) {
+         OutlinedTextField(name, { name = it }, label = { Text("群名（可不填）") }, singleLine = true,
+             modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp))
+-        PlusSection("选成员", footer = "代打字的 App 很慢（每条 20–90 秒），会切到那个 App 里操作，可能中途断") {
+-            val ready = partners.filter { it.ready }
+-            if (ready.isEmpty()) InfoLine("还没有能用的 AI。去「AI 伙伴」连接一个")
+-            ready.forEach { p ->
+-                Row(Modifier.fillMaxWidth().heightIn(min = 60.dp).clickable { picked = if (p.id in picked) picked - p.id else picked + p.id }
+-                    .padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+-                    PartnerAvatar(p, p.id, p.spec.name, 36.dp)
+-                    Spacer(Modifier.width(12.dp))
+-                    Column(Modifier.weight(1f)) {
 -                        Text(p.spec.name, fontSize = 17.sp, fontWeight = FontWeight.Medium, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
 -                        Text(listOf(p.model, p.via).filter { it.isNotBlank() }.joinToString(" · "), fontSize = 14.sp, color = m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis)
-+                        Text(p.spec.name, fontSize = MT.Body, fontWeight = FontWeight.Medium, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
-+                        Text(listOf(p.model, p.via).filter { it.isNotBlank() }.joinToString(" · "), fontSize = MT.Sub, color = m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                     }
-                     if (p.spec.proto == Proto.PHONE) { Tag("慢", MinesDesign.Warning); Spacer(Modifier.width(6.dp)) }
-                     Checkbox(p.id in picked, { picked = if (it) picked + p.id else picked - p.id })
-@@ -216,126 +219,207 @@ fun NewGroupScreen(onBack: () -> Unit, onCreated: (String) -> Unit) {
+-                    }
+-                    if (p.spec.proto == Proto.PHONE) { Tag("慢", MinesDesign.Warning); Spacer(Modifier.width(6.dp)) }
+-                    Checkbox(p.id in picked, { picked = if (it) picked + p.id else picked - p.id })
+-                }
++        val agents = partners.filter { it.spec.kind == Kind.AGENT }
++        val apps = partners.filter { it.spec.kind == Kind.APP }
++        val models = partners.filter { it.spec.kind == Kind.MODEL && it.spec.proto != Proto.PHONE && it.ready }
++        val phone = partners.filter { it.spec.proto == Proto.PHONE && it.ready }
++        fun toggle(id: String) { picked = if (id in picked) picked - id else picked + id }
++        PlusSection("智能体", footer = "Manus 这类按任务做事的会慢一些，别的成员不用等它") {
++            if (agents.isEmpty()) InfoLine("正在识别…")
++            agents.sortedBy { if (it.ready) 0 else 1 }.forEach { p -> PickRow(p, p.id in picked, { toggle(p.id) }) { fixPartner(p, go) } }
++        }
++        PlusSection("App 账号", footer = "用你自己的账号登录网页版，Mines 替你提问、读回复，不需要密钥") {
++            apps.sortedBy { if (it.ready) 0 else 1 }.forEach { p -> PickRow(p, p.id in picked, { toggle(p.id) }) { fixPartner(p, go) } }
++        }
++        if (phone.isNotEmpty()) PlusSection("手机 App 代打字", footer = "很慢（每条 20–90 秒），会切到那个 App 里操作，可能中途断") {
++            phone.forEach { p -> PickRow(p, p.id in picked, { toggle(p.id) }) {} }
++        }
++        if (models.isNotEmpty()) {
++            FoldHeader("高级：直接用模型（${models.size}）", advanced) { advanced = !advanced }
++            if (advanced) PlusSection(null, footer = "只调模型接口，没有 App 里的记忆和工具") {
++                models.forEach { p -> PickRow(p, p.id in picked, { toggle(p.id) }) {} }
+             }
+         }
+         PlusSection("群设置") {
+@@ -214,128 +237,366 @@ fun NewGroupScreen(onBack: () -> Unit, onCreated: (String) -> Unit) {
+     }
+ }
  
++/** One selectable member: ready ones get a checkbox; ones needing sign-in get a 登录 / 连接 pill instead. */
++@Composable
++private fun PickRow(p: Partner, on: Boolean, onToggle: () -> Unit, onFix: () -> Unit) {
++    val m = mines()
++    Row(Modifier.fillMaxWidth().heightIn(min = 60.dp).then(if (p.ready) Modifier.clickable(onClick = onToggle) else Modifier)
++        .padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
++        PartnerAvatar(p, p.id, p.spec.name, 36.dp)
++        Spacer(Modifier.width(12.dp))
++        Column(Modifier.weight(1f)) {
++            Text(p.spec.name, fontSize = MT.Body, fontWeight = FontWeight.Medium, color = if (p.ready) m.ink else m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis)
++            Text(statusLine(p), fontSize = MT.Sub, color = m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis)
++        }
++        if (p.ready) {
++            if (p.spec.proto == Proto.PHONE || p.spec.proto == Proto.MANUS) { Tag("慢", MinesDesign.Warning); Spacer(Modifier.width(6.dp)) }
++            Checkbox(on, { onToggle() })
++        } else ActionPill(fixLabel(p), onFix)
++    }
++}
++
++/** Plain one-line status: 已登录 / 需登录 / 能用 / the reason. */
++private fun statusLine(p: Partner): String = when {
++    p.spec.proto == Proto.WEBAPP -> if (p.ready) "已登录 · 网页版" else "需登录"
++    p.spec.proto == Proto.MINES -> if (p.ready) "能用工具、查资料、读文件" else (p.reason ?: "还不能用")
++    p.ready && p.spec.kind == Kind.AGENT -> p.spec.note.ifBlank { "能用" }
++    p.ready -> listOf(p.model, p.via).filter { it.isNotBlank() }.joinToString(" · ")
++    else -> p.reason ?: p.spec.note.ifBlank { "还没连接" }
++}
++
++private fun fixLabel(p: Partner): String = when {
++    p.spec.proto == Proto.WEBAPP -> "登录"
++    p.reason?.contains("重新登录") == true -> "重新登录"
++    p.spec.proto == Proto.MINES -> "去设置"
++    p.spec.vaultKind != null -> "连接"
++    else -> "怎么接"
++}
++
++/** The one tap that makes a member usable: web sign-in, 账号连接 (扣子 / Manus), or the explanation dialog. */
++private fun fixPartner(p: Partner, go: (String) -> Unit, explain: (() -> Unit)? = null) {
++    when {
++        p.spec.proto == Proto.WEBAPP -> go(GroupRoutes.webLogin(p.id))
++        p.spec.vaultKind != null -> connect(p.spec.vaultKind)
++        else -> explain?.invoke()
++    }
++}
++
++@Composable
++private fun FoldHeader(text: String, open: Boolean, onClick: () -> Unit) {
++    val m = mines()
++    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(onClick = onClick).padding(horizontal = 24.dp, vertical = 8.dp)
++        .semantics { contentDescription = text }, verticalAlignment = Alignment.CenterVertically) {
++        Text(text, fontSize = MT.Section, fontWeight = FontWeight.SemiBold, color = m.ink2, modifier = Modifier.weight(1f))
++        MinesIcon(icon(if (open) "chevron-up" else "chevron-down"), null, tint = m.ink2, modifier = Modifier.size(18.dp))
++    }
++}
++
  // ── AI 伙伴 ──────────────────────────────────────────────────────────────
  
 +/** [Mines-38.5] one way to connect a service: the 账号连接 detail opens and 一键接入 starts at once (KeyAgent signs in, takes the key). */
@@ -2608,7 +3425,8 @@ index 2dbee20..27061ef 100644
 +}
 +
  @Composable
- fun PartnersScreen(onBack: () -> Unit) {
+-fun PartnersScreen(onBack: () -> Unit) {
++fun PartnersScreen(onBack: () -> Unit, go: (String) -> Unit = {}) {
      val ctx = LocalContext.current
      GroupStore.init(ctx)
      val partners by Partners.list.collectAsState()
@@ -2616,12 +3434,12 @@ index 2dbee20..27061ef 100644
 +    val vault by com.openminis.app.plus.PlusVault.entries.collectAsState()
      val scope = rememberCoroutineScope()
      var edit by remember { mutableStateOf<Partner?>(null) }
++    var info by remember { mutableStateOf<Partner?>(null) }
      var askPhone by remember { mutableStateOf<Partner?>(null) }
      var addCustom by remember { mutableStateOf(false) }
++    var advanced by remember { mutableStateOf(false) }
      var busy by remember { mutableStateOf(true) }
 -    LaunchedEffect(Unit) { Partners.refresh(ctx, rescanApps = true); busy = false }
-+    // [Mines-38.5] root cause of 「连接了又说没 key」: this list was read ONCE when the page first opened; coming back from
-+    // 账号连接 after 一键接入 showed the old snapshot. It now re-reads whenever the vault changes and on every resume.
 +    LaunchedEffect(vault.keys.joinToString(",") + vault.values.sumOf { it.updatedAt }) { Partners.refresh(ctx, rescanApps = busy); busy = false }
 +    val owner = androidx.lifecycle.compose.LocalLifecycleOwner.current
 +    androidx.compose.runtime.DisposableEffect(owner) {
@@ -2631,35 +3449,31 @@ index 2dbee20..27061ef 100644
 +    }
      val m = mines()
      fun reload() = scope.launch { Partners.refresh(ctx) }
++    fun chat(p: Partner) { go(GroupRoutes.chat(GroupStore.direct(p.id, p.spec.name).id)) }
  
 -    PlusPage("AI 伙伴", onBack, subtitle = "已连接的密钥自动识别；没有的点「连接」，Mines 帮你去官网一键获取",
-+    PlusPage("AI 伙伴", onBack, subtitle = "连好的直接能用；没连的点「一键连接」，Mines 帮你登录拿钥匙",
++    PlusPage("AI 伙伴", onBack, subtitle = "智能体和你登录过的 AI App；点「聊天」直接聊，也能拉进群",
          actions = { if (busy) CircularProgressIndicator(Modifier.size(22.dp).padding(end = 4.dp), strokeWidth = 2.dp) }) {
-         val api = partners.filter { it.spec.proto != Proto.PHONE }
-         val ready = api.filter { it.ready }
-+        val readyIds = ready.map { it.id }.toSet()
-         val notYet = api.filter { !it.ready }
+-        val api = partners.filter { it.spec.proto != Proto.PHONE }
+-        val ready = api.filter { it.ready }
+-        val notYet = api.filter { !it.ready }
 -        PlusSection("能直接用（${ready.size}）", footer = "点一个可以换模型") {
 -            if (ready.isEmpty() && !busy) InfoLine("还没有。下面点「连接」，或在模型组里加一个服务")
 -            ready.forEach { p -> PartnerRow(p, onClick = { edit = p }) }
-+        PlusSection("能直接用 · ${ready.size}", footer = if (ready.isNotEmpty()) "点一个可以换模型" else null) {
-+            if (ready.isEmpty() && !busy) InfoLine("还没有。下面点「一键连接」")
-+            ready.forEachIndexed { i, p ->
++        val agents = partners.filter { it.spec.kind == Kind.AGENT }.sortedBy { if (it.ready) 0 else 1 }
++        val webApps = partners.filter { it.spec.kind == Kind.APP }.sortedBy { if (it.ready) 0 else 1 }
++        PlusSection("智能体 · ${agents.count { it.ready }} 个能用") {
++            if (agents.isEmpty()) InfoLine("正在识别…")
++            agents.forEachIndexed { i, p ->
 +                if (i > 0) com.openminis.app.ui.plus.WarmDivider(68.dp)
-+                PartnerRow(p, onClick = { edit = p })
++                PartnerRow(p, onClick = { info = p }, trailing = {
++                    if (p.ready) ActionPill("聊天") { chat(p) } else ActionPill(fixLabel(p)) { fixPartner(p, go) { edit = p } }
++                })
 +            }
          }
 -        PlusSection("还没连接") {
 -            notYet.forEach { p ->
-+        if (notYet.isNotEmpty()) PlusSection("还没连接 · ${notYet.size}") {
-+            notYet.forEachIndexed { i, p ->
-+                if (i > 0) com.openminis.app.ui.plus.WarmDivider(68.dp)
-+                val label = when {
-+                    p.spec.proto == Proto.COZE && p.key != null -> "选智能体"
-+                    p.spec.vaultKind != null -> "一键连接"
-+                    else -> "怎么接"
-+                }
-                 PartnerRow(p, trailing = {
+-                PartnerRow(p, trailing = {
 -                    Text(if (p.spec.vaultKind != null) "连接" else "去设置", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = m.onPrimary,
 -                        modifier = Modifier.clip(RoundedCornerShape(50)).background(m.primary)
 -                            .clickable {
@@ -2669,25 +3483,21 @@ index 2dbee20..27061ef 100644
 -                                    else -> PlusNav.go("providers")
 -                                }
 -                            }.padding(horizontal = 14.dp, vertical = 8.dp))
-+                    ActionPill(label) {
-+                        when {
-+                            p.spec.proto == Proto.COZE && p.key != null -> edit = p
-+                            p.spec.vaultKind != null -> connect(p.spec.vaultKind)
-+                            else -> edit = p
-+                        }
-+                    }
++        PlusSection("App 账号 · ${webApps.count { it.ready }} 个已登录", footer = "登录一次网页版就行；手机 App 里的登录和这里是分开的") {
++            webApps.forEachIndexed { i, p ->
++                if (i > 0) com.openminis.app.ui.plus.WarmDivider(68.dp)
++                PartnerRow(p, onClick = { info = p }, trailing = {
++                    if (p.ready) ActionPill("聊天") { chat(p) } else ActionPill("登录") { go(GroupRoutes.webLogin(p.id)) }
                  })
              }
          }
 -        PlusSection("手机上的 AI App", footer = "「代打字」= Mines 用无障碍替你在那个 App 里打字、读回复。慢、可能断，默认关闭。微信、QQ 不做：没有个人号官方接口，自动收发会触发风控封号。") {
 -            if (apps.isEmpty()) InfoLine(if (busy) "正在扫描…" else "没找到已安装的 AI App")
 -            apps.forEach { f ->
-+        // [Mines-38.5] 「app 能接又没给接」: API apps get a real 一键连接 button; ones already usable are not listed again;
-+        // several apps of one provider (Grok / Grok Bot / Grok2API …) collapse into one row.
-+        val appRows = apps.filter { f -> f.known.verdict != PhoneApps.Verdict.API || (f.known.partner != null && f.known.partner !in readyIds) }
-+            .distinctBy { f -> f.known.partner ?: f.pkg }
-+        if (appRows.isNotEmpty() || busy) PlusSection("手机上的 AI App", footer = "「代打字」= Mines 用无障碍替你在那个 App 里打字、读回复，慢、可能断，默认关闭。微信、QQ 不做：自动收发会触发风控封号。") {
-+            if (appRows.isEmpty()) InfoLine("正在扫描…")
++        // phone apps that can only be driven by 代打字 (or not at all)
++        val readyIds = partners.filter { it.ready }.map { it.id }.toSet()
++        val appRows = apps.filter { f -> f.known.verdict != PhoneApps.Verdict.API }.distinctBy { f -> f.known.partner ?: f.pkg }
++        if (appRows.isNotEmpty()) PlusSection("手机上的 AI App", footer = "「代打字」= Mines 用无障碍替你在那个 App 里打字、读回复，慢、可能断，默认关闭。微信、QQ 不做：自动收发会触发风控封号。") {
 +            appRows.forEachIndexed { i, f ->
 +                if (i > 0) com.openminis.app.ui.plus.WarmDivider(16.dp)
                  val v = f.known.verdict
@@ -2700,13 +3510,10 @@ index 2dbee20..27061ef 100644
                  val phoneId = PhoneApps.idFor(f.pkg)
                  val on = partners.firstOrNull { it.id == phoneId }?.ready == true
 -                Row(Modifier.fillMaxWidth().heightIn(min = 64.dp).padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-+                val kind = f.known.partner?.let { com.openminis.app.plus.group.AiCatalog.spec(it)?.vaultKind }
-+                val name = if (v == PhoneApps.Verdict.API) f.known.name else f.label
 +                val status = when (v) {
-+                    PhoneApps.Verdict.API -> f.known.reason
 +                    PhoneApps.Verdict.TYPING -> if (on) "已开代打字 · 慢、可能断" else "可以代打字（慢、可能断）"
-+                    PhoneApps.Verdict.INDIRECT -> f.known.reason
 +                    PhoneApps.Verdict.NO -> "接不了：" + f.known.reason
++                    else -> f.known.reason
 +                }
 +                Row(Modifier.fillMaxWidth().heightIn(min = 60.dp).padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
                      Column(Modifier.weight(1f)) {
@@ -2716,31 +3523,71 @@ index 2dbee20..27061ef 100644
 -                            Spacer(Modifier.width(8.dp)); Tag(v.label, tone)
 -                        }
 -                        Text(f.known.reason, fontSize = 14.sp, lineHeight = 19.sp, color = m.ink2)
-+                        Text(name, fontSize = MT.Body, fontWeight = FontWeight.Medium, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
-+                        Text(status, fontSize = MT.Sub, lineHeight = MT.SubLH, color = if (v == PhoneApps.Verdict.NO) m.ink3 else m.ink2, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                     }
+-                    }
 -                    if (v == PhoneApps.Verdict.TYPING) {
 -                        Spacer(Modifier.width(8.dp))
 -                        Switch(on, { want ->
-+                    Spacer(Modifier.width(MS.M))
-+                    when {
-+                        v == PhoneApps.Verdict.API && kind != null -> ActionPill("一键连接") { connect(kind) }
-+                        v == PhoneApps.Verdict.API && f.known.partner == "workbuddy" -> ActionPill("重新检测") { reload() }
-+                        v == PhoneApps.Verdict.TYPING -> Switch(on, { want ->
-                             if (want) askPhone = partners.firstOrNull { it.id == phoneId }
-                             else { GroupPrefs.setPhoneOn(phoneId, false); reload() }
-                         })
-+                        else -> {}
+-                            if (want) askPhone = partners.firstOrNull { it.id == phoneId }
+-                            else { GroupPrefs.setPhoneOn(phoneId, false); reload() }
+-                        })
++                        Text(f.label, fontSize = MT.Body, fontWeight = FontWeight.Medium, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
++                        Text(status, fontSize = MT.Sub, lineHeight = MT.SubLH, color = if (v == PhoneApps.Verdict.NO) m.ink3 else m.ink2, maxLines = 2, overflow = TextOverflow.Ellipsis)
                      }
++                    Spacer(Modifier.width(MS.M))
++                    if (v == PhoneApps.Verdict.TYPING) Switch(on, { want ->
++                        if (want) askPhone = partners.firstOrNull { it.id == phoneId }
++                        else { GroupPrefs.setPhoneOn(phoneId, false); reload() }
++                    })
                  }
              }
          }
-         PlusSection("自定义") {
+-        PlusSection("自定义") {
 -            PlusRow(icon("plus"), "添加 OpenAI 兼容接口", "自建中继、公司网关等：填地址、密钥和模型") { addCustom = true }
-+            PlusRow(icon("plus"), "添加自己的接口", "自建中继、公司网关") { addCustom = true }
++        // bare model APIs: folded, closed by default
++        val api = partners.filter { it.spec.kind == Kind.MODEL && it.spec.proto != Proto.PHONE }
++        FoldHeader("高级：直接用模型（${api.count { it.ready }} 个能用）", advanced) { advanced = !advanced }
++        if (advanced) {
++            val ready = api.filter { it.ready }
++            val notYet = api.filter { !it.ready }
++            PlusSection("能直接用 · ${ready.size}", footer = if (ready.isNotEmpty()) "点一个可以换模型" else null) {
++                if (ready.isEmpty() && !busy) InfoLine("还没有。下面点「一键连接」")
++                ready.forEachIndexed { i, p ->
++                    if (i > 0) com.openminis.app.ui.plus.WarmDivider(68.dp)
++                    PartnerRow(p, onClick = { edit = p })
++                }
++            }
++            if (notYet.isNotEmpty()) PlusSection("还没连接 · ${notYet.size}") {
++                notYet.forEachIndexed { i, p ->
++                    if (i > 0) com.openminis.app.ui.plus.WarmDivider(68.dp)
++                    PartnerRow(p, trailing = {
++                        ActionPill(if (p.spec.vaultKind != null) "一键连接" else "怎么接") { if (p.spec.vaultKind != null) connect(p.spec.vaultKind) else edit = p }
++                    })
++                }
++            }
++            val apiApps = apps.filter { f -> f.known.verdict == PhoneApps.Verdict.API && f.known.partner != null && f.known.partner !in readyIds }
++                .distinctBy { it.known.partner }
++            if (apiApps.isNotEmpty()) PlusSection("手机上有、可用接口连接的") {
++                apiApps.forEachIndexed { i, f ->
++                    if (i > 0) com.openminis.app.ui.plus.WarmDivider(16.dp)
++                    val kind = f.known.partner?.let { AiCatalog.spec(it)?.vaultKind }
++                    Row(Modifier.fillMaxWidth().heightIn(min = 60.dp).padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
++                        Column(Modifier.weight(1f)) {
++                            Text(f.known.name, fontSize = MT.Body, fontWeight = FontWeight.Medium, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
++                            Text(f.known.reason, fontSize = MT.Sub, lineHeight = MT.SubLH, color = m.ink2, maxLines = 2, overflow = TextOverflow.Ellipsis)
++                        }
++                        Spacer(Modifier.width(MS.M))
++                        if (kind != null) ActionPill("一键连接") { connect(kind) }
++                    }
++                }
++            }
++            PlusSection("自定义") {
++                PlusRow(icon("plus"), "添加自己的接口", "自建中继、公司网关") { addCustom = true }
++            }
          }
      }
  
++    info?.let { p -> PartnerInfoDialog(p, onDismiss = { info = null }, onChat = { info = null; chat(p) },
++        onFix = { info = null; fixPartner(p, go) { edit = p } }) }
      edit?.let { p ->
 -        var model by remember(p.id) { mutableStateOf(GroupPrefs.model(p.id) ?: "") }
 -        var bot by remember(p.id) { mutableStateOf(GroupPrefs.bot(p.id) ?: "") }
@@ -2786,18 +3633,99 @@ index 2dbee20..27061ef 100644
 -                    OutlinedTextField(b, { b = it }, label = { Text("地址，如 https://x.com/v1") }, singleLine = true)
 -                    OutlinedTextField(k, { k = it }, label = { Text("密钥（可空）") }, singleLine = true)
 -                    OutlinedTextField(md, { md = it }, label = { Text("模型") }, singleLine = true)
--                }
--            },
--            confirmButton = { TextButton({
--                if (b.startsWith("http")) { GroupPrefs.addCustom(n.ifBlank { "自定义" }, b, k, md); addCustom = false; reload() }
--            }) { Text("添加") } },
--            dismissButton = { TextButton({ addCustom = false }) { Text("取消") } })
 +        com.openminis.app.ui.plus.MinesDialog("添加接口", onDismiss = { addCustom = false }, confirm = "添加", confirmEnabled = b.startsWith("http"),
 +            onConfirm = { GroupPrefs.addCustom(n.ifBlank { "自定义" }, b, k, md); addCustom = false; reload() }) {
 +            OutlinedTextField(n, { n = it }, label = { Text("名字") }, singleLine = true, modifier = Modifier.fillMaxWidth())
 +            OutlinedTextField(b, { b = it }, label = { Text("地址，如 https://x.com/v1") }, singleLine = true, modifier = Modifier.fillMaxWidth())
 +            OutlinedTextField(k, { k = it }, label = { Text("密钥（可空）") }, singleLine = true, modifier = Modifier.fillMaxWidth())
 +            OutlinedTextField(md, { md = it }, label = { Text("模型（可空，自动选）") }, singleLine = true, modifier = Modifier.fillMaxWidth())
++        }
++    }
++}
++
++/**
++ * [Mines-38.6] What an agent / app is, in plain words, with 「直接聊」 / the one fix; Bot ID, address and the like only
++ * under 「详情」 (folded).
++ */
++@Composable
++private fun PartnerInfoDialog(p: Partner, onDismiss: () -> Unit, onChat: () -> Unit, onFix: () -> Unit) {
++    val m = mines()
++    var open by remember(p.id) { mutableStateOf(false) }
++    com.openminis.app.ui.plus.MinesDialog(p.spec.name, onDismiss = onDismiss,
++        confirm = if (p.ready) "直接聊" else fixLabel(p), onConfirm = { if (p.ready) onChat() else onFix() }, dismiss = "关闭") {
++        Row(verticalAlignment = Alignment.CenterVertically) {
++            PartnerAvatar(p, p.id, p.spec.name, 44.dp)
++            Spacer(Modifier.width(12.dp))
++            Text(statusLine(p), fontSize = MT.Body, lineHeight = MT.BodyLH, color = m.ink)
++        }
++        if (p.spec.note.isNotBlank() && statusLine(p) != p.spec.note) Text(p.spec.note, fontSize = MT.Sub, lineHeight = MT.SubLH, color = m.ink2)
++        if (p.reason?.contains("重新登录") == true) com.openminis.app.ui.plus.GlassTextButton("重新登录") { onFix() }
++        com.openminis.app.ui.plus.GlassTextButton(if (open) "收起详情" else "详情") { open = !open }
++        if (open) SelectionContainer {
++            val lines = buildList {
++                if (p.id.startsWith("coze:")) add("Bot ID：" + p.id.removePrefix("coze:"))
++                if (p.base.isNotBlank()) add("地址：" + p.base)
++                if (p.model.isNotBlank()) add("模型 / 档位：" + p.model)
++                if (p.via.isNotBlank()) add("来源：" + p.via)
++                if (p.key != null) add("令牌：••••" + p.key.takeLast(4))
++            }
++            Text(lines.joinToString("\n"), fontSize = MT.Meta, lineHeight = 17.sp, color = m.ink2)
++        }
++    }
++}
++
++/**
++ * [Mines-38.6] Sign in to an AI app's web chat once: full-screen page in the shared cookie store; 「登录好了」 checks that
++ * the chat box shows (no login wall) and marks the app 已登录.
++ */
++@Composable
++fun WebAppLoginScreen(id: String, onBack: () -> Unit) {
++    val ctx = LocalContext.current
++    val spec = AiCatalog.spec(id)
++    val m = mines()
++    if (spec == null) { PlusPage("登录", onBack) { InfoLine("找不到这个 App") }; return }
++    val url = GroupPrefs.get("base_${spec.id}") ?: spec.webUrl
++    var web by remember { mutableStateOf<android.webkit.WebView?>(null) }
++    var note by remember { mutableStateOf("在下面登录你的 ${spec.name} 账号，好了点右上「登录好了」") }
++    val scope = rememberCoroutineScope()
++    Box(Modifier.fillMaxSize()) {
++        MinesBackdrop(Modifier.fillMaxSize())
++        Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().imePadding()) {
++            Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
++                Box(Modifier.size(48.dp).clip(CircleShape).clickable(onClick = onBack).semantics { contentDescription = "返回" }, contentAlignment = Alignment.Center) {
++                    MinesIcon(icon("arrow-left"), null, tint = m.ink)
+                 }
+-            },
+-            confirmButton = { TextButton({
+-                if (b.startsWith("http")) { GroupPrefs.addCustom(n.ifBlank { "自定义" }, b, k, md); addCustom = false; reload() }
+-            }) { Text("添加") } },
+-            dismissButton = { TextButton({ addCustom = false }) { Text("取消") } })
++                Text("登录 ${spec.name}", fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
++                ActionPill("登录好了") {
++                    val w = web ?: return@ActionPill
++                    w.evaluateJavascript("(function(){var t=(document.body&&document.body.innerText)||'';var i=document.querySelector('textarea,[contenteditable=\"true\"]');return (i?'input':'none')+'|'+(/登录|Log in|Sign in/.test(t.slice(0,3000))?'login':'');})()") { r ->
++                        val v = r.orEmpty()
++                        val ok = v.contains("input") && !(v.contains("login") && !WebChat.signedIn(spec))
++                        com.openminis.app.plus.LoginWeb.flush()
++                        if (ok || WebChat.signedIn(spec)) {
++                            WebChat.markSignedIn(spec.id, true)
++                            scope.launch { Partners.refresh(ctx) }
++                            onBack()
++                        } else note = "还没看到聊天框，像是还没登录完。登录后再点一次"
++                    }
++                }
++                Spacer(Modifier.width(8.dp))
++            }
++            Text(note, fontSize = MT.Sub, color = m.ink2, modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp))
++            androidx.compose.ui.viewinterop.AndroidView(factory = { c ->
++                android.webkit.WebView(c).also { w ->
++                    com.openminis.app.plus.LoginWeb.configure(w)
++                    w.webViewClient = object : android.webkit.WebViewClient() {
++                        override fun onPageFinished(view: android.webkit.WebView, u: String) { com.openminis.app.plus.LoginWeb.flush() }
++                    }
++                    w.loadUrl(url); web = w
++                }
++            }, modifier = Modifier.fillMaxWidth().weight(1f), onRelease = { runCatching { it.destroy() } })
 +        }
 +    }
 +}
@@ -2878,7 +3806,7 @@ index 2dbee20..27061ef 100644
      }
  }
  
-@@ -345,17 +429,20 @@ private fun PartnerRow(p: Partner, onClick: (() -> Unit)? = null, trailing: (@Co
+@@ -345,17 +606,20 @@ private fun PartnerRow(p: Partner, onClick: (() -> Unit)? = null, trailing: (@Co
      Row(Modifier.fillMaxWidth().heightIn(min = 64.dp).then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
          .padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
          PartnerAvatar(p, p.id, p.spec.name, 40.dp)
@@ -2908,7 +3836,7 @@ index 2dbee20..27061ef 100644
      }
  }
  
-@@ -395,12 +482,12 @@ fun GroupChatScreen(gid: String, onBack: () -> Unit, onPartners: () -> Unit) {
+@@ -395,12 +659,12 @@ fun GroupChatScreen(gid: String, onBack: () -> Unit, onPartners: () -> Unit) {
                      MinesIcon(icon("arrow-left"), null, tint = m.ink)
                  }
                  Column(Modifier.weight(1f)) {
@@ -2925,7 +3853,7 @@ index 2dbee20..27061ef 100644
                      modifier = Modifier.clip(RoundedCornerShape(50)).clickable(enabled = !busy && msgs.isNotEmpty()) { GroupRunner.summarize(ctx, gid) }
                          .padding(horizontal = 12.dp, vertical = 10.dp))
                  Box(Modifier.size(48.dp).clip(CircleShape).clickable { menu = true }.semantics { contentDescription = "更多" }, contentAlignment = Alignment.Center) {
-@@ -423,8 +510,8 @@ fun GroupChatScreen(gid: String, onBack: () -> Unit, onPartners: () -> Unit) {
+@@ -423,8 +687,8 @@ fun GroupChatScreen(gid: String, onBack: () -> Unit, onPartners: () -> Unit) {
                  if (msgs.isEmpty()) item {
                      MinesCard(Modifier.fillMaxWidth()) {
                          Column(Modifier.padding(18.dp)) {
@@ -2936,7 +3864,7 @@ index 2dbee20..27061ef 100644
                          }
                      }
                  }
-@@ -435,14 +522,14 @@ fun GroupChatScreen(gid: String, onBack: () -> Unit, onPartners: () -> Unit) {
+@@ -435,14 +699,14 @@ fun GroupChatScreen(gid: String, onBack: () -> Unit, onPartners: () -> Unit) {
              }
              // input
              Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)
@@ -2954,7 +3882,7 @@ index 2dbee20..27061ef 100644
                  val canSend = input.isNotBlank()
                  Box(Modifier.size(44.dp).clip(CircleShape).background(if (busy) MinesDesign.DangerFill else if (canSend) m.primary else m.ink3.copy(alpha = 0.3f))
                      .clickable(enabled = busy || canSend) {
-@@ -481,15 +568,15 @@ private fun fmtTok(n: Int) = if (n >= 10_000) String.format("%.1f万", n / 10_00
+@@ -481,15 +745,15 @@ private fun fmtTok(n: Int) = if (n >= 10_000) String.format("%.1f万", n / 10_00
  @Composable
  private fun MemberChip(p: Partner?, who: String, name: String, badge: String?, onClick: () -> Unit) {
      val m = mines()
@@ -2975,7 +3903,7 @@ index 2dbee20..27061ef 100644
          }
      }
  }
-@@ -500,51 +587,98 @@ private fun Bubble(msg: GroupMsg, p: Partner?, onRetry: () -> Unit, onFix: () ->
+@@ -500,51 +764,140 @@ private fun Bubble(msg: GroupMsg, p: Partner?, onRetry: () -> Unit, onFix: () ->
      if (msg.who == "user") {
          Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
              SelectionContainer {
@@ -2993,17 +3921,20 @@ index 2dbee20..27061ef 100644
 +        Row(Modifier.fillMaxWidth().padding(start = 4.dp), verticalAlignment = Alignment.CenterVertically) {
 +            PartnerAvatar(p, msg.who, msg.name, 24.dp)
 +            Spacer(Modifier.width(8.dp))
-+            Text(GroupRunner.shortName(msg.name) + if (msg.status == "skip") " · 没连接，这轮跳过" else " · 已停止",
++            Text(GroupRunner.shortName(msg.name) + if (msg.status == "skip") (if (msg.detail == "需登录") " · 需登录，这轮跳过" else " · 没连接，这轮跳过") else " · 已停止",
 +                fontSize = MT.Meta, color = m.ink3, maxLines = 1, overflow = TextOverflow.Ellipsis)
 +        }
 +        return
 +    }
++    // [Mines-38.6] the 讨论总结 bubble takes the full width (it read as a narrow column of short lines)
++    val wide = msg.kind == "summary" && msg.status == "ok"
      Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
 -        PartnerAvatar(p, msg.who, msg.name, 36.dp)
 -        Spacer(Modifier.width(8.dp))
+-        Column(Modifier.weight(1f, fill = false).widthIn(max = 320.dp)) {
 +        PartnerAvatar(p, msg.who, msg.name, 34.dp)
 +        Spacer(Modifier.width(MS.S))
-         Column(Modifier.weight(1f, fill = false).widthIn(max = 320.dp)) {
++        Column(if (wide) Modifier.weight(1f) else Modifier.weight(1f, fill = false).widthIn(max = 320.dp)) {
 +            // name (14 sp SemiBold ink) + model (12 sp ink3, one line) — same hierarchy as the member chips
              Row(verticalAlignment = Alignment.CenterVertically) {
 -                Text(if (msg.who == GroupStore.HOST) "Mines · 主持" else msg.name, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = m.ink, maxLines = 1)
@@ -3024,19 +3955,27 @@ index 2dbee20..27061ef 100644
 -                        CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
 -                        Spacer(Modifier.width(8.dp))
 -                        Text(if (p?.spec?.proto == Proto.PHONE) "正在 ${p.spec.name} 里代打字…" else "正在想…", fontSize = 15.sp, color = m.ink2)
--                    }
--                    "error" -> {
--                        Text("没回上：" + msg.text, fontSize = 15.sp, lineHeight = 21.sp, color = MinesDesign.Danger)
--                        Row {
--                            if (canRetry) TextButton(onRetry) { Text("重试") }
--                            if (msg.text.contains("密钥") || msg.text.contains("连接") || msg.text.contains("余额") || msg.text.contains("模型")) TextButton(onFix) { Text("去设置") }
 +            val shape = RoundedCornerShape(6.dp, 18.dp, 18.dp, 18.dp)
 +            when (msg.status) {
 +                "pending" -> Row(Modifier.clip(shape).background(minesGlassFill(strong = true)).padding(horizontal = 14.dp, vertical = 10.dp),
 +                    verticalAlignment = Alignment.CenterVertically) {
 +                    CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
 +                    Spacer(Modifier.width(8.dp))
-+                    Text(if (p?.spec?.proto == Proto.PHONE) "正在 ${p.spec.name} 里代打字…" else if (msg.kind == "summary") "正在总结…" else "正在想…", fontSize = MT.Sub, color = m.ink2)
++                    // [Mines-38.6] slow agents: 「正在思考… 12 秒」, and after 40 s a calm note that nobody waits for it
++                    val sec by androidx.compose.runtime.produceState(((System.currentTimeMillis() - msg.at) / 1000).toInt(), msg.id) {
++                        while (true) { kotlinx.coroutines.delay(1000); value = ((System.currentTimeMillis() - msg.at) / 1000).toInt() }
++                    }
++                    val slow = p?.spec?.proto == Proto.MANUS || p?.spec?.proto == Proto.WEBAPP || p?.spec?.proto == Proto.MINES
++                    Column {
++                        Text((if (p?.spec?.proto == Proto.PHONE) "正在 ${p.spec.name} 里代打字…" else if (msg.kind == "summary") "正在总结…" else "正在思考…") +
++                            if (sec >= 3) " $sec 秒" else "", fontSize = MT.Sub, color = m.ink2)
++                        if (slow && sec >= 40) Text("${GroupRunner.shortName(msg.name)} 回得慢，别的成员不用等它", fontSize = MT.Meta, color = m.ink3)
+                     }
+-                    "error" -> {
+-                        Text("没回上：" + msg.text, fontSize = 15.sp, lineHeight = 21.sp, color = MinesDesign.Danger)
+-                        Row {
+-                            if (canRetry) TextButton(onRetry) { Text("重试") }
+-                            if (msg.text.contains("密钥") || msg.text.contains("连接") || msg.text.contains("余额") || msg.text.contains("模型")) TextButton(onFix) { Text("去设置") }
 +                }
 +                "error" -> {
 +                    // compact one-line error: friendly Chinese, actions inline, the raw server text folded under 「详情」
@@ -3067,8 +4006,10 @@ index 2dbee20..27061ef 100644
 +                    val summary = msg.kind == "summary"
 +                    Column(Modifier.clip(shape).background(if (isHost && msg.kind.isNotEmpty()) m.container.copy(alpha = if (m.dark) 0.5f else 0.7f) else minesGlassFill(strong = true))
 +                        .border(1.dp, m.glassBorder, shape).padding(horizontal = 14.dp, vertical = 10.dp)) {
-+                        if (summary) Text("讨论总结", fontSize = MT.Section, fontWeight = FontWeight.SemiBold, color = m.primaryText, modifier = Modifier.padding(bottom = 4.dp))
-+                        SelectionContainer { Text(if (summary) prettySummary(msg.text) else msg.text, fontSize = MT.Body, lineHeight = MT.BodyLH, color = m.ink) }
++                        if (summary) {
++                            Text("讨论总结", fontSize = MT.Section, fontWeight = FontWeight.SemiBold, color = m.primaryText, modifier = Modifier.padding(bottom = 2.dp))
++                            SelectionContainer { SummaryBody(msg.text) }
++                        } else SelectionContainer { Text(msg.text, fontSize = MT.Body, lineHeight = MT.BodyLH, color = m.ink) }
 +                    }
 +                    val meta = listOfNotNull(msg.detail.ifBlank { null }, if (msg.ms > 0) "%.1f 秒".format(msg.ms / 1000.0) else null,
 +                        if (msg.inTok + msg.outTok > 0) "${msg.inTok + msg.outTok} tokens" else null).joinToString(" · ")
@@ -3093,6 +4034,35 @@ index 2dbee20..27061ef 100644
 +        x.startsWith("模型不存在") || x.contains("does not exist") -> "模型不可用，可在成员设置换模型"
 +        x.contains("429") || x.contains("限流") -> "现在太忙（被限流），稍后重试"
 +        else -> x.substringBefore("：http").substringBefore("（HTTP").take(60)
++    }
++}
++
++/**
++ * [Mines-38.6] structured summary: each 「## 结论」/「【结论】」 heading becomes a small terracotta sub-title with its points as
++ * body text under it (not one 【】 line per item).
++ */
++@Composable
++private fun SummaryBody(t: String) {
++    val m = mines()
++    data class Sec(val title: String?, val body: MutableList<String> = mutableListOf())
++    val secs = mutableListOf(Sec(null))
++    for (raw in t.lines()) {
++        val l = raw.trim()
++        if (l.isEmpty()) continue
++        val h = when {
++            l.startsWith("#") -> l.trimStart('#').trim()
++            l.startsWith("【") && l.indexOf('】') in 1..12 && l.substringAfter('】').isBlank() -> l.removePrefix("【").substringBefore('】')
++            l.endsWith("：") && l.length <= 10 && !l.startsWith("-") -> l.removeSuffix("：")
++            else -> null
++        }
++        if (h != null) secs += Sec(h.replace("**", "")) else secs.last().body += l.replace("**", "").removePrefix("- ").removePrefix("* ").let { if (it != l) "• $it" else it }
++    }
++    Column {
++        secs.filter { it.title != null || it.body.isNotEmpty() }.forEachIndexed { i, sct ->
++            if (sct.title != null) Text(sct.title, fontSize = MT.Sub, fontWeight = FontWeight.SemiBold, color = m.primaryText,
++                modifier = Modifier.padding(top = if (i == 0) 2.dp else 10.dp, bottom = 2.dp))
++            if (sct.body.isNotEmpty()) Text(sct.body.joinToString("\n"), fontSize = MT.Body, lineHeight = MT.BodyLH, color = m.ink)
++        }
 +    }
 +}
 +
@@ -3180,8 +4150,80 @@ index 3abd64e..b7d0adf 100644
      val fg = cardTextColor(fill)
      val ratio = contrastRatio(fg, bg)
      PlusSection("卡片文字颜色", footer = "首页「工作位置 / 服务器 / 账号」卡片和问候语的文字颜色。自动 = 按卡片明暗选白字或黑字，保证看得清。") {
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ChatCards.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ChatCards.kt
+new file mode 100644
+index 0000000..40cd382
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ChatCards.kt
+@@ -0,0 +1,66 @@
++package com.openminis.app.ui.plus
++
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.drawBehind
++import androidx.compose.ui.geometry.CornerRadius
++import androidx.compose.ui.geometry.RoundRect
++import androidx.compose.ui.graphics.Path
++import androidx.compose.ui.graphics.drawscope.Stroke
++import androidx.compose.ui.unit.dp
++
++/**
++ * [Mines-38.6] item E: an AI reply drawn as one design card although the chat list holds it as several items (one per
++ * markdown block). [seg] bit 1 = first slice (rounded top), bit 2 = last slice (rounded bottom); a middle slice has
++ * straight edges. Each slice paints only its own background (reaching 1 dp past its edge to bridge the list's 2 dp
++ * item spacing), so text selection, its bounds registry and the list's per-item measuring are unchanged; the only
++ * layout change is a fixed inner padding (12 dp sides, 10 dp at the card's top / bottom).
++ */
++@Composable
++fun ReplyCardSlice(seg: Int, content: @Composable () -> Unit) {
++    val m = mines()
++    val first = seg and 1 != 0
++    val last = seg and 2 != 0
++    val fill = minesGlassFill(strong = true)
++    val line = m.glassBorder
++    Box(
++        Modifier.fillMaxWidth()
++            .drawBehind {
++                val r = 18.dp.toPx()
++                val bridge = 1.dp.toPx()
++                val top = if (first) 0f else -bridge
++                val bottom = if (last) size.height else size.height + bridge
++                val rr = RoundRect(0f, top, size.width, bottom,
++                    topLeftCornerRadius = if (first) CornerRadius(r) else CornerRadius.Zero,
++                    topRightCornerRadius = if (first) CornerRadius(r) else CornerRadius.Zero,
++                    bottomRightCornerRadius = if (last) CornerRadius(r) else CornerRadius.Zero,
++                    bottomLeftCornerRadius = if (last) CornerRadius(r) else CornerRadius.Zero)
++                val path = Path().apply { addRoundRect(rr) }
++                drawPath(path, fill)
++                // hairline on the outer edges only (sides always, top on the first slice, bottom on the last)
++                val w = 1.dp.toPx()
++                val sw = Stroke(w)
++                drawLine(line, androidx.compose.ui.geometry.Offset(w / 2, if (first) r else top), androidx.compose.ui.geometry.Offset(w / 2, if (last) size.height - r else bottom), w)
++                drawLine(line, androidx.compose.ui.geometry.Offset(size.width - w / 2, if (first) r else top), androidx.compose.ui.geometry.Offset(size.width - w / 2, if (last) size.height - r else bottom), w)
++                if (first) {
++                    val p = Path().apply {
++                        moveTo(w / 2, r); arcTo(androidx.compose.ui.geometry.Rect(w / 2, w / 2, 2 * r, 2 * r), 180f, 90f, false)
++                        lineTo(size.width - r, w / 2); arcTo(androidx.compose.ui.geometry.Rect(size.width - 2 * r, w / 2, size.width - w / 2, 2 * r), 270f, 90f, false)
++                    }
++                    drawPath(p, line, style = sw)
++                }
++                if (last) {
++                    val h = size.height
++                    val p = Path().apply {
++                        moveTo(w / 2, h - r); arcTo(androidx.compose.ui.geometry.Rect(w / 2, h - 2 * r, 2 * r, h - w / 2), 180f, -90f, false)
++                        lineTo(size.width - r, h - w / 2); arcTo(androidx.compose.ui.geometry.Rect(size.width - 2 * r, h - 2 * r, size.width - w / 2, h - w / 2), 90f, -90f, false)
++                    }
++                    drawPath(p, line, style = sw)
++                }
++            }
++            .padding(start = 12.dp, end = 12.dp, top = if (first) 10.dp else 0.dp, bottom = if (last) 10.dp else 0.dp),
++    ) { content() }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
-index feb81e5..d161d1e 100644
+index feb81e5..b529a74 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
 @@ -78,6 +78,8 @@ import kotlin.coroutines.resume
@@ -3520,6 +4562,15 @@ index feb81e5..d161d1e 100644
  }
  
  @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+@@ -385,7 +462,7 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
+     }
+     val (toneFg, toneBg) = toneColors(tone)
+     val (fh, fs) = com.openminis.app.plus.DigestWriter.fallback(it)
+-    val headline = com.openminis.app.plus.AccountLabel.maskText(feedClean(it.headline) ?: feedClean(fh) ?: it.source)
++    val headline = glueNumbers(com.openminis.app.plus.AccountLabel.maskText(feedClean(it.headline) ?: feedClean(fh) ?: it.source))
+     val brief = feedClean(it.brief ?: fs)?.let { b -> com.openminis.app.plus.AccountLabel.maskText(b) }?.takeIf { b -> b != headline }
+     val isX = it.source == "X"
+     val isGh = it.tab == Digest.Tab.GITHUB
 @@ -393,55 +470,57 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
      val actLabel = actLabelOf(it)
      var liked by remember(it.id) { mutableStateOf(false) }
@@ -3633,10 +4684,12 @@ index feb81e5..d161d1e 100644
  }
  
  /** Brand logo of the source when there is one, else a soft 3D-looking gradient orb with an emoji. */
-@@ -529,58 +608,64 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
+@@ -528,59 +607,65 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
+     val isFix = m.act?.startsWith("fix:") == true
      val label = actLabelOf(m)
      val mc = mines()
-     val headline = com.openminis.app.plus.AccountLabel.maskText(feedClean(m.headline) ?: feedClean(fh) ?: m.source)
+-    val headline = com.openminis.app.plus.AccountLabel.maskText(feedClean(m.headline) ?: feedClean(fh) ?: m.source)
++    val headline = glueNumbers(com.openminis.app.plus.AccountLabel.maskText(feedClean(m.headline) ?: feedClean(fh) ?: m.source))
 +    // [Mines-38.5] sheet stops below the status bar, frosted glass, read time teaches 为你推荐
 +    val opened = remember(m.id) { System.currentTimeMillis() }
 +    androidx.compose.runtime.DisposableEffect(m.id) { onDispose { Digest.dwelled(context, m, System.currentTimeMillis() - opened) } }
@@ -3756,8 +4809,26 @@ index feb81e5..d161d1e 100644
              webViewClient = WebViewClient()
          }
          suspend fun eval(js: String): String = suspendCancellableCoroutine { c ->
+@@ -708,3 +795,17 @@ private fun XReader(tick: Int, onDone: () -> Unit) {
+         if (out.isNotEmpty()) { DigestX.store(out.distinctBy { it.id }); onDone() }
+     }
+ }
++
++
++/**
++ * [Mines-38.6] balanced headline breaks must not split a number from its unit (「2000 / 万 tokens」): the number, a
++ * CJK unit right after it and a following unit word are glued with no-break characters (U+00A0 for a space,
++ * U+2060 WORD JOINER where there was none), so the line breaker moves them as one piece.
++ */
++private val numUnit = Regex("""(\d[\d.,]*)( ?)(万亿|亿|万|千|百|[kKMBG]B?|%|％|元|美元|块|个|次|倍|小时|分钟|秒|天|年|月|人|条|篇|张|位|项|款|tokens?|Tokens?|stars?|星)(?:( )(tokens?|Tokens?|stars?|美元|元|次|人))?""")
++
++fun glueNumbers(s: String): String = numUnit.replace(s) { m ->
++    val (num, sp, unit) = Triple(m.groupValues[1], m.groupValues[2], m.groupValues[3])
++    val tail = m.groupValues[5]
++    num + (if (sp.isNotEmpty()) "\u00A0" else "\u2060") + unit + (if (tail.isNotEmpty()) "\u00A0" + tail else "")
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/Glass.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/Glass.kt
-index 402ddfd..ef9bd0d 100644
+index 402ddfd..ad0e5cf 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/Glass.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/Glass.kt
 @@ -109,7 +109,7 @@ fun GlassCard(
@@ -3778,7 +4849,28 @@ index 402ddfd..ef9bd0d 100644
          dark -> lum.max
          else -> lum.min
      }
-@@ -220,7 +220,7 @@ fun glassRowBrush(): Brush? {
+@@ -155,8 +155,10 @@ fun GlassCard(
+     ) {
+         // 1) backdrop: the wallpaper slice behind this card, blurred
+         if (glass && bmp != null) {
++            val soft = rememberSoftBitmap(bmp)  // [Mines-38.6] pre-blurred small copy: no dither grid under the GPU blur
+             Image(
+-                bmp, null, contentScale = ContentScale.Crop, alpha = st.wallpaperAlpha.coerceIn(0f, 1f),
++                soft ?: bmp, null, contentScale = ContentScale.Crop, alpha = st.wallpaperAlpha.coerceIn(0f, 1f),
++                filterQuality = androidx.compose.ui.graphics.FilterQuality.High,
+                 modifier = Modifier
+                     .matchParentSize()
+                     .layout { m, c ->
+@@ -171,7 +173,7 @@ fun GlassCard(
+                         val h = if (c.hasBoundedHeight) c.maxHeight else c.minHeight
+                         layout(w, h) { p.place(IntOffset(-pos.x.roundToInt(), -pos.y.roundToInt())) }
+                     }
+-                    .blur(st.glassBlur.coerceIn(0, 40).dp),
++                    .blur((st.glassBlur.coerceIn(0, 40) / 2).dp),
+             )
+         } else if (glass && preset != null) {
+             Box(Modifier.matchParentSize().background(Brush.linearGradient(preset)))
+@@ -220,7 +222,7 @@ fun glassRowBrush(): Brush? {
      PlusPrefs.init(ctx)
      val st by PlusPrefs.state.collectAsState()
      if (!st.glassOn || st.wallpaper.isEmpty() || !st.wallpaperOnHome) return null
@@ -4545,7 +5637,7 @@ index d041079..7fa3cd5 100644
                  if (r.ui && r.enabled && r.ok != false) {
                      // [Mines-dsh-ui] Widget plugins: shown as a floating window.
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
-index 3ed42b8..7554b4c 100644
+index 3ed42b8..535f5b3 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
 @@ -17,6 +17,7 @@ import androidx.compose.foundation.clickable
@@ -4572,7 +5664,15 @@ index 3ed42b8..7554b4c 100644
  import androidx.compose.ui.draw.clip
  import androidx.compose.ui.graphics.graphicsLayer
  import androidx.compose.ui.graphics.Brush
-@@ -81,6 +84,8 @@ object PlusNav {
+@@ -56,6 +59,7 @@ import androidx.compose.ui.graphics.compositeOver
+ import androidx.compose.ui.graphics.luminance
+ import androidx.compose.ui.graphics.ImageBitmap
+ import androidx.compose.ui.graphics.asImageBitmap
++import androidx.compose.ui.graphics.asAndroidBitmap
+ import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+ import androidx.compose.ui.graphics.nativeCanvas
+ import androidx.compose.ui.layout.ContentScale
+@@ -81,6 +85,8 @@ object PlusNav {
      @Volatile var fixAccount: String? = null
      /** [Mines-feed-35.3] with openKind: start 帮我领 (一键接入) right away, as from the 应用 list */
      @Volatile var autoClaim: Boolean = false
@@ -4581,7 +5681,7 @@ index 3ed42b8..7554b4c 100644
      fun go(route: String) { navigate?.invoke(route) ?: run { pending = route } }
  }
  
-@@ -101,6 +106,7 @@ object PlusRoutes {
+@@ -101,6 +107,7 @@ object PlusRoutes {
      const val REPORT = "plus_report"
      const val DIGEST = "plus_digest"
      const val CARDS = "plus_cards"
@@ -4589,7 +5689,7 @@ index 3ed42b8..7554b4c 100644
      const val SERVER = "plus_server/{id}"
      fun server(id: String) = "plus_server/$id"
  }
-@@ -151,21 +157,28 @@ fun ChatWallpaperLayer(modifier: Modifier = Modifier, home: Boolean = false) {
+@@ -151,21 +158,33 @@ fun ChatWallpaperLayer(modifier: Modifier = Modifier, home: Boolean = false) {
      val st by PlusPrefs.state.collectAsState()
      val spec = st.wallpaper
      if (spec.isEmpty() || (home && !st.wallpaperOnHome)) return
@@ -4610,7 +5710,12 @@ index 3ed42b8..7554b4c 100644
          } else {
              val bmp = rememberWallpaperBitmap(spec)
 -            if (bmp != null) Image(bmp, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop, alpha = st.wallpaperAlpha.coerceIn(0f, 1f))
-+            if (bmp != null) Image(bmp, null, imgMod, contentScale = ContentScale.Crop, alpha = st.wallpaperAlpha.coerceIn(0f, 1f))
++            // [Mines-38.6] smooth frost: a 48 dp RenderEffect over the full-size photo showed a fine grid / dither on the
++            // emulator (GPU blur of a high-frequency picture). The photo is first shrunk to ~1/16 with filtering (a cheap
++            // pre-blur), drawn back up with high-quality filtering and then only lightly blurred.
++            val soft = rememberSoftBitmap(bmp)
++            if (soft != null) Image(soft, null, Modifier.fillMaxSize().then(if (canBlur) Modifier.blur(16.dp) else Modifier),
++                contentScale = ContentScale.Crop, alpha = st.wallpaperAlpha.coerceIn(0f, 1f), filterQuality = androidx.compose.ui.graphics.FilterQuality.High)
          }
 -        // Dim layer keeps message text readable.
 -        Box(
@@ -4627,7 +5732,7 @@ index 3ed42b8..7554b4c 100644
      }
  }
  
-@@ -176,8 +189,7 @@ fun ChatWallpaperLayer(modifier: Modifier = Modifier, home: Boolean = false) {
+@@ -176,8 +195,7 @@ fun ChatWallpaperLayer(modifier: Modifier = Modifier, home: Boolean = false) {
   */
  @Composable
  fun homeCardColor(base: Color): Color =
@@ -4637,7 +5742,7 @@ index 3ed42b8..7554b4c 100644
  
  /** True when a wallpaper is drawn on this screen (bars then go translucent). */
  @Composable
-@@ -262,7 +274,7 @@ fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, action
+@@ -262,7 +280,7 @@ fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, action
              containerColor = Color.Transparent,
              topBar = {
                  TopAppBar(
@@ -4646,7 +5751,7 @@ index 3ed42b8..7554b4c 100644
                          overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) },
                      navigationIcon = {
                          IconButton(onClick = onBack) {
-@@ -274,13 +286,26 @@ fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, action
+@@ -274,13 +292,26 @@ fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, action
                  )
              },
          ) { padding ->
@@ -4680,7 +5785,7 @@ index 3ed42b8..7554b4c 100644
              }
          }
      }
-@@ -291,7 +316,7 @@ fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, action
+@@ -291,7 +322,7 @@ fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, action
  fun minesGlassFill(strong: Boolean = false): Color {
      val m = mines()
      val photo = wallpaperOn(home = true)
@@ -4689,7 +5794,7 @@ index 3ed42b8..7554b4c 100644
      @Suppress("UNUSED_EXPRESSION") photo
      return (if (m.dark) Color(0xFF221D1A) else Color(0xFFFFFDFA)).copy(alpha = a)
  }
-@@ -300,7 +325,7 @@ fun minesGlassFill(strong: Boolean = false): Color {
+@@ -300,7 +331,7 @@ fun minesGlassFill(strong: Boolean = false): Color {
  @Composable
  fun MinesCard(modifier: Modifier = Modifier, strong: Boolean = false, onClick: (() -> Unit)? = null, content: @Composable ColumnScope.() -> Unit) {
      val m = mines()
@@ -4698,7 +5803,7 @@ index 3ed42b8..7554b4c 100644
      Column(
          modifier.shadow(if (m.dark) 0.dp else 3.dp, shape, clip = false, ambientColor = Color(0xFF3C2814).copy(alpha = 0.10f), spotColor = Color(0xFF3C2814).copy(alpha = 0.12f))
              .clip(shape).background(minesGlassFill(strong)).border(1.dp, m.glassBorder, shape)
-@@ -313,10 +338,11 @@ fun MinesCard(modifier: Modifier = Modifier, strong: Boolean = false, onClick: (
+@@ -313,10 +344,11 @@ fun MinesCard(modifier: Modifier = Modifier, strong: Boolean = false, onClick: (
  fun PlusSection(title: String?, footer: String? = null, action: String? = null, onAction: (() -> Unit)? = null,
                  content: @Composable ColumnScope.() -> Unit) {
      val m = mines()
@@ -4713,7 +5818,7 @@ index 3ed42b8..7554b4c 100644
                  modifier = Modifier.clickable(onClick = onAction).padding(4.dp))
          }
          MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
-@@ -324,21 +350,21 @@ fun PlusSection(title: String?, footer: String? = null, action: String? = null,
+@@ -324,21 +356,21 @@ fun PlusSection(title: String?, footer: String? = null, action: String? = null,
          }
          if (footer != null) Text(
              footer,
@@ -4739,7 +5844,7 @@ index 3ed42b8..7554b4c 100644
      }
  }
  
-@@ -363,20 +389,25 @@ fun PlusRow(
+@@ -363,20 +395,25 @@ fun PlusRow(
  ) {
      val m = mines()
      Row(
@@ -4772,7 +5877,7 @@ index 3ed42b8..7554b4c 100644
      }
  }
  
-@@ -384,11 +415,11 @@ fun PlusRow(
+@@ -384,11 +421,11 @@ fun PlusRow(
  @Composable
  fun StatusPill(text: String, ok: Boolean?) {
      val (c, bg) = toneColors(when (ok) { true -> Tone.SUCCESS; false -> Tone.DANGER; null -> Tone.NEUTRAL })
@@ -4788,7 +5893,7 @@ index 3ed42b8..7554b4c 100644
      }
  }
  
-@@ -400,13 +431,13 @@ fun PillButton(text: String, modifier: Modifier = Modifier, primary: Boolean = t
+@@ -400,13 +437,13 @@ fun PillButton(text: String, modifier: Modifier = Modifier, primary: Boolean = t
      val bg = when { primary -> m.primary; else -> if (m.dark) Color(0x1FFFFFFF) else Color(0x141C1915) }
      val fg = when { primary -> m.onPrimary; else -> m.ink }
      Box(
@@ -4805,7 +5910,7 @@ index 3ed42b8..7554b4c 100644
  }
  
  private fun Modifier.graphicsLayerAlpha(a: Float): Modifier = if (a >= 1f) this else this.then(Modifier.graphicsLayer { alpha = a })
-@@ -416,9 +447,9 @@ private fun Modifier.graphicsLayerAlpha(a: Float): Modifier = if (a >= 1f) this
+@@ -416,9 +453,9 @@ private fun Modifier.graphicsLayerAlpha(a: Float): Modifier = if (a >= 1f) this
  fun InfoLine(text: String) {
      val m = mines()
      Row(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 6.dp), verticalAlignment = Alignment.Top) {
@@ -4817,7 +5922,7 @@ index 3ed42b8..7554b4c 100644
      }
  }
  
-@@ -447,7 +478,7 @@ fun cardTextColor(fill: Color): Color {
+@@ -447,7 +484,7 @@ fun cardTextColor(fill: Color): Color {
      val ctx = LocalContext.current
      PlusPrefs.init(ctx)
      val st by PlusPrefs.state.collectAsState()
@@ -4826,7 +5931,7 @@ index 3ed42b8..7554b4c 100644
      return when (st.cardTextMode) {
          "white" -> Color.White
          "black" -> Color.Black
-@@ -471,3 +502,22 @@ fun readableSecondary(): Color {
+@@ -471,3 +508,40 @@ fun readableSecondary(): Color {
      val cs = MaterialTheme.colorScheme
      return readableSecondary(cs.onSurface, cs.surface)
  }
@@ -4848,6 +5953,24 @@ index 3ed42b8..7554b4c 100644
 +    val mid = s.length / 2
 +    val i = s.indices.filter { s[it] in "；，。、" && it in 4 until s.length - 4 }.minByOrNull { kotlin.math.abs(it - mid) } ?: return null
 +    return s.substring(0, i + 1) + "\n" + s.substring(i + 1).trimStart()
++}
++
++
++/**
++ * [Mines-38.6] A heavily downsampled copy of [bmp] (longest side ≈ 64 px, two filtered halving steps so no aliasing),
++ * used as a pre-blurred backdrop: upscaled with bilinear filtering it is already smooth, so the GPU blur on top can stay
++ * small and shows no grid / dither pattern.
++ */
++@Composable
++fun rememberSoftBitmap(bmp: androidx.compose.ui.graphics.ImageBitmap?): androidx.compose.ui.graphics.ImageBitmap? = androidx.compose.runtime.remember(bmp) {
++    if (bmp == null) null else runCatching {
++        var b = bmp.asAndroidBitmap()  // asAndroidBitmap: androidx.compose.ui.graphics
++        val target = 64
++        while (maxOf(b.width, b.height) / 2 >= target) {
++            b = android.graphics.Bitmap.createScaledBitmap(b, maxOf(1, b.width / 2), maxOf(1, b.height / 2), true)
++        }
++        b.asImageBitmap()
++    }.getOrNull() ?: bmp
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ReportScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ReportScreen.kt
 index d4af28d..d2280ed 100644
@@ -4876,20 +5999,28 @@ index d4af28d..d2280ed 100644
              Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                  OutlinedTextField(desc, { desc = it }, placeholder = { Text("写一句哪里不对就行") }, minLines = 3,
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
-index 8737da3..5c818a5 100644
+index 8737da3..ca8a608 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
-@@ -63,7 +63,8 @@ import java.util.Locale
+@@ -37,6 +37,7 @@ import androidx.compose.material3.Icon
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
++import androidx.compose.ui.layout.layout
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.collectAsState
+ import androidx.compose.runtime.getValue
+@@ -63,7 +64,8 @@ import java.util.Locale
   * one-tap chips for where work runs, servers, and connected accounts.
   */
  @Composable
 -fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier, onSearch: () -> Unit = {}) {
 +fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier, onSearch: () -> Unit = {},
-+              all: List<com.openminis.app.data.db.ChatSessionEntity> = emptyList()) {
++              all: List<com.openminis.app.data.db.ChatSessionEntity> = emptyList(), showAvatar: Boolean = true) {
      val context = LocalContext.current
      PlusPrefs.init(context)
      PlusVault.init(context)
-@@ -108,41 +109,123 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier, onSearch:
+@@ -108,41 +110,148 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier, onSearch:
      val appear by androidx.compose.animation.core.animateFloatAsState(if (shown) 1f else 0f, androidx.compose.animation.core.tween(280), label = "appear")
      val eff = PlusVps.effectiveMode(st)
      val vpsDown = st.isVps && eff == PlusState.MODE_LOCAL
@@ -4924,9 +6055,11 @@ index 8737da3..5c818a5 100644
 +        // [Mines-38.5] user 2026-10-15 「虚拟形象放太低了，设备状况也搞没了」: the character is the visual centre
 +        // (104 dp, nothing pressed over it), name + status on one line under it, then greeting + search,
 +        // the 设备状况 chips (电量 · 网络 · 存储 · 运行), then 最近对话.
-+        Column(Modifier.fillMaxWidth().padding(top = 4.dp), horizontalAlignment = Alignment.CenterHorizontally) {
++        // [Mines-38.6] user 2026-10-15 「再上一点，得接近两侧边的两个图标高度」: on the home list the face sits in the
++        // top bar between ☰ and ⚙ (HomeAvatar, drawn by SessionListScreen); this card starts at the name line.
++        Column(Modifier.fillMaxWidth().padding(top = if (showAvatar) 4.dp else 0.dp), horizontalAlignment = Alignment.CenterHorizontally) {
 +            val name = com.openminis.app.plus.Avatars.name(currentCharacter())
-+            Box(Modifier.size(112.dp).clip(CircleShape)
++            if (showAvatar) Box(Modifier.size(112.dp).clip(CircleShape)
 +                .background(androidx.compose.ui.graphics.Brush.radialGradient(listOf(m.container.copy(alpha = 0.9f), m.container.copy(alpha = 0f))))
 +                .clickable { switcher = true }.semantics { contentDescription = "换角色：$name" },
 +                contentAlignment = Alignment.Center) { PetAvatar(size = 100.dp) }
@@ -4959,6 +6092,29 @@ index 8737da3..5c818a5 100644
 +            ChatFilterMenu(all)
 +        }
 +    }
++}
++
++/**
++ * [Mines-38.6] The home character face (100 dp, same glow and 换角色 tap as before), placed by the home top bar
++ * between ☰ and ⚙ so its upper half lines up with those two buttons. The 112 dp glow box is pulled up by its
++ * 6 dp glow margin, so the face itself starts right under the status bar and the bar reports 106 dp.
++ */
++@Composable
++fun HomeAvatar(modifier: Modifier = Modifier) {
++    val m = mines()
++    var switcher by androidx.compose.runtime.saveable.rememberSaveable { androidx.compose.runtime.mutableStateOf(false) }
++    if (switcher) AvatarSwitcherSheet(onDismiss = { switcher = false })
++    val name = com.openminis.app.plus.Avatars.name(currentCharacter())
++    Box(modifier
++        .layout { measurable, constraints ->
++            val p = measurable.measure(constraints)
++            val lift = 6.dp.roundToPx()
++            layout(p.width, (p.height - lift).coerceAtLeast(0)) { p.place(0, -lift) }
++        }
++        .size(112.dp).clip(CircleShape)
++        .background(androidx.compose.ui.graphics.Brush.radialGradient(listOf(m.container.copy(alpha = 0.9f), m.container.copy(alpha = 0f))))
++        .clickable { switcher = true }.semantics { contentDescription = "换角色：$name" },
++        contentAlignment = Alignment.Center) { PetAvatar(size = 100.dp) }
 +}
 +
 +/** [Mines-38.5] 设备状况: battery, network, free storage and where work runs, refreshed every 30 s. */
@@ -5038,7 +6194,7 @@ index 8737da3..5c818a5 100644
          }
      }
  }
-@@ -191,7 +274,7 @@ private fun Chip(modifier: Modifier, icon: androidx.compose.ui.graphics.vector.I
+@@ -191,7 +300,7 @@ private fun Chip(modifier: Modifier, icon: androidx.compose.ui.graphics.vector.I
      GlassCard(modifier.semantics(mergeDescendants = true) { contentDescription = "$label：$value" },
          shape = RoundedCornerShape(14.dp), elevation = 2.dp, onClick = onClick) {
          val fill = MaterialTheme.colorScheme.surfaceContainerHigh
@@ -6570,10 +7726,18 @@ index 93d7159..a3b7b21 100644
 +
 +private fun Modifier.alphaCompat(a: Float): Modifier = this.then(Modifier.graphicsLayer { alpha = a })
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
-index c82aa8b..182afc1 100644
+index c82aa8b..9ee94e5 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
-@@ -119,14 +119,14 @@ import androidx.compose.material3.OutlinedTextField
+@@ -29,6 +29,7 @@ import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.Spacer
+ import androidx.compose.foundation.layout.WindowInsets
++import androidx.compose.foundation.layout.windowInsetsPadding
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.imePadding
+@@ -119,14 +120,14 @@ import androidx.compose.material3.OutlinedTextField
  import androidx.compose.material3.rememberModalBottomSheetState
  import androidx.compose.material3.Badge
  import androidx.compose.material3.BadgedBox
@@ -6590,7 +7754,7 @@ index c82aa8b..182afc1 100644
  import androidx.compose.runtime.Composable
  import androidx.compose.runtime.collectAsState
  import androidx.compose.runtime.derivedStateOf
-@@ -675,6 +675,14 @@ fun SessionListScreen(
+@@ -675,6 +676,14 @@ fun SessionListScreen(
      var showBrowserSheet by remember { mutableStateOf(false) }
      var showBrowserSettings by remember { mutableStateOf(false) }
      val browserTabPool = remember { com.openminis.app.browser.BrowserTabPool(context) }
@@ -6605,47 +7769,85 @@ index c82aa8b..182afc1 100644
  
      // [T-android-session-grouping] Groups are pulled out FIRST; only the
      // leftovers go through date bucketing. Assembly order below is
-@@ -880,8 +888,37 @@ fun SessionListScreen(
+@@ -847,13 +856,64 @@ fun SessionListScreen(
+     // drawn edge to edge behind the status bar, top bar and navigation bar.
+     // The Scaffold and its top bar go fully transparent so no opaque band
+     // (the old 60%-surface bar) sits over the picture.
++    // [Mines-38.6] ☰ + its warm menu, shared by the home header and the selection top bar.
++    val minesNavIcon: @Composable () -> Unit = {
++        Box {
++            IconButton(onClick = { showOverflowMenu = true }) {
++                MinesIcon(com.openminis.app.ui.brand.MinesIcons.named("menu")!!, contentDescription = "更多")
++            }
++            fun ic(n: String) = com.openminis.app.ui.brand.MinesIcons.named(n)
++            com.openminis.app.ui.plus.WarmMenu(showOverflowMenu, onDismiss = { showOverflowMenu = false }) {
++                if (sessions.isNotEmpty()) com.openminis.app.ui.plus.WarmMenuItem("选择对话", ic("list-select")) {
++                    showOverflowMenu = false; viewModel.isSelecting.value = true
++                }
++                com.openminis.app.ui.plus.WarmMenuItem("AI 群聊", ic("users")) {
++                    showOverflowMenu = false; com.openminis.app.ui.plus.PlusNav.go(com.openminis.app.ui.group.GroupRoutes.HOME)
++                }
++                com.openminis.app.ui.plus.WarmMenuItem(if (scheduledTaskCount > 0) "定时任务  $scheduledTaskCount" else "定时任务", ic("clock")) {
++                    showOverflowMenu = false; onScheduledTasksClick()
++                }
++                com.openminis.app.ui.plus.WarmMenuDivider()
++                com.openminis.app.ui.plus.WarmMenuItem(stringResource(R.string.sessionlist_shell_terminal), ic("terminal")) {
++                    showOverflowMenu = false; onTerminalClick()
++                }
++                com.openminis.app.ui.plus.WarmMenuItem(stringResource(R.string.sessionlist_rootfs_management), ic("hard-drive")) {
++                    showOverflowMenu = false; onRootfsClick()
++                }
++                com.openminis.app.ui.plus.WarmMenuDivider()
++                com.openminis.app.ui.plus.WarmMenuItem(stringResource(R.string.sessionlist_open_browser), ic("globe")) {
++                    showOverflowMenu = false; browserTabPool.ensureTabForUI(); showBrowserSheet = true
++                }
++                com.openminis.app.ui.plus.WarmMenuItem(stringResource(R.string.sessionlist_browser_settings), ic("settings")) {
++                    showOverflowMenu = false; showBrowserSettings = true
++                }
++            }
++        }
++    }
+     Box(Modifier.fillMaxSize()) {
+     if (minesPhotoWall) com.openminis.app.ui.plus.ChatWallpaperLayer(Modifier.fillMaxSize(), home = true)
+     else com.openminis.app.ui.plus.PorcelainBackdrop(Modifier.fillMaxSize())
+     Scaffold(
+         containerColor = if (minesHomeWallpaper) Color.Transparent else MaterialTheme.colorScheme.background,
+         topBar = {
+-            TopAppBar(
++            // [Mines-38.6] user 2026-10-15 「头像不够上，再上一点，得接近两侧边的两个图标高度」: on the home list the
++            // character face sits in the top bar itself, centred between ☰ and ⚙ with its upper half level with
++            // them (face top right under the status bar); the name/status line and everything below move up with it.
++            if (!isSelecting && isInitialLoadComplete && minesAllSessions.isNotEmpty()) {
++                Box(Modifier.fillMaxWidth().windowInsetsPadding(androidx.compose.material3.TopAppBarDefaults.windowInsets)
++                    .semantics { contentDescription = "Mines" }) {
++                    androidx.compose.runtime.CompositionLocalProvider(
++                        androidx.compose.material3.LocalContentColor provides MaterialTheme.colorScheme.onSurface,
++                    ) {
++                        Box(Modifier.align(Alignment.TopStart).padding(start = 4.dp, top = 8.dp)) { minesNavIcon() }
++                    }
++                    com.openminis.app.ui.plus.HomeAvatar(Modifier.align(Alignment.TopCenter))
++                    Box(Modifier.align(Alignment.TopEnd).padding(end = 12.dp, top = 12.dp)) {
++                        com.openminis.app.ui.plus.WarmRoundButton(com.openminis.app.ui.brand.MinesIcons.named("settings")!!,
++                            stringResource(R.string.sessionlist_settings), size = 40.dp, onClick = onSettingsClick)
++                    }
++                }
++            } else TopAppBar(
+                 title = {
+                     if (isSelecting) {
+                         Text(
+@@ -880,9 +940,8 @@ fun SessionListScreen(
                              Text(stringResource(R.string.cancel))
                          }
                      } else {
 -                        IconButton(onClick = onSettingsClick) {
 -                            MinesIcon(Icons.Default.Settings, contentDescription = stringResource(R.string.sessionlist_settings))
+-                        }
 +                        // [Mines-38.1] board 01: ☰ (left) holds the developer tools in a warm menu; ⚙ (right) opens settings.
-+                        Box {
-+                            IconButton(onClick = { showOverflowMenu = true }) {
-+                                MinesIcon(com.openminis.app.ui.brand.MinesIcons.named("menu")!!, contentDescription = "更多")
-+                            }
-+                            fun ic(n: String) = com.openminis.app.ui.brand.MinesIcons.named(n)
-+                            com.openminis.app.ui.plus.WarmMenu(showOverflowMenu, onDismiss = { showOverflowMenu = false }) {
-+                                if (sessions.isNotEmpty()) com.openminis.app.ui.plus.WarmMenuItem("选择对话", ic("list-select")) {
-+                                    showOverflowMenu = false; viewModel.isSelecting.value = true
-+                                }
-+                                com.openminis.app.ui.plus.WarmMenuItem("AI 群聊", ic("users")) {
-+                                    showOverflowMenu = false; com.openminis.app.ui.plus.PlusNav.go(com.openminis.app.ui.group.GroupRoutes.HOME)
-+                                }
-+                                com.openminis.app.ui.plus.WarmMenuItem(if (scheduledTaskCount > 0) "定时任务  $scheduledTaskCount" else "定时任务", ic("clock")) {
-+                                    showOverflowMenu = false; onScheduledTasksClick()
-+                                }
-+                                com.openminis.app.ui.plus.WarmMenuDivider()
-+                                com.openminis.app.ui.plus.WarmMenuItem(stringResource(R.string.sessionlist_shell_terminal), ic("terminal")) {
-+                                    showOverflowMenu = false; onTerminalClick()
-+                                }
-+                                com.openminis.app.ui.plus.WarmMenuItem(stringResource(R.string.sessionlist_rootfs_management), ic("hard-drive")) {
-+                                    showOverflowMenu = false; onRootfsClick()
-+                                }
-+                                com.openminis.app.ui.plus.WarmMenuDivider()
-+                                com.openminis.app.ui.plus.WarmMenuItem(stringResource(R.string.sessionlist_open_browser), ic("globe")) {
-+                                    showOverflowMenu = false; browserTabPool.ensureTabForUI(); showBrowserSheet = true
-+                                }
-+                                com.openminis.app.ui.plus.WarmMenuItem(stringResource(R.string.sessionlist_browser_settings), ic("settings")) {
-+                                    showOverflowMenu = false; showBrowserSettings = true
-+                                }
-+                            }
-                         }
++                        minesNavIcon()
                      }
                  },
-@@ -896,93 +933,9 @@ fun SessionListScreen(
+                 actions = {
+@@ -896,93 +955,9 @@ fun SessionListScreen(
                              )
                          }
                      } else {
@@ -6742,8 +7944,11 @@ index c82aa8b..182afc1 100644
                      }
                  },
                  colors = androidx.compose.material3.TopAppBarDefaults.topAppBarColors(
-@@ -1064,10 +1017,11 @@ fun SessionListScreen(
+@@ -1062,12 +1037,14 @@ fun SessionListScreen(
+                         Modifier.fillMaxWidth().onSizeChanged { minesHeaderH = it.height },
+                     ) {
                          com.openminis.app.ui.plus.TodayCard(
++                            showAvatar = false,  // [Mines-38.6] the face is in the top bar now
                              onOpen = { route -> com.openminis.app.ui.plus.PlusNav.go(route) },
                              onSearch = { viewModel.isSearchActive.value = true },
 +                            all = minesAllSessions,
@@ -6755,7 +7960,7 @@ index c82aa8b..182afc1 100644
                      }
                      com.openminis.app.ui.plus.DshModelsAutoStart()
                      LazyColumn(
-@@ -1076,7 +1030,7 @@ fun SessionListScreen(
+@@ -1076,7 +1053,7 @@ fun SessionListScreen(
                          state = listState,
                          modifier = Modifier.fillMaxWidth().weight(1f).clipToBounds(),
                          // Leave space for bottom FAB row; [Mines-compact-29] small top gap under the chips
@@ -6764,7 +7969,7 @@ index c82aa8b..182afc1 100644
                      ) {
                          // T25: search-active path used to flatten the list and skip
                          // section headers entirely. Now reuses the same grouped
-@@ -1136,7 +1090,24 @@ fun SessionListScreen(
+@@ -1136,7 +1113,24 @@ fun SessionListScreen(
                                              },
                                          )
                                  } else {
@@ -6789,7 +7994,7 @@ index c82aa8b..182afc1 100644
                                  }
                                  // animateItem gives the accordion its motion:
                                  // member rows fade+slide over 250ms instead of
-@@ -1193,8 +1164,7 @@ fun SessionListScreen(
+@@ -1193,8 +1187,7 @@ fun SessionListScreen(
                                      rowBackground = when {
                                          session.id == selectedSessionId ->
                                              MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
@@ -6799,7 +8004,7 @@ index c82aa8b..182afc1 100644
                                      },
                                      isFolderMember = inFolder,
                                  )
-@@ -1257,19 +1227,9 @@ fun SessionListScreen(
+@@ -1257,19 +1250,9 @@ fun SessionListScreen(
                              }
                          }
  
@@ -6822,7 +8027,7 @@ index c82aa8b..182afc1 100644
                      }
                      } // Plus: Today card column
                  }
-@@ -1398,7 +1358,21 @@ fun SessionListScreen(
+@@ -1398,7 +1381,21 @@ fun SessionListScreen(
                      onDelete = { showBulkDeleteDialog = true },
                      modifier = Modifier.align(Alignment.BottomCenter),
                  )
@@ -6845,7 +8050,7 @@ index c82aa8b..182afc1 100644
                  // Dual FAB row (matching iOS: New Chat left + Search right, or vice versa).
                  // Hidden while the onboarding landing is showing — Step 3 provides the CTA.
                  // T46: stay visible while search is active even when the result
-@@ -1425,6 +1399,7 @@ fun SessionListScreen(
+@@ -1425,6 +1422,7 @@ fun SessionListScreen(
                      modelGroups = providerConfig.modelGroups,
                      onSearchToggle = {
                          if (isSearchActive) {
@@ -6853,7 +8058,7 @@ index c82aa8b..182afc1 100644
                              viewModel.searchQuery.value = ""
                              viewModel.isSearchActive.value = false
                          } else {
-@@ -1433,6 +1408,7 @@ fun SessionListScreen(
+@@ -1433,6 +1431,7 @@ fun SessionListScreen(
                      },
                      onSearchQueryChange = { viewModel.searchQuery.value = it },
                      onSearchDismiss = {
@@ -6861,7 +8066,7 @@ index c82aa8b..182afc1 100644
                          viewModel.searchQuery.value = ""
                          viewModel.isSearchActive.value = false
                      },
-@@ -1682,6 +1658,7 @@ private fun DualFabRow(
+@@ -1682,6 +1681,7 @@ private fun DualFabRow(
      onSearchQueryChange: (String) -> Unit,
      onSearchDismiss: () -> Unit,
      modifier: Modifier = Modifier,
@@ -6869,7 +8074,7 @@ index c82aa8b..182afc1 100644
  ) {
      val context = LocalContext.current
      val prefs = remember { context.getSharedPreferences("ui_prefs", Context.MODE_PRIVATE) }
-@@ -1829,8 +1806,9 @@ private fun DualFabRow(
+@@ -1829,8 +1829,9 @@ private fun DualFabRow(
          horizontalArrangement = Arrangement.SpaceBetween,
          verticalAlignment = Alignment.CenterVertically,
      ) {
@@ -6881,7 +8086,7 @@ index c82aa8b..182afc1 100644
  
          // Middle: Inline search bar (when active)
          AnimatedVisibility(
-@@ -1903,7 +1881,7 @@ private fun DualFabRow(
+@@ -1903,7 +1904,7 @@ private fun DualFabRow(
              )
          }
  
@@ -6890,7 +8095,7 @@ index c82aa8b..182afc1 100644
      }
  }
  
-@@ -2142,7 +2120,7 @@ private fun SessionItemContent(
+@@ -2142,7 +2143,7 @@ private fun SessionItemContent(
                  Box(
                      modifier = Modifier
                          .matchParentSize()
@@ -6899,7 +8104,7 @@ index c82aa8b..182afc1 100644
                      contentAlignment = Alignment.Center,
                  ) {
                      Row(
-@@ -2993,7 +2971,8 @@ private fun SessionRow(
+@@ -2993,7 +2994,8 @@ private fun SessionRow(
                  // tinted rectangle looked. Row metrics are left exactly as they
                  // were; the pill's proportions are handled by the inset of the
                  // drawn tint instead (see the drawBehind above).
@@ -6909,7 +8114,7 @@ index c82aa8b..182afc1 100644
              ),
          verticalAlignment = Alignment.CenterVertically,
          horizontalArrangement = Arrangement.spacedBy(12.dp),
-@@ -3014,14 +2993,16 @@ private fun SessionRow(
+@@ -3014,14 +3016,16 @@ private fun SessionRow(
          // future ICLOUD_SYNCING uses the same anchor.
          val badgeMap by com.openminis.app.service.SessionBadgeStore.byId.collectAsState()
          val badgeHead = badgeMap[session.id]?.firstOrNull()
@@ -6929,7 +8134,7 @@ index c82aa8b..182afc1 100644
                          shape = CircleShape,
                      ),
                  contentAlignment = Alignment.Center,
-@@ -3029,20 +3010,20 @@ private fun SessionRow(
+@@ -3029,20 +3033,20 @@ private fun SessionRow(
                  MinesIcon(
                      imageVector = style.icon,
                      contentDescription = null,
@@ -6955,7 +8160,7 @@ index c82aa8b..182afc1 100644
                      )
                  }
              }
-@@ -3059,12 +3040,12 @@ private fun SessionRow(
+@@ -3059,12 +3063,12 @@ private fun SessionRow(
              modifier = Modifier.weight(1f),
              verticalArrangement = Arrangement.spacedBy(1.dp),
          ) {
@@ -6971,7 +8176,7 @@ index c82aa8b..182afc1 100644
                      color = MaterialTheme.colorScheme.onSurface,
                      maxLines = 1,
                      overflow = TextOverflow.Ellipsis,
-@@ -3072,8 +3053,8 @@ private fun SessionRow(
+@@ -3072,8 +3076,8 @@ private fun SessionRow(
              } else {
                  Text(
                      text = titleText,
@@ -6982,7 +8187,7 @@ index c82aa8b..182afc1 100644
                      color = MaterialTheme.colorScheme.onSurface,
                      maxLines = 1,
                      overflow = TextOverflow.Ellipsis,
-@@ -3085,15 +3066,15 @@ private fun SessionRow(
+@@ -3085,15 +3089,15 @@ private fun SessionRow(
              if (searchQuery.isNotBlank() && searchSnippet != null) {
                  Text(
                      text = highlightedAnnotatedString(searchSnippet, searchQuery),
@@ -7001,7 +8206,7 @@ index c82aa8b..182afc1 100644
                      color = MaterialTheme.colorScheme.onSurfaceVariant,
                      maxLines = 1,
                      overflow = TextOverflow.Ellipsis,
-@@ -3104,7 +3085,10 @@ private fun SessionRow(
+@@ -3104,7 +3108,10 @@ private fun SessionRow(
          // Relative timestamp
          Text(
              text = timeText,
@@ -7013,7 +8218,7 @@ index c82aa8b..182afc1 100644
              // [Mines-a11y-26] was colorScheme.outline (too dark to read)
              color = com.openminis.app.ui.plus.readableSecondary(),
          )
-@@ -3216,7 +3200,7 @@ private fun SessionBadgeOverlay(
+@@ -3216,7 +3223,7 @@ private fun SessionBadgeOverlay(
                      )
                      .border(
                          width = 1.5.dp,
