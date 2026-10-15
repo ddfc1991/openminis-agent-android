@@ -1,0 +1,116 @@
+name: Publish signed Mines APK as prerelease + download-back + emulator install check
+
+on:
+  push:
+    branches: [hark-sign]
+    paths: ['.github/workflows/mines-release-check.yml', 'hark-build/relcheck/**']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  SIGNED_RUN: "38677237336"     # mines-resign run 3 -> artifact mines-38.5-signed
+  ORIG_RUN: "38626360095"       # build run 135 -> mines-apk (38.5, v2 only)
+  OLD_RUN: "38586258739"        # build run 131 -> mines-apk (38.4, v2 only, installed fine on the phone)
+  TAG: mines-38.5-signed
+  ASSET: mines-38.5-signed.apk
+  WANT_SHA: 048ac98a70eb0cee9d4af29258f29555976f8c5cb234e024a49240bf8bf87d02
+  MINES_CERT_SHA256: 001814fb258110b003c851aeeac930fd3d803224eb9acdcab0a383edcb740e2b
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch APKs
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          mkdir -p s o old apks
+          gh run download "$SIGNED_RUN" -R "$GITHUB_REPOSITORY" -n mines-38.5-signed -D s
+          gh run download "$ORIG_RUN"   -R "$GITHUB_REPOSITORY" -n mines-apk -D o
+          gh run download "$OLD_RUN"    -R "$GITHUB_REPOSITORY" -n mines-apk -D old
+          cp s/$ASSET apks/$ASSET
+          cp "$(ls o/*.apk | head -1)" apks/mines-38.5-orig.apk
+          cp "$(ls old/*.apk | head -1)" apks/mines-38.4.apk
+          sha256sum apks/*; ls -l apks
+          echo "$WANT_SHA  apks/$ASSET" | sha256sum -c -
+      - name: Create prerelease and upload asset
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          gh release delete "$TAG" -R "$GITHUB_REPOSITORY" -y --cleanup-tag 2>/dev/null || true
+          sleep 3
+          gh release create "$TAG" "apks/$ASSET" -R "$GITHUB_REPOSITORY" --prerelease --target hark-sign \
+            --title "Mines 38.5 (v1+v2+v3 signed)" \
+            --notes "Mines 38.5 (versionCode 33 / 1.19), re-signed v1+v2+v3 with the Mines key (cert SHA-256 $MINES_CERT_SHA256). File SHA-256 $WANT_SHA, 89,220,658 bytes."
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json url,assets
+      - name: Download back from the public URL (no auth) and verify
+        run: |
+          URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$ASSET"
+          echo "URL=$URL"
+          for i in 1 2 3 4 5; do curl -fL --retry 3 -o dl.apk "$URL" && break; sleep 10; done
+          curl -sIL "$URL" | grep -iE '^(HTTP|content-type|content-length|content-disposition|location)' || true
+          stat -c '%s bytes' dl.apk; sha256sum dl.apk | tee dl.sha
+          [ "$(cut -d' ' -f1 dl.sha)" = "$WANT_SHA" ] && echo "DOWNLOAD SHA MATCH" || { echo "::error::download sha mismatch"; exit 1; }
+          cp dl.apk apks/mines-38.5-downloaded.apk
+      - name: Diagnose (38.4 vs 38.5 orig vs 38.5 signed vs downloaded)
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1); echo "BT=$BT" | tee diag.txt
+          for f in apks/mines-38.4.apk apks/mines-38.5-orig.apk apks/mines-38.5-downloaded.apk; do
+            {
+            echo; echo "################ $f"; sha256sum "$f"; stat -c '%s bytes' "$f"
+            echo "--- apksigner verify -v (own minSdk)"; "$BT/apksigner" verify -v --print-certs "$f" 2>&1 | grep -vE '^WARNING: META-INF/' | head -30
+            for m in 24 26 28 30 33 35; do echo "--- apksigner verify --min-sdk-version $m"; "$BT/apksigner" verify --min-sdk-version $m "$f" >/dev/null 2>&1 && echo OK || "$BT/apksigner" verify --min-sdk-version $m "$f" 2>&1 | grep -v '^WARNING' | head -5; done
+            echo "--- aapt2 badging"; "$BT/aapt2" dump badging "$f" 2>&1 | grep -E "^(package|sdkVersion|targetSdkVersion|native-code|alt-native|application:|uses-library|densities|testOnly|debuggable|split|leanback)" | head -20
+            echo "--- manifest attrs"; "$BT/aapt2" dump xmltree --file AndroidManifest.xml "$f" 2>&1 | grep -iE "extractNativeLibs|testOnly|debuggable|minSdk|targetSdk|compileSdk|isSplitRequired|requiredSplit|split|pageSizeCompat|sharedUserId|installLocation|isolatedSplits|appComponentFactory" | head -30
+            echo "--- zipalign -c -P 16 4"; "$BT/zipalign" -c -P 16 -v 4 "$f" | grep -vE "\(OK" | tail -8
+            echo "--- META-INF signature-ish files"; unzip -l "$f" 'META-INF/*.SF' 'META-INF/*.RSA' 'META-INF/*.EC' 'META-INF/*.DSA' 'META-INF/MANIFEST.MF' 'stamp-cert-sha256' 2>&1 | tail -8
+            echo "--- zip layout"; python3 hark-build/relcheck/ziplayout.py "$f"
+            } >> diag.txt 2>&1
+          done
+          cat diag.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: relcheck-apks
+          path: apks/
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: relcheck-diag
+          path: diag.txt
+
+  emulator:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        api: [35, 36]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: relcheck-apks, path: apks }
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      - name: Emulator install tests
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api }}
+          target: google_apis
+          arch: x86_64
+          ram-size: 4096M
+          disk-size: 6G
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot
+          disable-animations: true
+          script: bash hark-build/relcheck/emu-install.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: relcheck-emu-${{ matrix.api }}
+          path: emu-out
