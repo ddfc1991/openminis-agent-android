@@ -1452,7 +1452,7 @@ index 039a904..bc973a4 100644
                  // [Mines-voice-35.2] the call's full setup (tools, transcription hints, resumption, compression)
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/HomeGreeting.kt b/src/android/app/src/main/java/com/openminis/app/plus/HomeGreeting.kt
 new file mode 100644
-index 0000000..276c3f2
+index 0000000..671bc40
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/HomeGreeting.kt
 @@ -0,0 +1,271 @@
@@ -1493,7 +1493,7 @@ index 0000000..276c3f2
 +    private val _tick = MutableStateFlow(0)
 +    /** bumps when the weather arrives or an override is set, so the home card recomputes. */
 +    val tick: StateFlow<Int> = _tick.asStateFlow()
-+    fun setOverride(o: JSONObject?) { override = o; _tick.value++ }
++    fun applyOverride(o: JSONObject?) { override = o; _tick.value++ }
 +
 +    private const val PREFS = "mines_greeting"
 +    private fun prefs(c: Context) = c.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -3448,7 +3448,7 @@ index 22661da..1d773a2 100644
          for (id in phone) one(id)
      }
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-index 8e5984b..29ed67a 100644
+index 8e5984b..4af9e5d 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 @@ -38,10 +38,131 @@ object GroupSelfTest {
@@ -3565,7 +3565,7 @@ index 8e5984b..29ed67a 100644
 +            // [Mines-38.7] home greeting with injected time / weather / battery: 'greet {"hour":23,"weather":"rain"}' / 'greet off'
 +            "greet" -> {
 +                val o = rest.trim().takeIf { it.startsWith("{") }?.let { JSONObject(it) }
-+                com.openminis.app.plus.HomeGreeting.setOverride(o)
++                com.openminis.app.plus.HomeGreeting.applyOverride(o)
 +                val g = com.openminis.app.plus.HomeGreeting.compute(context, com.openminis.app.plus.HomeGreeting.context(context, 80, false))
 +                JSONObject().put("title", g.title).put("care", g.care).put("kind", g.kind)
 +                    .put("weather", com.openminis.app.plus.HomeGreeting.cachedWeather(context)?.let { "${it.code}/${it.temp}" } ?: "none").toString()
@@ -8623,7 +8623,7 @@ index d4af28d..d2280ed 100644
              Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                  OutlinedTextField(desc, { desc = it }, placeholder = { Text("写一句哪里不对就行") }, minLines = 3,
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
-index 8737da3..129fc15 100644
+index 8737da3..548988a 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
 @@ -1,3 +1,4 @@
@@ -8683,7 +8683,7 @@ index 8737da3..129fc15 100644
      @Suppress("UNUSED_VARIABLE") val weekday = SimpleDateFormat("EEEE", Locale.CHINA).format(cal.time).replace("星期", "周")
      // [Mines-warm-36] design36warm 01/02: home = 对话 only. Face + name plate, greeting, one status line,
      // then 最近对话. No message card / bar here (user 13:01 「对话就对话，要处理放在消息嘛」); the
-@@ -108,41 +118,290 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier, onSearch:
+@@ -108,41 +118,311 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier, onSearch:
      val appear by androidx.compose.animation.core.animateFloatAsState(if (shown) 1f else 0f, androidx.compose.animation.core.tween(280), label = "appear")
      val eff = PlusVps.effectiveMode(st)
      val vpsDown = st.isVps && eff == PlusState.MODE_LOCAL
@@ -8763,11 +8763,13 @@ index 8737da3..129fc15 100644
 +    // [Mines-38.7] user 2026-10-15 「太阳能不能围着头像转，点一下然后一个大太阳回归头顶」: a small weather sprite circles the
 +    // face; tap the face (or the sprite) → it flies up and grows into the big weather picture above the head with the
 +    // temperature pill and 「晴 26 度」 read aloud; after 4 s / another tap it shrinks back into its orbit. Long-press = 换角色.
-+    val orbit = remember { WeatherOrbitState() }
++    val orbit = HomeOrbit
++    val appCtx = LocalContext.current
++    val stillAnim = remember { AnimeWeather.still(appCtx) }
 +    val view = androidx.compose.ui.platform.LocalView.current
 +    val scope = androidx.compose.runtime.rememberCoroutineScope()
 +    val toggle: () -> Unit = {
-+        if (wx == null) { switcher = true } else { scope.launch { orbit.toggle(); if (orbit.open) view.announceForAccessibility(wx.spoken) } }
++        if (wx == null) { switcher = true } else { scope.launch { orbit.toggle(stillAnim); if (orbit.open) view.announceForAccessibility(wx.spoken) } }
 +        Unit
 +    }
 +    Box(modifier
@@ -8805,9 +8807,36 @@ index 8737da3..129fc15 100644
 +    return HomeWx(icon, words, Math.round(w.temp).toInt(), extra, night)
 +}
 +
-+/** Room above the face for the big weather picture + pill (gone when there is no weather). */
++/**
++ * [Mines-38.7] orbit board (design387/orbit.jpg): when the big weather picture is up, the 「26° 晴 · 新加坡」 pill pops up
++ * under the face and pushes the greeting down a little; it folds away when the picture goes back into its orbit.
++ */
++@Composable
++fun HomeWeatherPill() {
++    val wx = homeWeather() ?: return
++    val m = mines()
++    androidx.compose.animation.AnimatedVisibility(HomeOrbit.open,
++        enter = androidx.compose.animation.fadeIn() + androidx.compose.animation.expandVertically(),
++        exit = androidx.compose.animation.fadeOut() + androidx.compose.animation.shrinkVertically()) {
++        val fill = if (m.dark) Color(0xFF2A2421) else Color.White.copy(alpha = 0.94f)
++        Row(Modifier.padding(top = 10.dp, bottom = 2.dp).heightIn(min = 36.dp)
++            .clip(RoundedCornerShape(50)).background(fill).border(1.dp, m.hairline.copy(alpha = 0.18f), RoundedCornerShape(50))
++            .padding(horizontal = 14.dp, vertical = 4.dp)
++            .semantics(mergeDescendants = true) { contentDescription = "天气：" + wx.spoken },
++            verticalAlignment = Alignment.CenterVertically) {
++            Text("${wx.temp}°", fontSize = 18.sp, lineHeight = 22.sp, fontWeight = FontWeight.Bold, color = m.ink, maxLines = 1, softWrap = false)
++            Spacer(Modifier.width(6.dp))
++            Text(if (wx.extra.isNotBlank()) "${wx.words} · ${wx.extra}" else wx.words, fontSize = 14.sp, lineHeight = 18.sp, color = m.ink2, maxLines = 1, softWrap = false)
++        }
++    }
++}
++
++/** Room above the face for the big weather picture (gone when there is no weather). */
 +@Composable
 +fun HomeWeatherSpace() { if (homeWeather() != null) Spacer(Modifier.height(WeatherOrbitState.TOP_SPACE)) }
++
++/** [Mines-38.7] one orbit state for the home face (the pill under the face reads it too). */
++val HomeOrbit = WeatherOrbitState()
 +
 +class WeatherOrbitState {
 +    companion object {
@@ -8820,13 +8849,15 @@ index 8737da3..129fc15 100644
 +    val fly = androidx.compose.animation.core.Animatable(0f)
 +    /** orbit angle frozen while open (radians) */
 +    var angle by androidx.compose.runtime.mutableFloatStateOf(-0.6f)
-+    suspend fun toggle() {
++    suspend fun toggle(still: Boolean = false) {
++        if (still) { open = !open; shownNow = open; return }
 +        if (open) close() else {
 +            open = true; shownNow = true
 +            fly.animateTo(1f, androidx.compose.animation.core.tween(650, easing = androidx.compose.animation.core.FastOutSlowInEasing))
 +        }
 +    }
 +    suspend fun close() {
++        if (fly.value == 0f) { open = false; shownNow = false; return }
 +        fly.animateTo(0f, androidx.compose.animation.core.tween(550, easing = androidx.compose.animation.core.FastOutSlowInEasing))
 +        open = false; shownNow = false
 +    }
@@ -8870,6 +8901,15 @@ index 8737da3..129fc15 100644
 +    val rx = 74f; val ry = 50f; val cy = 8f
 +    val ox = if (still) 52f else rx * kotlin.math.cos(a)
 +    val oy = if (still) -44f else cy + ry * kotlin.math.sin(a)
++    // faint dashed orbit line (back layer, while circling)
++    if (!front && !still && f < 0.02f) {
++        androidx.compose.foundation.Canvas(Modifier.size(1.dp)) {
++            val c = androidx.compose.ui.geometry.Offset(size.width / 2f, size.height / 2f + cy.dp.toPx())
++            drawOval(Color(0xFFE8B98A).copy(alpha = 0.45f), topLeft = androidx.compose.ui.geometry.Offset(c.x - rx.dp.toPx(), c.y - ry.dp.toPx()),
++                size = androidx.compose.ui.geometry.Size(2 * rx.dp.toPx(), 2 * ry.dp.toPx()),
++                style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.dp.toPx(), pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(3.dp.toPx(), 5.dp.toPx()))))
++        }
++    }
 +    val inFront = still || kotlin.math.sin(a) >= 0f || f > 0.02f
 +    if (front != inFront && f <= 0.02f) return
 +    if (!front && f > 0.02f) return
@@ -8878,10 +8918,10 @@ index 8737da3..129fc15 100644
 +    val sc0 = 0.68f + 0.32f * depth
 +    val al0 = 0.55f + 0.45f * depth
 +    // flight to the top of the head: arc with a little bulge, grows 26 → 60 dp
-+    val tx = 0f; val ty = -80f
++    val tx = 0f; val ty = -82f
 +    val x = ox + (tx - ox) * f
 +    val y = oy + (ty - oy) * f - kotlin.math.sin(Math.PI.toFloat() * f) * 22f
-+    val sizeDp = 26f + (56f - 26f) * f
++    val sizeDp = 30f + (62f - 30f) * f
 +    val scale = sc0 + (1f - sc0) * f
 +    val alpha = al0 + (1f - al0) * f
 +    // faint trail of light dots behind the sprite while it circles
@@ -8900,25 +8940,6 @@ index 8737da3..129fc15 100644
 +        .clickable(interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }, indication = null, onClick = onTap)
 +        .semantics { contentDescription = "天气：${wx.spoken}" }) {
 +        AnimeWeatherIcon(wx.icon, sizeDp.dp)
-+    }
-+    // the pill pops out to the right of the big picture (or next to the parked sprite when animations are off)
-+    if (front && (f > 0.6f || (still && st.open))) {
-+        val pillAlpha = if (still) 1f else ((f - 0.6f) / 0.4f).coerceIn(0f, 1f)
-+        val fill = if (m.dark) Color(0xFF2A2421) else Color.White.copy(alpha = 0.94f)
-+        val px = if (still) 70f else 34f; val py = if (still) -44f else ty
-+        Row(Modifier.layout { mm, c ->
-+                // zero-size anchor at the face centre; the pill's LEFT edge sits px dp right of it
-+                val pl = mm.measure(androidx.compose.ui.unit.Constraints())
-+                layout(0, 0) { pl.place(px.dp.roundToPx(), py.dp.roundToPx() - pl.height / 2) }
-+            }.heightIn(min = 34.dp).graphicsLayer { this.alpha = pillAlpha; translationX = (1f - pillAlpha) * -24f }
-+            .clip(RoundedCornerShape(50)).background(fill).border(1.dp, m.hairline.copy(alpha = 0.18f), RoundedCornerShape(50))
-+            .padding(horizontal = 12.dp, vertical = 4.dp)
-+            .semantics(mergeDescendants = true) { contentDescription = "天气：" + wx.spoken },
-+            verticalAlignment = Alignment.CenterVertically) {
-+            Text("${wx.temp}°", fontSize = 18.sp, lineHeight = 22.sp, fontWeight = FontWeight.Bold, color = m.ink, maxLines = 1, softWrap = false)
-+            Spacer(Modifier.width(6.dp))
-+            Text(if (wx.extra.isNotBlank()) "${wx.words} · ${wx.extra}" else wx.words, fontSize = 14.sp, lineHeight = 18.sp, color = m.ink2, maxLines = 1, softWrap = false)
-+        }
 +    }
 +}
 +
@@ -8999,7 +9020,7 @@ index 8737da3..129fc15 100644
          }
      }
  }
-@@ -191,7 +450,7 @@ private fun Chip(modifier: Modifier, icon: androidx.compose.ui.graphics.vector.I
+@@ -191,7 +471,7 @@ private fun Chip(modifier: Modifier, icon: androidx.compose.ui.graphics.vector.I
      GlassCard(modifier.semantics(mergeDescendants = true) { contentDescription = "$label：$value" },
          shape = RoundedCornerShape(14.dp), elevation = 2.dp, onClick = onClick) {
          val fill = MaterialTheme.colorScheme.surfaceContainerHigh
@@ -9008,7 +9029,7 @@ index 8737da3..129fc15 100644
          val fg = cardTextColor(fill)
          Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
              MinesIcon(icon, null, tint = readableSecondary(fg, bg), modifier = Modifier.size(14.dp))
-@@ -227,3 +486,37 @@ private fun MessagesBar(count: Int, onClick: () -> Unit) {
+@@ -227,3 +507,37 @@ private fun MessagesBar(count: Int, onClick: () -> Unit) {
          Text("›", fontSize = 20.sp, color = m.ink3)
      }
  }
@@ -10598,7 +10619,7 @@ index 93d7159..a3b7b21 100644
 +
 +private fun Modifier.alphaCompat(a: Float): Modifier = this.then(Modifier.graphicsLayer { alpha = a })
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
-index c82aa8b..9babb1c 100644
+index c82aa8b..4e1f21b 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
 @@ -29,6 +29,7 @@ import androidx.compose.foundation.layout.Column
@@ -10641,7 +10662,7 @@ index c82aa8b..9babb1c 100644
  
      // [T-android-session-grouping] Groups are pulled out FIRST; only the
      // leftovers go through date bucketing. Assembly order below is
-@@ -847,13 +856,71 @@ fun SessionListScreen(
+@@ -847,13 +856,72 @@ fun SessionListScreen(
      // drawn edge to edge behind the status bar, top bar and navigation bar.
      // The Scaffold and its top bar go fully transparent so no opaque band
      // (the old 60%-surface bar) sits over the picture.
@@ -10709,12 +10730,13 @@ index c82aa8b..9babb1c 100644
 +                            stringResource(R.string.sessionlist_settings), size = 44.dp, onClick = onSettingsClick)
 +                    }
 +                }
++                com.openminis.app.ui.plus.HomeWeatherPill() // [Mines-38.7] 「26° 晴」 under the face while the big picture is up
 +                }
 +            } else TopAppBar(
                  title = {
                      if (isSelecting) {
                          Text(
-@@ -880,9 +947,8 @@ fun SessionListScreen(
+@@ -880,9 +948,8 @@ fun SessionListScreen(
                              Text(stringResource(R.string.cancel))
                          }
                      } else {
@@ -10726,7 +10748,7 @@ index c82aa8b..9babb1c 100644
                      }
                  },
                  actions = {
-@@ -896,93 +962,9 @@ fun SessionListScreen(
+@@ -896,93 +963,9 @@ fun SessionListScreen(
                              )
                          }
                      } else {
@@ -10823,7 +10845,7 @@ index c82aa8b..9babb1c 100644
                      }
                  },
                  colors = androidx.compose.material3.TopAppBarDefaults.topAppBarColors(
-@@ -1062,12 +1044,14 @@ fun SessionListScreen(
+@@ -1062,12 +1045,14 @@ fun SessionListScreen(
                          Modifier.fillMaxWidth().onSizeChanged { minesHeaderH = it.height },
                      ) {
                          com.openminis.app.ui.plus.TodayCard(
@@ -10839,7 +10861,7 @@ index c82aa8b..9babb1c 100644
                      }
                      com.openminis.app.ui.plus.DshModelsAutoStart()
                      LazyColumn(
-@@ -1076,7 +1060,7 @@ fun SessionListScreen(
+@@ -1076,7 +1061,7 @@ fun SessionListScreen(
                          state = listState,
                          modifier = Modifier.fillMaxWidth().weight(1f).clipToBounds(),
                          // Leave space for bottom FAB row; [Mines-compact-29] small top gap under the chips
@@ -10848,7 +10870,7 @@ index c82aa8b..9babb1c 100644
                      ) {
                          // T25: search-active path used to flatten the list and skip
                          // section headers entirely. Now reuses the same grouped
-@@ -1136,7 +1120,24 @@ fun SessionListScreen(
+@@ -1136,7 +1121,24 @@ fun SessionListScreen(
                                              },
                                          )
                                  } else {
@@ -10873,7 +10895,7 @@ index c82aa8b..9babb1c 100644
                                  }
                                  // animateItem gives the accordion its motion:
                                  // member rows fade+slide over 250ms instead of
-@@ -1193,8 +1194,7 @@ fun SessionListScreen(
+@@ -1193,8 +1195,7 @@ fun SessionListScreen(
                                      rowBackground = when {
                                          session.id == selectedSessionId ->
                                              MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
@@ -10883,7 +10905,7 @@ index c82aa8b..9babb1c 100644
                                      },
                                      isFolderMember = inFolder,
                                  )
-@@ -1257,19 +1257,9 @@ fun SessionListScreen(
+@@ -1257,19 +1258,9 @@ fun SessionListScreen(
                              }
                          }
  
@@ -10906,7 +10928,7 @@ index c82aa8b..9babb1c 100644
                      }
                      } // Plus: Today card column
                  }
-@@ -1398,7 +1388,21 @@ fun SessionListScreen(
+@@ -1398,7 +1389,21 @@ fun SessionListScreen(
                      onDelete = { showBulkDeleteDialog = true },
                      modifier = Modifier.align(Alignment.BottomCenter),
                  )
@@ -10929,7 +10951,7 @@ index c82aa8b..9babb1c 100644
                  // Dual FAB row (matching iOS: New Chat left + Search right, or vice versa).
                  // Hidden while the onboarding landing is showing — Step 3 provides the CTA.
                  // T46: stay visible while search is active even when the result
-@@ -1425,6 +1429,7 @@ fun SessionListScreen(
+@@ -1425,6 +1430,7 @@ fun SessionListScreen(
                      modelGroups = providerConfig.modelGroups,
                      onSearchToggle = {
                          if (isSearchActive) {
@@ -10937,7 +10959,7 @@ index c82aa8b..9babb1c 100644
                              viewModel.searchQuery.value = ""
                              viewModel.isSearchActive.value = false
                          } else {
-@@ -1433,6 +1438,7 @@ fun SessionListScreen(
+@@ -1433,6 +1439,7 @@ fun SessionListScreen(
                      },
                      onSearchQueryChange = { viewModel.searchQuery.value = it },
                      onSearchDismiss = {
@@ -10945,7 +10967,7 @@ index c82aa8b..9babb1c 100644
                          viewModel.searchQuery.value = ""
                          viewModel.isSearchActive.value = false
                      },
-@@ -1682,6 +1688,7 @@ private fun DualFabRow(
+@@ -1682,6 +1689,7 @@ private fun DualFabRow(
      onSearchQueryChange: (String) -> Unit,
      onSearchDismiss: () -> Unit,
      modifier: Modifier = Modifier,
@@ -10953,7 +10975,7 @@ index c82aa8b..9babb1c 100644
  ) {
      val context = LocalContext.current
      val prefs = remember { context.getSharedPreferences("ui_prefs", Context.MODE_PRIVATE) }
-@@ -1829,8 +1836,9 @@ private fun DualFabRow(
+@@ -1829,8 +1837,9 @@ private fun DualFabRow(
          horizontalArrangement = Arrangement.SpaceBetween,
          verticalAlignment = Alignment.CenterVertically,
      ) {
@@ -10965,7 +10987,7 @@ index c82aa8b..9babb1c 100644
  
          // Middle: Inline search bar (when active)
          AnimatedVisibility(
-@@ -1903,7 +1911,7 @@ private fun DualFabRow(
+@@ -1903,7 +1912,7 @@ private fun DualFabRow(
              )
          }
  
@@ -10974,7 +10996,7 @@ index c82aa8b..9babb1c 100644
      }
  }
  
-@@ -2142,7 +2150,7 @@ private fun SessionItemContent(
+@@ -2142,7 +2151,7 @@ private fun SessionItemContent(
                  Box(
                      modifier = Modifier
                          .matchParentSize()
@@ -10983,7 +11005,7 @@ index c82aa8b..9babb1c 100644
                      contentAlignment = Alignment.Center,
                  ) {
                      Row(
-@@ -2993,7 +3001,8 @@ private fun SessionRow(
+@@ -2993,7 +3002,8 @@ private fun SessionRow(
                  // tinted rectangle looked. Row metrics are left exactly as they
                  // were; the pill's proportions are handled by the inset of the
                  // drawn tint instead (see the drawBehind above).
@@ -10993,7 +11015,7 @@ index c82aa8b..9babb1c 100644
              ),
          verticalAlignment = Alignment.CenterVertically,
          horizontalArrangement = Arrangement.spacedBy(12.dp),
-@@ -3014,14 +3023,16 @@ private fun SessionRow(
+@@ -3014,14 +3024,16 @@ private fun SessionRow(
          // future ICLOUD_SYNCING uses the same anchor.
          val badgeMap by com.openminis.app.service.SessionBadgeStore.byId.collectAsState()
          val badgeHead = badgeMap[session.id]?.firstOrNull()
@@ -11013,7 +11035,7 @@ index c82aa8b..9babb1c 100644
                          shape = CircleShape,
                      ),
                  contentAlignment = Alignment.Center,
-@@ -3029,20 +3040,20 @@ private fun SessionRow(
+@@ -3029,20 +3041,20 @@ private fun SessionRow(
                  MinesIcon(
                      imageVector = style.icon,
                      contentDescription = null,
@@ -11039,7 +11061,7 @@ index c82aa8b..9babb1c 100644
                      )
                  }
              }
-@@ -3059,12 +3070,12 @@ private fun SessionRow(
+@@ -3059,12 +3071,12 @@ private fun SessionRow(
              modifier = Modifier.weight(1f),
              verticalArrangement = Arrangement.spacedBy(1.dp),
          ) {
@@ -11055,7 +11077,7 @@ index c82aa8b..9babb1c 100644
                      color = MaterialTheme.colorScheme.onSurface,
                      maxLines = 1,
                      overflow = TextOverflow.Ellipsis,
-@@ -3072,8 +3083,8 @@ private fun SessionRow(
+@@ -3072,8 +3084,8 @@ private fun SessionRow(
              } else {
                  Text(
                      text = titleText,
@@ -11066,7 +11088,7 @@ index c82aa8b..9babb1c 100644
                      color = MaterialTheme.colorScheme.onSurface,
                      maxLines = 1,
                      overflow = TextOverflow.Ellipsis,
-@@ -3085,15 +3096,15 @@ private fun SessionRow(
+@@ -3085,15 +3097,15 @@ private fun SessionRow(
              if (searchQuery.isNotBlank() && searchSnippet != null) {
                  Text(
                      text = highlightedAnnotatedString(searchSnippet, searchQuery),
@@ -11085,7 +11107,7 @@ index c82aa8b..9babb1c 100644
                      color = MaterialTheme.colorScheme.onSurfaceVariant,
                      maxLines = 1,
                      overflow = TextOverflow.Ellipsis,
-@@ -3104,7 +3115,10 @@ private fun SessionRow(
+@@ -3104,7 +3116,10 @@ private fun SessionRow(
          // Relative timestamp
          Text(
              text = timeText,
@@ -11097,7 +11119,7 @@ index c82aa8b..9babb1c 100644
              // [Mines-a11y-26] was colorScheme.outline (too dark to read)
              color = com.openminis.app.ui.plus.readableSecondary(),
          )
-@@ -3216,7 +3230,7 @@ private fun SessionBadgeOverlay(
+@@ -3216,7 +3231,7 @@ private fun SessionBadgeOverlay(
                      )
                      .border(
                          width = 1.5.dp,
