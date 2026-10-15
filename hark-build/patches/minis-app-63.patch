@@ -92,7 +92,7 @@ index 9d16beb..3855cc1 100644
          <receiver
              android:name=".plus.KeepAliveReceiver"
 diff --git a/src/android/app/src/main/java/com/openminis/app/MainActivity.kt b/src/android/app/src/main/java/com/openminis/app/MainActivity.kt
-index 68fe7ee..661c73d 100644
+index 68fe7ee..7660141 100644
 --- a/src/android/app/src/main/java/com/openminis/app/MainActivity.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/MainActivity.kt
 @@ -19,6 +19,8 @@ import androidx.activity.result.contract.ActivityResultContracts
@@ -164,7 +164,15 @@ index 68fe7ee..661c73d 100644
              }
          }
      }
-@@ -661,6 +679,14 @@ class MainActivity : ComponentActivity() {
+@@ -651,6 +669,7 @@ class MainActivity : ComponentActivity() {
+     /** [Mines-apps-32] notification deep link: route + optional service detail. */
+     private fun handleMinesRoute(i: Intent?) {
+         val route = i?.getStringExtra("mines_route") ?: return
++        if (i.getBooleanExtra("mines_link_retry", false)) { i.removeExtra("mines_link_retry"); com.openminis.app.plus.LinkCodeReader.retryRequested = true }
+         i.getStringExtra("mines_open_kind")?.let { com.openminis.app.ui.plus.PlusNav.openKind = it }
+         i.removeExtra("mines_route")
+         com.openminis.app.ui.plus.PlusNav.go(route)
+@@ -661,6 +680,14 @@ class MainActivity : ComponentActivity() {
          com.openminis.app.plus.LoginWeb.flush()
      }
  
@@ -179,7 +187,7 @@ index 68fe7ee..661c73d 100644
      override fun onStart() {
          super.onStart()
          // [Mines-sources-33] every saved login / key becomes a data source automatically (toast on a new build)
-@@ -725,7 +751,10 @@ class MainActivity : ComponentActivity() {
+@@ -725,7 +752,10 @@ class MainActivity : ComponentActivity() {
          if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
          val code = getSharedPreferences(PREF_APPEARANCE, MODE_PRIVATE).getString(KEY_LANGUAGE, "") ?: ""
          val localeManager = getSystemService(LocaleManager::class.java) ?: return
@@ -1911,6 +1919,101 @@ index c4569f6..382df32 100644
              "zhipu" -> verdict(call(base, bearer("https://open.bigmodel.cn/api/paas/v4/models", key)))
              "xai" -> verdict(call(base, bearer("https://api.x.ai/v1/api-key", key))) { it.optString("name") }
              "anthropic" -> verdict(call(base, Request.Builder().url("https://api.anthropic.com/v1/models")
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/LinkCodeReader.kt b/src/android/app/src/main/java/com/openminis/app/plus/LinkCodeReader.kt
+new file mode 100644
+index 0000000..9d6e748
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/LinkCodeReader.kt
+@@ -0,0 +1,89 @@
++package com.openminis.app.plus
++
++import android.app.NotificationChannel
++import android.app.NotificationManager
++import android.app.PendingIntent
++import android.content.Context
++import android.content.Intent
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.withContext
++import kotlinx.coroutines.withTimeoutOrNull
++
++/**
++ * [Mines-38.7] 快速线路 connection code over SSH, never stuck (user 2026-10-15: 「正在通过 SSH 读取服务器上的连接码…」 sat
++ * there all afternoon with no retry and no warning). Every read has a 20 s hard limit; 3 tries with back-off (2 s,
++ * 4 s); after that one 「自动配置」 (install, 5 min limit); still nothing → a red 「快速线路未就绪：原因」 and a system
++ * notification with 「重试」 (also when the app is in the background).
++ */
++object LinkCodeReader {
++    sealed class Result { data class Code(val code: String) : Result(); data class NotInstalled(val why: String) : Result(); data class Failed(val why: String) : Result() }
++
++    /** smoke: every SSH read "hangs" (exceeds the 20 s limit) */
++    @Volatile var simulateHang = false
++    @Volatile var readLimitMs = 20_000L
++
++    private suspend fun readOnce(c: Context, s: VpsServer): Result = withContext(Dispatchers.IO) {
++        val r = withTimeoutOrNull(readLimitMs) {
++            if (simulateHang) { delay(Long.MAX_VALUE) }
++            runCatching { VpsSsh.run(c, s.copy(linkUrl = ""), "cat /etc/mines-link/phone.txt 2>/dev/null", 15_000, 1).first.output.trim() }
++        } ?: return@withContext Result.Failed("读取连接码超时（${readLimitMs / 1000} 秒没回应）")
++        r.fold({ out -> out.lines().firstOrNull { it.startsWith("mines-link://") }?.let { Result.Code(it) } ?: Result.NotInstalled("服务器上还没装快速线路") },
++            { e -> Result.Failed("SSH 连不上：" + VpsSsh.reason(e)) })
++    }
++
++    private suspend fun install(c: Context, s: VpsServer): Result = withContext(Dispatchers.IO) {
++        if (simulateHang) { delay(readLimitMs); return@withContext Result.Failed("自动配置也超时了") }
++        val r = withTimeoutOrNull(300_000L) {
++            runCatching {
++                val bundle = c.assets.open("mines-link/install-bundle.sh").use { it.readBytes() }
++                val (sess, _) = VpsSsh.session(c, s.copy(linkUrl = ""))
++                val sudo = if (s.user == "root") "" else "sudo -n "
++                VpsSsh.exec(sess, "${sudo}sh -s -- --port 8443", 290_000, bundle).output
++            }
++        } ?: return@withContext Result.Failed("自动配置超时（5 分钟）")
++        r.fold({ out -> out.lines().firstOrNull { it.startsWith("mines-link://") }?.let { Result.Code(it) } ?: Result.Failed("自动配置没成功：" + out.lines().lastOrNull { it.isNotBlank() }.orEmpty().take(120)) },
++            { e -> Result.Failed("SSH 连不上，没法自动配置：" + VpsSsh.reason(e)) })
++    }
++
++    /** Reads the code with retries, then auto-configures once; [onStep] gets plain status lines. */
++    suspend fun obtain(c: Context, s: VpsServer, onStep: (String) -> Unit): Result {
++        var last: Result = Result.Failed("没有回应")
++        for (i in 0 until 3) {
++            onStep(if (i == 0) "正在通过 SSH 读取服务器上的连接码…" else "第 ${i + 1} 次重试读取连接码…")
++            last = readOnce(c, s)
++            if (last is Result.Code) return last
++            if (last is Result.NotInstalled) break
++            delay(2000L shl i)
++        }
++        onStep("读不到连接码，正在自动配置快速线路（约 1 分钟）…")
++        val ins = install(c, s)
++        if (ins is Result.Code) return ins
++        val why = (ins as? Result.Failed)?.why ?: (last as? Result.Failed)?.why ?: "没有回应"
++        notifyNotReady(c, s, why)
++        return Result.Failed(why)
++    }
++
++    const val CHANNEL = "mines_vps_link"
++
++    fun notifyNotReady(c: Context, s: VpsServer, why: String) {
++        val nm = c.getSystemService(NotificationManager::class.java) ?: return
++        if (nm.getNotificationChannel(CHANNEL) == null) nm.createNotificationChannel(NotificationChannel(CHANNEL, "服务器快速线路", NotificationManager.IMPORTANCE_HIGH))
++        val i = Intent(c, com.openminis.app.MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
++            .putExtra("mines_route", "plus_server/" + s.id).putExtra("mines_link_retry", true)
++        val pi = PendingIntent.getActivity(c, 7390 + (s.id.hashCode() and 0xff), i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
++        runCatching {
++            nm.notify(73900 + (s.id.hashCode() and 0xff), android.app.Notification.Builder(c, CHANNEL)
++                .setSmallIcon(com.openminis.app.R.drawable.ic_launcher_monochrome)
++                .setContentTitle("快速线路未就绪：${s.name.ifBlank { s.host }}")
++                .setContentText(why)
++                .setStyle(android.app.Notification.BigTextStyle().bigText(why))
++                .setContentIntent(pi)
++                .addAction(android.app.Notification.Action.Builder(null, "重试", pi).build())
++                .setAutoCancel(true).build())
++        }
++    }
++
++    /** set when the notification's 「重试」 opened the server page */
++    @Volatile var retryRequested = false
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/LoginAssist.kt b/src/android/app/src/main/java/com/openminis/app/plus/LoginAssist.kt
 new file mode 100644
 index 0000000..2069931
@@ -3748,10 +3851,10 @@ index 22661da..1d773a2 100644
          for (id in phone) one(id)
      }
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-index 8e5984b..01e0166 100644
+index 8e5984b..6425773 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-@@ -38,10 +38,151 @@ object GroupSelfTest {
+@@ -38,10 +38,164 @@ object GroupSelfTest {
                  GroupRunner.send(context, gid, parts.drop(1).joinToString("|"))
                  delay(300)
                  val t0 = System.currentTimeMillis()
@@ -3901,11 +4004,24 @@ index 8e5984b..01e0166 100644
 +            }
 +            // [Mines-38.7] saved-login import from CSV text in the arg ('savedlogins name,url,username,password\n…' with \n as two chars)
 +            "savedlogins" -> "imported=" + com.openminis.app.plus.SavedLogins.importCsv(context, rest.replace("\\n", "\n"))
++            // [Mines-38.7] 快速线路 code read that hangs: 'vpscodesim' → server id (page then opened by the smoke); 'vpscodesim off'
++            "vpscodesim" -> {
++                if (parts.getOrElse(0) { "" } == "off") { com.openminis.app.plus.LinkCodeReader.simulateHang = false; com.openminis.app.plus.LinkCodeReader.readLimitMs = 20_000L; "off" } else {
++                    com.openminis.app.plus.LinkCodeReader.simulateHang = true
++                    com.openminis.app.plus.LinkCodeReader.readLimitMs = 3_000L   // smoke: same flow, short limit
++                    com.openminis.app.plus.PlusPrefs.init(context)
++                    var sv = com.openminis.app.plus.PlusPrefs.state.value.servers.firstOrNull { it.name == "alvps-sim" }
++                    if (sv == null) { sv = com.openminis.app.plus.VpsServer(name = "alvps-sim", host = "10.0.2.2", port = 2222)
++                        val nv = sv; com.openminis.app.plus.PlusPrefs.update(context) { st -> st.copy(servers = st.servers + nv) } }
++                    com.openminis.app.plus.LinkCodeReader.retryRequested = true
++                    sv.id
++                }
++            }
 +            "weatherframe" -> JSONObject().put("t", com.openminis.app.ui.plus.AnimeWeather.lastT.toDouble()).toString()
              "reset" -> {
                  GroupStore.groups.value.forEach { GroupStore.delete(it.id) }
                  GroupPrefs.customs().forEach { GroupPrefs.removeCustom(it.id) }
-@@ -50,4 +191,41 @@ object GroupSelfTest {
+@@ -50,4 +204,41 @@ object GroupSelfTest {
              else -> "unknown group command"
          }
      }
@@ -7955,10 +8071,10 @@ index 8843d0f..310d404 100644
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/LinkAll.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/LinkAll.kt
 new file mode 100644
-index 0000000..2c509b0
+index 0000000..70dbf2c
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/LinkAll.kt
-@@ -0,0 +1,263 @@
+@@ -0,0 +1,277 @@
 +package com.openminis.app.ui.plus
 +
 +import android.webkit.WebView
@@ -8021,11 +8137,16 @@ index 0000000..2c509b0
 +    fun note(id: String): String? = GroupPrefs.get("linkres_$id")
 +    fun setNote(id: String, v: String?) = GroupPrefs.put("linkres_$id", v)
 +
-+    enum class St(val label: String) { LINKED("已关联"), USER("需要你操作"), EXPIRED("过期了"), NONE("还没关联") }
++    enum class St(val label: String) { LINKED("已关联"), USER("需要你操作"), EXPIRED("过期了"), NONE("还没关联"), IGNORED("已忽略") }
++
++    /** [Mines-38.7] 「忽略」: a platform that cannot be fixed is no longer offered / counted (restore in 关联结果) */
++    fun ignored(id: String) = GroupPrefs.get("linkignore_$id") == "1"
++    fun setIgnored(id: String, on: Boolean) = GroupPrefs.put("linkignore_$id", if (on) "1" else null)
 +
 +    fun state(id: String): St {
 +        val spec = AiCatalog.spec(id) ?: return St.NONE
 +        if (WebChat.signedIn(spec, id)) return St.LINKED
++        if (ignored(id)) return St.IGNORED
 +        if (GroupPrefs.get("weblogin_$id") == "0") return St.EXPIRED
 +        val n = note(id)
 +        if (n == "扫码" || n == "验证") return St.USER
@@ -8039,7 +8160,7 @@ index 0000000..2c509b0
 +    }
 +
 +    fun start() {
-+        queue.clear(); queue.addAll(platforms().filter { state(it) != St.LINKED })
++        queue.clear(); queue.addAll(platforms().filter { state(it) != St.LINKED && state(it) != St.IGNORED })
 +        index = 0; waiting = null
 +        running = queue.isNotEmpty(); autoLogin = running
 +    }
@@ -8113,12 +8234,13 @@ index 0000000..2c509b0
 +        if (!LinkAll.running) {
 +            val all = remember(tick) { LinkAll.platforms() }
 +            val linked = all.count { LinkAll.state(it) == LinkAll.St.LINKED }
++            val ign = all.count { LinkAll.state(it) == LinkAll.St.IGNORED }
 +            BigText("把 AI 平台都关联上", 22)
 +            BigText("我会一个一个打开登录页，手机号和短信验证码我自动填。只有要扫码或人机验证时才停下来叫你。", 17, FontWeight.Normal)
-+            BigText("共 ${all.size} 个，已关联 $linked 个", 17, FontWeight.Normal)
++            BigText("共 ${all.size - ign} 个，已关联 $linked 个" + if (ign > 0) "（忽略了 $ign 个）" else "", 17, FontWeight.Normal)
 +            Spacer(Modifier.height(16.dp))
 +            Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-+                PillButton(if (linked == all.size) "全部都关联好了" else "开始", Modifier.fillMaxWidth(), enabled = linked < all.size) { LinkAll.start(); paused = false; tick++ }
++                PillButton(if (linked + ign >= all.size) "全部都关联好了" else "开始", Modifier.fillMaxWidth(), enabled = linked + ign < all.size) { LinkAll.start(); paused = false; tick++ }
 +                PillButton("看关联结果", Modifier.fillMaxWidth(), primary = false) { go(LinkAll.SUMMARY) }
 +            }
 +            Spacer(Modifier.height(20.dp))
@@ -8150,12 +8272,14 @@ index 0000000..2c509b0
 +    val ctx = androidx.compose.ui.platform.LocalContext.current
 +    remember { GroupPrefs.init(ctx); 0 }
 +    val all = remember { LinkAll.platforms() }
-+    val groups = remember { all.groupBy { LinkAll.state(it) } }
++    var rev by remember { mutableIntStateOf(0) }
++    val groups = remember(rev) { all.groupBy { LinkAll.state(it) } }
 +    PlusPage("关联结果", onBack) {
 +        val linked = groups[LinkAll.St.LINKED].orEmpty().size
++        val ign = groups[LinkAll.St.IGNORED].orEmpty().size
 +        Spacer(Modifier.height(8.dp))
-+        BigText("已关联 $linked 个，共 ${all.size} 个", 18)
-+        for (st in listOf(LinkAll.St.USER, LinkAll.St.EXPIRED, LinkAll.St.NONE, LinkAll.St.LINKED)) {
++        BigText("已关联 $linked 个，共 ${all.size - ign} 个", 18)
++        for (st in listOf(LinkAll.St.USER, LinkAll.St.EXPIRED, LinkAll.St.NONE, LinkAll.St.LINKED, LinkAll.St.IGNORED)) {
 +            val l = groups[st].orEmpty()
 +            if (l.isEmpty()) continue
 +            PlusSection(st.label + "（${l.size}）") {
@@ -8166,15 +8290,21 @@ index 0000000..2c509b0
 +                            LinkAll.St.USER -> LinkAll.userStepText(id)
 +                            LinkAll.St.EXPIRED -> "登录过期了，点一下重新登录"
 +                            LinkAll.St.NONE -> if (LinkAll.note(id) == "跳过") "上次跳过了，点一下登录" else "点一下登录"
++                            LinkAll.St.IGNORED -> "不再提醒，也不算失败"
 +                        }
-+                        PlusRow(null, LinkAll.name(id), sub, trailing = { StatusPill(st.label, if (st == LinkAll.St.LINKED) true else if (st == LinkAll.St.NONE) null else false) },
-+                            onClick = { LinkAll.autoLogin = false; go(com.openminis.app.ui.group.GroupRoutes.webLogin(id)) })
++                        PlusRow(null, LinkAll.name(id), sub, trailing = {
++                            when (st) {
++                                LinkAll.St.LINKED -> StatusPill(st.label, true)
++                                LinkAll.St.IGNORED -> PillButton("恢复", primary = false) { LinkAll.setIgnored(id, false); rev++ }
++                                else -> PillButton("忽略", primary = false) { LinkAll.setIgnored(id, true); rev++ }
++                            }
++                        }, onClick = { LinkAll.autoLogin = false; go(com.openminis.app.ui.group.GroupRoutes.webLogin(id)) })
 +                    }
 +                }
 +            }
 +        }
 +        Spacer(Modifier.height(16.dp))
-+        if (linked < all.size) Row(Modifier.fillMaxWidth().padding(horizontal = 24.dp), verticalAlignment = Alignment.CenterVertically) {
++        if (linked + ign < all.size) Row(Modifier.fillMaxWidth().padding(horizontal = 24.dp), verticalAlignment = Alignment.CenterVertically) {
 +            PillButton("再关联一遍没好的", Modifier.fillMaxWidth()) { LinkAll.start(); go(LinkAll.ROUTE) }
 +        }
 +        Spacer(Modifier.height(24.dp))
@@ -9071,6 +9201,70 @@ index d6772d9..926fe48 100644
          }
          // [Mines-degen-34] 防乱码: models marked 不稳定 + thinking length cap
          com.openminis.app.plus.ModelHealth.load(ctx)
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt
+index 8cb1e59..4ee1029 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt
+@@ -255,19 +255,38 @@ private fun LinkSection(server: VpsServer) {
+                 else "安装没成功：" + out.lines().lastOrNull { it.isNotBlank() }.orEmpty().take(160)
+         }
+     }
++    // [Mines-38.7] connection code: 20 s limit, retries with back-off, one auto-configure, then a red line + notification
++    var notReady by remember { mutableStateOf<String?>(null) }
++    var reading by remember { mutableStateOf(false) }
++    fun obtain() {
++        if (reading) return
++        reading = true; notReady = null
++        scope.launch {
++            when (val r = com.openminis.app.plus.LinkCodeReader.obtain(context, server) { msg = it }) {
++                is com.openminis.app.plus.LinkCodeReader.Result.Code -> save(r.code)
++                is com.openminis.app.plus.LinkCodeReader.Result.NotInstalled -> { notInstalled = true; msg = r.why }
++                is com.openminis.app.plus.LinkCodeReader.Result.Failed -> { notReady = r.why; msg = null }
++            }
++            reading = false
++        }
++    }
++    LaunchedEffect(Unit) { if (com.openminis.app.plus.LinkCodeReader.retryRequested) { com.openminis.app.plus.LinkCodeReader.retryRequested = false; obtain() } }
+     PlusSection("快速线路（HTTPS，抗代理和断线）",
+         footer = if (paired && !notInstalled) "任务在服务器上跑，手机断线不会中断；网络恢复后自动续上输出。端口 8443 没放行时，Mines 自动走已经能用的 SSH 通道，不用开新端口。" else
+             "点「一键安装」：Mines 通过 SSH 在服务器上装一个小程序（开机自启）。想直连更快，可在云服务器安全组放行 TCP 8443；不放行也能用（走 SSH 通道）。") {
+         val st = states[server.id]
+         Text(
++            // [Mines-38.7] no code yet → never 「已连接」
+             when {
++                notReady != null -> "快速线路未就绪：$notReady"
++                reading -> "快速线路未就绪：正在读取连接码"
+                 !paired -> "未配置"
+                 notInstalled -> "服务器上还没装快速线路"
+                 st == null -> "正在连接…"
+                 else -> st.second
+             },
+             fontSize = 17.sp,
+-            color = if (st?.first == com.openminis.app.plus.MinesLink.State.ONLINE) Color(0xFF1F7A3F) else MaterialTheme.colorScheme.onSurface,
++            color = if (notReady != null) Color(0xFFB3261E) else if (paired && st?.first == com.openminis.app.plus.MinesLink.State.ONLINE) Color(0xFF1F7A3F) else MaterialTheme.colorScheme.onSurface,
+             modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+         )
+         msg?.takeIf { it != "服务器上还没装快速线路" || !notInstalled }?.let { Text(it, fontSize = 15.sp, modifier = Modifier.padding(horizontal = 14.dp)) }
+@@ -276,18 +295,7 @@ private fun LinkSection(server: VpsServer) {
+             Text(if (installing) "正在安装…" else "一键安装", fontSize = 18.sp)
+         }
+         Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+-            OutlinedButton(onClick = {
+-                msg = "正在通过 SSH 读取服务器上的连接码…"
+-                scope.launch {
+-                    val r = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+-                        runCatching { com.openminis.app.plus.VpsSsh.run(context, server.copy(linkUrl = ""), "cat /etc/mines-link/phone.txt 2>/dev/null", 15_000, 2).first.output.trim() }
+-                    }
+-                    val code = r.getOrNull()?.lines()?.firstOrNull { it.startsWith("mines-link://") }
+-                    if (code != null) save(code)
+-                    else if (r.isFailure) msg = "SSH 也连不上：${com.openminis.app.plus.VpsSsh.reason(r.exceptionOrNull()!!)}。请粘贴连接码。"
+-                    else { notInstalled = true; msg = "服务器上还没装快速线路" }
+-                }
+-            }, modifier = Modifier.weight(1f).heightIn(min = 52.dp)) { Text("自动配置") }
++            OutlinedButton(onClick = { obtain() }, modifier = Modifier.weight(1f).heightIn(min = 52.dp)) { Text("自动配置") }
+             OutlinedButton(onClick = {
+                 val cm = context.getSystemService(android.content.ClipboardManager::class.java)
+                 val t = cm?.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()?.trim().orEmpty()
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
 index 8737da3..7ce3231 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
