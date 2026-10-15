@@ -3851,10 +3851,10 @@ index 22661da..1d773a2 100644
          for (id in phone) one(id)
      }
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-index 8e5984b..6425773 100644
+index 8e5984b..ee68e54 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-@@ -38,10 +38,164 @@ object GroupSelfTest {
+@@ -38,10 +38,203 @@ object GroupSelfTest {
                  GroupRunner.send(context, gid, parts.drop(1).joinToString("|"))
                  delay(300)
                  val t0 = System.currentTimeMillis()
@@ -3984,6 +3984,45 @@ index 8e5984b..6425773 100644
 +            "linknote" -> { com.openminis.app.ui.plus.LinkAll.setNote(parts.getOrElse(0) { "" }, parts.getOrNull(1)); "ok" }
 +            "linkmark" -> { WebChat.markSignedIn(parts.getOrElse(0) { "" }, when (parts.getOrNull(1)) { "1" -> true; "0" -> false; else -> null }); "ok" }
 +            "linkstates" -> JSONObject(com.openminis.app.ui.plus.LinkAll.platforms().associateWith { com.openminis.app.ui.plus.LinkAll.state(it).label }).toString()
++            // [Mines-38.7] every 一键关联 platform (web AI apps + all of 账号连接) with how it links, for the report table
++            "linkinfo" -> {
++                com.openminis.app.plus.PlusVault.init(context)
++                val L = com.openminis.app.ui.plus.LinkAll
++                JSONArray(L.platforms().map { id ->
++                    JSONObject().put("id", id).put("name", L.name(id)).put("category", L.category(id)).put("how", L.how(id))
++                        .put("auto", L.automatic(id)).put("external", L.externalSync(id)).put("state", L.state(id).label)
++                        .put("step", if (L.automatic(id)) "" else L.manualStep(id))
++                }).toString()
++            }
++            // [Mines-38.7] open one platform the way 一键关联 does ('linkopen conn:x' / 'linkopen web:kimi')
++            "linkopen" -> {
++                val id = parts.getOrElse(0) { "" }
++                android.os.Handler(android.os.Looper.getMainLooper()).post {
++                    com.openminis.app.ui.plus.LinkAll.open(id, { r -> com.openminis.app.ui.plus.PlusNav.go(r) }, auto = false)
++                }
++                "ok"
++            }
++            // [Mines-38.7] persistence check without a real account: 'connfake x' puts a session cookie for X into Mines' own
++            // cookie store + a 账号连接 entry (as a real in-app sign-in leaves it); 'connfake x|off' removes both
++            "connfake" -> {
++                com.openminis.app.plus.PlusVault.init(context)
++                val k = com.openminis.app.plus.PlusVault.kind(parts.getOrElse(0) { "x" }) ?: return@runBlocking "no kind"
++                val host = com.openminis.app.plus.PlusConnect.hostOf(k.loginUrl ?: "")
++                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
++                val cm = com.openminis.app.plus.LoginWeb.cookies(k.id)
++                if (parts.getOrNull(1) == "off") {
++                    k.doneCookies.forEach { c -> cm.setCookie("https://$host/", "$c=; Max-Age=0; Path=/") }
++                    com.openminis.app.plus.LoginWeb.flush()
++                    runCatching { com.openminis.app.plus.PlusVault.remove(context, k) }; "off"
++                } else {
++                    k.doneCookies.forEach { c -> cm.setCookie("https://$host/", "$c=smoke; Max-Age=86400; Path=/; Secure") }
++                    com.openminis.app.plus.LoginWeb.flush()
++                    com.openminis.app.plus.PlusVault.save(context, k, "smoke", null, share = false, via = "web")
++                    "signedIn=" + com.openminis.app.plus.LoginWeb.signedIn(k)
++                }
++                }
++            }
++            "linkignore" -> { com.openminis.app.ui.plus.LinkAll.setIgnored(parts.getOrElse(0) { "" }, parts.getOrNull(1) == "1"); "ok" }
 +            // [Mines-38.7] day ↔ night: 'daynight 18:29:58|18:30' runs a fake clock (crosses the sunset in 2 s); 'daynight off'
 +            "daynight" -> {
 +                val a0 = parts.getOrElse(0) { "" }
@@ -4021,7 +4060,7 @@ index 8e5984b..6425773 100644
              "reset" -> {
                  GroupStore.groups.value.forEach { GroupStore.delete(it.id) }
                  GroupPrefs.customs().forEach { GroupPrefs.removeCustom(it.id) }
-@@ -50,4 +204,41 @@ object GroupSelfTest {
+@@ -50,4 +243,41 @@ object GroupSelfTest {
              else -> "unknown group command"
          }
      }
@@ -5311,10 +5350,18 @@ index dc5c875..9480c27 100644
              modifier = Modifier.fillMaxWidth(),
          ) {
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/group/GroupScreens.kt b/src/android/app/src/main/java/com/openminis/app/ui/group/GroupScreens.kt
-index 2dbee20..7e527c1 100644
+index 2dbee20..0190ef2 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/group/GroupScreens.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/group/GroupScreens.kt
-@@ -69,6 +69,10 @@ import com.openminis.app.plus.group.Partners
+@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.Spacer
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
+ import androidx.compose.foundation.layout.heightIn
+ import androidx.compose.foundation.layout.imePadding
+ import androidx.compose.foundation.layout.navigationBarsPadding
+@@ -69,6 +70,10 @@ import com.openminis.app.plus.group.Partners
  import com.openminis.app.plus.group.PhoneApps
  import com.openminis.app.plus.group.PhoneTyping
  import com.openminis.app.plus.group.Proto
@@ -5325,7 +5372,7 @@ index 2dbee20..7e527c1 100644
  import com.openminis.app.ui.brand.MinesIcon
  import com.openminis.app.ui.brand.MinesIcons
  import com.openminis.app.ui.plus.InfoLine
-@@ -84,6 +88,8 @@ import com.openminis.app.ui.plus.PlusRow
+@@ -84,6 +89,8 @@ import com.openminis.app.ui.plus.PlusRow
  import com.openminis.app.ui.plus.PlusSection
  import com.openminis.app.ui.plus.StatusPill
  import com.openminis.app.ui.plus.mines
@@ -5334,7 +5381,7 @@ index 2dbee20..7e527c1 100644
  import com.openminis.app.ui.plus.minesGlassFill
  import kotlinx.coroutines.launch
  
-@@ -94,14 +100,23 @@ object GroupRoutes {
+@@ -94,14 +101,24 @@ object GroupRoutes {
      const val NEW = "plus_group_new"
      const val CHAT = "plus_group_chat/{id}"
      fun chat(id: String) = "plus_group_chat/$id"
@@ -5353,6 +5400,7 @@ index 2dbee20..7e527c1 100644
 +    // [Mines-38.7] 一键关联 + 关联结果 + 手机权限
 +    composable(com.openminis.app.ui.plus.LinkAll.ROUTE) { com.openminis.app.ui.plus.LinkAllScreen(back) { nav.navigate(it) } }
 +    composable(com.openminis.app.ui.plus.LinkAll.SUMMARY) { com.openminis.app.ui.plus.LinkSummaryScreen(back) { nav.navigate(it) } }
++    composable(com.openminis.app.ui.plus.LinkAll.IGNORED) { com.openminis.app.ui.plus.LinkIgnoredScreen(back) }
 +    composable(com.openminis.app.ui.plus.PermGuide.ROUTE) { com.openminis.app.ui.plus.PermGuideScreen(back) }
      composable(GroupRoutes.NEW) {
 -        NewGroupScreen(back) { id -> nav.navigate(GroupRoutes.chat(id)) { popUpTo(GroupRoutes.NEW) { inclusive = true } } }
@@ -5360,7 +5408,7 @@ index 2dbee20..7e527c1 100644
      }
      composable(GroupRoutes.CHAT, arguments = listOf(navArgument("id") { type = NavType.StringType })) { e ->
          GroupChatScreen(e.arguments?.getString("id") ?: "", back) { nav.navigate(GroupRoutes.PARTNERS) }
-@@ -126,7 +141,9 @@ fun PartnerAvatar(p: Partner?, who: String, name: String, size: Dp = 36.dp) {
+@@ -126,7 +143,9 @@ fun PartnerAvatar(p: Partner?, who: String, name: String, size: Dp = 36.dp) {
              .border(1.dp, m.hairline, CircleShape),
          contentAlignment = Alignment.Center,
      ) {
@@ -5371,7 +5419,7 @@ index 2dbee20..7e527c1 100644
          else Text(GroupRunner.shortName(name).take(1).uppercase(), fontSize = (size.value * 0.42f).sp, fontWeight = FontWeight.Bold, color = tint)
      }
  }
-@@ -147,15 +164,17 @@ fun GroupHomeScreen(onBack: () -> Unit, go: (String) -> Unit) {
+@@ -147,15 +166,17 @@ fun GroupHomeScreen(onBack: () -> Unit, go: (String) -> Unit) {
      val partners by Partners.list.collectAsState()
      LaunchedEffect(Unit) { Partners.refresh(ctx) }
      val ready = partners.filter { it.ready }
@@ -5392,7 +5440,7 @@ index 2dbee20..7e527c1 100644
                      go(GroupRoutes.chat(g.id))
                  }
              }
-@@ -167,8 +186,13 @@ fun GroupHomeScreen(onBack: () -> Unit, go: (String) -> Unit) {
+@@ -167,8 +188,13 @@ fun GroupHomeScreen(onBack: () -> Unit, go: (String) -> Unit) {
  
  // ── 新建群 ───────────────────────────────────────────────────────────────
  
@@ -5407,7 +5455,7 @@ index 2dbee20..7e527c1 100644
      val ctx = LocalContext.current
      GroupStore.init(ctx)
      val partners by Partners.list.collectAsState()
-@@ -177,25 +201,30 @@ fun NewGroupScreen(onBack: () -> Unit, onCreated: (String) -> Unit) {
+@@ -177,25 +203,30 @@ fun NewGroupScreen(onBack: () -> Unit, onCreated: (String) -> Unit) {
      var picked by remember { mutableStateOf(setOf<String>()) }
      var host by remember { mutableStateOf(true) }
      var seq by remember { mutableStateOf(true) }
@@ -5454,7 +5502,7 @@ index 2dbee20..7e527c1 100644
              }
          }
          PlusSection("群设置") {
-@@ -214,128 +243,454 @@ fun NewGroupScreen(onBack: () -> Unit, onCreated: (String) -> Unit) {
+@@ -214,128 +245,473 @@ fun NewGroupScreen(onBack: () -> Unit, onCreated: (String) -> Unit) {
      }
  }
  
@@ -5551,11 +5599,10 @@ index 2dbee20..7e527c1 100644
      val m = mines()
      fun reload() = scope.launch { Partners.refresh(ctx) }
 +    fun chat(p: Partner) { go(GroupRoutes.chat(GroupStore.direct(p.id, p.spec.name).id)) }
-+    LaunchedEffect(partners.size) {
-+        val want = PartnersNav.open
-+        val hit = want?.let { id -> partners.firstOrNull { it.id == id } }
-+        if (hit != null) { PartnersNav.open = null; if (hit.ready) { info = hit } else { edit = hit } }
-+    }
++    // [Mines-38.7] arriving from 新建群聊 「怎么接」: no dialog on top of AI 伙伴 (testers read it as a "Muse dialog");
++    // the member's row is tinted and its explanation opens inline under it
++    var howto by remember { mutableStateOf<String?>(PartnersNav.open) }
++    LaunchedEffect(Unit) { PartnersNav.open = null }
  
 -    PlusPage("AI 伙伴", onBack, subtitle = "已连接的密钥自动识别；没有的点「连接」，Mines 帮你去官网一键获取",
 +    PlusPage("AI 伙伴", onBack, subtitle = "智能体和你登录过的 AI App；点「聊天」直接聊，也能拉进群",
@@ -5585,9 +5632,14 @@ index 2dbee20..7e527c1 100644
 +            if (agents.isEmpty()) InfoLine("正在识别…")
 +            agents.forEachIndexed { i, p ->
 +                if (i > 0) com.openminis.app.ui.plus.WarmDivider(68.dp)
-+                PartnerRow(p, onClick = { info = p }, trailing = {
-+                    if (p.ready) ActionPill("聊天") { chat(p) } else ActionPill(fixLabel(p)) { fixPartner(p, go) { edit = p } }
-+                })
++                val open = howto == p.id
++                Column(if (open) Modifier.background(m.container.copy(alpha = 0.45f)) else Modifier) {
++                    PartnerRow(p, onClick = { info = p }, trailing = {
++                        if (p.ready) ActionPill("聊天") { chat(p) }
++                        else ActionPill(fixLabel(p)) { fixPartner(p, go) { howto = if (open) null else p.id } }
++                    })
++                    if (open && !p.ready) HowToInline(p, onManual = { edit = p })
++                }
 +            }
 +        }
 +        PlusSection("App 账号 · ${webApps.count { it.ready }} 个已登录", footer = "登录一次网页版就行；同一个 App 可以登录多个账号（点它 →「再登录一个账号」），各自分开") {
@@ -5988,10 +6040,25 @@ index 2dbee20..7e527c1 100644
 +        .clickable(onClick = onClick).padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
 +        Text(text, fontSize = MT.Body, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
 +        if (on) MinesIcon(icon("check"), null, tint = m.icon, modifier = Modifier.size(18.dp))
++    }
++}
++
++/** [Mines-38.7] 「怎么接」 explained in place (no dialog): what the member is, what it needs, one optional manual step. */
++@Composable
++private fun HowToInline(p: Partner, onManual: () -> Unit) {
++    val m = mines()
++    Column(Modifier.fillMaxWidth().padding(start = 68.dp, end = 16.dp, bottom = 12.dp)) {
++        val why = p.reason?.takeIf { it.isNotBlank() }
++        Text(listOfNotNull(p.spec.note.ifBlank { null }, why?.let { "现在：$it" }).joinToString("\n").ifBlank { "这个成员需要一个能访问的地址才能进群。" },
++            fontSize = MT.Sub, lineHeight = MT.SubLH, color = m.ink2)
++        Spacer(Modifier.height(8.dp))
++        Text("它不用登录账号：地址能连上后会自动变成「能用」。也可以自己填地址。", fontSize = MT.Sub, lineHeight = MT.SubLH, color = m.ink3)
++        Spacer(Modifier.height(8.dp))
++        ActionPill("手动填写地址", onManual)
      }
  }
  
-@@ -345,17 +700,23 @@ private fun PartnerRow(p: Partner, onClick: (() -> Unit)? = null, trailing: (@Co
+@@ -345,17 +721,23 @@ private fun PartnerRow(p: Partner, onClick: (() -> Unit)? = null, trailing: (@Co
      Row(Modifier.fillMaxWidth().heightIn(min = 64.dp).then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
          .padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
          PartnerAvatar(p, p.id, p.spec.name, 40.dp)
@@ -6024,7 +6091,7 @@ index 2dbee20..7e527c1 100644
      }
  }
  
-@@ -375,6 +736,10 @@ fun GroupChatScreen(gid: String, onBack: () -> Unit, onPartners: () -> Unit) {
+@@ -375,6 +757,10 @@ fun GroupChatScreen(gid: String, onBack: () -> Unit, onPartners: () -> Unit) {
      val running by GroupRunner.running.collectAsState()
      val busy = gid in running
      val members = g.members.mapNotNull { id -> partners.firstOrNull { it.id == id } }
@@ -6035,7 +6102,7 @@ index 2dbee20..7e527c1 100644
      var input by remember { mutableStateOf("") }
      var menu by remember { mutableStateOf(false) }
      val list = rememberLazyListState()
-@@ -395,25 +760,26 @@ fun GroupChatScreen(gid: String, onBack: () -> Unit, onPartners: () -> Unit) {
+@@ -395,25 +781,26 @@ fun GroupChatScreen(gid: String, onBack: () -> Unit, onPartners: () -> Unit) {
                      MinesIcon(icon("arrow-left"), null, tint = m.ink)
                  }
                  Column(Modifier.weight(1f)) {
@@ -6069,7 +6136,7 @@ index 2dbee20..7e527c1 100644
                      }) { input = mention(input, GroupRunner.shortName(p.spec.name)) }
                  }
              }
-@@ -423,8 +789,13 @@ fun GroupChatScreen(gid: String, onBack: () -> Unit, onPartners: () -> Unit) {
+@@ -423,8 +810,13 @@ fun GroupChatScreen(gid: String, onBack: () -> Unit, onPartners: () -> Unit) {
                  if (msgs.isEmpty()) item {
                      MinesCard(Modifier.fillMaxWidth()) {
                          Column(Modifier.padding(18.dp)) {
@@ -6085,7 +6152,7 @@ index 2dbee20..7e527c1 100644
                          }
                      }
                  }
-@@ -435,14 +806,15 @@ fun GroupChatScreen(gid: String, onBack: () -> Unit, onPartners: () -> Unit) {
+@@ -435,14 +827,15 @@ fun GroupChatScreen(gid: String, onBack: () -> Unit, onPartners: () -> Unit) {
              }
              // input
              Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)
@@ -6105,7 +6172,7 @@ index 2dbee20..7e527c1 100644
                  val canSend = input.isNotBlank()
                  Box(Modifier.size(44.dp).clip(CircleShape).background(if (busy) MinesDesign.DangerFill else if (canSend) m.primary else m.ink3.copy(alpha = 0.3f))
                      .clickable(enabled = busy || canSend) {
-@@ -458,13 +830,15 @@ fun GroupChatScreen(gid: String, onBack: () -> Unit, onPartners: () -> Unit) {
+@@ -458,13 +851,15 @@ fun GroupChatScreen(gid: String, onBack: () -> Unit, onPartners: () -> Unit) {
          AlertDialog(onDismissRequest = { menu = false }, title = { Text(g.name) },
              text = {
                  Column {
@@ -6125,7 +6192,7 @@ index 2dbee20..7e527c1 100644
                  }
              },
              confirmButton = { TextButton({ menu = false }) { Text("关闭") } })
-@@ -481,15 +855,15 @@ private fun fmtTok(n: Int) = if (n >= 10_000) String.format("%.1f万", n / 10_00
+@@ -481,15 +876,15 @@ private fun fmtTok(n: Int) = if (n >= 10_000) String.format("%.1f万", n / 10_00
  @Composable
  private fun MemberChip(p: Partner?, who: String, name: String, badge: String?, onClick: () -> Unit) {
      val m = mines()
@@ -6146,7 +6213,7 @@ index 2dbee20..7e527c1 100644
          }
      }
  }
-@@ -500,51 +874,141 @@ private fun Bubble(msg: GroupMsg, p: Partner?, onRetry: () -> Unit, onFix: () ->
+@@ -500,51 +895,141 @@ private fun Bubble(msg: GroupMsg, p: Partner?, onRetry: () -> Unit, onFix: () ->
      if (msg.who == "user") {
          Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
              SelectionContainer {
@@ -6207,18 +6274,18 @@ index 2dbee20..7e527c1 100644
 +                    // [Mines-38.6] slow agents: 「正在思考… 12 秒」, and after 40 s a calm note that nobody waits for it
 +                    val sec by androidx.compose.runtime.produceState(((System.currentTimeMillis() - msg.at) / 1000).toInt(), msg.id) {
 +                        while (true) { kotlinx.coroutines.delay(1000); value = ((System.currentTimeMillis() - msg.at) / 1000).toInt() }
++                    }
++                    val slow = p?.spec?.proto == Proto.MANUS || p?.spec?.proto == Proto.WEBAPP || p?.spec?.proto == Proto.MINES
++                    Column {
++                        Text((if (p?.spec?.proto == Proto.PHONE) "正在 ${p.spec.name} 里代打字…" else if (msg.kind == "summary") "正在总结…" else "正在思考…") +
++                            if (sec >= 3) " $sec 秒" else "", fontSize = MT.Sub, color = m.ink2)
++                        if (slow && sec >= 40) Text("${GroupRunner.shortName(msg.name)} 回得慢，别的成员不用等它", fontSize = MT.Meta, color = m.ink3)
                      }
 -                    "error" -> {
 -                        Text("没回上：" + msg.text, fontSize = 15.sp, lineHeight = 21.sp, color = MinesDesign.Danger)
 -                        Row {
 -                            if (canRetry) TextButton(onRetry) { Text("重试") }
 -                            if (msg.text.contains("密钥") || msg.text.contains("连接") || msg.text.contains("余额") || msg.text.contains("模型")) TextButton(onFix) { Text("去设置") }
-+                    val slow = p?.spec?.proto == Proto.MANUS || p?.spec?.proto == Proto.WEBAPP || p?.spec?.proto == Proto.MINES
-+                    Column {
-+                        Text((if (p?.spec?.proto == Proto.PHONE) "正在 ${p.spec.name} 里代打字…" else if (msg.kind == "summary") "正在总结…" else "正在思考…") +
-+                            if (sec >= 3) " $sec 秒" else "", fontSize = MT.Sub, color = m.ink2)
-+                        if (slow && sec >= 40) Text("${GroupRunner.shortName(msg.name)} 回得慢，别的成员不用等它", fontSize = MT.Meta, color = m.ink3)
-+                    }
 +                }
 +                "error" -> {
 +                    // compact one-line error: friendly Chinese, actions inline, the raw server text folded under 「详情」
@@ -6239,12 +6306,7 @@ index 2dbee20..7e527c1 100644
                      }
 -                    "stopped" -> Text(msg.text.ifBlank { "已停止" }, fontSize = 15.sp, color = m.ink3)
 -                    else -> SelectionContainer { Text(msg.text, fontSize = 17.sp, lineHeight = 25.sp, color = m.ink) }
-                 }
--            }
--            if (msg.status == "ok" && (msg.outTok > 0 || msg.ms > 0)) {
--                Text(listOfNotNull(if (msg.ms > 0) "%.1f 秒".format(msg.ms / 1000.0) else null,
--                    if (msg.inTok + msg.outTok > 0) "${msg.inTok + msg.outTok} tokens" else null).joinToString(" · "),
--                    fontSize = 12.sp, color = m.ink3, modifier = Modifier.padding(start = 6.dp, top = 2.dp))
++                }
 +                else -> {
 +                    val summary = msg.kind == "summary"
 +                    // [Mines-38.7] the 讨论总结 bubble itself fills the row (38.6 widened only its column, the bubble still hugged the text)
@@ -6258,8 +6320,13 @@ index 2dbee20..7e527c1 100644
 +                    val meta = listOfNotNull(msg.detail.ifBlank { null }, if (msg.ms > 0) "%.1f 秒".format(msg.ms / 1000.0) else null,
 +                        if (msg.inTok + msg.outTok > 0) "${msg.inTok + msg.outTok} tokens" else null).joinToString(" · ")
 +                    if (meta.isNotBlank()) Text(meta, fontSize = MT.Meta, color = m.ink3, maxLines = 2, modifier = Modifier.padding(start = 6.dp, top = 2.dp))
-+                }
+                 }
              }
+-            if (msg.status == "ok" && (msg.outTok > 0 || msg.ms > 0)) {
+-                Text(listOfNotNull(if (msg.ms > 0) "%.1f 秒".format(msg.ms / 1000.0) else null,
+-                    if (msg.inTok + msg.outTok > 0) "${msg.inTok + msg.outTok} tokens" else null).joinToString(" · "),
+-                    fontSize = 12.sp, color = m.ink3, modifier = Modifier.padding(start = 6.dp, top = 2.dp))
+-            }
          }
      }
  }
@@ -6662,10 +6729,25 @@ index 0000000..40cd382
 +    ) { content() }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
-index b565569..c2e8603 100644
+index b565569..6a136a6 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
-@@ -198,6 +198,9 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+@@ -121,6 +121,14 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+     var addSite by remember { mutableStateOf(false) }
+     var query by rememberSaveable { mutableStateOf("") }
+     var balTick by remember { mutableIntStateOf(0) }
++    // [Mines-38.7] 一键关联: once the platform it opened here is saved, go back so the run moves on to the next one
++    LaunchedEffect(entries) {
++        val w = LinkAll.waiting
++        if (LinkAll.running && w != null && LinkAll.isConn(w)) {
++            val base = w.removePrefix(LinkAll.CONN)
++            if (PlusVault.accountsOf(base).any { (entries[it]?.updatedAt ?: 0L) >= LinkAll.waitingSince }) { delay(900); onBack() }
++        }
++    }
+ 
+     fun startWeb(k: ConnectionKind) {
+         val url = k.loginUrl ?: return
+@@ -198,6 +206,9 @@ fun ConnectionsScreen(onBack: () -> Unit) {
  
      // [Mines-apps-32] keys already in the 模型组 count as connected; balances refresh quietly (plain HTTP)
      LaunchedEffect(Unit) {
@@ -6675,7 +6757,7 @@ index b565569..c2e8603 100644
          PlusNav.openKind?.let { k -> PlusNav.openKind = null
              val claim = PlusNav.autoClaim; PlusNav.autoClaim = false
              if (PlusVault.kind(k) != null) { autoStart = claim; detailId = PlusVault.defaultAccount(k) ?: k }
-@@ -1215,7 +1218,9 @@ fun SecureWindow() {
+@@ -1215,7 +1226,9 @@ fun SecureWindow() {
      androidx.compose.runtime.DisposableEffect(view) {
          val w = (view as? androidx.compose.ui.window.DialogWindowProvider)?.window ?: (view.parent as? androidx.compose.ui.window.DialogWindowProvider)?.window
              ?: generateSequence(context) { (it as? android.content.ContextWrapper)?.baseContext }.filterIsInstance<android.app.Activity>().firstOrNull()?.window
@@ -8075,10 +8157,10 @@ index 8843d0f..310d404 100644
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/LinkAll.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/LinkAll.kt
 new file mode 100644
-index 0000000..70dbf2c
+index 0000000..09ebda6
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/LinkAll.kt
-@@ -0,0 +1,277 @@
+@@ -0,0 +1,435 @@
 +package com.openminis.app.ui.plus
 +
 +import android.webkit.WebView
@@ -8131,11 +8213,98 @@ index 0000000..70dbf2c
 +
 +    const val ROUTE = "plus_linkall"
 +    const val SUMMARY = "plus_linkall_summary"
++    /** [Mines-38.7] 设置 › 已忽略的平台: restore what 一键关联 was told to ignore */
++    const val IGNORED = "plus_linkall_ignored"
++    fun ignoredList(): List<String> = platforms().filter { ignored(it) }
 +
-+    /** Every account of every web AI platform (豆包, 豆包·账号B, 元宝 …). */
-+    fun platforms(): List<String> = AiCatalog.webApps.flatMap { WebAccounts.ids(it.id) }
++    /**
++     * [Mines-38.7] user 2026-10-15 (priority #1): 一键关联 covers EVERY platform listed in 账号连接 (AI, 开发, 办公, 金融,
++     * 社交 incl. X / 微博 …), not only the nine web AI apps. Those rows are "conn:<kind id>".
++     */
++    const val CONN = "conn:"
++    fun isConn(id: String) = id.startsWith(CONN)
++    fun connKind(id: String): com.openminis.app.plus.ConnectionKind? = if (isConn(id)) com.openminis.app.plus.PlusVault.kind(id.removePrefix(CONN)) else null
++    private const val ZHIHU = "site:www.zhihu.com"
 +
-+    fun name(id: String): String = AiCatalog.spec(id)?.let { WebAccounts.display(AiCatalog.spec(WebAccounts.site(id))?.name ?: it.name, id) } ?: id
++    /** Every 账号连接 platform (no MCP servers, no hidden legacy rows, no extra-account copies) + 知乎 (a 消息 source). */
++    fun connKinds(): List<com.openminis.app.plus.ConnectionKind> {
++        val V = com.openminis.app.plus.PlusVault
++        return V.kinds.filter { !it.hidden && it.group != V.G_MCP && !it.id.contains('#') && !it.id.startsWith("mcp_") } +
++            listOfNotNull(V.kind(ZHIHU))
++    }
++
++    /** Every account of every web AI platform (豆包, 豆包·账号B, 元宝 …), then every 账号连接 platform. */
++    fun platforms(): List<String> = AiCatalog.webApps.flatMap { WebAccounts.ids(it.id) } + connKinds().map { CONN + it.id }
++
++    fun name(id: String): String {
++        if (isConn(id)) { val k = connKind(id) ?: return id.removePrefix(CONN); return if (k.id == ZHIHU) "知乎" else k.name }
++        return AiCatalog.spec(id)?.let { WebAccounts.display(AiCatalog.spec(WebAccounts.site(id))?.name ?: it.name, id) } ?: id
++    }
++
++    /** Which 账号连接 category a platform sits in (same words as that page). */
++    fun category(id: String): String {
++        val k = connKind(id) ?: return "AI App 网页版"
++        val V = com.openminis.app.plus.PlusVault
++        return when {
++            k.id == "x" || k.group == V.G_SOCIAL || k.id == ZHIHU -> "社交与资讯"
++            k.group == V.G_AI -> "AI 服务商"
++            k.group == V.G_DEV -> "开发与服务器"
++            k.group == V.G_FIN -> "金融与加密"
++            k.group == V.G_COMMON -> "效率与办公"
++            else -> "其他"
++        }
++    }
++
++    /** How this platform is linked, in plain words (the report table's 登录方式). */
++    fun how(id: String): String {
++        val k = connKind(id) ?: return "在 Mines 内登录网页版"
++        return when (k.method) {
++            com.openminis.app.plus.ConnMethod.WEB -> "在 Mines 内登录"
++            com.openminis.app.plus.ConnMethod.GOOGLE -> "Chrome 登录（Google 不让 App 内登录）"
++            com.openminis.app.plus.ConnMethod.GITHUB, com.openminis.app.plus.ConnMethod.MICROSOFT -> "一键授权（输入配对码）"
++            com.openminis.app.plus.ConnMethod.CALENDAR -> "手机日历权限"
++            com.openminis.app.plus.ConnMethod.A11Y -> "无障碍代操作"
++            com.openminis.app.plus.ConnMethod.KEY -> if (inAppKey(k)) "在 Mines 内登录官网，自动取密钥" else if (k.keyUrl != null) "去官网复制密钥，回来自动填" else "粘贴${k.keyLabel}"
++        }
++    }
++
++    private fun inAppKey(k: com.openminis.app.plus.ConnectionKind) =
++        com.openminis.app.plus.KeyAgent.recipe(k.id)?.mode == com.openminis.app.plus.KeyAgent.Mode.WEBVIEW
++
++    /** Mines can run it by itself inside the app (the user only types a code / scans if asked). */
++    fun automatic(id: String): Boolean {
++        val k = connKind(id) ?: return true
++        return when (k.method) {
++            com.openminis.app.plus.ConnMethod.WEB, com.openminis.app.plus.ConnMethod.GITHUB, com.openminis.app.plus.ConnMethod.MICROSOFT -> true
++            com.openminis.app.plus.ConnMethod.KEY -> inAppKey(k)
++            else -> false
++        }
++    }
++
++    /** Can a sign-in done in another browser / app reach Mines? (none has an official OAuth client configured) */
++    fun externalSync(id: String): String {
++        val k = connKind(id) ?: return "不能：外部浏览器只是打开，登录要在 Mines 内做"
++        return when (k.method) {
++            com.openminis.app.plus.ConnMethod.GITHUB, com.openminis.app.plus.ConnMethod.MICROSOFT -> "能：在任意浏览器输入配对码，授权结果回到 Mines"
++            com.openminis.app.plus.ConnMethod.CALENDAR -> "能：读手机里已同步的日历"
++            com.openminis.app.plus.ConnMethod.GOOGLE -> "不能自动同步：Chrome 登录后回来点「我已经登录好了」"
++            com.openminis.app.plus.ConnMethod.KEY -> "部分：在外部复制密钥，回到 Mines 自动识别剪贴板"
++            else -> "不能：外部浏览器只是打开，登录要在 Mines 内做"
++        }
++    }
++
++    /** Where a platform's link is opened (web app page, or 账号连接 with its login / 一键接入 started). */
++    fun open(id: String, go: (String) -> Unit, auto: Boolean) {
++        val k = connKind(id)
++        if (k == null) { go(com.openminis.app.ui.group.GroupRoutes.webLogin(id)); return }
++        if (k.id == ZHIHU) com.openminis.app.plus.PlusVault.setExtra(k.id, "url", "https://www.zhihu.com/signin")
++        if (k.method == com.openminis.app.plus.ConnMethod.WEB) PlusNav.openLogin = k.id
++        else { PlusNav.openKind = k.id; PlusNav.autoClaim = auto }
++        go(PlusRoutes.CONNECTIONS)
++    }
++
++    /** start time of the link that is open right now: a 账号连接 entry saved after it counts as linked */
++    var waitingSince = 0L
 +
 +    /** What the last attempt left: 「扫码」/「验证」 (user step), 「跳过」, 「未完成」, or null. */
 +    fun note(id: String): String? = GroupPrefs.get("linkres_$id")
@@ -8148,6 +8317,7 @@ index 0000000..70dbf2c
 +    fun setIgnored(id: String, on: Boolean) = GroupPrefs.put("linkignore_$id", if (on) "1" else null)
 +
 +    fun state(id: String): St {
++        if (isConn(id)) return connState(id)
 +        val spec = AiCatalog.spec(id) ?: return St.NONE
 +        if (WebChat.signedIn(spec, id)) return St.LINKED
 +        if (ignored(id)) return St.IGNORED
@@ -8157,14 +8327,43 @@ index 0000000..70dbf2c
 +        return St.NONE
 +    }
 +
-+    fun userStepText(id: String): String = when (note(id)) {
++    private fun connState(id: String): St {
++        val k = connKind(id) ?: return St.NONE
++        val V = com.openminis.app.plus.PlusVault
++        val accts = V.accountsOf(k.id)
++        if (accts.isNotEmpty()) {
++            val bad = runCatching { com.openminis.app.plus.AccountPatrol.problems().any { V.baseId(it.first) == k.id } }.getOrDefault(false)
++            val webGone = k.method == com.openminis.app.plus.ConnMethod.WEB && k.doneCookies.isNotEmpty() &&
++                V.entries.value[accts.first()]?.via != "oauth" && !runCatching { com.openminis.app.plus.LoginWeb.signedIn(V.kind(accts.first()) ?: k) }.getOrDefault(true)
++            if (!bad && !webGone) return St.LINKED
++            if (ignored(id)) return St.IGNORED
++            return St.EXPIRED
++        }
++        if (ignored(id)) return St.IGNORED
++        val n = note(id)
++        if (n == "扫码" || n == "验证" || n == "手动") return St.USER
++        return St.NONE
++    }
++
++    fun userStepText(id: String): String = if (isConn(id) && note(id) == "手动") manualStep(id) else when (note(id)) {
 +        "扫码" -> "打开手机上的 ${name(id)} App，扫一下登录页上的二维码"
 +        "验证" -> "登录页要你过一下人机验证，按页面提示做一下"
 +        else -> "点一下，登录 ${name(id)}"
 +    }
 +
-+    fun start() {
-+        queue.clear(); queue.addAll(platforms().filter { state(it) != St.LINKED && state(it) != St.IGNORED })
++    /** The one thing the user does for a platform Mines cannot link by itself. */
++    fun manualStep(id: String): String {
++        val k = connKind(id) ?: return "点一下，登录 ${name(id)}"
++        return when (k.method) {
++            com.openminis.app.plus.ConnMethod.GOOGLE -> "Google 不让在 App 里登录：点一下，用 Chrome 登录"
++            com.openminis.app.plus.ConnMethod.CALENDAR -> "点一下，允许 Mines 读手机日历"
++            com.openminis.app.plus.ConnMethod.A11Y -> "点一下，按步骤打开无障碍"
++            else -> if (k.keyUrl != null) "点一下去官网复制${k.keyLabel}，回来会自动填好" else "点一下，粘贴${k.keyLabel}"
++        }
++    }
++
++    fun start(only: List<String>? = null) {
++        queue.clear(); queue.addAll((only ?: platforms()).filter { state(it) != St.LINKED && state(it) != St.IGNORED })
 +        index = 0; waiting = null
 +        running = queue.isNotEmpty(); autoLogin = running
 +    }
@@ -8227,10 +8426,19 @@ index 0000000..70dbf2c
 +        if (!LinkAll.running) return@LaunchedEffect
 +        if (cur == null) { LinkAll.stop(); go(LinkAll.SUMMARY); return@LaunchedEffect }
 +        if (paused) return@LaunchedEffect
++        // [Mines-38.7] a platform Mines cannot link by itself (Chrome-only Google, 日历权限, 无障碍, pasted key) is not
++        // opened mid-run: it goes to 「需要你操作」 with its one step, and the run moves on
++        if (!LinkAll.automatic(cur)) {
++            delay(600)
++            LinkAll.setNote(cur, "手动")
++            last = LinkAll.name(cur) + "：需要你操作（" + LinkAll.manualStep(cur) + "）"
++            LinkAll.index++; tick++
++            return@LaunchedEffect
++        }
 +        delay(3000)
 +        if (LinkAll.running && !paused && LinkAll.queue.getOrNull(LinkAll.index) == cur) {
-+            LinkAll.waiting = cur
-+            go(com.openminis.app.ui.group.GroupRoutes.webLogin(cur))
++            LinkAll.waiting = cur; LinkAll.waitingSince = System.currentTimeMillis()
++            LinkAll.open(cur, go, auto = true)
 +        }
 +    }
 +    PlusPage("一键关联", { LinkAll.stop(); onBack() }) {
@@ -8239,8 +8447,8 @@ index 0000000..70dbf2c
 +            val all = remember(tick) { LinkAll.platforms() }
 +            val linked = all.count { LinkAll.state(it) == LinkAll.St.LINKED }
 +            val ign = all.count { LinkAll.state(it) == LinkAll.St.IGNORED }
-+            BigText("把 AI 平台都关联上", 22)
-+            BigText("我会一个一个打开登录页，手机号和短信验证码我自动填。只有要扫码或人机验证时才停下来叫你。", 17, FontWeight.Normal)
++            BigText("把账号都关联上", 22)
++            BigText("AI、开发、办公、金融、社交（X、微博…），账号连接里的每个平台我都一个一个打开登录页，手机号和短信验证码我自动填。只有要扫码、人机验证或必须你自己点的时候才停下来叫你。", 17, FontWeight.Normal)
 +            BigText("共 ${all.size - ign} 个，已关联 $linked 个" + if (ign > 0) "（忽略了 $ign 个）" else "", 17, FontWeight.Normal)
 +            Spacer(Modifier.height(16.dp))
 +            Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -8254,6 +8462,7 @@ index 0000000..70dbf2c
 +            last?.let { BigText(it, 17, FontWeight.Normal) }
 +            if (cur != null) {
 +                BigText("下一个：${LinkAll.name(cur)}", 24)
++                BigText(LinkAll.category(cur) + " · " + LinkAll.how(cur), 15, FontWeight.Normal)
 +                BigText(if (paused) "已暂停。点「继续」打开它的登录页" else "马上打开它的登录页…", 17, FontWeight.Normal)
 +            }
 +            Spacer(Modifier.height(16.dp))
@@ -8289,8 +8498,8 @@ index 0000000..70dbf2c
 +            PlusSection(st.label + "（${l.size}）") {
 +                MinesCard(Modifier.fillMaxWidth().padding(horizontal = MS.PageH)) {
 +                    l.forEach { id ->
-+                        val sub = when (st) {
-+                            LinkAll.St.LINKED -> "可以直接在群聊、单聊里用"
++                        val sub = LinkAll.category(id) + " · " + when (st) {
++                            LinkAll.St.LINKED -> if (LinkAll.isConn(id)) "已连上" else "可以直接在群聊、单聊里用"
 +                            LinkAll.St.USER -> LinkAll.userStepText(id)
 +                            LinkAll.St.EXPIRED -> "登录过期了，点一下重新登录"
 +                            LinkAll.St.NONE -> if (LinkAll.note(id) == "跳过") "上次跳过了，点一下登录" else "点一下登录"
@@ -8302,7 +8511,7 @@ index 0000000..70dbf2c
 +                                LinkAll.St.IGNORED -> PillButton("恢复", primary = false) { LinkAll.setIgnored(id, false); rev++ }
 +                                else -> PillButton("忽略", primary = false) { LinkAll.setIgnored(id, true); rev++ }
 +                            }
-+                        }, onClick = { LinkAll.autoLogin = false; go(com.openminis.app.ui.group.GroupRoutes.webLogin(id)) })
++                        }, onClick = { LinkAll.autoLogin = false; LinkAll.open(id, go, auto = false) })
 +                    }
 +                }
 +            }
@@ -8354,6 +8563,37 @@ index 0000000..70dbf2c
 +                android.net.Uri.parse("package:" + (if (has) ms else ctx.packageName))).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)) }
 +                .onFailure { runCatching { ctx.startActivity(android.content.Intent(android.provider.Settings.ACTION_SETTINGS).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)) } }
 +        }
++    }
++}
++
++
++/** [Mines-38.7] 设置 › 已忽略的平台: every platform 一键关联 was told to ignore, each with 恢复 (and 全部恢复). */
++@Composable
++fun LinkIgnoredScreen(onBack: () -> Unit) {
++    val ctx = androidx.compose.ui.platform.LocalContext.current
++    remember { GroupPrefs.init(ctx); com.openminis.app.plus.PlusVault.init(ctx); 0 }
++    var rev by remember { mutableIntStateOf(0) }
++    val list = remember(rev) { LinkAll.ignoredList() }
++    PlusPage("已忽略的平台", onBack) {
++        Spacer(Modifier.height(8.dp))
++        if (list.isEmpty()) BigText("没有忽略的平台。在「一键关联 › 关联结果」里点「忽略」的平台会出现在这里。", 17, FontWeight.Normal)
++        else {
++            BigText("这些平台不再提醒，也不算失败。点「恢复」重新加入一键关联。", 17, FontWeight.Normal)
++            PlusSection("已忽略（${list.size}）") {
++                MinesCard(Modifier.fillMaxWidth().padding(horizontal = MS.PageH)) {
++                    list.forEach { id ->
++                        PlusRow(null, LinkAll.name(id), LinkAll.category(id) + " · " + LinkAll.how(id), chevron = false, trailing = {
++                            PillButton("恢复", primary = false) { LinkAll.setIgnored(id, false); rev++ }
++                        })
++                    }
++                }
++            }
++            Spacer(Modifier.height(16.dp))
++            Row(Modifier.fillMaxWidth().padding(horizontal = 24.dp)) {
++                PillButton("全部恢复", Modifier.fillMaxWidth()) { list.forEach { LinkAll.setIgnored(it, false) }; rev++ }
++            }
++        }
++        Spacer(Modifier.height(24.dp))
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt
@@ -9246,7 +9486,7 @@ index d6772d9..926fe48 100644
          // [Mines-degen-34] 防乱码: models marked 不稳定 + thinking length cap
          com.openminis.app.plus.ModelHealth.load(ctx)
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxScreen.kt
-index 4cef43e..fc52af6 100644
+index 4cef43e..4e3e64b 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxScreen.kt
 @@ -9,6 +9,11 @@ import android.os.PowerManager
@@ -9261,7 +9501,17 @@ index 4cef43e..fc52af6 100644
  import androidx.compose.foundation.layout.Box
  import androidx.compose.foundation.layout.Column
  import androidx.compose.foundation.layout.Row
-@@ -204,13 +209,9 @@ fun SandboxScreen(onBack: () -> Unit) {
+@@ -19,7 +24,9 @@ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.layout.width
+ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.outlined.CheckCircle
+ import androidx.compose.material.icons.outlined.CleaningServices
++import androidx.compose.material.icons.outlined.Info
+ import androidx.compose.material3.Button
+ import androidx.compose.material3.LinearProgressIndicator
+ import androidx.compose.material3.MaterialTheme
+@@ -204,13 +211,9 @@ fun SandboxScreen(onBack: () -> Unit) {
              var toolCap by remember { mutableIntStateOf(com.openminis.app.agent.RunLoopGuard.maxToolCalls(context)) }
              Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                  Text("每次任务最多调用 $toolCap 次工具，到了就暂停问你", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
@@ -9278,7 +9528,7 @@ index 4cef43e..fc52af6 100644
              }
          }
      }
-@@ -218,9 +219,18 @@ fun SandboxScreen(onBack: () -> Unit) {
+@@ -218,9 +221,18 @@ fun SandboxScreen(onBack: () -> Unit) {
  
  @Composable
  private fun CheckRow(title: String, ok: Boolean, action: String, onAction: () -> Unit) {
@@ -9287,7 +9537,7 @@ index 4cef43e..fc52af6 100644
 -        Text(title, Modifier.weight(1f))
 -        if (!ok) OutlinedButton(onClick = onAction) { Text(action) }
 +    // [Mines-38.7] same shape as every row: status icon bubble + text + one small button on the right
-+    PlusRow(if (ok) androidx.compose.material.icons.Icons.Outlined.CheckCircle else androidx.compose.material.icons.Icons.Outlined.Info, title,
++    PlusRow(if (ok) Icons.Outlined.CheckCircle else Icons.Outlined.Info, title,
 +        if (ok) "已完成" else null, tint = if (ok) Color(0xFF34C759) else Color(0xFFFF9500), chevron = false,
 +        trailing = if (ok) null else ({ PillButton(action, primary = false) { onAction() } }))
 +}
@@ -12228,7 +12478,7 @@ index 58146f1..29b9e76 100644
  import androidx.compose.runtime.CompositionLocalProvider
  import androidx.compose.runtime.Composable
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt
-index 0260d35..c67ddc2 100644
+index 0260d35..c053468 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt
 @@ -65,7 +65,7 @@ import androidx.compose.material3.MaterialTheme
@@ -12251,7 +12501,7 @@ index 0260d35..c67ddc2 100644
                  navigationIcon = {
                      IconButton(onClick = { if (grp != null) grp = null else onBack() }) {
                          MinesIcon(
-@@ -169,25 +169,44 @@ fun SettingsScreen(
+@@ -169,25 +169,49 @@ fun SettingsScreen(
          ) {
              if (grp == null) {
              // [Mines-design-34] profile card: character + build
@@ -12297,15 +12547,20 @@ index 0260d35..c67ddc2 100644
                      onClick = { grp = "ai" })
 +                // [Mines-38.7] 一键关联 (all AI platforms, phone + SMS code filled in) and 手机权限 (what each permission is for)
 +                SettingsItem(icon = Icons.Outlined.Key, iconColor = Color(0xFFB5532F), title = "一键关联",
-+                    subtitle = "把豆包、元宝、Kimi 等一次登录好，验证码自动填",
++                    subtitle = "AI、开发、办公、金融、社交账号一次登录好，验证码自动填",
 +                    onClick = { onPlusClick(com.openminis.app.ui.plus.LinkAll.ROUTE) })
++                // [Mines-38.7] restore platforms 一键关联 was told to ignore (also in 关联结果)
++                val ignoredN = remember { runCatching { com.openminis.app.plus.group.GroupPrefs.init(context); com.openminis.app.ui.plus.LinkAll.ignoredList().size }.getOrDefault(0) }
++                SettingsItem(icon = Icons.Outlined.Key, iconColor = Color(0xFF8E8E93), title = "已忽略的平台",
++                    subtitle = if (ignoredN > 0) "$ignoredN 个 · 点一下恢复" else "没有忽略的平台",
++                    onClick = { onPlusClick(com.openminis.app.ui.plus.LinkAll.IGNORED) })
 +                SettingsItem(icon = Icons.Outlined.Shield, iconColor = Color(0xFF007AFF), title = "手机权限",
 +                    subtitle = "开了哪些、用来做什么，没开的一步步带你开",
 +                    onClick = { onPlusClick(com.openminis.app.ui.plus.PermGuide.ROUTE) })
                  SettingsItem(icon = Icons.Outlined.Cloud, iconColor = Color(0xFF34C759), title = "网络",
                      subtitle = "电脑与服务器 · 模型路由与分流 · 浏览器验证",
                      onClick = { grp = "net" }, showDivider = false)
-@@ -316,7 +335,7 @@ fun SettingsScreen(
+@@ -316,7 +340,7 @@ fun SettingsScreen(
                      icon = Icons.Outlined.VerifiedUser,
                      iconColor = Color(0xFFFF9500),
                      title = "一键自检 + 上报",
@@ -12314,7 +12569,7 @@ index 0260d35..c67ddc2 100644
                      onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.REPORT) },
                  )
                  SettingsItem(
-@@ -735,13 +754,13 @@ private fun SettingsSection(
+@@ -735,13 +759,13 @@ private fun SettingsSection(
      content: @Composable () -> Unit,
  ) {
      val mc = com.openminis.app.ui.plus.mines()
@@ -12332,7 +12587,7 @@ index 0260d35..c67ddc2 100644
              modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp))
      }
  }
-@@ -765,22 +784,22 @@ private fun SettingsItem(
+@@ -765,22 +789,22 @@ private fun SettingsItem(
      val mc = com.openminis.app.ui.plus.mines()
      Column {
          Row(
