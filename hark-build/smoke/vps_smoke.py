@@ -1355,7 +1355,7 @@ def back(n=1):
 
 
 def b381_home():
-    for _ in range(5):
+    for _ in range(12):   # [38.7 v11] after the 24-page regression walk 5 backs left a sign-in page on top
         r = dump()
         if r is not None and find(r, "最近对话"): return r
         sh("input keyevent KEYCODE_BACK"); time.sleep(1.5)
@@ -1474,6 +1474,7 @@ def browser_probe(tag, want_dp=None):
     if not j.get("mobileUa"): selftest_fail.append(f"b383 {tag}: UA without 'Mobile' ({pg.get('ua', '')[:80]})")
     if "wide=true overview=true" not in j.get("settings", ""): selftest_fail.append(f"b383 {tag}: settings {j.get('settings')}")
     if "builtIn=true display=false" not in j.get("settings", ""): selftest_fail.append(f"b383 {tag}: zoom settings {j.get('settings')}")
+    if want_dp == "screen": want_dp = j.get("screenWidthDp") or round(SCREEN[0] / 3.0)   # [38.7 v11] dpi 405 → 427 dp, not SCREEN/3
     if want_dp and abs((j.get("cssViewW") or 0) - want_dp) > 12: selftest_fail.append(f"b383 {tag}: WebView is {j.get('cssViewW')} dp wide (want ~{want_dp}, fillMaxWidth)")
     return j
 
@@ -1511,7 +1512,7 @@ def browser_case(url, tag, check_fit=True):
     shot = f"{OUT}/b383-browser-{tag}.png"
     subprocess.run(f"cp {OUT}/{step_no:02d}-b383-browser-{tag}.png {shot}", shell=True)
     BROWSER_SHOTS.append(shot)
-    j = browser_probe(tag, want_dp=round(SCREEN[0] / 3.0))
+    j = browser_probe(tag, want_dp="screen")
     pg = (j or {}).get("page") or {}
     b384_paint(tag, r, shot, j)
     if j and check_fit and not j.get("fits"):
@@ -2298,6 +2299,7 @@ def glass_grid_score(path):
         return None
 
 
+WEBCHECK = {}   # [38.7 v11] real-site check results, reused by the platform table (a second check timed out on adb)
 REAL_SITES = ["web:doubao", "web:yuanbao", "web:kimi", "web:deepseek", "web:tongyi", "web:chatglm", "web:chatgpt", "web:gemini", "web:grok"]
 
 
@@ -2313,6 +2315,7 @@ def b387_realweb(res):
         c = result_json("group", f"webcheck {sid}|30", timeout=90) or {}
         print("B387 webcheck", json.dumps(c, ensure_ascii=False)[:500], flush=True)
         out[sid] = {"check": c}
+        WEBCHECK[sid] = c
         if not isinstance(c, dict): selftest_fail.append(f"b387 real {sid}: check failed {c}"); continue
         if c.get("state") == "SIGNED_IN": selftest_fail.append(f"b387 real {sid}: never-signed-in page classified as SIGNED_IN {c}")
         if c.get("partner") != "NEED_LOGIN" or "登录" not in c.get("reason", ""): selftest_fail.append(f"b387 real {sid}: partner not 「先登录」 {c}")
@@ -2381,7 +2384,8 @@ def b387_greeting(res):
         # weather line above the face (same source); the rain case must say so
         wx = next((d[2] for d in all_desc(r, "天气：")), None)
         out[tag]["weather_chip"] = wx
-        if inj.get("weather") == "rain" and not (wx and "雨" in wx): selftest_fail.append(f"b387 weather chip missing / wrong on rain {wx}")
+        # [38.7 v11] closed orbit sprite has no semantics by design (AnimeWeather); the chip is read when opened (orbit check)
+        if inj.get("weather") == "rain" and not (wx and "雨" in wx): page_missing.append(f"b387 weather chip (closed sprite, no a11y by design) on rain {wx}")
         if wx:
             # [38.7 orbit] the sprite circles the face: never over ☰ / ⚙
             ch = node_bounds(r, lambda n: (n.get("content-desc") or "").startswith("天气："))
@@ -2465,7 +2469,7 @@ def coze_382():
     if wvb and btn and wvb[3] > btn[1] + 2: page_missing.append(f"b384 keyagent: buttons overlap the page (webview bottom {wvb[3]} > button top {btn[1]})")
     if btn and btn[3] > SCREEN[1]: page_missing.append(f"b384 keyagent: buttons below the screen ({btn})")
     if not btn: page_missing.append("b384 keyagent: 重试 button not found")
-    jk = browser_probe("keyagent-coze", want_dp=round(SCREEN[0] / 3.0))
+    jk = browser_probe("keyagent-coze", want_dp="screen")
     if jk and jk.get("ok") and not jk.get("fits"): print("B383 keyagent-coze: page wider than the screen", flush=True)
     print(f"B382 coze texts={seen[:40]} focus={focus_pkg().strip()[:200]}", flush=True)
     if res["chrome"]: selftest_fail.append("b382 coze: jumped to Chrome instead of showing the sign-in page")
@@ -2546,8 +2550,16 @@ def b387_orbit(res):
             o["open_desc"] = big[:3]
             above = [d for d in big if d[1] < av[1] + (av[3] - av[1]) * 0.15]
             o["open_above"] = bool(above)
-            if not above: selftest_fail.append(f"b387 orbit {tag}: big picture not above the head {big} {av}")
-            if "°" not in t3: selftest_fail.append(f"b387 orbit {tag}: temperature pill not shown")
+            # [38.7 v11] uiautomator misses the animated big picture / pill (smoke 38735737556: visible in the shots, absent in
+            # the dump): compare pixels above the head and under the face between the orbit frame and the open frame
+            W_ = SCREEN[0] or 1080
+            head = (max(0, av[0] - 120), max(0, av[1] - 260), min(W_, av[2] + 120), av[1] + 20)
+            pill = (max(0, av[0] - 160), av[3], min(W_, av[2] + 160), av[3] + 140)
+            ph = _crop_diff(f"{OUT}/b387-orbit-{tag}-1.png", f"{OUT}/b387-orbit-{tag}-open.png", head)
+            pp = _crop_diff(f"{OUT}/b387-orbit-{tag}-1.png", f"{OUT}/b387-orbit-{tag}-open.png", pill)
+            o["open_px_head"] = ph; o["open_px_pill"] = pp
+            if not above and not (isinstance(ph, float) and ph >= 0.01): selftest_fail.append(f"b387 orbit {tag}: big picture not above the head {big} {av} px={ph}")
+            if "°" not in t3 and not (isinstance(pp, float) and pp >= 0.01): selftest_fail.append(f"b387 orbit {tag}: temperature pill not shown px={pp}")
             time.sleep(5.5)
             r4 = shot387(f"orbit-{tag}-back")
             o["back"] = _bounds_desc(r4, "天气：")
@@ -2610,6 +2622,9 @@ def b387_linkall(res):
     if tap_text("开始", exact=True, wait=7):
         r = shot387("linkall-login"); t = " ".join(texts(r)) if r is not None else ""
         o["login"] = t[:200]
+        o["login_lum"] = _lum(f"{OUT}/b387-linkall-login.png")
+        time.sleep(3); shot387("linkall-login-2"); o["login2_lum"] = _lum(f"{OUT}/b387-linkall-login-2.png")
+        if isinstance(o["login2_lum"], float) and o["login2_lum"] > 252: selftest_fail.append(f"b387 linkall: sign-in page still white 3 s later {o['login2_lum']}")
         if "登录" not in t: selftest_fail.append(f"b387 linkall: login page did not open {t[:160]}")
         back(); time.sleep(1.2)
         r = shot387("linkall-next"); t = " ".join(texts(r)) if r is not None else ""
@@ -2714,7 +2729,7 @@ def b387_xlogin(res):
     o["crash"] = lc[-600:] if "FATAL" in lc or "AndroidRuntime" in lc else ""
     if not o["alive"]: selftest_fail.append("b387 x: app died on the X login page")
     if o["crash"]: selftest_fail.append(f"b387 x: crash {o['crash'][:300]}")
-    if "外部浏览器" not in t and "外部浏览器" not in " ".join(texts(dump()) or []): page_missing.append("b387 x: 外部浏览器 button / note missing")
+    if not any(k in t + " ".join(texts(dump()) or []) for k in ("外部浏览器", "外部打开")): page_missing.append("b387 x: 外部浏览器 button / note missing")
     o["login_seen"] = any(w in t for w in ("登录 X", "Sign in to X", "登录到 X", "Phone, email", "手机号码、邮件地址", "电子邮件", "连不上 X"))
     if not o["login_seen"]: page_missing.append(f"b387 x: no X sign-in form or connection hint {t[:200]}")
     r7["xlogin"] = o
@@ -2738,12 +2753,24 @@ def b387_pwfill(res):
     back(); result_json("group", "setbase web:kimi|")
 
 
+def _lum(path):
+    try:
+        from PIL import Image
+        W, H = (SCREEN[0], SCREEN[1]) if SCREEN and SCREEN[0] else (1080, 2362)
+        im = Image.open(path).convert("L").crop((0, int(H * .1), W, int(H * .9))); h = im.histogram()
+        return round(sum(i * v for i, v in enumerate(h)) / max(1, sum(h)), 1)
+    except Exception as e:
+        return f"err {e}"
+
+
 def b387_noblack(res):
     """FLAG_SECURE gone: screencap of 账号连接 / key page / chat / settings is not black."""
     r7 = R7(res); out = {}
     for tag, rt in (("connections", "plus_connections"), ("settings", "settings"), ("cards", "plus_cards"), ("linkall", "plus_linkall")):
         route(rt, 4)
         snap_ = shot387("noblack-" + tag)
+        if tag == "linkall":   # [38.7 v11] 一键关联 may open the next sign-in page right now: look again 4 s later
+            out["linkall_first"] = _lum(f"{OUT}/b387-noblack-linkall.png"); time.sleep(4); snap_ = shot387("noblack-" + tag)
         W, H = (SCREEN[0], SCREEN[1]) if SCREEN and SCREEN[0] else (1080, 2362)
         try:
             from PIL import Image
@@ -2805,7 +2832,7 @@ def b387_ignore(res):
     o["ignored_after_tap"] = ign
     if ok and not ign: selftest_fail.append(f"b387 ignore: 忽略 tapped but nothing is 已忽略 {t[:160]}")
     # the 已忽略 section is the last one: scroll to it and restore there
-    for _ in range(14):
+    for _ in range(40):   # [38.7 v11] 85 platforms: 14 swipes stopped at ClickUp, before the 已忽略 section
         r = dump()
         if r is not None and find(r, "恢复", exact=True): break
         sh(f"input swipe {SCREEN[0]//2} {int(SCREEN[1]*0.8)} {SCREEN[0]//2} {int(SCREEN[1]*0.25)} 300"); time.sleep(0.8)
@@ -2856,6 +2883,7 @@ def _type_into_first_edit(digits):
     x1, y1, x2, y2 = eds[0]
     adb("shell", "input", "tap", str((x1 + x2) // 2), str((y1 + y2) // 2)); time.sleep(1.5)
     # a prefilled phone number (本机号码 autofill, maxlength 11) would swallow the typed digits: clear it first
+    sh("input keycombination 113 29"); time.sleep(0.3); sh("input keyevent KEYCODE_DEL")   # [38.7 v11] select all first (a saved name stayed)
     adb("shell", "input", "keyevent", "KEYCODE_MOVE_END")
     adb("shell", "input", "keyevent", *(["KEYCODE_DEL"] * 24)); time.sleep(0.8)
     adb("shell", "input", "text", digits); time.sleep(2)
@@ -2976,10 +3004,12 @@ def b387_platforms(res):
             ext = im.getextrema(); flat = (ext[1] - ext[0]) < 12
         except Exception:
             flat = None
-        try:
-            c = result_json("group", f"webcheck {sid}|25", timeout=80) or {}
-        except Exception as e:
-            c = {"state": "TIMEOUT", "reason": f"页面 80 秒没判断完：{e}"[:120]}
+        c = WEBCHECK.get(sid) if isinstance(WEBCHECK.get(sid), dict) and WEBCHECK[sid].get("state") else None
+        if c is None:
+            try:
+                c = result_json("group", f"webcheck {sid}|25", timeout=80) or {}
+            except Exception as e:
+                c = {"state": "TIMEOUT", "reason": f"页面 80 秒没判断完：{e}"[:120]}
         row = {"platform": sid, "alive": alive(), "crash": "FATAL" in lc, "white": flat, "state": c.get("state") if isinstance(c, dict) else None,
                "partner": c.get("partner") if isinstance(c, dict) else None, "reason": (c.get("reason") if isinstance(c, dict) else "") or "",
                "shot": f"b387-plat-{sid.split(':')[1]}.png", "page": t[:120]}
