@@ -92,10 +92,69 @@ index 9d16beb..3855cc1 100644
          <receiver
              android:name=".plus.KeepAliveReceiver"
 diff --git a/src/android/app/src/main/java/com/openminis/app/MainActivity.kt b/src/android/app/src/main/java/com/openminis/app/MainActivity.kt
-index 68fe7ee..717feaf 100644
+index 68fe7ee..e8eca3c 100644
 --- a/src/android/app/src/main/java/com/openminis/app/MainActivity.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/MainActivity.kt
-@@ -612,6 +612,8 @@ class MainActivity : ComponentActivity() {
+@@ -19,6 +19,8 @@ import androidx.activity.result.contract.ActivityResultContracts
+ import android.app.AlertDialog
+ import androidx.compose.foundation.isSystemInDarkTheme
+ import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
+ import androidx.compose.runtime.SideEffect
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableIntStateOf
+@@ -513,13 +515,13 @@ class MainActivity : ComponentActivity() {
+ 
+         setContent {
+             val prefs = remember { getAppearancePrefs(this) }
+-            var themeMode by remember { mutableIntStateOf(prefs.getInt(KEY_THEME_MODE, 0)) }
++            var themeMode by remember { mutableIntStateOf(prefs.getInt(KEY_THEME_MODE, 3)) } // [Mines-38.7] default 3 = 随日出日落
+             var appBaseLevel by remember { mutableIntStateOf(prefs.getInt(KEY_FONT_APP_BASE, 0)) }
+ 
+             DisposableEffect(prefs) {
+                 val listener = SharedPreferences.OnSharedPreferenceChangeListener { sp, key ->
+                     when (key) {
+-                        KEY_THEME_MODE -> themeMode = sp.getInt(KEY_THEME_MODE, 0)
++                        KEY_THEME_MODE -> themeMode = sp.getInt(KEY_THEME_MODE, 3)
+                         KEY_FONT_APP_BASE -> appBaseLevel = sp.getInt(KEY_FONT_APP_BASE, 0)
+                         KEY_KEEP_SCREEN_AWAKE -> applyKeepScreenAwakeFlag(
+                             SessionActivityTracker.activeSessions.value.isNotEmpty()
+@@ -530,11 +532,24 @@ class MainActivity : ComponentActivity() {
+                 onDispose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
+             }
+ 
++            // [Mines-38.7] 3 = day / night by the real sunrise / sunset, animated (~2.6 s) while the app is open
++            val sunNight by com.openminis.app.plus.DayNight.night.collectAsState()
++            LaunchedEffect(themeMode) {
++                if (themeMode != 3) return@LaunchedEffect
++                while (true) {
++                    com.openminis.app.plus.DayNight.tick(this@MainActivity)
++                    kotlinx.coroutines.delay(if (com.openminis.app.plus.DayNight.simulating) 500L else 30_000L)
++                }
++            }
+             val darkTheme = when (themeMode) {
+                 1 -> false
+                 2 -> true
++                3 -> sunNight
+                 else -> isSystemInDarkTheme()
+             }
++            val dnStill = remember { com.openminis.app.ui.plus.AnimeWeather.still(this@MainActivity) }
++            val nightF by androidx.compose.animation.core.animateFloatAsState(if (darkTheme) 1f else 0f,
++                androidx.compose.animation.core.tween(if (dnStill) 0 else 2600, easing = androidx.compose.animation.core.FastOutSlowInEasing), label = "daynight")
+             val fontScale = fontScaleForLevel(appBaseLevel)
+ 
+             SideEffect {
+@@ -557,7 +572,7 @@ class MainActivity : ComponentActivity() {
+                 enableEdgeToEdge(statusBarStyle = barStyle, navigationBarStyle = barStyle)
+             }
+ 
+-            MinisTheme(darkTheme = darkTheme, fontScale = fontScale) {
++            MinisTheme(darkTheme = darkTheme, fontScale = fontScale, nightFraction = if (themeMode == 3) nightF else null) {
+                 val navController = rememberNavController().also { this.navController = it }
+ 
+                 // T166: drive `SessionActivityTracker.setPresent` /
+@@ -612,6 +627,8 @@ class MainActivity : ComponentActivity() {
                  com.openminis.app.ui.settings.ConfigConfirmDialogHost()
                  // [Mines-jobs-25] Background install / check progress + result popups.
                  com.openminis.app.ui.plus.MinesJobsHost()
@@ -104,7 +163,7 @@ index 68fe7ee..717feaf 100644
              }
          }
      }
-@@ -661,6 +663,14 @@ class MainActivity : ComponentActivity() {
+@@ -661,6 +678,14 @@ class MainActivity : ComponentActivity() {
          com.openminis.app.plus.LoginWeb.flush()
      }
  
@@ -119,7 +178,7 @@ index 68fe7ee..717feaf 100644
      override fun onStart() {
          super.onStart()
          // [Mines-sources-33] every saved login / key becomes a data source automatically (toast on a new build)
-@@ -725,7 +735,10 @@ class MainActivity : ComponentActivity() {
+@@ -725,7 +750,10 @@ class MainActivity : ComponentActivity() {
          if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
          val code = getSharedPreferences(PREF_APPEARANCE, MODE_PRIVATE).getString(KEY_LANGUAGE, "") ?: ""
          val localeManager = getSystemService(LocaleManager::class.java) ?: return
@@ -1089,6 +1148,66 @@ index 9cfc585..2e08d6a 100644
      }
  }
  
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/DayNight.kt b/src/android/app/src/main/java/com/openminis/app/plus/DayNight.kt
+new file mode 100644
+index 0000000..dc0c255
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/DayNight.kt
+@@ -0,0 +1,54 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import java.util.Calendar
++
++/**
++ * [Mines-38.7] Day ↔ night by the real sunrise / sunset (user 2026-10-15 「白天↔夜晚主动动画切换」): open-meteo daily
++ * sunrise/sunset of the home-weather place (saved by [HomeGreeting.refreshWeather]), else 6:00 / 18:30. The app's
++ * 「随日出日落」 theme mode (the default) follows [night]; MinisTheme animates the change (~2.5 s fog / glass / ink fade,
++ * sun sets and moon rises on the home orbit). Smoke: [simulate] runs a fake clock from a given time so the sunset is
++ * crossed while the app is open.
++ */
++object DayNight {
++    private const val PREFS = "mines_greeting"
++    private val _night = MutableStateFlow(false)
++    val night: StateFlow<Boolean> = _night
++
++    /** fake clock for the smoke: (minute of day it started at, real ms when it started); null = real time */
++    @Volatile private var sim: Pair<Double, Long>? = null
++    @Volatile private var simSunset: Int? = null
++
++    fun simulate(startMinute: Double?, sunsetMinute: Int? = null) {
++        sim = startMinute?.let { it to System.currentTimeMillis() }
++        simSunset = sunsetMinute
++    }
++    val simulating get() = sim != null
++
++    /** minute of the day now (fake clock when simulating) */
++    fun minuteNow(): Double {
++        sim?.let { (m, at) -> return (m + (System.currentTimeMillis() - at) / 60_000.0) % 1440.0 }
++        val c = Calendar.getInstance()
++        return c.get(Calendar.HOUR_OF_DAY) * 60.0 + c.get(Calendar.MINUTE) + c.get(Calendar.SECOND) / 60.0
++    }
++
++    fun sunrise(c: Context): Int = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getInt("sunrise", 6 * 60)
++    fun sunset(c: Context): Int = simSunset ?: c.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getInt("sunset", 18 * 60 + 30)
++
++    /** "2026-10-15T18:21" → 1101 */
++    fun saveSun(c: Context, rise: String?, set: String?) {
++        fun mins(s: String?): Int? = s?.substringAfter('T', "")?.split(':')?.let { p -> if (p.size >= 2) (p[0].toIntOrNull() ?: return null) * 60 + (p[1].toIntOrNull() ?: return null) else null }
++        val r = mins(rise); val s = mins(set)
++        val e = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
++        if (r != null && r in 120..720) e.putInt("sunrise", r)
++        if (s != null && s in 900..1380) e.putInt("sunset", s)
++        e.apply()
++    }
++
++    fun isNightNow(c: Context): Boolean { val m = minuteNow(); return m < sunrise(c) || m >= sunset(c) }
++
++    /** re-checks the clock (MainActivity calls it every 30 s, every 1 s while simulating) */
++    fun tick(c: Context): Boolean { val n = isNightNow(c); _night.value = n; return n }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt b/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt
 index 25d6809..2bfd012 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt
@@ -1452,10 +1571,10 @@ index 039a904..bc973a4 100644
                  // [Mines-voice-35.2] the call's full setup (tools, transcription hints, resumption, compression)
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/HomeGreeting.kt b/src/android/app/src/main/java/com/openminis/app/plus/HomeGreeting.kt
 new file mode 100644
-index 0000000..671bc40
+index 0000000..44e47ed
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/HomeGreeting.kt
-@@ -0,0 +1,271 @@
+@@ -0,0 +1,273 @@
 +package com.openminis.app.plus
 +
 +import android.content.Context
@@ -1684,7 +1803,7 @@ index 0000000..671bc40
 +        p.edit().putLong("w_try", System.currentTimeMillis()).apply()
 +        val loc = location(c) ?: return@withContext
 +        val url = "https://api.open-meteo.com/v1/forecast?latitude=${loc.first}&longitude=${loc.second}" +
-+            "&current=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code" +
++            "&current=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code,sunrise,sunset" +
 +            "&past_days=1&forecast_days=1&timezone=auto"
 +        val o = runCatching { http.newCall(Request.Builder().url(url).build()).execute().use { r -> if (r.isSuccessful) JSONObject(r.body?.string().orEmpty()) else null } }.getOrNull()
 +            ?: return@withContext
@@ -1693,6 +1812,8 @@ index 0000000..671bc40
 +            val maxA = d.getJSONArray("temperature_2m_max"); val minA = d.getJSONArray("temperature_2m_min")
 +            val prA = d.optJSONArray("precipitation_probability_max"); val codeA = d.optJSONArray("weather_code")
 +            val i = maxA.length() - 1
++            // [Mines-38.7] sunrise / sunset for the day ↔ night switch
++            runCatching { DayNight.saveSun(c, d.optJSONArray("sunrise")?.optString(i), d.optJSONArray("sunset")?.optString(i)) }
 +            val dayCode = codeA?.optInt(i) ?: 0
 +            val curCode = cur.optInt("weather_code", dayCode)
 +            // rain / snow later today counts too (the current hour may still be dry)
@@ -3448,10 +3569,10 @@ index 22661da..1d773a2 100644
          for (id in phone) one(id)
      }
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-index 8e5984b..4af9e5d 100644
+index 8e5984b..5858ecd 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-@@ -38,10 +38,131 @@ object GroupSelfTest {
+@@ -38,10 +38,143 @@ object GroupSelfTest {
                  GroupRunner.send(context, gid, parts.drop(1).joinToString("|"))
                  delay(300)
                  val t0 = System.currentTimeMillis()
@@ -3581,11 +3702,23 @@ index 8e5984b..4af9e5d 100644
 +            "linknote" -> { com.openminis.app.ui.plus.LinkAll.setNote(parts.getOrElse(0) { "" }, parts.getOrNull(1)); "ok" }
 +            "linkmark" -> { WebChat.markSignedIn(parts.getOrElse(0) { "" }, when (parts.getOrNull(1)) { "1" -> true; "0" -> false; else -> null }); "ok" }
 +            "linkstates" -> JSONObject(com.openminis.app.ui.plus.LinkAll.platforms().associateWith { com.openminis.app.ui.plus.LinkAll.state(it).label }).toString()
++            // [Mines-38.7] day ↔ night: 'daynight 18:29:58|18:30' runs a fake clock (crosses the sunset in 2 s); 'daynight off'
++            "daynight" -> {
++                val a0 = parts.getOrElse(0) { "" }
++                if (a0 == "off" || a0.isBlank()) { com.openminis.app.plus.DayNight.simulate(null); "off" } else {
++                    val hms = a0.split(':').map { it.toDoubleOrNull() ?: 0.0 }
++                    val start = hms.getOrElse(0) { 0.0 } * 60 + hms.getOrElse(1) { 0.0 } + hms.getOrElse(2) { 0.0 } / 60.0
++                    val ss = parts.getOrNull(1)?.split(':')?.let { (it[0].toIntOrNull() ?: 18) * 60 + (it.getOrNull(1)?.toIntOrNull() ?: 30) }
++                    com.openminis.app.plus.DayNight.simulate(start, ss)
++                    "sim start=$start sunset=$ss night=" + com.openminis.app.plus.DayNight.tick(context)
++                }
++            }
++            "thememode" -> { com.openminis.app.ui.settings.getAppearancePrefs(context).edit().putInt(com.openminis.app.ui.settings.KEY_THEME_MODE, parts.getOrElse(0) { "3" }.toIntOrNull() ?: 3).apply(); "ok" }
 +            "weatherframe" -> JSONObject().put("t", com.openminis.app.ui.plus.AnimeWeather.lastT.toDouble()).toString()
              "reset" -> {
                  GroupStore.groups.value.forEach { GroupStore.delete(it.id) }
                  GroupPrefs.customs().forEach { GroupPrefs.removeCustom(it.id) }
-@@ -50,4 +171,41 @@ object GroupSelfTest {
+@@ -50,4 +183,41 @@ object GroupSelfTest {
              else -> "unknown group command"
          }
      }
@@ -7812,7 +7945,7 @@ index 0000000..7927d96
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt
-index fe38e21..9055244 100644
+index fe38e21..b4df912 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt
 @@ -13,7 +13,12 @@ import androidx.compose.ui.Modifier
@@ -7843,7 +7976,25 @@ index fe38e21..9055244 100644
      val GlassBorder = Color(0xBFFFFFFF); val GlassBorderDark = Color(0x1AFFFFFF)
      val Hairline = Color(0x171C1915); val HairlineDark = Color(0x17FFFFFF)
      val Ink = Color(0xFF1C1915); val InkDark = Color(0xFFF5F0EA)
-@@ -159,26 +165,83 @@ fun toneColors(tone: Tone): Pair<Color, Color> {
+@@ -119,6 +125,17 @@ fun minesColors(style: String?, dark: Boolean): MinesColors {
+     )
+ }
+ 
++/** [Mines-38.7] colours part-way between day [a] and night [b] (the animated sunrise / sunset change). */
++fun lerpMines(a: MinesColors, b: MinesColors, f: Float): MinesColors {
++    fun l(x: Color, y: Color) = androidx.compose.ui.graphics.lerp(x, y, f)
++    return MinesColors(
++        f >= 0.5f, a.character, l(a.bg, b.bg), l(a.surface, b.surface), l(a.surface2, b.surface2), l(a.glass, b.glass), l(a.glassStrong, b.glassStrong),
++        l(a.glassBorder, b.glassBorder), l(a.hairline, b.hairline), l(a.ink, b.ink), l(a.ink2, b.ink2), l(a.ink3, b.ink3),
++        l(a.primary, b.primary), l(a.onPrimary, b.onPrimary), l(a.primaryText, b.primaryText), l(a.container, b.container), l(a.onContainer, b.onContainer),
++        l(a.brand, b.brand), a.blobs.mapIndexed { i, c -> l(c, b.blobs.getOrElse(i) { c }) }, l(a.ring, b.ring), l(a.icon, b.icon),
++    )
++}
++
+ val LocalMinesColors = staticCompositionLocalOf { minesColors("claude", false) }
+ 
+ /** Current design colours (provided by MinisTheme from the chosen character). */
+@@ -159,26 +176,83 @@ fun toneColors(tone: Tone): Pair<Color, Color> {
   */
  @Composable
  fun PorcelainBackdrop(modifier: Modifier = Modifier) {
@@ -7936,7 +8087,7 @@ index fe38e21..9055244 100644
  /** Character id currently picked (reads PlusPrefs). */
  @Composable
  fun currentCharacter(): String {
-@@ -187,3 +250,28 @@ fun currentCharacter(): String {
+@@ -187,3 +261,28 @@ fun currentCharacter(): String {
      val st by PlusPrefs.state.collectAsState()
      return st.petStyle
  }
@@ -8623,7 +8774,7 @@ index d4af28d..d2280ed 100644
              Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                  OutlinedTextField(desc, { desc = it }, placeholder = { Text("写一句哪里不对就行") }, minLines = 3,
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
-index 8737da3..548988a 100644
+index 8737da3..7ce3231 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
 @@ -1,3 +1,4 @@
@@ -8683,7 +8834,7 @@ index 8737da3..548988a 100644
      @Suppress("UNUSED_VARIABLE") val weekday = SimpleDateFormat("EEEE", Locale.CHINA).format(cal.time).replace("星期", "周")
      // [Mines-warm-36] design36warm 01/02: home = 对话 only. Face + name plate, greeting, one status line,
      // then 最近对话. No message card / bar here (user 13:01 「对话就对话，要处理放在消息嘛」); the
-@@ -108,41 +118,311 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier, onSearch:
+@@ -108,41 +118,328 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier, onSearch:
      val appear by androidx.compose.animation.core.animateFloatAsState(if (shown) 1f else 0f, androidx.compose.animation.core.tween(280), label = "appear")
      val eff = PlusVps.effectiveMode(st)
      val vpsDown = st.isVps && eff == PlusState.MODE_LOCAL
@@ -8800,9 +8951,11 @@ index 8737da3..548988a 100644
 +    val tick by com.openminis.app.plus.HomeGreeting.tick.collectAsState()
 +    LaunchedEffect(Unit) { runCatching { com.openminis.app.plus.HomeGreeting.refreshWeather(context) } }
 +    val w = remember(tick) { com.openminis.app.plus.HomeGreeting.weatherNow(context) } ?: return null
-+    val hour = (com.openminis.app.plus.HomeGreeting.override?.optInt("hour", -1)?.takeIf { it >= 0 }) ?: Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
-+    val (icon, words) = com.openminis.app.plus.HomeGreeting.describe(w.code, hour)
-+    val night = hour >= 19 || hour < 6
++    // [Mines-38.7] night = after the real sunset (DayNight), unless the smoke injected an hour
++    val sunNight by com.openminis.app.plus.DayNight.night.collectAsState()
++    val forced = com.openminis.app.plus.HomeGreeting.override?.optInt("hour", -1)?.takeIf { it >= 0 }
++    val night = if (forced != null) forced >= 19 || forced < 6 else sunNight
++    val (icon, words) = com.openminis.app.plus.HomeGreeting.describe(w.code, if (night) 23 else 12)
 +    val extra = w.place.takeIf { it.isNotBlank() && it.length <= 8 } ?: if (night) "夜里" else ""
 +    return HomeWx(icon, words, Math.round(w.temp).toInt(), extra, night)
 +}
@@ -8896,6 +9049,15 @@ index 8737da3..548988a 100644
 -                    .padding(horizontal = 8.dp, vertical = 8.dp).semantics { contentDescription = "实时语音" })
 +    }
 +    LaunchedEffect(st.open) { if (front && st.open) { kotlinx.coroutines.delay(4000); if (st.open) st.close() } }
++    var prevIcon by remember { androidx.compose.runtime.mutableStateOf(wx.icon) }
++    var old by remember { androidx.compose.runtime.mutableStateOf<String?>(null) }
++    val swap = remember { androidx.compose.animation.core.Animatable(1f) }
++    LaunchedEffect(wx.icon) {
++        if (wx.icon == prevIcon) return@LaunchedEffect
++        old = prevIcon; prevIcon = wx.icon
++        if (still) swap.snapTo(1f) else { swap.snapTo(0f); swap.animateTo(1f, androidx.compose.animation.core.tween(2600, easing = androidx.compose.animation.core.FastOutSlowInEasing)) }
++        old = null
++    }
 +    val a = st.angle
 +    val f = st.fly.value
 +    val rx = 74f; val ry = 50f; val cy = 8f
@@ -8939,7 +9101,13 @@ index 8737da3..548988a 100644
 +        .graphicsLayer { scaleX = scale; scaleY = scale; this.alpha = alpha }
 +        .clickable(interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }, indication = null, onClick = onTap)
 +        .semantics { contentDescription = "天气：${wx.spoken}" }) {
-+        AnimeWeatherIcon(wx.icon, sizeDp.dp)
++        // [Mines-38.7] day ↔ night: the old picture sets along an arc (down + sideways, fading), the new one rises
++        val s = swap.value
++        val o = old
++        if (o != null && s < 1f) Box(Modifier.size(sizeDp.dp).graphicsLayer {
++            translationY = s * 64.dp.toPx(); translationX = s * 28.dp.toPx(); this.alpha = 1f - s }) { AnimeWeatherIcon(o, sizeDp.dp) }
++        Box(Modifier.size(sizeDp.dp).graphicsLayer {
++            if (o != null && s < 1f) { translationY = (1f - s) * 64.dp.toPx(); translationX = -(1f - s) * 28.dp.toPx(); this.alpha = s } }) { AnimeWeatherIcon(wx.icon, sizeDp.dp) }
 +    }
 +}
 +
@@ -9020,7 +9188,7 @@ index 8737da3..548988a 100644
          }
      }
  }
-@@ -191,7 +471,7 @@ private fun Chip(modifier: Modifier, icon: androidx.compose.ui.graphics.vector.I
+@@ -191,7 +488,7 @@ private fun Chip(modifier: Modifier, icon: androidx.compose.ui.graphics.vector.I
      GlassCard(modifier.semantics(mergeDescendants = true) { contentDescription = "$label：$value" },
          shape = RoundedCornerShape(14.dp), elevation = 2.dp, onClick = onClick) {
          val fill = MaterialTheme.colorScheme.surfaceContainerHigh
@@ -9029,7 +9197,7 @@ index 8737da3..548988a 100644
          val fg = cardTextColor(fill)
          Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
              MinesIcon(icon, null, tint = readableSecondary(fg, bg), modifier = Modifier.size(14.dp))
-@@ -227,3 +507,37 @@ private fun MessagesBar(count: Int, onClick: () -> Unit) {
+@@ -227,3 +524,37 @@ private fun MessagesBar(count: Int, onClick: () -> Unit) {
          Text("›", fontSize = 20.sp, color = m.ink3)
      }
  }
@@ -11167,6 +11335,37 @@ index 9f086d2..19be515 100644
  import androidx.compose.material3.TopAppBarDefaults
  import androidx.compose.runtime.Composable
  import androidx.compose.runtime.collectAsState
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/settings/AppearanceScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/settings/AppearanceScreen.kt
+index 0741a0b..d3947d0 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/settings/AppearanceScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/settings/AppearanceScreen.kt
+@@ -240,7 +240,7 @@ fun getAppearancePrefs(context: Context): SharedPreferences =
+     context.getSharedPreferences(PREF_APPEARANCE, Context.MODE_PRIVATE)
+ 
+ fun getThemeMode(context: Context): Int =
+-    getAppearancePrefs(context).getInt(KEY_THEME_MODE, 0)
++    getAppearancePrefs(context).getInt(KEY_THEME_MODE, 3)
+ 
+ fun getFontScale(context: Context, key: String): Float =
+     fontScaleForLevel(getAppearancePrefs(context).getInt(key, 0))
+@@ -258,7 +258,7 @@ fun AppearanceScreen(
+     val context = LocalContext.current
+     val prefs = remember { getAppearancePrefs(context) }
+ 
+-    var themeMode by remember { mutableIntStateOf(prefs.getInt(KEY_THEME_MODE, 0)) }
++    var themeMode by remember { mutableIntStateOf(prefs.getInt(KEY_THEME_MODE, 3)) }
+     var launchSession by remember { mutableIntStateOf(prefs.getInt(KEY_LAUNCH_SESSION, 0)) }
+     var returnKeyBehavior by remember { mutableIntStateOf(prefs.getInt(KEY_RETURN_KEY_BEHAVIOR, 0)) }
+     var keepScreenAwake by remember { mutableStateOf(prefs.getBoolean(KEY_KEEP_SCREEN_AWAKE, false)) }
+@@ -297,6 +297,8 @@ fun AppearanceScreen(
+                 ThemeRow(stringResource(R.string.appearance_theme_system), Icons.Outlined.BrightnessAuto, tilePurple),
+                 ThemeRow(stringResource(R.string.appearance_theme_light), Icons.Outlined.LightMode, tileOrange),
+                 ThemeRow(stringResource(R.string.appearance_theme_dark), Icons.Outlined.DarkMode, tilePurple),
++                // [Mines-38.7] index 3: day / night by sunrise & sunset, with the animated change (default)
++                ThemeRow("随日出日落（自动）", Icons.Outlined.BrightnessAuto, tileOrange),
+             )
+             themeRows.forEachIndexed { idx, row ->
+                 SettingsChoiceRow(
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/settings/BackgroundSettingsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/settings/BackgroundSettingsScreen.kt
 index 76863c5..7016db8 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/settings/BackgroundSettingsScreen.kt
@@ -11659,7 +11858,7 @@ index e318773..1423126 100644
  
  val LocalChatPalette = compositionLocalOf { LightChatPalette }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/theme/Theme.kt b/src/android/app/src/main/java/com/openminis/app/ui/theme/Theme.kt
-index 2ecc45a..bc42847 100644
+index 2ecc45a..df61d03 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/theme/Theme.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/theme/Theme.kt
 @@ -144,9 +144,9 @@ fun minisFabColor(): Color = LocalChatPalette.current.fabAccent
@@ -11675,18 +11874,28 @@ index 2ecc45a..bc42847 100644
      large = RoundedCornerShape(24.dp),        // NavigationDrawer
      extraLarge = RoundedCornerShape(28.dp),   // Dialog, BottomSheet
  )
-@@ -161,7 +161,9 @@ fun MinisTheme(
+@@ -155,13 +155,19 @@ private val MinisShapes = Shapes(
+ fun MinisTheme(
+     darkTheme: Boolean = isSystemInDarkTheme(),
+     fontScale: Float = 1f,
++    /** [Mines-38.7] 0 = day … 1 = night while the sunrise/sunset mode animates; null = plain light / dark */
++    nightFraction: Float? = null,
+     content: @Composable () -> Unit,
+ ) {
+     // [Mines-design-34] 「暖瓷 · 毛玻璃」 palette; the accent follows the desk-pet character.
      val ctx = androidx.compose.ui.platform.LocalContext.current
      com.openminis.app.plus.PlusPrefs.init(ctx)
      val plusSt = com.openminis.app.plus.PlusPrefs.state.collectAsState().value
 -    val mc = com.openminis.app.ui.plus.minesColors(plusSt.petStyle, darkTheme)
 +    // [Mines-38.1] single accent: terracotta #B5532F everywhere, whatever character is chosen (user 16:03)
 +    @Suppress("UNUSED_VARIABLE") val style = plusSt.petStyle
-+    val mc = com.openminis.app.ui.plus.minesColors("claude", darkTheme)
++    val mc = if (nightFraction != null && nightFraction > 0f && nightFraction < 1f)
++        com.openminis.app.ui.plus.lerpMines(com.openminis.app.ui.plus.minesColors("claude", false), com.openminis.app.ui.plus.minesColors("claude", true), nightFraction)
++    else com.openminis.app.ui.plus.minesColors("claude", if (nightFraction != null) nightFraction >= 0.5f else darkTheme)
      val colorScheme = porcelainScheme(if (darkTheme) DarkColorScheme else LightColorScheme, mc)
      val typography = scaledTypography(fontScale)
      val chatPalette = if (darkTheme) DarkChatPalette else LightChatPalette
-@@ -192,15 +194,24 @@ private fun porcelainScheme(base: androidx.compose.material3.ColorScheme, m: com
+@@ -192,15 +198,24 @@ private fun porcelainScheme(base: androidx.compose.material3.ColorScheme, m: com
      secondaryContainer = m.container,
      onSecondaryContainer = m.onContainer,
      tertiary = m.primaryText,
@@ -11713,7 +11922,7 @@ index 2ecc45a..bc42847 100644
      surfaceContainerHigh = m.surface2,
      surfaceContainerHighest = m.surface2,
      outline = if (m.dark) Color(0xFF6A615A) else Color(0xFF8F857A),
-@@ -211,17 +222,21 @@ private fun TextStyle.scale(factor: Float): TextStyle =
+@@ -211,17 +226,21 @@ private fun TextStyle.scale(factor: Float): TextStyle =
      if (factor == 1f) this else copy(fontSize = fontSize * factor)
  
  private fun scaledTypography(factor: Float): Typography {
