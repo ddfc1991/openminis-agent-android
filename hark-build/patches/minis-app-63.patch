@@ -2252,6 +2252,21 @@ index 5c7f934..6e513f5 100644
              CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
              wv.webViewClient = object : WebViewClient() {
                  override fun onPageFinished(view: WebView, u: String) {
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt
+index 66ceed1..3957e02 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/PlusVault.kt
+@@ -271,7 +271,9 @@ object PlusVault {
+             keyRegex = Regex("""https://qyapi\.weixin\.qq\.com/cgi-bin/webhook/send\?key=[A-Za-z0-9\-]+"""),
+             keyLabel = "Webhook 地址", envKey = "WECOM_WEBHOOK"),
+         ConnectionKind("feishu", "飞书", "飞书账号（网页版登录）", G_SOCIAL, R.drawable.ic_brand_feishu, ConnMethod.WEB, PermProfile.CHAT,
+-            loginUrl = "https://www.feishu.cn/accounts/page/login?app_id=2&redirect_uri=https%3A%2F%2Fwww.feishu.cn%2Fmessenger%2F",
++            // [Mines-38.7 v11] the app_id=2 login URL showed 「无效的请求参数 错误码 4401」 (smoke 2026-10-15); this is where
++            // www.feishu.cn/messenger/ itself sends a signed-out visitor (checked 2026-10-15)
++            loginUrl = "https://accounts.feishu.cn/accounts/page/login?app_id=1&no_trap=1&redirect_uri=https%3A%2F%2Fwww.feishu.cn%2Fmessenger%2F",
+             doneUrl = Regex("""https://[a-z0-9\-]+\.feishu\.cn/(messenger|next/messenger|drive|docx|wiki).*""")),
+         ConnectionKind("dingtalk", "钉钉", "群机器人（复制 Webhook 地址即可）", G_SOCIAL, R.drawable.ic_brand_dingtalk, ConnMethod.KEY, PermProfile.CHAT,
+             keyUrl = "https://open.dingtalk.com/document/orgapp/custom-robot-access",
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SavedLogins.kt b/src/android/app/src/main/java/com/openminis/app/plus/SavedLogins.kt
 new file mode 100644
 index 0000000..305a4ac
@@ -4424,10 +4439,10 @@ index 0000000..98b3d83
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/WebChat.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/WebChat.kt
 new file mode 100644
-index 0000000..421d9a1
+index 0000000..4e7078d
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/WebChat.kt
-@@ -0,0 +1,335 @@
+@@ -0,0 +1,360 @@
 +package com.openminis.app.plus.group
 +
 +import android.annotation.SuppressLint
@@ -4467,6 +4482,8 @@ index 0000000..421d9a1
 +        val wall: Regex? = null,
 +        /** the site lets a visitor chat without an account (seen on the real site) */
 +        val guestOk: Boolean = false,
++        /** [Mines-38.7 v11] session cookie a signed-in account always has: without it the page is a visitor's (GUEST) */
++        val sessionCookie: String = "",
 +    )
 +
 +    private val genericWall = Regex("请先登录|请登录后|登录后(才能|即可|使用|继续|输入)|受区域限制|手机号码?登录|发送验证码|获取验证码|注册以无缝继续|免费注册|Log in to continue|Sign in to continue|Sign up to continue")
@@ -4478,7 +4495,9 @@ index 0000000..421d9a1
 +            loggedOut = "[data-testid='to_login_button'],button[class*='login']", wall = Regex("受区域限制|请先登录再使用豆包")),
 +        "web:yuanbao" to Site(".ql-editor[contenteditable='true'],[contenteditable='true']", "#yuanbao-send-btn,a[class*='send-btn'],[class*='send-btn']",
 +            ".agent-chat__list__item--ai .hyc-content-md,.agent-chat__list__item--ai",
-+            loggedOut = ".agent-dialogue__tool__login", wall = Regex("请登录后输入内容")),
++            loggedOut = ".agent-dialogue__tool__login", wall = Regex("请登录后输入内容"),
++            // smoke 2026-10-15 21:2x: the never-signed-in 元宝 page (chat box, no 登录 text in the page yet) was taken for signed in
++            sessionCookie = "hy_token"),
 +        "web:kimi" to Site(".chat-input-editor[contenteditable='true'],[contenteditable='true'],textarea", ".send-button-container,.send-button,[class*='send-button']",
 +            ".segment-assistant .markdown,.chat-content-item-assistant .markdown,.segment-assistant",
 +            loggedOut = ".login-button,.next-sidebar-history-list__login"),
@@ -4526,6 +4545,25 @@ index 0000000..421d9a1
 +            val parts = host.split('.'); val root = if (parts.size > 2) parts.takeLast(2).joinToString(".") else host
 +            listOf(u, "https://$host/", "https://$root/", "https://www.$root/")
 +        }.any { u -> MailParse.cookieHas(runCatching { cm.getCookie(u) }.getOrNull().orEmpty(), spec.cookies) }
++    }
++
++    /** [Mines-38.7 v11] the account's own cookie store holds [names] for this site (profile or swapped store). */
++    fun hasCookie(spec: AiSpec, id: String, names: List<String>): Boolean {
++        if (names.isEmpty()) return false
++        val cm = AccountJar.cookieManager(id)
++        return urls(spec, id).flatMap { u ->
++            val host = runCatching { java.net.URI(u).host }.getOrNull() ?: return@flatMap emptyList()
++            val parts = host.split('.'); val root = if (parts.size > 2) parts.takeLast(2).joinToString(".") else host
++            listOf(u, "https://$host/", "https://$root/", "https://www.$root/")
++        }.any { u -> MailParse.cookieHas(runCatching { cm.getCookie(u) }.getOrNull().orEmpty(), names) }
++    }
++
++    /** [classify] plus the account's session cookie: a SIGNED_IN look without it is a visitor (GUEST). */
++    fun classifyFor(spec: AiSpec?, id: String, o: JSONObject): PageState {
++        val site = site(id)
++        val st = classify(site, o)
++        if (st != PageState.SIGNED_IN || site.sessionCookie.isEmpty() || spec == null) return st
++        return if (runCatching { hasCookie(spec, id, listOf(site.sessionCookie)) }.getOrDefault(true)) st else PageState.GUEST
 +    }
 +
 +    fun markSignedIn(id: String, on: Boolean?) = GroupPrefs.put("weblogin_$id", when (on) { true -> "1"; false -> "0"; null -> null })
@@ -4651,7 +4689,7 @@ index 0000000..421d9a1
 +    suspend fun check(context: Context, spec: AiSpec, id: String, waitMs: Long = 25_000): Check = AccountJar.lock(id).withLock {
 +        withContext(Dispatchers.Main) {
 +            val h = open(context, spec, id)
-+            val (st, o) = waitState(h.wv, site(id), waitMs)
++            val (st, o) = waitState(h.wv, site(id), waitMs, spec, id)
 +            when (st) { PageState.SIGNED_IN -> markSignedIn(id, true); PageState.LOGIN, PageState.GUEST -> markSignedIn(id, false); else -> {} }
 +            AccountJar.saveLocal(id, eval(h.wv, AccountJar.DUMP_LOCAL_JS)); AccountJar.remember(id, urls(spec, id))
 +            Check(st, o?.optString("url").orEmpty(), o?.optString("text").orEmpty().take(400))
@@ -4675,13 +4713,13 @@ index 0000000..421d9a1
 +        return h
 +    }
 +
-+    private suspend fun waitState(wv: WebView, site: Site, waitMs: Long): Pair<PageState, JSONObject?> {
++    private suspend fun waitState(wv: WebView, site: Site, waitMs: Long, spec: AiSpec? = null, id: String = ""): Pair<PageState, JSONObject?> {
 +        val t0 = System.currentTimeMillis()
 +        var last: JSONObject? = null; var st = PageState.LOADING
 +        while (System.currentTimeMillis() - t0 < waitMs) {
 +            delay(1000)
 +            val o = runCatching { JSONObject(eval(wv, probeJs(site))) }.getOrNull() ?: continue
-+            last = o; st = classify(site, o)
++            last = o; st = if (spec != null) classifyFor(spec, id, o) else classify(site, o)
 +            // a chat box decides at once; walls / checks get a few seconds (pages redirect / hydrate)
 +            if (st == PageState.SIGNED_IN || st == PageState.GUEST) { if (System.currentTimeMillis() - t0 > 3000) break }
 +            else if (st != PageState.LOADING && System.currentTimeMillis() - t0 > 8000) break
@@ -4701,7 +4739,7 @@ index 0000000..421d9a1
 +            val h = open(context, p.spec, p.id)
 +            val wv = h.wv
 +            // 1. what the page is: chat box / signed out / wall / robot check
-+            val (st, _) = waitState(wv, site, 30_000)
++            val (st, _) = waitState(wv, site, 30_000, p.spec, p.id)
 +            when (st) {
 +                PageState.VERIFY -> { drop(p.id); throw MemberError("$name 网页要先做一次人机验证：在「AI 伙伴」里点「登录」，在页面里过一下") }
 +                PageState.LOGIN -> { drop(p.id); markSignedIn(p.id, false); throw MemberError("$name 要先登录：在「AI 伙伴」里点「登录」") }
@@ -4719,7 +4757,9 @@ index 0000000..421d9a1
 +                delay(1500)
 +                val o = runCatching { JSONObject(eval(wv, readJs(site))) }.getOrNull() ?: continue
 +                val txt = clean(o.optString("text"))
-+                if (txt.isEmpty() && System.currentTimeMillis() - t1 > 4000 && genericWall.containsMatchIn(o.optString("page"))) {
++                // [Mines-38.7 v11] a login / sign-up wall that pops up after sending is not a reply (smoke: Kimi 「手机号码登录 发送验证码」, Grok 「免费注册」)
++                if ((txt.isEmpty() && System.currentTimeMillis() - t1 > 4000 && genericWall.containsMatchIn(o.optString("page"))) ||
++                    (st == PageState.GUEST && txt.isNotEmpty() && genericWall.containsMatchIn(txt))) {
 +                    drop(p.id); markSignedIn(p.id, false)
 +                    throw MemberError("$name 要先登录：在「AI 伙伴」里点「登录」")
 +                }
@@ -5360,7 +5400,7 @@ index dc5c875..9480c27 100644
              modifier = Modifier.fillMaxWidth(),
          ) {
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/group/GroupScreens.kt b/src/android/app/src/main/java/com/openminis/app/ui/group/GroupScreens.kt
-index 2dbee20..0190ef2 100644
+index 2dbee20..b11b6b8 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/group/GroupScreens.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/group/GroupScreens.kt
 @@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.Row
@@ -5921,7 +5961,7 @@ index 2dbee20..0190ef2 100644
 +                    val w = web ?: return@ActionPill
 +                    w.evaluateJavascript(WebChat.probeJs(WebChat.site(id))) { r ->
 +                        val o = runCatching { org.json.JSONObject(org.json.JSONTokener(r ?: "\"\"").nextValue() as? String ?: "{}") }.getOrNull()
-+                        val st = o?.let { WebChat.classify(WebChat.site(id), it) }
++                        val st = o?.let { WebChat.classifyFor(spec, id, it) }
 +                        com.openminis.app.plus.LoginWeb.flush()
 +                        when {
 +                            st == WebChat.PageState.SIGNED_IN || WebChat.signedIn(spec, id) && st != WebChat.PageState.LOGIN -> {
@@ -8167,7 +8207,7 @@ index 8843d0f..310d404 100644
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/LinkAll.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/LinkAll.kt
 new file mode 100644
-index 0000000..09ebda6
+index 0000000..f69ee42
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/LinkAll.kt
 @@ -0,0 +1,435 @@
@@ -8393,7 +8433,7 @@ index 0000000..09ebda6
 +            delay(3000)
 +            val wv = web() ?: continue
 +            val o = runCatching { org.json.JSONObject(eval(wv, WebChat.probeJs(WebChat.site(id)))) }.getOrNull() ?: continue
-+            if (WebChat.classify(WebChat.site(id), o) == WebChat.PageState.SIGNED_IN) {
++            if (WebChat.classifyFor(AiCatalog.spec(id), id, o) == WebChat.PageState.SIGNED_IN) {
 +                WebChat.markSignedIn(id, true); setNote(id, null)
 +                com.openminis.app.plus.LoginWeb.flush()
 +                AiCatalog.spec(id)?.let { com.openminis.app.plus.AccountJar.rememberNow(id, WebChat.urls(it, id)) }
@@ -11151,7 +11191,7 @@ index 1b05757..4f72cc4 100644
 +        0f to c.copy(alpha = 0f), 0.18f to c.copy(alpha = 0.96f), 1f to c)))
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
-index dbdf1e9..521adf6 100644
+index dbdf1e9..a6b8dbd 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
 @@ -14,6 +14,8 @@ import androidx.compose.foundation.layout.Column
@@ -11176,9 +11216,14 @@ index dbdf1e9..521adf6 100644
  import androidx.compose.runtime.Composable
  import androidx.compose.runtime.DisposableEffect
  import androidx.compose.runtime.LaunchedEffect
-@@ -83,6 +88,9 @@ fun WebLoginScreen(
+@@ -81,8 +86,13 @@ fun WebLoginScreen(
+     var finished by remember { mutableStateOf(false) }
+     val scope = androidx.compose.runtime.rememberCoroutineScope()
      // [Mines-login-32] this provider's page did not render inside Mines → it is open in a Chrome Custom Tab
-     var external by remember { mutableStateOf(PlusVault.extra(kind.id, "login_external") == "1") }
+-    var external by remember { mutableStateOf(PlusVault.extra(kind.id, "login_external") == "1") }
++    // [Mines-38.7 v11] user 2026-10-15: every sign-in stays inside Mines. A Chrome switch remembered by an older build
++    // (login_external, set by the blank-page fallback) is not followed any more: the page opens here again.
++    var external by remember { mutableStateOf(false) }
      var status by remember { mutableStateOf<String?>(if (detect) "正在检查是否已经登录…" else null) }
 +    var extOpened by remember { mutableStateOf(false) }
 +    var extBack by remember { mutableStateOf(false) }
@@ -11186,7 +11231,28 @@ index dbdf1e9..521adf6 100644
      var googleInApp by remember { mutableStateOf(kind.id == "gmail" && PlusVault.extra(kind.id, "google_refused") != "1") }
  
      suspend fun eval(js: String): String {
-@@ -148,30 +156,28 @@ fun WebLoginScreen(
+@@ -127,10 +137,16 @@ fun WebLoginScreen(
+             delay(2500)
+         }
+         if (blanks >= 2 && !finished) {
+-            external = true
+-            PlusVault.setExtra(kind.id, "login_external", "1")
+-            status = "这个网站在 Mines 里显示不出来，已改用 Chrome 打开。登录好后回来点下面的按钮"
+-            GoogleAuthRouter.openInCustomTab(context, current.ifBlank { url })
++            // [Mines-38.7 v11] smoke 2026-10-15 21:59: X (heavy page, slow network) was still blank after ~13 s and the old
++            // fallback threw the user out to Chrome — a sign-in there never reaches Mines. Stay here: load it once more, and
++            // if it is still empty say what to do (network / proxy, or wait), with the page kept open.
++            val waitNote = if (progress < 100) "页面还在加载（网站慢或需要代理），请稍等…" else "页面还没显示出来，正在重新加载…"
++            status = waitNote
++            if (progress >= 100) runCatching { webView?.reload() }
++            delay(15000)
++            if (!finished && eval(LoginWeb.BLANK_JS) == "blank")
++                status = "页面还是没显示出来：网站慢或需要代理。可以再等一会儿，或检查网络 / 代理后关掉重新打开（登录一直在 Mines 里做）"
++            else if (status == waitNote) status = null
+         }
+     }
+     // [Mines-sources-33] Google refused the embedded sign-in → say what still works, stop retrying.
+@@ -148,30 +164,28 @@ fun WebLoginScreen(
      }
      // [Mines-sources-33] Login pages that ask for an SMS / e-mail code: fill it from notifications
      // or the user's signed-in mailboxes, no typing.
@@ -11233,7 +11299,7 @@ index dbdf1e9..521adf6 100644
          owner.lifecycle.addObserver(obs)
          onDispose { owner.lifecycle.removeObserver(obs); LoginWeb.flush() }
      }
-@@ -227,18 +233,36 @@ fun WebLoginScreen(
+@@ -227,18 +241,36 @@ fun WebLoginScreen(
              }
          },
      ) { padding ->
@@ -11272,7 +11338,7 @@ index dbdf1e9..521adf6 100644
                          LoginWeb.configure(this, kind.id)
                          settings.setSupportMultipleWindows(false)
                          webChromeClient = object : WebChromeClient() {
-@@ -253,10 +277,11 @@ fun WebLoginScreen(
+@@ -253,10 +285,11 @@ fun WebLoginScreen(
                                  // page is detected below and then we stop trying.
                                  val tryGoogleHere = googleInApp && !u.contains("apple.com")
                                  if (GoogleAuthRouter.shouldRouteExternally(u) && !tryGoogleHere) {
@@ -11288,7 +11354,7 @@ index dbdf1e9..521adf6 100644
                                  }
                                  if (!u.startsWith("http")) return true // app deep links (weixin://, etc.)
                                  return false
-@@ -271,15 +296,28 @@ fun WebLoginScreen(
+@@ -271,15 +304,28 @@ fun WebLoginScreen(
                                  current = u; visited.add(u); load.finished(view, u)
                                  LoginWeb.flush()
                              }
