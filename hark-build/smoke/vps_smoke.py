@@ -1867,7 +1867,7 @@ def b385():
             print("b386 error:", e, flush=True); selftest_fail.append(f"b386 error {e}")
     if B387:
         anim(True)
-        for fn in (b387_greeting, b387_orbit, b387_daynight, b387_fog, b387_still, b387_xlogin, b387_pwfill, b387_sms, b387_linkall, b387_ignore, b387_perms, b387_noblack, b387_vps, b387_typing, b387_regress, b387_knowledge, b387_multiacct, b387_leftovers, b387_realweb):
+        for fn in (b387_greeting, b387_orbit, b387_daynight, b387_fog, b387_still, b387_xlogin, b387_pwfill, b387_sms, b387_linkall, b387_ignore, b387_perms, b387_noblack, b387_vps, b387_typing, b387_regress, b387_knowledge, b387_multiacct, b387_persist, b387_leftovers, b387_realweb, b387_platforms, b387_coze):
             try:
                 fn(res)
             except Exception as e:
@@ -2777,14 +2777,39 @@ def b387_vps(res):
 
 
 def b387_ignore(res):
-    r7 = R7(res)
+    """忽略 in 关联结果 → 已忽略 section; restore from 设置 › 已忽略的平台 (both places)."""
+    r7 = R7(res); o = {}
     route("plus_linkall_summary", 4)
-    r = dump()
     ok = tap_text("忽略", exact=True, wait=2)
     r = shot387("linkall-ignored"); t = " ".join(texts(r)) if r is not None else ""
-    r7["ignore"] = {"tapped": ok, "text": t[:300]}
+    o["tapped"] = ok; o["text"] = t[:300]
     if ok and "已忽略" not in t: selftest_fail.append(f"b387 ignore: no 已忽略 section after 忽略 {t[:200]}")
-    if ok and tap_text("恢复", exact=True, wait=2): r7["ignore"]["restored"] = True
+    if ok and tap_text("恢复", exact=True, wait=2): o["restored_in_summary"] = True
+    back()
+    # ignore one again, then restore it from 设置
+    result_json("group", "linkignore conn:weibo|1")
+    route("settings", 4)
+    for _ in range(6):
+        r = dump()
+        if r is not None and find(r, "已忽略的平台"): break
+        sh(f"input swipe {SCREEN[0]//2} {int(SCREEN[1]*0.75)} {SCREEN[0]//2} {int(SCREEN[1]*0.35)} 400"); time.sleep(1)
+    r = shot387("settings-ignored-row"); t = " ".join(texts(r)) if r is not None else ""
+    o["settings_row"] = "已忽略的平台" in t
+    if "已忽略的平台" not in t: selftest_fail.append("b387 ignore: 设置 has no 已忽略的平台 row")
+    if tap_text("已忽略的平台", exact=True, wait=3):
+        r = shot387("settings-ignored-page"); t = " ".join(texts(r)) if r is not None else ""
+        o["page"] = t[:300]
+        if "微博" not in t: selftest_fail.append(f"b387 ignore: 已忽略的平台 page does not list 微博 {t[:160]}")
+        if tap_text("恢复", exact=True, wait=2):
+            r = shot387("settings-ignored-restored"); t = " ".join(texts(r)) if r is not None else ""
+            o["restored_in_settings"] = "没有忽略的平台" in t
+            if "没有忽略的平台" not in t: selftest_fail.append(f"b387 ignore: restore in 设置 did not clear the list {t[:160]}")
+        back()
+    else: page_missing.append("b387 ignore: 已忽略的平台 not tappable")
+    st = result_json("group", "linkstates") or {}
+    o["weibo_state"] = st.get("conn:weibo") if isinstance(st, dict) else None
+    r7["ignore"] = o
+    print("B387 ignore", json.dumps(o, ensure_ascii=False)[:600], flush=True)
     back()
 
 
@@ -2837,7 +2862,7 @@ def b387_typing(res):
 REGRESS_ROUTES = ["settings", "plus_connections", "plus_personalize", "plus_voice_settings", "plus_sandbox", "plus_plugins", "plus_market",
                   "plus_routing", "plus_tidy", "plus_knowledge", "plus_verify", "plus_update", "plus_report", "plus_digest", "plus_cards",
                   "plus_work_location", "plus_group", "plus_group_partners", "plus_group_new", "plus_linkall", "plus_linkall_summary",
-                  "plus_permissions_guide", "plus_migrate"]
+                  "plus_permissions_guide", "plus_linkall_ignored", "plus_migrate"]
 
 
 def b387_regress(res):
@@ -2865,6 +2890,127 @@ def b387_regress(res):
     r7["regress"] = rows
     print("B387 REGRESS " + json.dumps(rows, ensure_ascii=False), flush=True)
 
+
+
+def b387_persist(res):
+    """in-app sign-in survives an app restart: the two fake 豆包 accounts stay signed in and still answer as themselves."""
+    r7 = R7(res); o = {}
+    o["connfake"] = {k: result_json("group", f"connfake {k}") for k in ("x", "weibo")}
+    st0 = result_json("group", "linkstates") or {}
+    o["conn_before"] = {k: st0.get(k) for k in ("conn:x", "conn:weibo")} if isinstance(st0, dict) else st0
+    before = result_json("group", "webstates") or []
+    o["before"] = [(w.get("id"), w.get("state")) for w in before if isinstance(w, dict) and "doubao" in w.get("id", "")]
+    adb("shell", "am", "force-stop", PKG); time.sleep(2)
+    adb("shell", "monkey", "-p", PKG, "-c", "android.intent.category.LAUNCHER", "1"); time.sleep(10)
+    after = result_json("group", "webstates") or []
+    o["after"] = [(w.get("id"), w.get("state")) for w in after if isinstance(w, dict) and "doubao" in w.get("id", "")]
+    ask = result_json("group", "webask web:doubao|你是哪个账号", timeout=150) or {}
+    o["ask_after_restart"] = ask
+    o["links"] = result_json("group", "linkstates")
+    o["conn_after"] = {k: o["links"].get(k) for k in ("conn:x", "conn:weibo")} if isinstance(o["links"], dict) else None
+    for k in ("x", "weibo"): result_json("group", f"connfake {k}|off")
+    r7["persist"] = o
+    print("B387 persist", json.dumps(o, ensure_ascii=False)[:900], flush=True)
+    ready_after = [x for x in o["after"] if x[1] == "READY"]
+    cp = o.get("conn_after") or {}
+    for k in ("conn:x", "conn:weibo"):
+        if cp.get(k) != "已关联": selftest_fail.append(f"b387 persist: {k} not 已关联 after restart ({cp.get(k)})")
+    if not ready_after: selftest_fail.append(f"b387 persist: sign-in lost after restart {o['after']}")
+    if not (isinstance(ask, dict) and ask.get("ok")): selftest_fail.append(f"b387 persist: account does not answer after restart {ask}")
+
+
+def b387_platforms(res):
+    """一键关联, every platform for real (never signed in on this emulator): sign-in page opens inside Mines, no crash,
+    no silent white page; the page state + the hint Mines shows are recorded for the report table."""
+    r7 = R7(res); rows = []
+    for sid in REAL_SITES:
+        result_json("group", f"base {sid}|"); result_json("group", f"weblogin {sid}|")
+        sh("logcat -c")
+        route("plus_group_weblogin/" + sid.replace(":", "%3A"), 16)
+        r = shot387("plat-" + sid.split(":")[1]); t = " ".join(texts(r)) if r is not None else ""
+        lc = sh("logcat -d -b crash | tail -20", timeout=20)
+        W, H = (SCREEN[0], SCREEN[1]) if SCREEN and SCREEN[0] else (1080, 2362)
+        try:
+            from PIL import Image
+            im = Image.open(f"{OUT}/b387-plat-{sid.split(':')[1]}.png").convert("L").crop((0, int(H * .25), W, int(H * .9)))
+            ext = im.getextrema(); flat = (ext[1] - ext[0]) < 12
+        except Exception:
+            flat = None
+        c = result_json("group", f"webcheck {sid}|25", timeout=80) or {}
+        row = {"platform": sid, "alive": alive(), "crash": "FATAL" in lc, "white": flat, "state": c.get("state") if isinstance(c, dict) else None,
+               "partner": c.get("partner") if isinstance(c, dict) else None, "reason": (c.get("reason") if isinstance(c, dict) else "") or "",
+               "shot": f"b387-plat-{sid.split(':')[1]}.png", "page": t[:120]}
+        rows.append(row)
+        if not row["alive"] or row["crash"]: selftest_fail.append(f"b387 platform {sid}: app crashed on its sign-in page")
+        if flat: selftest_fail.append(f"b387 platform {sid}: white page without a hint")
+        if not row["alive"]: relaunch()
+        back(); time.sleep(1)
+    # [38.7 v8] every 账号连接 platform (AI 服务商, 开发, 办公, 金融, 社交 incl. X / 微博 …) the way 一键关联 opens it
+    info = result_json("group", "linkinfo", timeout=60) or []
+    r7["linkinfo"] = info
+    for p in info:
+        sid = p.get("id", "")
+        if not sid.startswith("conn:"): continue
+        kid = sid[5:]; tag = re.sub(r"[^a-z0-9_]", "_", kid.lower())
+        sh("logcat -c")
+        b381_home()
+        result_json("group", f"linkopen {sid}")
+        time.sleep(9 if p.get("how", "").startswith("在 Mines 内登录") and "密钥" not in p.get("how", "") else 4)
+        r = shot387("plat-" + tag); t = " ".join(texts(r)) if r is not None else ""
+        lc = sh("logcat -d -b crash | tail -20", timeout=20)
+        W, H = (SCREEN[0], SCREEN[1]) if SCREEN and SCREEN[0] else (1080, 2362)
+        try:
+            from PIL import Image
+            im = Image.open(f"{OUT}/b387-plat-{tag}.png").convert("L").crop((0, int(H * .25), W, int(H * .9)))
+            ext = im.getextrema(); flat = (ext[1] - ext[0]) < 12
+        except Exception:
+            flat = None
+        name = p.get("name", kid)
+        opened = alive() and not flat and bool(t.strip()) and ("账号连接" not in t or name.split(" ")[0] in t)
+        hint = next((x for x in texts(r) or [] if any(k in x for k in ("连不上", "打不开", "超时", "失败", "代理", "人机", "验证", "不允许", "无法"))), "") if r is not None else ""
+        row = {"platform": sid, "name": name, "category": p.get("category"), "how": p.get("how"), "auto": p.get("auto"),
+               "external": p.get("external"), "alive": alive(), "crash": "FATAL" in lc, "white": flat, "opened": opened,
+               "state": p.get("state"), "reason": hint[:80] or (p.get("step") or ""), "shot": f"b387-plat-{tag}.png", "page": t[:120]}
+        rows.append(row)
+        if not row["alive"] or row["crash"]: selftest_fail.append(f"b387 platform {sid}: app crashed opening it")
+        if flat: selftest_fail.append(f"b387 platform {sid}: white page without a hint")
+        if not row["alive"]: relaunch()
+        back(); time.sleep(0.8)
+    r7["platforms"] = rows
+    print("B387 PLATFORMS " + json.dumps(rows, ensure_ascii=False), flush=True)
+
+
+
+def b387_coze(res):
+    """[38.7 v8] the 扣子 Coze row of the platform table, step by step. Real coze.cn sign-in page in Mines' WebView is
+    opened for real; the phone + SMS sign-in and the KeyAgent pat_ capture need a real account → 未实测; listing /
+    publishing bots and the group reply run against the runner's fake Coze API (same code path, fake server)."""
+    r7 = R7(res); row = {"platform": "扣子 Coze"}
+    try:
+        c = coze_382()
+    except Exception as e:
+        c = {"err": str(e)}
+    row["webview_login_page"] = ("通过（真站点）：内置 WebView 显示了扣子登录页「%s」" % c.get("login_text")) if c.get("login_text") and not c.get("chrome") \
+        else f"失败：{c}"
+    row["phone_sms_login"] = "未实测：模拟器上没有真实手机号 / 短信，卡在扣子（火山引擎）登录页的手机号 + 验证码这一步"
+    row["keyagent_pat"] = "未实测：KeyAgent 取 pat_ 密钥要先真登录扣子，登录这一步没法在 CI 完成，所以没走到「创建个人访问令牌」"
+    B = "http://10.0.2.2:8088"
+    result_json("group", f"vaultkey coze|pat_smoke_0123456789abcdef0123|{B}/v3")
+    cs = result_json("group", "cozesync", timeout=60) or {}
+    bots = cs.get("bots", []) if isinstance(cs, dict) else []
+    pub = (cs.get("published", []) if isinstance(cs, dict) else []) + fake_stats().get("coze_published", [])
+    row["list_bots"] = f"通过（假扣子接口）：列出 {len(bots)} 个 bot" if len(bots) == 2 else f"失败：{cs}"
+    row["publish_bot"] = "通过（假扣子接口）：未发布的 bot2 被自动发布" if "bot2" in pub else f"失败：bot2 没被发布 {pub}"
+    gid = result_json("group", "make 扣子冒烟群|coze:bot1")
+    r = result_json("group", f"send {gid}|你好，回一句", timeout=120) or []
+    x = next((y for y in r if isinstance(y, dict) and y.get("who") == "coze:bot1"), {}) if isinstance(r, list) else {}
+    row["group_reply"] = ("通过（假扣子接口）：群里 bot1 回了「%s」" % x.get("text", "")[:40]) if x.get("status") == "ok" and x.get("text") \
+        else f"失败：{x or r}"
+    row["real_group_reply"] = "未实测：真实扣子 bot 回话需要真实 pat_ 密钥（卡在上面的手机号登录）"
+    for k in ("webview_login_page", "list_bots", "publish_bot", "group_reply"):
+        if not row[k].startswith("通过"): selftest_fail.append(f"b387 coze {k}: {row[k][:160]}")
+    r7["coze"] = row
+    print("B387 COZE " + json.dumps(row, ensure_ascii=False), flush=True)
 
 
 def main():
