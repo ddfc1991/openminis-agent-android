@@ -45,8 +45,9 @@ except Exception:
     B386 = False
 try:
     B387 = "b387" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
+    FAST = "fast" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
 except Exception:
-    B387 = False
+    B387 = False; FAST = False
 FONT_SCALE = "1.18"
 step_no = 0
 crashed = []
@@ -2622,9 +2623,11 @@ def b387_linkall(res):
     if tap_text("开始", exact=True, wait=7):
         r = shot387("linkall-login"); t = " ".join(texts(r)) if r is not None else ""
         o["login"] = t[:200]
-        o["login_lum"] = _lum(f"{OUT}/b387-linkall-login.png")
-        time.sleep(3); shot387("linkall-login-2"); o["login2_lum"] = _lum(f"{OUT}/b387-linkall-login-2.png")
-        if isinstance(o["login2_lum"], float) and o["login2_lum"] > 252: selftest_fail.append(f"b387 linkall: sign-in page still white 3 s later {o['login2_lum']}")
+        o["login_lum"] = _lum(f"{OUT}/b387-linkall-login.png"); o["login_flat"] = _flat(f"{OUT}/b387-linkall-login.png")
+        time.sleep(3); shot387("linkall-login-2"); o["login2_lum"] = _lum(f"{OUT}/b387-linkall-login-2.png"); o["login2_flat"] = _flat(f"{OUT}/b387-linkall-login-2.png")
+        # [v11d] a white sign-in SITE is fine (元宝 is white); a frame with nothing on it (no header either) is the bug
+        if o["login_flat"]: selftest_fail.append(f"b387 linkall: blank frame when the sign-in page opened {o['login_flat']}")
+        if o["login2_flat"]: selftest_fail.append(f"b387 linkall: still blank 3 s later {o['login2_flat']}")
         if "登录" not in t: selftest_fail.append(f"b387 linkall: login page did not open {t[:160]}")
         back(); time.sleep(1.2)
         r = shot387("linkall-next"); t = " ".join(texts(r)) if r is not None else ""
@@ -2763,6 +2766,17 @@ def _lum(path):
         return f"err {e}"
 
 
+def _flat(path):
+    """whole screen (below the status bar) one colour = nothing drawn; returns the stddev when flat, else None"""
+    try:
+        from PIL import Image, ImageStat
+        im = Image.open(path).convert("L"); W, H = im.size
+        sd = ImageStat.Stat(im.crop((0, int(H * .04), W, int(H * .95)))).stddev[0]
+        return round(sd, 2) if sd < 2.0 else None
+    except Exception as e:
+        return None
+
+
 def b387_noblack(res):
     """FLAG_SECURE gone: screencap of 账号连接 / key page / chat / settings is not black."""
     r7 = R7(res); out = {}
@@ -2770,7 +2784,11 @@ def b387_noblack(res):
         route(rt, 4)
         snap_ = shot387("noblack-" + tag)
         if tag == "linkall":   # [38.7 v11] 一键关联 may open the next sign-in page right now: look again 4 s later
-            out["linkall_first"] = _lum(f"{OUT}/b387-noblack-linkall.png"); time.sleep(4); snap_ = shot387("noblack-" + tag)
+            out["linkall_first"] = _lum(f"{OUT}/b387-noblack-linkall.png"); out["linkall_first_flat"] = _flat(f"{OUT}/b387-noblack-linkall.png")
+            if out["linkall_first_flat"]: selftest_fail.append(f"b387 noblack linkall: blank frame {out['linkall_first_flat']}")
+            time.sleep(4); snap_ = shot387("noblack-" + tag)
+            out["linkall_second_flat"] = _flat(f"{OUT}/b387-noblack-linkall.png")
+            if out["linkall_second_flat"]: selftest_fail.append(f"b387 noblack linkall: blank 4 s later {out['linkall_second_flat']}")
         W, H = (SCREEN[0], SCREEN[1]) if SCREEN and SCREEN[0] else (1080, 2362)
         try:
             from PIL import Image
@@ -2991,7 +3009,7 @@ def b387_platforms(res):
     """一键关联, every platform for real (never signed in on this emulator): sign-in page opens inside Mines, no crash,
     no silent white page; the page state + the hint Mines shows are recorded for the report table."""
     r7 = R7(res); rows = []
-    for sid in REAL_SITES:
+    for sid in ([x for x in REAL_SITES if x == "web:yuanbao"] if FAST else REAL_SITES):
         result_json("group", f"base {sid}|"); result_json("group", f"weblogin {sid}|")
         sh("logcat -c")
         route("plus_group_weblogin/" + sid.replace(":", "%3A"), 16)
@@ -3024,6 +3042,7 @@ def b387_platforms(res):
     for p in info:
         sid = p.get("id", "")
         if not sid.startswith("conn:"): continue
+        if FAST and sid[5:] not in ("douyin", "x", "feishu", "qq", "weibo"): continue
         kid = sid[5:]; tag = re.sub(r"[^a-z0-9_]", "_", kid.lower())
         sh("logcat -c")
         b381_home()
@@ -3043,6 +3062,14 @@ def b387_platforms(res):
             ext = im.getextrema(); flat = (ext[1] - ext[0]) < 12
         except Exception:
             flat = None
+        if flat:   # [v11d] a heavy page (抖音 video) can be mid-paint: look again before calling it white
+            time.sleep(6); r = shot387("plat-" + tag); t = " ".join(texts(r)) if r is not None else ""
+            try:
+                im = Image.open(f"{OUT}/b387-plat-{tag}.png").convert("L").crop((0, int(H * .25), W, int(H * .9)))
+                ext = im.getextrema(); flat = (ext[1] - ext[0]) < 12
+            except Exception:
+                pass
+            if flat and r is not None and any(k in " ".join(texts(r)) for k in ("加载中", "还在加载", "没显示出来")): flat = False   # a hint is shown
         name = p.get("name", kid)
         opened = alive() and not flat and bool(t.strip()) and ("账号连接" not in t or name.split(" ")[0] in t)
         hint = next((x for x in texts(r) or [] if any(k in x for k in ("连不上", "打不开", "超时", "失败", "代理", "人机", "验证", "不允许", "无法"))), "") if r is not None else ""
@@ -3116,6 +3143,20 @@ def main():
         dump_fatal()
         user_like_state()
 
+    if FAST:   # [38.7 v11d] user-approved targeted gate: linking, white pages, persistence, chosen platform rows
+        res = {}
+        try:
+            result_json("group", "wallpaper off"); anim(True)
+        except Exception as e:
+            print("fast prep error", e, flush=True)
+        for fn in (b387_linkall, b387_noblack, b387_persist, b387_platforms):
+            try:
+                fn(res)
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                print(f"{fn.__name__} error:", e, flush=True); selftest_fail.append(f"{fn.__name__} error {e}")
+        print("B387 RESULT " + json.dumps(res.get("b387", {}), ensure_ascii=False), flush=True)
+        return finish(lc)
     if B385:
         try:
             b385()
