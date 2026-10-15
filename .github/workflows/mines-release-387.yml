@@ -1,0 +1,68 @@
+name: Publish Mines 38.7 prerelease + download-back check
+
+on:
+  push:
+    branches: [hark-minis-build]
+    paths: ['hark-build/release/**', '.github/workflows/mines-release-387.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  MINES_CERT_SHA256: 001814fb258110b003c851aeeac930fd3d803224eb9acdcab0a383edcb740e2b
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read release inputs
+        run: |
+          cat hark-build/release/387.env
+          cat hark-build/release/387.env >> "$GITHUB_ENV"
+      - name: Fetch the APK from the build run
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          mkdir -p o apks
+          gh run download "$BUILD_RUN" -R "$GITHUB_REPOSITORY" -n mines-apk -D o
+          ls -l o
+          cp "$(ls o/*.apk | head -1)" "apks/$ASSET"
+          sha256sum "apks/$ASSET"
+          echo "$WANT_SHA  apks/$ASSET" | sha256sum -c -
+      - name: Create prerelease and upload asset
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          gh release delete "$TAG" -R "$GITHUB_REPOSITORY" -y --cleanup-tag 2>/dev/null || true
+          sleep 3
+          SIZE=$(stat -c %s "apks/$ASSET")
+          gh release create "$TAG" "apks/$ASSET" -R "$GITHUB_REPOSITORY" --prerelease --target hark-minis-build \
+            --title "Mines 38.7" \
+            --notes "Mines 38.7 (versionCode 35 / 1.21), signed v1+v2+v3 with the Mines key (cert SHA-256 $MINES_CERT_SHA256). File SHA-256 $WANT_SHA, $SIZE bytes. Updates 38.6 in place (same key)."
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json url,assets
+      - name: Download back from the public URL (no auth) and verify
+        run: |
+          URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$ASSET"
+          echo "URL=$URL"
+          for i in 1 2 3 4 5; do curl -fL --retry 3 -o dl.apk "$URL" && break; sleep 10; done
+          stat -c '%s bytes' dl.apk; sha256sum dl.apk | tee dl.sha
+          [ "$(cut -d' ' -f1 dl.sha)" = "$WANT_SHA" ] && echo "DOWNLOAD SHA MATCH" || { echo "::error::download sha mismatch"; exit 1; }
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          "$BT/apksigner" verify -v --print-certs dl.apk 2>&1 | grep -vE '^WARNING: META-INF/' | head -20 | tee verify.txt
+          grep -q "Verified using v1 scheme (JAR signing): true" verify.txt
+          grep -q "Verified using v2 scheme (APK Signature Scheme v2): true" verify.txt
+          grep -q "Verified using v3 scheme (APK Signature Scheme v3): true" verify.txt
+          grep -qi "certificate SHA-256 digest: $MINES_CERT_SHA256" verify.txt && echo "CERT MATCH"
+          unzip -tq dl.apk
+          echo "UNZIP OK"
+          "$BT/aapt2" dump badging dl.apk | head -1 | tee badging.txt
+          grep -q "package: name='com.openminis.mines.plus'" badging.txt && echo "BADGING $(grep -o "versionCode='[0-9]*'" badging.txt) $(grep -o "versionName='[^']*'" badging.txt)"
+      - name: Download back through the ghfast.top mirror and verify
+        run: |
+          URL="https://ghfast.top/https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$ASSET"
+          ok=0; for i in 1 2 3 4 5; do curl -fL --retry 2 --max-time 300 -o mirror.apk "$URL" && ok=1 && break; sleep 15; done
+          if [ $ok = 1 ]; then stat -c '%s bytes' mirror.apk; S=$(sha256sum mirror.apk | cut -d' ' -f1); echo "MIRROR SHA $S"
+            [ "$S" = "$WANT_SHA" ] && echo "MIRROR SHA MATCH" || echo "::warning::mirror sha mismatch"
+          else echo "::warning::ghfast mirror download failed"; fi
