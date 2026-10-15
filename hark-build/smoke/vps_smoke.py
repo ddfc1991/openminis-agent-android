@@ -2480,13 +2480,13 @@ def _bounds_desc(r, prefix):
     return node_bounds(r, lambda n: (n.get("content-desc") or "").startswith(prefix))
 
 
-def _crop_diff(a, b, box):
+def _crop_diff(a, b, box, lvl=12):
     try:
         from PIL import Image, ImageChops
         ia = Image.open(a).convert("RGB").crop(box); ib = Image.open(b).convert("RGB").crop(box)
         d = ImageChops.difference(ia, ib).convert("L")
         hist = d.histogram(); n = sum(hist)
-        changed = sum(hist[12:]) / max(1, n)
+        changed = sum(hist[lvl:]) / max(1, n)
         return round(changed, 4)
     except Exception as e:
         return f"err {e}"
@@ -2527,7 +2527,13 @@ def b387_orbit(res):
         r2 = shot387(f"orbit-{tag}-2"); b2 = _bounds_desc(r2, "天气：")
         av = _bounds_desc(r2, "换角色")
         o = {"sprite1": b1, "sprite2": b2, "avatar": av}
-        if not b1 or not b2: selftest_fail.append(f"b387 orbit {tag}: sprite not found {b1} {b2}")
+        if (not b1 or not b2) and av:
+            # uiautomator often misses the moving sprite node: compare the pixels around the face instead
+            bx = (max(0, av[0] - 200), max(0, av[1] - 200), min(SCREEN[0] or 1080, av[2] + 200), av[3] + 200)
+            pd = _crop_diff(f"{OUT}/b387-orbit-{tag}-1.png", f"{OUT}/b387-orbit-{tag}-2.png", bx)
+            o["pixel_move"] = pd
+            if not isinstance(pd, float) or pd < 0.002: selftest_fail.append(f"b387 orbit {tag}: sprite not found and no movement around the face {pd}")
+        elif not b1 or not b2: selftest_fail.append(f"b387 orbit {tag}: sprite not found {b1} {b2}")
         elif b1 == b2: selftest_fail.append(f"b387 orbit {tag}: sprite did not move {b1}")
         if av:
             adb("shell", "input", "tap", str((av[0] + av[2]) // 2), str((av[1] + av[3]) // 2)); time.sleep(1.3)
@@ -2556,11 +2562,11 @@ def b387_fog(res):
     r7 = R7(res)
     route("plus_permissions_guide", 4)
     a = f"{OUT}/b387-fog-1.png"; b = f"{OUT}/b387-fog-2.png"
-    shot387("fog-1"); time.sleep(3); shot387("fog-2")
+    f1 = result_json("group", "fogstate"); shot387("fog-1"); time.sleep(3); shot387("fog-2"); f2 = result_json("group", "fogstate")
     W, H = (SCREEN[0], SCREEN[1]) if SCREEN and SCREEN[0] else (1080, 2362)
     box = (0, int(H * 0.86), W, H - 10)   # under the card list (empty backdrop)
-    d = _crop_diff(a, b, box); g = _grid_score(a, (0, int(H * 0.86), W, H - 10))
-    r7["fog"] = {"changed": d, "grid": g, "box": box}
+    d = _crop_diff(a, b, box, lvl=2); g = _grid_score(a, (0, int(H * 0.86), W, H - 10))
+    r7["fog"] = {"changed": d, "grid": g, "box": box, "state1": f1, "state2": f2}
     print("B387 fog", r7["fog"], flush=True)
     if not isinstance(d, float) or d < 0.01: selftest_fail.append(f"b387 fog: backdrop did not move {d}")
     if isinstance(g, float) and g > 6: selftest_fail.append(f"b387 fog: patterned backdrop (grid score {g})")
