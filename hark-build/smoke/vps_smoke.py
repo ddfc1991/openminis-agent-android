@@ -69,6 +69,10 @@ try:
     UI3891 = "ui3891" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
 except Exception:
     UI3891 = False
+try:
+    FIX3891 = "fix3891" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
+except Exception:
+    FIX3891 = False
 FONT_SCALE = "1.18"
 step_no = 0
 crashed = []
@@ -3186,6 +3190,7 @@ def main():
         except Exception as e:
             print("fast prep error", e, flush=True)
         if UI388: fns = (b388_ui, b389_ui, b3891_fb, b3891_ui) if UI3891 else (b388_ui, b389_ui) if UI389 else (b388_ui,)
+        elif FIX3891: fns = (b3891_fix,)   # [38.9.1 e] states smoke d missed
         elif UI3891: fns = (b3891_fb, b3891_ui)   # [38.9.1 d] feedback round first, then the 38.9.1 pages
         elif HUB: fns = ()
         elif B388: fns = (b387_linkall, b387_noblack, b388_weblogin, b388_mailbox, b388_presets)
@@ -3760,6 +3765,110 @@ def b3891_hub(res):
     back(2)
     r8["hub"] = o
     print("HUB RESULT " + json.dumps(o, ensure_ascii=False)[:3000], flush=True)
+
+
+def rawshot(name):
+    """screencap only (no uiautomator dump: heavy WebView pages time it out)"""
+    global step_no
+    step_no += 1
+    p = f"{OUT}/{step_no:02d}-b388-{name}.png"
+    for _ in range(3):
+        subprocess.run(f"adb exec-out screencap -p > {p}", shell=True, timeout=60)
+        if os.path.exists(p) and os.path.getsize(p) > 1000: break
+        time.sleep(1.5)
+    subprocess.run(f"cp {p} {OUT}/b388-{name}.png", shell=True)
+    print(f"[rawshot {name}] alive={alive()}", flush=True)
+
+
+def b3891_fix(res):
+    """[38.9.1 e] what smoke d missed: keychain with saved logins + identities, Google detail, 已记下 toast logos,
+    model picker from the header, Hark 测试一下 (signed-in → real round trip → plain result), Grok delete → card gone,
+    硅基流动 / OpenAI consoles, KeyAgent dialog with the soft keyboard up, 163 add with a cleared address field."""
+    r8 = R8(res); o = {}; F = "http://10.0.2.2:8088"
+    def step(name, f):
+        try: f()
+        except Exception as e:
+            import traceback; traceback.print_exc(); page_missing.append(f"fix3891 {name} error {e}")
+        if not alive(): crashed.append(f"fix3891 {name}"); relaunch()
+    theme388(1)
+    def kc():
+        csv = ("name,url,username,password\\n"
+               "GitHub,https://github.com/login,smoke@example.com,pw-smoke-1\\n"
+               "Cloudflare,https://dash.cloudflare.com/login,smoke@example.com,pw-smoke-2\\n"
+               "阿里云,https://account.aliyun.com/login,13800138000,pw-smoke-3\\n"
+               "OKX,https://www.okx.com/account/login,smoke@example.com,pw-smoke-4\\n"
+               "ModelScope,https://modelscope.cn/login,13800138000,pw-smoke-5\\n"
+               "Google,https://accounts.google.com/,smoke@example.com,pw-smoke-6")
+        o["seed"] = result_json("group", "savedlogins " + csv, timeout=30)
+        o["kcseed"] = result_json("group", "kcseed", timeout=30)
+        route("plus_keychain", 10); time.sleep(4); r = shot388("fix-kc"); o["kc"] = _txt(r)[:500]
+        rows = [d for d in all_desc(r, "") if "，" in d[2] and "Google" in d[2]]
+        if rows:
+            sh(f"input tap {rows[0][0]} {rows[0][1]}"); time.sleep(4); r = shot388("fix-kc-google"); o["kc_google"] = _txt(r)[:300]; back(1)
+        else: page_missing.append("fix3891 kc: Google row not found")
+        o["autoacct"] = result_json("group", "autoacct Hugging Face|huggingface.co|smoke@example.com", timeout=20)
+        time.sleep(1.5); shot388("fix-kc-toast"); time.sleep(5); shot388("fix-kc-after-toast")
+        back(1)
+    step("kc", kc)
+    def picker():
+        b381_home(); time.sleep(1)
+        if not tap_text("你好，我是测试模型。", wait=5): tap_text("GARBAGETEST", wait=5)
+        if not tap_text("Default Models", wait=3): page_missing.append("fix3891 picker: Default Models row not found")
+        r = shot388("fix-picker"); t = _txt(r); o["picker"] = t[:400]
+        if "自动" not in t: page_missing.append(f"fix3891 picker: 自动（推荐） not seen {t[:160]}")
+        scroll_down(); time.sleep(1); shot388("fix-picker-b"); back(2)
+    step("picker", picker)
+    def hark():
+        result_json("group", "agents clear", timeout=20); result_json("group", "agents add web:hark", timeout=20)
+        o["weblogin"] = result_json("group", "weblogin web:hark|1", timeout=30)
+        route("plus_app_agents", 6); r = shot388("fix-hark-row"); o["hark_row"] = _txt(r)[:300]
+        if tap_text("测试一下", wait=1.2):
+            shot388("fix-hark-testing"); time.sleep(35); r = shot388("fix-hark-test"); o["hark_test"] = _txt(r)[:300]
+        else: page_missing.append("fix3891 hark: 测试一下 not found after weblogin")
+        back(1)
+    step("hark", hark)
+    def grok():
+        result_json("group", "vaultkey xai|xai-smokeKEY000000000000000000000000000000000000000000000000000000000000", timeout=30)
+        selftest_json("openkind", "xai", timeout=20); time.sleep(6); shot388("fix-grok-before")
+        if tap_text("删除这个API Key", wait=2.5):
+            tap_text("删除", exact=True, wait=3); time.sleep(2); r = shot388("fix-grok-after"); o["grok_after"] = _txt(r)[:300]
+            if "没通过" in o["grok_after"]: selftest_fail.append("fix3891 grok: stale 「保存的…没通过」 card after delete")
+        else: page_missing.append("fix3891 grok: 删除这个API Key not found")
+        back(2)
+    step("grok", grok)
+    def ime():
+        sh("settings put secure show_ime_with_hard_keyboard 1")
+        result_json("group", f"keyagent groq|{F}/keydlg", timeout=20); time.sleep(10)
+        if tap_text("Create API Key", wait=2.5):
+            e = edits(dump())
+            if e: sh(f"input tap {e[0][0]} {e[0][1]}"); time.sleep(2.5)
+            shot388("fix-ka-ime")
+        back(3); time.sleep(2)
+    step("ime", ime)
+    def consoles():
+        nw = {}
+        for k in ("siliconflow", "openai"):
+            result_json("group", f"keyagent {k}|", timeout=20); time.sleep(22)
+            rawshot(f"fix-con-{k}"); nw[k] = _nonwhite(f"{OUT}/b388-fix-con-{k}.png"); back(3); time.sleep(2)
+        o["console_nonwhite"] = nw
+        for k, v in nw.items():
+            if isinstance(v, float) and v < 0.02: page_missing.append(f"fix3891 console {k}: looks blank ({v})")
+    step("consoles", consoles)
+    def mail():
+        result_json("mailbox", "open"); time.sleep(5)
+        if tap_text("添加 163 / QQ 邮箱", wait=3) or tap_text("添加邮箱", wait=3):
+            e = edits(dump())
+            if len(e) >= 2:
+                sh(f"input tap {e[0][0]} {e[0][1]}"); time.sleep(.6); sh("input keyevent KEYCODE_MOVE_END")
+                sh("input keyevent " + " ".join(["67"] * 45)); type_text("smoke.mines.test@163.com"); sh("input keyevent 111"); time.sleep(1)
+                e2 = edits(dump()); t2 = e2[1] if len(e2) >= 2 else e[1]
+                sh(f"input tap {t2[0]} {t2[1]}"); time.sleep(.8); type_text("ABCDEFGHIJKLMNOP"); sh("input keyevent 111")
+                tap_text("验证并添加", wait=20)
+                r = shot388("fix-mail-163"); o["mail163"] = _txt(r)[:300]
+            back(2)
+    step("mail", mail)
+    r8["fix3891"] = o
+    print("FIX3891 RESULT " + json.dumps(o, ensure_ascii=False)[:4000], flush=True)
 
 
 def b3891_fb(res):
