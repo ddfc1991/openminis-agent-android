@@ -62,6 +62,10 @@ try:
 except Exception:
     UI389 = False
 try:
+    HUB = "hub" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
+except Exception:
+    HUB = False
+try:
     UI3891 = "ui3891" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
 except Exception:
     UI3891 = False
@@ -3181,7 +3185,12 @@ def main():
             result_json("group", "wallpaper off"); anim(True)
         except Exception as e:
             print("fast prep error", e, flush=True)
-        for fn in (((b388_ui, b389_ui, b3891_ui) if UI3891 else (b388_ui, b389_ui) if UI389 else (b388_ui,)) if UI388 else (b387_linkall, b387_noblack, b388_weblogin, b388_mailbox, b388_presets) if B388 else (b387_linkall, b387_noblack, b387_persist, b387_platforms)):
+        if UI388: fns = (b388_ui, b389_ui, b3891_ui) if UI3891 else (b388_ui, b389_ui) if UI389 else (b388_ui,)
+        elif HUB: fns = ()
+        elif B388: fns = (b387_linkall, b387_noblack, b388_weblogin, b388_mailbox, b388_presets)
+        else: fns = (b387_linkall, b387_noblack, b387_persist, b387_platforms)
+        if HUB: fns = tuple(fns) + (b3891_hub,)   # [38.9.1 c] hub runs after the UI passes
+        for fn in fns:
             try:
                 fn(res)
             except Exception as e:
@@ -3720,6 +3729,38 @@ def _nonwhite(path):
         return f"err {e}"
 
 
+def b3891_hub(res):
+    """[38.9.1] 技能市场 = Hermes Skills Hub: real index sync (ETag), hub list + category + search shots, one GitHub install + one ClawHub install."""
+    r8 = R8(res); o = {}
+    theme388(1)
+    o["sync"] = result_json("group", "skillshub sync", timeout=900)
+    cnt = o["sync"].get("count", 0) if isinstance(o["sync"], dict) else 0
+    if cnt < 50000: selftest_fail.append(f"hub: index has only {cnt} skills {o['sync']}")
+    o["sync2"] = result_json("group", "skillshub sync", timeout=120)   # second call: no download (fresh / 304)
+    o["pdf"] = result_json("group", "skillshub page pdf", timeout=60)
+    o["cat_sec"] = result_json("group", "skillshub cat 数据安全", timeout=60)
+    o["zh"] = result_json("group", "skillshub page 设计", timeout=60)
+    result_json("group", "skillshub open", timeout=20); time.sleep(8)
+    r = shot388("hub3891-list"); o["list"] = _txt(r)[:400]
+    if "Skills Hub" not in o["list"]: page_missing.append("hub: list page missing 'Skills Hub'")
+    if tap_text("数据安全", wait=4): shot388("hub3891-cat")
+    tap_text("数据安全", wait=2)
+    o["inst_gh"] = result_json("group", "skillshub install algorithmic-art", timeout=180)
+    o["inst_claw"] = result_json("group", "skillshub install clawhub algorithmic-art", timeout=180)   # only the ClawHub row matches both words
+    for k in ("inst_gh", "inst_claw"):
+        v = o[k]
+        if not (isinstance(v, dict) and v.get("hasSkillMd")): selftest_fail.append(f"hub: {k} did not install SKILL.md {v}")
+    back(); result_json("group", "skillshub open", timeout=20); time.sleep(6)
+    xy = find(dump(), "搜索技能")
+    if xy:
+        sh(f"input tap {xy[0]} {xy[1]}"); time.sleep(1); sh("input text algorithmic"); time.sleep(4); sh("input keyevent 111"); time.sleep(1)
+        r = shot388("hub3891-installed"); o["installed"] = _txt(r)[:300]
+        if "已安装" not in o["installed"]: page_missing.append("hub: 已安装 not shown for the installed skill")
+    back(2)
+    r8["hub"] = o
+    print("HUB RESULT " + json.dumps(o, ensure_ascii=False)[:3000], flush=True)
+
+
 def b3891_ui(res):
     """[38.9.1] 账号关联 dynamic identities + Google provider detail, 应用代理 empty + manual add + 去登录 WebView + 测试一下 card,
     WorkBuddy error text, Grok key delete, KeyAgent IME dialog + Groq drawer, 4 real consoles non-white, 邮箱 verify Gmail + 163
@@ -3777,11 +3818,11 @@ def b3891_ui(res):
         o["grok_seed"] = result_json("group", "vaultkey xai|xai-smokeKEY000000000000000000000000000000000000000000000000000000000000", timeout=30)
         selftest_json("openkind", "xai", timeout=20); time.sleep(5)
         shot388("grok3891-before")
-        if tap_text("删除这个密钥", wait=2.5):
+        if tap_text("删除这个API Key", wait=2.5) or tap_text("删除这个密钥", wait=2.5):   # label = 删除这个<keyLabel>
             shot388("grok3891-confirm")
             tap_text("删除", exact=True, wait=3) or tap_text("确定", wait=3)
             r = shot388("grok3891-after"); o["grok-after"] = _txt(r)[:300]
-        else: page_missing.append("ui3891 grok: 删除这个密钥 not found")
+        else: page_missing.append("ui3891 grok: 删除这个API Key / 密钥 not found")
         o["grok_state"] = selftest_json("keystate", "xai", timeout=20)
         if isinstance(o["grok_state"], dict) and o["grok_state"].get("has"): selftest_fail.append(f"ui3891 grok: key still there after delete {o['grok_state']}")
         back(2)
