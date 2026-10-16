@@ -44,10 +44,10 @@ index 7660141..f87c772 100644
          if (code.isEmpty()) return
 diff --git a/src/android/app/src/main/java/com/openminis/app/browser/WebPrewarm.kt b/src/android/app/src/main/java/com/openminis/app/browser/WebPrewarm.kt
 new file mode 100644
-index 0000000..4e9c52d
+index 0000000..db33444
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/browser/WebPrewarm.kt
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,43 @@
 +package com.openminis.app.browser
 +
 +import android.content.Context
@@ -64,26 +64,31 @@ index 0000000..4e9c52d
 +object WebPrewarm {
 +    @Volatile private var done = false
 +    @Volatile private var holder: WebView? = null
++    private val main by lazy { Handler(Looper.getMainLooper()) }   // one handler: removeCallbacks only matches its own posts
++    private val release = Runnable { runCatching { holder?.destroy() }; holder = null }
 +
 +    fun warm(context: Context, keepMs: Long = 15_000L, again: Boolean = false) {
-+        if (done && !(again && holder == null)) return
-+        val main = Handler(Looper.getMainLooper())
++        // [Mines-38.8 smoke 38841427883] 一键关联 opened while the idle warm-up was about to end (15 s): the renderer was
++        // killed (「isolated not needed」) and the first sign-in page cold-started it again. Asking again keeps it longer.
++        if (again && holder != null) { main.removeCallbacks(release); main.postDelayed(release, keepMs); return }
++        if (done && !again) return
 +        main.post {
-+            if (done && !(again && holder == null)) return@post
++            if (holder != null) { main.removeCallbacks(release); main.postDelayed(release, keepMs); return@post }
++            if (done && !again) return@post
 +            done = true
 +            runCatching {
 +                val w = WebView(context.applicationContext)
 +                w.settings.javaScriptEnabled = false
 +                w.loadDataWithBaseURL("about:blank", "<html></html>", "text/html", "utf-8", null)
 +                holder = w
-+                main.postDelayed({ runCatching { holder?.destroy() }; holder = null }, keepMs)
++                main.postDelayed(release, keepMs)
 +            }.onFailure { done = false }
 +        }
 +    }
 +
 +    /** After the first frame: wait until the main thread is idle, then warm (never on the launch path). */
 +    fun warmWhenIdle(context: Context) {
-+        Looper.myQueue().addIdleHandler { Handler(Looper.getMainLooper()).postDelayed({ warm(context) }, 1500); false }
++        Looper.myQueue().addIdleHandler { main.postDelayed({ warm(context) }, 1500); false }
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/i18n/LocaleWrap.kt b/src/android/app/src/main/java/com/openminis/app/i18n/LocaleWrap.kt
@@ -974,7 +979,7 @@ index 0000000..dea50cb
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/Partners.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/Partners.kt
-index 427fd3a..d484b2f 100644
+index 427fd3a..6b3cf6e 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/Partners.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/Partners.kt
 @@ -157,6 +157,7 @@ object Partners {
@@ -985,7 +990,14 @@ index 427fd3a..d484b2f 100644
              // [Mines-38.6] Mines itself and the web-chat apps need no key
              if (spec.proto == Proto.MINES) {
                  out += if (insts.isNotEmpty()) Partner(spec, Partner.State.READY, "", null, "", "本机")
-@@ -176,7 +177,7 @@ object Partners {
+@@ -170,13 +171,13 @@ object Partners {
+                     val s = spec.copy(id = aid, name = WebAccounts.display(spec.name, aid))
+                     out += if (WebChat.signedIn(s, aid)) Partner(s, Partner.State.READY, url, null, "网页版", "已登录")
+                     else Partner(s, Partner.State.NEED_LOGIN, url, null, "", "",
+-                        reason = if (WebChat.guestOk(aid)) "先登录${s.name}（没登录也能游客试用）" else "需登录：点一下登录${s.name}，只要一次")
++                        reason = if (WebChat.guestOk(aid)) "先登录${s.name}（没登录也能游客试用）" else "点「登录」登一次就行"  /* [Mines-38.8] was 「需登录：点一下登录X，只要一次」: wrapped with an orphan 「次」 */)
+                 }
+                 continue
              }
              val inst = insts.firstOrNull { it.id !in used && matches(spec, it) }
              if (inst != null) used += inst.id
@@ -2429,7 +2441,7 @@ index afd2104..208aeea 100644
      val openBrowser = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
      fun go(route: String) { navigate?.invoke(route) ?: run { pending = route } }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
-index c17bd02..746a6f8 100644
+index c17bd02..4c19605 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
 @@ -9,6 +9,13 @@ import android.webkit.WebChromeClient
@@ -2446,7 +2458,7 @@ index c17bd02..746a6f8 100644
  import androidx.compose.foundation.layout.Box
  import androidx.compose.foundation.layout.Column
  import androidx.compose.foundation.layout.fillMaxSize
-@@ -237,37 +244,42 @@ fun WebLoginScreen(
+@@ -237,37 +244,43 @@ fun WebLoginScreen(
              )
          },
          bottomBar = {
@@ -2458,8 +2470,8 @@ index c17bd02..746a6f8 100644
 -                ) { Text(if (detect) (if (external) "我在 Chrome 里登录好了" else "我已登录好了") else "完成", fontSize = 18.sp, fontWeight = FontWeight.SemiBold) }
 +            // [Mines-38.8] user 2026-10-16: no heavy solid full-width orange bar — translucent porcelain glass bar
 +            // with one compact terracotta pill (#B5532F), same family as the glass dialogs.
-+            val gm = mines()
-+            Box(Modifier.fillMaxWidth().background(glassVeil())
++            val gm = minesColors(currentCharacter(), false)   // porcelain in day AND night (user: no brown bands)
++            Box(Modifier.fillMaxWidth().background(androidx.compose.ui.graphics.Brush.verticalGradient(listOf(PORCELAIN.copy(alpha = 0.86f), PORCELAIN.copy(alpha = 0.94f))))
 +                .drawBehind { drawLine(gm.glassBorder, androidx.compose.ui.geometry.Offset(0f, 0f), androidx.compose.ui.geometry.Offset(size.width, 0f), 1.dp.toPx()) }
 +                .navigationBarsPadding().padding(horizontal = 20.dp, vertical = 10.dp),
 +                contentAlignment = Alignment.Center) {
@@ -2478,9 +2490,10 @@ index c17bd02..746a6f8 100644
 -                      modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp))
 +          // [Mines-38.8] user 2026-10-16: the solid brown bands (「已填好手机号」, 「在 Mines 内登录…」) are now ONE frosted-glass
 +          // strip: status (or the in-Mines hint) on the left, 「外部打开 · 不同步」 on the right.
-+          val gm = mines()
++          val gm = minesColors(currentCharacter(), false)
 +          val stripShape = RoundedCornerShape(16.dp)
-+          Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp).clip(stripShape).background(glassVeil())
++          Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp).clip(stripShape)
++              .background(androidx.compose.ui.graphics.Brush.verticalGradient(listOf(PORCELAIN.copy(alpha = 0.80f), PORCELAIN.copy(alpha = 0.90f))))
 +              .border(1.dp, gm.glassBorder, stripShape)
 +              .then(if (extBack) Modifier.clickable { extBack = false; webView?.let { w -> if (w.url.isNullOrBlank() || w.url == "about:blank") w.loadUrl(url) else w.reload() } } else Modifier)
 +              .padding(start = 14.dp, end = 2.dp).heightIn(min = 44.dp),
@@ -2512,6 +2525,12 @@ index c17bd02..746a6f8 100644
                }
            }
            Box(Modifier.fillMaxWidth().weight(1f)) {
+@@ -338,3 +351,5 @@ fun WebLoginScreen(
+     }
+ }
+ 
++/** [Mines-38.8] porcelain glass base for the sign-in page chrome (same as the light glass veil). */
++private val PORCELAIN = androidx.compose.ui.graphics.Color(0xFFFBF7F2)
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/MailImapTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/MailImapTest.kt
 new file mode 100644
 index 0000000..68b38d4
