@@ -1,0 +1,2693 @@
+diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
+index e0c88bb..a0f5f65 100644
+--- a/src/android/app/build.gradle.kts
++++ b/src/android/app/build.gradle.kts
+@@ -38,8 +38,8 @@ android {
+         applicationId = "com.openminis.mines.plus"
+         minSdk = 26
+         targetSdk = 35
+-        versionCode = 35
+-        versionName = "1.21"
++        versionCode = 36
++        versionName = "1.22"
+ 
+         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+ 
+diff --git a/src/android/app/src/main/java/com/openminis/app/MainActivity.kt b/src/android/app/src/main/java/com/openminis/app/MainActivity.kt
+index 7660141..f87c772 100644
+--- a/src/android/app/src/main/java/com/openminis/app/MainActivity.kt
++++ b/src/android/app/src/main/java/com/openminis/app/MainActivity.kt
+@@ -161,6 +161,8 @@ class MainActivity : ComponentActivity() {
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+         handleMinesRoute(intent)
++        // [Mines-38.8] warm the WebView engine once the app is idle (first 一键关联 page had one blank frame)
++        runCatching { com.openminis.app.browser.WebPrewarm.warmWhenIdle(this) }
+         // [Mines-voiceprint-35.3] a voiceprint recorded while its model was still missing finishes in the background
+         runCatching { if (com.openminis.app.plus.Voiceprint.hasPending(this)) com.openminis.app.plus.Voiceprint.finishInBackground(this) }
+ 
+@@ -750,8 +752,14 @@ class MainActivity : ComponentActivity() {
+ 
+     private fun applySavedLanguage() {
+         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+-        val code = getSharedPreferences(PREF_APPEARANCE, MODE_PRIVATE).getString(KEY_LANGUAGE, "") ?: ""
+         val localeManager = getSystemService(LocaleManager::class.java) ?: return
++        // [Mines-38.8] Mines is a Chinese app: a phone/emulator in English showed 「Welcome to Mines / Add a Provider」.
++        // First run with no language ever picked (key absent) → 简体中文, unless Android's per-app language already has one.
++        val prefs = getSharedPreferences(PREF_APPEARANCE, MODE_PRIVATE)
++        if (!prefs.contains(KEY_LANGUAGE)) {
++            prefs.edit().putString(KEY_LANGUAGE, if (localeManager.applicationLocales.isEmpty) "zh" else "").apply()
++        }
++        val code = prefs.getString(KEY_LANGUAGE, "") ?: ""
+         // [Mines-38.1b] 「跟随系统」 (empty) must not wipe a language picked for Mines in Android's own per-app
+         // language settings (it did: every launch reset it, so system Settings → Apps → Mines → 语言 never stuck)
+         if (code.isEmpty()) return
+diff --git a/src/android/app/src/main/java/com/openminis/app/browser/WebPrewarm.kt b/src/android/app/src/main/java/com/openminis/app/browser/WebPrewarm.kt
+new file mode 100644
+index 0000000..4e9c52d
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/browser/WebPrewarm.kt
+@@ -0,0 +1,38 @@
++package com.openminis.app.browser
++
++import android.content.Context
++import android.os.Handler
++import android.os.Looper
++import android.webkit.WebView
++
++/**
++ * [Mines-38.8 / 38.7.1] The first WebView in a process starts the Chromium engine + renderer (smoke 38824392362:
++ * 「Skipped 82 frames」, Davey 1.6 s) and the first 一键关联 sign-in page showed one blank frame meanwhile.
++ * Warm it once when the app goes idle after launch (and again when 一键关联 opens): one off-screen WebView loads
++ * about:blank, then is destroyed — the engine and the renderer stay loaded for the real pages.
++ */
++object WebPrewarm {
++    @Volatile private var done = false
++    @Volatile private var holder: WebView? = null
++
++    fun warm(context: Context, keepMs: Long = 15_000L, again: Boolean = false) {
++        if (done && !(again && holder == null)) return
++        val main = Handler(Looper.getMainLooper())
++        main.post {
++            if (done && !(again && holder == null)) return@post
++            done = true
++            runCatching {
++                val w = WebView(context.applicationContext)
++                w.settings.javaScriptEnabled = false
++                w.loadDataWithBaseURL("about:blank", "<html></html>", "text/html", "utf-8", null)
++                holder = w
++                main.postDelayed({ runCatching { holder?.destroy() }; holder = null }, keepMs)
++            }.onFailure { done = false }
++        }
++    }
++
++    /** After the first frame: wait until the main thread is idle, then warm (never on the launch path). */
++    fun warmWhenIdle(context: Context) {
++        Looper.myQueue().addIdleHandler { Handler(Looper.getMainLooper()).postDelayed({ warm(context) }, 1500); false }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/i18n/LocaleWrap.kt b/src/android/app/src/main/java/com/openminis/app/i18n/LocaleWrap.kt
+index 1956659..be4aa22 100644
+--- a/src/android/app/src/main/java/com/openminis/app/i18n/LocaleWrap.kt
++++ b/src/android/app/src/main/java/com/openminis/app/i18n/LocaleWrap.kt
+@@ -40,10 +40,10 @@ object LocaleWrap {
+      */
+     fun wrap(base: Context): Context {
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) return base
+-        val code = base
+-            .getSharedPreferences(PREF_APPEARANCE, Context.MODE_PRIVATE)
+-            .getString(KEY_LANGUAGE, "")
+-            .orEmpty()
++        val prefs = base.getSharedPreferences(PREF_APPEARANCE, Context.MODE_PRIVATE)
++        // [Mines-38.8] first run with no language ever picked → 简体中文 (Mines is a Chinese app)
++        if (!prefs.contains(KEY_LANGUAGE)) prefs.edit().putString(KEY_LANGUAGE, "zh").apply()
++        val code = prefs.getString(KEY_LANGUAGE, "").orEmpty()
+         if (code.isEmpty()) return base
+         val locale = parseLocale(code) ?: return base
+         val config = Configuration(base.resources.configuration)
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MailImap.kt b/src/android/app/src/main/java/com/openminis/app/plus/MailImap.kt
+new file mode 100644
+index 0000000..d5f9d4a
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/MailImap.kt
+@@ -0,0 +1,155 @@
++package com.openminis.app.plus
++
++import java.io.BufferedInputStream
++import java.io.ByteArrayOutputStream
++import java.io.OutputStream
++import java.net.InetSocketAddress
++import java.net.Socket
++import javax.net.ssl.SSLSocket
++import javax.net.ssl.SSLSocketFactory
++
++/**
++ * [Mines-38.8] 消息 → 邮箱: a read-only IMAP reader for the aggregated inbox (no Android imports, unit-tested on the JVM).
++ *
++ * Only ever LOGIN / SELECT (EXAMINE) / FETCH with BODY.PEEK — Mines never sends mail, never marks mail read, never deletes.
++ * An account is "connected" only after a real LOGIN + SELECT succeeded (user rule: never pretend linked).
++ */
++object MailImap {
++    enum class Fail { AUTH, NET, PROTOCOL }
++
++    class ImapError(val kind: Fail, message: String) : Exception(message)
++
++    data class Msg(
++        val uid: String, val from: String, val fromAddr: String, val subject: String, val text: String,
++        val at: Long, val unread: Boolean,
++    )
++
++    data class Box(val exists: Int, val unseen: Int, val msgs: List<Msg>)
++
++    /** Test hook: "host:port" → plain TCP instead of TLS on 993 (JVM unit test + adb self-test fake server only). */
++    @Volatile var plainOverride: String? = null
++
++    /** IMAP host for an address, or null when Mines does not know the provider. */
++    fun hostFor(email: String): String? {
++        val d = email.substringAfter('@', "").lowercase().trim()
++        return when {
++            d == "gmail.com" || d == "googlemail.com" -> "imap.gmail.com"
++            d == "163.com" -> "imap.163.com"
++            d == "126.com" -> "imap.126.com"
++            d == "yeah.net" -> "imap.yeah.net"
++            d == "vip.163.com" -> "imap.vip.163.com"
++            d == "qq.com" || d == "foxmail.com" || d == "vip.qq.com" -> "imap.qq.com"
++            d == "sina.com" || d == "sina.cn" -> "imap.sina.com"
++            d == "aliyun.com" -> "imap.aliyun.com"
++            d == "outlook.com" || d == "hotmail.com" || d == "live.com" -> "outlook.office365.com"
++            d == "smoke.test" && plainOverride != null -> "smoke"
++            else -> null
++        }
++    }
++
++    private val DATE = java.time.format.DateTimeFormatter.ofPattern("d-MMM-yyyy HH:mm:ss Z", java.util.Locale.US)
++
++    private fun open(host: String): Socket {
++        plainOverride?.let { o ->
++            val h = o.substringBefore(':'); val p = o.substringAfter(':').toIntOrNull() ?: 1143
++            return Socket().apply { connect(InetSocketAddress(h, p), 8000); soTimeout = 15_000 }
++        }
++        return (SSLSocketFactory.getDefault().createSocket() as SSLSocket).apply {
++            connect(InetSocketAddress(host, 993), 8000); soTimeout = 15_000; startHandshake()
++        }
++    }
++
++    /** Newest [max] messages of INBOX, newest first, plus the unseen count. Throws [ImapError]. */
++    fun inbox(host: String, user: String, pass: String, max: Int = 20): Box {
++        val sock = try { open(host) } catch (e: Exception) { throw ImapError(Fail.NET, "连不上 $host（${e.javaClass.simpleName}）") }
++        sock.use { s ->
++            val inp = BufferedInputStream(s.getInputStream())
++            val out = s.getOutputStream()
++            try {
++                val greet = readLine(inp)
++                if (!greet.startsWith("* OK") && !greet.startsWith("* PREAUTH")) throw ImapError(Fail.PROTOCOL, "服务器没有正常应答")
++                var n = 0
++                fun cmd(c: String): List<Any> { n++; val tag = "m$n"; send(out, "$tag $c"); return readTagged(inp, tag) }
++                // 163 / 126 / yeah refuse SELECT ("Unsafe Login") unless the client says who it is first
++                if (host.contains("163") || host.contains("126") || host.contains("yeah")) cmd("ID (\"name\" \"Mines\" \"version\" \"38.8\" \"vendor\" \"Mines\")")
++                val login = cmd("LOGIN ${q(user)} ${q(pass)}")
++                if (!lastOk(login)) {
++                    val why = (login.lastOrNull() as? String)?.substringAfter(" NO ", "")?.trim()?.take(80).orEmpty()
++                    throw ImapError(Fail.AUTH, if (why.isNotBlank()) "登录被拒：$why" else "登录被拒")
++                }
++                val sel = cmd("EXAMINE INBOX")   // read-only: nothing is ever marked read
++                if (!lastOk(sel)) {
++                    val why = (sel.lastOrNull() as? String)?.take(80).orEmpty()
++                    throw ImapError(if (why.contains("Unsafe", true)) Fail.AUTH else Fail.PROTOCOL, "打不开收件箱：$why")
++                }
++                val exists = sel.filterIsInstance<String>().firstNotNullOfOrNull { Regex("^\\* (\\d+) EXISTS").find(it)?.groupValues?.get(1)?.toIntOrNull() } ?: 0
++                val st = cmd("STATUS INBOX (UNSEEN)")
++                var unseen = st.filterIsInstance<String>().firstNotNullOfOrNull { Regex("UNSEEN (\\d+)").find(it)?.groupValues?.get(1)?.toIntOrNull() } ?: -1
++                if (exists == 0) { runCatching { cmd("LOGOUT") }; return Box(0, 0, emptyList()) }
++                val from = maxOf(1, exists - max + 1)
++                val res = cmd("FETCH $from:$exists (UID FLAGS INTERNALDATE BODY.PEEK[]<0.16000>)")
++                runCatching { cmd("LOGOUT") }
++                val msgs = ArrayList<Msg>()
++                var i = 0
++                while (i < res.size) {
++                    val line = res[i] as? String
++                    val lit = res.getOrNull(i + 1) as? ByteArray
++                    if (line != null && line.contains("FETCH") && lit != null) {
++                        val uid = Regex("UID (\\d+)").find(line)?.groupValues?.get(1) ?: line.hashCode().toString()
++                        val flags = Regex("FLAGS \\(([^)]*)\\)").find(line + " " + ((res.getOrNull(i + 2) as? String)?.takeIf { !it.contains("FETCH") }.orEmpty()))?.groupValues?.get(1).orEmpty()
++                        val at = Regex("INTERNALDATE \"([^\"]+)\"").find(line)?.groupValues?.get(1)?.let {
++                            runCatching { java.time.ZonedDateTime.parse(it.trim(), DATE).toInstant().toEpochMilli() }.getOrDefault(0L)
++                        } ?: 0L
++                        val raw = String(lit, Charsets.UTF_8)
++                        val headEnd = Regex("\\r?\\n\\r?\\n").find(raw)?.range?.first ?: raw.length
++                        val (subject, fromH) = MailParse.headers(raw.substring(0, headEnd))
++                        val text = runCatching { MailParse.mime(raw) }.getOrDefault("")
++                        val addr = Regex("<([^>]+)>").find(fromH)?.groupValues?.get(1) ?: fromH.takeIf { it.contains('@') }.orEmpty()
++                        msgs += Msg(uid, fromH.substringBefore('<').trim().ifBlank { addr.ifBlank { fromH } }, addr.trim(), subject,
++                            text.replace(Regex("[ \\t]+"), " ").trim().take(6000), at, !flags.contains("\\Seen", ignoreCase = true))
++                        i += 2
++                    } else i++
++                }
++                if (unseen < 0) unseen = msgs.count { it.unread }
++                return Box(exists, unseen, msgs.sortedByDescending { it.uid.toLongOrNull() ?: 0L })
++            } catch (e: ImapError) { throw e
++            } catch (e: java.net.SocketTimeoutException) { throw ImapError(Fail.NET, "$host 没有应答（超时）")
++            } catch (e: java.io.IOException) { throw ImapError(Fail.NET, "和 $host 的连接断了") }
++        }
++    }
++
++    internal fun q(s: String) = "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
++
++    private fun send(out: OutputStream, line: String) { out.write((line + "\r\n").toByteArray(Charsets.UTF_8)); out.flush() }
++
++    private fun lastOk(r: List<Any>) = (r.lastOrNull() as? String)?.split(' ')?.getOrNull(1)?.equals("OK", true) == true
++
++    private fun readLine(inp: BufferedInputStream): String {
++        val b = ByteArrayOutputStream()
++        while (true) {
++            val c = inp.read()
++            if (c < 0) { if (b.size() == 0) throw java.io.EOFException(); break }
++            if (c == '\n'.code) break
++            if (c != '\r'.code) b.write(c)
++        }
++        return String(b.toByteArray(), Charsets.UTF_8)
++    }
++
++    private fun readTagged(inp: BufferedInputStream, tag: String): List<Any> {
++        val out = ArrayList<Any>()
++        var guard = 0
++        while (guard++ < 20000) {
++            val line = readLine(inp)
++            out += line
++            val lit = Regex("\\{(\\d+)\\}$").find(line)?.groupValues?.get(1)?.toIntOrNull()
++            if (lit != null) {
++                val buf = ByteArray(lit); var got = 0
++                while (got < lit) { val r = inp.read(buf, got, lit - got); if (r < 0) break; got += r }
++                out += buf
++                continue
++            }
++            if (line.startsWith("$tag ")) break
++        }
++        return out
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MailInbox.kt b/src/android/app/src/main/java/com/openminis/app/plus/MailInbox.kt
+new file mode 100644
+index 0000000..782361b
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/MailInbox.kt
+@@ -0,0 +1,274 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import android.webkit.CookieManager
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.async
++import kotlinx.coroutines.awaitAll
++import kotlinx.coroutines.coroutineScope
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.withContext
++import kotlinx.coroutines.withTimeoutOrNull
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import java.util.concurrent.TimeUnit
++
++/**
++ * [Mines-38.8] 消息 → 「邮箱」: one inbox for every mailbox the user signed in to (Gmail + several 163 / 126 / QQ …).
++ *
++ *  - IMAP accounts: address + 授权码 / 应用专用密码 kept in the Connections vault (gmail / mail163 / qqmail entries,
++ *    one entry per address). Added only after a real LOGIN + EXAMINE INBOX succeeded ([verifyAndAdd]); a wrong code is
++ *    never saved and the account never shows 「已连接」 without a successful read.
++ *  - Gmail web: signed in inside Mines (own cookie jar) → the Atom feed (newest unread). Shown as connected only when
++ *    the feed really answered; an expired session says 「登录过期」.
++ *  - Read-only: BODY.PEEK / EXAMINE — nothing is marked read, sent or deleted. Mail text stays in memory only;
++ *    per-account status (ok / error text / time) is the only thing written to disk.
++ */
++object MailInbox {
++    enum class St { OK, AUTH, NET, CHECKING, NEW }
++
++    data class Account(val id: String, val address: String, val provider: String, val how: String, val base: String)
++    data class AcctState(val st: St, val msg: String = "", val at: Long = 0L, val unread: Int = 0, val total: Int = 0)
++    data class Mail(
++        val id: String, val accountId: String, val address: String, val provider: String,
++        val from: String, val fromAddr: String, val subject: String, val text: String, val at: Long,
++        val unread: Boolean, val url: String? = null,
++    )
++
++    private val _accounts = MutableStateFlow<List<Account>>(emptyList())
++    val accounts: StateFlow<List<Account>> = _accounts
++    private val _mails = MutableStateFlow<List<Mail>>(emptyList())
++    val mails: StateFlow<List<Mail>> = _mails
++    private val _states = MutableStateFlow<Map<String, AcctState>>(emptyMap())
++    val states: StateFlow<Map<String, AcctState>> = _states
++    private val _busy = MutableStateFlow(false)
++    val busy: StateFlow<Boolean> = _busy
++    @Volatile private var lastAt = 0L
++    /** adb self-test: fixed accounts / mail for screenshots (never set in normal use). */
++    @Volatile var fake: Boolean = false
++
++    private val http = OkHttpClient.Builder().connectTimeout(8, TimeUnit.SECONDS).readTimeout(12, TimeUnit.SECONDS)
++        .callTimeout(18, TimeUnit.SECONDS).followRedirects(false).build()
++
++    fun providerOf(address: String): String {
++        val d = address.substringAfter('@', "").lowercase()
++        return when {
++            d == "gmail.com" || d == "googlemail.com" -> "Gmail"
++            d == "163.com" || d == "vip.163.com" -> "163"
++            d == "126.com" -> "126"
++            d == "yeah.net" -> "yeah"
++            d == "qq.com" || d == "foxmail.com" || d == "vip.qq.com" -> "QQ"
++            d.contains("outlook") || d.contains("hotmail") || d == "live.com" -> "Outlook"
++            d == "sina.com" || d == "sina.cn" -> "新浪"
++            d == "aliyun.com" -> "阿里"
++            else -> d.substringBefore('.').ifBlank { "邮箱" }
++        }
++    }
++
++    private fun baseFor(address: String): String = when (providerOf(address)) {
++        "Gmail" -> "gmail"; "QQ" -> "qqmail"; else -> "mail163"
++    }
++
++    private fun prefs(c: Context) = c.getSharedPreferences("mines_mailbox", Context.MODE_PRIVATE)
++
++    // ---------------- accounts ----------------
++
++    fun gmailWebSignedIn(): Boolean = runCatching {
++        val cm = CookieManager.getInstance()
++        MailParse.cookieHas(cm.getCookie("https://mail.google.com/mail/"), listOf("SID", "__Secure-1PSID", "OSID")) ||
++            MailParse.cookieHas(cm.getCookie("https://accounts.google.com/"), listOf("SID", "__Secure-1PSID"))
++    }.getOrDefault(false)
++
++    fun load(context: Context): List<Account> {
++        if (fake) return _accounts.value
++        PlusVault.init(context)
++        val out = ArrayList<Account>()
++        listOf("gmail", "mail163", "qqmail").forEach { base ->
++            PlusVault.accountsOf(base).forEach { id ->
++                val user = PlusVault.entries.value[id]?.account?.trim().orEmpty()
++                if (user.contains('@') && PlusVault.secret(id) != null && MailImap.hostFor(user) != null)
++                    out += Account(id, user, providerOf(user), if (base == "gmail") "应用专用密码" else "授权码", base)
++            }
++        }
++        if (gmailWebSignedIn() && out.none { it.id == "gmail_web" }) {
++            val addr = prefs(context).getString("gmail_web_addr", null) ?: "Gmail（网页登录）"
++            out += Account("gmail_web", addr, "Gmail", "在 Mines 内登录", "gmail")
++        }
++        // restore last known status (no mail content on disk)
++        val p = prefs(context)
++        _states.value = out.associate { a ->
++            a.id to (_states.value[a.id] ?: p.getString("st_${a.id}", null)?.let { s ->
++                val parts = s.split('|', limit = 3)
++                AcctState(runCatching { St.valueOf(parts[0]) }.getOrDefault(St.NEW), parts.getOrElse(2) { "" }, parts.getOrNull(1)?.toLongOrNull() ?: 0L)
++            } ?: AcctState(St.NEW))
++        }
++        _accounts.value = out
++        return out
++    }
++
++    private fun setState(context: Context, id: String, s: AcctState) {
++        _states.value = _states.value + (id to s)
++        if (s.st != St.CHECKING) prefs(context).edit().putString("st_$id", "${s.st.name}|${s.at}|${s.msg.take(120)}").apply()
++    }
++
++    // ---------------- reading ----------------
++
++    /** Re-read every account in parallel (each one on its own: one broken mailbox never hides the others). */
++    suspend fun refresh(context: Context, force: Boolean = false) = withContext(Dispatchers.IO) {
++        if (fake) return@withContext
++        if (!force && System.currentTimeMillis() - lastAt < 30_000L && _mails.value.isNotEmpty()) return@withContext
++        if (_busy.value) return@withContext
++        _busy.value = true
++        try {
++            val accts = load(context)
++            accts.forEach { a -> setState(context, a.id, (_states.value[a.id] ?: AcctState(St.NEW)).copy(st = St.CHECKING)) }
++            val got = coroutineScope {
++                accts.map { a -> async { a to (withTimeoutOrNull(30_000L) { runCatching { read(context, a) } } ?: Result.failure(MailImap.ImapError(MailImap.Fail.NET, "30 秒没读完"))) } }.awaitAll()
++            }
++            val all = ArrayList<Mail>()
++            got.forEach { (a, r) ->
++                r.onSuccess { (mails, unseen, total) ->
++                    all += mails
++                    setState(context, a.id, AcctState(St.OK, "", System.currentTimeMillis(), unseen, total))
++                }.onFailure { e ->
++                    val kind = (e as? MailImap.ImapError)?.kind
++                    val st = if (kind == MailImap.Fail.AUTH) St.AUTH else St.NET
++                    val msg = when {
++                        a.id == "gmail_web" && st == St.AUTH -> "Gmail 登录过期了，点这里在 Mines 内重新登录"
++                        st == St.AUTH && a.provider == "Gmail" -> "应用专用密码不对或已失效（${e.message}）"
++                        st == St.AUTH -> "授权码不对或已失效：到 ${a.provider} 网页的 设置 → POP3/SMTP/IMAP 重新生成"
++                        else -> e.message ?: "连不上"
++                    }
++                    // keep this account's mail from the last good read
++                    all += _mails.value.filter { it.accountId == a.id }
++                    setState(context, a.id, AcctState(st, msg, System.currentTimeMillis(), _states.value[a.id]?.unread ?: 0))
++                }
++            }
++            _mails.value = all.distinctBy { it.id }.sortedByDescending { it.at }
++            lastAt = System.currentTimeMillis()
++        } finally { _busy.value = false }
++    }
++
++    private fun read(context: Context, a: Account): Triple<List<Mail>, Int, Int> {
++        if (a.id == "gmail_web") return gmailWeb(context, a)
++        val pass = PlusVault.secret(a.id)?.replace(" ", "") ?: throw MailImap.ImapError(MailImap.Fail.AUTH, "没有保存授权码")
++        val host = MailImap.hostFor(a.address) ?: throw MailImap.ImapError(MailImap.Fail.PROTOCOL, "不认识这个邮箱")
++        val box = MailImap.inbox(host, a.address, pass)
++        val mails = box.msgs.map { m ->
++            Mail("${a.id}:${m.uid}", a.id, a.address, a.provider, m.from, m.fromAddr, m.subject.ifBlank { "（无主题）" }, m.text,
++                if (m.at > 0) m.at else 0L, m.unread, webUrl(a.address))
++        }
++        return Triple(mails, box.unseen, box.exists)
++    }
++
++    fun webUrl(address: String): String? = when (providerOf(address)) {
++        "Gmail" -> "https://mail.google.com/mail/"
++        "163" -> "https://mail.163.com/"; "126" -> "https://mail.126.com/"; "yeah" -> "https://mail.yeah.net/"
++        "QQ" -> "https://wx.mail.qq.com/"
++        else -> null
++    }
++
++    private fun gmailWeb(context: Context, a: Account): Triple<List<Mail>, Int, Int> {
++        val out = ArrayList<Mail>(); var count = 0; var anyOk = false
++        for (u in 0..1) {
++            val url = "https://mail.google.com/mail/u/$u/feed/atom"
++            val cookie = runCatching { CookieManager.getInstance().getCookie(url) }.getOrNull()
++            val b = Request.Builder().url(url).header("User-Agent", MINES_MOBILE_UA).header("Accept", "application/atom+xml,text/xml,*/*")
++            if (!cookie.isNullOrBlank()) b.header("Cookie", cookie)
++            val (code, xml) = try {
++                http.newCall(b.build()).execute().use { r -> r.code to (if (r.code == 200) r.body?.string().orEmpty() else "") }
++            } catch (e: java.io.IOException) { if (u == 0) throw MailImap.ImapError(MailImap.Fail.NET, "连不上 Gmail（需要代理时请把 Mines 加入代理）") else break }
++            if (code != 200 || !xml.contains("<feed")) { if (u == 0) throw MailImap.ImapError(MailImap.Fail.AUTH, "Gmail 返回 $code") else break }
++            anyOk = true
++            val addr = Regex("Inbox for ([^<\\s]+@[^<\\s]+)").find(xml)?.groupValues?.get(1) ?: a.address
++            if (u == 0 && addr.contains('@')) prefs(context).edit().putString("gmail_web_addr", addr).apply()
++            count += Regex("<fullcount>(\\d+)</fullcount>").find(xml)?.groupValues?.get(1)?.toIntOrNull() ?: 0
++            val entries = Regex("(?s)<entry>(.*?)</entry>").findAll(xml).toList()
++            entries.forEach { m ->
++                val e = m.groupValues[1]
++                fun tag(n: String) = Regex("(?s)<$n>(.*?)</$n>").find(e)?.groupValues?.get(1)?.let { MailParse.unescape(it) }.orEmpty()
++                val name = Regex("(?s)<author>.*?<name>(.*?)</name>").find(e)?.groupValues?.get(1)?.let { MailParse.unescape(it) }.orEmpty()
++                val email = Regex("(?s)<author>.*?<email>(.*?)</email>").find(e)?.groupValues?.get(1).orEmpty()
++                val link = Regex("<link[^>]*href=\"([^\"]+)\"").find(e)?.groupValues?.get(1)?.let { MailParse.unescape(it) }
++                out += Mail("gw$u:" + tag("id").ifBlank { tag("title") }.hashCode(), a.id, addr, "Gmail", name.ifBlank { email }, email,
++                    tag("title").ifBlank { "（无主题）" }, tag("summary"), MailParse.parseIso(tag("issued").ifBlank { tag("modified") }), true, link)
++            }
++            if (u == 0 && entries.isEmpty()) break
++        }
++        if (!anyOk) throw MailImap.ImapError(MailImap.Fail.AUTH, "Gmail 没有应答")
++        return Triple(out, count, count)
++    }
++
++    // ---------------- adding / removing ----------------
++
++    /**
++     * Log in for real first; saved to the vault only when LOGIN + EXAMINE INBOX worked.
++     * Returns null on success, else the plain reason shown under the form.
++     */
++    suspend fun verifyAndAdd(context: Context, address: String, code: String): String? = withContext(Dispatchers.IO) {
++        val addr = address.trim().lowercase()
++        val pass = code.replace(" ", "").trim()
++        if (!Regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$").matches(addr)) return@withContext "邮箱地址看起来不对"
++        if (pass.length < 4) return@withContext "请填授权码（不是邮箱登录密码）"
++        val host = MailImap.hostFor(addr) ?: return@withContext "暂时只支持 163 / 126 / yeah / QQ / Gmail / 新浪 / 阿里邮箱"
++        try { MailImap.inbox(host, addr, pass, max = 1) } catch (e: MailImap.ImapError) {
++            return@withContext when (e.kind) {
++                MailImap.Fail.AUTH -> if (providerOf(addr) == "Gmail") "Gmail 没接受这个应用专用密码（${e.message}）" else
++                    "${providerOf(addr)} 没接受这个授权码：请确认已在网页版开启 IMAP，并填「授权码」而不是登录密码（${e.message}）"
++                else -> e.message ?: "连不上 $host"
++            }
++        }
++        PlusVault.init(context)
++        val base = baseFor(addr)
++        val id = PlusVault.accountsOf(base).firstOrNull { PlusVault.entries.value[it]?.account.equals(addr, true) } ?: PlusVault.newAccountId(base)
++        val kind = PlusVault.kind(id) ?: return@withContext "保存失败（找不到 $base）"
++        withContext(Dispatchers.Main) { PlusVault.save(context, kind, addr, pass, share = false, via = "mailbox") }
++        MailSources.invalidate()
++        lastAt = 0L
++        null
++    }
++
++    fun remove(context: Context, id: String) {
++        if (id == "gmail_web") return
++        PlusVault.kind(id)?.let { PlusVault.remove(context, it) }
++        prefs(context).edit().remove("st_$id").apply()
++        _mails.value = _mails.value.filterNot { it.accountId == id }
++        load(context)
++    }
++
++    // ---------------- adb self-test ----------------
++
++    fun fakeFill(now: Long = System.currentTimeMillis()) {
++        fake = true
++        val accts = listOf(
++            Account("gmail", "deningyang740@gmail.com", "Gmail", "在 Mines 内登录", "gmail"),
++            Account("mail163", "qqq440681@163.com", "163", "授权码", "mail163"),
++            Account("mail163#2", "ds19910904@163.com", "163", "授权码", "mail163"),
++            Account("mail163#3", "icuy3d5n1@163.com", "163", "授权码", "mail163"),
++        )
++        val h = 3_600_000L
++        fun m(i: Int, a: Account, from: String, subj: String, text: String, ago: Long, unread: Boolean) =
++            Mail("fake$i", a.id, a.address, a.provider, from, "", subj, text, now - ago, unread, webUrl(a.address))
++        _accounts.value = accts
++        _mails.value = listOf(
++            m(1, accts[0], "GitHub", "[openminis-agent-android] Run succeeded: Build Mines APK", "Build Mines APK: all jobs have passed. View workflow run …", h / 6, true),
++            m(2, accts[1], "网易邮箱", "你的邮箱已开启 IMAP 服务", "你好，你已成功开启 IMAP/SMTP 服务，可在第三方客户端中使用授权码登录。", h, true),
++            m(3, accts[2], "阿里云", "云服务器 ECS 续费提醒", "尊敬的用户，您的实例将于 7 天后到期，请及时续费以免影响业务。", 3 * h, false),
++            m(4, accts[0], "Google", "安全提醒：新设备登录", "你的 Google 账号刚刚在一台新的 Android 设备上登录。如果是你本人，无需执行任何操作。", 5 * h, false),
++            m(5, accts[3], "Intigriti", "Your submission was triaged", "Good news! Your submission has been triaged and is now awaiting the program's review.", 26 * h, true),
++            m(6, accts[1], "OKX", "资产变动通知", "您的账户于今日 09:12 完成一笔划转，如非本人操作请立即联系客服。", 50 * h, false),
++            m(7, accts[2], "京东", "您的订单已发货", "您购买的商品已由顺丰快递发出，预计明天送达。", 80 * h, false),
++        )
++        _states.value = mapOf(
++            accts[0].id to AcctState(St.OK, "", now, 2, 120),
++            accts[1].id to AcctState(St.OK, "", now, 1, 58),
++            accts[2].id to AcctState(St.OK, "", now, 0, 33),
++            accts[3].id to AcctState(St.AUTH, "授权码不对或已失效：到 163 网页的 设置 → POP3/SMTP/IMAP 重新生成", now, 1),
++        )
++    }
++
++    fun fakeOff(context: Context) { fake = false; _mails.value = emptyList(); _states.value = emptyMap(); lastAt = 0L; load(context) }
++
++    fun unreadTotal(): Int = _states.value.values.sumOf { it.unread.coerceAtLeast(0) }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MailSources.kt b/src/android/app/src/main/java/com/openminis/app/plus/MailSources.kt
+index 928ae75..36d6d21 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/MailSources.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/MailSources.kt
+@@ -218,13 +218,13 @@ object MailSources {
+             }
+         }
+ 
+-        private fun q(s: String) = "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
++        internal fun q(s: String) = "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+ 
+-        private fun send(out: OutputStream, line: String) { out.write((line + "\r\n").toByteArray(Charsets.UTF_8)); out.flush() }
++        internal fun send(out: OutputStream, line: String) { out.write((line + "\r\n").toByteArray(Charsets.UTF_8)); out.flush() }
+ 
+-        private fun lastOk(r: List<Any>) = (r.lastOrNull() as? String)?.split(' ')?.getOrNull(1)?.equals("OK", true) == true
++        internal fun lastOk(r: List<Any>) = (r.lastOrNull() as? String)?.split(' ')?.getOrNull(1)?.equals("OK", true) == true
+ 
+-        private fun readLine(inp: BufferedInputStream): String {
++        internal fun readLine(inp: BufferedInputStream): String {
+             val b = ByteArrayOutputStream()
+             while (true) {
+                 val c = inp.read()
+@@ -236,7 +236,7 @@ object MailSources {
+         }
+ 
+         /** Lines (String) and literals (ByteArray) up to and including the tagged status line. */
+-        private fun readTagged(inp: BufferedInputStream, tag: String): List<Any> {
++        internal fun readTagged(inp: BufferedInputStream, tag: String): List<Any> {
+             val out = ArrayList<Any>()
+             var guard = 0
+             while (guard++ < 5000) {
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
+index 787c5f7..b23ddb1 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
+@@ -603,6 +603,34 @@ class SelfTestProvider : ContentProvider() {
+                 out.putString("result", res.get() ?: "{\"ok\":false,\"error\":\"timeout\"}")
+             }
+             "group" -> out.putString("result", com.openminis.app.plus.group.GroupSelfTest.handle(context!!, arg ?: "")) // [Mines-group-37]
++            // [Mines-38.8] 消息 → 邮箱: fake inbox for screenshots, plain-IMAP fake server (runner) for the real add/read path
++            "mailbox" -> {
++                val c = context!!.applicationContext
++                val a = arg ?: ""
++                val j = org.json.JSONObject()
++                when {
++                    a == "fake" -> { MailInbox.fakeFill(); j.put("ok", true) }
++                    a == "off" -> { MailInbox.fakeOff(c); j.put("ok", true) }
++                    a.startsWith("plain ") -> { MailImap.plainOverride = a.removePrefix("plain ").trim().ifBlank { null }; j.put("plain", MailImap.plainOverride ?: "") }
++                    a.startsWith("add ") -> {
++                        val p = a.removePrefix("add ").split('|')
++                        j.put("error", kotlinx.coroutines.runBlocking { MailInbox.verifyAndAdd(c, p.getOrElse(0) { "" }, p.getOrElse(1) { "" }) } ?: "")
++                    }
++                    a == "refresh" -> kotlinx.coroutines.runBlocking { MailInbox.refresh(c, force = true) }
++                    a == "open" -> {
++                        val l = java.util.concurrent.CountDownLatch(1)
++                        android.os.Handler(android.os.Looper.getMainLooper()).post {
++                            com.openminis.app.ui.plus.PlusNav.digestTab = com.openminis.app.ui.plus.MAIL_TAB
++                            com.openminis.app.ui.plus.PlusNav.go(com.openminis.app.ui.plus.PlusRoutes.DIGEST); l.countDown() }
++                        l.await(5, TimeUnit.SECONDS); j.put("ok", true)
++                    }
++                }
++                j.put("accounts", org.json.JSONArray(MailInbox.accounts.value.map { it.address }))
++                j.put("states", org.json.JSONObject(MailInbox.states.value.mapValues { (_, v) -> v.st.name + ":" + v.msg.take(60) + ":" + v.unread }))
++                j.put("mails", MailInbox.mails.value.size)
++                j.put("subjects", org.json.JSONArray(MailInbox.mails.value.take(5).map { it.subject.take(40) + (if (it.unread) " *" else "") }))
++                out.putString("result", j.toString())
++            }
+             // [Mines-38.6] F: one real read of 微博 / B站 / 知乎 (own session + a public endpoint each)
+             "sourcecheck" -> out.putString("result", kotlinx.coroutines.runBlocking {
+                 org.json.JSONArray(SourceAccounts.check(context!!.applicationContext).map { (own, pub) ->
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/Adapters.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/Adapters.kt
+new file mode 100644
+index 0000000..10dd165
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/group/Adapters.kt
+@@ -0,0 +1,185 @@
++package com.openminis.app.plus.group
++
++import android.content.Context
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++import org.json.JSONArray
++import org.json.JSONObject
++import java.util.concurrent.ConcurrentHashMap
++
++/**
++ * [Mines-38.8] Adapters for transports 38.7 has no branch for. AiClient.replyOnce sends [Proto.ADAPTER] members here.
++ * OPENAI_CHAT presets (nanoMuse) keep running on AiClient's own OpenAI path; WEBVIEW presets on [WebBridge].
++ */
++object Adapters {
++    private val byTransport: Map<Transport, ChatAdapter> by lazy { mapOf(Transport.MEMOH to MemohAdapter) }
++
++    fun of(preset: PlatformPreset): ChatAdapter? = byTransport[preset.transport]
++
++    suspend fun reply(p: Partner, system: String, turns: List<AiClient.Turn>, maxTokens: Int): AiClient.Reply {
++        val preset = PresetRegistry.preset(p.id) ?: throw MemberError("不认识这个成员（${p.id}）")
++        val a = of(preset) ?: throw MemberError("${preset.name} 还不能在群里用")
++        return a.reply(p, preset, TurnRequest(system, turns, maxTokens))
++    }
++
++    suspend fun probe(p: Partner): AiClient.Probe {
++        val preset = PresetRegistry.preset(p.id) ?: return AiClient.Probe(false, null, false)
++        return of(preset)?.probe(p, preset) ?: AiClient.Probe(false, null, false)
++    }
++}
++
++/**
++ * [Mines-38.8] Memoh (self-hosted, memohai/Memoh, spec/swagger.yaml): JWT from POST /auth/login; a turn is
++ * POST /bots/{bot}/web/messages {"message":{"text":…}} (ack only), the answer is read by polling
++ * GET /bots/{bot}/messages?limit=30 (UITurn list) for an assistant turn that was not there before we sent and whose text
++ * stopped changing. 401 → log in again once with the saved password.
++ */
++object MemohAdapter : AsyncTaskAdapter() {
++    override val transport: Transport = Transport.MEMOH
++
++    private class State(val bot: String, val seen: Set<String>, var lastText: String = "", var stable: Int = 0, var answer: String = "")
++    private val states = ConcurrentHashMap<String, State>()
++
++    fun botOf(p: Partner): String = p.id.substringAfter("${PresetRegistry.MEMOH}:", "").ifBlank { GroupPrefs.bot(p.id).orEmpty() }
++
++    private fun base(p: Partner): String = p.base.ifBlank { PresetAuth.memohBase().orEmpty() }.trimEnd('/')
++
++    /** One authorised call; a 401 logs in again once. */
++    private suspend fun authed(url: String, body: JSONObject? = null): PresetHttp.Res {
++        val t = PresetAuth.memohToken() ?: throw MemberError("Memoh 还没登录：在「AI 伙伴」里点「登录」")
++        var r = PresetHttp.call(url, t, body)
++        if (r.code == 401) {
++            val t2 = PresetAuth.memohToken(force = true) ?: throw MemberError("Memoh 登录过期了：在「AI 伙伴」里点「登录」", r.body.take(160))
++            r = PresetHttp.call(url, t2, body)
++        }
++        if (r.code == 401 || r.code == 403) throw MemberError("Memoh 不让这个账号用这个机器人", r.body.take(160))
++        if (r.code == 404) throw MemberError("Memoh 找不到这个机器人（可能已删除）", r.body.take(160))
++        if (!r.ok) throw MemberError(if (r.code >= 500) "Memoh 服务器出错，稍后再试" else "Memoh 没有正常回复", "HTTP ${r.code}：" + r.body.take(160))
++        return r
++    }
++
++    /** Assistant turns of a UITurn list: id → text (text field, or the text parts of its messages). */
++    fun assistantTurns(body: String): List<Pair<String, String>> {
++        val o = runCatching { JSONObject(body) }.getOrNull()
++        val items = o?.optJSONArray("items") ?: runCatching { JSONArray(body) }.getOrNull() ?: JSONArray()
++        val out = ArrayList<Triple<String, String, String>>()
++        for (i in 0 until items.length()) {
++            val t = items.optJSONObject(i) ?: continue
++            if (t.optString("role") != "assistant") continue
++            val id = t.optString("id").ifBlank { t.optString("turn_id") }.ifBlank { "#$i" }
++            var text = t.optString("text").takeIf { it != "null" }.orEmpty()
++            if (text.isBlank()) {
++                val ms = t.optJSONArray("messages") ?: JSONArray()
++                text = (0 until ms.length()).mapNotNull { ms.optJSONObject(it) }
++                    .filter { m -> m.optString("type").let { it.isBlank() || it == "text" || it == "assistant" || it == "message" } }
++                    .mapNotNull { m -> m.optString("content").takeIf { it.isNotBlank() && it != "null" } }.joinToString("\n")
++            }
++            out += Triple(id, text.trim(), t.optString("timestamp"))
++        }
++        // oldest → newest by timestamp when every turn has one (the list order is not specified)
++        val sorted = if (out.all { it.third.isNotBlank() }) out.sortedBy { it.third } else out
++        return sorted.map { it.first to it.second }
++    }
++
++    private suspend fun list(p: Partner, bot: String): List<Pair<String, String>> =
++        assistantTurns(authed("${base(p)}/bots/$bot/messages?limit=30").body)
++
++    override fun prompt(req: TurnRequest): String {
++        // a 1:1 chat sends the user's words as they are; a group sends the shared context squeezed into one message
++        val direct = !req.system.contains("群聊")
++        return if (direct) req.turns.lastOrNull { it.role == "user" }?.text.orEmpty() else req.flat(4000)
++    }
++
++    override suspend fun create(p: Partner, preset: PlatformPreset, prompt: String): AsyncTaskAdapter.Created {
++        val bot = botOf(p).ifBlank { throw MemberError("Memoh 里还没选机器人") }
++        val seen = runCatching { list(p, bot).map { it.first }.toSet() }.getOrDefault(emptySet())
++        authed("${base(p)}/bots/$bot/web/messages", JSONObject().put("message", JSONObject().put("text", prompt)))
++        val key = bot + ":" + System.nanoTime()
++        states[key] = State(bot, seen)
++        return AsyncTaskAdapter.Created(key, viewUrl = base(p).removeSuffix("/api"))
++    }
++
++    override suspend fun poll(p: Partner, preset: PlatformPreset, c: AsyncTaskAdapter.Created): AsyncTaskAdapter.Phase {
++        val s = states[c.id] ?: return AsyncTaskAdapter.Phase.FAILED
++        val fresh = list(p, s.bot).lastOrNull { it.first !in s.seen && it.second.isNotBlank() } ?: return AsyncTaskAdapter.Phase.RUNNING
++        if (fresh.second == s.lastText) s.stable++ else { s.lastText = fresh.second; s.stable = 0 }
++        // the answer is persisted when the turn ends, but a streaming store could grow: wait for 2 equal reads
++        if (s.stable >= 1) { s.answer = fresh.second; return AsyncTaskAdapter.Phase.DONE }
++        return AsyncTaskAdapter.Phase.RUNNING
++    }
++
++    override suspend fun fetch(p: Partner, preset: PlatformPreset, c: AsyncTaskAdapter.Created): String = states.remove(c.id)?.answer.orEmpty()
++
++    override suspend fun cancel(p: Partner, preset: PlatformPreset, c: AsyncTaskAdapter.Created) { states.remove(c.id) }
++
++    override suspend fun probe(p: Partner, preset: PlatformPreset): AiClient.Probe = runCatching {
++        val r = authed("${base(p)}/bots")
++        AiClient.Probe(true, r.json()?.optJSONArray("items")?.optJSONObject(0)?.optString("id"), false)
++    }.getOrElse { AiClient.Probe(false, null, it is MemberError && it.message?.contains("登录") == true) }
++}
++
++/**
++ * [Mines-38.8] Members that a preset lists itself (Memoh: one member per bot of the signed-in account, "memoh:<bot id>").
++ * Partners appends [collect]'s rows; nothing is pasted by the user.
++ */
++object PresetPartners {
++    data class Bot(val id: String, val name: String, val avatar: String?)
++
++    private fun cachedBots(): List<Bot> = runCatching {
++        val a = JSONArray(GroupPrefs.get("memoh_bots") ?: "[]")
++        (0 until a.length()).map { a.getJSONObject(it) }.map { Bot(it.getString("id"), it.optString("name"), it.optString("avatar").ifBlank { null }) }
++    }.getOrDefault(emptyList())
++
++    private fun saveBots(l: List<Bot>) = GroupPrefs.put("memoh_bots",
++        JSONArray(l.map { JSONObject().put("id", it.id).put("name", it.name).put("avatar", it.avatar ?: "") }).toString())
++
++    /** Lists the account's bots (GET /bots), remembered for offline display. */
++    suspend fun memohBots(): Result<List<Bot>> = withContext(Dispatchers.IO) {
++        runCatching {
++            val base = PresetAuth.memohBase() ?: throw MemberError("Memoh 还没登录")
++            var t = PresetAuth.memohToken() ?: throw MemberError("Memoh 还没登录")
++            var r = PresetHttp.call("$base/bots", t)
++            if (r.code == 401) { t = PresetAuth.memohToken(force = true) ?: throw MemberError("Memoh 登录过期了，点「登录」"); r = PresetHttp.call("$base/bots", t) }
++            if (!r.ok) throw MemberError("读不到 Memoh 的机器人（HTTP ${r.code}）", r.body.take(160))
++            val items = r.json()?.optJSONArray("items") ?: JSONArray()
++            val l = (0 until items.length()).mapNotNull { items.optJSONObject(it) }
++                .filter { it.optBoolean("is_active", true) }
++                .map { Bot(it.optString("id"), it.optString("display_name").ifBlank { it.optString("name") }.ifBlank { "Memoh 机器人" }, it.optString("avatar_url").ifBlank { null }) }
++                .filter { it.id.isNotBlank() }
++            saveBots(l)
++            l
++        }
++    }
++
++    fun memohSpec(id: String): AiSpec {
++        val base = PresetRegistry.preset(PresetRegistry.MEMOH)!!.toSpec()
++        val b = cachedBots().firstOrNull { "${PresetRegistry.MEMOH}:" + it.id == id }
++        return base.copy(id = id, name = b?.name ?: "Memoh 机器人", iconUrl = b?.avatar, note = "你在 Memoh 的机器人")
++    }
++
++    /** Rows for Partners.refresh (IO thread). */
++    suspend fun collect(context: Context): List<Partner> {
++        val out = ArrayList<Partner>()
++        val base = PresetAuth.memohBase()
++        val signed = base != null && PresetAuth.key(PresetRegistry.MEMOH) != null
++        if (!signed) {
++            out += Partner(PresetRegistry.specOf(PresetRegistry.MEMOH)!!, Partner.State.NEED_LOGIN, "", null, "", "",
++                reason = "填你的 Memoh 服务器地址和账号登录，机器人会自动出现")
++            return out
++        }
++        val res = memohBots()
++        val bots = res.getOrNull() ?: cachedBots()
++        if (bots.isEmpty()) {
++            out += Partner(PresetRegistry.specOf(PresetRegistry.MEMOH)!!, if (res.isFailure) Partner.State.UNREACHABLE else Partner.State.NEED_LOGIN,
++                base!!, null, "", "已登录",
++                reason = res.exceptionOrNull()?.message ?: "Memoh 里还没有机器人：在 Memoh 建一个，回来自动出现")
++            return out
++        }
++        for (b in bots) {
++            val spec = memohSpec("${PresetRegistry.MEMOH}:" + b.id)
++            out += if (res.isSuccess) Partner(spec, Partner.State.READY, base!!, null, "", "Memoh")
++            else Partner(spec, Partner.State.UNREACHABLE, base!!, null, "", "Memoh", reason = res.exceptionOrNull()?.message ?: "连不上 Memoh")
++        }
++        return out
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/AiCatalog.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/AiCatalog.kt
+index 664fe66..4877c07 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/group/AiCatalog.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/group/AiCatalog.kt
+@@ -10,7 +10,7 @@ import com.openminis.app.R
+  * Phone-only apps (no public API) are driven by the accessibility / Shizuku
+  * FastUi path ("代打字"): slow, can break when the app changes, default off.
+  */
+-enum class Proto { OPENAI, ANTHROPIC, MANUS, COZE, PHONE, WEBAPP, MINES }
++enum class Proto { OPENAI, ANTHROPIC, MANUS, COZE, PHONE, WEBAPP, MINES, /** [Mines-38.8] registry transports (Memoh …) → Adapters */ ADAPTER }
+ 
+ /**
+  * [Mines-38.6] user 2026-10-15 「群聊我是要 app、AI agent 这些群聊，不是模型群聊」: members are grouped as
+@@ -100,7 +100,7 @@ object AiCatalog {
+         // [Mines-38.6] Mines itself as a member: the real agent (tools, files, web), not a bare model call
+         AiSpec(MINES_ID, "Mines 智能体", null, Proto.MINES, "", "", emptyList(), 0, 0xFFB5532F, keyOptional = true,
+             note = "Mines 自己：能用工具、查资料、读文件", kind = Kind.AGENT),
+-    ) + webApps }
++    ).map { PresetRegistry.override(it) }.let { l -> l + webApps + PresetRegistry.extraSpecs((l + webApps).map { it.id }.toSet()) } }  // [Mines-38.8]
+ 
+     const val MINES_ID = "mines"
+ 
+@@ -128,6 +128,7 @@ object AiCatalog {
+         // [Mines-38.7] 2nd+ account of a web app ("web:doubao#2") / of Manus ("manus@manus#2"): same platform, own name
+         ?: id.takeIf { it.startsWith("web:") && it.contains('#') }?.let { a -> specs.firstOrNull { it.id == WebAccounts.site(a) }?.let { it.copy(id = a, name = WebAccounts.display(it.name, a)) } }
+         ?: id.takeIf { it.startsWith("manus@") }?.let { a -> Partners.find(a)?.spec }
++        ?: PresetRegistry.specOf(id)  // [Mines-38.8] memoh / memoh:<bot>
+ 
+     /** [Mines-38.7] display name of a member id, multi-account aware (「豆包·账号A」). */
+     fun nameOf(id: String): String = Partners.find(id)?.spec?.name ?: spec(id)?.let { if (id.startsWith("web:")) WebAccounts.display(it.name, id) else it.name } ?: id
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/AiClient.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/AiClient.kt
+index c6a0308..2665f97 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/group/AiClient.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/group/AiClient.kt
+@@ -205,7 +205,9 @@ object AiClient {
+         Proto.MANUS -> manus(p, system, turns)
+         Proto.COZE -> coze(p, system, turns)
+         Proto.PHONE -> PhoneTyping.ask(p, turns.lastOrNull { it.role == "user" }?.text ?: "")
+-        Proto.WEBAPP -> WebChat.ask(PhoneTyping.appContext ?: throw MemberError("还没准备好"), p, flat(webIntro(system), turns, 1800))
++        Proto.WEBAPP -> if (WebBridge.handles(p.id)) WebBridge.ask(PhoneTyping.appContext ?: throw MemberError("还没准备好"), p, flat(webIntro(system), turns, 1800))  // [Mines-38.8]
++            else WebChat.ask(PhoneTyping.appContext ?: throw MemberError("还没准备好"), p, flat(webIntro(system), turns, 1800))
++        Proto.ADAPTER -> Adapters.reply(p, system, turns, maxTokens)  // [Mines-38.8] Memoh …
+         Proto.MINES -> minesAgent(p, system, turns)
+     }
+ 
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupRunner.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupRunner.kt
+index 1d773a2..5489e65 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupRunner.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupRunner.kt
+@@ -192,7 +192,7 @@ object GroupRunner {
+         val (phone, rest) = who.partition { PhoneApps.isPhone(it) }
+         // [Mines-38.6] slow agents (Manus tasks, web-chat apps, Mines' own agent loop) start at once in the background and
+         // never hold up the quick members; each shows 「正在思考…」 with its own time until it answers or times out.
+-        val slowProtos = setOf(Proto.MANUS, Proto.WEBAPP, Proto.MINES)
++        val slowProtos = setOf(Proto.MANUS, Proto.WEBAPP, Proto.MINES, Proto.ADAPTER)  // [Mines-38.8] ADAPTER = Memoh …
+         val (slow, api) = rest.partition { id -> id != GroupStore.HOST && members.firstOrNull { it.id == id }?.let { it.ready && it.spec.proto in slowProtos } == true }
+         coroutineScope {
+             val bg = slow.map { id -> async { one(id) } }
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
+index af13c1b..3fc4543 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
+@@ -21,6 +21,7 @@ object GroupSelfTest {
+         val rest = arg.substringAfter(' ', "")
+         val parts = rest.split('|')
+         when (cmd) {
++            "preset" -> PresetSelfTest.handle(context, rest)  // [Mines-38.8]
+             "partners" -> {
+                 val l = Partners.refresh(context, rescanApps = true)
+                 JSONArray(l.map { JSONObject().put("id", it.id).put("name", it.spec.name).put("state", it.state.name).put("model", it.model).put("via", it.via) }).toString()
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/MultiAgentGroup.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/MultiAgentGroup.kt
+new file mode 100644
+index 0000000..dea50cb
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/group/MultiAgentGroup.kt
+@@ -0,0 +1,90 @@
++package com.openminis.app.plus.group
++
++import android.content.Context
++import kotlinx.coroutines.runBlocking
++import org.json.JSONArray
++import org.json.JSONObject
++
++/**
++ * [Mines-38.8] Multi-agent group without Feishu: a Mines group chat whose members are any presets — Mines' own agent,
++ * Muse via the nanoMuse relay, Memoh bots, 扣子 bots, web-chat apps (Hark / Manus web / Muse web …). They all share one
++ * context: GroupRunner gives every member the same history (others' lines as 【名字】…), Mines hosts and wraps up.
++ */
++object MultiAgentGroup {
++    const val NAME = "Mines × Muse"
++
++    /** Members for the default multi-agent group: Mines, Muse 中继, then every other ready AGENT / registry member. */
++    fun defaultMembers(all: List<Partner> = Partners.list.value): List<String> {
++        val ready = all.filter { it.ready }
++        val first = listOf(AiCatalog.MINES_ID, "nanomuse").filter { id -> all.any { it.id == id } }
++        val more = ready.filter { p ->
++            p.id !in first && (p.spec.kind == Kind.AGENT || PresetRegistry.preset(p.id) != null) && p.spec.proto != Proto.PHONE
++        }.map { it.id }
++        return (first + more).distinct().take(8)
++    }
++
++    /** Creates (or reuses) the group; returns its id. Members that are not ready yet are kept and skipped quietly per round. */
++    suspend fun ensure(context: Context, members: List<String>? = null): String {
++        GroupStore.init(context)
++        val list = Partners.refresh(context)
++        val ids = members ?: defaultMembers(list)
++        val old = GroupStore.groups.value.firstOrNull { it.name == NAME }
++        if (old != null) {
++            if (old.members.toSet() != ids.toSet()) GroupStore.update(old.copy(members = ids))
++            return old.id
++        }
++        return GroupStore.create(NAME, ids, host = true, sequential = true).id
++    }
++}
++
++/**
++ * [Mines-38.8] adb-only smoke hooks for the presets (GroupSelfTest forwards `preset …`):
++ *   preset list                     → every registry preset with its spec / visibility
++ *   preset relaykey <nm_key>        → stores a relay key (as the code flow does) and returns the Muse 中继 state
++ *   preset relayparse <json>        → what keyFromVerify takes out of a verify answer
++ *   preset memoh <url>|<user>|<pw>  → logs in, lists bots, returns their member ids
++ *   preset memohparse <json>        → assistant turns MemohAdapter reads from a /messages answer
++ *   preset muse 1|0                 → Muse toggle
++ *   preset group                    → creates the Mines × Muse group, returns id + members
++ */
++object PresetSelfTest {
++    fun handle(context: Context, arg: String): String = runBlocking {
++        GroupPrefs.init(context)
++        val cmd = arg.substringBefore(' ')
++        val rest = arg.substringAfter(' ', "")
++        val parts = rest.split('|')
++        when (cmd) {
++            "list" -> JSONArray(PresetRegistry.all.map { p ->
++                val s = AiCatalog.spec(p.id) ?: p.toSpec()
++                JSONObject().put("id", p.id).put("transport", p.transport.name).put("proto", s.proto.name).put("keyOptional", s.keyOptional)
++                    .put("visible", PresetRegistry.visible(p.id)).put("login", p.auth.login?.javaClass?.simpleName ?: "")
++            }).toString()
++            "relaykey" -> {
++                PresetAuth.setKey("nanomuse", parts.getOrNull(0)?.takeIf { it.isNotBlank() })
++                val p = Partners.refresh(context).firstOrNull { it.id == "nanomuse" }
++                JSONObject().put("state", p?.state?.name).put("via", p?.via).put("model", p?.model).put("reason", p?.reason).toString()
++            }
++            "relayparse" -> PresetAuth.keyFromVerify(rest) ?: "null"
++            "memoh" -> {
++                val r = PresetAuth.memohLogin(parts.getOrElse(0) { "" }, parts.getOrElse(1) { "" }, parts.getOrElse(2) { "" })
++                if (r.isFailure) "login failed: " + r.exceptionOrNull()?.message
++                else JSONArray(Partners.refresh(context).filter { it.id.startsWith(PresetRegistry.MEMOH) }.map { "${it.id}:${it.state}" }).toString()
++            }
++            "memohparse" -> JSONArray(MemohAdapter.assistantTurns(rest).map { JSONArray().put(it.first).put(it.second) }).toString()
++            // [Mines-38.8] smoke: open AI 伙伴 with a preset's own sign-in dialog up (nanomuse / memoh / coze)
++            "openlogin" -> {
++                val l = java.util.concurrent.CountDownLatch(1)
++                android.os.Handler(android.os.Looper.getMainLooper()).post {
++                    com.openminis.app.ui.group.PartnersNav.open = rest.trim().ifBlank { null }
++                    com.openminis.app.ui.plus.PlusNav.go(com.openminis.app.ui.group.GroupRoutes.PARTNERS); l.countDown() }
++                l.await(5, java.util.concurrent.TimeUnit.SECONDS); "ok"
++            }
++            "muse" -> { PresetRegistry.setMuseOn(parts.getOrNull(0) == "1"); Partners.refresh(context); "ok" }
++            "group" -> {
++                val gid = MultiAgentGroup.ensure(context)
++                JSONObject().put("id", gid).put("members", JSONArray(GroupStore.group(gid)?.members ?: emptyList<String>())).toString()
++            }
++            else -> "unknown: $cmd"
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/Partners.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/Partners.kt
+index 427fd3a..d484b2f 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/group/Partners.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/group/Partners.kt
+@@ -157,6 +157,7 @@ object Partners {
+             AiCatalog.specs.filter { it.keyOptional && it.proto == Proto.OPENAI }.map { s -> async { s.id to AiClient.probe(s.baseUrl) } }.awaitAll().toMap()
+         }
+         for (spec in AiCatalog.specs) {
++            if (!PresetRegistry.visible(spec.id)) continue  // [Mines-38.8] Muse web stays hidden until the US toggle is on
+             // [Mines-38.6] Mines itself and the web-chat apps need no key
+             if (spec.proto == Proto.MINES) {
+                 out += if (insts.isNotEmpty()) Partner(spec, Partner.State.READY, "", null, "", "本机")
+@@ -176,7 +177,7 @@ object Partners {
+             }
+             val inst = insts.firstOrNull { it.id !in used && matches(spec, it) }
+             if (inst != null) used += inst.id
+-            val vaultKey = spec.vaultKind?.let { k -> vaultKey(k) }
++            val vaultKey = spec.vaultKind?.let { k -> vaultKey(k) } ?: PresetAuth.key(spec.id)  // [Mines-38.8] nanoMuse code sign-in key
+             val key = vaultKey ?: inst?.key?.takeIf { it.isNotBlank() }
+             val base = GroupPrefs.get("base_${spec.id}")?.trimEnd('/') ?: inst?.base?.trimEnd('/') ?: spec.baseUrl  // base_<id>: smoke override
+             // [Mines-38.6] 扣子: every bot of the user is its own member (listed, auto-published to the API channel)
+@@ -256,6 +257,7 @@ object Partners {
+             out += Partner(spec, if (GroupPrefs.phoneOn(spec.id)) Partner.State.READY else Partner.State.OFF, f.pkg, null, "App", "代打字",
+                 reason = "慢、可能断：Mines 替你在 ${f.label} 里打字、读回复")
+         }
++        runCatching { out += PresetPartners.collect(context) }  // [Mines-38.8] Memoh bots (account login, listed)
+         // [Mines-38.5] one row per service: a READY entry wins over a duplicate that is not
+         val dedup = out.groupBy { it.id }.map { (_, l) -> l.firstOrNull { it.ready } ?: l.first() }
+         _list.value = dedup
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/PlatformPreset.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/PlatformPreset.kt
+new file mode 100644
+index 0000000..4e081f8
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/group/PlatformPreset.kt
+@@ -0,0 +1,173 @@
++package com.openminis.app.plus.group
++
++/**
++ * [Mines-38.8] One declarative row per platform a group / 单聊 member can come from (integration spec §10).
++ *
++ * User rule 2026-10-15 19:28 「黏贴key就免了，收费的」: 38.8 only ships FREE, login-based routes — 扣子 (login → PAT, free
++ * quota), the nanoMuse relay (own server, e-mail code → nm_ key), self-hosted Memoh (account login → JWT) and web-chat
++ * bridges (Hark, Manus web, Meta Muse web) on the 38.7 WebView session store. Paid-key rows stay as they were in
++ * [AiCatalog] and are not part of this registry.
++ *
++ * Presets PRODUCE [AiSpec] ([PlatformPreset.toSpec]) so everything downstream (Partners, GroupRunner, AI 伙伴) keeps
++ * working unchanged; only transports without a 38.7 branch go through [Proto.ADAPTER] → [Adapters].
++ */
++enum class Transport {
++    OPENAI_CHAT, OPENAI_RESPONSES, ANTHROPIC, DASHSCOPE_APP, DIFY_CHAT,
++    /** Memoh: POST /bots/{id}/web/messages, then poll /bots/{id}/messages. */
++    MEMOH,
++    /** create → poll → fetch (Manus, 扣子 v3 chat …). */
++    ASYNC_TASK,
++    MCP, WEBVIEW, PHONE, MINES,
++}
++
++enum class Region { DOMESTIC, OVERSEAS, SELF_HOSTED, US_ONLY }
++
++/** Where the credential goes and how the user gets it. */
++data class AuthSpec(
++    val header: String = "Authorization",
++    val prefix: String = "Bearer ",
++    /** PlusVault kind (账号连接 row); null = stored by [PresetAuth]. */
++    val vaultKind: String? = null,
++    val keyPage: String? = null,
++    val extraHeaders: Map<String, String> = emptyMap(),
++    val login: LoginFlow? = null,
++)
++
++sealed interface LoginFlow {
++    /** nanoMuse relay: POST {base}/auth/code {identifier} → code (server log / mail) → POST {base}/auth/verify → nm_ key. */
++    data class RelayCode(val codePath: String = "/auth/code", val verifyPath: String = "/auth/verify") : LoginFlow
++    /** Memoh: POST {base}/auth/login {username,password} → access_token (JWT); re-login on 401 with the saved password. */
++    data class PasswordJwt(val path: String = "/auth/login", val tokenField: String = "access_token") : LoginFlow
++    /** Web chat signed in with the user's own account in its own isolated store (38.7 AccountJar). */
++    data object WebSession : LoginFlow
++    /** Website sign-in, then Mines creates the API token itself on the token page ([com.openminis.app.plus.KeyAgent]). */
++    data class KeyAgentPat(val kind: String) : LoginFlow
++}
++
++sealed interface TargetId {
++    data class Model(val default: String, val prefer: List<String> = emptyList(), val autoSwitch: Boolean = true) : TargetId
++    data class AgentTarget(val default: String) : TargetId
++    data class MemohBot(val hint: String = "bot id") : TargetId
++    /** The platform lists the user's agents itself (扣子 bots, Memoh bots): one member per agent, nothing pasted. */
++    data object Listed : TargetId
++}
++
++data class Timeouts(val readSec: Long = 120, val pollMs: Long = 0, val totalMs: Long = 180_000)
++
++data class UserField(val key: String, val label: String, val secret: Boolean = false, val hint: String = "")
++
++enum class Verified { DOC, PARTIAL, UNVERIFIED }
++
++/** Web-chat details for [Transport.WEBVIEW] presets (generic selectors until the real-site probe fills them). */
++data class WebProfile(
++    val site: WebChat.Site,
++    /** a reply is done when the page has not changed for this long and no Stop button shows */
++    val stableMs: Long = 4500,
++    val timeoutMs: Long = 180_000,
++    /** step / UI lines that are never part of the answer (Manus timeline …) */
++    val noise: Set<String> = emptySet(),
++    /** extra cookie domains of the account (sign-out / swap) */
++    val extraUrls: List<String> = emptyList(),
++    /** "us": only usable on a US network (Muse); the member says so instead of trying direct */
++    val proxyPin: String? = null,
++    /** the user must enter the page address first (no verified default) */
++    val urlRequired: Boolean = false,
++)
++
++data class PlatformPreset(
++    val id: String,
++    val name: String,
++    val kind: Kind,
++    val transport: Transport,
++    val baseUrl: String,
++    val auth: AuthSpec,
++    val target: TargetId?,
++    val region: Region,
++    val streaming: Boolean = false,
++    val timeouts: Timeouts = Timeouts(),
++    val userFields: List<UserField> = emptyList(),
++    val docs: String = "",
++    val verified: Verified = Verified.UNVERIFIED,
++    val note: String = "",
++    val color: Long = 0xFF8A7F74,
++    val hosts: List<String> = emptyList(),
++    val web: WebProfile? = null,
++    /** hidden until the user turns it on (Muse: US network + age check) */
++    val offByDefault: Boolean = false,
++) {
++    /** 38.7 [Proto] this preset runs on; transports 38.7 has no branch for go through [Proto.ADAPTER]. */
++    fun legacyProto(): Proto = when (transport) {
++        Transport.OPENAI_CHAT -> Proto.OPENAI
++        Transport.ANTHROPIC -> Proto.ANTHROPIC
++        Transport.WEBVIEW -> Proto.WEBAPP
++        Transport.PHONE -> Proto.PHONE
++        Transport.MINES -> Proto.MINES
++        Transport.ASYNC_TASK -> when (id.substringBefore(':')) { "coze" -> Proto.COZE; "manus" -> Proto.MANUS; else -> Proto.ADAPTER }
++        else -> Proto.ADAPTER
++    }
++
++    /** Bridge to 38.7: everything downstream still consumes AiSpec. */
++    fun toSpec(): AiSpec {
++        val m = target as? TargetId.Model
++        val webUrl = if (transport == Transport.WEBVIEW) baseUrl else ""
++        return AiSpec(
++            id = id, name = name, vaultKind = auth.vaultKind, proto = legacyProto(), baseUrl = baseUrl,
++            defaultModel = m?.default.orEmpty(), prefer = m?.prefer.orEmpty(), icon = 0, color = color,
++            domestic = region == Region.DOMESTIC || region == Region.SELF_HOSTED, note = note, hosts = hosts,
++            // a login flow means a key IS needed (nanoMuse: every model route answers 401 bad_key without one)
++            keyOptional = transport == Transport.WEBVIEW || transport == Transport.MINES,
++            kind = kind, webUrl = webUrl,
++        )
++    }
++}
++
++/** Turn input every adapter receives (same data AiClient.reply gets). */
++data class TurnRequest(val system: String, val turns: List<AiClient.Turn>, val maxTokens: Int, val stream: Boolean = false) {
++    /** Group context squeezed into one prompt for task-style agents (same shape as AiClient.flat). */
++    fun flat(cap: Int = 6000): String {
++        val sb = StringBuilder(system).append("\n\n群聊记录：\n")
++        turns.dropLast(1).takeLast(12).forEach { sb.append(if (it.role == "assistant") "（你）" else "").append(it.text).append('\n') }
++        sb.append("\n请回复最新一条：\n").append(turns.lastOrNull()?.text ?: "")
++        return sb.toString().takeLast(cap)
++    }
++}
++
++/** One adapter per transport; stateless (conversation state lives in GroupPrefs / the platform). */
++interface ChatAdapter {
++    val transport: Transport
++    suspend fun reply(p: Partner, preset: PlatformPreset, req: TurnRequest): AiClient.Reply
++    /** 「检测」: reachability + auth, no billable call. */
++    suspend fun probe(p: Partner, preset: PlatformPreset): AiClient.Probe
++}
++
++/** Shared create → poll → fetch loop (Memoh now; Manus / 扣子 / Jules can move onto it later). */
++abstract class AsyncTaskAdapter : ChatAdapter {
++    override val transport: Transport = Transport.ASYNC_TASK
++    data class Created(val id: String, val viewUrl: String? = null, val extra: Map<String, String> = emptyMap())
++    enum class Phase { RUNNING, DONE, NEEDS_INPUT, FAILED, CANCELLED }
++
++    protected abstract suspend fun create(p: Partner, preset: PlatformPreset, prompt: String): Created
++    protected abstract suspend fun poll(p: Partner, preset: PlatformPreset, c: Created): Phase
++    protected abstract suspend fun fetch(p: Partner, preset: PlatformPreset, c: Created): String
++    protected open suspend fun cancel(p: Partner, preset: PlatformPreset, c: Created) {}
++    protected open fun prompt(req: TurnRequest): String = req.flat()
++
++    final override suspend fun reply(p: Partner, preset: PlatformPreset, req: TurnRequest): AiClient.Reply {
++        val c = create(p, preset, prompt(req))
++        val t0 = System.currentTimeMillis()
++        var ph = Phase.RUNNING
++        try {
++            while (ph == Phase.RUNNING && System.currentTimeMillis() - t0 < preset.timeouts.totalMs) {
++                kotlinx.coroutines.delay(preset.timeouts.pollMs.coerceAtLeast(1500))
++                ph = try { poll(p, preset, c) } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (e: MemberError) { throw e } catch (e: Exception) { Phase.RUNNING }
++            }
++        } catch (e: kotlinx.coroutines.CancellationException) {
++            runCatching { cancel(p, preset, c) }
++            throw e
++        }
++        if (ph == Phase.RUNNING) throw MemberError("${preset.name} ${preset.timeouts.totalMs / 60_000} 分钟还没做完，结果会留在 ${preset.name} 里", c.viewUrl)
++        if (ph == Phase.FAILED || ph == Phase.CANCELLED) throw MemberError("${preset.name} 任务没完成（$ph）", c.viewUrl)
++        val text = fetch(p, preset, c).ifBlank { throw MemberError("${preset.name} 没有给出回复") }
++        return AiClient.Reply(text + if (ph == Phase.NEEDS_INPUT) "\n（${preset.name} 在等你补充信息）" else "", model = preset.name)
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/PresetAuth.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/PresetAuth.kt
+new file mode 100644
+index 0000000..b3969b0
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/group/PresetAuth.kt
+@@ -0,0 +1,190 @@
++package com.openminis.app.plus.group
++
++import com.openminis.app.plus.PlusVault
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.suspendCancellableCoroutine
++import kotlinx.coroutines.withContext
++import okhttp3.Call
++import okhttp3.Callback
++import okhttp3.MediaType.Companion.toMediaType
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.RequestBody.Companion.toRequestBody
++import okhttp3.Response
++import org.json.JSONObject
++import java.io.IOException
++import java.util.concurrent.TimeUnit
++import kotlin.coroutines.resume
++import kotlin.coroutines.resumeWithException
++
++/** [Mines-38.8] Small cancellable HTTP helper for the preset adapters (self-hosted / domestic hosts: direct connection). */
++object PresetHttp {
++    data class Res(val code: Int, val body: String) {
++        val ok: Boolean get() = code in 200..299
++        fun json(): JSONObject? = runCatching { JSONObject(body) }.getOrNull()
++    }
++
++    val JSON = "application/json".toMediaType()
++
++    private fun client(readSec: Long) = OkHttpClient.Builder().connectTimeout(10, TimeUnit.SECONDS)
++        .readTimeout(readSec, TimeUnit.SECONDS).callTimeout(readSec + 15, TimeUnit.SECONDS).build()
++
++    private suspend fun Call.await(): Response = suspendCancellableCoroutine { cont ->
++        cont.invokeOnCancellation { runCatching { cancel() } }
++        enqueue(object : Callback {
++            override fun onFailure(call: Call, e: IOException) { if (cont.isActive) cont.resumeWithException(e) }
++            override fun onResponse(call: Call, response: Response) { cont.resume(response) }
++        })
++    }
++
++    /** Throws [MemberError] with a plain reason when the host cannot be reached. */
++    suspend fun call(url: String, token: String? = null, body: JSONObject? = null, readSec: Long = 30, method: String? = null): Res {
++        val b = try { Request.Builder().url(url) } catch (e: IllegalArgumentException) { throw MemberError("地址不对：$url") }
++        if (!token.isNullOrBlank()) b.header("Authorization", "Bearer $token")
++        b.header("Accept", "application/json")
++        when {
++            body != null -> b.method(method ?: "POST", body.toString().toRequestBody(JSON))
++            method != null -> b.method(method, if (method == "GET" || method == "HEAD") null else "{}".toRequestBody(JSON))
++        }
++        return try {
++            client(readSec).newCall(b.build()).await().use { r -> Res(r.code, r.body?.string().orEmpty()) }
++        } catch (e: IOException) {
++            val m = (e.message ?: "").lowercase()
++            throw MemberError(when {
++                m.contains("timeout") || m.contains("timed out") -> "等太久没回复（超时）"
++                m.contains("unable to resolve") || m.contains("no address") -> "连不上（域名解析失败）"
++                m.contains("refused") -> "连不上（服务器没开或端口不对）"
++                m.contains("canceled") -> "已停止"
++                else -> "连不上（网络问题）"
++            }, e.message)
++        }
++    }
++
++    /** The error code a relay / server put in its body ({"error":"bad_key"} / {"code":"…"} / {"error":{"code":…}}). */
++    fun errCode(r: Res): String {
++        val o = r.json() ?: return ""
++        o.optJSONObject("error")?.let { e -> return e.optString("code").ifBlank { e.optString("type") } }
++        return o.optString("error").ifBlank { o.optString("code") }.ifBlank { o.optString("message") }.take(60)
++    }
++}
++
++/**
++ * [Mines-38.8] Credentials of login-flow presets, encrypted in PlusVault (kind "preset_auth"); plain settings (server
++ * address, user name, e-mail) in GroupPrefs. Never shown in the UI.
++ */
++object PresetAuth {
++    private const val V = "preset_auth"
++
++    fun key(id: String): String? {
++        val base = id.substringBefore(':')
++        return PlusVault.secretExtra(V, "key_$base")?.trim()?.takeIf { it.isNotBlank() }
++    }
++    fun setKey(id: String, v: String?) = PlusVault.setSecretExtra(V, "key_$id", v?.trim())
++
++    // ── nanoMuse relay ────────────────────────────────────────────────────
++
++    fun relayBase(): String = GroupPrefs.get("base_nanomuse")?.trimEnd('/') ?: AiCatalog.NANOMUSE_BASE
++    fun relayEmail(): String? = GroupPrefs.get("nanomuse_email")
++
++    private fun relayProblem(r: PresetHttp.Res): String = when (val c = PresetHttp.errCode(r)) {
++        "code_too_often", "rate_limited" -> "发得太频繁了，等一分钟再试"
++        "domain_limited" -> "这个邮箱域名今天开号太多了，换个常用邮箱"
++        "signup_closed", "signups_closed", "signup_paused" -> "中继没开放新账号：用中继里已有的邮箱"
++        "account_disabled" -> "这个账号在中继里被停用了"
++        "bad_code", "wrong_code", "code_expired", "invalid_code", "too_many_attempts" -> "验证码不对或过期了，重新获取"
++        else -> when (r.code) {
++            401, 403 -> "验证码不对或过期了（$c）"
++            404 -> "中继地址不对（没有登录接口）"
++            429 -> "发得太频繁了，等一分钟再试"
++            in 500..599 -> "中继服务器出错了"
++            else -> "中继没接受（HTTP ${r.code} ${c.ifBlank { r.body.take(60) }}）"
++        }
++    }
++
++    /** Step 1: the relay sends (or, with CODE_SENDER=log, prints in its service log) a 6-digit code. */
++    suspend fun relayRequestCode(email: String): Result<Unit> = withContext(Dispatchers.IO) {
++        runCatching {
++            val r = PresetHttp.call(relayBase() + "/auth/code", body = JSONObject().put("identifier", email.trim()))
++            if (!r.ok) throw MemberError(relayProblem(r), r.body.take(200))
++            GroupPrefs.put("nanomuse_email", email.trim())
++        }
++    }
++
++    /** Pulls the nm_ key out of the verify answer ({"key":"nm_…"} / {"api_key":…} / anything that starts with nm_). */
++    fun keyFromVerify(body: String): String? {
++        val o = runCatching { JSONObject(body) }.getOrNull()
++        if (o != null) {
++            for (k in listOf("key", "api_key", "apiKey", "token", "access_token")) o.optString(k).takeIf { it.startsWith("nm_") || (it.length > 20 && k != "token") }?.let { return it }
++            o.optJSONObject("data")?.let { d -> for (k in listOf("key", "api_key", "token")) d.optString(k).takeIf { it.isNotBlank() }?.let { return it } }
++        }
++        return Regex("nm_[A-Za-z0-9_\\-]{16,}").find(body)?.value
++    }
++
++    /** Step 2: code → nm_ key, stored; the 「Muse 中继」 member becomes ready on the next refresh. */
++    suspend fun relayVerify(email: String, code: String): Result<String> = withContext(Dispatchers.IO) {
++        runCatching {
++            val r = PresetHttp.call(relayBase() + "/auth/verify",
++                body = JSONObject().put("identifier", email.trim()).put("code", code.trim()).put("device", "Mines"))
++            if (!r.ok) throw MemberError(relayProblem(r), r.body.take(200))
++            val k = keyFromVerify(r.body) ?: throw MemberError("中继回了，但没找到密钥", r.body.take(200))
++            setKey("nanomuse", k)
++            GroupPrefs.put("nanomuse_email", email.trim())
++            k
++        }
++    }
++
++    // ── Memoh ─────────────────────────────────────────────────────────────
++
++    fun memohBase(): String? = GroupPrefs.get("memoh_base")?.trimEnd('/')
++    fun memohUser(): String? = GroupPrefs.get("memoh_user")
++
++    /** The user types the address they open in the browser; the bundled web UI calls the API under /api. */
++    fun normalizeMemohBase(input: String): List<String> {
++        var u = input.trim().trimEnd('/')
++        if (u.isEmpty()) return emptyList()
++        if (!u.startsWith("http://") && !u.startsWith("https://")) u = "http://$u"
++        return if (u.endsWith("/api")) listOf(u, u.removeSuffix("/api")) else listOf("$u/api", u)
++    }
++
++    /** Logs in (tries "<url>/api" then "<url>"), stores JWT + password, returns the base that worked. */
++    suspend fun memohLogin(input: String, user: String, pass: String): Result<String> = withContext(Dispatchers.IO) {
++        runCatching {
++            var last: MemberError? = null
++            for (base in normalizeMemohBase(input)) {
++                try {
++                    val r = PresetHttp.call("$base/auth/login", body = JSONObject().put("username", user.trim()).put("password", pass))
++                    if (r.code == 404 || r.code == 405 || (r.ok && r.json()?.optString("access_token").isNullOrBlank())) {
++                        last = MemberError("这个地址不像 Memoh（没有登录接口）", r.body.take(160)); continue
++                    }
++                    if (r.code == 401 || r.code == 403) throw MemberError("用户名或密码不对", r.body.take(160))
++                    if (!r.ok) throw MemberError("Memoh 没接受（HTTP ${r.code}）", r.body.take(160))
++                    val jwt = r.json()!!.optString("access_token")
++                    GroupPrefs.put("memoh_base", base); GroupPrefs.put("memoh_user", user.trim())
++                    PlusVault.setSecretExtra(V, "memoh_pass", pass)
++                    setKey(PresetRegistry.MEMOH, jwt)
++                    return@runCatching base
++                } catch (e: MemberError) {
++                    if (e.message?.startsWith("用户名或密码") == true) throw e
++                    last = e
++                }
++            }
++            throw last ?: MemberError("地址是空的")
++        }
++    }
++
++    /** Current JWT; [force] logs in again with the saved password (after a 401). */
++    suspend fun memohToken(force: Boolean = false): String? {
++        if (!force) key(PresetRegistry.MEMOH)?.let { return it }
++        val base = memohBase() ?: return null
++        val user = memohUser() ?: return null
++        val pass = PlusVault.secretExtra(V, "memoh_pass") ?: return null
++        return memohLogin(base, user, pass).map { key(PresetRegistry.MEMOH) }.getOrNull()
++    }
++
++    fun memohSignOut() {
++        setKey(PresetRegistry.MEMOH, null); PlusVault.setSecretExtra(V, "memoh_pass", null)
++        GroupPrefs.put("memoh_bots", null)
++    }
++
++    fun relaySignOut() = setKey("nanomuse", null)
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/PresetRegistry.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/PresetRegistry.kt
+new file mode 100644
+index 0000000..f732f3e
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/group/PresetRegistry.kt
+@@ -0,0 +1,122 @@
++package com.openminis.app.plus.group
++
++/**
++ * [Mines-38.8] The free, login-based presets (no paid API key anywhere). See [PlatformPreset].
++ *
++ * Hooks into 38.7 code are kept to single lines:
++ *  - [AiCatalog.specs]: `.map { PresetRegistry.override(it) } + PresetRegistry.extraSpecs(…)`; [AiCatalog.spec]: `?: PresetRegistry.specOf(id)`
++ *  - Partners: [visible] filter, [PresetAuth.key] for login-flow keys, [PresetPartners.collect] for listed agents (Memoh bots)
++ *  - AiClient.replyOnce: `Proto.ADAPTER -> Adapters.reply(…)`; WEBAPP members of this registry → [WebBridge]
++ *  - WebChat.site: `?: PresetRegistry.webSite(id)`
++ */
++object PresetRegistry {
++    const val MEMOH = "memoh"
++    const val MUSE_TOGGLE = "preset_muse_us"
++
++    private val genericInput = "textarea,[contenteditable='true'],input[type='text']"
++    private val genericSend = "button[aria-label*='Send'],button[aria-label*='send'],button[aria-label*='发送'],button[data-testid*='send'],button[type='submit']"
++    private val genericReply = "[data-message-author-role='assistant'],[data-role='assistant'],[class*='assistant'] [class*='markdown'],[class*='assistant-message']," +
++        "[class*='AssistantMessage'],[class*='bot-message'],[class*='markdown'],.prose"
++
++    val all: List<PlatformPreset> = listOf(
++        // 扣子: website sign-in → KeyAgent creates the PAT on www.coze.cn/open/oauth/pats → CozeBots lists + publishes every bot
++        PlatformPreset("coze", "扣子", Kind.AGENT, Transport.ASYNC_TASK, "https://api.coze.cn/v3",
++            auth = AuthSpec(vaultKind = "coze", keyPage = "https://www.coze.cn/open/oauth/pats", login = LoginFlow.KeyAgentPat("coze")),
++            target = TargetId.Listed, region = Region.DOMESTIC, timeouts = Timeouts(readSec = 60, pollMs = 1500, totalMs = 180_000),
++            docs = "https://www.coze.cn/open/docs/developer_guides/chat_v3", verified = Verified.DOC, color = 0xFF4E40E5,
++            note = "登录扣子就行：Mines 自己拿令牌，你的每个智能体自动出现（免费额度）"),
++        // nanoMuse relay (the user's own server): e-mail → code (relay log, CODE_SENDER=log) → nm_ key; OpenAI-compatible
++        PlatformPreset("nanomuse", "Muse 中继", Kind.AGENT, Transport.OPENAI_CHAT, AiCatalog.NANOMUSE_BASE,
++            auth = AuthSpec(login = LoginFlow.RelayCode()),
++            target = TargetId.Model("deepseek-v4.1-flash", listOf("deepseek-v4.1-flash", "qwen3.8-flash", "qwen3.8-27b", "deepseek")),
++            region = Region.SELF_HOSTED, streaming = true, hosts = listOf("8.217.89.133:8787"),
++            docs = "https://raw.githubusercontent.com/nano-muse/nanoMuse/master/cloud/README.md", verified = Verified.DOC, color = 0xFF8E6CEF,
++            note = "你自己的中继（阿里云）：点「登录」填邮箱，输入验证码就接上"),
++        // Memoh (self-hosted): server address + account login → JWT; every bot of the account is its own member
++        PlatformPreset(MEMOH, "Memoh", Kind.AGENT, Transport.MEMOH, "",
++            auth = AuthSpec(login = LoginFlow.PasswordJwt()), target = TargetId.Listed, region = Region.SELF_HOSTED,
++            timeouts = Timeouts(readSec = 30, pollMs = 1500, totalMs = 180_000),
++            userFields = listOf(UserField("base", "服务器地址", hint = "http://你的服务器/api"), UserField("username", "用户名"), UserField("password", "密码", secret = true)),
++            docs = "https://raw.githubusercontent.com/memohai/Memoh/main/spec/swagger.yaml", verified = Verified.PARTIAL, color = 0xFF2F7D6D,
++            note = "你自己部署的 Memoh：填服务器地址和账号密码登录，你的机器人会自动出现"),
++        // Web-chat bridges (38.7 WebView store, one isolated profile per account); selectors generic until probed
++        PlatformPreset("web:hark", "Hark", Kind.APP, Transport.WEBVIEW, "https://hark.com/",
++            auth = AuthSpec(login = LoginFlow.WebSession), target = null, region = Region.OVERSEAS, color = 0xFF1C1C1C,
++            note = "用你的 Hark 账号登录网页版，Mines 替你提问、读回复（网页地址可在「更多接入」里改）",
++            web = WebProfile(WebChat.Site(genericInput, genericSend, genericReply,
++                wall = Regex("Sign in to continue|Log in to continue|Continue with Google|Continue with email")),
++                stableMs = 6000, timeoutMs = 6 * 60_000L)),
++        PlatformPreset("web:manus", "Manus 网页版", Kind.APP, Transport.WEBVIEW, "https://manus.im/app",
++            auth = AuthSpec(login = LoginFlow.WebSession), target = null, region = Region.OVERSEAS, color = 0xFF2B2B2B,
++            note = "用你的 Manus 账号登录网页版（不用 API 密钥）；每个任务照常消耗积分",
++            web = WebProfile(WebChat.Site(genericInput, genericSend, genericReply,
++                wall = Regex("not available in your region|服务不可用|Sign in to Manus|Log in to Manus")),
++                stableMs = 9000, timeoutMs = 10 * 60_000L,
++                noise = setOf("Manus is working", "Manus 正在工作", "Task completed", "任务已完成", "Thinking", "思考中", "Knowledge recalled", "View all", "Share", "分享"),
++                extraUrls = listOf("https://manus.im/"))),
++        PlatformPreset("web:muse", "Meta Muse", Kind.APP, Transport.WEBVIEW, "",
++            auth = AuthSpec(login = LoginFlow.WebSession), target = null, region = Region.US_ONLY, color = 0xFF0866FF,
++            note = "需要美国网络和 Meta 账号年龄验证；验证和人机检查都在「登录」里由你自己完成",
++            web = WebProfile(WebChat.Site(genericInput, genericSend, genericReply,
++                wall = Regex("not available in your (country|region)|age verification|verify your age|confirm your age|Log in with Meta|Continue with Meta")),
++                stableMs = 6000, timeoutMs = 6 * 60_000L, proxyPin = "us", urlRequired = true),
++            offByDefault = true),
++    )
++
++    private val byId = all.associateBy { it.id }
++
++    fun preset(id: String): PlatformPreset? = byId[id] ?: byId[id.substringBefore('#')] ?: byId[id.substringBefore(':').takeIf { id.contains(':') && !id.startsWith("web:") } ?: ""]
++
++    /** Login flow of a member id (nanomuse / memoh / memoh:<bot> / coze:<bot>). */
++    fun loginFlowOf(id: String): LoginFlow? = preset(id)?.auth?.login
++
++    /** True when the AI 伙伴 row should open [com.openminis.app.ui.group.PresetLoginDialog] instead of 38.7's flows. */
++    fun ownLogin(id: String): Boolean = loginFlowOf(id).let { it is LoginFlow.RelayCode || it is LoginFlow.PasswordJwt }
++
++    /** Muse is off unless the user said they are on a US network. */
++    fun museOn(): Boolean = GroupPrefs.get(MUSE_TOGGLE) == "1"
++    fun setMuseOn(on: Boolean) = GroupPrefs.put(MUSE_TOGGLE, if (on) "1" else null)
++
++    fun visible(id: String): Boolean {
++        val p = preset(id) ?: return true
++        return !p.offByDefault || (p.id == "web:muse" && museOn())
++    }
++
++    /** 38.7 rows this registry corrects (nanoMuse needed a key all along; keyOptional=true was wrong). */
++    fun override(s: AiSpec): AiSpec {
++        val p = byId[s.id] ?: return s
++        return when (p.transport) {
++            Transport.OPENAI_CHAT -> s.copy(keyOptional = false, note = p.note,
++                defaultModel = (p.target as? TargetId.Model)?.default ?: s.defaultModel,
++                prefer = (p.target as? TargetId.Model)?.prefer ?: s.prefer)
++            Transport.ASYNC_TASK -> s.copy(note = p.note)
++            else -> s
++        }
++    }
++
++    /** Presets 38.7 does not have as rows: the web-chat bridges (Memoh is listed per bot by [PresetPartners]). */
++    fun extraSpecs(existing: Set<String>): List<AiSpec> =
++        all.filter { it.id !in existing && it.transport == Transport.WEBVIEW }.map { it.toSpec() }
++
++    /** Member spec for ids 38.7 cannot resolve: "memoh", "memoh:<bot>". */
++    fun specOf(id: String): AiSpec? {
++        if (id == MEMOH) return byId.getValue(MEMOH).toSpec()
++        if (id.startsWith("$MEMOH:")) return PresetPartners.memohSpec(id)
++        return null
++    }
++
++    /** WebChat.Site of a bridge preset (login screen classification, 38.7 check()). */
++    fun webSite(id: String): WebChat.Site? = byId[WebAccounts.site(id)]?.web?.site
++
++    fun webProfile(id: String): WebProfile? = byId[WebAccounts.site(id)]?.web
++
++    /** The page a bridge member opens (user override first). */
++    fun webUrl(id: String): String = GroupPrefs.get("base_${WebAccounts.site(id)}")?.takeIf { it.isNotBlank() } ?: byId[WebAccounts.site(id)]?.baseUrl.orEmpty()
++
++    /** AI 伙伴 button text for a member that is not ready. */
++    fun fixLabel(id: String): String? = when (loginFlowOf(id)) {
++        is LoginFlow.RelayCode, is LoginFlow.PasswordJwt -> "登录"
++        is LoginFlow.KeyAgentPat -> "登录扣子"
++        else -> null
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/WebBridge.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/WebBridge.kt
+new file mode 100644
+index 0000000..f4b4f56
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/group/WebBridge.kt
+@@ -0,0 +1,196 @@
++package com.openminis.app.plus.group
++
++import android.annotation.SuppressLint
++import android.content.Context
++import android.webkit.WebView
++import android.webkit.WebViewClient
++import com.openminis.app.plus.AccountJar
++import com.openminis.app.plus.LoginWeb
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.suspendCancellableCoroutine
++import kotlinx.coroutines.sync.withLock
++import kotlinx.coroutines.withContext
++import org.json.JSONObject
++import kotlin.coroutines.resume
++
++/**
++ * [Mines-38.8] Web-chat bridge for the registry's WEBVIEW presets (Hark, Manus web, Meta Muse web) — sites whose pages
++ * could not be probed, so nothing here depends on a site's own class names:
++ *  - the account's own isolated store (38.7 [AccountJar]: one WebView profile per member id, "web:hark", "web:hark#2" …);
++ *  - the page is classified with 38.7's [WebChat.probeJs] / [WebChat.classify] + the preset's wall regex first;
++ *  - the question goes into the bottom-most visible textarea / contenteditable, then a send-ish button or Enter;
++ *  - a MutationObserver installed at send time records the newest text block that appeared after the question
++ *    (assistant-looking containers first, any new block otherwise) and when the page last changed; the reply is done
++ *    when the page has been quiet for [WebProfile.stableMs] and no Stop button shows;
++ *  - CAPTCHA / 2FA / age check / login wall → a plain 「需要你操作」 error that sends the user to 「登录」 (Mines never
++ *    solves those itself).
++ */
++object WebBridge {
++    fun handles(id: String): Boolean = PresetRegistry.webProfile(id) != null
++
++    private val verifyRx = Regex("Human Verification|确认您是人类|人机验证|访问验证|滑动验证|Just a moment|Verify you are human|Checking your browser|" +
++        "two-factor|2-step|两步验证|二次验证|verification code|输入验证码|age verification|verify your age|confirm your age")
++
++    private class Held(val wv: WebView, var used: Long, val url: String)
++    private val held = HashMap<String, Held>()
++
++    @SuppressLint("SetJavaScriptEnabled")
++    private fun newView(context: Context, id: String): WebView {
++        val wv = WebView(context.applicationContext)
++        if (!AccountJar.prepare(wv, id) && id.contains('#')) {
++            runCatching { wv.destroy() }
++            throw MemberError("这台手机的系统 WebView 太旧，第二个账号没法单独隔离：先更新「Android System WebView」")
++        }
++        LoginWeb.configure(wv)
++        wv.webViewClient = WebViewClient()
++        val w = 1080; val h = 2200
++        wv.measure(android.view.View.MeasureSpec.makeMeasureSpec(w, android.view.View.MeasureSpec.EXACTLY),
++            android.view.View.MeasureSpec.makeMeasureSpec(h, android.view.View.MeasureSpec.EXACTLY))
++        wv.layout(0, 0, w, h)
++        return wv
++    }
++
++    private suspend fun eval(wv: WebView, js: String): String = suspendCancellableCoroutine { c ->
++        runCatching {
++            wv.evaluateJavascript(js) { r ->
++                val v = runCatching { org.json.JSONTokener(r ?: "\"\"").nextValue() as? String }.getOrNull().orEmpty()
++                if (c.isActive) c.resume(v)
++            }
++        }.onFailure { if (c.isActive) c.resume("") }
++    }
++
++    private fun urls(spec: AiSpec, id: String): List<String> = listOf(PresetRegistry.webUrl(id).ifBlank { spec.webUrl }) + (PresetRegistry.webProfile(id)?.extraUrls ?: emptyList())
++
++    private suspend fun drop(id: String) {
++        val h = held.remove(id) ?: return
++        AccountJar.saveLocal(id, eval(h.wv, AccountJar.DUMP_LOCAL_JS))
++        runCatching { h.wv.destroy() }
++    }
++
++    private fun sweep() {
++        val now = System.currentTimeMillis()
++        held.entries.filter { now - it.value.used > 600_000 }.toList().forEach { runCatching { it.value.wv.destroy() }; held.remove(it.key) }
++    }
++
++    /** Installs the observer, types the question and presses send. Returns 'ok' / 'noinput' / 'err:…'. */
++    fun sendJs(site: WebChat.Site, q: String): String = """(function(){try{
++function vis(e){if(!e)return false;var r=e.getBoundingClientRect();if(r.width<2||r.height<2)return false;var s=getComputedStyle(e);return s.display!='none'&&s.visibility!='hidden';}
++function pick(sel){if(!sel)return null;var l;try{l=document.querySelectorAll(sel);}catch(e){return null;}var b=null;for(var i=0;i<l.length;i++){if(l[i].disabled||!vis(l[i]))continue;var r=l[i].getBoundingClientRect();if(!b||r.bottom>=b.getBoundingClientRect().bottom)b=l[i];}return b;}
++var q=${JSONObject.quote(q)};var RS=${JSONObject.quote(site.reply)};
++var inp=pick(${JSONObject.quote(site.input)})||pick('textarea')||pick('[contenteditable="true"]');
++if(!inp)return 'noinput';
++var M=window.__mb={q:q,t:Date.now(),last:'',lastNode:null,pre:new WeakSet(),inp:inp};
++try{var ex=document.querySelectorAll(RS||'p');for(var i=0;i<ex.length;i++)M.pre.add(ex[i]);}catch(e){}
++function inInput(n){for(var x=n;x;x=x.parentElement){if(x===inp||x.tagName=='TEXTAREA'||x.isContentEditable)return true;}return false;}
++function block(n){var e=n.nodeType==1?n:n.parentElement;while(e&&e!==document.body){var d=getComputedStyle(e).display;if((d=='block'||d=='flex'||d=='grid'||d=='list-item')&&(e.innerText||'').length>0)return e;e=e.parentElement;}return null;}
++function best(){var c=null;if(RS){try{var l=document.querySelectorAll(RS);for(var i=l.length-1;i>=0;i--){if(!M.pre.has(l[i])&&!inInput(l[i])&&vis(l[i])&&(l[i].innerText||'').trim().length>0){c=l[i];break;}}}catch(e){}}
++ return c;}
++if(window.__mbObs)try{window.__mbObs.disconnect();}catch(e){}
++window.__mbObs=new MutationObserver(function(ms){M.t=Date.now();var c=best();
++ if(!c){for(var i=ms.length-1;i>=0&&!c;i--){var m=ms[i];var ns=m.addedNodes&&m.addedNodes.length?m.addedNodes:[m.target];for(var j=ns.length-1;j>=0;j--){if(inInput(ns[j]))continue;var b=block(ns[j]);if(b&&!inInput(b)){var tx=(b.innerText||'').trim();if(tx.length>0&&tx.indexOf(q.slice(0,40))<0){c=b;break;}}}}}
++ if(c){M.lastNode=c;}
++ if(M.lastNode)M.last=(M.lastNode.innerText||'');});
++window.__mbObs.observe(document.body,{childList:true,subtree:true,characterData:true});
++inp.focus();
++function cur(){return inp.tagName=='TEXTAREA'||inp.tagName=='INPUT'?inp.value:(inp.innerText||'');}
++if(inp.tagName=='TEXTAREA'||inp.tagName=='INPUT'){var proto=inp.tagName=='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;
++Object.getOwnPropertyDescriptor(proto,'value').set.call(inp,q);inp.dispatchEvent(new Event('input',{bubbles:true}));inp.dispatchEvent(new Event('change',{bubbles:true}));}
++else{document.execCommand('selectAll',false,null);document.execCommand('insertText',false,q);
++ if(cur().indexOf(q.slice(0,12))<0){try{var dt=new DataTransfer();dt.setData('text/plain',q);inp.dispatchEvent(new ClipboardEvent('paste',{clipboardData:dt,bubbles:true,cancelable:true}));}catch(e){}}
++ if(cur().trim().length<2){inp.innerText=q;inp.dispatchEvent(new InputEvent('input',{bubbles:true,data:q}));}}
++var tries=0;
++function fire(){var b=pick(${JSONObject.quote(site.send)});
++ if(b&&(b.disabled||b.getAttribute('aria-disabled')=='true'))b=null;
++ if(!b){var bs=document.querySelectorAll('button,[role=button]');for(var i=bs.length-1;i>=0;i--){var x=bs[i];var a=((x.getAttribute('aria-label')||'')+' '+(x.getAttribute('data-testid')||'')+' '+(x.getAttribute('class')||'')+' '+(x.innerText||'')).toLowerCase();
++  if(!x.disabled&&x.getAttribute('aria-disabled')!='true'&&vis(x)&&/send|发送|submit|提交|arrow-up|arrowup/.test(a)){b=x;break;}}}
++ if(b){b.click();M.sent='click';return;}
++ if(++tries<8){setTimeout(fire,350);return;}
++ ['keydown','keypress','keyup'].forEach(function(t){inp.dispatchEvent(new KeyboardEvent(t,{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true}));});M.sent='enter';}
++setTimeout(fire,400);
++return 'ok';}catch(e){return 'err:'+e}})()"""
++
++    /** {text, idle, busy, page}: newest reply text, ms since the page last changed, Stop button shown, page tail. */
++    const val READ_JS = """(function(){try{var M=window.__mb||{};var t=(document.body&&document.body.innerText)||'';var out=M.last||'';
++if(!out&&M.q){var key=M.q.slice(-24);var i=t.lastIndexOf(key);if(i>=0)out=t.slice(i+key.length);}
++var busy=!!document.querySelector('[aria-label*="停止"],[aria-label*="Stop"],[aria-label*="stop"],[data-testid*="stop"],[class*="stop-button"],[class*="stopBtn"]');
++return JSON.stringify({text:out,idle:Date.now()-(M.t||0),busy:busy,page:t.slice(-2500)});}catch(e){return JSON.stringify({text:'',idle:0,busy:false,page:''})}})()"""
++
++    private val baseNoise = setOf("复制", "重新生成", "分享", "编辑", "朗读", "Copy", "Regenerate", "Share", "Edit", "发送", "停止", "Stop", "Retry", "重试")
++
++    fun clean(t: String, noise: Set<String>, question: String): String = t.lines().map { it.trim() }
++        .filter { l -> l.isNotEmpty() && l !in baseNoise && noise.none { n -> l.equals(n, true) || (l.length < 40 && l.startsWith(n, true)) } && l != question.trim() }
++        .joinToString("\n").trim()
++
++    private fun needsUser(name: String, what: String) =
++        MemberError("$name 需要你操作：$what。在「AI 伙伴」里点「登录」，在页面里完成后再试")
++
++    suspend fun ask(context: Context, p: Partner, question: String): AiClient.Reply = AccountJar.lock(p.id).withLock {
++        val prof = PresetRegistry.webProfile(p.id) ?: throw MemberError("不认识这个网页成员")
++        val site = prof.site
++        val name = p.spec.name
++        val url = PresetRegistry.webUrl(p.id).ifBlank { p.base }
++        if (url.isBlank() || !url.startsWith("http")) throw MemberError(if (prof.urlRequired) "$name 还没填网页地址：在「AI 伙伴 › 更多免费接入」里填" else "$name 网页地址不对")
++        withContext(Dispatchers.Main) {
++            sweep()
++            if (!AccountJar.profiles()) held.keys.filter { WebAccounts.site(it) == WebAccounts.site(p.id) && it != p.id }.forEach { drop(it) }
++            AccountJar.activate(p.id, urls(p.spec, p.id))
++            var h = held[p.id]
++            if (h == null || h.url != url) {
++                h?.let { runCatching { it.wv.destroy() } }
++                val wv = newView(context, p.id)
++                wv.loadUrl(url)
++                h = Held(wv, System.currentTimeMillis(), url); held[p.id] = h
++            }
++            h.used = System.currentTimeMillis()
++            val wv = h.wv
++            // 1. classify the page (wall / robot check / chat box)
++            val t0 = System.currentTimeMillis()
++            var st = WebChat.PageState.LOADING; var text = ""
++            while (System.currentTimeMillis() - t0 < 30_000) {
++                delay(1000)
++                val o = runCatching { JSONObject(eval(wv, WebChat.probeJs(site))) }.getOrNull() ?: continue
++                st = WebChat.classify(site, o); text = o.optString("text")
++                if (verifyRx.containsMatchIn(text.take(2000)) && !o.optBoolean("input")) st = WebChat.PageState.VERIFY
++                if (st == WebChat.PageState.SIGNED_IN || st == WebChat.PageState.GUEST) { if (System.currentTimeMillis() - t0 > 3000) break }
++                else if (st != WebChat.PageState.LOADING && System.currentTimeMillis() - t0 > 8000) break
++            }
++            when (st) {
++                WebChat.PageState.VERIFY -> { drop(p.id); throw needsUser(name, if (Regex("age|年龄").containsMatchIn(text)) "年龄验证" else "人机验证 / 两步验证") }
++                WebChat.PageState.LOGIN -> {
++                    drop(p.id); WebChat.markSignedIn(p.id, false)
++                    if (prof.proxyPin == "us" && Regex("not available in your (country|region)").containsMatchIn(text))
++                        throw MemberError("$name 只在美国网络能用：在代理 App 里给 Mines 开美国线路（全局），再试")
++                    throw needsUser(name, "先登录")
++                }
++                WebChat.PageState.LOADING -> { drop(p.id); throw MemberError("$name 网页没打开聊天框（可能改版、网络慢或要开代理），这轮跳过") }
++                WebChat.PageState.GUEST -> { WebChat.markSignedIn(p.id, false); throw needsUser(name, "先登录") }
++                WebChat.PageState.SIGNED_IN -> WebChat.markSignedIn(p.id, true)
++            }
++            // 2. type + send (observer installed first)
++            val s = eval(wv, sendJs(site, question))
++            if (s != "ok") throw MemberError("$name 网页没法输入（$s）")
++            // 3. wait until the page has been quiet long enough and no Stop button shows
++            var last = ""
++            val t1 = System.currentTimeMillis()
++            while (System.currentTimeMillis() - t1 < prof.timeoutMs) {
++                delay(1500)
++                val o = runCatching { JSONObject(eval(wv, READ_JS)) }.getOrNull() ?: continue
++                val txt = clean(o.optString("text"), prof.noise, question)
++                val page = o.optString("page")
++                if (txt.isEmpty() && System.currentTimeMillis() - t1 > 4000) {
++                    if (verifyRx.containsMatchIn(page)) { drop(p.id); throw needsUser(name, "人机验证 / 两步验证") }
++                    if (site.wall?.containsMatchIn(page) == true) { drop(p.id); WebChat.markSignedIn(p.id, false); throw needsUser(name, "先登录") }
++                }
++                if (txt.isNotEmpty()) last = txt
++                if (last.isNotEmpty() && !o.optBoolean("busy") && o.optLong("idle") >= prof.stableMs) break
++            }
++            h.used = System.currentTimeMillis()
++            AccountJar.saveLocal(p.id, eval(wv, AccountJar.DUMP_LOCAL_JS))
++            AccountJar.remember(p.id, urls(p.spec, p.id))
++            LoginWeb.flush()
++            if (last.isBlank()) throw MemberError("$name ${prof.timeoutMs / 60_000} 分钟内没回复，这轮跳过")
++            AiClient.Reply(last.take(6000), model = "网页版")
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/WebChat.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/WebChat.kt
+index 4e7078d..84b98eb 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/group/WebChat.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/group/WebChat.kt
+@@ -73,7 +73,7 @@ object WebChat {
+             loggedOut = "a[href*='sign-in'],a[href*='/sign-up']"),
+     )
+ 
+-    fun site(id: String): Site = sites[WebAccounts.site(id)] ?: Site()
++    fun site(id: String): Site = sites[WebAccounts.site(id)] ?: PresetRegistry.webSite(id) ?: Site()  // [Mines-38.8] registry bridges
+     fun guestOk(id: String) = site(id).guestOk
+ 
+     /** The domains whose cookies make up one account's session (for [AccountJar] swaps / sign-out). */
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/group/GroupScreens.kt b/src/android/app/src/main/java/com/openminis/app/ui/group/GroupScreens.kt
+index 9e32ad4..ce38e35 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/group/GroupScreens.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/group/GroupScreens.kt
+@@ -278,6 +278,7 @@ private fun statusLine(p: Partner): String = when {
+ private fun fixLabel(p: Partner): String = when {
+     p.spec.proto == Proto.WEBAPP -> "登录"
+     p.reason?.contains("重新登录") == true -> "重新登录"
++    com.openminis.app.plus.group.PresetRegistry.fixLabel(p.id) != null -> com.openminis.app.plus.group.PresetRegistry.fixLabel(p.id)!!  // [Mines-38.8]
+     p.spec.proto == Proto.MINES -> "去设置"
+     p.spec.vaultKind != null -> "连接"
+     else -> "怎么接"
+@@ -339,6 +340,8 @@ fun PartnersScreen(onBack: () -> Unit, go: (String) -> Unit = {}) {
+     // [Mines-38.7] arriving from 新建群聊 「怎么接」: no dialog on top of AI 伙伴 (testers read it as a "Muse dialog");
+     // the member's row is tinted and its explanation opens inline under it
+     var howto by remember { mutableStateOf<String?>(PartnersNav.open) }
++    // [Mines-38.8] Muse 中继 / Memoh sign in with their own one-step-at-a-time dialog (also when arriving from 新建群聊)
++    var presetLogin by remember { mutableStateOf(PartnersNav.open?.takeIf { com.openminis.app.plus.group.PresetRegistry.ownLogin(it) }) }
+     LaunchedEffect(Unit) { PartnersNav.open = null }
+ 
+     PlusPage("AI 伙伴", onBack, subtitle = "智能体和你登录过的 AI App；点「聊天」直接聊，也能拉进群",
+@@ -353,7 +356,7 @@ fun PartnersScreen(onBack: () -> Unit, go: (String) -> Unit = {}) {
+                 Column(if (open) Modifier.background(m.container.copy(alpha = 0.45f)) else Modifier) {
+                     PartnerRow(p, onClick = { info = p }, trailing = {
+                         if (p.ready) ActionPill("聊天") { chat(p) }
+-                        else ActionPill(fixLabel(p)) { fixPartner(p, go) { howto = if (open) null else p.id } }
++                        else ActionPill(fixLabel(p)) { if (com.openminis.app.plus.group.PresetRegistry.ownLogin(p.id)) presetLogin = p.id else fixPartner(p, go) { howto = if (open) null else p.id } }
+                     })
+                     if (open && !p.ready) HowToInline(p, onManual = { edit = p })
+                 }
+@@ -435,10 +438,11 @@ fun PartnersScreen(onBack: () -> Unit, go: (String) -> Unit = {}) {
+                 PlusRow(icon("plus"), "添加自己的接口", "自建中继、公司网关") { addCustom = true }
+             }
+         }
++        PresetExtrasSection(go)  // [Mines-38.8] Muse 网页版 switch, bridge addresses, Mines × Muse group
+     }
+ 
+     info?.let { p -> PartnerInfoDialog(p, onDismiss = { info = null }, onChat = { info = null; chat(p) },
+-        onFix = { info = null; fixPartner(p, go) { edit = p } },
++        onFix = { info = null; if (com.openminis.app.plus.group.PresetRegistry.ownLogin(p.id)) presetLogin = p.id else fixPartner(p, go) { edit = p } },
+         // [Mines-38.7] several accounts per web app, each isolated; sign one out without touching the others
+         onAddAccount = if (p.spec.proto == Proto.WEBAPP) ({ info = null; go(GroupRoutes.webLogin(WebAccounts.add(WebAccounts.site(p.id)))); Unit }) else null,
+         onSignOut = if (p.spec.proto == Proto.WEBAPP && p.ready) ({ info = null; scope.launch { WebChat.signOut(p.spec, p.id); Partners.refresh(ctx) }; Unit }) else null,
+@@ -446,6 +450,7 @@ fun PartnersScreen(onBack: () -> Unit, go: (String) -> Unit = {}) {
+     edit?.let { p ->
+         PartnerEditDialog(p, onDismiss = { edit = null }, onSaved = { edit = null; reload() })
+     }
++    presetLogin?.let { id -> partners.firstOrNull { it.id == id }?.let { p -> PresetLoginDialog(p, onDismiss = { presetLogin = null }, onDone = { presetLogin = null; reload() }) } }
+     askPhone?.let { p ->
+         com.openminis.app.ui.plus.MinesDialog("开启「${p.spec.name}」代打字？", onDismiss = { askPhone = null },
+             confirm = "开启", onConfirm = { GroupPrefs.setPhoneOn(p.id, true); askPhone = null; reload() }, dismiss = "先不用") {
+@@ -586,7 +591,11 @@ fun WebAppLoginScreen(id: String, onBack: () -> Unit) {
+                 }
+                 Spacer(Modifier.width(8.dp))
+             }
+-            Text(note, fontSize = MT.Body, lineHeight = MT.BodyLH, color = m.ink, modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)
++            // [Mines-38.8] note as one frosted-glass strip (no bare text on the fog band)
++            Text(note, fontSize = MT.Sub, lineHeight = MT.SubLH, color = m.ink, maxLines = 2, overflow = TextOverflow.Ellipsis,
++                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp).fillMaxWidth()
++                .clip(RoundedCornerShape(16.dp)).background(com.openminis.app.ui.plus.glassVeil())
++                .border(1.dp, m.glassBorder, RoundedCornerShape(16.dp)).padding(horizontal = 14.dp, vertical = 11.dp)
+                 .semantics { contentDescription = note })
+             // [Mines-38.7 v11d] smoke 38758822905: the sign-in screen still caught blank. The page is shown at its first frame or
+             // 1.2 s at the latest, and a spinner sits on the backdrop until then: never an empty area.
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/group/PresetLogin.kt b/src/android/app/src/main/java/com/openminis/app/ui/group/PresetLogin.kt
+new file mode 100644
+index 0000000..a21e92e
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/group/PresetLogin.kt
+@@ -0,0 +1,186 @@
++package com.openminis.app.ui.group
++
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.text.KeyboardOptions
++import androidx.compose.material3.CircularProgressIndicator
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.Switch
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.input.KeyboardType
++import androidx.compose.ui.text.input.PasswordVisualTransformation
++import androidx.compose.ui.unit.dp
++import com.openminis.app.plus.group.GroupPrefs
++import com.openminis.app.plus.group.LoginFlow
++import com.openminis.app.plus.group.MultiAgentGroup
++import com.openminis.app.plus.group.Partner
++import com.openminis.app.plus.group.Partners
++import com.openminis.app.plus.group.PresetAuth
++import com.openminis.app.plus.group.PresetPartners
++import com.openminis.app.plus.group.PresetRegistry
++import com.openminis.app.ui.plus.GlassTextButton
++import com.openminis.app.ui.plus.MT
++import com.openminis.app.ui.plus.MinesDesign
++import com.openminis.app.ui.plus.MinesDialog
++import com.openminis.app.ui.plus.PlusRow
++import com.openminis.app.ui.plus.PlusSection
++import com.openminis.app.ui.plus.mines
++import kotlinx.coroutines.launch
++
++/**
++ * [Mines-38.8] Sign-in for the registry's login-flow presets, one simple step at a time (user is partially sighted):
++ *  - Muse 中继 (nanoMuse): 邮箱 → 「发验证码」 → 验证码 → 「登录」 (the relay prints the code in its server log; Hark can read
++ *    it there and tell the user) → nm_ key stored;
++ *  - Memoh: 服务器地址 + 用户名 + 密码 → 「登录」 → the account's bots become members.
++ */
++@Composable
++fun PresetLoginDialog(p: Partner, onDismiss: () -> Unit, onDone: () -> Unit) {
++    when (PresetRegistry.loginFlowOf(p.id)) {
++        is LoginFlow.RelayCode -> RelayCodeDialog(onDismiss, onDone)
++        is LoginFlow.PasswordJwt -> MemohLoginDialog(onDismiss, onDone)
++        else -> androidx.compose.runtime.LaunchedEffect(p.id) { onDismiss() }
++    }
++}
++
++@Composable
++private fun Busy(text: String) {
++    val m = mines()
++    Row(verticalAlignment = Alignment.CenterVertically) {
++        CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp); Spacer(Modifier.width(8.dp))
++        Text(text, fontSize = MT.Sub, color = m.ink2)
++    }
++}
++
++@Composable
++private fun RelayCodeDialog(onDismiss: () -> Unit, onDone: () -> Unit) {
++    val m = mines()
++    val ctx = LocalContext.current
++    val scope = rememberCoroutineScope()
++    var email by remember { mutableStateOf(PresetAuth.relayEmail() ?: "") }
++    var code by remember { mutableStateOf("") }
++    var sent by remember { mutableStateOf(false) }
++    var busy by remember { mutableStateOf(false) }
++    var msg by remember { mutableStateOf<String?>(null) }
++    val signedIn = PresetAuth.key("nanomuse") != null
++    MinesDialog("登录 Muse 中继", onDismiss = onDismiss,
++        confirm = if (!sent) "发验证码" else "登录", confirmEnabled = !busy && (if (!sent) email.contains('@') else code.trim().length >= 4),
++        onConfirm = {
++            busy = true; msg = null
++            scope.launch {
++                if (!sent) {
++                    val r = PresetAuth.relayRequestCode(email)
++                    busy = false
++                    if (r.isSuccess) { sent = true; msg = "验证码已发出。私人中继会把它写在服务器日志里：让 Hark 帮你读，或自己看日志，然后填在下面" }
++                    else msg = r.exceptionOrNull()?.message ?: "没发出去"
++                } else {
++                    val r = PresetAuth.relayVerify(email, code)
++                    busy = false
++                    if (r.isSuccess) { Partners.refresh(ctx); onDone() } else msg = r.exceptionOrNull()?.message ?: "没登录上"
++                }
++            }
++        }) {
++        Text(if (signedIn) "已经登录过。重新登录会换一个新密钥。" else "第 1 步：填你在中继里的邮箱，点「发验证码」。",
++            fontSize = MT.Body, lineHeight = MT.BodyLH, color = m.ink)
++        OutlinedTextField(email, { email = it.trim() }, singleLine = true, enabled = !sent, modifier = Modifier.fillMaxWidth(),
++            label = { Text("邮箱") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email))
++        if (sent) {
++            Text("第 2 步：填 6 位验证码，点「登录」。", fontSize = MT.Body, lineHeight = MT.BodyLH, color = m.ink)
++            OutlinedTextField(code, { code = it.filter { c -> c.isLetterOrDigit() }.take(8) }, singleLine = true, modifier = Modifier.fillMaxWidth(),
++                label = { Text("验证码") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
++            GlassTextButton("重新发验证码") { sent = false; code = "" }
++        }
++        if (busy) Busy(if (!sent) "正在请中继发验证码…" else "正在登录…")
++        msg?.let { Text(it, fontSize = MT.Sub, lineHeight = MT.SubLH, color = if (it.startsWith("验证码已发出")) m.ink2 else MinesDesign.Danger) }
++        if (signedIn) GlassTextButton("退出中继", color = MinesDesign.Danger) { PresetAuth.relaySignOut(); scope.launch { Partners.refresh(ctx) }; onDone() }
++    }
++}
++
++@Composable
++private fun MemohLoginDialog(onDismiss: () -> Unit, onDone: () -> Unit) {
++    val m = mines()
++    val ctx = LocalContext.current
++    val scope = rememberCoroutineScope()
++    var url by remember { mutableStateOf(PresetAuth.memohBase()?.removeSuffix("/api") ?: "") }
++    var user by remember { mutableStateOf(PresetAuth.memohUser() ?: "") }
++    var pass by remember { mutableStateOf("") }
++    var busy by remember { mutableStateOf(false) }
++    var msg by remember { mutableStateOf<String?>(null) }
++    val signedIn = PresetAuth.key(PresetRegistry.MEMOH) != null
++    MinesDialog("登录 Memoh", onDismiss = onDismiss, confirm = "登录",
++        confirmEnabled = !busy && url.isNotBlank() && user.isNotBlank() && pass.isNotEmpty(),
++        onConfirm = {
++            busy = true; msg = null
++            scope.launch {
++                val r = PresetAuth.memohLogin(url, user, pass)
++                if (r.isFailure) { busy = false; msg = r.exceptionOrNull()?.message ?: "没登录上"; return@launch }
++                val bots = PresetPartners.memohBots()
++                busy = false
++                Partners.refresh(ctx)
++                val n = bots.getOrNull()?.size ?: 0
++                if (n > 0) onDone() else msg = bots.exceptionOrNull()?.message ?: "登录好了，但 Memoh 里还没有机器人：在 Memoh 建一个，回来自动出现"
++            }
++        }) {
++        Text("填你打开 Memoh 网页的地址和账号。", fontSize = MT.Body, lineHeight = MT.BodyLH, color = m.ink)
++        OutlinedTextField(url, { url = it.trim() }, singleLine = true, modifier = Modifier.fillMaxWidth(), label = { Text("服务器地址") },
++            placeholder = { Text("http://你的服务器") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri))
++        OutlinedTextField(user, { user = it }, singleLine = true, modifier = Modifier.fillMaxWidth(), label = { Text("用户名") })
++        OutlinedTextField(pass, { pass = it }, singleLine = true, modifier = Modifier.fillMaxWidth(), label = { Text("密码") },
++            visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password))
++        if (busy) Busy("正在登录…")
++        msg?.let { Text(it, fontSize = MT.Sub, lineHeight = MT.SubLH, color = MinesDesign.Danger) }
++        if (signedIn) GlassTextButton("退出 Memoh", color = MinesDesign.Danger) { PresetAuth.memohSignOut(); scope.launch { Partners.refresh(ctx) }; onDone() }
++    }
++}
++
++/**
++ * [Mines-38.8] 「更多免费接入」 at the bottom of AI 伙伴: Muse 网页版 switch (US network + age check), web addresses of the
++ * bridge apps, and one tap to start the Mines × Muse multi-agent group.
++ */
++@Composable
++fun PresetExtrasSection(go: (String) -> Unit) {
++    val ctx = LocalContext.current
++    val scope = rememberCoroutineScope()
++    var muse by remember { mutableStateOf(PresetRegistry.museOn()) }
++    var editUrl by remember { mutableStateOf<String?>(null) }
++    var making by remember { mutableStateOf(false) }
++    PlusSection("更多免费接入", footer = "都不用付费密钥：登录账号就行。Muse 网页版只在美国网络能用，年龄验证要你自己在登录页里完成。") {
++        PlusRow(null, "建一个 Mines × Muse 群", if (making) "正在建…" else "Mines、Muse 中继和你已连接的智能体在一个群里，共用同一段上下文") {
++            if (making) return@PlusRow
++            making = true
++            scope.launch { val gid = MultiAgentGroup.ensure(ctx); making = false; go(GroupRoutes.chat(gid)) }
++        }
++        PlusRow(null, "Meta Muse 网页版", if (muse) "已打开 · 需要美国网络" else "默认关闭：我在美国网络下使用时再打开", chevron = false, trailing = {
++            Switch(muse, { on -> muse = on; PresetRegistry.setMuseOn(on); scope.launch { Partners.refresh(ctx) } })
++        })
++        val bridges = (listOf("web:hark", "web:manus") + if (muse) listOf("web:muse") else emptyList()).mapNotNull { PresetRegistry.preset(it) }
++        bridges.forEach { p ->
++            PlusRow(null, "${p.name} 网页地址", PresetRegistry.webUrl(p.id).ifBlank { "还没填" }) { editUrl = p.id }
++        }
++    }
++    editUrl?.let { id ->
++        val m = mines()
++        var v by remember(id) { mutableStateOf(PresetRegistry.webUrl(id)) }
++        MinesDialog("网页地址", onDismiss = { editUrl = null }, confirm = "保存", confirmEnabled = v.isBlank() || v.startsWith("http"),
++            onConfirm = {
++                GroupPrefs.put("base_$id", v.trim().ifBlank { null })
++                editUrl = null
++                scope.launch { Partners.refresh(ctx) }
++            }) {
++            Text("填你在浏览器里打开聊天的地址（以 https:// 开头）。留空用默认。", fontSize = MT.Body, lineHeight = MT.BodyLH, color = m.ink)
++            OutlinedTextField(v, { v = it.trim() }, singleLine = true, modifier = Modifier.fillMaxWidth(), label = { Text("地址") },
++                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri))
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
+index b529a74..1b36dcf 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
+@@ -86,13 +86,15 @@ fun DigestScreen(onBack: () -> Unit) {
+     val vault by com.openminis.app.plus.PlusVault.entries.collectAsState()
+     val scope = rememberCoroutineScope()
+     // [Mines-feed-35.1] tab by name ("ALL" = 全部); null = not chosen yet → X when it has items
+-    var tabSel by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf<String?>(null) }
++    var tabSel by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf<String?>(PlusNav.digestTab.also { PlusNav.digestTab = null }) }
+     val snack = remember { androidx.compose.material3.SnackbarHostState() }
+     var menuFor by remember { mutableStateOf<Digest.Item?>(null) }
+     var whyFor by remember { mutableStateOf<Digest.Item?>(null) }
+     var detailFor by remember { mutableStateOf<Digest.Item?>(null) }
+     var editFollows by remember { mutableStateOf(false) }
+     var xTick by remember { mutableStateOf(0) }
++    var mailTick by remember { mutableStateOf(0) }   // [Mines-38.8] 邮箱 pull-to-refresh
++    val mailBusy by com.openminis.app.plus.MailInbox.busy.collectAsState()
+     var resumes by remember { mutableStateOf(0) }
+     val owner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+     androidx.compose.runtime.DisposableEffect(owner) {
+@@ -139,7 +141,8 @@ fun DigestScreen(onBack: () -> Unit) {
+             topBar = {
+                 // [Mines-warm-36] design36warm 03: back · face + name plate · 关注设置
+                 WarmHeader(
+-                    status = if (busy) "正在替你看 X 和 GitHub" else "替你看着 X 和 GitHub",
++                    status = if (curTab == MAIL_TAB) (if (mailBusy) "正在读你的邮箱" else "替你看着 ${com.openminis.app.plus.MailInbox.accounts.collectAsState().value.size.takeIf { it > 0 }?.let { "$it 个" } ?: ""}邮箱")
++                        else if (busy) "正在替你看 X 和 GitHub" else "替你看着 X 和 GitHub",
+                     modifier = Modifier.background(androidx.compose.ui.graphics.Brush.verticalGradient(listOf(mines().bg.copy(alpha = 0.96f), mines().bg.copy(alpha = 0.90f), mines().bg.copy(alpha = 0f))))
+                         .statusBarsPadding().padding(bottom = 2.dp),
+                     leading = { WarmRoundButton(Icons.AutoMirrored.Filled.ArrowBack, "返回", onClick = onBack) },
+@@ -159,7 +162,7 @@ fun DigestScreen(onBack: () -> Unit) {
+         ) { pad ->
+           // [Mines-feed-32] pull down to refresh (no big 刷新 button)
+           androidx.compose.material3.pulltorefresh.PullToRefreshBox(
+-            isRefreshing = busy, onRefresh = { scope.launch { Digest.refresh(context) }; xTick++ },
++            isRefreshing = busy || (curTab == MAIL_TAB && mailBusy), onRefresh = { if (curTab == MAIL_TAB) mailTick++ else { scope.launch { Digest.refresh(context) }; xTick++ } },
+             modifier = Modifier.fillMaxSize().padding(pad),
+           ) {
+             androidx.compose.foundation.lazy.LazyColumn(
+@@ -175,15 +178,21 @@ fun DigestScreen(onBack: () -> Unit) {
+                         todo.take(3).joinToString(" · ") { t -> feedClean(t.headline) ?: feedClean(t.title) ?: t.source },
+                         onClick = { tabSel = Digest.Tab.ACCOUNT.name },
+                     )
+-                    val tabs = listOf(WarmTab(FOR_YOU, "为你推荐", 0)) + listOf(Digest.Tab.ACCOUNT, Digest.Tab.X, Digest.Tab.GITHUB, Digest.Tab.DEAL).map { t ->
++                    // [Mines-38.8] 「邮箱」 right after 为你推荐: every signed-in mailbox in one inbox
++                    val mailAccts by com.openminis.app.plus.MailInbox.accounts.collectAsState()
++                    @Suppress("UNUSED_VARIABLE") val mailStates by com.openminis.app.plus.MailInbox.states.collectAsState()
++                    val tabs = listOf(WarmTab(FOR_YOU, "为你推荐", 0), WarmTab(MAIL_TAB, "邮箱", if (mailAccts.isEmpty()) 0 else com.openminis.app.plus.MailInbox.unreadTotal())) + listOf(Digest.Tab.ACCOUNT, Digest.Tab.X, Digest.Tab.GITHUB, Digest.Tab.DEAL).map { t ->
+                         WarmTab(t.name, t.label, items.count { tabOf(it) == t }, danger = t == Digest.Tab.ACCOUNT)
+                     } + (items.count { it.tab == Digest.Tab.OTHER }.takeIf { it > 0 }?.let { listOf(WarmTab(Digest.Tab.OTHER.name, "其他", it)) } ?: emptyList())
+                     WarmTabs(tabs, curTab, onSelect = { k -> tabSel = k })
+                     feedClean(Digest.lastError)?.let { Text(it, fontSize = 12.sp, color = mines().ink3, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                         modifier = Modifier.padding(horizontal = 24.dp)) }
+                 }
+-                val shown = (if (curTab == "ALL" || curTab == FOR_YOU) items else items.filter { tabOf(it).name == curTab }).take(80)
+-                if (shown.isEmpty() && !busy) item(key = "empty") {
++                if (curTab == MAIL_TAB) item(key = "mailbox") {
++                    MailboxPane(mailTick, onOpenWeb = { u -> onBack(); PlusNav.openBrowser.value = u })
++                }
++                val shown = if (curTab == MAIL_TAB) emptyList() else (if (curTab == "ALL" || curTab == FOR_YOU) items else items.filter { tabOf(it).name == curTab }).take(80)
++                if (shown.isEmpty() && !busy && curTab != MAIL_TAB) item(key = "empty") {
+                     Text(when (curTab) {
+                         Digest.Tab.X.name -> "X 上暂时没有新消息。右上角「关注设置」可以加要关注的人和话题"
+                         Digest.Tab.ACCOUNT.name -> "账号都正常，没有要你处理的异常"
+@@ -217,7 +226,7 @@ fun DigestScreen(onBack: () -> Unit) {
+                         }
+                     }
+                 }
+-                item(key = "add_sources") {
++                if (curTab != MAIL_TAB) item(key = "add_sources") {
+                     @Suppress("UNUSED_EXPRESSION") resumes
+                     @Suppress("UNUSED_EXPRESSION") vault
+                     val rows = com.openminis.app.plus.AutoSources.missing(context)
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/LinkAll.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/LinkAll.kt
+index f69ee42..ede6065 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/LinkAll.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/LinkAll.kt
+@@ -242,6 +242,8 @@ private fun BigText(t: String, size: Int = 20, weight: FontWeight = FontWeight.S
+ fun LinkAllScreen(onBack: () -> Unit, go: (String) -> Unit) {
+     val ctx = androidx.compose.ui.platform.LocalContext.current
+     remember { GroupPrefs.init(ctx); 0 }
++    // [Mines-38.8] keep a warm WebView engine while 一键关联 walks through the sign-in pages
++    remember { com.openminis.app.browser.WebPrewarm.warm(ctx, keepMs = 120_000L, again = true); 0 }
+     var tick by remember { mutableIntStateOf(0) }
+     var paused by remember { mutableStateOf(false) }
+     var last by remember { mutableStateOf<String?>(null) }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/MailboxPane.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/MailboxPane.kt
+new file mode 100644
+index 0000000..cac0686
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/MailboxPane.kt
+@@ -0,0 +1,346 @@
++package com.openminis.app.ui.plus
++
++import androidx.compose.foundation.background
++import androidx.compose.foundation.border
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.combinedClickable
++import androidx.compose.foundation.horizontalScroll
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.foundation.text.KeyboardOptions
++import androidx.compose.material3.CircularProgressIndicator
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.OutlinedTextFieldDefaults
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.semantics.Role
++import androidx.compose.ui.semantics.contentDescription
++import androidx.compose.ui.semantics.role
++import androidx.compose.ui.semantics.semantics
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.input.KeyboardType
++import androidx.compose.ui.text.input.PasswordVisualTransformation
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import com.openminis.app.plus.MailInbox
++import kotlinx.coroutines.launch
++
++/** [Mines-38.8] 消息 → 「邮箱」 tab key. */
++const val MAIL_TAB = "MAIL"
++
++/**
++ * [Mines-38.8] 消息 → 邮箱: every signed-in mailbox in one frosted-glass inbox (user 2026-10-15: Gmail + several 163,
++ * 毛玻璃, no grid). Account chips → one grouped glass card per day group → detail sheet. Add = real IMAP login first.
++ */
++@Composable
++fun MailboxPane(refreshTick: Int, onOpenWeb: (String) -> Unit) {
++    val ctx = LocalContext.current
++    val m = mines()
++    val scope = rememberCoroutineScope()
++    val accounts by MailInbox.accounts.collectAsState()
++    val mails by MailInbox.mails.collectAsState()
++    val states by MailInbox.states.collectAsState()
++    val busy by MailInbox.busy.collectAsState()
++    var sel by remember { mutableStateOf<String?>(null) }
++    var open by remember { mutableStateOf<MailInbox.Mail?>(null) }
++    var adding by remember { mutableStateOf(false) }
++    var manage by remember { mutableStateOf<MailInbox.Account?>(null) }
++    LaunchedEffect(refreshTick) { MailInbox.load(ctx); MailInbox.refresh(ctx, force = refreshTick > 0) }
++
++    Column(Modifier.fillMaxWidth()) {
++        if (accounts.isEmpty()) {
++            EmptyMailbox(onAdd163 = { adding = true }, onGmail = { gmailLogin() })
++        } else {
++            // account chips: 全部 + one per mailbox (unread count; a red dot when the box needs attention)
++            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 4.dp),
++                horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
++                MailChip("全部", MailInbox.unreadTotal(), sel == null, false) { sel = null }
++                accounts.forEach { a ->
++                    val st = states[a.id]
++                    MailChip(shortAddr(a), st?.unread ?: 0, sel == a.id, st?.st == MailInbox.St.AUTH || st?.st == MailInbox.St.NET,
++                        onLong = { manage = a }) { sel = if (sel == a.id) null else a.id }
++                }
++            }
++            // problems: one glass strip per broken mailbox, tap = fix (never shown as connected)
++            accounts.filter { a -> states[a.id]?.st == MailInbox.St.AUTH || states[a.id]?.st == MailInbox.St.NET }
++                .filter { sel == null || it.id == sel }.forEach { a ->
++                    val st = states[a.id]!!
++                    GlassStrip(text = "${shortAddr(a)}：${st.msg}", danger = st.st == MailInbox.St.AUTH,
++                        action = if (st.st == MailInbox.St.AUTH) (if (a.id == "gmail_web") "重新登录" else "重新填写") else "重试") {
++                        when {
++                            st.st != MailInbox.St.AUTH -> scope.launch { MailInbox.refresh(ctx, force = true) }
++                            a.id == "gmail_web" -> gmailLogin()
++                            else -> { manage = null; adding = true; MailAddPrefill.prefill = a.address }
++                        }
++                    }
++                }
++            val shown = mails.filter { sel == null || it.accountId == sel }
++            val checking = states.values.any { it.st == MailInbox.St.CHECKING } || busy
++            if (shown.isEmpty()) {
++                Text(if (checking) "正在读收件箱…" else "收件箱里暂时没有邮件，下拉刷新", fontSize = MT.Caption, color = m.ink2,
++                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 18.dp))
++            }
++            val now = System.currentTimeMillis()
++            val startOfDay = java.util.Calendar.getInstance().apply { set(java.util.Calendar.HOUR_OF_DAY, 0); set(java.util.Calendar.MINUTE, 0); set(java.util.Calendar.SECOND, 0) }.timeInMillis
++            val groups = shown.take(80).groupBy { when { it.at >= startOfDay -> "今天"; now - it.at < 7 * 86_400_000L -> "本周"; else -> "更早" } }
++            listOf("今天", "本周", "更早").forEach { g ->
++                val list = groups[g] ?: return@forEach
++                Row(Modifier.fillMaxWidth().padding(start = 24.dp, end = 24.dp, top = 12.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
++                    Text(g, fontSize = MT.Section, fontWeight = FontWeight.SemiBold, color = m.ink2, modifier = Modifier.weight(1f))
++                    if (g == groups.keys.first()) Text(if (checking) "正在读…" else "只读 · 不会标成已读", fontSize = MT.Meta, color = m.ink3)
++                }
++                GlassCard(Modifier.fillMaxWidth().padding(horizontal = 16.dp), shape = RoundedCornerShape(MS.CardRadius), elevation = 3.dp) {
++                    Column {
++                        list.forEachIndexed { i, mail ->
++                            if (i > 0) Box(Modifier.fillMaxWidth().padding(start = 68.dp).height(1.dp).background(m.hairline))
++                            MailRow(mail, showAccount = sel == null && accounts.size > 1) { open = mail }
++                        }
++                    }
++                }
++            }
++        }
++        // 「＋ 添加邮箱」: faint row at the end, like 「＋ 添加来源」
++        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp).clip(RoundedCornerShape(14.dp))
++            .clickable { MailAddPrefill.prefill = null; adding = true }.heightIn(min = 44.dp).padding(horizontal = 12.dp)
++            .semantics(mergeDescendants = true) { contentDescription = "添加邮箱"; role = Role.Button },
++            verticalAlignment = Alignment.CenterVertically) {
++            Text("＋ 添加邮箱", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = m.primaryText)
++            Spacer(Modifier.width(8.dp))
++            Text("163 / 126 / QQ 用授权码 · Gmail 在 Mines 内登录", fontSize = 12.sp, color = m.ink3, maxLines = 1, overflow = TextOverflow.Ellipsis)
++        }
++    }
++
++    open?.let { mail -> MailDetail(mail, onDismiss = { open = null }, onOpenWeb = onOpenWeb) }
++    if (adding) MailAdd(onDismiss = { adding = false }, onOpenWeb = onOpenWeb, onAdded = { adding = false; scope.launch { MailInbox.refresh(ctx, force = true) } })
++    manage?.let { a ->
++        MinesSheet(onDismiss = { manage = null }) {
++            Text(a.address, fontSize = MT.Body, fontWeight = FontWeight.SemiBold, color = m.ink, modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp))
++            Text("${a.provider} · ${a.how}", fontSize = MT.Sub, color = m.ink2, modifier = Modifier.padding(horizontal = 24.dp))
++            Spacer(Modifier.height(8.dp))
++            GlassMenuRow("重新读一次", WarmIcons.of("refresh-cw")) { manage = null; scope.launch { MailInbox.refresh(ctx, force = true) } }
++            if (a.id != "gmail_web") GlassMenuRow("换授权码", WarmIcons.of("key-round")) { manage = null; MailAddPrefill.prefill = a.address; adding = true }
++            if (a.id != "gmail_web") GlassMenuRow("从邮箱里移除", WarmIcons.of("trash"), danger = true) { manage = null; MailInbox.remove(ctx, a.id); if (sel == a.id) sel = null }
++        }
++    }
++}
++
++private fun gmailLogin() {
++    // the Gmail connection's own in-app sign-in page (own cookie store, Google's account page — never an external browser)
++    PlusNav.openLogin = "gmail"; PlusNav.go(PlusRoutes.CONNECTIONS)
++}
++
++private fun shortAddr(a: MailInbox.Account): String {
++    if (!a.address.contains('@')) return a.address
++    val local = a.address.substringBefore('@')
++    val dom = a.address.substringAfter('@')
++    return (if (local.length > 12) local.take(11) + "…" else local) + "@" + dom.substringBefore('.')
++}
++
++private fun providerTint(p: String): Pair<Color, Color> = when (p) {   // (letter, tile) — warm family, no neon
++    "Gmail" -> Color(0xFFB3362B) to Color(0x1FB3362B)
++    "163", "126", "yeah" -> Color(0xFFB5532F) to Color(0x1FB5532F)
++    "QQ" -> Color(0xFF2F6FB5) to Color(0x1F2F6FB5)
++    else -> Color(0xFF6B5E55) to Color(0x1F6B5E55)
++}
++
++@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
++@Composable
++private fun MailChip(label: String, count: Int, on: Boolean, alert: Boolean, onLong: (() -> Unit)? = null, onClick: () -> Unit) {
++    val m = mines()
++    val shape = RoundedCornerShape(50)
++    Row(Modifier.heightIn(min = 40.dp).clip(shape).background(if (on) m.ink else minesGlassFill(strong = true))
++        .border(1.dp, if (on) Color.Transparent else m.glassBorder, shape)
++        .combinedClickable(onClick = onClick, onLongClick = onLong)
++        .semantics(mergeDescendants = true) { contentDescription = if (count > 0) "$label，$count 封未读" else label; role = Role.Tab }
++        .padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
++        if (alert) { Box(Modifier.size(7.dp).clip(CircleShape).background(if (m.dark) MinesDesign.DangerDark else MinesDesign.Danger)); Spacer(Modifier.width(5.dp)) }
++        Text(label, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = if (on) m.bg else m.ink, maxLines = 1, softWrap = false)
++        if (count > 0) { Spacer(Modifier.width(4.dp)); Text(count.toString(), fontSize = 12.sp, fontWeight = FontWeight.Medium, color = if (on) m.bg.copy(alpha = 0.85f) else m.ink2, maxLines = 1, softWrap = false) }
++    }
++}
++
++@Composable
++private fun GlassStrip(text: String, danger: Boolean, action: String, onClick: () -> Unit) {
++    val m = mines()
++    val shape = RoundedCornerShape(16.dp)
++    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp).clip(shape).background(glassVeil()).border(1.dp, m.glassBorder, shape)
++        .clickable(onClick = onClick).heightIn(min = 48.dp).padding(start = 14.dp, end = 6.dp)
++        .semantics(mergeDescendants = true) { contentDescription = "$text，$action"; role = Role.Button },
++        verticalAlignment = Alignment.CenterVertically) {
++        Box(Modifier.size(8.dp).clip(CircleShape).background(if (danger) (if (m.dark) MinesDesign.DangerDark else MinesDesign.Danger) else m.ink3))
++        Spacer(Modifier.width(10.dp))
++        Text(text, fontSize = MT.Sub, lineHeight = MT.SubLH, color = m.ink, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
++        Text(action, fontSize = MT.Sub, fontWeight = FontWeight.SemiBold, color = m.primaryText, maxLines = 1, softWrap = false,
++            modifier = Modifier.padding(horizontal = 8.dp))
++    }
++}
++
++@Composable
++private fun MailRow(mail: MailInbox.Mail, showAccount: Boolean, onClick: () -> Unit) {
++    val m = mines()
++    val (fg, tile) = providerTint(mail.provider)
++    val name = mail.from.ifBlank { mail.fromAddr.ifBlank { "（未知发件人）" } }
++    Row(Modifier.fillMaxWidth().clickable(onClick = onClick).heightIn(min = 84.dp).padding(horizontal = 14.dp, vertical = 12.dp)
++        .semantics(mergeDescendants = true) { contentDescription = (if (mail.unread) "未读，" else "") + "$name：${mail.subject}" },
++        verticalAlignment = Alignment.Top) {
++        Box(Modifier.size(40.dp).clip(RoundedCornerShape(12.dp)).background(tile), contentAlignment = Alignment.Center) {
++            Text(name.trim().take(1).uppercase(), fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = fg)
++        }
++        Spacer(Modifier.width(12.dp))
++        Column(Modifier.weight(1f)) {
++            Row(verticalAlignment = Alignment.CenterVertically) {
++                if (mail.unread) { Box(Modifier.size(8.dp).clip(CircleShape).background(m.primary)); Spacer(Modifier.width(6.dp)) }
++                Text(name, fontSize = MT.Body, fontWeight = if (mail.unread) FontWeight.SemiBold else FontWeight.Medium, color = m.ink,
++                    maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
++                Spacer(Modifier.width(8.dp))
++                Text(mailTime(mail.at), fontSize = MT.Meta, color = m.ink3, maxLines = 1, softWrap = false)
++            }
++            Text(mail.subject, fontSize = 15.sp, lineHeight = 20.sp, color = if (mail.unread) m.ink else m.ink2,
++                fontWeight = if (mail.unread) FontWeight.Medium else FontWeight.Normal, maxLines = 1, overflow = TextOverflow.Ellipsis)
++            val snip = mail.text.replace(Regex("\\s+"), " ").trim()
++            Row(verticalAlignment = Alignment.CenterVertically) {
++                if (showAccount) {
++                    Text(mail.provider, fontSize = 11.sp, fontWeight = FontWeight.Medium, color = fg, maxLines = 1, softWrap = false,
++                        modifier = Modifier.clip(RoundedCornerShape(6.dp)).background(tile).padding(horizontal = 5.dp, vertical = 1.dp))
++                    Spacer(Modifier.width(6.dp))
++                }
++                Text(snip.ifBlank { mail.address }, fontSize = MT.Sub, lineHeight = MT.SubLH, color = m.ink3, maxLines = 1, overflow = TextOverflow.Ellipsis)
++            }
++        }
++    }
++}
++
++private fun mailTime(t: Long): String {
++    if (t <= 0) return ""
++    val now = java.util.Calendar.getInstance()
++    val c = java.util.Calendar.getInstance().apply { timeInMillis = t }
++    return when {
++        c.get(java.util.Calendar.YEAR) == now.get(java.util.Calendar.YEAR) && c.get(java.util.Calendar.DAY_OF_YEAR) == now.get(java.util.Calendar.DAY_OF_YEAR) ->
++            String.format(java.util.Locale.ROOT, "%02d:%02d", c.get(java.util.Calendar.HOUR_OF_DAY), c.get(java.util.Calendar.MINUTE))
++        System.currentTimeMillis() - t < 7 * 86_400_000L -> "周" + "日一二三四五六"[c.get(java.util.Calendar.DAY_OF_WEEK) - 1]
++        else -> "${c.get(java.util.Calendar.MONTH) + 1}月${c.get(java.util.Calendar.DAY_OF_MONTH)}日"
++    }
++}
++
++@Composable
++private fun EmptyMailbox(onAdd163: () -> Unit, onGmail: () -> Unit) {
++    val m = mines()
++    GlassCard(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), shape = RoundedCornerShape(MS.CardRadius), elevation = 3.dp) {
++        Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
++            Text("把你的邮箱都放到这里", fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = m.ink)
++            Text("Gmail 和几个 163 邮箱合成一个收件箱。Mines 只读收件箱：不发信、不删信、不会标成已读。",
++                fontSize = MT.Caption, lineHeight = MT.CaptionLH, color = m.ink2)
++            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
++                GlassPill("添加 163 / QQ 邮箱", onClick = onAdd163)
++                GlassSecondaryPill("登录 Gmail", onClick = onGmail)
++            }
++        }
++    }
++}
++
++@Composable
++private fun MailDetail(mail: MailInbox.Mail, onDismiss: () -> Unit, onOpenWeb: (String) -> Unit) {
++    val m = mines()
++    val ctx = LocalContext.current
++    MinesSheet(onDismiss = onDismiss) {
++        Column(Modifier.padding(horizontal = 24.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
++            Text(mail.subject, fontSize = 18.sp, lineHeight = 24.sp, fontWeight = FontWeight.SemiBold, color = m.ink)
++            Text(listOf(mail.from, mail.fromAddr.takeIf { it.isNotBlank() && it != mail.from }?.let { "<$it>" }).filterNotNull().joinToString(" "),
++                fontSize = MT.Sub, color = m.ink2, maxLines = 2, overflow = TextOverflow.Ellipsis)
++            Text("收件：${mail.address} · ${mailTime(mail.at)}", fontSize = MT.Meta, color = m.ink3, maxLines = 1, overflow = TextOverflow.Ellipsis)
++            Box(Modifier.fillMaxWidth().padding(vertical = 6.dp).height(1.dp).background(m.hairline))
++            androidx.compose.foundation.text.selection.SelectionContainer {
++                Text(mail.text.ifBlank { "（这封邮件没有文字内容）" }.take(6000), fontSize = MT.Body, lineHeight = MT.BodyLH, color = m.ink)
++            }
++            Spacer(Modifier.height(8.dp))
++            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
++                mail.url?.let { u -> GlassPill("在 Mines 里打开网页版") { onDismiss(); onOpenWeb(u) } }
++                GlassSecondaryPill("复制正文") {
++                    val cm = ctx.getSystemService(android.content.ClipboardManager::class.java)
++                    cm?.setPrimaryClip(android.content.ClipData.newPlainText("邮件", mail.subject + "\n\n" + mail.text))
++                    android.widget.Toast.makeText(ctx, "已复制", android.widget.Toast.LENGTH_SHORT).show()
++                }
++            }
++        }
++    }
++}
++
++/** Add a mailbox: address + 授权码 → real IMAP login → saved only when it worked. */
++object MailAddPrefill { @Volatile var prefill: String? = null }
++
++@Composable
++private fun MailAdd(onDismiss: () -> Unit, onOpenWeb: (String) -> Unit, onAdded: () -> Unit) {
++    val m = mines()
++    val ctx = LocalContext.current
++    val scope = rememberCoroutineScope()
++    var addr by remember { mutableStateOf(MailAddPrefill.prefill.orEmpty()) }
++    var code by remember { mutableStateOf("") }
++    var busy by remember { mutableStateOf(false) }
++    var err by remember { mutableStateOf<String?>(null) }
++    val prov = MailInbox.providerOf(addr)
++    val isGmail = prov == "Gmail"
++    MinesSheet(onDismiss = { if (!busy) onDismiss() }) {
++        Column(Modifier.padding(horizontal = 24.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
++            Text("添加邮箱", fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = m.ink)
++            Text(if (isGmail) "Gmail 最简单：在 Mines 内登录一次就行。也可以填 Google 的「应用专用密码」走 IMAP。"
++                 else "163 / 126 / QQ 邮箱要用「授权码」登录（不是邮箱密码）：网页版 设置 → POP3/SMTP/IMAP → 开启 IMAP → 生成授权码。",
++                fontSize = MT.Caption, lineHeight = MT.CaptionLH, color = m.ink2)
++            val fc = OutlinedTextFieldDefaults.colors(focusedBorderColor = m.primary, unfocusedBorderColor = m.glassBorder,
++                focusedContainerColor = Color.Transparent, unfocusedContainerColor = Color.Transparent, cursorColor = m.primary,
++                focusedLabelColor = m.primaryText, unfocusedLabelColor = m.ink2, focusedTextColor = m.ink, unfocusedTextColor = m.ink)
++            OutlinedTextField(addr, { addr = it.trim(); err = null }, label = { Text("邮箱地址") }, singleLine = true, enabled = !busy,
++                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email), shape = RoundedCornerShape(14.dp), colors = fc,
++                modifier = Modifier.fillMaxWidth())
++            OutlinedTextField(code, { code = it; err = null }, label = { Text(if (isGmail) "应用专用密码（16 位）" else "授权码") }, singleLine = true, enabled = !busy,
++                visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
++                shape = RoundedCornerShape(14.dp), colors = fc, modifier = Modifier.fillMaxWidth())
++            err?.let { Text(it, fontSize = MT.Sub, lineHeight = MT.SubLH, color = if (m.dark) MinesDesign.DangerDark else MinesDesign.Danger) }
++            if (busy) Row(verticalAlignment = Alignment.CenterVertically) {
++                CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = m.primary)
++                Spacer(Modifier.width(10.dp))
++                Text("正在登录 ${com.openminis.app.plus.MailImap.hostFor(addr) ?: "邮箱"}…", fontSize = MT.Sub, color = m.ink2)
++            }
++            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
++                GlassPill("验证并添加", enabled = !busy && addr.contains('@') && code.isNotBlank()) {
++                    busy = true; err = null
++                    scope.launch {
++                        val r = MailInbox.verifyAndAdd(ctx, addr, code)
++                        busy = false
++                        if (r == null) { android.widget.Toast.makeText(ctx, "已连接 $addr", android.widget.Toast.LENGTH_SHORT).show(); MailAddPrefill.prefill = null; onAdded() }
++                        else err = r
++                    }
++                }
++                if (isGmail) GlassTextButton("在 Mines 内登录 Gmail") { onDismiss(); gmailLogin() }
++                else MailInbox.webUrl(addr.ifBlank { "x@163.com" })?.let { u ->
++                    GlassTextButton("去网页拿授权码") { onDismiss(); onOpenWeb(u) }
++                }
++            }
++            Spacer(Modifier.height(4.dp))
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
+index afd2104..208aeea 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
+@@ -87,6 +87,8 @@ object PlusNav {
+     @Volatile var autoClaim: Boolean = false
+     /** [Mines-38.7] with route plus_connections: open this account's in-app sign-in page right away */
+     @Volatile var openLogin: String? = null
++    /** [Mines-38.8] 消息 page opens on this tab next ("MAIL" = 邮箱; self-test / notification) */
++    @Volatile var digestTab: String? = null
+     /** [Mines-webfit-38.3] open the in-app browser on this URL (home screen picks it up; smoke self-test). */
+     val openBrowser = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
+     fun go(route: String) { navigate?.invoke(route) ?: run { pending = route } }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
+index c17bd02..746a6f8 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
+@@ -9,6 +9,13 @@ import android.webkit.WebChromeClient
+ import android.webkit.WebResourceRequest
+ import android.webkit.WebView
+ import android.webkit.WebViewClient
++import androidx.compose.foundation.background
++import androidx.compose.foundation.border
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.draw.drawBehind
++import androidx.compose.foundation.layout.widthIn
++import androidx.compose.ui.semantics.contentDescription
++import androidx.compose.ui.semantics.semantics
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.fillMaxSize
+@@ -237,37 +244,42 @@ fun WebLoginScreen(
+             )
+         },
+         bottomBar = {
+-            Surface(tonalElevation = 3.dp) {
+-                Button(
+-                    onClick = { if (detect) scope.launch { finish() } else onClose() },
+-                    modifier = Modifier.fillMaxWidth().navigationBarsPadding().padding(12.dp).heightIn(min = 56.dp),
+-                    shape = RoundedCornerShape(14.dp),
+-                ) { Text(if (detect) (if (external) "我在 Chrome 里登录好了" else "我已登录好了") else "完成", fontSize = 18.sp, fontWeight = FontWeight.SemiBold) }
++            // [Mines-38.8] user 2026-10-16: no heavy solid full-width orange bar — translucent porcelain glass bar
++            // with one compact terracotta pill (#B5532F), same family as the glass dialogs.
++            val gm = mines()
++            Box(Modifier.fillMaxWidth().background(glassVeil())
++                .drawBehind { drawLine(gm.glassBorder, androidx.compose.ui.geometry.Offset(0f, 0f), androidx.compose.ui.geometry.Offset(size.width, 0f), 1.dp.toPx()) }
++                .navigationBarsPadding().padding(horizontal = 20.dp, vertical = 10.dp),
++                contentAlignment = Alignment.Center) {
++                GlassPill(if (detect) (if (external) "我在 Chrome 里登录好了" else "我已登录好了") else "完成",
++                    modifier = Modifier.widthIn(min = 200.dp).semantics { contentDescription = if (detect) "我已登录好了" else "完成" }) {
++                    if (detect) scope.launch { finish() } else onClose()
++                }
+             }
+         },
+     ) { padding ->
+         // [Mines-webfit-38.3] keyboard: the page shrinks above it (bottom bar height already counted)
+         Column(Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding).imePadding()) {
+-          status?.let {
+-              Surface(color = MaterialTheme.colorScheme.primaryContainer, modifier = Modifier.fillMaxWidth()) {
+-                  Text(it, fontSize = 17.sp, color = MaterialTheme.colorScheme.onPrimaryContainer,
+-                      modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp))
++          // [Mines-38.8] user 2026-10-16: the solid brown bands (「已填好手机号」, 「在 Mines 内登录…」) are now ONE frosted-glass
++          // strip: status (or the in-Mines hint) on the left, 「外部打开 · 不同步」 on the right.
++          val gm = mines()
++          val stripShape = RoundedCornerShape(16.dp)
++          Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp).clip(stripShape).background(glassVeil())
++              .border(1.dp, gm.glassBorder, stripShape)
++              .then(if (extBack) Modifier.clickable { extBack = false; webView?.let { w -> if (w.url.isNullOrBlank() || w.url == "about:blank") w.loadUrl(url) else w.reload() } } else Modifier)
++              .padding(start = 14.dp, end = 2.dp).heightIn(min = 44.dp),
++              verticalAlignment = Alignment.CenterVertically) {
++              val hint = when {
++                  extBack -> "外部登录 Mines 拿不到，点这里在 Mines 内一键登录"
++                  status != null -> status!!
++                  else -> "在 Mines 内登录，自动关联"
+               }
+-          }
+-          // [Mines-38.7] external login cannot sync: one tap back to the in-app login (saved password filled in)
+-          if (extBack) Surface(color = MaterialTheme.colorScheme.tertiaryContainer, modifier = Modifier.fillMaxWidth()
+-              .clickable { extBack = false; webView?.let { w -> if (w.url.isNullOrBlank() || w.url == "about:blank") w.loadUrl(url) else w.reload() } }) {
+-              Text("外部浏览器的登录 Mines 拿不到，点这里在 Mines 内一键登录", fontSize = 18.sp, color = MaterialTheme.colorScheme.onTertiaryContainer,
+-                  modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp))
+-          }
+-          // [Mines-38.7] 「用外部浏览器登录」 as a second button, marked 仅打开，不同步
+-          // [Mines-38.7 v11] smoke shots: side by side, the hint wrapped into three lines next to the link. One line each now.
+-          Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+-              Text("在 Mines 内登录，自动关联", fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+-                  maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
++              Text(hint, fontSize = MT.Sub, lineHeight = MT.SubLH, color = if (status != null || extBack) gm.ink else gm.ink2,
++                  fontWeight = if (status != null || extBack) FontWeight.Medium else FontWeight.Normal,
++                  maxLines = if (status != null && status!!.length > 20) 2 else 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+               androidx.compose.material3.TextButton(onClick = { extOpened = true
+                   GoogleAuthRouter.openInCustomTab(context, webView?.url?.takeIf { it.startsWith("http") } ?: url) }) {
+-                  Text("外部打开 · 不同步", fontSize = 13.sp, maxLines = 1, softWrap = false)
++                  Text("外部打开 · 不同步", fontSize = MT.Meta, color = gm.primaryText, maxLines = 1, softWrap = false)
+               }
+           }
+           Box(Modifier.fillMaxWidth().weight(1f)) {
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/MailImapTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/MailImapTest.kt
+new file mode 100644
+index 0000000..68b38d4
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/MailImapTest.kt
+@@ -0,0 +1,97 @@
++package com.openminis.app.plus
++
++import org.junit.After
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Assert.fail
++import org.junit.Before
++import org.junit.Test
++import java.net.ServerSocket
++import java.util.Base64
++import kotlin.concurrent.thread
++
++/** [Mines-38.8] 邮箱: the read-only IMAP reader against a tiny in-process server (plain TCP via MailImap.plainOverride). */
++class MailImapTest {
++    private lateinit var server: ServerSocket
++    private val seen = java.util.Collections.synchronizedList(ArrayList<String>())
++
++    private fun raw(from: String, subj: String, body: String): ByteArray =
++        ("From: $from\r\nSubject: =?UTF-8?B?" + Base64.getEncoder().encodeToString(subj.toByteArray()) + "?=\r\n" +
++            "Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n" +
++            Base64.getEncoder().encodeToString(body.toByteArray()) + "\r\n").toByteArray()
++
++    @Before fun start() {
++        server = ServerSocket(0)
++        thread(isDaemon = true) {
++            while (!server.isClosed) {
++                val s = runCatching { server.accept() }.getOrNull() ?: break
++                thread(isDaemon = true) {
++                    s.use { sock ->
++                        val r = sock.getInputStream().bufferedReader(); val o = sock.getOutputStream()
++                        fun w(x: String) { o.write((x + "\r\n").toByteArray()); o.flush() }
++                        w("* OK ready"); var authed = false
++                        while (true) {
++                            val line = r.readLine() ?: break
++                            val p = line.split(" ", limit = 3); val tag = p[0]; val cmd = p.getOrElse(1) { "" }.uppercase()
++                            seen += cmd
++                            when (cmd) {
++                                "ID" -> { w("* ID NIL"); w("$tag OK") }
++                                "LOGIN" -> { authed = line.contains("\"goodcode\""); w(if (authed) "$tag OK LOGIN" else "$tag NO LOGIN Login error password error") }
++                                "EXAMINE", "SELECT" -> { w("* 2 EXISTS"); w("$tag OK [READ-ONLY]") }
++                                "STATUS" -> { w("* STATUS INBOX (UNSEEN 1)"); w("$tag OK") }
++                                "FETCH" -> {
++                                    val a = raw("Alice <alice@example.com>", "周报", "第一封，已读")
++                                    val b = raw("网易邮箱 <svc@163.com>", "IMAP 已开启", "第二封，未读")
++                                    o.write("* 1 FETCH (UID 11 FLAGS (\\Seen) INTERNALDATE \"16-Oct-2026 01:00:00 +0800\" BODY[]<0> {${a.size}}\r\n".toByteArray() + a + ")\r\n".toByteArray())
++                                    o.write("* 2 FETCH (UID 12 FLAGS () INTERNALDATE \"16-Oct-2026 02:00:00 +0800\" BODY[]<0> {${b.size}}\r\n".toByteArray() + b + ")\r\n".toByteArray())
++                                    w("$tag OK FETCH")
++                                }
++                                "LOGOUT" -> { w("* BYE"); w("$tag OK"); break }
++                                else -> w("$tag BAD")
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        MailImap.plainOverride = "127.0.0.1:${server.localPort}"
++    }
++
++    @After fun stop() { MailImap.plainOverride = null; runCatching { server.close() } }
++
++    @Test fun readsInboxReadOnly() {
++        val box = MailImap.inbox("imap.163.com", "box1@163.com", "goodcode")
++        assertEquals(2, box.exists)
++        assertEquals(1, box.unseen)
++        assertEquals(listOf("12", "11"), box.msgs.map { it.uid })          // newest first
++        assertEquals("IMAP 已开启", box.msgs[0].subject)
++        assertEquals("网易邮箱", box.msgs[0].from)
++        assertEquals("svc@163.com", box.msgs[0].fromAddr)
++        assertTrue(box.msgs[0].unread)
++        assertFalse(box.msgs[1].unread)
++        assertTrue(box.msgs[1].text.contains("第一封"))
++        assertTrue("163 needs ID before LOGIN", seen.indexOf("ID") in 0 until seen.indexOf("LOGIN"))
++        assertTrue("read-only EXAMINE, never SELECT", "EXAMINE" in seen && "SELECT" !in seen)
++        assertFalse("never STORE / flags change", seen.any { it == "STORE" || it == "EXPUNGE" })
++    }
++
++    @Test fun wrongCodeIsAuthFailure() {
++        try { MailImap.inbox("imap.163.com", "box1@163.com", "badcode"); fail("must throw") }
++        catch (e: MailImap.ImapError) { assertEquals(MailImap.Fail.AUTH, e.kind) }
++    }
++
++    @Test fun unreachableIsNetFailure() {
++        MailImap.plainOverride = "127.0.0.1:1"
++        try { MailImap.inbox("imap.163.com", "x@163.com", "goodcode"); fail("must throw") }
++        catch (e: MailImap.ImapError) { assertEquals(MailImap.Fail.NET, e.kind) }
++    }
++
++    @Test fun hosts() {
++        MailImap.plainOverride = null
++        assertEquals("imap.163.com", MailImap.hostFor("qqq440681@163.com"))
++        assertEquals("imap.gmail.com", MailImap.hostFor("deningyang740@gmail.com"))
++        assertEquals("imap.qq.com", MailImap.hostFor("a@qq.com"))
++        assertEquals(null, MailImap.hostFor("a@unknown-domain.xyz"))
++    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/group/PresetRegistryTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/group/PresetRegistryTest.kt
+new file mode 100644
+index 0000000..ae52f50
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/group/PresetRegistryTest.kt
+@@ -0,0 +1,70 @@
++package com.openminis.app.plus.group
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/** [Mines-38.8] Pure-JVM checks of the preset registry and the response parsers (no Android, no network). */
++class PresetRegistryTest {
++    @Test fun nanoMuseNeedsAKey() {
++        val s = PresetRegistry.preset("nanomuse")!!.toSpec()
++        assertFalse(s.keyOptional)
++        assertEquals(Proto.OPENAI, s.proto)
++        assertEquals(AiCatalog.NANOMUSE_BASE, s.baseUrl)
++        val fixed = PresetRegistry.override(AiSpec("nanomuse", "Muse 中继", null, Proto.OPENAI, AiCatalog.NANOMUSE_BASE, "", keyOptional = true))
++        assertFalse(fixed.keyOptional)
++        assertEquals("deepseek-v4.1-flash", fixed.defaultModel)
++    }
++
++    @Test fun transportsMapOnto387Protos() {
++        assertEquals(Proto.COZE, PresetRegistry.preset("coze")!!.legacyProto())
++        assertEquals(Proto.ADAPTER, PresetRegistry.preset("memoh")!!.legacyProto())
++        assertEquals(Proto.WEBAPP, PresetRegistry.preset("web:hark")!!.legacyProto())
++        assertTrue(PresetRegistry.preset("web:manus")!!.toSpec().keyOptional)
++        assertEquals("memoh", PresetRegistry.preset("memoh:bot-1")!!.id)
++        assertEquals("coze", PresetRegistry.preset("coze:7123")!!.id)
++        assertEquals("web:hark", PresetRegistry.preset("web:hark#2")!!.id)
++    }
++
++    @Test fun museIsOffByDefault() {
++        assertFalse(PresetRegistry.visible("web:muse"))
++        assertTrue(PresetRegistry.visible("web:hark"))
++        assertTrue(PresetRegistry.visible("deepseek"))
++    }
++
++    @Test fun extraSpecsOnlyAddsMissingBridges() {
++        val ids = PresetRegistry.extraSpecs(setOf("web:hark")).map { it.id }
++        assertFalse("web:hark" in ids)
++        assertTrue("web:manus" in ids)
++        assertFalse("memoh" in ids)
++    }
++
++    @Test fun relayKeyParsing() {
++        assertEquals("nm_abcdefghijklmnopqrstu", PresetAuth.keyFromVerify("""{"key":"nm_abcdefghijklmnopqrstu","account":{"id":3}}"""))
++        assertEquals("nm_abcdefghijklmnopqrstu", PresetAuth.keyFromVerify("""{"data":{"api_key":"nm_abcdefghijklmnopqrstu"}}"""))
++        assertEquals("nm_ABCDEFGHIJKLMNOPQRST", PresetAuth.keyFromVerify("ok nm_ABCDEFGHIJKLMNOPQRST"))
++        assertNull(PresetAuth.keyFromVerify("""{"ok":true}"""))
++    }
++
++    @Test fun memohBaseNormalisation() {
++        assertEquals(listOf("http://1.2.3.4:8080/api", "http://1.2.3.4:8080"), PresetAuth.normalizeMemohBase("1.2.3.4:8080/"))
++        assertEquals(listOf("https://m.example/api", "https://m.example"), PresetAuth.normalizeMemohBase("https://m.example/api"))
++    }
++
++    @Test fun memohAssistantTurns() {
++        val body = """{"items":[
++          {"id":"t2","role":"assistant","timestamp":"2026-10-15T10:00:02Z","text":"","messages":[{"type":"text","content":"你好"},{"type":"tool","content":"x"}]},
++          {"id":"t1","role":"user","timestamp":"2026-10-15T10:00:01Z","text":"hi"},
++          {"id":"t0","role":"assistant","timestamp":"2026-10-15T09:00:00Z","text":"old"}]}"""
++        val l = MemohAdapter.assistantTurns(body)
++        assertEquals(listOf("t0" to "old", "t2" to "你好"), l)
++    }
++
++    @Test fun flatKeepsTheLastQuestion() {
++        val r = TurnRequest("你在群聊里", listOf(AiClient.Turn("user", "【群主】a"), AiClient.Turn("assistant", "b"), AiClient.Turn("user", "【群主】c")), 100)
++        assertTrue(r.flat().endsWith("请回复最新一条：\n【群主】c"))
++        assertTrue(r.flat().contains("（你）b"))
++    }
++}
