@@ -53,6 +53,10 @@ try:
 except Exception:
     B388 = False
 if B388: B387 = True; FAST = True
+try:
+    UI388 = "ui388" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
+except Exception:
+    UI388 = False
 FONT_SCALE = "1.18"
 step_no = 0
 crashed = []
@@ -3166,7 +3170,7 @@ def main():
             result_json("group", "wallpaper off"); anim(True)
         except Exception as e:
             print("fast prep error", e, flush=True)
-        for fn in ((b387_linkall, b387_noblack, b388_weblogin, b388_mailbox, b388_presets) if B388 else (b387_linkall, b387_noblack, b387_persist, b387_platforms)):
+        for fn in ((b388_ui,) if UI388 else (b387_linkall, b387_noblack, b388_weblogin, b388_mailbox, b388_presets) if B388 else (b387_linkall, b387_noblack, b387_persist, b387_platforms)):
             try:
                 fn(res)
             except Exception as e:
@@ -3466,6 +3470,117 @@ def b388_presets(res):
     r8["presets"] = o
     print("B388 presets", json.dumps(o, ensure_ascii=False)[:2500], flush=True)
 
+
+
+def _strip_diff(a, b):
+    """mean abs difference of the left 28 px margin strip (fog only, no cards) between two screenshots"""
+    try:
+        from PIL import Image, ImageChops
+        A = Image.open(a).convert("L"); B_ = Image.open(b).convert("L"); W, H = A.size
+        box = (0, int(H * 0.12), 28, int(H * 0.80))
+        d = ImageChops.difference(A.crop(box), B_.crop(box)); h = d.histogram(); n = sum(h)
+        return round(sum(i * v for i, v in enumerate(h)) / max(1, n), 2)
+    except Exception as e:
+        return f"err {e}"
+
+
+def _bounds_of(r, pred):
+    for tx, d, x, y, n in nodes(r):
+        if pred(tx or "", d or ""): return (x, y)
+    return None
+
+
+def b388_ui(res):
+    """[38.8 v4] build-36 sheet restyle: home light/dark (+ fog moving), search in place with the keyboard,
+    消息 with a resolved card and no spinner, 知识库 mind map card, KeyAgent compact strip + pills."""
+    r8 = R8(res); o = {}
+    result_json("group", "thememode 1"); adb("shell", "am", "force-stop", PKG); time.sleep(1)
+    adb("shell", "monkey", "-p", PKG, "-c", "android.intent.category.LAUNCHER", "1"); time.sleep(8)
+    print("UI388 inject", selftest_json("feedinject", "resolved", timeout=30), flush=True)
+    r = b381_home(); time.sleep(3)
+    r = shot388("home-light")
+    t = _txt(r); o["home_text"] = t[:600]
+    for want in ("最近对话", "都在正常跑"):
+        if want not in t: page_missing.append(f"ui388 home: '{want}' not seen")
+    for gone in ("电量 ", "存储 ", "运行 "):
+        if any(x.startswith(gone.strip()) and len(x) <= 3 for x in texts(r) or []): selftest_fail.append(f"ui388 home: status tile '{gone}' still shown")
+    if not any(("好，" in x) or x.startswith(("早上好", "上午好", "中午好", "下午好", "晚上好", "夜深了")) for x in texts(r) or []):
+        page_missing.append("ui388 home: greeting not seen")
+    face0 = _bounds_of(r, lambda tx, d: d.startswith("换角色"))
+    time.sleep(5)
+    shot388("home-light-b")
+    o["fog_diff_home"] = _strip_diff(f"{OUT}/b388-home-light.png", f"{OUT}/b388-home-light-b.png")
+    # search in place with the keyboard up
+    if tap_text("搜索对话", wait=2.5):
+        time.sleep(2); type_text("Mines"); time.sleep(2.5)
+        r = shot388("home-search-ime")
+        ime = "mInputShown=true" in sh("dumpsys input_method | grep -m1 mInputShown")
+        face1 = _bounds_of(r, lambda tx, d: d.startswith("换角色"))
+        o["ime"] = ime; o["face_before"] = face0; o["face_ime"] = face1
+        if face0 and face1 and abs(face0[1] - face1[1]) > 6: selftest_fail.append(f"ui388 search: header moved with the keyboard {face0}→{face1}")
+        if "取消" not in _txt(r): page_missing.append("ui388 search: in-place field (取消) not seen")
+        tap_text("取消", exact=True, wait=2)
+        sh("input keyevent KEYCODE_BACK"); time.sleep(1)
+    else:
+        page_missing.append("ui388 search button not found")
+    # dark
+    result_json("group", "thememode 2"); adb("shell", "am", "force-stop", PKG); time.sleep(1)
+    adb("shell", "monkey", "-p", PKG, "-c", "android.intent.category.LAUNCHER", "1"); time.sleep(8)
+    print("UI388 inject2", selftest_json("feedinject", "resolved", timeout=30), flush=True)
+    b381_home(); time.sleep(3); shot388("home-dark"); time.sleep(5); shot388("home-dark-b")
+    o["fog_diff_dark"] = _strip_diff(f"{OUT}/b388-home-dark.png", f"{OUT}/b388-home-dark-b.png")
+    # 消息 (light)
+    result_json("group", "thememode 1"); adb("shell", "am", "force-stop", PKG); time.sleep(1)
+    adb("shell", "monkey", "-p", PKG, "-c", "android.intent.category.LAUNCHER", "1"); time.sleep(8)
+    print("UI388 inject3", selftest_json("feedinject", "resolved", timeout=30), flush=True)
+    b381_home(); time.sleep(2)
+    if not tap_text("消息", exact=True, wait=1.2): tap_text("消息，", wait=1.2)
+    shot388("msg-open")
+    time.sleep(4)
+    r = shot388("msg")
+    t = _txt(r); o["msg_text"] = t[:800]
+    if "已解决" not in t: selftest_fail.append("ui388 消息: 已解决 card not shown")
+    if "收起" not in t: page_missing.append("ui388 消息: 收起 not seen")
+    if "权限问题已解决" in t and any("已失效" in x for x in (texts(r) or [])[:0]): pass
+    o["msg_progress_nodes"] = sh("uiautomator dump /sdcard/pg.xml >/dev/null 2>&1; cat /sdcard/pg.xml | grep -o 'ProgressBar' | head -3")
+    if open_tab("账号异常"):
+        time.sleep(2); r = shot388("msg-account"); o["msg_account"] = _txt(r)[:600]
+    back(1)
+    # 知识库
+    B = "http://10.0.2.2:8088"
+    result_json("group", "kbep "); result_json("group", f"base web:doubao|{B}/webchat")
+    result_json("group", "kbseed "); result_json("group", "kbrun", timeout=120)
+    route("plus_knowledge", 7)
+    r = shot388("kb-map")
+    topics = [d for d in all_desc(r, "脑图节点：") if " · " in d[2]]
+    o["kb_topics"] = [d[2] for d in topics]
+    if not topics: selftest_fail.append("ui388 kb: no topic nodes")
+    time.sleep(4); shot388("kb-map-b")
+    o["fog_diff_kb"] = _strip_diff(f"{OUT}/b388-kb-map.png", f"{OUT}/b388-kb-map-b.png")
+    if topics:
+        tp = next((d for d in topics if "交易" in d[2]), topics[0])
+        sh(f"input tap {tp[0]} {tp[1]}"); time.sleep(2.5); shot388("kb-branch")
+    result_json("group", "thememode 2"); back(2)
+    route("plus_knowledge", 7); shot388("kb-map-dark")
+    result_json("group", "thememode 1"); back(2)
+    # KeyAgent page (DeepSeek)
+    sh(f"am start -n {PKG}/com.openminis.app.MainActivity --es mines_route plus_connections --es mines_open_kind deepseek", timeout=60)
+    time.sleep(6)
+    if tap_text("一键接入", wait=3) or tap_text("再生成一个新密钥", wait=3) or (scroll_down() or tap_text("一键接入", wait=3)):
+        time.sleep(14)
+        r = shot388("keyagent")
+        t = texts(r) or []
+        o["keyagent"] = t[:20]
+        if not any("重试" in x for x in t) or not any("浏览器打开" in x for x in t): selftest_fail.append("ui388 keyagent: no 重试 / 浏览器打开")
+        for _ in range(3): sh("input keyevent KEYCODE_BACK"); time.sleep(1.5)
+    else:
+        page_missing.append("ui388 keyagent: 一键接入 not found")
+    if not alive(): relaunch()
+    for k in ("fog_diff_home", "fog_diff_dark"):
+        v = o.get(k)
+        if isinstance(v, (int, float)) and v < 0.4: page_missing.append(f"ui388 fog did not move ({k}={v})")
+    r8["ui"] = o
+    print("UI388 RESULT " + json.dumps(o, ensure_ascii=False)[:4000], flush=True)
 
 def finish(lc):
     lc.terminate()
