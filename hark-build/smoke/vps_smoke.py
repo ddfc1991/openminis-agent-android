@@ -57,6 +57,10 @@ try:
     UI388 = "ui388" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
 except Exception:
     UI388 = False
+try:
+    UI389 = "ui389" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
+except Exception:
+    UI389 = False
 FONT_SCALE = "1.18"
 step_no = 0
 crashed = []
@@ -3173,7 +3177,7 @@ def main():
             result_json("group", "wallpaper off"); anim(True)
         except Exception as e:
             print("fast prep error", e, flush=True)
-        for fn in ((b388_ui,) if UI388 else (b387_linkall, b387_noblack, b388_weblogin, b388_mailbox, b388_presets) if B388 else (b387_linkall, b387_noblack, b387_persist, b387_platforms)):
+        for fn in (((b388_ui, b389_ui) if UI389 else (b388_ui,)) if UI388 else (b387_linkall, b387_noblack, b388_weblogin, b388_mailbox, b388_presets) if B388 else (b387_linkall, b387_noblack, b387_persist, b387_platforms)):
             try:
                 fn(res)
             except Exception as e:
@@ -3631,6 +3635,75 @@ def b388_ui(res):
         if isinstance(v, (int, float)) and v < 0.4: page_missing.append(f"ui388 fog did not move ({k}={v})")
     r8["ui"] = o
     print("UI388 RESULT " + json.dumps(o, ensure_ascii=False)[:4000], flush=True)
+
+
+def b389_ui(res):
+    """[38.9] new pages: 账号关联 keychain list light+dark + detail, 应用代理 light+dark (+ 分工 scrolled), 外观调节, 经验,
+    and the 知识库 星空 map with animations ON (two frames + a short screenrecord)."""
+    r8 = R8(res); o = {}
+    csv = ("name,url,username,password\\n"
+           "GitHub,https://github.com/login,smoke@example.com,pw-smoke-1\\n"
+           "Cloudflare,https://dash.cloudflare.com/login,smoke@example.com,pw-smoke-2\\n"
+           "阿里云,https://account.aliyun.com/login,13800138000,pw-smoke-3\\n"
+           "OKX,https://www.okx.com/account/login,smoke@example.com,pw-smoke-4\\n"
+           "ModelScope,https://modelscope.cn/login,13800138000,pw-smoke-5\\n"
+           "Google,https://accounts.google.com/,smoke@example.com,pw-smoke-6")
+    o["seed"] = result_json("group", "savedlogins " + csv, timeout=30)
+    def relaunch_theme(mode):
+        result_json("group", f"thememode {mode}"); adb("shell", "am", "force-stop", PKG); time.sleep(1)
+        adb("shell", "monkey", "-p", PKG, "-c", "android.intent.category.LAUNCHER", "1"); time.sleep(8)
+    def page(rt, name, want, wait=6):
+        try:
+            route(rt, wait); r = shot388(name); t = _txt(r); o[name] = t[:500]
+            if not alive(): crashed.append(f"b389 {name}"); relaunch(); return None
+            for w in want:
+                if w not in t: page_missing.append(f"ui389 {name}: '{w}' not seen")
+            return r
+        except Exception as e:
+            page_missing.append(f"ui389 {name} error {e}"); return None
+    relaunch_theme(1)
+    time.sleep(6)   # favicons fetch in the background on first open
+    r = page("plus_keychain", "kc-list", ("账号关联",), wait=9)
+    time.sleep(4); r = shot388("kc-list"); o["kc-list"] = _txt(r)[:600]
+    rows = [d for d in all_desc(r, "") if "，" in d[2] and any(k in d[2] for k in ("GitHub", "Cloudflare", "阿里云", "OKX", "ModelScope", "Google", "github", "aliyun"))]
+    o["kc_rows"] = [d[2] for d in rows][:12]
+    if not rows: page_missing.append("ui389 kc-list: no seeded account rows")
+    else:
+        sh(f"input tap {rows[0][0]} {rows[0][1]}"); time.sleep(4)
+        r = shot388("kc-detail"); o["kc-detail"] = _txt(r)[:500]
+        if not alive(): crashed.append("b389 kc-detail"); relaunch()
+        back(1)
+    # 「已记下 X 账号」 glass toast (mock 05)
+    o["autoacct"] = result_json("group", "autoacct Hugging Face|huggingface.co|smoke@example.com", timeout=20)
+    time.sleep(1.2); r = shot388("kc-toast"); o["kc-toast"] = _txt(r)[:300]
+    if "已记下" not in o["kc-toast"]: page_missing.append("ui389 kc-toast: 已记下 not seen")
+    page("plus_app_agents", "agents", ("应用代理",))
+    scroll_down(); time.sleep(1.5); shot388("agents-split")
+    page("plus_look", "look", ())
+    result_json("group", "expadd howto|在服务器上跑长任务|用 minis-vps bg 起任务，再 minis-vps attach 看输出|别直接 ssh 跑，断线会中断", timeout=20)
+    result_json("group", "expadd lesson|找服务器登录|在 设置 › 网络 › 电脑与服务器，不要去搜文件|", timeout=20)
+    page("plus_experience", "exp", ("经验",))
+    relaunch_theme(2)
+    page("plus_keychain", "kc-list-dark", ("账号关联",), wait=9)
+    page("plus_app_agents", "agents-dark", ("应用代理",))
+    relaunch_theme(1)
+    # 知识库 星空 with animations ON (the smoke otherwise runs with animator scale 0 → GalaxyMotion.still)
+    try:
+        anim(True)
+        route("plus_knowledge", 8)
+        shot388("kb-anim-1"); time.sleep(1.4); shot388("kb-anim-2")
+        o["kb_anim_diff"] = _strip_diff(f"{OUT}/b388-kb-anim-1.png", f"{OUT}/b388-kb-anim-2.png")
+        sh("screenrecord --time-limit 7 --size 540x1200 --bit-rate 2500000 /sdcard/kb.mp4", timeout=30)
+        subprocess.run(f"adb pull /sdcard/kb.mp4 {OUT}/b389-kb-anim.mp4", shell=True, timeout=60)
+        o["kb_mp4"] = os.path.getsize(f"{OUT}/b389-kb-anim.mp4") if os.path.exists(f"{OUT}/b389-kb-anim.mp4") else 0
+        if isinstance(o["kb_anim_diff"], (int, float)) and o["kb_anim_diff"] < 0.3: page_missing.append(f"ui389 kb: frames identical with animations on ({o['kb_anim_diff']})")
+        back(2)
+    except Exception as e:
+        page_missing.append(f"ui389 kb anim error {e}")
+    finally:
+        anim(False)
+    r8["ui389"] = o
+    print("UI389 RESULT " + json.dumps(o, ensure_ascii=False)[:4000], flush=True)
 
 def finish(lc):
     lc.terminate()
