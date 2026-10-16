@@ -10,6 +10,8 @@ def msg(i, frm, subj, body, seen):
 MSGS = [msg(1, "Alice <alice@example.com>", "周报：38.8 测试进度", "邮箱聚合测试第一封，已读。", True),
         msg(2, "网易邮箱 <service@163.com>", "IMAP 服务已开启", "这是 fake IMAP 服务器的第二封，未读。", False),
         msg(3, "GitHub <noreply@github.com>", "Run succeeded: mines-388", "第三封，未读，最新。", False)]
+# [38.9.1] a fresh code mail for 一键关联's e-mail login (INTERNALDATE = now, so it counts as new)
+CODE_MSG = msg(4, "SmokeCloud <noreply@smokecloud.test>", "SmokeCloud 登录验证码", "你的验证码是 482913，10 分钟内有效。", False)
 class H(socketserver.StreamRequestHandler):
     def w(self, s): self.wfile.write((s + "\r\n").encode()); self.wfile.flush()
     def handle(self):
@@ -30,9 +32,11 @@ class H(socketserver.StreamRequestHandler):
                 self.w(f"* {len(MSGS)} EXISTS"); self.w("* 0 RECENT"); self.w(f"{tag} OK [READ-ONLY] done")
             elif cmd == "STATUS": self.w(f"* STATUS INBOX (UNSEEN {sum(1 for m in MSGS if not m[2])})"); self.w(f"{tag} OK STATUS done")
             elif cmd == "FETCH":
-                for i, raw, seen in MSGS:
+                import time as _t
+                for i, raw, seen in MSGS + [CODE_MSG]:
                     fl = "\\Seen" if seen else ""
-                    self.wfile.write(f'* {i} FETCH (UID {100+i} FLAGS ({fl}) INTERNALDATE "16-Oct-2026 0{i}:00:00 +0800" BODY[]<0> {{{len(raw)}}}\r\n'.encode() + raw + b")\r\n")
+                    date = _t.strftime("%d-%b-%Y %H:%M:%S +0000", _t.gmtime()) if i == 4 else f"16-Oct-2026 0{i}:00:00 +0800"
+                    self.wfile.write(f'* {i} FETCH (UID {100+i} FLAGS ({fl}) INTERNALDATE "{date}" BODY[]<0> {{{len(raw)}}}\r\n'.encode() + raw + b")\r\n")
                 self.w(f"{tag} OK FETCH done")
             elif cmd == "LOGOUT": self.w("* BYE"); self.w(f"{tag} OK bye"); return
             else: self.w(f"{tag} BAD unknown")

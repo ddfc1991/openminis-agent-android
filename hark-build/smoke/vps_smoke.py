@@ -61,6 +61,10 @@ try:
     UI389 = "ui389" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
 except Exception:
     UI389 = False
+try:
+    UI3891 = "ui3891" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
+except Exception:
+    UI3891 = False
 FONT_SCALE = "1.18"
 step_no = 0
 crashed = []
@@ -3177,7 +3181,7 @@ def main():
             result_json("group", "wallpaper off"); anim(True)
         except Exception as e:
             print("fast prep error", e, flush=True)
-        for fn in (((b388_ui, b389_ui) if UI389 else (b388_ui,)) if UI388 else (b387_linkall, b387_noblack, b388_weblogin, b388_mailbox, b388_presets) if B388 else (b387_linkall, b387_noblack, b387_persist, b387_platforms)):
+        for fn in (((b388_ui, b389_ui, b3891_ui) if UI3891 else (b388_ui, b389_ui) if UI389 else (b388_ui,)) if UI388 else (b387_linkall, b387_noblack, b388_weblogin, b388_mailbox, b388_presets) if B388 else (b387_linkall, b387_noblack, b387_persist, b387_platforms)):
             try:
                 fn(res)
             except Exception as e:
@@ -3403,15 +3407,15 @@ def b388_mailbox(res):
     for want in ("邮箱", "全部", "GitHub", "今天"):
         if want not in t: selftest_fail.append(f"b388 mailbox: '{want}' missing on the inbox")
     if "授权码不对" not in t: page_missing.append("b388 mailbox: broken-account strip not shown")
-    if tap_text("qqq440681@163", wait=2.5):
+    if tap_text("demo.one@163", wait=2.5):
         shot388("mail-one")
-        tap_text("qqq440681@163", wait=1.5)
+        tap_text("demo.one@163", wait=1.5)
     if tap_text("Run succeeded", wait=3):
         r = shot388("mail-detail"); o["detail"] = _txt(r)[:300]
         if "复制正文" not in o["detail"]: page_missing.append("b388 mailbox: detail sheet buttons missing")
         back()
     # long-press the first account chip → manage sheet
-    xy = find(dump(), "deningyang7")
+    xy = find(dump(), "alex.demo")
     if xy:
         sh(f"input swipe {xy[0]} {xy[1]} {xy[0]} {xy[1]} 900"); time.sleep(2); shot388("mail-manage"); back()
     # dark
@@ -3704,6 +3708,171 @@ def b389_ui(res):
         anim(False)
     r8["ui389"] = o
     print("UI389 RESULT " + json.dumps(o, ensure_ascii=False)[:4000], flush=True)
+
+def _nonwhite(path):
+    """share of pixels that are not near-white in the middle band (blank console pages are ~0)"""
+    try:
+        from PIL import Image
+        im = Image.open(path).convert("RGB"); W, H = im.size
+        px = list(im.crop((0, int(H * .18), W, int(H * .85))).resize((90, 160)).getdata())
+        return round(sum(1 for (r, g, b) in px if min(r, g, b) < 225) / len(px), 3)
+    except Exception as e:
+        return f"err {e}"
+
+
+def b3891_ui(res):
+    """[38.9.1] 账号关联 dynamic identities + Google provider detail, 应用代理 empty + manual add + 去登录 WebView + 测试一下 card,
+    WorkBuddy error text, Grok key delete, KeyAgent IME dialog + Groq drawer, 4 real consoles non-white, 邮箱 verify Gmail + 163
+    (real servers, fake codes → plain reason), in-app browser 手机版/电脑版 chip, 一键关联 e-mail login page."""
+    r8 = R8(res); o = {}
+    F = "http://10.0.2.2:8088"
+    def page(rt, name, want=(), wait=6):
+        try:
+            route(rt, wait); r = shot388(name); t = _txt(r); o[name] = t[:500]
+            if not alive(): crashed.append(f"b3891 {name}"); relaunch(); return None
+            for w in want:
+                if w not in t: page_missing.append(f"ui3891 {name}: '{w}' not seen")
+            return r
+        except Exception as e:
+            page_missing.append(f"ui3891 {name} error {e}"); return None
+    def step(name, f):
+        try: f()
+        except Exception as e:
+            import traceback; traceback.print_exc(); page_missing.append(f"ui3891 {name} error {e}")
+        if not alive(): crashed.append(f"b3891 {name}"); relaunch()
+    theme388(1)
+    # 1 账号关联: identities the user has, + Google provider detail
+    def kc():
+        o["kcseed"] = result_json("group", "kcseed", timeout=30)
+        r = page("plus_keychain", "kc3891-ident", ("账号关联",), wait=9)
+        t = _txt(r)
+        for w in ("138", "smoke@example.com"):
+            if w not in t: page_missing.append(f"ui3891 kc-ident: '{w}' not seen")
+        if tap_text("Google", wait=4): shot388("kc3891-google"); back()
+        scroll_down(); time.sleep(1.5); shot388("kc3891-ident-b")
+    step("kc", kc)
+    # 2 应用代理: empty state, manual add, 去登录 (real web page), 测试一下 visible result
+    def ag():
+        o["ag_clear"] = result_json("group", "agents clear", timeout=20)
+        r = page("plus_app_agents", "ag3891-empty", ("应用代理",))
+        if tap_text("添加", wait=3) or tap_text("+", exact=True, wait=3):
+            shot388("ag3891-catalog")
+            if tap_text("Memoh", wait=3): pass
+            back()
+        o["ag_add"] = result_json("group", "agents add memoh", timeout=20)
+        r = page("plus_app_agents", "ag3891-one", ("Memoh",))
+        if tap_text("去登录", wait=8):
+            r = shot388("ag3891-login"); o["ag-login"] = _txt(r)[:300]; back(); time.sleep(2)
+        else: page_missing.append("ui3891 agents: 去登录 not found")
+        if tap_text("测试一下", wait=1.5):
+            time.sleep(2.5); shot388("ag3891-testing"); time.sleep(8); r = shot388("ag3891-test"); o["ag-test"] = _txt(r)[:300]
+    step("agents", ag)
+    # 3 WorkBuddy: the error is specific (not 「网络问题」 for a loopback gateway)
+    def wb():
+        o["workbuddy"] = str(result_json("group", "direct workbuddy|回复 OK", timeout=120))[:400]
+        page("plus_group_partners", "wb3891-partners", ())
+    step("workbuddy", wb)
+    # 4 Grok key: delete works and stays deleted
+    def grok():
+        o["grok_seed"] = result_json("group", "vaultkey xai|xai-smokeKEY000000000000000000000000000000000000000000000000000000000000", timeout=30)
+        selftest_json("openkind", "xai", timeout=20); time.sleep(5)
+        shot388("grok3891-before")
+        if tap_text("删除这个密钥", wait=2.5):
+            shot388("grok3891-confirm")
+            tap_text("删除", exact=True, wait=3) or tap_text("确定", wait=3)
+            r = shot388("grok3891-after"); o["grok-after"] = _txt(r)[:300]
+        else: page_missing.append("ui3891 grok: 删除这个密钥 not found")
+        o["grok_state"] = selftest_json("keystate", "xai", timeout=20)
+        if isinstance(o["grok_state"], dict) and o["grok_state"].get("has"): selftest_fail.append(f"ui3891 grok: key still there after delete {o['grok_state']}")
+        back(2)
+    step("grok", grok)
+    # 5 KeyAgent WebView: dialog with the keyboard up, Groq-like drawer opaque
+    def ka():
+        o["ka1"] = result_json("group", f"keyagent groq|{F}/keydlg", timeout=20); time.sleep(10)
+        shot388("ka3891-page")
+        if tap_text("Create API Key", wait=2.5):
+            if tap_text("Name", wait=2.5): pass
+            time.sleep(2); shot388("ka3891-ime")
+        back(3); time.sleep(2)
+        o["ka2"] = result_json("group", f"keyagent groq|{F}/drawer", timeout=20); time.sleep(10)
+        shot388("ka3891-drawer"); back(3)
+        theme388(2)
+        o["ka3"] = result_json("group", f"keyagent groq|{F}/drawer", timeout=20); time.sleep(10)
+        shot388("ka3891-drawer-dark"); back(3)
+        theme388(1)
+    step("keyagent", ka)
+    # 6 four real consoles in the KeyAgent WebView: not a white page (sign-in page is fine)
+    def consoles():
+        nw = {}
+        for k in ("volcengine", "qwen", "siliconflow", "openai"):
+            result_json("group", f"keyagent {k}|", timeout=20); time.sleep(20)
+            shot388(f"con3891-{k}"); nw[k] = _nonwhite(f"{OUT}/b388-con3891-{k}.png"); back(3); time.sleep(2)
+        o["console_nonwhite"] = nw
+        for k, v in nw.items():
+            if isinstance(v, float) and v < 0.02: page_missing.append(f"ui3891 console {k}: looks blank ({v})")
+    step("consoles", consoles)
+    # 7 邮箱 verify against the REAL servers with fake codes: a plain Chinese reason, nothing saved
+    def mail():
+        result_json("mailbox", "plain ", timeout=10)
+        g = result_json("mailbox", "add smoke.mines.test@gmail.com|abcd efgh ijkl mnop", timeout=60) or {}
+        n = result_json("mailbox", "add smoke.mines.test@163.com|ABCDEFGHIJKLMNOP", timeout=60) or {}
+        q = result_json("mailbox", "add smoke@outlook.com|abcdabcdabcd", timeout=30) or {}
+        o["verify_gmail"] = g.get("error") if isinstance(g, dict) else g
+        o["verify_163"] = n.get("error") if isinstance(n, dict) else n
+        o["verify_outlook"] = q.get("error") if isinstance(q, dict) else q
+        for nm, e in (("gmail", o["verify_gmail"]), ("163", o["verify_163"]), ("outlook", o["verify_outlook"])):
+            if not e: selftest_fail.append(f"ui3891 mailbox {nm}: fake code accepted")
+        result_json("mailbox", "open"); time.sleep(5); shot388("mail3891-box")
+        if tap_text("添加邮箱", wait=3) or tap_text("添加 163 / QQ 邮箱", wait=3):
+            r = dump(); edits = []
+            try:
+                import xml.etree.ElementTree as ET
+                for nd in r.iter("node"):
+                    if nd.get("class", "").endswith("EditText"):
+                        b = re.findall(r"\d+", nd.get("bounds", "")); edits.append(((int(b[0]) + int(b[2])) // 2, (int(b[1]) + int(b[3])) // 2))
+            except Exception as e: print("edit scan", e)
+            if len(edits) >= 2:
+                sh(f"input tap {edits[0][0]} {edits[0][1]}"); time.sleep(.6); sh("input text smoke.mines.test@163.com")
+                sh(f"input tap {edits[1][0]} {edits[1][1]}"); time.sleep(.6); sh("input text ABCDEFGHIJKLMNOP"); sh("input keyevent 111")
+                tap_text("验证并添加", wait=18)
+                r = shot388("mail3891-163-result"); o["mail-163-ui"] = _txt(r)[:300]
+            back(2)
+    step("mailbox", mail)
+    # 8 in-app browser: 手机版 / 电脑版 chip per site + 用系统浏览器打开; 一键关联 e-mail login fake
+    def br():
+        selftest("webfit", f"open:{F}/linkfake", timeout=30); time.sleep(8)
+        r = shot388("br3891-mobile"); o["br"] = _txt(r)[:300]
+        if "手机版" not in o["br"] and "电脑版" not in o["br"]: page_missing.append("ui3891 browser: mode chip not seen")
+        if tap_text("手机版", wait=6): shot388("br3891-desktop")
+        tap_text("电脑版", wait=4)
+        back(2)
+        result_json("group", f"linkrun {F}/linkfake", timeout=20); time.sleep(8)
+        if tap_text("邮箱登录", wait=2): shot388("link3891-email")
+        back(2)
+    step("browser", br)
+    # 9 fog demo: calm / windy / rain wind forced, one screenrecord across them, plus 3 glass levels (light)
+    def fog():
+        anim(True)
+        try:
+            b381_home(); time.sleep(3)
+            result_json("group", "fogwind 0.5|270|1", timeout=10); time.sleep(1)
+            subprocess.Popen(f"adb shell screenrecord --time-limit 15 --size 540x1200 --bit-rate 3000000 /sdcard/fog.mp4", shell=True)
+            time.sleep(1); shot388("fog3891-calm"); time.sleep(3.5)
+            result_json("group", "fogwind 12|270|3", timeout=10); time.sleep(1); shot388("fog3891-windy"); time.sleep(3.5)
+            result_json("group", "fogwind 6|200|63", timeout=10); time.sleep(1); shot388("fog3891-rain"); time.sleep(5)
+            subprocess.run(f"adb pull /sdcard/fog.mp4 {OUT}/b3891-fog-demo.mp4", shell=True, timeout=60)
+            o["fog_mp4"] = os.path.getsize(f"{OUT}/b3891-fog-demo.mp4") if os.path.exists(f"{OUT}/b3891-fog-demo.mp4") else 0
+            o["fog_diff_windy_rain"] = _strip_diff(f"{OUT}/b388-fog3891-windy.png", f"{OUT}/b388-fog3891-rain.png")
+            result_json("group", "fogwind off", timeout=10)
+            for g in ("0.15", "0.30", "0.55"):
+                o[f"look_{g}"] = result_json("group", f"lookset {g}|", timeout=10); time.sleep(2); shot388(f"glass3891-{g}")
+            result_json("group", "lookset reset", timeout=10)
+        finally:
+            anim(False)
+    step("fog", fog)
+    r8["ui3891"] = o
+    print("UI3891 RESULT " + json.dumps(o, ensure_ascii=False)[:5000], flush=True)
+
 
 def finish(lc):
     lc.terminate()

@@ -187,6 +187,55 @@ class H(BaseHTTPRequestHandler):
                     '<pre id="out" style="margin-top:20px"></pre></body></html>').encode()
             self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(html))); self.end_headers(); self.wfile.write(html); return
+        # [38.9.1] 一键关联 against an e-mail login page: 手机号登录 (default tab) / 邮箱登录 tab; e-mail + 发送验证码 → code from IMAP
+        if self.path.startswith("/linkfake/home"):
+            return self._html('<html><head><meta name="viewport" content="width=device-width"><meta charset="utf-8"><title>控制台</title></head>'
+                              '<body style="font-family:sans-serif;font-size:20px;padding:16px"><h2>欢迎回来</h2><p id="who">已登录</p></body></html>')
+        if self.path.startswith("/linkfake/send"):
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query); STATS["link_send"] = (q.get("email") or q.get("phone") or [""])[0]; STATS["link_kind"] = "email" if q.get("email") else "phone"
+            return self._json({"ok": True})
+        if self.path.startswith("/linkfake/verify"):
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query); STATS["link_code"] = (q.get("code") or [""])[0]
+            ok = STATS["link_code"] == "482913"; STATS["link_ok"] = ok
+            if ok:
+                self.send_response(302); self.send_header("Set-Cookie", "sess=ok; Path=/"); self.send_header("Location", "/linkfake/home"); self.end_headers(); return
+            return self._json({"ok": False})
+        if self.path.startswith("/linkfake"):
+            return self._html("""<html><head><meta name="viewport" content="width=device-width"><meta charset="utf-8"><title>登录</title>
+<style>body{font-family:sans-serif;font-size:19px;padding:16px} .tabs span{display:inline-block;padding:10px 16px;margin-right:8px;border-bottom:3px solid transparent}
+.tabs span.on{border-color:#e55;font-weight:bold} input{width:90%;height:46px;font-size:19px;margin:8px 0} button{height:46px;font-size:18px;margin:6px 0}</style></head>
+<body><h2>登录 SmokeCloud</h2>
+<div class="tabs" role="tablist"><span role="tab" class="on" id="tp" onclick="show('p')">手机号登录</span><span role="tab" id="te" onclick="show('e')">邮箱登录</span></div>
+<div id="fp"><input id="phone" type="tel" placeholder="请输入手机号"><br><button onclick="send('phone')">获取验证码</button>
+<p style="color:#888;font-size:15px">本站仅支持 +1 手机号</p></div>
+<div id="fe" style="display:none"><input id="email" type="email" name="email" placeholder="请输入邮箱"><br><button onclick="send('email')">发送验证码</button></div>
+<div id="fc" style="display:none"><input id="code" name="code" placeholder="请输入验证码" autocomplete="one-time-code" inputmode="numeric"><br>
+<button onclick="location.href='/linkfake/verify?code='+document.getElementById('code').value">登录</button></div>
+<p id="err" role="alert" class="error"></p>
+<script>function show(t){document.getElementById('fp').style.display=t=='p'?'block':'none';document.getElementById('fe').style.display=t=='e'?'block':'none';
+document.getElementById('tp').className=t=='p'?'on':'';document.getElementById('te').className=t=='e'?'on':'';}
+function send(k){var v=document.getElementById(k).value;if(k=='phone'){document.getElementById('err').innerText='该手机号不支持，请用邮箱登录';return;}
+fetch('/linkfake/send?'+k+'='+encodeURIComponent(v));document.getElementById('fc').style.display='block';document.getElementById('err').innerText='';}</script></body></html>""")
+        # [38.9.1] key page with a modal dialog (name + expiration) for the keyboard-up shot
+        if self.path.startswith("/keydlg"):
+            return self._html("""<html><head><meta name="viewport" content="width=device-width"><meta charset="utf-8"><title>API Keys</title></head>
+<body style="font-family:sans-serif;font-size:18px;margin:0"><div style="padding:16px"><h2>API Keys</h2><p>Manage your keys.</p>
+<button onclick="document.getElementById('dlg').style.display='flex'">Create API Key</button></div>
+<div id="dlg" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);align-items:center;justify-content:center">
+<div style="background:#fff;border-radius:12px;padding:18px;width:86%"><h3>Create API Key</h3><p>Display name</p>
+<input id="name" placeholder="Name" style="width:95%;height:44px;font-size:18px"><p>Expiration</p>
+<select id="exp" style="height:44px;font-size:17px"><option>30 days</option><option>No expiration</option></select><br><br>
+<button onclick="document.getElementById('out').innerText='gsk_'+'smokeKEY1234567890'.repeat(3);document.getElementById('dlg').style.display='none'">Submit</button></div></div>
+<pre id="out" style="padding:16px"></pre></body></html>""")
+        # [38.9.1] Groq-like console with its nav drawer open: dark-theme CSS made the drawer see-through on a light page
+        if self.path.startswith("/drawer"):
+            return self._html("""<html><head><meta name="viewport" content="width=device-width"><meta charset="utf-8"><title>Console</title>
+<style>body{font-family:sans-serif;margin:0;background:#fff;color:#111} .drawer{position:fixed;top:0;left:0;bottom:0;width:72%;background:#fff;box-shadow:2px 0 12px #0003;padding:18px;font-size:20px;line-height:2.2}
+@media (prefers-color-scheme: dark){ .drawer{background:transparent;color:#eee} }</style></head>
+<body><div style="padding:18px 18px 18px 40%"><h2>API Keys</h2><p>Your API keys are listed below. Do not share your API key with others.</p><p>gsk_…old (created 3 days ago)</p></div>
+<nav class="drawer" data-state="open"><div>Playground</div><div>API Keys</div><div>Dashboard</div><div>Docs</div><div>Settings</div><div>Sign Out</div></nav></body></html>""")
         if self.path.rstrip("/").endswith("/models"):
             return self._json({"object": "list", "data": [{"id": "smoke-model", "object": "model", "owned_by": "smoke"}]})
         self._json({"ok": True})
