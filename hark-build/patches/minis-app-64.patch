@@ -2199,6 +2199,658 @@ index 4e7078d..84b98eb 100644
      fun guestOk(id: String) = site(id).guestOk
  
      /** The domains whose cookies make up one account's session (for [AccountJar] swaps / sign-out). */
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt
+index bf0df66..ac07bce 100644
+--- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt
+@@ -66,6 +66,9 @@ Groups:
+   ui list               numbered list of what is on screen
+   tap <n> | type <n> <text> | key back|home|enter
+   do "tap 3; type 5 你好; key enter; wait 500; list"
++  do --task "名字" "…"  remember a path that worked; replay "名字" reruns it (checked step by step)
++  ui elements           JSON element list (text/desc/id/role/clickable/center/bounds)
++  Reading tiers: 1·回放 → 2·无障碍树 (default) → 3·OCR (auto when the tree has no text) → 4·云端视觉 (ui screenshot + read_image)
+   (works through Shizuku too when accessibility is off)
+ 
+   ui        dump | find | info | node | screenshot
+@@ -543,6 +546,8 @@ First-run: enable "Mines" under Settings → Accessibility, then `service ping`.
+             .put("scaledHeight", outH)
+             .put("scale", scale.toDouble())
+             .put("sizeBytes", pngBytes.size)
++            // [Mines-38.8 v5d] the screenshot path is reading tier 4 (cloud vision via read_image), the last resort
++            .put("tier", ScreenTiers.TIER_CLOUD)
+ 
+         if (inline) {
+             data.put("encoding", "png+base64")
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/FastUi.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/FastUi.kt
+index 0a3ea52..1e94fc6 100644
+--- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/FastUi.kt
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/FastUi.kt
+@@ -45,7 +45,11 @@ internal class FastUi(private val context: Context) {
+     data class El(
+         val n: Int, val label: String, val role: String, val bounds: Rect,
+         val node: AccessibilityNodeInfo?, val clickable: Boolean, val editable: Boolean, val scrollable: Boolean,
+-    )
++        // [Mines-38.8 v5d] resource-id / content-desc (element list + replay matching) and where the element came from (tree / ocr)
++        val rid: String = "", val desc: String = "", val source: String = "tree",
++    ) {
++        fun item() = ScreenTiers.Item(label, desc, rid, role, bounds.left, bounds.top, bounds.right, bounds.bottom, clickable, source)
++    }
+ 
+     private enum class Backend(val label: String) { A11Y("无障碍"), SHIZUKU("Shizuku") }
+ 
+@@ -55,6 +59,7 @@ internal class FastUi(private val context: Context) {
+         @Volatile private var lastPkg: String = ""
+         private val lastEventAt = AtomicLong(0L)
+         @Volatile private var listening = false
++        @Volatile private var lastTier: String = ScreenTiers.TIER_TREE
+ 
+         const val HELP = """Fast UI (numbered list + batching; no screenshots):
+   ui list [--all]          numbered list of what is on screen (alias: list)
+@@ -64,15 +69,23 @@ internal class FastUi(private val context: Context) {
+   open <包名或应用名>       open an app (verified: says whether it really came to the front)
+   shade open|qs|close      pull down the notification shade / quick settings, or close it
+   do "<step>; <step>; …"   run several steps in ONE call, then print a fresh list
+-       steps: tap N | tap "文本" | type N 文本 | key K | scroll down|up [N] | wait MS | open <包名/应用名> | shade open|qs|close | list
++       steps: tap N | tap "文本" | tap X,Y | longpress N|"文本"|X,Y | swipe X1 Y1 X2 Y2 [MS] | type N 文本 | key K |
++              scroll down|up [N] | wait MS | open <包名/应用名> | shade open|qs|close | list
++  do --task "<任务名>" "<steps>"   same, and remember the path when every step worked; next time the saved
++                           path is replayed first (each step checked on screen, falls back on the first mismatch)
++  replay "<任务名>"         replay a saved path now        paths    list saved paths
++  ui elements [--all]      JSON element list (text / desc / id / role / clickable / center / bounds)
++Reading tiers, fastest first (every result says which one was used):
++  1·回放 saved path → 2·无障碍树 tree (default, no screenshot) → 3·OCR on-device text recognition when the tree has
++  no text (games / canvas) → 4·云端视觉: ui screenshot + read_image to the cloud vision group (last resort; no local model).
+ Backend: accessibility when enabled, otherwise Shizuku (uiautomator + input).
+ """
+ 
+         fun handles(args: OffloadArgs): Boolean {
+             val p = args.positional
+             return when (p.getOrNull(0)) {
+-                "list", "do", "type" -> true
+-                "ui" -> p.getOrNull(1) == "list"
++                "list", "do", "type", "elements", "replay", "paths" -> true
++                "ui" -> p.getOrNull(1) == "list" || p.getOrNull(1) == "elements"
+                 "tap" -> p.getOrNull(1)?.toIntOrNull() != null
+                 "key" -> true
+                 // [Mines-launch-29] top-level open/launch and the shade work
+@@ -191,7 +204,17 @@ Backend: accessibility when enabled, otherwise Shizuku (uiautomator + input).
+         val p = args.positional
+         return try {
+             when (p[0]) {
+-                "list", "ui" -> NativeOffloadResult(0, list(be, args.hasFlag("all")))
++                "ui", "list", "elements" -> if (p[0] == "elements" || p.getOrNull(1) == "elements") {
++                    val els = elements(be, args.hasFlag("all"))
++                    NativeOffloadResult(0, ScreenTiers.elementsJson(els.map { it.item() }, lastTier, lastPkg).toString() + "\n")
++                } else NativeOffloadResult(0, list(be, args.hasFlag("all")))
++                "replay" -> {
++                    val task = p.drop(1).joinToString(" ").let { unquote(it) }
++                    if (task.isBlank()) return NativeOffloadResult(2, "用法：replay <任务名>\n")
++                    val r = replay(be, task)
++                    NativeOffloadResult(if (r.first) 0 else 1, r.second + list(be, false))
++                }
++                "paths" -> NativeOffloadResult(0, PathStore.describe(context))
+                 "tap" -> step(be, "tap ${p[1]}").let { NativeOffloadResult(if (it.first) 0 else 1, it.second + "\n") }
+                 "type" -> {
+                     val n = p.getOrNull(1) ?: return NativeOffloadResult(2, "用法：type <n> <文字>\n")
+@@ -202,7 +225,17 @@ Backend: accessibility when enabled, otherwise Shizuku (uiautomator + input).
+                 "key" -> step(be, "key ${p.getOrNull(1) ?: ""}").let { NativeOffloadResult(if (it.first) 0 else 1, it.second + "\n") }
+                 "do" -> {
+                     val script = p.drop(1).joinToString(" ")
+-                    NativeOffloadResult(0, batch(be, script))
++                    val task = args.get("task")?.trim()?.takeIf { it.isNotEmpty() }
++                    if (task == null) return NativeOffloadResult(0, batch(be, script))
++                    // [Mines-38.8 v5d] tier 1: a saved path for this app + task is replayed first
++                    val pre = StringBuilder()
++                    if (PathStore.get(context, currentPkg(be), task) != null) {
++                        val (ok, note) = replay(be, task)
++                        if (ok) return NativeOffloadResult(0, note + list(be, false))
++                        pre.append(note)
++                    }
++                    if (script.isBlank()) return NativeOffloadResult(1, pre.toString() + "没有保存过「$task」的路径，请给出步骤。\n" + list(be, false))
++                    NativeOffloadResult(0, pre.toString() + batch(be, script, task))
+                 }
+                 else -> NativeOffloadResult(2, HELP)
+             }
+@@ -228,22 +261,79 @@ Backend: accessibility when enabled, otherwise Shizuku (uiautomator + input).
+         return out
+     }
+ 
+-    private fun batch(be: Backend, script: String): String {
++    private fun batch(be: Backend, script: String, task: String? = null): String {
+         val steps = splitSteps(script)
+         val sb = StringBuilder()
+         var endsWithList = false
++        val startPkg = if (task != null) currentPkg(be) else ""
++        val startAct = if (task != null) currentActivity() else ""
++        val rec = ArrayList<ScreenTiers.Step>()
++        var allOk = true
+         for ((i, st) in steps.withIndex()) {
+             if (st == "list") {
+                 sb.append(list(be, false)); endsWithList = i == steps.lastIndex; continue
+             }
++            lastTarget = null
+             val (ok, msg) = step(be, st)
+             sb.append("${i + 1}. $st → ").append(if (ok) "✓ " else "✗ ").append(msg).append('\n')
+-            if (!ok) { sb.append("（后面的步骤已停止）\n"); break }
++            if (!ok) { allOk = false; sb.append("（后面的步骤已停止）\n"); break }
++            val verb = st.substringBefore(' ').lowercase(); val rest = st.substringAfter(' ', "").trim()
++            val t = lastTarget
++            rec += when {
++                t != null && verb in setOf("type", "input", "输入") -> ScreenTiers.Step("type", t.label, t.rid, t.bounds.centerX(), t.bounds.centerY(), unquote(rest.substringAfter(' ', "")))
++                t != null -> ScreenTiers.Step(if (verb in setOf("longpress", "长按")) "longpress" else "tap", t.label, t.rid, t.bounds.centerX(), t.bounds.centerY())
++                else -> ScreenTiers.Step("raw", arg = st)
++            }
++        }
++        if (task != null) {
++            if (allOk && ScreenTiers.replayable(rec)) {
++                PathStore.put(context, ScreenTiers.Path(startPkg, startAct, task, rec, System.currentTimeMillis()))
++                sb.append("读屏方式：${lastTier} · 已记下「$task」的路径（${rec.size} 步，下次先回放）\n")
++            } else if (allOk) sb.append("（含付款/发送一类步骤，路径不保存）\n")
+         }
+         if (!endsWithList) sb.append(list(be, false))
+         return sb.toString()
+     }
+ 
++    // ── tier 1: replay ───────────────────────────────────────────────────
++
++    @Volatile private var lastTarget: El? = null
++
++    private fun currentPkg(be: Backend): String {
++        MinisAccessibilityService.getInstance()?.foregroundPackage()?.first?.let { if (it.isNotBlank()) return it }
++        if (lastPkg.isBlank()) runCatching { stableSnapshot(be, false) }
++        return lastPkg
++    }
++    private fun currentActivity(): String = MinisAccessibilityService.getInstance()?.foregroundPackage()?.second ?: ""
++
++    /** Replays the saved path; (true, note) when every step matched and worked, else (false, why) after the first mismatch. */
++    private fun replay(be: Backend, task: String): Pair<Boolean, String> {
++        val path = PathStore.get(context, currentPkg(be), task) ?: return false to "没有保存过「$task」的路径。\n"
++        val t0 = System.currentTimeMillis()
++        for ((i, s) in path.steps.withIndex()) {
++            val r: Pair<Boolean, String> = when (s.verb) {
++                "raw" -> step(be, s.arg)
++                "tap", "longpress", "type" -> {
++                    val els = stableSnapshot(be, true); last = els
++                    val hit = ScreenTiers.matchStep(s, els.map { it.item() })
++                    val el = hit?.let { h -> els.firstOrNull { it.bounds.left == h.l && it.bounds.top == h.t && it.bounds.right == h.r && it.bounds.bottom == h.b && it.label == h.label } }
++                    if (el == null) {
++                        return false to "回放「$task」第 ${i + 1} 步对不上（没找到「${s.label.ifBlank { s.rid }}」），改用读屏：\n"
++                    }
++                    when (s.verb) {
++                        "type" -> doTypeEl(be, el, s.arg)
++                        "longpress" -> longPressXY(be, el.bounds.centerX(), el.bounds.centerY()).let { it to (if (it) "长按了「${el.label}」" else "长按失败") }
++                        else -> tapEl(be, el)
++                    }.also { if (it.first) settle(be) }
++                }
++                else -> true to ""
++            }
++            if (!r.first) return false to "回放「$task」第 ${i + 1} 步失败（${r.second}），改用读屏：\n"
++        }
++        PathStore.put(context, path.copy(uses = path.uses + 1))
++        return true to "读屏方式：${ScreenTiers.TIER_REPLAY} · 回放「$task」${path.steps.size} 步全部成功（${System.currentTimeMillis() - t0} ms）\n"
++    }
++
+     private fun unquote(s: String) = s.trim().let {
+         if (it.length >= 2 && (it.first() == '"' && it.last() == '"' || it.first() == '\'' && it.last() == '\'')) it.substring(1, it.length - 1) else it
+     }
+@@ -254,10 +344,31 @@ Backend: accessibility when enabled, otherwise Shizuku (uiautomator + input).
+         val rest = st.substringAfter(' ', "").trim()
+         val r: Pair<Boolean, String> = when (verb) {
+             "tap", "click", "点" -> {
+-                val n = rest.toIntOrNull()
+-                val el = if (n != null) elementFor(be, n) else findByText(be, unquote(rest))
+-                if (el == null) false to (if (n != null) "没有第 $n 项（先 list）" else "屏幕上没找到「${unquote(rest)}」")
+-                else tapEl(be, el)
++                val xy = parseXY(rest)
++                if (xy != null) tapXY(be, xy.first, xy.second).let { it to (if (it) "点了 (${xy.first},${xy.second})" else "点击失败") }
++                else {
++                    val n = rest.toIntOrNull()
++                    val el = if (n != null) elementFor(be, n) else findByText(be, unquote(rest))
++                    lastTarget = el
++                    if (el == null) false to (if (n != null) "没有第 $n 项（先 list）" else "屏幕上没找到「${unquote(rest)}」")
++                    else tapEl(be, el)
++                }
++            }
++            "longpress", "长按" -> {
++                val xy = parseXY(rest)
++                if (xy != null) longPressXY(be, xy.first, xy.second).let { it to (if (it) "长按了 (${xy.first},${xy.second})" else "长按失败") }
++                else {
++                    val n = rest.toIntOrNull()
++                    val el = if (n != null) elementFor(be, n) else findByText(be, unquote(rest))
++                    lastTarget = el
++                    if (el == null) false to "没找到要长按的「$rest」"
++                    else longPressXY(be, el.bounds.centerX(), el.bounds.centerY()).let { it to (if (it) "长按了「${el.label}」" else "长按失败") }
++                }
++            }
++            "swipe" -> {
++                val nums = rest.split(Regex("[\\s,]+")).mapNotNull { it.toIntOrNull() }
++                if (nums.size >= 4) swipeXY(be, nums[0], nums[1], nums[2], nums[3], (nums.getOrNull(4) ?: 300).coerceIn(50, 3000))
++                else scroll(be, rest)
+             }
+             "type", "input", "输入" -> {
+                 val n = rest.substringBefore(' ')
+@@ -266,11 +377,11 @@ Backend: accessibility when enabled, otherwise Shizuku (uiautomator + input).
+             "key" -> key(be, rest.lowercase())
+             "back" -> key(be, "back")
+             "home" -> key(be, "home")
+-            "scroll", "swipe" -> scroll(be, rest)
++            "scroll" -> scroll(be, rest)
+             "wait", "sleep" -> { Thread.sleep((rest.toLongOrNull() ?: 500L).coerceIn(0L, 10_000L)); return true to "等了 ${rest.ifBlank { "500" }} ms" }
+             "open", "launch" -> open(be, rest)
+             "shade" -> shade(rest.ifBlank { "open" })
+-            else -> return false to "不认识的步骤（可用：tap/type/key/scroll/wait/open/shade/list）"
++            else -> return false to "不认识的步骤（可用：tap/longpress/swipe/type/key/scroll/wait/open/shade/list）"
+         }
+         if (r.first) settle(be)
+         // [Mines-30] Going home starts the launcher's enter animation; give it time.
+@@ -280,17 +391,32 @@ Backend: accessibility when enabled, otherwise Shizuku (uiautomator + input).
+ 
+     // ── snapshot ─────────────────────────────────────────────────────────
+ 
++    /** [Mines-38.8 v5d] tier 2 (tree), plus tier 3 (OCR lines) when the tree has almost no text. Sets [lastTier]. */
++    private fun elements(be: Backend, all: Boolean): List<El> {
++        val tree = stableSnapshot(be, all)
++        lastTier = ScreenTiers.TIER_TREE
++        if (!ScreenTiers.needsOcr(tree.map { it.item() })) { last = tree; return tree }
++        val o = ScreenOcr.read(context)
++        if (o.items.isEmpty()) { last = tree; if (o.error != null) ocrNote = o.error; return tree }
++        val extra = ScreenTiers.mergeOcr(tree.map { it.item() }, o.items)
++        lastTier = ScreenTiers.TIER_TREE + " + " + ScreenTiers.TIER_OCR + "（${o.ms} ms）"
++        val merged = tree + extra.map { e -> El(0, e.label, "文字(OCR)", Rect(e.l, e.t, e.r, e.b), null, true, false, false, source = "ocr") }
++        return merged.mapIndexed { i, e -> e.copy(n = i + 1) }.also { last = it }
++    }
++    @Volatile private var ocrNote: String? = null
++
+     private fun list(be: Backend, all: Boolean): String {
+-        val els = stableSnapshot(be, all)
+-        last = els
++        ocrNote = null
++        val els = elements(be, all)
+         val sb = StringBuilder()
+-        sb.append("屏幕：").append(lastPkg.ifBlank { "?" }).append(" · ").append(be.label).append(" · ").append(els.size).append(" 项\n")
++        sb.append("屏幕：").append(lastPkg.ifBlank { "?" }).append(" · ").append(be.label).append(" · ").append(els.size).append(" 项 · 读屏 ").append(lastTier).append('\n')
+         for (e in els) {
+             sb.append(e.n).append(' ')
+             if (e.role.isNotEmpty()) sb.append('[').append(e.role).append("] ")
+             sb.append(e.label).append("  (").append(e.bounds.centerX()).append(',').append(e.bounds.centerY()).append(")\n")
+         }
+-        if (els.isEmpty()) sb.append("（没读到可操作的内容；可能是游戏/视频画面，可用 ui screenshot 看一眼）\n")
++        if (els.isEmpty() || ScreenTiers.needsOcr(els.map { it.item() }))
++            sb.append("（读到的字很少${ocrNote?.let { "；$it" } ?: ""}。最后一招 ${ScreenTiers.TIER_CLOUD}：android-a11y-cli ui screenshot，再用 read_image 交给云端视觉模型组看；不用本地模型）\n")
+         return sb.toString()
+     }
+ 
+@@ -333,9 +459,11 @@ Backend: accessibility when enabled, otherwise Shizuku (uiautomator + input).
+                 if (n.isEditable && n.text.isNullOrEmpty()) n.hintText?.let { label = "（$it）" }
+                 out += El(out.size + 1, label.replace('\n', ' ').take(60),
+                     roleOf(cls, n.isClickable, n.isEditable, n.isScrollable, n.isCheckable, n.isChecked),
+-                    r, n, n.isClickable, n.isEditable, n.isScrollable)
++                    r, n, n.isClickable, n.isEditable, n.isScrollable,
++                    rid = n.viewIdResourceName ?: "", desc = n.contentDescription?.toString()?.take(80) ?: "")
+             } else if (own.isNotEmpty() && !insideInteractive) {
+-                out += El(out.size + 1, own.replace('\n', ' ').take(60), "", r, n, false, false, false)
++                out += El(out.size + 1, own.replace('\n', ' ').take(60), "", r, n, false, false, false,
++                    rid = n.viewIdResourceName ?: "", desc = n.contentDescription?.toString()?.take(80) ?: "")
+             }
+             for (i in 0 until n.childCount) walk(n.getChild(i), depth + 1, insideInteractive || interactive)
+         }
+@@ -379,9 +507,10 @@ Backend: accessibility when enabled, otherwise Shizuku (uiautomator + input).
+                 if (rect.width() > 1 && rect.height() > 1) {
+                     if (interactive) {
+                         out += El(0, text.ifEmpty { a("resource-id").substringAfter('/').let { if (it.isEmpty()) cls.substringAfterLast('.') else "#$it" } }.take(60),
+-                            roleOf(cls, clickable, editable, scrollable, checkable, a("checked") == "true"), rect, null, clickable, editable, scrollable)
++                            roleOf(cls, clickable, editable, scrollable, checkable, a("checked") == "true"), rect, null, clickable, editable, scrollable,
++                            rid = a("resource-id"), desc = a("content-desc").take(80))
+                     } else if (text.isNotEmpty() && !inside) {
+-                        out += El(0, text.take(60), "", rect, null, false, false, false)
++                        out += El(0, text.take(60), "", rect, null, false, false, false, rid = a("resource-id"), desc = a("content-desc").take(80))
+                     }
+                 }
+                 interactiveDepth += interactive
+@@ -401,7 +530,43 @@ Backend: accessibility when enabled, otherwise Shizuku (uiautomator + input).
+     private fun findByText(be: Backend, text: String): El? {
+         val els = if (be == Backend.A11Y) snapshotA11y(true) else snapshotShizuku(true)
+         last = els
+-        return els.firstOrNull { it.label == text } ?: els.firstOrNull { it.label.contains(text) }
++        // [Mines-38.8 v5d] ranked match (exact > prefix > contains > fuzzy; label or content-desc), then OCR lines (tier 3)
++        ScreenTiers.best(text, els.map { it.item() })?.let { b -> els.firstOrNull { it.item() == b }?.let { return it } }
++        val ocr = ScreenOcr.read(context).items
++        val b = ScreenTiers.best(text, ocr) ?: return null
++        lastTier = ScreenTiers.TIER_OCR
++        return El(0, b.label, "文字(OCR)", Rect(b.l, b.t, b.r, b.b), null, true, false, false, source = "ocr")
++    }
++
++    private fun parseXY(s: String): Pair<Int, Int>? {
++        val m = Regex("^\\(?\\s*(\\d{1,5})\\s*[, ]\\s*(\\d{1,5})\\s*\\)?$").find(s.trim()) ?: return null
++        return m.groupValues[1].toInt() to m.groupValues[2].toInt()
++    }
++
++    private fun longPressXY(be: Backend, x: Int, y: Int): Boolean {
++        if (be == Backend.A11Y) {
++            val svc = MinisAccessibilityService.getInstance()
++            if (svc != null) {
++                val path = Path().apply { moveTo(x.toFloat(), y.toFloat()); lineTo(x + 0.1f, y + 0.1f) }
++                if (svc.dispatchSimpleGesture(path, 0L, 700L)) return true
++            }
++        }
++        return shizukuReady() && shell("input", "swipe", "$x", "$y", "$x", "$y", "700")
++    }
++
++    private fun swipeXY(be: Backend, x1: Int, y1: Int, x2: Int, y2: Int, ms: Int): Pair<Boolean, String> {
++        val ok = if (be == Backend.A11Y && MinisAccessibilityService.getInstance() != null) {
++            val p = Path().apply { moveTo(x1.toFloat(), y1.toFloat()); lineTo(x2.toFloat(), y2.toFloat()) }
++            MinisAccessibilityService.getInstance()!!.dispatchSimpleGesture(p, 0L, ms.toLong())
++        } else shell("input", "swipe", "$x1", "$y1", "$x2", "$y2", "$ms")
++        return ok to (if (ok) "从 ($x1,$y1) 滑到 ($x2,$y2)" else "滑动失败")
++    }
++
++    /** type into a replayed element (same path as `type N`, without the numbered list). */
++    private fun doTypeEl(be: Backend, el: El, text: String): Pair<Boolean, String> {
++        val idx = last.indexOf(el)
++        if (idx >= 0) return doType(be, last[idx].n.toString(), text)
++        return false to "输入框不在列表里"
+     }
+ 
+     // ── actions ──────────────────────────────────────────────────────────
+@@ -434,6 +599,7 @@ Backend: accessibility when enabled, otherwise Shizuku (uiautomator + input).
+ 
+     private fun doType(be: Backend, nArg: String, text: String): Pair<Boolean, String> {
+         val n = nArg.toIntOrNull()
++        if (n != null) lastTarget = elementFor(be, n)
+         if (be == Backend.A11Y) {
+             val svc = MinisAccessibilityService.getInstance() ?: return false to "无障碍未运行"
+             val target: AccessibilityNodeInfo? = if (n != null) elementFor(be, n)?.node else
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/PathStore.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/PathStore.kt
+new file mode 100644
+index 0000000..e9e9c6c
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/PathStore.kt
+@@ -0,0 +1,36 @@
++package com.openminis.app.sandbox.offload
++
++import android.content.Context
++import org.json.JSONObject
++
++/**
++ * [Mines-38.8 v5d] Tier 1 storage: step paths that worked, per app (package at the start) + task name.
++ * Small JSON values in one SharedPreferences file; at most [MAX] paths (least used / oldest dropped).
++ */
++internal object PathStore {
++    private const val PREFS = "mines_ui_paths"
++    private const val MAX = 200
++
++    private fun prefs(c: Context) = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++
++    fun get(c: Context, pkg: String, task: String): ScreenTiers.Path? =
++        prefs(c).getString(ScreenTiers.key(pkg, task), null)?.let { runCatching { ScreenTiers.fromJson(JSONObject(it)) }.getOrNull() }
++
++    fun put(c: Context, p: ScreenTiers.Path) {
++        val sp = prefs(c)
++        val e = sp.edit().putString(ScreenTiers.key(p.pkg, p.task), ScreenTiers.toJson(p).toString())
++        val all = sp.all
++        if (all.size >= MAX) {
++            all.entries.mapNotNull { (k, v) -> (v as? String)?.let { s -> runCatching { ScreenTiers.fromJson(JSONObject(s)) }.getOrNull()?.let { k to it } } }
++                .sortedWith(compareBy<Pair<String, ScreenTiers.Path>> { it.second.uses }.thenBy { it.second.savedAt })
++                .take(all.size - MAX + 1).forEach { e.remove(it.first) }
++        }
++        e.apply()
++    }
++
++    fun describe(c: Context): String {
++        val list = prefs(c).all.values.mapNotNull { (it as? String)?.let { s -> runCatching { ScreenTiers.fromJson(JSONObject(s)) }.getOrNull() } }
++        if (list.isEmpty()) return "还没有保存的路径（do --task \"任务名\" \"步骤…\" 成功后会记下）\n"
++        return list.sortedByDescending { it.savedAt }.joinToString("\n", postfix = "\n") { "· ${it.task} @ ${it.pkg} · ${it.steps.size} 步 · 回放 ${it.uses} 次" }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ScreenOcr.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ScreenOcr.kt
+new file mode 100644
+index 0000000..00ff5e0
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ScreenOcr.kt
+@@ -0,0 +1,58 @@
++package com.openminis.app.sandbox.offload
++
++import android.content.Context
++import android.graphics.Bitmap
++import android.graphics.BitmapFactory
++import android.os.Build
++import com.openminis.app.accessibility.MinisAccessibilityService
++import com.openminis.app.logging.AppLogger
++import com.openminis.app.offload.ShizukuManager
++
++/**
++ * [Mines-38.8 v5d] Tier 3: on-device OCR with the ML Kit text recognizer already in the APK
++ * (com.google.mlkit:text-recognition 16.0.1, Latin script model; Chinese characters are not read by this model).
++ * Screenshot from the accessibility service (Android 11+) or Shizuku `screencap`, recognised in-process; returns
++ * one element per text line with its screen bounds, so `tap N` / `tap "文本"` work on games and canvas screens.
++ */
++internal object ScreenOcr {
++    private const val TAG = "ScreenOcr"
++
++    data class Result(val items: List<ScreenTiers.Item>, val error: String? = null, val via: String = "", val ms: Long = 0)
++
++    fun screenshot(): Pair<Bitmap?, String> {
++        val svc = MinisAccessibilityService.getInstance()
++        if (svc != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
++            val shot = runCatching { svc.captureScreenshot() }.getOrNull()
++            if (shot?.bitmap != null) return shot.bitmap to "无障碍截图"
++        }
++        if (FastUi.shizukuReady()) runCatching {
++            val r = ShizukuManager.runProcess(arrayOf("sh", "-c", "screencap -p | base64"), timeoutMs = 10_000L)
++            val bytes = android.util.Base64.decode(r.stdout.replace("\n", "").replace("\r", ""), android.util.Base64.DEFAULT)
++            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { return it to "Shizuku 截图" }
++        }.onFailure { AppLogger.warning(TAG, "shizuku screencap: ${it.message}") }
++        return null to "截不了屏（需要 Android 11+ 的无障碍服务，或 Shizuku）"
++    }
++
++    fun read(context: Context): Result {
++        val t0 = System.currentTimeMillis()
++        val (bmp, via) = screenshot()
++        if (bmp == null) return Result(emptyList(), via)
++        return try {
++            val rec = com.google.mlkit.vision.text.TextRecognition.getClient(com.google.mlkit.vision.text.latin.TextRecognizerOptions.DEFAULT_OPTIONS)
++            val text = com.google.android.gms.tasks.Tasks.await(rec.process(com.google.mlkit.vision.common.InputImage.fromBitmap(bmp, 0)), 8, java.util.concurrent.TimeUnit.SECONDS)
++            runCatching { rec.close() }
++            val out = ArrayList<ScreenTiers.Item>()
++            for (block in text.textBlocks) for (line in block.lines) {
++                val b = line.boundingBox ?: continue
++                val s = line.text.trim(); if (s.isEmpty()) continue
++                out += ScreenTiers.Item(s.take(60), l = b.left, t = b.top, r = b.right, b = b.bottom, clickable = false, source = "ocr", role = "文字")
++            }
++            Result(out, null, via, System.currentTimeMillis() - t0)
++        } catch (t: Throwable) {
++            AppLogger.warning(TAG, "ocr failed: ${t.javaClass.simpleName} ${t.message}")
++            Result(emptyList(), "OCR 失败：${t.javaClass.simpleName}", via, System.currentTimeMillis() - t0)
++        } finally {
++            runCatching { bmp.recycle() }
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ScreenTiers.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ScreenTiers.kt
+new file mode 100644
+index 0000000..1d4a2a6
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/ScreenTiers.kt
+@@ -0,0 +1,165 @@
++package com.openminis.app.sandbox.offload
++
++import org.json.JSONArray
++import org.json.JSONObject
++
++/**
++ * [Mines-38.8 v5d] Fast phone screen reading, fastest tier first (user-approved 2026-10-16):
++ *
++ *   1 回放 replay   a saved step path that already worked for this app + task is replayed directly; every step is
++ *                   checked against the live screen first (same resource-id / label near the saved place) and the
++ *                   replay stops at the first mismatch → the normal path below takes over.
++ *   2 无障碍树 tree  the accessibility tree (or Shizuku uiautomator): compact element list, no screenshot. Default.
++ *   3 OCR            on-device ML Kit text recognition on a screenshot, only when the tree has (almost) no text
++ *                   (games, canvas, image-only WebViews). OCR lines become tappable elements.
++ *   4 云端视觉 cloud  last resort: `ui screenshot` + read_image to the user's cloud vision model group. Never a local LLM.
++ *
++ * This file is the pure part (no Android types) so the parsing / ranking / matching is unit-tested on the JVM.
++ */
++object ScreenTiers {
++    const val TIER_REPLAY = "1·回放"
++    const val TIER_TREE = "2·无障碍树"
++    const val TIER_OCR = "3·OCR"
++    const val TIER_CLOUD = "4·云端视觉"
++
++    /** Screen-agnostic element: what tiers 2 and 3 produce and tier 1 matches against. */
++    data class Item(
++        val label: String, val desc: String = "", val rid: String = "", val role: String = "",
++        val l: Int, val t: Int, val r: Int, val b: Int,
++        val clickable: Boolean = false, val source: String = "tree",
++    ) {
++        val cx get() = (l + r) / 2
++        val cy get() = (t + b) / 2
++        fun area() = (r - l).toLong() * (b - t).toLong()
++    }
++
++    // ── tier 3 trigger ──────────────────────────────────────────────────
++
++    /** A label that carries no words a person would read (a bare #resource-id or a widget class name). */
++    fun isGenericLabel(s: String): Boolean {
++        val t = s.trim()
++        if (t.isEmpty()) return true
++        if (t.startsWith("#")) return true
++        if (Regex("^[A-Z][A-Za-z]*(View|Layout|Button|Image|Text|Group|Frame|Canvas|Surface)$").matches(t)) return true
++        return false
++    }
++
++    /**
++     * True when the tree is too thin to act on, so OCR should be tried: fewer than [minText] elements with a
++     * readable label (games / canvas / video / image-only WebViews typically expose 0–2).
++     */
++    fun needsOcr(items: List<Item>, minText: Int = 3): Boolean = items.count { !isGenericLabel(it.label) || it.desc.isNotBlank() } < minText
++
++    /** OCR lines that do not repeat what the tree already says at the same place (overlap > 50 % with the same text). */
++    fun mergeOcr(tree: List<Item>, ocr: List<Item>): List<Item> {
++        val out = ArrayList<Item>()
++        for (o in ocr) {
++            val txt = norm(o.label)
++            if (txt.isEmpty()) continue
++            val dup = tree.any { t -> overlapRatio(t, o) > 0.5f && (norm(t.label).contains(txt) || txt.contains(norm(t.label)) && norm(t.label).isNotEmpty()) }
++            if (!dup && out.none { norm(it.label) == txt && overlapRatio(it, o) > 0.5f }) out += o.copy(source = "ocr", role = o.role.ifEmpty { "文字" })
++        }
++        return out
++    }
++
++    fun overlapRatio(a: Item, b: Item): Float {
++        val w = minOf(a.r, b.r) - maxOf(a.l, b.l); val h = minOf(a.b, b.b) - maxOf(a.t, b.t)
++        if (w <= 0 || h <= 0) return 0f
++        val small = minOf(a.area(), b.area()).coerceAtLeast(1)
++        return (w.toLong() * h.toLong()).toFloat() / small
++    }
++
++    // ── text ranking (tap "文本") ────────────────────────────────────────
++
++    fun norm(s: String): String = s.lowercase().replace(Regex("[\\s\\u00A0·•:：,，.。!！?？\"'“”‘’()（）\\[\\]【】]"), "")
++
++    /**
++     * Score how well [label] (or its content-desc) answers [query]: 100 exact, 80 starts with, 60 contains,
++     * 40 the query contains the label (≥ 2 chars), 20 all query characters in order; 0 no match. Clickable +5.
++     */
++    fun score(query: String, it: Item): Int {
++        val q = norm(query); if (q.isEmpty()) return 0
++        fun one(s0: String): Int {
++            val s = norm(s0); if (s.isEmpty()) return 0
++            return when {
++                s == q -> 100
++                s.startsWith(q) -> 80
++                s.contains(q) -> 60
++                s.length >= 2 && q.contains(s) -> 40
++                inOrder(q, s) -> 20
++                else -> 0
++            }
++        }
++        val base = maxOf(one(it.label), one(it.desc), if (it.rid.isNotEmpty()) one(it.rid.substringAfter('/')) - 10 else 0)
++        return if (base > 0 && it.clickable) base + 5 else base
++    }
++
++    private fun inOrder(q: String, s: String): Boolean {
++        if (q.length < 2) return false
++        var i = 0
++        for (c in s) if (i < q.length && c == q[i]) i++
++        return i == q.length
++    }
++
++    /** Best match for [query], ties broken by smaller (more specific) element then top-left order; null when nothing scores. */
++    fun best(query: String, items: List<Item>): Item? =
++        items.map { it to score(query, it) }.filter { it.second > 0 }
++            .sortedWith(compareByDescending<Pair<Item, Int>> { it.second }.thenBy { it.first.area() }.thenBy { it.first.t }.thenBy { it.first.l })
++            .firstOrNull()?.first
++
++    // ── tier 1: saved step paths ─────────────────────────────────────────
++
++    /** One recorded step: verb (tap / type / key / scroll / wait / open …), its target as seen when it worked, and text. */
++    data class Step(val verb: String, val label: String = "", val rid: String = "", val cx: Int = -1, val cy: Int = -1, val arg: String = "")
++
++    data class Path(val pkg: String, val activity: String, val task: String, val steps: List<Step>, val savedAt: Long = 0L, val uses: Int = 0)
++
++    fun key(pkg: String, task: String) = pkg + "|" + norm(task)
++
++    fun toJson(p: Path): JSONObject = JSONObject().put("pkg", p.pkg).put("activity", p.activity).put("task", p.task)
++        .put("savedAt", p.savedAt).put("uses", p.uses)
++        .put("steps", JSONArray().apply {
++            p.steps.forEach { s -> put(JSONObject().put("verb", s.verb).put("label", s.label).put("rid", s.rid).put("cx", s.cx).put("cy", s.cy).put("arg", s.arg)) }
++        })
++
++    fun fromJson(o: JSONObject): Path? = runCatching {
++        val arr = o.getJSONArray("steps")
++        Path(o.getString("pkg"), o.optString("activity"), o.getString("task"),
++            (0 until arr.length()).map { i -> arr.getJSONObject(i).let { s -> Step(s.getString("verb"), s.optString("label"), s.optString("rid"), s.optInt("cx", -1), s.optInt("cy", -1), s.optString("arg")) } },
++            o.optLong("savedAt"), o.optInt("uses"))
++    }.getOrNull()
++
++    /**
++     * The live element a saved tap step means, or null (mismatch → stop replaying): same resource-id first, else the
++     * best text match; either must sit within [maxShift] px of where it was (layouts move a little, not across the screen).
++     */
++    fun matchStep(s: Step, items: List<Item>, maxShift: Int = 260): Item? {
++        fun near(it: Item) = s.cx < 0 || (kotlin.math.abs(it.cx - s.cx) <= maxShift && kotlin.math.abs(it.cy - s.cy) <= maxShift)
++        if (s.rid.isNotEmpty()) {
++            val byId = items.filter { it.rid == s.rid && near(it) }
++            if (byId.size == 1) return byId[0]
++            if (byId.size > 1 && s.label.isNotEmpty()) byId.firstOrNull { norm(it.label) == norm(s.label) }?.let { return it }
++            if (byId.isNotEmpty() && s.label.isEmpty()) return byId.minByOrNull { kotlin.math.abs(it.cx - s.cx) + kotlin.math.abs(it.cy - s.cy) }
++        }
++        if (s.label.isEmpty()) return null
++        val cands = items.filter { near(it) && score(s.label, it) >= 80 }
++        return best(s.label, cands)
++    }
++
++    /** Steps that are safe to store and replay: never a step that pays, orders or sends (same words the voice guard uses). */
++    private val sensitive = Regex("支付|付款|转账|确认付款|立即支付|下单|提交订单|购买|发送|send|pay|transfer|checkout", RegexOption.IGNORE_CASE)
++    fun replayable(steps: List<Step>): Boolean = steps.isNotEmpty() && steps.none { sensitive.containsMatchIn(it.label) || sensitive.containsMatchIn(it.arg) }
++
++    // ── output (Mobile-MCP-style list_elements_on_screen) ───────────────
++
++    fun elementsJson(items: List<Item>, tier: String, pkg: String): JSONObject = JSONObject()
++        .put("tier", tier).put("package", pkg).put("count", items.size)
++        .put("elements", JSONArray().apply {
++            items.forEachIndexed { i, e ->
++                put(JSONObject().put("n", i + 1).put("text", e.label).put("desc", e.desc).put("id", e.rid).put("role", e.role)
++                    .put("clickable", e.clickable).put("source", e.source)
++                    .put("center", JSONObject().put("x", e.cx).put("y", e.cy))
++                    .put("bounds", JSONArray().put(e.l).put(e.t).put(e.r).put(e.b)))
++            }
++        })
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
+index e0d0cae..2ffc78f 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
+@@ -15429,7 +15429,7 @@ CLI tools at /usr/local/bin with the `android-` prefix give you access to Androi
+ - android-speech — microphone transcription (`listen [--language BCP47] [--max N] [--timeout SEC]`; `status`). Requires RECORD_AUDIO.
+ - android-weather <latitude> <longitude> — Open-Meteo forecast (current + hourly + daily). No API key needed.
+ - android-shizuku-cli — invoke privileged Android system APIs (package management, settings, system commands) via Shizuku when granted. Curated subcommands return structured JSON; for anything not covered, fall back to `android-shizuku-cli exec <any shell command>` which runs the command via `sh -c` with Shizuku privilege (same surface as `adb shell`). Run with no args (or --help) for the subcommand list.
+-- android-a11y-cli — drive the phone UI. FAST PATH, use it first: `android-a11y-cli ui list` prints a numbered list of what is on screen; then batch steps in ONE call: `android-a11y-cli do "tap 3; type 5 你好; key enter; wait 500; list"` (steps: tap N | tap "文本" | type N 文本 | key back/home/enter | scroll down/up [N] | wait MS | open <package> | list; a fresh list is printed at the end). Avoid screenshots and `ui dump` unless the list is not enough. Works via the AccessibilityService, or via Shizuku when accessibility is off. Run with --help for everything else.
++- android-a11y-cli — drive the phone UI. FAST PATH, use it first: `android-a11y-cli ui list` prints a numbered list of what is on screen; then batch steps in ONE call: `android-a11y-cli do "tap 3; type 5 你好; key enter; wait 500; list"` (steps: tap N | tap "文本" | tap X,Y | longpress N | swipe X1 Y1 X2 Y2 | type N 文本 | key back/home/enter | scroll down/up [N] | wait MS | open <package> | list; a fresh list is printed at the end). For a task you may repeat, add `--task "名字"`: a path that worked is saved and replayed first next time (tier 1, falls back on mismatch). The list says which reading tier it used; OCR (tier 3) kicks in by itself when the tree has no text. Avoid screenshots and `ui dump` unless the list is not enough. Works via the AccessibilityService, or via Shizuku when accessibility is off. Run with --help for everything else.
+ - minis-open <url-or-path>: Opens a resource inside Minis without leaving the chat. Accepts http/https URLs (→ built-in WebKit preview) and chat-resource file paths under /var/minis/** (→ built-in file preview, routed by extension: images to the image viewer, .md to markdown preview, .html to HTML preview, .pdf/office docs to QuickLook, audio/video to the media player, else share sheet). Examples: minis-open https://example.com, minis-open /var/minis/workspace/report.md, minis-open /var/minis/attachments/chart.png. Prefer this over android-open for anything that can be previewed in-app so the user doesn't lose conversation context. Run android-open via shell_execute for non-web schemes (tel:, mailto:, geo:, intent:, etc.) or when the user explicitly wants the system handler.
+ - minis-sessions-cli: Read chat history. `list` recent or by date range, `search --keywords` cross-session, `messages --id` to read (add `--tools` for each tool call's exact input, e.g. the shell command, and its output). Run --help for full options.
+ - minis-model-use: Invoke other LLM models pre-configured by the user. Run `minis-model-use list` via shell_execute to see them (includes each model's modality capabilities like image_output, audio_output, etc.), `minis-model-use search <query>` to filter by name/provider. `minis-model-use run --model <id_or_name>` sends an OpenAI-compatible messages request; pass input via --input <json_file> or stdin, output goes to stdout or --output <path>. The OpenAI shape is the PRIMARY input for every model and modality; standard params are auto-converted to the underlying provider, so do not hand-write provider-native bodies as the primary input. For provider-specific extras the standard schema doesn't model (web-search plugins, image-to-image fields, TTS/video or other custom endpoints), escape hatches exist for OpenAI-compatible providers (they error or are ignored on Anthropic/Gemini models): `extra_body` (object merged verbatim into the request body), a custom `endpoint` path, and a top-level `passthrough` envelope for fully verbatim requests with RAW (unparsed) responses. Results may carry `warnings` (fields that were ignored/downgraded and why) and `applied_extras` (which extras actually took effect) — read them to self-correct. Run --help for the full contract before using these. Models may support multimodal output (image generation, TTS/audio, video) — check the modalities field in list output. For image_output models, pass generation params in the input JSON: top-level `n`/`size`/`quality`/`prompt` (OpenAI /images/generations style) or `generation_config.{aspect_ratio,image_size,number_of_images,person_generation}` (Gemini). Run with --help for full usage.${modelUseDelegateNote}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/group/GroupScreens.kt b/src/android/app/src/main/java/com/openminis/app/ui/group/GroupScreens.kt
 index 9e32ad4..ce38e35 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/group/GroupScreens.kt
@@ -2756,10 +3408,10 @@ index b529a74..2febbff 100644
                  }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/GalaxyMap.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/GalaxyMap.kt
 new file mode 100644
-index 0000000..714c68f
+index 0000000..2ef7bc3
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/GalaxyMap.kt
-@@ -0,0 +1,134 @@
+@@ -0,0 +1,138 @@
 +package com.openminis.app.ui.plus
 +
 +import androidx.compose.foundation.Canvas
@@ -2798,17 +3450,21 @@ index 0000000..714c68f
 +        "服务器" to Color(0xFF8CE66E), "AI会议" to Color(0xFFFF786E),
 +    )
 +    private val palette = named.map { it.second }
++    private val extras = listOf(Color(0xFFFFB347), Color(0xFF7AD7F0), Color(0xFFB8F27A), Color(0xFFF07AE0), Color(0xFF9D8CFF), Color(0xFFFFE07A))
 +
 +    /** The topic's own colour: the 8 named topics keep theirs; any other topic takes the next unused colour by rank. */
 +    fun colorsFor(topics: List<String>): Map<String, Color> {
 +        val out = LinkedHashMap<String, Color>()
 +        val key = { s: String -> s.replace(" ", "").lowercase() }
 +        topics.forEach { t -> named.firstOrNull { key(it.first) == key(t) }?.let { out[t] = it.second } }
-+        var k = 0
++        // [Mines-38.8 v5d] any other topic (e.g. 交易) gets a stable colour of its own: picked by the topic's name hash
++        // from a bright extra palette (+ the unused named colours), so it stays the same as other topics come and go
 +        topics.forEach { t ->
 +            if (t !in out) {
-+                val free = palette.filter { it !in out.values }
-+                out[t] = if (free.isNotEmpty()) free.first() else palette[k++ % palette.size]
++                val pool = extras + palette
++                val start = Math.floorMod(key(t).hashCode(), extras.size)
++                val order = (pool.indices).map { pool[(start + it) % pool.size] }
++                out[t] = order.firstOrNull { it !in out.values } ?: pool[start]
 +            }
 +        }
 +        return out
@@ -2894,6 +3550,22 @@ index 0000000..714c68f
 +        }
 +    }
 +}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassDialogs.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassDialogs.kt
+index 8a17234..7a3315c 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassDialogs.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassDialogs.kt
+@@ -203,8 +203,9 @@ fun glassVeil(): Color {
+     val ctx = LocalContext.current
+     // [Mines-38.7] the backdrop is our own blurred copy on every phone (Android 8+), so the veil no longer depends on the
+     // system's cross-window blur switch
+-    val base = if (m.dark) Color(0xFF221D1A) else Color(0xFFFBF7F2)
+-    return base.copy(alpha = if (m.dark) 0.84f else 0.80f)
++    // [Mines-38.8 v5d] light sheets / dialogs: frosted peach glass at 65 % (was 80 % near-white); dark unchanged
++    val base = if (m.dark) Color(0xFF221D1A) else LightGlassTint
++    return base.copy(alpha = if (m.dark) 0.84f else 0.65f)
+ }
+ 
+ /**
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/KeyAgentScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/KeyAgentScreen.kt
 index 725fc33..fdd2e44 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/KeyAgentScreen.kt
@@ -3044,7 +3716,7 @@ index 725fc33..fdd2e44 100644
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/KnowledgeMap.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/KnowledgeMap.kt
-index 96fef50..30d2567 100644
+index 96fef50..3356ecf 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/KnowledgeMap.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/KnowledgeMap.kt
 @@ -2,6 +2,7 @@ package com.openminis.app.ui.plus
@@ -3075,7 +3747,79 @@ index 96fef50..30d2567 100644
  import androidx.compose.ui.graphics.drawscope.Stroke
  import androidx.compose.ui.input.pointer.pointerInput
  import androidx.compose.ui.platform.LocalDensity
-@@ -87,7 +95,7 @@ fun KnowledgeMindMap(entries: List<com.openminis.app.plus.ChatKnowledge.Entry>,
+@@ -74,6 +82,71 @@ object KnowledgeClusters {
+         list.groupBy { topicOf(it) }.toList().sortedByDescending { it.second.size }.take(8)
+ }
+ 
++private const val OPEN_Z = 0.9f
++
++/** [Mines-38.8 v5d] geometry for the open branch's sub-chips (world px at zoom 1; sizes match the Canvas drawing). Pure, unit-tested. */
++object KnowledgeLayout {
++    fun chipSize(measurer: androidx.compose.ui.text.TextMeasurer, label: String, d: androidx.compose.ui.unit.Density): Size {
++        val tl = measurer.measure(label, TextStyle(fontSize = MT.Caption), maxLines = 1, overflow = TextOverflow.Ellipsis,
++            constraints = Constraints(maxWidth = with(d) { 170.dp.roundToPx() }), density = d)
++        val w = with(d) { (10.dp * 2 + 3.dp * 2 + 6.dp).toPx() } + tl.size.width
++        return Size(w, with(d) { 26.dp.toPx() })
++    }
++    fun pillRect(measurer: androidx.compose.ui.text.TextMeasurer, topic: String, count: Int, p: Offset, d: androidx.compose.ui.unit.Density): Rect {
++        val tl = measurer.measure(topic, TextStyle(fontSize = MT.Body, fontWeight = FontWeight.Medium), maxLines = 1, overflow = TextOverflow.Ellipsis,
++            constraints = Constraints(maxWidth = with(d) { 110.dp.roundToPx() }), density = d)
++        val w = with(d) { (11.dp + 4.dp * 2 + 7.dp * 2 + 22.dp + 5.dp).toPx() } + tl.size.width + (if (count >= 10) with(d) { 8.dp.toPx() } else 0f)
++        val h = with(d) { 32.dp.toPx() }
++        return Rect(Offset(p.x - w / 2f, p.y - h / 2f), Size(w, h))
++    }
++    /** the face ring and the 「我」 pill under it */
++    fun faceRects(d: androidx.compose.ui.unit.Density): List<Rect> = with(d) {
++        val r = (36.dp + 10.dp).toPx()
++        listOf(Rect(Offset(-r, -r), Size(r * 2, r * 2)), Rect(Offset(-30.dp.toPx(), (36.dp + 4.dp).toPx()), Size(60.dp.toPx(), 26.dp.toPx())))
++    }
++
++    /**
++     * Places [sizes] chips around [parent] (a topic pill centred at [bp], outward unit direction [dir]): candidates on
++     * rings of growing radius, angles alternating either side of the outward direction (never more than 100° off it),
++     * each clamped to [-half, half] minus [margin]; the first candidate overlapping no obstacle / placed chip (all inflated
++     * by [gap]) wins. When nothing is free the least-overlapping candidate is used. Returns chip centres.
++     */
++    fun placeChips(bp: Offset, dir: Offset, parent: Rect, sizes: List<Size>, obstacles: List<Rect>, half: Size, gap: Float, margin: Float): List<Offset> {
++        val base = kotlin.math.atan2(dir.y, dir.x)
++        val taken = ArrayList<Rect>(); taken += obstacles; taken += parent
++        val out = ArrayList<Offset>()
++        val angles = ArrayList<Float>().apply {
++            add(0f); for (s in 1..5) { add(s * 20f); add(-s * 20f) }
++        }.map { Math.toRadians(it.toDouble()).toFloat() }
++        for (sz in sizes) {
++            var best: Offset? = null; var bestCost = Float.MAX_VALUE
++            val r0 = kotlin.math.hypot(parent.width / 2f, parent.height / 2f) * 0.6f + kotlin.math.hypot(sz.width / 2f, sz.height / 2f) * 0.6f + gap
++            search@ for (ring in 0 until 14) {
++                val rr = r0 + ring * sz.height * 0.9f
++                for (a in angles) {
++                    val c0 = Offset(bp.x + kotlin.math.cos(base + a) * rr, bp.y + kotlin.math.sin(base + a) * rr)
++                    val c = clampCentre(c0, sz, half, margin)
++                    val rect = Rect(Offset(c.x - sz.width / 2f, c.y - sz.height / 2f), sz)
++                    val cost = taken.sumOf { overlap(it.inflate(gap), rect).toDouble() }.toFloat()
++                    if (cost == 0f) { best = c; bestCost = 0f; break@search }
++                    if (cost < bestCost) { bestCost = cost; best = c }
++                }
++            }
++            val c = best ?: bp
++            out += c; taken += Rect(Offset(c.x - sz.width / 2f, c.y - sz.height / 2f), sz)
++        }
++        return out
++    }
++    fun clampCentre(c: Offset, sz: Size, half: Size, margin: Float): Offset {
++        val hx = (half.width - margin - sz.width / 2f).coerceAtLeast(0f); val hy = (half.height - margin - sz.height / 2f).coerceAtLeast(0f)
++        return Offset(c.x.coerceIn(-hx, hx), c.y.coerceIn(-hy, hy))
++    }
++    fun overlap(a: Rect, b: Rect): Float {
++        val w = minOf(a.right, b.right) - maxOf(a.left, b.left); val h = minOf(a.bottom, b.bottom) - maxOf(a.top, b.top)
++        return if (w > 0f && h > 0f) w * h else 0f
++    }
++}
++
+ private class MapNode(val id: String, val label: String, val pos: Offset, val level: Int, val entry: com.openminis.app.plus.ChatKnowledge.Entry? = null, var rect: Rect = Rect.Zero,
+                       val point: Pair<String, String>? = null)
+ 
+@@ -87,27 +160,44 @@ fun KnowledgeMindMap(entries: List<com.openminis.app.plus.ChatKnowledge.Entry>,
      val clusters = remember(entries) { KnowledgeClusters.cluster(entries) }
      var openBranch by remember { mutableStateOf<String?>(null) }
      var leaf by remember { mutableStateOf<Pair<com.openminis.app.plus.ChatKnowledge.Entry, Pair<String, String>>?>(null) }
@@ -3083,8 +3827,13 @@ index 96fef50..30d2567 100644
 +    val camX = remember { Animatable(0f) }; val camY = remember { Animatable(0f) }; val zoom = remember { Animatable(0.88f) }
      val px = { d: Float -> with(density) { d.dp.toPx() } }
  
++    var boxSize by remember { mutableStateOf(androidx.compose.ui.unit.IntSize.Zero) }
      // layout in world coordinates (px), 「我」 at the origin
-@@ -98,16 +106,20 @@ fun KnowledgeMindMap(entries: List<com.openminis.app.plus.ChatKnowledge.Entry>,
+-    val nodes = remember(clusters, openBranch, density) {
++    val nodes = remember(clusters, openBranch, density, boxSize) {
+         val out = ArrayList<MapNode>()
+         out += MapNode("me", "我", Offset.Zero, 0)
+         val k = clusters.size.coerceAtLeast(1)
          clusters.forEachIndexed { i, (topic, list) ->
              val a = Math.toRadians(-90.0 + 360.0 * i / k)
              val dir = Offset(kotlin.math.cos(a).toFloat(), kotlin.math.sin(a).toFloat())
@@ -3093,34 +3842,49 @@ index 96fef50..30d2567 100644
 +            val bp = Offset(dir.x * px(118f), dir.y * px((height.value / 2f - 72f).coerceIn(130f, 210f)))
              out += MapNode("b:$topic", "$topic · ${list.size}", bp, 1)
              if (openBranch == topic) {
-                 val perp = Offset(-dir.y, dir.x)
+-                val perp = Offset(-dir.y, dir.x)
                  // [Mines-38.7] leaves are the 要点 (结论 / 待办 / 要点) of the topic's conversations, up to 2 per conversation, 10 per topic
 -                val kids = list.flatMap { e -> KnowledgeClusters.points(e).take(2).map { e to it } }.take(10)
-+                val kids = list.flatMap { e -> KnowledgeClusters.points(e).take(2).map { e to it } }.take(6)
-+                // [Mines-38.8] sub-points fan out beyond the topic in an arc (alternating rings), never over other topics
-+                val base = kotlin.math.atan2(dir.y, dir.x)
-                 kids.forEachIndexed { j, (e, pt) ->
+-                kids.forEachIndexed { j, (e, pt) ->
 -                    val off = (j - (kids.size - 1) / 2f) * px(58f)
-+                    val off = (j - (kids.size - 1) / 2f) * Math.toRadians(24.0).toFloat()
-+                    val rr = px(if (j % 2 == 0) 92f else 132f)
++                val kids = list.flatMap { e -> KnowledgeClusters.points(e).take(2).map { e to it } }.take(6)
++                // [Mines-38.8 v5d] sub-chips go radially OUTWARD from the topic pill: each one takes the first free spot on
++                // widening rings around the outward direction that overlaps no topic pill, the face / 「我」 pill or an
++                // earlier chip, and is clamped inside the map (the camera stays put while a branch is open, zoom OPEN_Z)
++                val sizes = kids.map { (_, pt) ->
                      val tag = when (pt.first) { "结论" -> "✓ "; "待办" -> "☐ "; else -> "" }
 -                    out += MapNode("l:${e.sessionId}:$j", tag + pt.second, bp + dir * px(200f) + perp * off, 2, e, point = pt)
-+                    out += MapNode("l:${e.sessionId}:$j", tag + pt.second, bp + Offset(kotlin.math.cos(base + off) * rr, kotlin.math.sin(base + off) * rr), 2, e, point = pt)
++                    tag + pt.second to KnowledgeLayout.chipSize(measurer, tag + pt.second, density)
++                }
++                val obstacles = ArrayList<Rect>()
++                obstacles += KnowledgeLayout.faceRects(density)
++                clusters.forEachIndexed { i2, (t2, l2) ->
++                    val a2 = Math.toRadians(-90.0 + 360.0 * i2 / k)
++                    val p2 = Offset(kotlin.math.cos(a2).toFloat() * px(118f), kotlin.math.sin(a2).toFloat() * px((height.value / 2f - 72f).coerceIn(130f, 210f)))
++                    obstacles += KnowledgeLayout.pillRect(measurer, t2, l2.size, p2, density)
++                }
++                val half = if (boxSize.width > 0) Size(boxSize.width / 2f / OPEN_Z, (boxSize.height / 2f - px(26f)) / OPEN_Z)
++                           else Size(px(180f) / OPEN_Z, px(height.value / 2f) / OPEN_Z)
++                val placed = KnowledgeLayout.placeChips(bp, dir, KnowledgeLayout.pillRect(measurer, topic, list.size, bp, density),
++                    sizes.map { it.second }, obstacles, half, px(10f), px(8f))
++                kids.forEachIndexed { j, (e, pt) ->
++                    out += MapNode("l:${e.sessionId}:$j", sizes[j].first, placed[j], 2, e, point = pt)
                  }
              }
          }
-@@ -125,18 +137,26 @@ fun KnowledgeMindMap(entries: List<com.openminis.app.plus.ChatKnowledge.Entry>,
+@@ -125,18 +215,25 @@ fun KnowledgeMindMap(entries: List<com.openminis.app.plus.ChatKnowledge.Entry>,
                  val t = hit.id.removePrefix("b:")
                  openBranch = if (openBranch == t) null else t
                  // glide to the branch, a bit further out so its children are in view
 -                if (openBranch != null) focus(hit.pos * 1.45f, 1.0f) else focus(Offset.Zero, 0.9f)
-+                if (openBranch != null) focus(hit.pos * 1.25f, 0.95f) else focus(Offset.Zero, 0.9f)
++                // [Mines-38.8 v5d] the camera stays centred (chips are laid out to fit the screen at OPEN_Z, no topic slides off)
++                if (openBranch != null) focus(Offset.Zero, OPEN_Z) else focus(Offset.Zero, 0.9f)
              }
              else -> hit.entry?.let { e -> leaf = e to (hit.point ?: ("要点" to e.summary)) }
          }
      }
-     var boxSize by remember { mutableStateOf(androidx.compose.ui.unit.IntSize.Zero) }
- 
+-    var boxSize by remember { mutableStateOf(androidx.compose.ui.unit.IntSize.Zero) }
+-
 -    val ink = m.ink; val ink2 = m.ink2; val line = m.icon.copy(alpha = 0.45f)
 -    val branchFill = m.container; val leafFill = if (m.dark) Color(0xFF2A2421) else Color(0xFFFFFDFA)
 -    val meStyle = TextStyle(fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color.White)
@@ -3142,7 +3906,7 @@ index 96fef50..30d2567 100644
  
      Box(Modifier.fillMaxWidth().height(height).semantics { contentDescription = "知识脑图：双指缩放，拖动查看，点主题展开" }) {
          Canvas(Modifier.fillMaxWidth().height(height).onSizeChanged { boxSize = it }
-@@ -155,37 +175,122 @@ fun KnowledgeMindMap(entries: List<com.openminis.app.plus.ChatKnowledge.Entry>,
+@@ -155,37 +252,122 @@ fun KnowledgeMindMap(entries: List<com.openminis.app.plus.ChatKnowledge.Entry>,
              }) {
              val c = Offset(size.width / 2f + camX.value, size.height / 2f + camY.value)
              val z = zoom.value
@@ -3287,7 +4051,7 @@ index 96fef50..30d2567 100644
          // [Mines-38.7] every node is also a real (invisible) button: TalkBack reads it (the user is partially sighted) and
          // uiautomator can tap it (smoke). Same action as tapping the drawn node.
          nodes.forEach { n ->
-@@ -201,7 +306,7 @@ fun KnowledgeMindMap(entries: List<com.openminis.app.plus.ChatKnowledge.Entry>,
+@@ -201,7 +383,7 @@ fun KnowledgeMindMap(entries: List<com.openminis.app.plus.ChatKnowledge.Entry>,
                      .clickable(interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }, indication = null) { onNode(n) })
          }
          // [Mines-38.5] empty state centred under 「我」 with padding (was flush top-left, orphan 「图」)
@@ -3297,7 +4061,7 @@ index 96fef50..30d2567 100644
              modifier = Modifier.align(androidx.compose.ui.Alignment.Center)
                  .offset(y = 84.dp).padding(horizontal = 24.dp))
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/KnowledgeScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/KnowledgeScreen.kt
-index 310d404..8f83b63 100644
+index 310d404..9f4f58c 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/KnowledgeScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/KnowledgeScreen.kt
 @@ -25,9 +25,15 @@ import androidx.compose.runtime.collectAsState
@@ -3316,7 +4080,7 @@ index 310d404..8f83b63 100644
  import androidx.compose.ui.Modifier
  import androidx.compose.ui.graphics.Color
  import androidx.compose.ui.platform.LocalContext
-@@ -70,19 +76,23 @@ fun KnowledgeScreen(onBack: () -> Unit) {
+@@ -70,19 +76,35 @@ fun KnowledgeScreen(onBack: () -> Unit) {
      // [Mines-38.7] the knowledge home IS the 脑图 (user 2026-10-15); 「列表」 shows the classic list
      var mapView by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(true) }
      val kEntries by com.openminis.app.plus.ChatKnowledge.entries.collectAsState()
@@ -3325,6 +4089,18 @@ index 310d404..8f83b63 100644
 +    // [Mines-38.8 v5] 脑图 view = 「星空脑图」: deep-space page with light text (dark colours just for this page)
 +    val pageM = mines()
 +    val galaxyM = remember(pageM.character.id) { minesColors(pageM.character.id, true) }
++    // [Mines-38.8 v5d] the 星空 page is dark in both themes: light status-bar icons while it shows, the previous ones back on leave / 列表
++    val sbView = androidx.compose.ui.platform.LocalView.current
++    androidx.compose.runtime.DisposableEffect(mapView) {
++        val win = (sbView.context as? android.app.Activity)?.window
++        val ctl = win?.let { androidx.core.view.WindowInsetsControllerCompat(it, sbView) }
++        val prev = if (mapView) ctl?.isAppearanceLightStatusBars else null
++        if (mapView) ctl?.isAppearanceLightStatusBars = false
++        onDispose { if (prev != null) ctl?.isAppearanceLightStatusBars = prev }
++    }
++    if (mapView) androidx.compose.runtime.SideEffect {
++        (sbView.context as? android.app.Activity)?.window?.let { androidx.core.view.WindowInsetsControllerCompat(it, sbView).isAppearanceLightStatusBars = false }
++    }
 +    androidx.compose.runtime.CompositionLocalProvider(LocalMinesColors provides (if (mapView) galaxyM else pageM)) {
 +    PlusPage("知识库", onBack, subtitle = if (mapView) "聊过的事自动整理到这里 · 点主题展开，点要点看详情" else "你的资料和聊过的事，AI 回答前会先查这里",
 +        actions = { GlassTextButton(if (mapView) "列表" else "脑图") { mapView = !mapView } },
@@ -3347,7 +4123,7 @@ index 310d404..8f83b63 100644
              return@PlusPage
          }
          ChatDigestSection()
-@@ -111,6 +121,7 @@ fun KnowledgeScreen(onBack: () -> Unit) {
+@@ -111,6 +133,7 @@ fun KnowledgeScreen(onBack: () -> Unit) {
          }
          if (bases.any { it.docs.isNotEmpty() }) SearchTry(null)
      }
@@ -3793,11 +4569,19 @@ index 0000000..781aaea
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt
-index 92e996b..a5750ff 100644
+index 92e996b..a4b3314 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt
-@@ -51,9 +51,10 @@ object MinesDesign {
-     val GlassStrong = Color(0xF2FFFDFA); val GlassStrongDark = Color(0xF2221D1A) // .92
+@@ -47,13 +47,16 @@ object MinesDesign {
+     val Surface = Color(0xFFFBF8F4);  // [Mines-38.1] no pure-white blocks
+     @Suppress("unused") private val surfaceWas = Color(0xFFFFFFFF); val SurfaceDark = Color(0xFF1F1B18)
+     val Surface2 = Color(0xFFEFEAE3); val Surface2Dark = Color(0xFF2A2521)
+-    val Glass = Color(0xF0FFFDFA); val GlassDark = Color(0xF0221D1A)          // [Mines-warm-36] .90 / .90 (cards 90 % opaque)
+-    val GlassStrong = Color(0xF2FFFDFA); val GlassStrongDark = Color(0xF2221D1A) // .92
++    val Glass = Color(0x8CFFF5EE);  // [Mines-38.8 v5d] light glass 55 % peach porcelain (was .94 near-white)
++    val GlassDark = Color(0xF0221D1A)          // [Mines-warm-36] .90 / .90 (cards 90 % opaque)
++    val GlassStrong = Color(0x99FFF5EE);  // [Mines-38.8 v5d] 60 % (was .95)
++    val GlassStrongDark = Color(0xF2221D1A) // .92
      val GlassBorder = Color(0xBFFFFFFF); val GlassBorderDark = Color(0x1AFFFFFF)
      val Hairline = Color(0x171C1915); val HairlineDark = Color(0x17FFFFFF)
 -    val Ink = Color(0xFF1C1915); val InkDark = Color(0xFFF5F0EA)
@@ -3810,7 +4594,7 @@ index 92e996b..a5750ff 100644
      // Semantic (text colour on its container ≥ 5:1)
      val Success = Color(0xFF1E6B40); val SuccessC = Color(0xFFE1F2E7)
      val Warning = Color(0xFF8A4E00); val WarningC = Color(0xFFFCEFD9)
-@@ -182,13 +183,15 @@ fun PorcelainBackdrop(modifier: Modifier = Modifier) {
+@@ -182,13 +185,15 @@ fun PorcelainBackdrop(modifier: Modifier = Modifier) {
      // native radial shaders (no banding / grid), ≈30 fps, only while the app is RESUMED, still when animations are off.
      // Cards stay solid frosted porcelain on top, so text contrast does not change.
      val m = mines()
@@ -3829,7 +4613,7 @@ index 92e996b..a5750ff 100644
          owner.lifecycle.repeatOnLifecycle(androidx.lifecycle.Lifecycle.State.RESUMED) {
              var last = 0L
              while (true) androidx.compose.runtime.withFrameMillis { now ->
-@@ -197,53 +200,54 @@ fun PorcelainBackdrop(modifier: Modifier = Modifier) {
+@@ -197,53 +202,54 @@ fun PorcelainBackdrop(modifier: Modifier = Modifier) {
          }
      }
      val paint = androidx.compose.runtime.remember { android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply { isDither = true } }
@@ -3917,7 +4701,7 @@ index 92e996b..a5750ff 100644
  /** [Mines-38.7] one fog clock for every backdrop, so the fog does not jump when a new page opens. */
  object FogClock {
      @Volatile var t: Float = 0f
-@@ -272,13 +276,14 @@ fun currentCharacter(): String {
+@@ -272,13 +278,14 @@ fun currentCharacter(): String {
   * from here; the system font scale multiplies them (the user's phone runs ≈ 1.18).
   */
  object MT {
@@ -3936,7 +4720,7 @@ index 92e996b..a5750ff 100644
      val Button = 15.sp         // all buttons
      val BodyLH = 22.sp; val SubLH = 18.sp; val CaptionLH = 18.sp
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
-index afd2104..edffa59 100644
+index afd2104..4874534 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
 @@ -87,6 +87,8 @@ object PlusNav {
@@ -3962,7 +4746,7 @@ index afd2104..edffa59 100644
          Scaffold(
              containerColor = Color.Transparent,
              topBar = {
-@@ -312,8 +315,10 @@ fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, action
+@@ -312,21 +315,33 @@ fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, action
                      }
                      content()
                  }
@@ -3975,7 +4759,13 @@ index afd2104..edffa59 100644
              }
          }
      }
-@@ -324,9 +329,15 @@ fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, action
+ }
+ 
++/** [Mines-38.8 v5d] warm porcelain tint of the light-theme glass (v2 design's peach-tinted cards). */
++val LightGlassTint = Color(0xFFFFF5EE)
++
+ /** Glass section card fill: translucent porcelain, opaque enough that ink stays ≥ 4.5:1 over any backdrop. */
+ @Composable
  fun minesGlassFill(strong: Boolean = false): Color {
      val m = mines()
      val photo = wallpaperOn(home = true)
@@ -3988,13 +4778,14 @@ index afd2104..edffa59 100644
 +    val a = when {
 +        photo -> if (strong) 0.95f else 0.94f
 +        m.dark -> 0.58f   // liquid-glass v2: text surfaces 56–58 %
-+        else -> 0.56f
++        // [Mines-38.8 v5d] user 2026-10-16 「浅色太白」: light glass is peach-tinted porcelain at 55 % (strong 60 %), not white
++        else -> if (strong) 0.60f else 0.55f
 +    }
-+    return (if (m.dark) Color(0xFF221B1E) else Color.White).copy(alpha = a)
++    return (if (m.dark) Color(0xFF221B1E) else if (photo) Color.White else LightGlassTint).copy(alpha = a)
  }
  
  /** A frosted 22 dp card (no blur pass: translucent fill + 1 dp highlight + soft warm shadow). */
-@@ -335,7 +346,7 @@ fun MinesCard(modifier: Modifier = Modifier, strong: Boolean = false, onClick: (
+@@ -335,7 +350,7 @@ fun MinesCard(modifier: Modifier = Modifier, strong: Boolean = false, onClick: (
      val m = mines()
      val shape = RoundedCornerShape(MS.CardRadius)
      Column(
@@ -4004,7 +4795,7 @@ index afd2104..edffa59 100644
              .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier),
          content = content,
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
-index 95d1b6b..8bd5a85 100644
+index 95d1b6b..ee19070 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
 @@ -12,10 +12,12 @@ import androidx.compose.foundation.background
@@ -4057,7 +4848,7 @@ index 95d1b6b..8bd5a85 100644
      val greeting = androidx.compose.runtime.remember(gTick, hour) {
          val snap = DeviceSnap.read(context)
          val charging = runCatching { context.getSystemService(android.os.BatteryManager::class.java)?.isCharging == true }.getOrDefault(false)
-@@ -143,21 +164,67 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier, onSearch:
+@@ -143,21 +164,72 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier, onSearch:
                  .clickable { switcher = true }.semantics { contentDescription = "换角色：$name" },
                  contentAlignment = Alignment.Center) { PetAvatar(size = 100.dp) }
          }
@@ -4113,7 +4904,12 @@ index 95d1b6b..8bd5a85 100644
 +                    Spacer(Modifier.width(8.dp))
 +                    Box(Modifier.weight(1f)) {
 +                        if (query.isEmpty()) Text("搜索对话…", fontSize = MT.Body, color = m.ink3, maxLines = 1)
-+                        androidx.compose.foundation.text.BasicTextField(query, onQuery, singleLine = true,
++                        // [Mines-38.8 v5d] own TextFieldValue: the cursor stays where the user types even when the parent's
++                        // query state lags a frame behind (a String field resets the selection to 0 → 「Mines」 came out 「sM」)
++                        var tfv by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(androidx.compose.ui.text.input.TextFieldValue(query, androidx.compose.ui.text.TextRange(query.length))) }
++                        // the only outside change is a clear (清空 / 取消); a lagging echo of what was typed is ignored
++                        androidx.compose.runtime.LaunchedEffect(query) { if (query.isEmpty() && tfv.text.isNotEmpty()) tfv = androidx.compose.ui.text.input.TextFieldValue("") }
++                        androidx.compose.foundation.text.BasicTextField(tfv, { v -> tfv = v; if (v.text != query) onQuery(v.text) }, singleLine = true,
 +                            textStyle = androidx.compose.ui.text.TextStyle(fontSize = MT.Body, color = m.ink),
 +                            cursorBrush = androidx.compose.ui.graphics.SolidColor(m.primary),
 +                            modifier = Modifier.fillMaxWidth().focusRequester(focus).semantics { contentDescription = "搜索对话" })
@@ -4139,7 +4935,7 @@ index 95d1b6b..8bd5a85 100644
          }
      }
  }
-@@ -203,6 +270,64 @@ fun HomeAvatar(modifier: Modifier = Modifier) {
+@@ -203,6 +275,64 @@ fun HomeAvatar(modifier: Modifier = Modifier) {
      }
  }
  
@@ -4204,7 +5000,7 @@ index 95d1b6b..8bd5a85 100644
  /** [Mines-38.7] the home weather as the sprite / big picture / pill need it; null = no weather (nothing shown). */
  class HomeWx(val icon: String, val words: String, val temp: Int, val extra: String, val night: Boolean) {
      val spoken get() = "$words $temp 度"
-@@ -219,7 +344,8 @@ fun homeWeather(): HomeWx? {
+@@ -219,7 +349,8 @@ fun homeWeather(): HomeWx? {
      val forced = com.openminis.app.plus.HomeGreeting.override?.optInt("hour", -1)?.takeIf { it >= 0 }
      val night = if (forced != null) forced >= 19 || forced < 6 else sunNight
      val (icon, words) = com.openminis.app.plus.HomeGreeting.describe(w.code, if (night) 23 else 12)
@@ -4214,7 +5010,16 @@ index 95d1b6b..8bd5a85 100644
      return HomeWx(icon, words, Math.round(w.temp).toInt(), extra, night)
  }
  
-@@ -242,7 +368,7 @@ fun HomeWeatherPill() {
+@@ -234,7 +365,7 @@ fun HomeWeatherPill() {
+     androidx.compose.animation.AnimatedVisibility(HomeOrbit.open,
+         enter = androidx.compose.animation.fadeIn() + androidx.compose.animation.expandVertically(),
+         exit = androidx.compose.animation.fadeOut() + androidx.compose.animation.shrinkVertically()) {
+-        val fill = if (m.dark) Color(0xFF2A2421) else Color.White.copy(alpha = 0.94f)
++        val fill = if (m.dark) Color(0xFF2A2421) else minesGlassFill(strong = true)  // [Mines-38.8 v5d] light: glass, not white
+         Row(Modifier.padding(top = 10.dp, bottom = 2.dp).heightIn(min = 36.dp)
+             .clip(RoundedCornerShape(50)).background(fill).border(1.dp, m.hairline.copy(alpha = 0.18f), RoundedCornerShape(50))
+             .padding(horizontal = 14.dp, vertical = 4.dp)
+@@ -242,7 +373,7 @@ fun HomeWeatherPill() {
              verticalAlignment = Alignment.CenterVertically) {
              Text("${wx.temp}°", fontSize = 18.sp, lineHeight = 22.sp, fontWeight = FontWeight.Bold, color = m.ink, maxLines = 1, softWrap = false)
              Spacer(Modifier.width(6.dp))
@@ -4223,7 +5028,7 @@ index 95d1b6b..8bd5a85 100644
          }
      }
  }
-@@ -287,7 +413,8 @@ class WeatherOrbitState {
+@@ -287,7 +418,8 @@ class WeatherOrbitState {
   * face's upper right, a tap shows the pill.
   */
  @Composable
@@ -4233,7 +5038,7 @@ index 95d1b6b..8bd5a85 100644
      val ctx = LocalContext.current
      val m = mines()
      val still = remember { AnimeWeather.still(ctx) }
-@@ -315,9 +442,9 @@ private fun WeatherOrbit(st: WeatherOrbitState, wx: HomeWx, front: Boolean, onTa
+@@ -315,9 +447,9 @@ private fun WeatherOrbit(st: WeatherOrbitState, wx: HomeWx, front: Boolean, onTa
      }
      val a = st.angle
      val f = st.fly.value
@@ -4246,7 +5051,7 @@ index 95d1b6b..8bd5a85 100644
      // faint dashed orbit line (back layer, while circling)
      if (!front && !still && f < 0.02f) {
          androidx.compose.foundation.Canvas(Modifier.size(1.dp)) {
-@@ -338,7 +465,7 @@ private fun WeatherOrbit(st: WeatherOrbitState, wx: HomeWx, front: Boolean, onTa
+@@ -338,7 +470,7 @@ private fun WeatherOrbit(st: WeatherOrbitState, wx: HomeWx, front: Boolean, onTa
      val tx = 0f; val ty = -82f
      val x = ox + (tx - ox) * f
      val y = oy + (ty - oy) * f - kotlin.math.sin(Math.PI.toFloat() * f) * 22f
@@ -4255,7 +5060,7 @@ index 95d1b6b..8bd5a85 100644
      val scale = sc0 + (1f - sc0) * f
      val alpha = al0 + (1f - al0) * f
      // faint trail of light dots behind the sprite while it circles
-@@ -407,7 +534,7 @@ private fun StatusTile(modifier: Modifier, icon: String, value: String, label: S
+@@ -407,7 +539,7 @@ private fun StatusTile(modifier: Modifier, icon: String, value: String, label: S
              Text(label, fontSize = MT.Meta, color = m.ink2, maxLines = 1, softWrap = false, modifier = Modifier.weight(1f))
              Box(Modifier.size(6.dp).clip(CircleShape).background(dot))
          }
@@ -4264,7 +5069,7 @@ index 95d1b6b..8bd5a85 100644
              overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, modifier = Modifier.padding(top = 2.dp))
      }
  }
-@@ -473,7 +600,7 @@ private fun FeedRow(item: com.openminis.app.plus.Digest.Item) {
+@@ -473,7 +605,7 @@ private fun FeedRow(item: com.openminis.app.plus.Digest.Item) {
          ToneBubble(com.openminis.app.ui.brand.MinesIcons.named(icon)!!, tone)
          Spacer(Modifier.width(14.dp))
          Column(Modifier.weight(1f)) {
@@ -4273,7 +5078,7 @@ index 95d1b6b..8bd5a85 100644
                  maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
              val sub = it.summary.takeIf { s -> s.isNotBlank() && s != it.headline } ?: it.source
              Text(sub, fontSize = 15.sp, lineHeight = 20.sp, color = m.ink2, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
-@@ -514,7 +641,7 @@ private fun MessagesBar(count: Int, onClick: () -> Unit) {
+@@ -514,7 +646,7 @@ private fun MessagesBar(count: Int, onClick: () -> Unit) {
      ) {
          MinesIcon(com.openminis.app.ui.brand.MinesIcons.named("mail")!!, null, tint = m.ink2, modifier = Modifier.size(20.dp))
          Spacer(Modifier.width(10.dp))
@@ -4282,7 +5087,7 @@ index 95d1b6b..8bd5a85 100644
          if (count > 0) {
              Box(Modifier.heightIn(min = 22.dp).clip(RoundedCornerShape(50)).background(MinesDesign.DangerFill).padding(horizontal = 7.dp),
                  contentAlignment = Alignment.Center) {
-@@ -542,7 +669,7 @@ fun HomeWeatherChip(modifier: Modifier = Modifier) {
+@@ -542,10 +674,10 @@ fun HomeWeatherChip(modifier: Modifier = Modifier) {
      val hour = (com.openminis.app.plus.HomeGreeting.override?.optInt("hour", -1)?.takeIf { it >= 0 }) ?: Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
      val (icon, words) = com.openminis.app.plus.HomeGreeting.describe(w.code, hour)
      val night = hour >= 19 || hour < 6
@@ -4290,8 +5095,12 @@ index 95d1b6b..8bd5a85 100644
 +    val extra = w.later.takeIf { it.isNotBlank() } ?: w.place.takeIf { it.isNotBlank() && it.length <= 8 } ?: if (night) "夜里" else ""
      val t = Math.round(w.temp).toInt()
      // design387 board: white pill (dark: deep porcelain), line icon, bold temperature, small 「晴 · 新加坡」
-     val fill = if (m.dark) Color(0xFF2A2421) else Color.White.copy(alpha = 0.94f)
-@@ -556,6 +683,15 @@ fun HomeWeatherChip(modifier: Modifier = Modifier) {
+-    val fill = if (m.dark) Color(0xFF2A2421) else Color.White.copy(alpha = 0.94f)
++    val fill = if (m.dark) Color(0xFF2A2421) else minesGlassFill(strong = true)  // [Mines-38.8 v5d] light: glass, not white
+     Row(modifier.padding(top = 4.dp, bottom = 6.dp).clip(RoundedCornerShape(50)).background(fill)
+         .border(1.dp, m.hairline.copy(alpha = 0.18f), RoundedCornerShape(50))
+         .padding(start = 8.dp, end = 16.dp, top = 3.dp, bottom = 3.dp)
+@@ -556,6 +688,15 @@ fun HomeWeatherChip(modifier: Modifier = Modifier) {
          Spacer(Modifier.width(6.dp))
          Text("$t°", fontSize = 18.sp, lineHeight = 22.sp, fontWeight = FontWeight.Bold, color = m.ink, maxLines = 1)
          Spacer(Modifier.width(8.dp))
@@ -4571,7 +5380,7 @@ index c17bd02..990d838 100644
 +/** [Mines-38.8] porcelain glass base for the sign-in page chrome (same as the light glass veil). */
 +private val PORCELAIN = androidx.compose.ui.graphics.Color(0xFFFBF7F2)
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
-index 4e1f21b..6400b76 100644
+index 4e1f21b..983a568 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
 @@ -29,6 +29,8 @@ import androidx.compose.foundation.layout.Column
@@ -4583,7 +5392,18 @@ index 4e1f21b..6400b76 100644
  import androidx.compose.foundation.layout.windowInsetsPadding
  import androidx.compose.foundation.layout.fillMaxSize
  import androidx.compose.foundation.layout.fillMaxWidth
-@@ -860,8 +862,8 @@ fun SessionListScreen(
+@@ -596,6 +598,10 @@ fun SessionListScreen(
+         if (isSearchActive && searchQuery.isNotBlank()) minesAllSessions
+         else com.openminis.app.plus.ChatOrganizer.apply(minesAllSessions, minesChatFilter)
+     }
++    // [Mines-38.8 v5d] a search with no hits empties displayedSessions; the home (face, greeting row with the
++    // in-place field, nav) must stay up then — it used to fall back to the old bottom search field (focus jumped to it,
++    // the typed text came out reordered, 「inesM」)
++    val minesHomeShown = minesAllSessions.isNotEmpty() || (isSearchActive && searchQuery.isNotBlank())
+     val isSelecting by viewModel.isSelecting.collectAsState()
+     val selectedIds by viewModel.selectedIds.collectAsState()
+     val regeneratingIds by viewModel.regeneratingIds.collectAsState()
+@@ -860,8 +866,8 @@ fun SessionListScreen(
      val minesNavIcon: @Composable () -> Unit = {
          Box {
              // [Mines-38.7] ☰ uses the same round porcelain button as ⚙ (38.6 had a bare icon on the left, a round one on the right)
@@ -4594,7 +5414,12 @@ index 4e1f21b..6400b76 100644
              fun ic(n: String) = com.openminis.app.ui.brand.MinesIcons.named(n)
              com.openminis.app.ui.plus.WarmMenu(showOverflowMenu, onDismiss = { showOverflowMenu = false }) {
                  if (sessions.isNotEmpty()) com.openminis.app.ui.plus.WarmMenuItem("选择对话", ic("list-select")) {
-@@ -903,22 +905,20 @@ fun SessionListScreen(
+@@ -899,26 +905,24 @@ fun SessionListScreen(
+             // [Mines-38.6] user 2026-10-15 「头像不够上，再上一点，得接近两侧边的两个图标高度」: on the home list the
+             // character face sits in the top bar itself, centred between ☰ and ⚙ with its upper half level with
+             // them (face top right under the status bar); the name/status line and everything below move up with it.
+-            if (!isSelecting && isInitialLoadComplete && minesAllSessions.isNotEmpty()) {
++            if (!isSelecting && isInitialLoadComplete && minesHomeShown) {
                  // [Mines-38.7] weather line above the face (hidden when there is no weather); ☰ / face / ⚙ keep their row
                  Column(Modifier.fillMaxWidth().windowInsetsPadding(androidx.compose.material3.TopAppBarDefaults.windowInsets),
                      horizontalAlignment = Alignment.CenterHorizontally) {
@@ -4630,16 +5455,16 @@ index 4e1f21b..6400b76 100644
                  com.openminis.app.ui.plus.HomeWeatherPill() // [Mines-38.7] 「26° 晴」 under the face while the big picture is up
                  }
              } else TopAppBar(
-@@ -988,7 +988,7 @@ fun SessionListScreen(
+@@ -988,7 +992,7 @@ fun SessionListScreen(
              // iOS `didInitialLoad` on ContentView. The transition is usually
              // sub-200ms, so no spinner.
              if (isInitialLoadComplete) Column(modifier = Modifier.fillMaxSize()) {
 -                if (minesAllSessions.isEmpty() || (sessions.isEmpty() && isSearchActive && searchQuery.isNotBlank())) {
-+                if (minesAllSessions.isEmpty()) {   // [Mines-38.8] no-results now shows inside the list, under the in-place search field
++                if (!minesHomeShown) {   // [Mines-38.8] no-results now shows inside the list, under the in-place search field
                      if (isSearchActive && searchQuery.isNotBlank()) {
                          Box(
                              modifier = Modifier.fillMaxSize(),
-@@ -1049,6 +1049,14 @@ fun SessionListScreen(
+@@ -1049,6 +1053,14 @@ fun SessionListScreen(
                              onOpen = { route -> com.openminis.app.ui.plus.PlusNav.go(route) },
                              onSearch = { viewModel.isSearchActive.value = true },
                              all = minesAllSessions,
@@ -4654,7 +5479,7 @@ index 4e1f21b..6400b76 100644
                          )
                          com.openminis.app.ui.plus.UpdateHomeCard(onOpen = { com.openminis.app.ui.plus.PlusNav.go(com.openminis.app.ui.plus.PlusRoutes.UPDATE) })
                          com.openminis.app.ui.plus.LocalGatewayCards()
-@@ -1059,10 +1067,17 @@ fun SessionListScreen(
+@@ -1059,10 +1071,17 @@ fun SessionListScreen(
                          // [T-android-newchat-list-autoscroll] Hoisted state so
                          // the new-session autoscroll effect above can drive it.
                          state = listState,
@@ -4674,7 +5499,7 @@ index 4e1f21b..6400b76 100644
                          // T25: search-active path used to flatten the list and skip
                          // section headers entirely. Now reuses the same grouped
                          // rendering — `displayedSessions` is already filtered by
-@@ -1132,10 +1147,10 @@ fun SessionListScreen(
+@@ -1132,10 +1151,10 @@ fun SessionListScreen(
                                      val mc = com.openminis.app.ui.plus.mines()
                                      Modifier
                                          .padding(start = 16.dp, end = 16.dp, bottom = if (last) 8.dp else 0.dp)
@@ -4687,7 +5512,7 @@ index 4e1f21b..6400b76 100644
                                          .then(if (!first) Modifier.drawBehind {
                                              drawLine(mc.hairline, Offset(64.dp.toPx(), 0f), Offset(size.width - 16.dp.toPx(), 0f), 1.dp.toPx())
                                          } else Modifier)
-@@ -1319,7 +1334,7 @@ fun SessionListScreen(
+@@ -1319,7 +1338,7 @@ fun SessionListScreen(
                                  // Folder names are user data — verbatim.
                                  Text(
                                      bar.folder.name,
@@ -4696,16 +5521,25 @@ index 4e1f21b..6400b76 100644
                                      fontWeight = FontWeight.SemiBold,
                                      color = MaterialTheme.colorScheme.onSurface,
                                      maxLines = 1,
-@@ -1403,7 +1418,7 @@ fun SessionListScreen(
+@@ -1403,7 +1422,7 @@ fun SessionListScreen(
                      onVoice = { com.openminis.app.ui.plus.PlusNav.go(com.openminis.app.ui.plus.PlusRoutes.VOICE) },
                      modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 80.dp),  // [Mines-38.5] nav bar 74 dp
                  )
 -            } else if (hasProviders && isSearchActive) {
-+            } else if (hasProviders && isSearchActive && minesAllSessions.isEmpty()) {
++            } else if (hasProviders && isSearchActive && !minesHomeShown) {
                  // Dual FAB row (matching iOS: New Chat left + Search right, or vice versa).
                  // Hidden while the onboarding landing is showing — Step 3 provides the CTA.
                  // T46: stay visible while search is active even when the result
-@@ -1949,7 +1964,7 @@ private fun SelectionToolbar(
+@@ -1447,7 +1466,7 @@ fun SessionListScreen(
+                 )
+             }
+             // [Mines-warm-36] bottom bar (对话 · 消息 · 灵感 · 任务 · 应用); 消息 shows the red count of things to handle
+-            if (!isSelecting && isInitialLoadComplete && minesAllSessions.isNotEmpty()) com.openminis.app.ui.plus.WarmHomeNav(
++            if (!isSelecting && isInitialLoadComplete && minesHomeShown) com.openminis.app.ui.plus.WarmHomeNav(
+                 modifier = Modifier.align(Alignment.BottomCenter),
+                 onTasks = onScheduledTasksClick,
+                 onTop = { scope.launch { listState.animateScrollToItem(0) } },
+@@ -1949,7 +1968,7 @@ private fun SelectionToolbar(
                          modifier = Modifier.size(20.dp),
                      )
                      Spacer(Modifier.height(4.dp))
@@ -4714,7 +5548,7 @@ index 4e1f21b..6400b76 100644
                  }
              }
              DropdownMenu(expanded = showExportMenu, onDismissRequest = { showExportMenu = false }) {
-@@ -1982,7 +1997,7 @@ private fun SelectionToolbar(
+@@ -1982,7 +2001,7 @@ private fun SelectionToolbar(
                      modifier = Modifier.size(20.dp),
                  )
                  Spacer(Modifier.height(4.dp))
@@ -4723,7 +5557,7 @@ index 4e1f21b..6400b76 100644
              }
          }
  
-@@ -2001,7 +2016,7 @@ private fun SelectionToolbar(
+@@ -2001,7 +2020,7 @@ private fun SelectionToolbar(
                  Spacer(Modifier.height(4.dp))
                  Text(
                      stringResource(R.string.delete),
@@ -4732,7 +5566,7 @@ index 4e1f21b..6400b76 100644
                      color = if (selectedCount > 0) MaterialTheme.colorScheme.error else Color.Gray,
                  )
              }
-@@ -2036,7 +2051,7 @@ private fun SectionHeader(title: String) {
+@@ -2036,7 +2055,7 @@ private fun SectionHeader(title: String) {
          }
          Text(
              text = title,
@@ -4741,7 +5575,7 @@ index 4e1f21b..6400b76 100644
              fontWeight = FontWeight.SemiBold,
              color = MaterialTheme.colorScheme.onSurfaceVariant,
          )
-@@ -2636,7 +2651,7 @@ private fun FolderCard(
+@@ -2636,7 +2655,7 @@ private fun FolderCard(
                  // User data — rendered verbatim, never a string lookup.
                  Text(
                      block.folder.name,
@@ -4750,7 +5584,7 @@ index 4e1f21b..6400b76 100644
                      fontWeight = FontWeight.SemiBold,
                      color = MaterialTheme.colorScheme.onSurface,
                      maxLines = 1,
-@@ -2654,7 +2669,7 @@ private fun FolderCard(
+@@ -2654,7 +2673,7 @@ private fun FolderCard(
                              stringResource(R.string.group_n_chats, block.totalCount)
                          else -> stringResource(R.string.group_empty)
                      },
@@ -4759,7 +5593,7 @@ index 4e1f21b..6400b76 100644
                      color = MaterialTheme.colorScheme.onSurfaceVariant,
                      maxLines = 1,
                      overflow = TextOverflow.Ellipsis,
-@@ -2667,7 +2682,7 @@ private fun FolderCard(
+@@ -2667,7 +2686,7 @@ private fun FolderCard(
              ) {
                  Text(
                      dateText,
@@ -4768,7 +5602,7 @@ index 4e1f21b..6400b76 100644
                      // [Mines-a11y-26] was colorScheme.outline (too dark to read)
                      color = com.openminis.app.ui.plus.readableSecondary(),
                  )
-@@ -3116,7 +3131,7 @@ private fun SessionRow(
+@@ -3116,7 +3135,7 @@ private fun SessionRow(
          // Relative timestamp
          Text(
              text = timeText,
@@ -4777,7 +5611,7 @@ index 4e1f21b..6400b76 100644
              maxLines = 1,
              softWrap = false,
              modifier = Modifier.align(Alignment.Top).padding(top = 2.dp),  // [Mines-38.2] board: time sits on the title line
-@@ -3570,7 +3585,7 @@ internal fun SessionEditSheet(
+@@ -3570,7 +3589,7 @@ internal fun SessionEditSheet(
                              Spacer(Modifier.height(4.dp))
                              Text(
                                  cat,
@@ -4786,7 +5620,7 @@ index 4e1f21b..6400b76 100644
                                  color = if (isSelected) style.color
                                  else MaterialTheme.colorScheme.onSurfaceVariant,
                                  fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
-@@ -3682,9 +3697,9 @@ private fun SessionExportSummaryDialog(
+@@ -3682,9 +3701,9 @@ private fun SessionExportSummaryDialog(
              Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                  for ((label, value) in rows) {
                      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -5048,5 +5882,137 @@ index 0000000..ae52f50
 +        val r = TurnRequest("你在群聊里", listOf(AiClient.Turn("user", "【群主】a"), AiClient.Turn("assistant", "b"), AiClient.Turn("user", "【群主】c")), 100)
 +        assertTrue(r.flat().endsWith("请回复最新一条：\n【群主】c"))
 +        assertTrue(r.flat().contains("（你）b"))
++    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/sandbox/offload/ScreenTiersTest.kt b/src/android/app/src/test/java/com/openminis/app/sandbox/offload/ScreenTiersTest.kt
+new file mode 100644
+index 0000000..82cbd3e
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/sandbox/offload/ScreenTiersTest.kt
+@@ -0,0 +1,71 @@
++package com.openminis.app.sandbox.offload
++
++import org.json.JSONObject
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNotNull
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/** [Mines-38.8 v5d] tiered screen reading: OCR trigger, OCR merge, text ranking, replay path matching + JSON. */
++class ScreenTiersTest {
++    private fun it(label: String, l: Int, t: Int, r: Int, b: Int, rid: String = "", desc: String = "", click: Boolean = true) =
++        ScreenTiers.Item(label, desc, rid, "", l, t, r, b, click)
++
++    @Test fun ocrOnlyWhenTreeHasNoText() {
++        val game = listOf(it("#surface", 0, 0, 1080, 2400), it("SurfaceView", 0, 0, 1080, 2400), it("", 10, 10, 20, 20))
++        assertTrue(ScreenTiers.needsOcr(game))
++        val settings = listOf(it("Wi-Fi", 0, 100, 1080, 200), it("蓝牙", 0, 200, 1080, 300), it("显示", 0, 300, 1080, 400))
++        assertFalse(ScreenTiers.needsOcr(settings))
++        assertTrue(ScreenTiers.isGenericLabel("#btn_ok")); assertFalse(ScreenTiers.isGenericLabel("OK"))
++    }
++
++    @Test fun ocrMergeDropsLinesTheTreeAlreadyHas() {
++        val tree = listOf(it("Start", 100, 100, 300, 160))
++        val ocr = listOf(it("Start", 110, 105, 290, 155, click = false), it("Level 3", 100, 400, 300, 450, click = false), it("Level 3", 102, 402, 298, 448, click = false))
++        val m = ScreenTiers.mergeOcr(tree, ocr)
++        assertEquals(listOf("Level 3"), m.map { it.label })
++        assertEquals("ocr", m[0].source)
++    }
++
++    @Test fun rankingPrefersExactThenPrefixThenContains() {
++        val items = listOf(it("设置中心", 0, 0, 500, 100), it("设置", 0, 200, 300, 260), it("打开设置页", 0, 300, 500, 360))
++        assertEquals("设置", ScreenTiers.best("设置", items)!!.label)
++        assertEquals("设置中心", ScreenTiers.best("设置中", items)!!.label)
++        assertEquals(100, ScreenTiers.score(" 设置 ", items[1]) - 5)
++        assertNull(ScreenTiers.best("蓝牙", items))
++        // content-desc counts too; fuzzy in-order match is the weakest
++        assertEquals("search_btn", ScreenTiers.best("搜索", listOf(it("search_btn", 0, 0, 10, 10, desc = "搜索")))!!.label)
++        assertTrue(ScreenTiers.score("wfi", it("Wi-Fi", 0, 0, 1, 1)) in 1..30)
++    }
++
++    @Test fun replayMatchesByIdThenTextNearTheSavedPlace() {
++        val now = listOf(it("登录", 400, 1500, 680, 1600, rid = "app:id/login"), it("登录", 400, 300, 680, 360))
++        val s = ScreenTiers.Step("tap", "登录", "app:id/login", 540, 1540)
++        assertEquals(1550, ScreenTiers.matchStep(s, now)!!.cy)
++        // id gone, text still there near the old place → still matches
++        val moved = listOf(it("登录", 420, 1520, 700, 1620))
++        assertNotNull(ScreenTiers.matchStep(s, moved))
++        // the button is now on the other end of the screen → mismatch, replay stops
++        assertNull(ScreenTiers.matchStep(s, listOf(it("登录", 400, 100, 680, 160))))
++        assertNull(ScreenTiers.matchStep(ScreenTiers.Step("tap", "确定", "", 540, 900), listOf(it("取消", 400, 860, 680, 940))))
++    }
++
++    @Test fun pathJsonRoundTripAndSensitiveStepsAreNotSaved() {
++        val p = ScreenTiers.Path("com.example", ".Main", "签到", listOf(ScreenTiers.Step("tap", "签到", "x:id/s", 10, 20), ScreenTiers.Step("raw", arg = "wait 500")), 5L, 2)
++        val back = ScreenTiers.fromJson(JSONObject(ScreenTiers.toJson(p).toString()))
++        assertEquals(p, back)
++        assertEquals(ScreenTiers.key("com.example", "签 到"), ScreenTiers.key("com.example", "签到"))
++        assertTrue(ScreenTiers.replayable(p.steps))
++        assertFalse(ScreenTiers.replayable(listOf(ScreenTiers.Step("tap", "立即支付"))))
++        assertFalse(ScreenTiers.replayable(emptyList()))
++    }
++
++    @Test fun elementsJsonNamesTheTier() {
++        val j = ScreenTiers.elementsJson(listOf(it("OK", 0, 0, 100, 50, rid = "a:id/ok")), ScreenTiers.TIER_TREE, "com.x")
++        assertEquals("2·无障碍树", j.getString("tier"))
++        val e = j.getJSONArray("elements").getJSONObject(0)
++        assertEquals(50, e.getJSONObject("center").getInt("x")); assertEquals("a:id/ok", e.getString("id")); assertEquals(1, e.getInt("n"))
++    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/ui/plus/KnowledgeLayoutTest.kt b/src/android/app/src/test/java/com/openminis/app/ui/plus/KnowledgeLayoutTest.kt
+new file mode 100644
+index 0000000..fda44cf
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/ui/plus/KnowledgeLayoutTest.kt
+@@ -0,0 +1,49 @@
++package com.openminis.app.ui.plus
++
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.geometry.Rect
++import androidx.compose.ui.geometry.Size
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/** [Mines-38.8 v5d] 知识库 脑图: an open topic's sub-chips never overlap its pill, the face or other topics, and stay on screen. */
++class KnowledgeLayoutTest {
++    private fun rectAt(c: Offset, s: Size) = Rect(Offset(c.x - s.width / 2f, c.y - s.height / 2f), s)
++
++    @Test fun rightTopicChipsDoNotOverlapAndStayOnScreen() {
++        // 360 dp x 600 dp map at density 3, zoom 0.9 → world half size
++        val d = 3f
++        val half = Size(540f / 0.9f, (900f - 78f) / 0.9f)
++        val bp = Offset(118f * d, 0f)
++        val parent = rectAt(bp, Size(80f * d, 32f * d))
++        val face = Rect(Offset(-46f * d, -46f * d), Size(92f * d, 92f * d))
++        val others = listOf(rectAt(Offset(0f, -210f * d), Size(110f * d, 32f * d)), rectAt(Offset(-118f * d, 0f), Size(110f * d, 32f * d)),
++            rectAt(Offset(0f, 210f * d), Size(70f * d, 32f * d)))
++        val sizes = listOf(Size(190f * d, 26f * d), Size(170f * d, 26f * d), Size(120f * d, 26f * d), Size(150f * d, 26f * d))
++        val obstacles = others + face
++        val placed = KnowledgeLayout.placeChips(bp, Offset(1f, 0f), parent, sizes, obstacles, half, 10f * d, 8f * d)
++        assertEquals(sizes.size, placed.size)
++        val rects = placed.mapIndexed { i, c -> rectAt(c, sizes[i]) }
++        rects.forEachIndexed { i, r ->
++            assertTrue("chip $i on screen $r", r.left >= -half.width && r.right <= half.width && r.top >= -half.height && r.bottom <= half.height)
++            assertEquals("chip $i vs parent", 0f, KnowledgeLayout.overlap(parent, r))
++            (obstacles).forEach { o -> assertEquals("chip $i vs $o", 0f, KnowledgeLayout.overlap(o, r)) }
++            rects.forEachIndexed { j, r2 -> if (j != i) assertEquals("chip $i vs chip $j", 0f, KnowledgeLayout.overlap(r, r2)) }
++        }
++    }
++
++    @Test fun topTopicChipsGoOutward() {
++        val half = Size(600f, 900f)
++        val bp = Offset(0f, -500f)
++        val parent = rectAt(bp, Size(240f, 96f))
++        val sizes = listOf(Size(300f, 78f), Size(300f, 78f))
++        val placed = KnowledgeLayout.placeChips(bp, Offset(0f, -1f), parent, sizes, emptyList(), half, 30f, 24f)
++        placed.forEach { assertTrue("chip above the topic, not toward the centre: $it", it.y <= bp.y + 1f) }
++    }
++
++    @Test fun clampKeepsChipInside() {
++        val c = KnowledgeLayout.clampCentre(Offset(1000f, -1000f), Size(200f, 50f), Size(300f, 400f), 10f)
++        assertEquals(190f, c.x, 0.01f); assertEquals(-365f, c.y, 0.01f)
 +    }
 +}
