@@ -334,7 +334,10 @@ def setup_provider():
                     if any((c.get("text") == placeholder) for c in n.iter("node")) or n.get("text") == placeholder:
                         b = list(map(int, re.findall(r"\d+", n.get("bounds", "")))); target = ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2); break
             if target:
-                sh(f"input tap {target[0]} {target[1]}"); time.sleep(1.0); type_text(value); time.sleep(0.6)
+                sh(f"input tap {target[0]} {target[1]}"); time.sleep(1.5)
+                # [38.8 v4] smoke 38860755136: one long `input text` lost characters on a slow emulator; type in small chunks
+                for k in range(0, len(value), 6): type_text(value[k:k + 6]); time.sleep(0.35)
+                time.sleep(0.6)
                 if ime_shown(): sh("input keyevent KEYCODE_BACK"); time.sleep(1)
                 return True
             scroll_down()
