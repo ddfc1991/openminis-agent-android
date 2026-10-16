@@ -2063,10 +2063,26 @@ index b529a74..1b36dcf 100644
                      @Suppress("UNUSED_EXPRESSION") vault
                      val rows = com.openminis.app.plus.AutoSources.missing(context)
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/LinkAll.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/LinkAll.kt
-index f69ee42..ede6065 100644
+index f69ee42..3435894 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/LinkAll.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/LinkAll.kt
-@@ -242,6 +242,8 @@ private fun BigText(t: String, size: Int = 20, weight: FontWeight = FontWeight.S
+@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.Spacer
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.size
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
+@@ -19,6 +20,7 @@ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.setValue
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.alpha
+ import androidx.compose.ui.semantics.contentDescription
+ import androidx.compose.ui.semantics.semantics
+ import androidx.compose.ui.text.font.FontWeight
+@@ -242,6 +244,8 @@ private fun BigText(t: String, size: Int = 20, weight: FontWeight = FontWeight.S
  fun LinkAllScreen(onBack: () -> Unit, go: (String) -> Unit) {
      val ctx = androidx.compose.ui.platform.LocalContext.current
      remember { GroupPrefs.init(ctx); 0 }
@@ -2075,6 +2091,38 @@ index f69ee42..ede6065 100644
      var tick by remember { mutableIntStateOf(0) }
      var paused by remember { mutableStateOf(false) }
      var last by remember { mutableStateOf<String?>(null) }
+@@ -294,6 +298,11 @@ fun LinkAllScreen(onBack: () -> Unit, go: (String) -> Unit) {
+             }
+             Spacer(Modifier.height(20.dp))
+             LinkAllHelpers()
++            // [Mines-38.8 v3] smokes 38841427883 + 38845542672: the first sign-in page of a run was a fully white screen for
++            // seconds (header included) while the window drew its FIRST WebView (engine prewarm alone did not help: the
++            // cost is the window's first WebView draw). A 1 dp, almost transparent WebView is drawn here on the start
++            // page, so that cost is paid while the user reads it; the real pages then open at once.
++            WindowWebWarm()
+         } else {
+             BigText("第 ${(LinkAll.index + 1).coerceAtMost(q.size)} 个，共 ${q.size} 个", 16, FontWeight.Normal)
+             last?.let { BigText(it, 17, FontWeight.Normal) }
+@@ -433,3 +442,19 @@ fun LinkIgnoredScreen(onBack: () -> Unit) {
+         Spacer(Modifier.height(24.dp))
+     }
+ }
++
++
++/** [Mines-38.8 v3] a 1 dp near-transparent WebView drawn in the window (see LinkAllScreen); destroyed on leave. */
++@Composable
++private fun WindowWebWarm() {
++    androidx.compose.ui.viewinterop.AndroidView(factory = { c ->
++        WebView(c).also { w ->
++            w.setBackgroundColor(android.graphics.Color.TRANSPARENT)
++            w.settings.javaScriptEnabled = false
++            w.isFocusable = false
++            w.importantForAccessibility = android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
++            w.loadDataWithBaseURL("about:blank", "<html><body style='background:transparent'></body></html>", "text/html", "utf-8", null)
++        }
++    }, onRelease = { w -> runCatching { w.stopLoading(); w.destroy() } },
++        modifier = Modifier.size(1.dp).alpha(0.01f))
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/MailboxPane.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/MailboxPane.kt
 new file mode 100644
 index 0000000..cac0686
@@ -2531,6 +2579,34 @@ index c17bd02..4c19605 100644
  
 +/** [Mines-38.8] porcelain glass base for the sign-in page chrome (same as the light glass veil). */
 +private val PORCELAIN = androidx.compose.ui.graphics.Color(0xFFFBF7F2)
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/theme/Theme.kt b/src/android/app/src/main/java/com/openminis/app/ui/theme/Theme.kt
+index df61d03..5e2a3fe 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/theme/Theme.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/theme/Theme.kt
+@@ -11,6 +11,7 @@ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.CompositionLocalProvider
+ import androidx.compose.runtime.collectAsState
+ import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.toArgb
+ import androidx.compose.ui.text.TextStyle
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.unit.sp
+@@ -171,6 +172,15 @@ fun MinisTheme(
+     val colorScheme = porcelainScheme(if (darkTheme) DarkColorScheme else LightColorScheme, mc)
+     val typography = scaledTypography(fontScale)
+     val chatPalette = if (darkTheme) DarkChatPalette else LightChatPalette
++    // [Mines-38.8 v3] the window behind Compose is the Mines backdrop colour, not the theme's plain white/black: a frame
++    // the window shows before Compose has drawn (first WebView draw on a slow GPU) is never a white flash.
++    val winBg = mc.bg.toArgb()
++    androidx.compose.runtime.DisposableEffect(winBg) {
++        var c: android.content.Context? = ctx
++        while (c is android.content.ContextWrapper && c !is android.app.Activity) c = c.baseContext
++        (c as? android.app.Activity)?.window?.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(winBg))
++        onDispose { }
++    }
+ 
+     MaterialTheme(
+         colorScheme = colorScheme,
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/MailImapTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/MailImapTest.kt
 new file mode 100644
 index 0000000..68b38d4
