@@ -3582,6 +3582,50 @@ def b388_ui(res):
     else:
         page_missing.append("ui388 keyagent: 一键接入 not found")
     if not alive(): relaunch()
+    # [38.8 v5d] home search with NO hits stays in place (face + 取消 + no-results line), typed text not reordered
+    try:
+        b381_home(); time.sleep(2)
+        if tap_text("搜索对话", wait=2.5):
+            time.sleep(2); type_text("zqxjk"); time.sleep(2.5)
+            r = shot388("home-search-nohit")
+            t = texts(r) or []
+            o["search_nohit_text"] = t[:12]
+            o["search_nohit_face"] = _bounds_of(r, lambda tx, d: d.startswith("换角色"))
+            if "取消" not in t: selftest_fail.append("ui388 search no-hit: 取消 / in-place field gone")
+            if not any("zqxjk" in x for x in t): selftest_fail.append(f"ui388 search no-hit: typed text wrong {t[:6]}")
+            tap_text("取消", exact=True, wait=2); sh("input keyevent KEYCODE_BACK"); time.sleep(1)
+    except Exception as e:
+        print("search nohit error", e, flush=True)
+    # [38.8 v5d] home weather ambience: forced sunny / rainy (light theme), two frames each to see it move
+    try:
+        for tag, inj in (("sun", {"hour": 11, "weather": "clear", "weekday": 1}), ("rain", {"hour": 11, "weather": "rain", "weekday": 1})):
+            result_json("group", "greet " + json.dumps(inj).replace(" ", ""), timeout=20)
+            b381_home(); time.sleep(3); shot388(f"home-{tag}"); time.sleep(1.2); shot388(f"home-{tag}-b")
+            o[f"amb_diff_{tag}"] = _strip_diff(f"{OUT}/b388-home-{tag}.png", f"{OUT}/b388-home-{tag}-b.png")
+        result_json("group", "greet off", timeout=20)
+    except Exception as e:
+        print("ambience shots error", e, flush=True)
+    # [38.8 v5d] tiered screen reading: tools register, the tree read returns elements, replay path saved + replayed
+    try:
+        selftest("allow", "a11y_cli")
+        comp = f"{PKG}/com.openminis.app.accessibility.MinisAccessibilityService"
+        sh(f"settings put secure enabled_accessibility_services {comp}"); sh("settings put secure accessibility_enabled 1"); time.sleep(4)
+        b381_home(); time.sleep(2)
+        el = selftest("offload", "android-a11y-cli ui elements", timeout=60)
+        m_ = re.search(r'"tier":"([^"]+)"', el); c_ = re.search(r'"count":(\d+)', el)
+        o["tiers_elements"] = {"tier": m_.group(1) if m_ else None, "count": int(c_.group(1)) if c_ else 0}
+        if not m_ or not c_ or int(c_.group(1)) <= 0: selftest_fail.append(f"tiers: ui elements returned no elements ({el.strip()[:200]})")
+        ls = selftest("offload", "android-a11y-cli list", timeout=60)
+        o["tiers_list_head"] = ls[ls.find("屏幕"):][:160]
+        if "读屏" not in ls: selftest_fail.append("tiers: list does not name its reading tier")
+        d1 = selftest("offload", 'android-a11y-cli do --task smoke-tier "wait 100"', timeout=60)
+        d2 = selftest("offload", 'android-a11y-cli do --task smoke-tier "wait 100"', timeout=60)
+        o["tiers_saved"] = "已记下" in d1; o["tiers_replayed"] = "1·回放" in d2
+        if not o["tiers_saved"] or not o["tiers_replayed"]: selftest_fail.append(f"tiers: replay path not saved/replayed ({d1.strip()[:120]} | {d2.strip()[:120]})")
+        pa = selftest("offload", "android-a11y-cli paths", timeout=30); o["tiers_paths"] = pa.strip()[:200]
+        sh("settings put secure enabled_accessibility_services ''")
+    except Exception as e:
+        selftest_fail.append(f"tiers smoke error {e}")
     for k in ("fog_diff_home", "fog_diff_dark"):
         v = o.get(k)
         if isinstance(v, (int, float)) and v < 0.4: page_missing.append(f"ui388 fog did not move ({k}={v})")
