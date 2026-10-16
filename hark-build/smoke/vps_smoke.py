@@ -3185,7 +3185,8 @@ def main():
             result_json("group", "wallpaper off"); anim(True)
         except Exception as e:
             print("fast prep error", e, flush=True)
-        if UI388: fns = (b388_ui, b389_ui, b3891_ui) if UI3891 else (b388_ui, b389_ui) if UI389 else (b388_ui,)
+        if UI388: fns = (b388_ui, b389_ui, b3891_fb, b3891_ui) if UI3891 else (b388_ui, b389_ui) if UI389 else (b388_ui,)
+        elif UI3891: fns = (b3891_fb, b3891_ui)   # [38.9.1 d] feedback round first, then the 38.9.1 pages
         elif HUB: fns = ()
         elif B388: fns = (b387_linkall, b387_noblack, b388_weblogin, b388_mailbox, b388_presets)
         else: fns = (b387_linkall, b387_noblack, b387_persist, b387_platforms)
@@ -3761,6 +3762,86 @@ def b3891_hub(res):
     print("HUB RESULT " + json.dumps(o, ensure_ascii=False)[:3000], flush=True)
 
 
+def b3891_fb(res):
+    """[38.9.1 d] user feedback round: chat header 2nd line (account · model · 思考), 429 ends with a reason (no endless
+    正在思考), per-reply model tag, model picker not empty + 自动（推荐）, 账号连接 cards, 一键关联 start copy, 关联结果 flat,
+    Hark 测试一下 one-sentence + 去登录, markdown viewer before (old transparent) / after (opaque) light + dark."""
+    r8 = R8(res); o = {}
+    def step(name, f):
+        try: f()
+        except Exception as e:
+            import traceback; traceback.print_exc(); page_missing.append(f"fb3891 {name} error {e}")
+        if not alive(): crashed.append(f"fb3891 {name}"); relaunch()
+    theme388(1)
+    def open_chat():
+        b381_home(); time.sleep(1)
+        if not tap_text("你好，我是测试模型。", wait=5): tap_text("GARBAGETEST", wait=5)
+    # 1 chat header + per-reply tag, then a 429 turn
+    def chat():
+        open_chat()
+        r = shot388("fb-chat-header"); t = _txt(r); o["header"] = t[:400]
+        if "smoke-model" not in t and "Smoke Model" not in t: page_missing.append(f"fb3891 chat header: model id not seen {t[:160]}")
+        def send(msg):
+            e = edits(dump())
+            if not e: page_missing.append("fb3891 chat: no input field"); return
+            sh(f"input tap {e[-1][0]} {e[-1][1]}"); time.sleep(0.6); type_text(msg)
+            sh("input keyevent KEYCODE_BACK"); time.sleep(0.6)
+            tap_any(["Send", "发送"], wait=2) or sh("input keyevent KEYCODE_ENTER")
+        send("hello again")
+        time.sleep(8); sh("input keyevent 111"); r = shot388("fb-chat-tag"); o["tag"] = _txt(r)[-300:]
+        send("SMOKE429 please")
+        time.sleep(10); sh("input keyevent 111"); shot388("fb-chat-429-10s")
+        time.sleep(30); r = shot388("fb-chat-429-40s"); t = _txt(r); o["429"] = t[-400:]
+        if "正在思考" in t: selftest_fail.append("fb3891 429: still 正在思考 40 s after a 429")
+    step("chat", chat)
+    # 2 model picker from the header (not empty, 自动（推荐） on top)
+    def picker():
+        r = dump()
+        if not (tap_text("smoke-model", wait=3, root=r) or tap_text("Smoke Model", wait=3, root=r) or tap_text("Default Models", wait=3, root=r)):
+            page_missing.append("fb3891 picker: header model row not found")
+        r = shot388("fb-picker"); t = _txt(r); o["picker"] = t[:400]
+        if "自动" not in t: page_missing.append(f"fb3891 picker: 自动（推荐） not seen {t[:160]}")
+        if "smoke-model" not in t and "Smoke Model" not in t: selftest_fail.append(f"fb3891 picker: no model rows {t[:160]}")
+        back(1)
+    step("picker", picker)
+    # 3 markdown viewer over the chat: old transparent (before) vs opaque (after), light + dark
+    def md():
+        open_chat()
+        o["md_legacy"] = result_json("group", "mdview legacy", timeout=20); time.sleep(4); shot388("fb-md-before"); back(1); time.sleep(1)
+        o["md_new"] = result_json("group", "mdview", timeout=20); time.sleep(4); r = shot388("fb-md-after"); o["md_after"] = _txt(r)[:300]
+        if "smoke-doc.md" not in o["md_after"]: page_missing.append("fb3891 md: viewer title not seen")
+        back(1)
+        theme388(2); open_chat()
+        result_json("group", "mdview", timeout=20); time.sleep(4); shot388("fb-md-after-dark"); back(1)
+        theme388(1)
+    step("md", md)
+    # 4 账号连接 cards (free credit, 需要处理) top + scrolled
+    def conn():
+        result_json("group", "feedinject resolved", timeout=20)
+        route("plus_connections", 6); shot388("fb-conn"); scroll_down(); time.sleep(1.5); r = shot388("fb-conn-b"); o["conn"] = _txt(r)[:400]
+        back(1)
+    step("conn", conn)
+    # 5 一键关联 start page copy, 6 关联结果 flattened
+    def link():
+        route("plus_linkall", 4); r = shot388("fb-linkall"); o["linkall"] = _txt(r)[:400]
+        back(1)
+        route("plus_linkall_summary", 5); r = shot388("fb-linkresult"); o["linkresult"] = _txt(r)[:400]
+        scroll_down(); time.sleep(1.5); shot388("fb-linkresult-b"); back(1)
+    step("link", link)
+    # 7 Hark 测试一下: one plain sentence + 去登录 pill
+    def hark():
+        result_json("group", "agents clear", timeout=20); o["hark_add"] = result_json("group", "agents add web:hark", timeout=20)
+        route("plus_app_agents", 6); shot388("fb-hark-row")
+        if tap_text("测试一下", wait=1.5):
+            time.sleep(1); shot388("fb-hark-testing"); time.sleep(8); r = shot388("fb-hark-test"); o["hark_test"] = _txt(r)[:300]
+            if "去登录" not in o["hark_test"]: page_missing.append("fb3891 hark test: 去登录 not seen")
+        else: page_missing.append("fb3891 hark: 测试一下 not found")
+        back(1)
+    step("hark", hark)
+    r8["fb3891"] = o
+    print("FB3891 RESULT " + json.dumps(o, ensure_ascii=False)[:4000], flush=True)
+
+
 def b3891_ui(res):
     """[38.9.1] 账号关联 dynamic identities + Google provider detail, 应用代理 empty + manual add + 去登录 WebView + 测试一下 card,
     WorkBuddy error text, Grok key delete, KeyAgent IME dialog + Groq drawer, 4 real consoles non-white, 邮箱 verify Gmail + 163
@@ -3829,6 +3910,7 @@ def b3891_ui(res):
     step("grok", grok)
     # 5 KeyAgent WebView: dialog with the keyboard up, Groq-like drawer opaque
     def ka():
+        sh("settings put secure show_ime_with_hard_keyboard 1")
         o["ka1"] = result_json("group", f"keyagent groq|{F}/keydlg", timeout=20); time.sleep(10)
         shot388("ka3891-page")
         if tap_text("Create API Key", wait=2.5):
@@ -3874,13 +3956,20 @@ def b3891_ui(res):
             except Exception as e: print("edit scan", e)
             if len(edits) >= 2:
                 sh(f"input tap {edits[0][0]} {edits[0][1]}"); time.sleep(.6); sh("input text smoke.mines.test@163.com")
-                sh(f"input tap {edits[1][0]} {edits[1][1]}"); time.sleep(.6); sh("input text ABCDEFGHIJKLMNOP"); sh("input keyevent 111")
+                sh("input keyevent 111"); time.sleep(1)   # keyboard down so the 2nd field is where the dump says
+                e2 = []
+                for nd in dump().iter("node"):
+                    if nd.get("class", "").endswith("EditText"):
+                        b = re.findall(r"\d+", nd.get("bounds", "")); e2.append(((int(b[0]) + int(b[2])) // 2, (int(b[1]) + int(b[3])) // 2))
+                tgt = e2[1] if len(e2) >= 2 else edits[1]
+                sh(f"input tap {tgt[0]} {tgt[1]}"); time.sleep(.8); sh("input text ABCDEFGHIJKLMNOP"); sh("input keyevent 111")
                 tap_text("验证并添加", wait=18)
                 r = shot388("mail3891-163-result"); o["mail-163-ui"] = _txt(r)[:300]
             back(2)
     step("mailbox", mail)
     # 8 in-app browser: 手机版 / 电脑版 chip per site + 用系统浏览器打开; 一键关联 e-mail login fake
     def br():
+        b381_home(); time.sleep(1)
         selftest("webfit", f"open:{F}/linkfake", timeout=30); time.sleep(8)
         r = shot388("br3891-mobile"); o["br"] = _txt(r)[:300]
         if "手机版" not in o["br"] and "电脑版" not in o["br"]: page_missing.append("ui3891 browser: mode chip not seen")

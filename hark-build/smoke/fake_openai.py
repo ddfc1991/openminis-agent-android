@@ -265,6 +265,9 @@ fetch('/linkfake/send?'+k+'='+encodeURIComponent(v));document.getElementById('fc
             STATS["rl_posts"] = STATS.get("rl_posts", 0) + 1
             if STATS["rl_posts"] % 3 != 0:
                 return self._json({"error": {"message": "Rate limit reached, please retry"}}, 429)
+        if "SMOKE429" in last_user_text(msgs):   # [38.9.1 d] chat 429: the turn must end with a reason, not hang on 正在思考
+            STATS["chat429"] = STATS.get("chat429", 0) + 1
+            return self._json({"error": {"message": "Rate limit reached for deepseek-flash, please retry"}}, 429)
         if "整理成用户以后能查的知识" in last_user_text(msgs):
             STATS["kb_posts"] = STATS.get("kb_posts", 0) + 1
             text = json.dumps(KB_JSON, ensure_ascii=False)
