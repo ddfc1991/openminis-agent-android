@@ -48,6 +48,11 @@ try:
     FAST = "fast" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
 except Exception:
     B387 = False; FAST = False
+try:
+    B388 = "b388" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
+except Exception:
+    B388 = False
+if B388: B387 = True; FAST = True
 FONT_SCALE = "1.18"
 step_no = 0
 crashed = []
@@ -1877,6 +1882,7 @@ def b385():
                 import traceback; traceback.print_exc()
                 print(f"{fn.__name__} error:", e, flush=True); selftest_fail.append(f"{fn.__name__} error {e}")
         print("B387 RESULT " + json.dumps(res.get("b387", {}), ensure_ascii=False), flush=True)
+        if B388: print("B388 RESULT " + json.dumps(res.get("b388", {}), ensure_ascii=False), flush=True)
     print(f"B385 {res}", flush=True)
 
 
@@ -2626,14 +2632,20 @@ def b387_linkall(res):
         o["login_lum"] = _lum(f"{OUT}/b387-linkall-login.png"); o["login_flat"] = _flat(f"{OUT}/b387-linkall-login.png")
         time.sleep(3); shot387("linkall-login-2"); o["login2_lum"] = _lum(f"{OUT}/b387-linkall-login-2.png"); o["login2_flat"] = _flat(f"{OUT}/b387-linkall-login-2.png")
         # [v11d] a white sign-in SITE is fine (元宝 is white); a frame with nothing on it (no header either) is the bug
-        if o["login_flat"]: selftest_fail.append(f"b387 linkall: blank frame when the sign-in page opened {o['login_flat']}")
-        if o["login2_flat"]: selftest_fail.append(f"b387 linkall: still blank 3 s later {o['login2_flat']}")
+        if o["login_flat"] is not None: selftest_fail.append(f"b387 linkall: blank frame when the sign-in page opened {o['login_flat']}")
+        if o["login2_flat"] is not None: selftest_fail.append(f"b387 linkall: still blank 3 s later {o['login2_flat']}")
         if "登录" not in t: selftest_fail.append(f"b387 linkall: login page did not open {t[:160]}")
         back(); time.sleep(1.2)
         r = shot387("linkall-next"); t = " ".join(texts(r)) if r is not None else ""
         o["next"] = t[:200]
         # coming back counts the platform and (3 s later) opens the next one by itself
-        if "下一个" not in t and "登录 元宝" in t: selftest_fail.append(f"b387 linkall: did not move on after coming back {t[:160]}")
+        moved = "下一个" in t or "登录 元宝" not in t
+        for _ in range(8):
+            if moved: break
+            time.sleep(1); r2 = dump(); t2 = " ".join(texts(r2)) if r2 is not None else ""
+            moved = "下一个" in t2 or ("登录 元宝" not in t2 and bool(t2.strip()))
+        o["moved_on"] = moved
+        if not moved: selftest_fail.append(f"b387 linkall: did not move on after coming back {t[:160]}")
         tap_text("停一下", exact=True, wait=1.5)
         tap_text("结束，看结果", exact=True, wait=3)
     else: page_missing.append("b387 linkall: 开始 not tappable")
@@ -2785,10 +2797,10 @@ def b387_noblack(res):
         snap_ = shot387("noblack-" + tag)
         if tag == "linkall":   # [38.7 v11] 一键关联 may open the next sign-in page right now: look again 4 s later
             out["linkall_first"] = _lum(f"{OUT}/b387-noblack-linkall.png"); out["linkall_first_flat"] = _flat(f"{OUT}/b387-noblack-linkall.png")
-            if out["linkall_first_flat"]: selftest_fail.append(f"b387 noblack linkall: blank frame {out['linkall_first_flat']}")
+            if out["linkall_first_flat"] is not None: selftest_fail.append(f"b387 noblack linkall: blank frame {out['linkall_first_flat']}")
             time.sleep(4); snap_ = shot387("noblack-" + tag)
             out["linkall_second_flat"] = _flat(f"{OUT}/b387-noblack-linkall.png")
-            if out["linkall_second_flat"]: selftest_fail.append(f"b387 noblack linkall: blank 4 s later {out['linkall_second_flat']}")
+            if out["linkall_second_flat"] is not None: selftest_fail.append(f"b387 noblack linkall: blank 4 s later {out['linkall_second_flat']}")
         W, H = (SCREEN[0], SCREEN[1]) if SCREEN and SCREEN[0] else (1080, 2362)
         try:
             from PIL import Image
@@ -3149,13 +3161,14 @@ def main():
             result_json("group", "wallpaper off"); anim(True)
         except Exception as e:
             print("fast prep error", e, flush=True)
-        for fn in (b387_linkall, b387_noblack, b387_persist, b387_platforms):
+        for fn in ((b387_linkall, b387_noblack, b388_weblogin, b388_mailbox, b388_presets) if B388 else (b387_linkall, b387_noblack, b387_persist, b387_platforms)):
             try:
                 fn(res)
             except Exception as e:
                 import traceback; traceback.print_exc()
                 print(f"{fn.__name__} error:", e, flush=True); selftest_fail.append(f"{fn.__name__} error {e}")
         print("B387 RESULT " + json.dumps(res.get("b387", {}), ensure_ascii=False), flush=True)
+        if B388: print("B388 RESULT " + json.dumps(res.get("b388", {}), ensure_ascii=False), flush=True)
         return finish(lc)
     if B385:
         try:
@@ -3293,6 +3306,150 @@ def main():
     except Exception as e:
         print("selftests error:", e, flush=True); selftest_fail.append(f"selftests error {e}")
     finish(lc)
+
+
+# ======================= [38.8] targeted screens =======================
+def R8(res):
+    return res.setdefault("b388", {})
+
+
+def shot388(name):
+    r = snap("b388-" + name)
+    subprocess.run(f"cp {OUT}/{step_no:02d}-b388-{name}.png {OUT}/b388-{name}.png", shell=True)
+    return r
+
+
+def _txt(r):
+    return " ".join(texts(r)) if r is not None else ""
+
+
+def _orange_share(path, top, bottom):
+    """share of strongly terracotta/orange pixels in a horizontal band (38.7 bottom bar ~ solid orange)"""
+    try:
+        from PIL import Image
+        im = Image.open(path).convert("RGB"); W, H = im.size
+        band = im.crop((0, int(H * top), W, int(H * bottom))).resize((108, 30)); px = list(band.getdata())
+        o = sum(1 for (r, g, b) in px if r > 170 and 60 < g < 150 and b < 110 and r - b > 90)
+        return round(o / len(px), 3)
+    except Exception as e:
+        return f"err {e}"
+
+
+def b388_weblogin(res):
+    """WebLoginScreen in frosted glass: compact pill (no full-width orange bar), one glass hint strip, no brown bands."""
+    r8 = R8(res); rows = []
+    info = result_json("group", "linkinfo", timeout=60) or []
+    for kid in ("x", "weibo", "qq"):
+        p = next((x for x in info if x.get("id") == "conn:" + kid), None)
+        sh("logcat -c"); b381_home()
+        try: result_json("group", f"linkopen conn:{kid}")
+        except Exception as e: print("linkopen error", kid, e, flush=True)
+        time.sleep(3)
+        if p and p.get("how", "") == "在 Mines 内登录": tap_text("在 Mines 内登录", wait=10)
+        else: time.sleep(6)
+        r = shot388("weblogin-" + kid); t = _txt(r)
+        pth = f"{OUT}/b388-weblogin-{kid}.png"
+        row = {"kid": kid, "alive": alive(), "text": t[:200], "has_done": "我已登录好了" in t or "登录好了" in t,
+               "has_strip": "外部打开" in t, "bottom_orange": _orange_share(pth, 0.90, 0.965), "top_orange": _orange_share(pth, 0.08, 0.16),
+               "flat": _flat(pth)}
+        rows.append(row)
+        if not row["alive"]: selftest_fail.append(f"b388 weblogin {kid}: app died"); relaunch()
+        if isinstance(row["bottom_orange"], float) and row["bottom_orange"] > 0.45:
+            selftest_fail.append(f"b388 weblogin {kid}: bottom bar still mostly solid orange ({row['bottom_orange']})")
+        if not row["has_done"]: page_missing.append(f"b388 weblogin {kid}: 我已登录好了 not found")
+        back(); time.sleep(1)
+    # the 群聊 sign-in page (元宝) with its glass note
+    result_json("group", "base web:yuanbao|"); result_json("group", "weblogin web:yuanbao|")
+    route("plus_group_weblogin/web%3Ayuanbao", 14)
+    r = shot388("weblogin-yuanbao"); rows.append({"kid": "web:yuanbao", "alive": alive(), "text": _txt(r)[:200]})
+    back(); time.sleep(1)
+    r8["weblogin"] = rows
+    print("B388 weblogin", json.dumps(rows, ensure_ascii=False)[:1500], flush=True)
+
+
+def b388_mailbox(res):
+    """消息 → 邮箱: injected multi-account inbox (screens), then the REAL add/read path against the runner's fake IMAP."""
+    r8 = R8(res); o = {}
+    o["fake"] = result_json("mailbox", "fake")
+    result_json("mailbox", "open"); time.sleep(5)
+    r = shot388("mail-all"); t = _txt(r); o["all_text"] = t[:400]
+    for want in ("邮箱", "全部", "GitHub", "今天"):
+        if want not in t: selftest_fail.append(f"b388 mailbox: '{want}' missing on the inbox")
+    if "授权码不对" not in t: page_missing.append("b388 mailbox: broken-account strip not shown")
+    if tap_text("qqq440681@163", wait=2.5):
+        shot388("mail-one")
+        tap_text("qqq440681@163", wait=1.5)
+    if tap_text("Run succeeded", wait=3):
+        r = shot388("mail-detail"); o["detail"] = _txt(r)[:300]
+        if "复制正文" not in o["detail"]: page_missing.append("b388 mailbox: detail sheet buttons missing")
+        back()
+    # long-press a chip → manage sheet
+    xy = find(dump(), "ds19910904@163")
+    if xy:
+        sh(f"input swipe {xy[0]} {xy[1]} {xy[0]} {xy[1]} 900"); time.sleep(2); shot388("mail-manage"); back()
+    # dark
+    result_json("group", "thememode 2"); adb("shell", "am", "force-stop", PKG); time.sleep(1)
+    adb("shell", "monkey", "-p", PKG, "-c", "android.intent.category.LAUNCHER", "1"); time.sleep(8)
+    result_json("mailbox", "fake"); result_json("mailbox", "open"); time.sleep(5)
+    shot388("mail-dark")
+    result_json("group", "thememode 1"); adb("shell", "am", "force-stop", PKG); time.sleep(1)
+    adb("shell", "monkey", "-p", PKG, "-c", "android.intent.category.LAUNCHER", "1"); time.sleep(8)
+    # empty state + add sheet
+    result_json("mailbox", "off"); result_json("mailbox", "open"); time.sleep(4)
+    r = shot388("mail-empty"); o["empty"] = _txt(r)[:300]
+    if "把你的邮箱都放到这里" not in o["empty"]: page_missing.append("b388 mailbox: empty state missing")
+    if tap_text("添加 163 / QQ 邮箱", wait=3) or tap_text("添加邮箱", wait=3):
+        r = shot388("mail-add"); o["add"] = _txt(r)[:300]
+        if "验证并添加" not in o["add"]: selftest_fail.append("b388 mailbox: add sheet missing 验证并添加")
+        back()
+    back()
+    # REAL path (same code as the phone, plain TCP to the runner's fake IMAP instead of TLS :993)
+    result_json("mailbox", "plain 10.0.2.2:1143")
+    bad = result_json("mailbox", "add box1@smoke.test|badcode", timeout=60) or {}
+    o["bad"] = bad
+    if not (isinstance(bad, dict) and bad.get("error")): selftest_fail.append(f"b388 mailbox: wrong 授权码 was accepted {bad}")
+    if isinstance(bad, dict) and "box1@smoke.test" in (bad.get("accounts") or []): selftest_fail.append("b388 mailbox: wrong 授权码 saved the account")
+    good = result_json("mailbox", "add box1@smoke.test|goodcode", timeout=60) or {}
+    o["good"] = good
+    if not (isinstance(good, dict) and good.get("error") == ""): selftest_fail.append(f"b388 mailbox: right 授权码 refused {good}")
+    st = result_json("mailbox", "refresh", timeout=90) or {}
+    o["read"] = st
+    if not (isinstance(st, dict) and st.get("mails", 0) >= 3): selftest_fail.append(f"b388 mailbox: real IMAP read got {st}")
+    result_json("mailbox", "open"); time.sleep(5)
+    r = shot388("mail-real"); o["real_text"] = _txt(r)[:300]
+    if "IMAP 服务已开启" not in o["real_text"] and "Run succeeded" not in o["real_text"]: page_missing.append("b388 mailbox: real mail not on screen")
+    back()
+    r8["mailbox"] = o
+    print("B388 mailbox", json.dumps(o, ensure_ascii=False)[:2500], flush=True)
+
+
+def b388_presets(res):
+    """free login routes: preset list, Muse 中继 / Memoh sign-in dialogs, AI 伙伴 「更多免费接入」, Mines × Muse 群."""
+    r8 = R8(res); o = {}
+    o["list"] = result_json("group", "preset list", timeout=40)
+    for pid in ("nanomuse", "memoh"):
+        result_json("group", f"preset openlogin {pid}"); time.sleep(6)
+        r = shot388("preset-" + pid); o[pid] = _txt(r)[:300]
+        want = "登录 Muse 中继" if pid == "nanomuse" else "登录 Memoh"
+        if want not in o[pid]: page_missing.append(f"b388 preset {pid}: '{want}' dialog not seen")
+        back(); time.sleep(1); back(); time.sleep(1)
+    route("plus_group_partners", 6)
+    r = shot388("partners-top"); o["partners_top"] = _txt(r)[:400]
+    t = ""
+    for _ in range(14):
+        scroll_down(); r = dump(); t = _txt(r)
+        if "建一个 Mines × Muse 群" in t: break
+    r = shot388("partners-extras"); o["extras"] = _txt(r)[:400]
+    if "建一个 Mines × Muse 群" not in o["extras"]: selftest_fail.append("b388 presets: 「建一个 Mines × Muse 群」 row missing")
+    if "扣子" not in o["partners_top"] + o["extras"] + t: page_missing.append("b388 presets: 扣子 row not seen")
+    if tap_text("建一个 Mines × Muse 群", wait=8):
+        r = shot388("muse-group"); o["group"] = _txt(r)[:300]
+        if not alive(): selftest_fail.append("b388 presets: app died opening the Mines × Muse group")
+        back()
+    o["group_json"] = result_json("group", "preset group", timeout=40)
+    back()
+    r8["presets"] = o
+    print("B388 presets", json.dumps(o, ensure_ascii=False)[:2500], flush=True)
 
 
 def finish(lc):

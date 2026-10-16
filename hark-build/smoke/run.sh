@@ -11,14 +11,26 @@ adb shell ip route show table all | grep default; adb shell dumpsys connectivity
 if [ -n "$OLD_APK" ] && [ -f "$OLD_APK" ]; then
   adb install -g "$OLD_APK" && echo "OLD_INSTALL: ok"
   adb shell monkey -p com.openminis.mines.plus -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1; sleep 12
+  mkdir -p smoke-out; adb exec-out screencap -p > smoke-out/zz-old-launch.png   # [38.8] before: 38.7 first screen
   adb shell am force-stop com.openminis.mines.plus
   adb shell dumpsys package com.openminis.mines.plus | grep -m2 -E "versionName|versionCode"
   if adb install -r -g "$APK" 2>&1 | tee /tmp/upg.txt | grep -q Success; then echo "INSTALL_UPGRADE: Success"; else echo "INSTALL_UPGRADE: FAILED $(cat /tmp/upg.txt)"; fi
   adb shell dumpsys package com.openminis.mines.plus | grep -m2 -E "versionName|versionCode"
+  # [38.8] open the upgraded app once: still running, and (no language ever picked) it comes up in 简体中文
+  mkdir -p smoke-out
+  adb shell monkey -p com.openminis.mines.plus -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1; sleep 15
+  if adb shell pidof com.openminis.mines.plus >/dev/null; then echo "UPGRADE_LAUNCH: running"; else echo "UPGRADE_LAUNCH: not running"; fi
+  adb exec-out screencap -p > smoke-out/zz-upgrade-launch.png
+  adb shell uiautomator dump /sdcard/up.xml >/dev/null 2>&1; adb shell cat /sdcard/up.xml > smoke-out/zz-upgrade-launch.xml 2>/dev/null
+  grep -q "欢迎使用 Mines" smoke-out/zz-upgrade-launch.xml && echo "UPGRADE_ZH: yes" || echo "UPGRADE_ZH: no ($(grep -o 'Welcome to Mines' smoke-out/zz-upgrade-launch.xml | head -1))"
+  adb shell am force-stop com.openminis.mines.plus
   # the smoke then runs on a clean app (fresh state) as before
   adb shell pm clear com.openminis.mines.plus
 fi
 adb install -r -g "$APK" || { echo "install failed"; exit 1; }
+# [38.8] the harness drives the English onboarding labels: pin Mines to en-US through Android's per-app language
+# (Mines then keeps 「跟随系统」 instead of its new 简体中文 default). The fresh install at the end checks the default.
+adb shell cmd locale set-app-locales com.openminis.mines.plus --locales en-US && echo "APP_LOCALE: en-US"
 for p in POST_NOTIFICATIONS RECORD_AUDIO; do adb shell pm grant com.openminis.mines.plus android.permission.$p 2>/dev/null; done
 adb shell appops set com.openminis.mines.plus SYSTEM_ALERT_WINDOW allow 2>/dev/null
 # a big camera-like photo for the 相册 wallpaper (pure-python PNG, 4000x3000)
@@ -46,4 +58,9 @@ if adb install -g "$APK" 2>&1 | tee /tmp/fresh.txt | grep -q Success; then echo 
 adb shell monkey -p com.openminis.mines.plus -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1; sleep 15
 if adb shell pidof com.openminis.mines.plus >/dev/null; then echo "FRESH_LAUNCH: running"; else echo "FRESH_LAUNCH: not running"; fi
 adb exec-out screencap -p > smoke-out/zz-fresh-install-launch.png
+adb shell uiautomator dump /sdcard/fr.xml >/dev/null 2>&1; adb shell cat /sdcard/fr.xml > smoke-out/zz-fresh-install-launch.xml 2>/dev/null
+grep -q "欢迎使用 Mines" smoke-out/zz-fresh-install-launch.xml && echo "FRESH_ZH: yes" || echo "FRESH_ZH: no ($(grep -o 'Welcome to Mines' smoke-out/zz-fresh-install-launch.xml | head -1))"
+adb logcat -d | grep -E "FATAL EXCEPTION|ANR in com.openminis" | head -5 | sed 's/^/AFTER_FRESH: /'
+for i in 1 2 3; do adb shell input swipe 540 1700 540 700 300; sleep 1; done
+adb exec-out screencap -p > smoke-out/zz-fresh-install-launch-2.png
 exit $rc
