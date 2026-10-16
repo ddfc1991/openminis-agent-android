@@ -110,6 +110,187 @@ index 1956659..be4aa22 100644
          if (code.isEmpty()) return base
          val locale = parseLocale(code) ?: return base
          val config = Configuration(base.resources.configuration)
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/HomeGreeting.kt b/src/android/app/src/main/java/com/openminis/app/plus/HomeGreeting.kt
+index 44e47ed..f6dbd26 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/HomeGreeting.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/HomeGreeting.kt
+@@ -26,7 +26,9 @@ import java.util.concurrent.TimeUnit
+  * there, otherwise from the IP (ipapi.co → ip-api.com). Cached 1 h; any failure → time-only greeting.
+  */
+ object HomeGreeting {
+-    data class Weather(val code: Int, val temp: Double, val max: Double, val min: Double, val maxYesterday: Double?, val rainProb: Int, val place: String = "")
++    data class Weather(val code: Int, val temp: Double, val max: Double, val min: Double, val maxYesterday: Double?, val rainProb: Int, val place: String = "",
++                       /** [Mines-38.8] short 「傍晚可能有雨」 hint for later today (rain probability >= 60 %), never replaces the current word. */
++                       val later: String = "")
+     data class Ctx(val hour: Int, val minute: Int, val dow: Int, val month: Int, val day: Int, val weather: Weather?, val battery: Int, val charging: Boolean, val awayDays: Int)
+     data class Greeting(val title: String, val care: String, val kind: String)
+ 
+@@ -213,20 +215,30 @@ object HomeGreeting {
+ 
+     fun cachedWeather(c: Context): Weather? = runCatching {
+         val p = prefs(c)
+-        if (System.currentTimeMillis() - p.getLong("w_at", 0L) > 3 * 3600_000L) return null
++        if (System.currentTimeMillis() - p.getLong("w_at", 0L) > 3600_000L) return null   // [Mines-38.8] max 1 h
+         val o = JSONObject(p.getString("w", null) ?: return null)
+         Weather(o.getInt("code"), o.getDouble("temp"), o.getDouble("max"), o.getDouble("min"),
+-            if (o.has("maxY")) o.getDouble("maxY") else null, o.optInt("rain"), o.optString("place"))
++            if (o.has("maxY")) o.getDouble("maxY") else null, o.optInt("rain"), o.optString("place"), o.optString("later"))
+     }.getOrNull()
+ 
+-    /** Fetches the weather at most once an hour (no key). Silent on failure. */
++    /**
++     * [Mines-38.8] user 2026-10-16 「我这里晴天，显示阵雨」. Fetches when the cache is older than 1 h, or on app resume when the
++     * phone moved more than 5 km from where the cached weather is for. The word / icon is the CURRENT condition
++     * (current weather_code); rain later today is only a separate short hint (「傍晚可能有雨」, probability >= 60 %).
++     */
+     suspend fun refreshWeather(c: Context) = withContext(Dispatchers.IO) {
+         val p = prefs(c)
+-        if (System.currentTimeMillis() - p.getLong("w_try", 0L) < 3600_000L && cachedWeather(c) != null) return@withContext
+-        p.edit().putLong("w_try", System.currentTimeMillis()).apply()
++        val now = System.currentTimeMillis()
++        val fresh = cachedWeather(c) != null
++        if (fresh && now - p.getLong("w_loc_try", 0L) < 5 * 60_000L) return@withContext
++        if (!fresh && now - p.getLong("w_try", 0L) < 2 * 60_000L) return@withContext
++        p.edit().putLong("w_loc_try", now).apply()
+         val loc = location(c) ?: return@withContext
++        if (fresh && p.contains("w_lat") && distKm(loc.first, loc.second, p.getFloat("w_lat", 0f).toDouble(), p.getFloat("w_lon", 0f).toDouble()) <= 5.0) return@withContext
++        p.edit().putLong("w_try", now).apply()
+         val url = "https://api.open-meteo.com/v1/forecast?latitude=${loc.first}&longitude=${loc.second}" +
+-            "&current=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code,sunrise,sunset" +
++            "&current=temperature_2m,weather_code,precipitation,is_day&hourly=precipitation_probability" +
++            "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code,sunrise,sunset" +
+             "&past_days=1&forecast_days=1&timezone=auto"
+         val o = runCatching { http.newCall(Request.Builder().url(url).build()).execute().use { r -> if (r.isSuccessful) JSONObject(r.body?.string().orEmpty()) else null } }.getOrNull()
+             ?: return@withContext
+@@ -238,31 +250,112 @@ object HomeGreeting {
+             // [Mines-38.7] sunrise / sunset for the day ↔ night switch
+             runCatching { DayNight.saveSun(c, d.optJSONArray("sunrise")?.optString(i), d.optJSONArray("sunset")?.optString(i)) }
+             val dayCode = codeA?.optInt(i) ?: 0
+-            val curCode = cur.optInt("weather_code", dayCode)
+-            // rain / snow later today counts too (the current hour may still be dry)
+-            val code = if (curCode < 51 && dayCode in 51..99) dayCode else curCode
++            // the word / icon is what it is like outside NOW (was: the day's worst code, so a sunny afternoon showed 阵雨)
++            val code = cur.optInt("weather_code", dayCode)
++            val later = laterRainHint(o, code)
+             val j = JSONObject().put("code", code)
+                 .put("temp", cur.optDouble("temperature_2m")).put("max", maxA.optDouble(i)).put("min", minA.optDouble(i))
+-                .put("rain", prA?.optInt(i) ?: 0).put("place", loc.third)
++                .put("rain", prA?.optInt(i) ?: 0).put("place", loc.third).put("later", later)
++                .put("precip", cur.optDouble("precipitation", 0.0)).put("isDay", cur.optInt("is_day", 1))
+             if (i >= 1) j.put("maxY", maxA.optDouble(i - 1))
+-            p.edit().putString("w", j.toString()).putLong("w_at", System.currentTimeMillis()).apply()
++            p.edit().putString("w", j.toString()).putLong("w_at", System.currentTimeMillis())
++                .putFloat("w_lat", loc.first.toFloat()).putFloat("w_lon", loc.second.toFloat()).apply()
+             _tick.value++
+         }
+     }
+ 
+-    /** (lat, lon, place): last known network / GPS location (permission already granted), else the IP's city. */
+-    private fun location(c: Context): Triple<Double, Double, String>? {
+-        runCatching {
+-            val ok = androidx.core.content.ContextCompat.checkSelfPermission(c, android.Manifest.permission.ACCESS_COARSE_LOCATION) ==
+-                android.content.pm.PackageManager.PERMISSION_GRANTED
+-            if (ok) {
+-                val lm = c.getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
+-                @Suppress("MissingPermission")
+-                val l = listOf(android.location.LocationManager.NETWORK_PROVIDER, android.location.LocationManager.GPS_PROVIDER, android.location.LocationManager.PASSIVE_PROVIDER)
+-                    .mapNotNull { pr -> runCatching { lm.getLastKnownLocation(pr) }.getOrNull() }.maxByOrNull { it.time }
+-                if (l != null) return Triple(l.latitude, l.longitude, "")
++    /** 「傍晚可能有雨」: the first hour later today with precipitation probability >= 60 %, only when it is dry now. */
++    private fun laterRainHint(o: JSONObject, curCode: Int): String = runCatching {
++        if (curCode in 51..67 || curCode in 80..82 || curCode in 95..99) return ""
++        val h = o.getJSONObject("hourly"); val times = h.getJSONArray("time"); val pr = h.getJSONArray("precipitation_probability")
++        val nowT = o.getJSONObject("current").optString("time")   // local time of the place, e.g. 2026-10-16T16:45
++        if (nowT.length < 13) return ""
++        val day = nowT.take(10); val nowH = nowT.substring(11, 13).toInt()
++        for (k in 0 until times.length()) {
++            val t = times.optString(k)
++            if (!t.startsWith(day) || t.length < 13) continue
++            val hh = t.substring(11, 13).toInt()
++            if (hh <= nowH) continue
++            if (pr.optInt(k, 0) >= 60) return when (hh) {
++                in 0..10 -> "上午可能有雨"; in 11..12 -> "中午可能有雨"; in 13..16 -> "下午可能有雨"
++                in 17..18 -> "傍晚可能有雨"; else -> "夜里可能有雨"
++            }
++        }
++        ""
++    }.getOrDefault("")
++
++    private fun distKm(a: Double, b: Double, c2: Double, d: Double): Double {
++        val r = FloatArray(1); android.location.Location.distanceBetween(a, b, c2, d, r); return r[0] / 1000.0
++    }
++
++    private fun vpnActive(c: Context): Boolean = runCatching {
++        val cm = c.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
++        @Suppress("DEPRECATION")
++        cm.allNetworks.any { n -> cm.getNetworkCapabilities(n)?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) == true }
++    }.getOrDefault(false)
++
++    private val _askLocation = MutableStateFlow(false)
++    /** [Mines-38.8] true once when there is no location permission and no remembered place: the home asks in plain words. */
++    val askLocation: StateFlow<Boolean> = _askLocation.asStateFlow()
++    fun locationAsked(c: Context) { _askLocation.value = false; prefs(c).edit().putBoolean("loc_asked", true).apply() }
++
++    /** A fresh network fix (5 s timeout), or null. */
++    @Suppress("MissingPermission")
++    private suspend fun freshFix(lm: android.location.LocationManager): android.location.Location? {
++        val pr = android.location.LocationManager.NETWORK_PROVIDER
++        if (runCatching { lm.isProviderEnabled(pr) }.getOrDefault(false) != true) return null
++        return kotlinx.coroutines.withTimeoutOrNull(5000L) {
++            kotlinx.coroutines.suspendCancellableCoroutine<android.location.Location?> { cont ->
++                runCatching {
++                    if (android.os.Build.VERSION.SDK_INT >= 30) {
++                        val cs = android.os.CancellationSignal()
++                        cont.invokeOnCancellation { runCatching { cs.cancel() } }
++                        lm.getCurrentLocation(pr, cs, java.util.concurrent.Executors.newSingleThreadExecutor()) { l -> cont.resumeWith(Result.success(l)) }
++                    } else {
++                        val ll = object : android.location.LocationListener {
++                            override fun onLocationChanged(l: android.location.Location) { cont.resumeWith(Result.success(l)) }
++                            @Deprecated("") override fun onStatusChanged(p: String?, s: Int, e: android.os.Bundle?) {}
++                            override fun onProviderEnabled(p: String) {}
++                            override fun onProviderDisabled(p: String) { cont.resumeWith(Result.success(null)) }
++                        }
++                        cont.invokeOnCancellation { runCatching { lm.removeUpdates(ll) } }
++                        @Suppress("DEPRECATION")
++                        lm.requestSingleUpdate(pr, ll, android.os.Looper.getMainLooper())
++                    }
++                }.onFailure { cont.resumeWith(Result.success(null)) }
++            }
++        }
++    }
++
++    /**
++     * (lat, lon, place). [Mines-38.8] order: a fresh network fix → the newest last-known fix if under 2 h old → the last good
++     * real location we remembered → an older last-known fix → the IP's city ONLY when no VPN is on (the user always runs a
++     * VPN, so the IP says the exit country, e.g. Singapore, not where they are). Nothing at all → ask once for coarse location.
++     */
++    private suspend fun location(c: Context): Triple<Double, Double, String>? {
++        val p = prefs(c)
++        val ok = androidx.core.content.ContextCompat.checkSelfPermission(c, android.Manifest.permission.ACCESS_COARSE_LOCATION) ==
++            android.content.pm.PackageManager.PERMISSION_GRANTED
++        fun remember(l: android.location.Location): Triple<Double, Double, String> {
++            p.edit().putFloat("loc_lat", l.latitude.toFloat()).putFloat("loc_lon", l.longitude.toFloat()).putLong("loc_at", System.currentTimeMillis()).apply()
++            return Triple(l.latitude, l.longitude, "")
++        }
++        var stale: android.location.Location? = null
++        if (ok) runCatching {
++            val lm = c.getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
++            freshFix(lm)?.let { return remember(it) }
++            @Suppress("MissingPermission")
++            val l = listOf(android.location.LocationManager.NETWORK_PROVIDER, android.location.LocationManager.GPS_PROVIDER, android.location.LocationManager.PASSIVE_PROVIDER)
++                .mapNotNull { pr -> runCatching { lm.getLastKnownLocation(pr) }.getOrNull() }.maxByOrNull { it.time }
++            if (l != null) {
++                if (System.currentTimeMillis() - l.time <= 2 * 3600_000L) return remember(l)
++                stale = l
+             }
+         }
++        if (p.contains("loc_lat")) return Triple(p.getFloat("loc_lat", 0f).toDouble(), p.getFloat("loc_lon", 0f).toDouble(), "")
++        stale?.let { return Triple(it.latitude, it.longitude, "") }
++        if (!ok && !p.getBoolean("loc_asked", false)) _askLocation.value = true
++        if (vpnActive(c)) return null
+         for (u in listOf("https://ipapi.co/json/", "http://ip-api.com/json/?fields=lat,lon,city")) {
+             val o = runCatching { http.newCall(Request.Builder().url(u).header("User-Agent", "Mines").build()).execute().use { r -> if (r.isSuccessful) JSONObject(r.body?.string().orEmpty()) else null } }.getOrNull() ?: continue
+             val lat = o.optDouble("latitude", o.optDouble("lat", Double.NaN)); val lon = o.optDouble("longitude", o.optDouble("lon", Double.NaN))
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MailImap.kt b/src/android/app/src/main/java/com/openminis/app/plus/MailImap.kt
 new file mode 100644
 index 0000000..d5f9d4a
@@ -2598,7 +2779,7 @@ index 725fc33..fdd2e44 100644
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/KnowledgeMap.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/KnowledgeMap.kt
-index 96fef50..ab11858 100644
+index 96fef50..30d2567 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/KnowledgeMap.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/KnowledgeMap.kt
 @@ -2,6 +2,7 @@ package com.openminis.app.ui.plus
@@ -2609,7 +2790,7 @@ index 96fef50..ab11858 100644
  import androidx.compose.foundation.Canvas
  import androidx.compose.foundation.gestures.detectTapGestures
  import androidx.compose.foundation.gestures.detectTransformGestures
-@@ -21,12 +22,18 @@ import androidx.compose.runtime.remember
+@@ -21,12 +22,19 @@ import androidx.compose.runtime.remember
  import androidx.compose.runtime.rememberCoroutineScope
  import androidx.compose.runtime.setValue
  import androidx.compose.ui.Modifier
@@ -2622,13 +2803,14 @@ index 96fef50..ab11858 100644
  import androidx.compose.ui.graphics.Color
  import androidx.compose.ui.graphics.Path
 +import androidx.compose.ui.graphics.drawscope.translate
++import androidx.compose.ui.graphics.drawscope.scale
 +import androidx.compose.ui.graphics.Brush
 +import androidx.compose.ui.graphics.nativeCanvas
 +import androidx.compose.ui.graphics.toArgb
  import androidx.compose.ui.graphics.drawscope.Stroke
  import androidx.compose.ui.input.pointer.pointerInput
  import androidx.compose.ui.platform.LocalDensity
-@@ -87,7 +94,7 @@ fun KnowledgeMindMap(entries: List<com.openminis.app.plus.ChatKnowledge.Entry>,
+@@ -87,7 +95,7 @@ fun KnowledgeMindMap(entries: List<com.openminis.app.plus.ChatKnowledge.Entry>,
      val clusters = remember(entries) { KnowledgeClusters.cluster(entries) }
      var openBranch by remember { mutableStateOf<String?>(null) }
      var leaf by remember { mutableStateOf<Pair<com.openminis.app.plus.ChatKnowledge.Entry, Pair<String, String>>?>(null) }
@@ -2637,7 +2819,7 @@ index 96fef50..ab11858 100644
      val px = { d: Float -> with(density) { d.dp.toPx() } }
  
      // layout in world coordinates (px), 「我」 at the origin
-@@ -98,16 +105,20 @@ fun KnowledgeMindMap(entries: List<com.openminis.app.plus.ChatKnowledge.Entry>,
+@@ -98,16 +106,20 @@ fun KnowledgeMindMap(entries: List<com.openminis.app.plus.ChatKnowledge.Entry>,
          clusters.forEachIndexed { i, (topic, list) ->
              val a = Math.toRadians(-90.0 + 360.0 * i / k)
              val dir = Offset(kotlin.math.cos(a).toFloat(), kotlin.math.sin(a).toFloat())
@@ -2662,7 +2844,7 @@ index 96fef50..ab11858 100644
                  }
              }
          }
-@@ -125,18 +136,26 @@ fun KnowledgeMindMap(entries: List<com.openminis.app.plus.ChatKnowledge.Entry>,
+@@ -125,18 +137,26 @@ fun KnowledgeMindMap(entries: List<com.openminis.app.plus.ChatKnowledge.Entry>,
                  val t = hit.id.removePrefix("b:")
                  openBranch = if (openBranch == t) null else t
                  // glide to the branch, a bit further out so its children are in view
@@ -2695,7 +2877,7 @@ index 96fef50..ab11858 100644
  
      Box(Modifier.fillMaxWidth().height(height).semantics { contentDescription = "知识脑图：双指缩放，拖动查看，点主题展开" }) {
          Canvas(Modifier.fillMaxWidth().height(height).onSizeChanged { boxSize = it }
-@@ -155,37 +174,122 @@ fun KnowledgeMindMap(entries: List<com.openminis.app.plus.ChatKnowledge.Entry>,
+@@ -155,37 +175,122 @@ fun KnowledgeMindMap(entries: List<com.openminis.app.plus.ChatKnowledge.Entry>,
              }) {
              val c = Offset(size.width / 2f + camX.value, size.height / 2f + camY.value)
              val z = zoom.value
@@ -2725,7 +2907,7 @@ index 96fef50..ab11858 100644
 +                drawCircle(Brush.radialGradient(listOf(col.copy(alpha = (0.24f + 0.20f * breathe) * ap), Color.Transparent), center = p, radius = core), radius = core, center = p)
 +                filaments[topic]?.let { fp ->
 +                    translate(p.x, p.y) {
-+                        androidx.compose.ui.graphics.drawscope.scale(z, z, pivot = Offset.Zero) {
++                        scale(z, z, pivot = Offset.Zero) {
 +                            drawPath(fp, col.copy(alpha = 0.10f * ap), style = Stroke(width = 2.4.dp.toPx()))
 +                            drawPath(fp, col.copy(alpha = 0.32f * ap), style = Stroke(width = 0.5.dp.toPx()))
 +                        }
@@ -2840,7 +3022,7 @@ index 96fef50..ab11858 100644
          // [Mines-38.7] every node is also a real (invisible) button: TalkBack reads it (the user is partially sighted) and
          // uiautomator can tap it (smoke). Same action as tapping the drawn node.
          nodes.forEach { n ->
-@@ -201,7 +305,7 @@ fun KnowledgeMindMap(entries: List<com.openminis.app.plus.ChatKnowledge.Entry>,
+@@ -201,7 +306,7 @@ fun KnowledgeMindMap(entries: List<com.openminis.app.plus.ChatKnowledge.Entry>,
                      .clickable(interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }, indication = null) { onNode(n) })
          }
          // [Mines-38.5] empty state centred under 「我」 with padding (was flush top-left, orphan 「图」)
@@ -3533,7 +3715,7 @@ index afd2104..edffa59 100644
              .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier),
          content = content,
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
-index 95d1b6b..67ac4a4 100644
+index 95d1b6b..8bd5a85 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
 @@ -12,10 +12,12 @@ import androidx.compose.foundation.background
@@ -3559,7 +3741,34 @@ index 95d1b6b..67ac4a4 100644
      val context = LocalContext.current
      PlusPrefs.init(context)
      PlusVault.init(context)
-@@ -143,21 +146,67 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier, onSearch:
+@@ -98,7 +101,25 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier, onSearch:
+     // [Mines-38.7] greeting with care: 8 time slots + weather (open-meteo, no key) + battery + late night + weekend /
+     // holiday + 好久不见, several lines per case, no sentence twice a day (HomeGreeting)
+     val gTick by com.openminis.app.plus.HomeGreeting.tick.collectAsState()
+-    LaunchedEffect(Unit) { runCatching { com.openminis.app.plus.HomeGreeting.refreshWeather(context) } }
++    // [Mines-38.8] weather re-checked on every app resume (refetched only when the cache is > 1 h old or the phone moved > 5 km)
++    val wOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
++    LaunchedEffect(wOwner) {
++        wOwner.lifecycle.repeatOnLifecycle(androidx.lifecycle.Lifecycle.State.RESUMED) { runCatching { com.openminis.app.plus.HomeGreeting.refreshWeather(context) } }
++    }
++    // [Mines-38.8] no location permission and no remembered place: ask once, in plain words, for the rough location
++    val askLoc by com.openminis.app.plus.HomeGreeting.askLocation.collectAsState()
++    val locLauncher = androidx.activity.compose.rememberLauncherForActivityResult(androidx.activity.result.contract.ActivityResultContracts.RequestPermission()) { granted ->
++        com.openminis.app.plus.HomeGreeting.locationAsked(context)
++        if (granted) runCatching { context.getSharedPreferences("mines_greeting", android.content.Context.MODE_PRIVATE).edit().putLong("w_loc_try", 0L).putLong("w_try", 0L).apply() }
++    }
++    val wScope = androidx.compose.runtime.rememberCoroutineScope()
++    if (askLoc) MinesDialog("看你那里的天气", onDismiss = { com.openminis.app.plus.HomeGreeting.locationAsked(context) },
++        confirm = "允许", onConfirm = {
++            locLauncher.launch(android.Manifest.permission.ACCESS_COARSE_LOCATION)
++            wScope.launch { kotlinx.coroutines.delay(1500); runCatching { com.openminis.app.plus.HomeGreeting.refreshWeather(context) } }
++        }, dismiss = "不用") {
++        Text("开着 VPN 时，网络位置不准。允许 Mines 知道你大概在哪个城市（不是精确位置），首页天气才对。", fontSize = MT.Body, lineHeight = MT.BodyLH, color = mines().ink2)
++    }
+     val greeting = androidx.compose.runtime.remember(gTick, hour) {
+         val snap = DeviceSnap.read(context)
+         val charging = runCatching { context.getSystemService(android.os.BatteryManager::class.java)?.isCharging == true }.getOrDefault(false)
+@@ -143,21 +164,67 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier, onSearch:
                  .clickable { switcher = true }.semantics { contentDescription = "换角色：$name" },
                  contentAlignment = Alignment.Center) { PetAvatar(size = 100.dp) }
          }
@@ -3641,7 +3850,7 @@ index 95d1b6b..67ac4a4 100644
          }
      }
  }
-@@ -203,6 +252,64 @@ fun HomeAvatar(modifier: Modifier = Modifier) {
+@@ -203,6 +270,64 @@ fun HomeAvatar(modifier: Modifier = Modifier) {
      }
  }
  
@@ -3706,7 +3915,17 @@ index 95d1b6b..67ac4a4 100644
  /** [Mines-38.7] the home weather as the sprite / big picture / pill need it; null = no weather (nothing shown). */
  class HomeWx(val icon: String, val words: String, val temp: Int, val extra: String, val night: Boolean) {
      val spoken get() = "$words $temp 度"
-@@ -242,7 +349,7 @@ fun HomeWeatherPill() {
+@@ -219,7 +344,8 @@ fun homeWeather(): HomeWx? {
+     val forced = com.openminis.app.plus.HomeGreeting.override?.optInt("hour", -1)?.takeIf { it >= 0 }
+     val night = if (forced != null) forced >= 19 || forced < 6 else sunNight
+     val (icon, words) = com.openminis.app.plus.HomeGreeting.describe(w.code, if (night) 23 else 12)
+-    val extra = w.place.takeIf { it.isNotBlank() && it.length <= 8 } ?: if (night) "夜里" else ""
++    // [Mines-38.8] rain later today is a separate short hint (「傍晚可能有雨」); the word stays the current condition
++    val extra = w.later.takeIf { it.isNotBlank() } ?: w.place.takeIf { it.isNotBlank() && it.length <= 8 } ?: if (night) "夜里" else ""
+     return HomeWx(icon, words, Math.round(w.temp).toInt(), extra, night)
+ }
+ 
+@@ -242,7 +368,7 @@ fun HomeWeatherPill() {
              verticalAlignment = Alignment.CenterVertically) {
              Text("${wx.temp}°", fontSize = 18.sp, lineHeight = 22.sp, fontWeight = FontWeight.Bold, color = m.ink, maxLines = 1, softWrap = false)
              Spacer(Modifier.width(6.dp))
@@ -3715,7 +3934,7 @@ index 95d1b6b..67ac4a4 100644
          }
      }
  }
-@@ -287,7 +394,8 @@ class WeatherOrbitState {
+@@ -287,7 +413,8 @@ class WeatherOrbitState {
   * face's upper right, a tap shows the pill.
   */
  @Composable
@@ -3725,7 +3944,7 @@ index 95d1b6b..67ac4a4 100644
      val ctx = LocalContext.current
      val m = mines()
      val still = remember { AnimeWeather.still(ctx) }
-@@ -315,9 +423,9 @@ private fun WeatherOrbit(st: WeatherOrbitState, wx: HomeWx, front: Boolean, onTa
+@@ -315,9 +442,9 @@ private fun WeatherOrbit(st: WeatherOrbitState, wx: HomeWx, front: Boolean, onTa
      }
      val a = st.angle
      val f = st.fly.value
@@ -3738,7 +3957,7 @@ index 95d1b6b..67ac4a4 100644
      // faint dashed orbit line (back layer, while circling)
      if (!front && !still && f < 0.02f) {
          androidx.compose.foundation.Canvas(Modifier.size(1.dp)) {
-@@ -338,7 +446,7 @@ private fun WeatherOrbit(st: WeatherOrbitState, wx: HomeWx, front: Boolean, onTa
+@@ -338,7 +465,7 @@ private fun WeatherOrbit(st: WeatherOrbitState, wx: HomeWx, front: Boolean, onTa
      val tx = 0f; val ty = -82f
      val x = ox + (tx - ox) * f
      val y = oy + (ty - oy) * f - kotlin.math.sin(Math.PI.toFloat() * f) * 22f
@@ -3747,7 +3966,7 @@ index 95d1b6b..67ac4a4 100644
      val scale = sc0 + (1f - sc0) * f
      val alpha = al0 + (1f - al0) * f
      // faint trail of light dots behind the sprite while it circles
-@@ -407,7 +515,7 @@ private fun StatusTile(modifier: Modifier, icon: String, value: String, label: S
+@@ -407,7 +534,7 @@ private fun StatusTile(modifier: Modifier, icon: String, value: String, label: S
              Text(label, fontSize = MT.Meta, color = m.ink2, maxLines = 1, softWrap = false, modifier = Modifier.weight(1f))
              Box(Modifier.size(6.dp).clip(CircleShape).background(dot))
          }
@@ -3756,7 +3975,7 @@ index 95d1b6b..67ac4a4 100644
              overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, modifier = Modifier.padding(top = 2.dp))
      }
  }
-@@ -473,7 +581,7 @@ private fun FeedRow(item: com.openminis.app.plus.Digest.Item) {
+@@ -473,7 +600,7 @@ private fun FeedRow(item: com.openminis.app.plus.Digest.Item) {
          ToneBubble(com.openminis.app.ui.brand.MinesIcons.named(icon)!!, tone)
          Spacer(Modifier.width(14.dp))
          Column(Modifier.weight(1f)) {
@@ -3765,7 +3984,7 @@ index 95d1b6b..67ac4a4 100644
                  maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
              val sub = it.summary.takeIf { s -> s.isNotBlank() && s != it.headline } ?: it.source
              Text(sub, fontSize = 15.sp, lineHeight = 20.sp, color = m.ink2, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
-@@ -514,7 +622,7 @@ private fun MessagesBar(count: Int, onClick: () -> Unit) {
+@@ -514,7 +641,7 @@ private fun MessagesBar(count: Int, onClick: () -> Unit) {
      ) {
          MinesIcon(com.openminis.app.ui.brand.MinesIcons.named("mail")!!, null, tint = m.ink2, modifier = Modifier.size(20.dp))
          Spacer(Modifier.width(10.dp))
@@ -3774,7 +3993,16 @@ index 95d1b6b..67ac4a4 100644
          if (count > 0) {
              Box(Modifier.heightIn(min = 22.dp).clip(RoundedCornerShape(50)).background(MinesDesign.DangerFill).padding(horizontal = 7.dp),
                  contentAlignment = Alignment.Center) {
-@@ -556,6 +664,15 @@ fun HomeWeatherChip(modifier: Modifier = Modifier) {
+@@ -542,7 +669,7 @@ fun HomeWeatherChip(modifier: Modifier = Modifier) {
+     val hour = (com.openminis.app.plus.HomeGreeting.override?.optInt("hour", -1)?.takeIf { it >= 0 }) ?: Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+     val (icon, words) = com.openminis.app.plus.HomeGreeting.describe(w.code, hour)
+     val night = hour >= 19 || hour < 6
+-    val extra = w.place.takeIf { it.isNotBlank() && it.length <= 8 } ?: if (night) "夜里" else ""
++    val extra = w.later.takeIf { it.isNotBlank() } ?: w.place.takeIf { it.isNotBlank() && it.length <= 8 } ?: if (night) "夜里" else ""
+     val t = Math.round(w.temp).toInt()
+     // design387 board: white pill (dark: deep porcelain), line icon, bold temperature, small 「晴 · 新加坡」
+     val fill = if (m.dark) Color(0xFF2A2421) else Color.White.copy(alpha = 0.94f)
+@@ -556,6 +683,15 @@ fun HomeWeatherChip(modifier: Modifier = Modifier) {
          Spacer(Modifier.width(6.dp))
          Text("$t°", fontSize = 18.sp, lineHeight = 22.sp, fontWeight = FontWeight.Bold, color = m.ink, maxLines = 1)
          Spacer(Modifier.width(8.dp))
