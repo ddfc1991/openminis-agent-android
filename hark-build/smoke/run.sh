@@ -52,6 +52,8 @@ adb shell content call --uri content://media/external/file --method scan_volume 
 python3 -m pip install -q --break-system-packages pillow 2>/dev/null || python3 -m pip install -q pillow 2>/dev/null || true   # [build-38.4] screenshot paint check
 python3 hark-build/smoke/vps_smoke.py
 rc=$?
+# [38.8 v5] if the emulator went away during the drive, stop here instead of waiting forever for the device
+if [ "$(timeout 20 adb get-state 2>/dev/null)" != "device" ]; then echo "EMULATOR_GONE: adb lost the emulator during the smoke"; exit 1; fi
 # [build-38.7] fresh install: uninstall, install, launch, still running after 15 s
 adb uninstall com.openminis.mines.plus >/dev/null 2>&1
 if adb install -g "$APK" 2>&1 | tee /tmp/fresh.txt | grep -q Success; then echo "INSTALL_FRESH: Success"; else echo "INSTALL_FRESH: FAILED $(cat /tmp/fresh.txt)"; fi

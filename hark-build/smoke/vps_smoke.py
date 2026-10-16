@@ -3542,12 +3542,15 @@ def b388_ui(res):
     time.sleep(4)
     r = shot388("msg")
     t = _txt(r); o["msg_text"] = t[:800]
-    if "已解决" not in t: selftest_fail.append("ui388 消息: 已解决 card not shown")
-    if "收起" not in t: page_missing.append("ui388 消息: 收起 not seen")
     if "权限问题已解决" in t and any("已失效" in x for x in (texts(r) or [])[:0]): pass
     o["msg_progress_nodes"] = sh("uiautomator dump /sdcard/pg.xml >/dev/null 2>&1; cat /sdcard/pg.xml | grep -o 'ProgressBar' | head -3")
     if open_tab("账号异常"):
         time.sleep(2); r = shot388("msg-account"); o["msg_account"] = _txt(r)[:600]
+        # the resolved card lives on the 账号异常 tab (为你推荐 does not list it)
+        if "已解决" not in o["msg_account"]: selftest_fail.append("ui388 消息: 已解决 card not shown")
+        if "收起" not in o["msg_account"]: page_missing.append("ui388 消息: 收起 not seen")
+    else:
+        page_missing.append("ui388 消息: 账号异常 tab not found")
     back(1)
     # 知识库
     B = "http://10.0.2.2:8088"
