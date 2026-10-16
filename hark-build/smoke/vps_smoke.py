@@ -2639,11 +2639,16 @@ def b387_linkall(res):
         r = shot387("linkall-next"); t = " ".join(texts(r)) if r is not None else ""
         o["next"] = t[:200]
         # coming back counts the platform and (3 s later) opens the next one by itself
-        moved = "下一个" in t or "登录 元宝" not in t
+        # [38.8] the queue order changed (豆包 first): "moved on" = 下一个 shown, or a DIFFERENT platform's sign-in page
+        first = (re.search(r"登录 (\S+)", o.get("login", "")) or [None, None])[1]
+        def _moved(tx):
+            m2 = re.search(r"登录 (\S+)", tx)
+            return "下一个" in tx or "第 2 个" in tx or (m2 is not None and first is not None and m2.group(1) != first)
+        moved = _moved(t)
         for _ in range(8):
             if moved: break
             time.sleep(1); r2 = dump(); t2 = " ".join(texts(r2)) if r2 is not None else ""
-            moved = "下一个" in t2 or ("登录 元宝" not in t2 and bool(t2.strip()))
+            moved = _moved(t2)
         o["moved_on"] = moved
         if not moved: selftest_fail.append(f"b387 linkall: did not move on after coming back {t[:160]}")
         tap_text("停一下", exact=True, wait=1.5)
@@ -3335,11 +3340,19 @@ def _orange_share(path, top, bottom):
         return f"err {e}"
 
 
+def theme388(mode):
+    result_json("group", f"thememode {mode}"); adb("shell", "am", "force-stop", PKG); time.sleep(1)
+    adb("shell", "monkey", "-p", PKG, "-c", "android.intent.category.LAUNCHER", "1"); time.sleep(8)
+
+
 def b388_weblogin(res):
     """WebLoginScreen in frosted glass: compact pill (no full-width orange bar), one glass hint strip, no brown bands."""
     r8 = R8(res); rows = []
     info = result_json("group", "linkinfo", timeout=60) or []
-    for kid in ("x", "weibo", "qq"):
+    for kid0 in ("x", "weibo", "qq", "weibo@night", "qq@night"):
+        kid = kid0.split("@")[0]
+        if kid0 == "x": theme388(1)
+        if kid0 == "weibo@night": theme388(2)
         p = next((x for x in info if x.get("id") == "conn:" + kid), None)
         sh("logcat -c"); b381_home()
         try: result_json("group", f"linkopen conn:{kid}")
@@ -3347,9 +3360,10 @@ def b388_weblogin(res):
         time.sleep(3)
         if p and p.get("how", "") == "在 Mines 内登录": tap_text("在 Mines 内登录", wait=10)
         else: time.sleep(6)
-        r = shot388("weblogin-" + kid); t = _txt(r)
-        pth = f"{OUT}/b388-weblogin-{kid}.png"
-        row = {"kid": kid, "alive": alive(), "text": t[:200], "has_done": "我已登录好了" in t or "登录好了" in t,
+        tag = kid0.replace("@", "-")
+        r = shot388("weblogin-" + tag); t = _txt(r)
+        pth = f"{OUT}/b388-weblogin-{tag}.png"
+        row = {"kid": kid0, "alive": alive(), "text": t[:200], "has_done": "我已登录好了" in t or "登录好了" in t,
                "has_strip": "外部打开" in t, "bottom_orange": _orange_share(pth, 0.90, 0.965), "top_orange": _orange_share(pth, 0.08, 0.16),
                "flat": _flat(pth)}
         rows.append(row)
@@ -3358,6 +3372,7 @@ def b388_weblogin(res):
             selftest_fail.append(f"b388 weblogin {kid}: bottom bar still mostly solid orange ({row['bottom_orange']})")
         if not row["has_done"]: page_missing.append(f"b388 weblogin {kid}: 我已登录好了 not found")
         back(); time.sleep(1)
+    theme388(1)
     # the 群聊 sign-in page (元宝) with its glass note
     result_json("group", "base web:yuanbao|"); result_json("group", "weblogin web:yuanbao|")
     route("plus_group_weblogin/web%3Ayuanbao", 14)
@@ -3370,6 +3385,7 @@ def b388_weblogin(res):
 def b388_mailbox(res):
     """消息 → 邮箱: injected multi-account inbox (screens), then the REAL add/read path against the runner's fake IMAP."""
     r8 = R8(res); o = {}
+    theme388(1)
     o["fake"] = result_json("mailbox", "fake")
     result_json("mailbox", "open"); time.sleep(5)
     r = shot388("mail-all"); t = _txt(r); o["all_text"] = t[:400]
@@ -3383,17 +3399,16 @@ def b388_mailbox(res):
         r = shot388("mail-detail"); o["detail"] = _txt(r)[:300]
         if "复制正文" not in o["detail"]: page_missing.append("b388 mailbox: detail sheet buttons missing")
         back()
-    # long-press a chip → manage sheet
-    xy = find(dump(), "ds19910904@163")
+    # long-press the first account chip → manage sheet
+    xy = find(dump(), "deningyang7")
     if xy:
         sh(f"input swipe {xy[0]} {xy[1]} {xy[0]} {xy[1]} 900"); time.sleep(2); shot388("mail-manage"); back()
     # dark
-    result_json("group", "thememode 2"); adb("shell", "am", "force-stop", PKG); time.sleep(1)
-    adb("shell", "monkey", "-p", PKG, "-c", "android.intent.category.LAUNCHER", "1"); time.sleep(8)
+    theme388(2)
     result_json("mailbox", "fake"); result_json("mailbox", "open"); time.sleep(5)
     shot388("mail-dark")
-    result_json("group", "thememode 1"); adb("shell", "am", "force-stop", PKG); time.sleep(1)
-    adb("shell", "monkey", "-p", PKG, "-c", "android.intent.category.LAUNCHER", "1"); time.sleep(8)
+    if tap_text("Run succeeded", wait=3): shot388("mail-detail-dark"); back()
+    theme388(1)
     # empty state + add sheet
     result_json("mailbox", "off"); result_json("mailbox", "open"); time.sleep(4)
     r = shot388("mail-empty"); o["empty"] = _txt(r)[:300]
