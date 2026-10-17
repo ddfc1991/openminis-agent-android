@@ -4535,6 +4535,7 @@ def b395_i(res):
     if not str(gw.get("models", "")).startswith("200"): selftest_fail.append(f"i395: gateway not answering on 127.0.0.1: {gw.get('models')}")
     o["bailian"] = selftest("group", "i395 bailian sk-ws-abcdEFGH12345678", timeout=20)[-200:]
     if "maas.aliyuncs.com" not in o["bailian"]: selftest_fail.append("i395: sk-ws key not sent to the workspace endpoint")
+    LOOK_NOW = [False]
     def pages(sfx):
         r = b381_home(); time.sleep(3); r = shot388(f"i395-home-{sfx}"); t = _txt(r); o["home_" + sfx] = t[:500]
         rows = all_desc(r, "进度：")
@@ -4588,6 +4589,7 @@ def b395_i(res):
         back(1); time.sleep(1)
         route("plus_app_agents", 5); shot388(f"i395-agents-{sfx}"); back(1); time.sleep(1)
         # glass 自动 (thin again in i5): 外观调节 over the fog, top + glass section
+        if sfx == "dark" and not LOOK_NOW[0]: return   # [i5b] dark 外观调节 runs last (emulator died there in 39044584628)
         route("plus_look", 6); r = shot388(f"i395-look-{sfx}"); o["look_" + sfx] = _txt(r)[:300]
         scroll_down(); time.sleep(1); r = shot388(f"i395-look2-{sfx}"); t = _txt(r)
         m_ = re.search(r"现在 (\d+)%", t + " " + o["look_" + sfx]); o["glass_" + sfx] = m_.group(1) if m_ else "?"
@@ -4606,7 +4608,6 @@ def b395_i(res):
         time.sleep(3); r = shot388("i395-keybad-login"); t = _txt(r); o["keybad_login"] = t[:600]
         if "OpenRouter" in t and "过期" in t: selftest_fail.append("i395: refused OpenRouter key still under 登录 › 过期了")
         back(1)
-    step("keybad", keybad)
     # 外观调节 over a photo wallpaper: frame time (emulator died here twice on 38.9.4)
     def lookperf():
         o["wall"] = selftest_json("uiprep", "杨arling|gen", timeout=20); time.sleep(2)
@@ -4622,7 +4623,6 @@ def b395_i(res):
         theme388(2); time.sleep(3); route("plus_look", 6); scroll_down(); time.sleep(1); shot388("i395-look-photo-dark")
         back(1); r = b381_home(); time.sleep(3); shot388("i395-home-photo-dark"); theme388(1)
         result_json("group", "wallpaper off")
-    step("lookperf", lookperf)
     # SkillHub same-slug rows: only the installed publisher's row says 已安装
     o["skill"] = result_json("group", "h394 skill weather", timeout=120)
     sk = o["skill"] if isinstance(o["skill"], dict) else {}
@@ -4636,7 +4636,6 @@ def b395_i(res):
         r = shot388("i395-skill-sameslug"); t = _txt(r); o["skill_page"] = t[:400]
         if t.count("已安装") > 1: selftest_fail.append("i395: more than one same-slug row says 已安装 on the market page")
         back(1)
-    step("skillshot", skillshot)
     # [i6] user 22:02–22:04: ☰ 「AI 服务」 + glass menu, Notion truthful web sign-in, 脑图 sci-fi
     def menu_ai(sfx):
         r = b381_home(); time.sleep(2)
@@ -4682,6 +4681,17 @@ def b395_i(res):
     step("menu-dark", lambda: menu_ai("dark"))
     step("kb-dark", lambda: kbmap("dark"))
     theme388(1)
+    step("keybad", keybad)
+    step("skillshot", skillshot)
+    def look_dark():
+        LOOK_NOW[0] = True; theme388(2)
+        route("plus_look", 6); r = shot388("i395-look-dark"); o["look_dark"] = _txt(r)[:300]
+        scroll_down(); time.sleep(1); r = shot388("i395-look2-dark"); t = _txt(r)
+        m_ = re.search(r"现在 (\d+)%", t + " " + o["look_dark"]); o["glass_dark"] = m_.group(1) if m_ else "?"
+        if m_ and int(m_.group(1)) > 50: selftest_fail.append(f"i395 dark: glass auto {m_.group(1)}% over the cap")
+        back(1); time.sleep(1); theme388(1)
+    step("look-dark", look_dark)
+    step("lookperf", lookperf)
     r8["i395"] = o
     print("I395 RESULT " + json.dumps(o, ensure_ascii=False)[:6000], flush=True)
 
