@@ -6529,10 +6529,10 @@ index 0000000..b0b8121
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SessionStatus.kt b/src/android/app/src/main/java/com/openminis/app/plus/SessionStatus.kt
 new file mode 100644
-index 0000000..121a9f6
+index 0000000..1c382da
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/SessionStatus.kt
-@@ -0,0 +1,124 @@
+@@ -0,0 +1,130 @@
 +package com.openminis.app.plus
 +
 +/**
@@ -6575,6 +6575,12 @@ index 0000000..121a9f6
 +     * service was judged as a web login it never had).
 +     */
 +    fun keyPill(level: String?): Pill = when (level) { null, "" -> Pill.UNCHECKED; "OK" -> Pill.OK; "BAD" -> Pill.BAD; else -> Pill.WARN }
++
++    /** [Mines-38.9.5 i] the key test was refused (401 / 403 / invalid key): a key problem, not a sign-in. */
++    fun keyRefused(level: String?, reason: String?): Boolean = level == "BAD" &&
++        Regex("(?i)\\b40[13]\\b|unauthori[sz]ed|forbidden|invalid[ _-]?(api[ _-]?)?key|incorrect api key|密钥无效|key 无效|无效的?密钥|密钥.*(错|失效)").containsMatchIn(reason.orEmpty())
++    /** The 服务 pill text: a refused key says 「key 无效」 (38.9.4 smoke: OpenRouter 401 was listed as 登录过期了). */
++    fun keyPillLabel(level: String?, reason: String?): String = if (keyRefused(level, reason)) "key 无效" else keyPill(level).label
 +
 +    /**
 +     * A web login: 异常 only for a real new-device alert; 要注意 only for a CONFIRMED sign-out (login wall after a real probe,
@@ -6659,10 +6665,10 @@ index 0000000..121a9f6
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SkillHubCn.kt b/src/android/app/src/main/java/com/openminis/app/plus/SkillHubCn.kt
 new file mode 100644
-index 0000000..e57cb69
+index 0000000..1ff8021
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/SkillHubCn.kt
-@@ -0,0 +1,291 @@
+@@ -0,0 +1,297 @@
 +package com.openminis.app.plus
 +
 +import android.content.Context
@@ -6907,11 +6913,17 @@ index 0000000..e57cb69
 +        return File(d, ".mines-source").takeIf { it.isFile }?.readText()?.trim() ?: "local"
 +    }
 +
-+    /** Download the zip, verify the signature hash when published, unpack into both skills dirs. Returns a one-line result. */
-+    fun installSkill(ctx: Context, s: Skill): String {
++    /** [Mines-38.9.5 i] this row's state: installed from THIS publisher, another publisher's same-slug skill, local, none. */
++    fun skillState(ctx: Context, s: Skill): SkillInstallKey.State = SkillInstallKey.state(installedSkill(ctx, s.slug), s.namespace, s.slug)
++
++    /** Download the zip, verify the signature hash when published, unpack into both skills dirs. Returns a one-line result.
++     *  [replace] = the user tapped 替换 on a row whose slug is held by another publisher's skill (never silently). */
++    fun installSkill(ctx: Context, s: Skill, replace: Boolean = false): String {
 +        if (!SLUG.matches(s.slug)) throw IllegalStateException("技能名不合法")
 +        val prev = installedSkill(ctx, s.slug)
 +        if (prev == "local") return "已经有一个同名的本地技能「${s.slug}」，没有覆盖"
++        val st = SkillInstallKey.state(prev, s.namespace, s.slug)
++        if (st == SkillInstallKey.State.OTHER && !replace) return "已装了另一位作者的同名技能「${s.slug}」，没有覆盖（要换成这个请点「替换」）"
 +        val c = open("$API/api/v1/download?slug=${URLEncoder.encode(s.slug, "UTF-8")}" + (if (s.namespace.isNotBlank()) "&namespace=" + URLEncoder.encode(s.namespace, "UTF-8") else "") + (if (s.version.isNotBlank()) "&version=" + URLEncoder.encode(s.version, "UTF-8") else "") + "&source=dsh", 30_000)
 +        c.setRequestProperty("Accept", "application/zip, application/octet-stream")
 +        if (c.responseCode !in 200..299) throw IllegalStateException("下载失败（HTTP ${c.responseCode}）")
@@ -6938,13 +6950,13 @@ index 0000000..e57cb69
 +            root.mkdirs()
 +            val tmp = File(root, ".tmp-${s.slug}").apply { deleteRecursively(); mkdirs() }
 +            for ((rel, b) in files) File(tmp, rel).apply { parentFile?.mkdirs() }.writeBytes(b)
-+            File(tmp, ".mines-source").writeText("skillhub:${s.slug}@${s.version}\n")
++            File(tmp, ".mines-source").writeText(SkillInstallKey.source(s.namespace, s.slug, s.version) + "\n")   // [Mines-38.9.5 i] + publisher
 +            val target = File(root, s.slug)
 +            target.deleteRecursively()
 +            if (!tmp.renameTo(target)) { tmp.copyRecursively(target, overwrite = true); tmp.deleteRecursively() }
 +        }
 +        (ctx.applicationContext as? com.openminis.app.MinisApp)?.skillRepository?.requestReload("skillhub", force = true)
-+        return (if (prev == null) "已安装「${s.name}」" else "已更新「${s.name}」") + " · $signed"
++        return (if (prev == null) "已安装「${s.name}」" else if (st == SkillInstallKey.State.OTHER) "已替换为「${s.name}」" else "已更新「${s.name}」") + " · $signed"
 +    }
 +
 +    fun uninstallSkill(ctx: Context, slug: String): String {
@@ -6953,6 +6965,48 @@ index 0000000..e57cb69
 +        (ctx.applicationContext as? com.openminis.app.MinisApp)?.skillRepository?.requestReload("skillhub", force = true)
 +        return "已卸载「$slug」"
 +    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SkillInstallKey.kt b/src/android/app/src/main/java/com/openminis/app/plus/SkillInstallKey.kt
+new file mode 100644
+index 0000000..755c5f9
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/SkillInstallKey.kt
+@@ -0,0 +1,36 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-38.9.5 i] SkillHub install state keyed by publisher namespace + slug (38.9.4 smoke: after installing one publisher's
++ * 「weather」, all 3 publishers' rows said 已安装 and 更新 on another row would have overwritten it with a different package).
++ * The skill still lives in one dir per slug (that is how skills are loaded), so a second publisher's same-slug skill is
++ * 「同名已装」 and only replaced on an explicit 替换. Source line: `skillhub:<namespace>/<slug>@<version>`; 38.9.4 wrote
++ * `skillhub:<slug>@<version>` (publisher unknown → never claimed as this row's). Pure, unit-tested in SkillInstallKeyTest.
++ */
++object SkillInstallKey {
++    enum class State { NONE, MINE, OTHER, LOCAL }
++
++    fun source(namespace: String, slug: String, version: String): String =
++        "skillhub:" + (if (namespace.isNotBlank()) "$namespace/" else "") + slug + "@" + version
++
++    /** (namespace, slug, version) of a source line; namespace "" = not recorded (38.9.4) / none; null = not from SkillHub. */
++    fun parse(src: String?): Triple<String, String, String>? {
++        val s = src?.trim().orEmpty()
++        if (!s.startsWith("skillhub:")) return null
++        val body = s.removePrefix("skillhub:")
++        val id = body.substringBefore('@'); val ver = body.substringAfter('@', "")
++        return if ('/' in id) Triple(id.substringBefore('/'), id.substringAfter('/'), ver) else Triple("", id, ver)
++    }
++
++    /** [src] = the installed dir's source record (null = nothing installed under this slug, "local" = the user's own). */
++    fun state(src: String?, namespace: String, slug: String): State {
++        if (src == null) return State.NONE
++        val p = parse(src) ?: return State.LOCAL
++        if (p.second != slug) return State.OTHER
++        if (p.first.isBlank()) return if (namespace.isBlank()) State.MINE else State.OTHER
++        return if (p.first.equals(namespace, ignoreCase = true)) State.MINE else State.OTHER
++    }
++
++    /** Row identity in lists (two publishers' same slug are two rows). */
++    fun rowKey(namespace: String, slug: String): String = if (namespace.isBlank()) slug else "$namespace/$slug"
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SkillsHub.kt b/src/android/app/src/main/java/com/openminis/app/plus/SkillsHub.kt
 new file mode 100644
@@ -8527,10 +8581,18 @@ index 1d773a2..5489e65 100644
          coroutineScope {
              val bg = slow.map { id -> async { one(id) } }
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-index af13c1b..f5ccfd5 100644
+index af13c1b..386853d 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-@@ -21,6 +21,65 @@ object GroupSelfTest {
+@@ -2,6 +2,7 @@ package com.openminis.app.plus.group
+ 
+ import android.content.Context
+ import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.runBlocking
+ import org.json.JSONArray
+ import org.json.JSONObject
+@@ -21,6 +22,112 @@ object GroupSelfTest {
          val rest = arg.substringAfter(' ', "")
          val parts = rest.split('|')
          when (cmd) {
@@ -8570,6 +8632,53 @@ index af13c1b..f5ccfd5 100644
 +                    .put("orPill", com.openminis.app.plus.SessionStatus.keyPill(com.openminis.app.plus.AccountPatrol.status.value["openrouter"]?.level?.name).name)
 +                    .put("auto", JSONArray(com.openminis.app.plus.AutoAccounts.list.value.map { it.site + "|" + it.host + "|" + it.source })).toString()
 +            }
++            // [Mines-38.9.5 i] smoke: 'i395 seed' = accounts like the user's (Google / GitHub signed in, 阿里云 过期了, 163 未检查),
++            // task progress on the 5 newest chats, a cloud browser + a server registered through workspace_register, 硅基 忽略;
++            // 'i395 accounts' = the agent's accounts(list) text; 'i395 login <site>' = one hidden re-login attempt (truthful reason);
++            // 'i395 gw' = the local 免登录 AI gateway (/v1/models over 127.0.0.1) + 模型组 route rows; 'i395 bailian <key>' = endpoint pick
++            "i395" -> {
++                val sub = rest.substringBefore(' ').trim(); val arg2 = rest.substringAfter(' ', "").trim()
++                val S = com.openminis.app.plus.IdentityStore; S.init(context)
++                val now = System.currentTimeMillis()
++                when (sub) {
++                    "seed" -> {
++                        val IC = com.openminis.app.plus.IdentityCore
++                        S.addIdent(context, IC.Ident(IC.IdType.GOOGLE, "smoke@example.com", source = "smoke", signedIn = true))
++                        S.addIdent(context, IC.Ident(IC.IdType.GITHUB, "smokedev", source = "smoke", signedIn = true))
++                        S.addRec(context, IC.Rec("google.com", "Google", "smoke@example.com", IC.IdType.EMAIL, IC.Method.EMAIL_PW, status = IC.LINKED, sources = setOf("网页登录"), at = now))
++                        S.addRec(context, IC.Rec("github.com", "GitHub", "smokedev", null, IC.Method.OAUTH, provider = IC.IdType.GOOGLE, status = IC.LINKED, sources = setOf("网页登录"), at = now))
++                        S.addRec(context, IC.Rec("aliyun.com", "阿里云", "demo_user", null, IC.Method.USER_PW, status = IC.EXPIRED, sources = setOf("网页登录"), hasPw = true, at = now))
++                        S.addRec(context, IC.Rec("mail.163.com", "163 邮箱", "smoke.mines.test@163.com", IC.IdType.EMAIL, IC.Method.EMAIL_PW, status = IC.UNCHECKED, sources = setOf("邮箱"), at = now))
++                        S.sync(context, force = true)
++                        com.openminis.app.plus.ServiceIgnore.set("siliconflow", true)
++                        val app = context.applicationContext as? com.openminis.app.MinisApp
++                        val sids = runCatching { app!!.chatRepository.observeSessions().first().map { it.id } }.getOrDefault(emptyList())
++                        val tp = com.openminis.app.plus.TaskProgress.smoke(context, "seed", sids)
++                        val w1 = com.openminis.app.plus.WorkspaceStore.runTool(context, JSONObject().put("type", "cloud_browser").put("host", "https://browser.example.test/s/42")
++                            .put("name", "免费云浏览器").put("provider", "Example Cloud").put("account", "smoke@example.com").put("expires", "7天")
++                            .put("limits", "每天 2 小时 · 2 核 4 GB").put("cost", "免费").put("vault_ref", "cloudbrowser:smoke").put("source_url", "https://example.test").toString())
++                        JSONObject().put("tasks", JSONArray(tp).length()).put("sids", sids.size).put("ws", w1.output)
++                            .put("ignored", com.openminis.app.plus.ServiceIgnore.ignored("siliconflow"))
++                            .put("login", JSONArray(com.openminis.app.plus.Keychain.all(context).map { it.site + "|" + it.status.name })).toString()
++                    }
++                    "accounts" -> com.openminis.app.plus.AccountsTool.runTool(context, "smoke", JSONObject().put("tool_title", "账号").put("action", "list").toString()).output
++                    "login" -> kotlinx.coroutines.withTimeoutOrNull(120_000) { com.openminis.app.plus.AccountsTool.hiddenLogin(context, arg2.ifBlank { "github.com" }) }
++                        ?.let { JSONObject().put("ok", it.ok).put("line", it.line).put("needsUser", it.needsUser).toString() } ?: "timeout"
++                    "gw" -> {
++                        com.openminis.app.plus.PartnerGateway.ensure(context)
++                        val models = runCatching {
++                            val u = java.net.URL("http://127.0.0.1:${com.openminis.app.plus.PartnerGateway.PORT}/v1/models").openConnection() as java.net.HttpURLConnection
++                            u.connectTimeout = 3000; u.readTimeout = 8000; u.setRequestProperty("Authorization", "Bearer mines-local")
++                            u.responseCode.toString() + " " + (runCatching { u.inputStream.bufferedReader().readText() }.getOrDefault("")).take(600)
++                        }.getOrElse { "ERR " + it.javaClass.simpleName + " " + it.message }
++                        val rows = runCatching { com.openminis.app.plus.PartnerGateway.refreshStatus(context) }.getOrDefault(emptyList())
++                        JSONObject().put("models", models).put("added", com.openminis.app.plus.PartnerGateway.providerAdded(context))
++                            .put("rows", JSONArray(rows.map { it.name + "|" + it.st.name + "|" + it.reason })).toString()
++                    }
++                    "bailian" -> com.openminis.app.plus.RouteStatusCore.bailianBase(arg2, null, GroupPrefs.get("bailian_ws"))
++                    else -> "i395 seed | accounts | login <site> | gw | bailian <key>"
++                }
++            }
 +            // [Mines-38.9.1] 应用代理: 'agents' list (mine + enabled), 'agents clear', 'agents add <id>'
 +            "agents" -> {
 +                val A = com.openminis.app.plus.AppAgents; A.init(context)
@@ -8596,7 +8705,7 @@ index af13c1b..f5ccfd5 100644
              "partners" -> {
                  val l = Partners.refresh(context, rescanApps = true)
                  JSONArray(l.map { JSONObject().put("id", it.id).put("name", it.spec.name).put("state", it.state.name).put("model", it.model).put("via", it.via) }).toString()
-@@ -136,6 +195,13 @@ object GroupSelfTest {
+@@ -136,6 +243,13 @@ object GroupSelfTest {
                  GroupStore.add(gid, GroupMsg(GroupStore.newId(), parts.getOrElse(2) { "host" }, "成员A", "", parts.getOrElse(3) { "好的，结论：照这个办。" }))
                  "ok"
              }
@@ -8610,7 +8719,7 @@ index af13c1b..f5ccfd5 100644
              "kbrun" -> { val n = com.openminis.app.plus.ChatKnowledge.runNow(context); "organised=$n" }
              "kbstate" -> {
                  val l = com.openminis.app.plus.ChatKnowledge.load(context)
-@@ -238,6 +304,108 @@ object GroupSelfTest {
+@@ -238,6 +352,112 @@ object GroupSelfTest {
              "wallpaper" -> { com.openminis.app.plus.PlusPrefs.init(context)
                  if (parts.getOrElse(0) { "" } == "off") com.openminis.app.plus.PlusPrefs.update(context) { it.copy(wallpaper = "") }
                  com.openminis.app.plus.PlusPrefs.state.value.wallpaper.ifBlank { "none" } }
@@ -8682,9 +8791,13 @@ index af13c1b..f5ccfd5 100644
 +                            .put("skills", JSONArray(k?.items.orEmpty().take(5).map { it.slug + "@" + it.version })).toString()
 +                    }
 +                    "skill" -> {
-+                        val hit = runCatching { H.skills(context, q, null, 1).items.firstOrNull { it.slug == q } }.getOrNull()
++                        val all = runCatching { H.skills(context, q, null, 1).items.filter { it.slug == q } }.getOrDefault(emptyList())
++                        val hit = all.firstOrNull()
 +                        if (hit == null) "no hit" else JSONObject().put("result", runCatching { H.installSkill(context, hit) }.getOrElse { "error " + it.message })
-+                            .put("installed", H.installedSkill(context, q) ?: "").toString()
++                            .put("installed", H.installedSkill(context, q) ?: "")
++                            // [Mines-38.9.5 i] every same-slug row's state: exactly one MINE (the installed publisher), the rest OTHER
++                            .put("states", JSONArray(all.map { it.namespace + ":" + H.skillState(context, it).name }))
++                            .put("other", all.drop(1).firstOrNull()?.let { o -> runCatching { H.installSkill(context, o) }.getOrElse { "error " + it.message } } ?: "").toString()
 +                    }
 +                    "plugsrc" -> {
 +                        val hit = runCatching { H.plugins(context, q.substringAfter('/'), null, "stars", 1).items.firstOrNull { (it.owner + "/" + it.name).equals(q, true) } }.getOrNull()
@@ -12357,7 +12470,7 @@ index 0000000..48d6b1f
 +    return when { s < 60 -> "刚刚"; s < 3600 -> "${s / 60} 分钟前"; else -> "${s / 3600} 小时前" }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
-index 6a136a6..d9840b6 100644
+index 6a136a6..344c428 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
 @@ -1,7 +1,10 @@
@@ -12451,7 +12564,7 @@ index 6a136a6..d9840b6 100644
                  problems.take(3).forEachIndexed { i, id ->
                      val k = PlusVault.kind(id) ?: return@forEachIndexed
                      val base = PlusVault.kind(PlusVault.baseId(id)) ?: k
-@@ -336,23 +323,37 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+@@ -336,23 +323,38 @@ fun ConnectionsScreen(onBack: () -> Unit) {
                      val (fg, _) = toneColors(if (bad) Tone.DANGER else Tone.WARNING)
                      val canFix = bad && com.openminis.app.plus.KeyAgent.recipe(id)?.mode == com.openminis.app.plus.KeyAgent.Mode.WEBVIEW
                      val why = ps?.reason?.let { r -> com.openminis.app.plus.AccountLabel.showText(r) }?.takeIf { it.isNotBlank() } ?: if (bad) "连不上" else "要注意"
@@ -12474,6 +12587,7 @@ index 6a136a6..d9840b6 100644
 -                    if (i < minOf(problems.size, 3) - 1) WarmDivider()
 +                    // [Mines-38.9.3] the same row as every account (logo 40 / 12, title 16, reason 13, one pill, chevron)
 +                    AcctRow({ AcctKindLogo(base) }, base.name, why, if (bad) com.openminis.app.plus.SessionStatus.Pill.BAD else com.openminis.app.plus.SessionStatus.Pill.WARN,
++                        pillLabel = com.openminis.app.plus.SessionStatus.keyPillLabel(ps?.level?.name, ps?.reason),
 +                        subtitleColor = fg, chevron = if (canFix) Chevron.NONE else Chevron.RIGHT, onClick = { detailId = id },
 +                        description = "${base.name}：$why", subtitleLines = 3, extra = {
 +                            if (canFix) {
@@ -12506,7 +12620,7 @@ index 6a136a6..d9840b6 100644
                  }
              }
          }
-@@ -361,6 +362,8 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+@@ -361,6 +363,8 @@ fun ConnectionsScreen(onBack: () -> Unit) {
              // 「N 个账号 · 全部正常」, status dot, chevron), no identity until it is opened; account rows are one line
              // (short label · masked identity, ellipsis), 全部检测 + 添加账号 only inside the opened service.
              var open by remember { mutableStateOf(setOf<String>()) }
@@ -12515,7 +12629,7 @@ index 6a136a6..d9840b6 100644
              val revealUntil by com.openminis.app.plus.Privacy.until.collectAsState()
              var revealTick by remember { mutableStateOf(0) }
              LaunchedEffect(revealUntil) {
-@@ -387,8 +390,8 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+@@ -387,8 +391,8 @@ fun ConnectionsScreen(onBack: () -> Unit) {
                      val cat = connCategory(base)
                      if (i == 0 || connCategory(bases[i - 1]) != cat) {
                          if (i > 0) PlusDivider()
@@ -12526,7 +12640,7 @@ index 6a136a6..d9840b6 100644
                      }
                      val ids = PlusVault.accountsOf(base.id)
                      val def = PlusVault.defaultAccount(base.id)
-@@ -400,28 +403,30 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+@@ -400,28 +404,31 @@ fun ConnectionsScreen(onBack: () -> Unit) {
                          nChecking > 0 -> "检测中…"
                          bad > 0 -> "$bad 个异常"
                          warn > 0 -> "$warn 个要注意"
@@ -12568,7 +12682,8 @@ index 6a136a6..d9840b6 100644
 +                    }.getOrNull() }
 +                    AcctRow({ AcctKindLogo(base) }, base.name,
 +                        summary + (loginLine?.let { " · 有网站登录" } ?: ""),
-+                        pill, pillLabel = if (nChecking > 0) "检测中" else null,
++                        pill, pillLabel = if (nChecking > 0) "检测中" else if (bad > 0 && ids.all { id -> patrol[id]?.level != com.openminis.app.plus.AccountPatrol.Level.BAD ||
++                            com.openminis.app.plus.SessionStatus.keyRefused("BAD", patrol[id]?.reason) }) "key 无效" else null,   // [Mines-38.9.5 i]
 +                        subtitleColor = if (bad > 0) (if (mines().dark) MinesDesign.DangerDark else MinesDesign.Danger) else null,
 +                        chevron = if (isOpen) Chevron.DOWN else Chevron.RIGHT,
 +                        onClick = { open = if (isOpen) open - base.id else open + base.id },
@@ -12576,7 +12691,7 @@ index 6a136a6..d9840b6 100644
                      if (isOpen) {
                          // 全部检测: one small action for the whole service
                          if (ids.any { PlusVault.hasSecret(it) }) Row(Modifier.fillMaxWidth().padding(start = 58.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-@@ -445,7 +450,9 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+@@ -445,7 +452,9 @@ fun ConnectionsScreen(onBack: () -> Unit) {
                                  else -> Green
                              }
                              Row(
@@ -12587,7 +12702,7 @@ index 6a136a6..d9840b6 100644
                                  verticalAlignment = Alignment.CenterVertically,
                              ) {
                                  androidx.compose.material3.IconButton(onClick = { if (!isDef) PlusVault.setDefault(context, id) }, modifier = Modifier.size(44.dp)) {
-@@ -459,9 +466,9 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+@@ -459,9 +468,9 @@ fun ConnectionsScreen(onBack: () -> Unit) {
                                      fontSize = 15.sp, maxLines = 1, softWrap = false, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                                      color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
                                  Spacer(Modifier.width(6.dp))
@@ -12596,11 +12711,11 @@ index 6a136a6..d9840b6 100644
 -                                    .semantics { contentDescription = ps?.level?.label ?: "正常" })
 +                                @Suppress("UNUSED_VARIABLE") val unusedDot = dotColor
 +                                AcctPill(if (id in checking) com.openminis.app.plus.SessionStatus.Pill.UNCHECKED else com.openminis.app.plus.SessionStatus.keyPill(ps?.level?.name),
-+                                    if (id in checking) "检测中" else com.openminis.app.plus.SessionStatus.keyPill(ps?.level?.name).label)
++                                    if (id in checking) "检测中" else com.openminis.app.plus.SessionStatus.keyPillLabel(ps?.level?.name, ps?.reason))
                                  Spacer(Modifier.width(4.dp))
                                  MinesIcon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
                              }
-@@ -478,6 +485,10 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+@@ -478,6 +487,10 @@ fun ConnectionsScreen(onBack: () -> Unit) {
                                      modifier = Modifier.weight(1f))
                                  if (canFix) Button(onClick = { fixId = id }, modifier = Modifier.heightIn(min = 40.dp),
                                      contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp)) { Text("一键修复", fontSize = 14.sp, maxLines = 1) }
@@ -12611,7 +12726,7 @@ index 6a136a6..d9840b6 100644
                                  if (lowCredit) OutlinedButton(onClick = {
                                      val k = PlusVault.kind(id); val u = k?.panelUrl ?: k?.keyUrl ?: com.openminis.app.plus.KeyAgent.recipe(id)?.url
                                      if (u != null) com.openminis.app.browser.GoogleAuthRouter.openInCustomTab(context, u)
-@@ -495,8 +506,39 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+@@ -495,8 +508,39 @@ fun ConnectionsScreen(onBack: () -> Unit) {
                              Text("添加账号", fontSize = 15.sp, maxLines = 1, color = MaterialTheme.colorScheme.primary)
                          }
                      }
@@ -12652,7 +12767,7 @@ index 6a136a6..d9840b6 100644
              }
          }
          PlusVault.groups.forEach { g ->
-@@ -589,22 +631,23 @@ fun BrandIcon(kind: ConnectionKind, size: Dp = 40.dp) {
+@@ -589,22 +633,23 @@ fun BrandIcon(kind: ConnectionKind, size: Dp = 40.dp) {
  /** [Mines-apps-32] catalog row: logo tile, bold name (+Beta), one gray line, round 「+」 on the right. */
  @Composable
  private fun ConnectionRow(k: ConnectionKind, sub: String, connected: Boolean, onConnect: () -> Unit, onClick: () -> Unit) {
@@ -12681,7 +12796,7 @@ index 6a136a6..d9840b6 100644
                  overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
          }
          Spacer(Modifier.width(8.dp))
-@@ -671,17 +714,13 @@ private fun ConnectionDetailScreen(
+@@ -671,17 +716,13 @@ private fun ConnectionDetailScreen(
              )
              Spacer(Modifier.height(14.dp))
              if (entry != null) {
@@ -12703,7 +12818,7 @@ index 6a136a6..d9840b6 100644
              } else if (isMcpOnly || kind.method in setOf(ConnMethod.WEB, ConnMethod.KEY, ConnMethod.GOOGLE)) {
                  Button(
                      onClick = {
-@@ -709,6 +748,32 @@ private fun ConnectionDetailScreen(
+@@ -709,6 +750,32 @@ private fun ConnectionDetailScreen(
          }
          if (agentOpen) KeyAgentDialog(kind) { saved -> agentOpen = false; if (saved) Toast.makeText(context, "已连接 ${kind.name}", Toast.LENGTH_SHORT).show() }
  
@@ -12720,7 +12835,7 @@ index 6a136a6..d9840b6 100644
 +                    val ps = patrolNow[kind.id]
 +                    AcctRow({ AcctKindLogo(kind) }, kind.keyLabel.ifBlank { "密钥" },
 +                        ps?.reason?.let { com.openminis.app.plus.AccountLabel.showText(it) }?.ifBlank { null } ?: "还没检测，点一下检测",
-+                        com.openminis.app.plus.SessionStatus.keyPill(ps?.level?.name), chevron = Chevron.NONE,
++                        com.openminis.app.plus.SessionStatus.keyPill(ps?.level?.name), pillLabel = com.openminis.app.plus.SessionStatus.keyPillLabel(ps?.level?.name, ps?.reason), chevron = Chevron.NONE,
 +                        onClick = { com.openminis.app.plus.AccountPatrol.recheck(context, kind.id) })
 +                }
 +                if (loginRec != null) {
@@ -12736,7 +12851,7 @@ index 6a136a6..d9840b6 100644
          // [Mines-offers-32] a free offer for this service
          com.openminis.app.plus.FreeOffers.forKind(context, kind.id)?.takeIf { entry == null }?.let { o ->
              PlusSection("免费额度", footer = (com.openminis.app.plus.FreeOffers.needsText(o).ifBlank { "Mines 不会付钱，也不会选付费套餐。" })) {
-@@ -1037,7 +1102,8 @@ private fun KeyBlock(kind: ConnectionKind, resumes: Int, autoStart: Boolean) {
+@@ -1037,7 +1104,8 @@ private fun KeyBlock(kind: ConnectionKind, resumes: Int, autoStart: Boolean) {
  @Composable
  private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean) {
      val context = LocalContext.current
@@ -12746,7 +12861,7 @@ index 6a136a6..d9840b6 100644
      var found by remember { mutableStateOf<String?>(null) }
      var manual by remember { mutableStateOf("") }
      var account by remember { mutableStateOf(existing?.account ?: "") }
-@@ -1045,7 +1111,21 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
+@@ -1045,7 +1113,21 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
      var voice by remember { mutableStateOf(PlusVault.extra(kind.id, "voice") ?: com.openminis.app.plus.GeminiLive.DEFAULT_VOICE) }
      val needsAccount = kind.id in setOf("gmail", "mail163", "qqmail")
  
@@ -12768,7 +12883,7 @@ index 6a136a6..d9840b6 100644
          if (kind.id == "gemini") { PlusVault.setExtra(kind.id, "model", model); PlusVault.setExtra(kind.id, "voice", voice) }
          PlusVault.save(context, kind, account.ifBlank { existing?.account ?: "" }, secret,
              share = existing?.shareWithAi ?: (kind.envKey != null), via = "key")
-@@ -1062,6 +1142,7 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
+@@ -1062,6 +1144,7 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
      fun autoSave(k: String, from: String) {
          if (autoBusy) return
          if (needsAccount && account.isBlank()) { manual = k; manualOpen = true; autoStatus = "先填上你的邮箱地址，再点「保存并连接」"; return }
@@ -12776,7 +12891,7 @@ index 6a136a6..d9840b6 100644
          autoBusy = true; autoStatus = "$from 里有 ${kind.name} 的${kind.keyLabel}，正在测试…"
          kscope.launch {
              val r = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.KeyTester.test(PlusVault.baseId(kind.id), k) }
-@@ -1096,11 +1177,53 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
+@@ -1096,11 +1179,53 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
              if (k != null && k != PlusVault.secret(kind.id)) { manual = k; autoSave(k, "页面") }
              else if (autoStatus == null) autoStatus = "没能自动拿到${kind.keyLabel}。在官网复制它，回到这里会自动填入；也可以粘贴到下面"
          }
@@ -12831,7 +12946,7 @@ index 6a136a6..d9840b6 100644
          if (needsAccount) OutlinedTextField(account, { account = it }, label = { Text(if (kind.id == "gmail") "Gmail 地址" else "邮箱地址") }, singleLine = true,
              textStyle = MaterialTheme.typography.bodyMedium,
              modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp))
-@@ -1232,3 +1355,68 @@ fun SecureWindow() {
+@@ -1232,3 +1357,68 @@ fun SecureWindow() {
          onDispose { }
      }
  }
@@ -13541,10 +13656,10 @@ index 0000000..8ac6e59
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassAutoUi.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassAutoUi.kt
 new file mode 100644
-index 0000000..8a7c755
+index 0000000..c95fb58
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassAutoUi.kt
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,88 @@
 +package com.openminis.app.ui.plus
 +
 +import android.graphics.Bitmap
@@ -13572,26 +13687,40 @@ index 0000000..8a7c755
 +    /** photo stats by "<mtime>:<alpha>:<dark>" (state map: cards recompose when a photo has been measured) */
 +    val photo = mutableStateMapOf<String, GlassAuto.Stats>()
 +    private val loading = ConcurrentHashMap.newKeySet<String>()
++    // [Mines-38.9.5 i] 外观调节 over a photo: every glass card re-ran the solver (6 bands × ~80 pow() steps), a disk stat and
++    // string formatting on EVERY recomposition, and each slider step re-decoded the photo. Now: thumbnail decoded once per
++    // file version, stats per (version, alpha in 0.05 steps), solver results memoised per (mode, tint, ink, stats).
++    private val thumbs = ConcurrentHashMap<Long, IntArray>()
++    private data class SolveKey(val dark: Boolean, val tint: Int, val ink: Int, val stats: Int)
++    private val solved = ConcurrentHashMap<SolveKey, Pair<List<Float>, Float>>()
++    fun solveCached(dark: Boolean, tint: Int, ink: Int, s: GlassAuto.Stats): Pair<List<Float>, Float> {
++        if (solved.size > 64) solved.clear()
++        return solved.getOrPut(SolveKey(dark, tint, ink, System.identityHashCode(s))) { GlassAuto.solve(dark, GlassAuto.lum(tint), GlassAuto.lum(ink), s) }
++    }
++    fun q(v: Float): Float = (Math.round(v * 20f) / 20f)
 +    /** last screen-wide auto alpha per mode (feeds [MinesLook.glassScale] for the palette glass tokens) */
 +    @Volatile var lastLight = MinesLook.NOMINAL_LIGHT
 +    @Volatile var lastDark = MinesLook.NOMINAL_DARK
 +
 +    fun fog(dark: Boolean, fogK: Float, dens: Float): GlassAuto.Stats {
-+        val k = "$dark:${"%.2f".format(fogK)}:${"%.2f".format(dens)}"
-+        return fogCache.getOrPut(k) { GlassAuto.fogStats(dark, fogK, dens) }
++        val fk = q(fogK); val dk = q(dens)
++        val k = "$dark:$fk:$dk"
++        return fogCache.getOrPut(k) { GlassAuto.fogStats(dark, fk, dk) }
 +    }
 +
-+    suspend fun loadPhoto(c: android.content.Context, key: String, alpha: Float, page: Int) {
++    suspend fun loadPhoto(c: android.content.Context, key: String, mtime: Long, alpha: Float, page: Int) {
 +        if (photo.containsKey(key) || !loading.add(key)) return
 +        try {
 +            val st = withContext(Dispatchers.IO) {
 +                runCatching {
-+                    val f = wallpaperFile(c)
-+                    if (!f.exists()) return@runCatching null
-+                    val o = BitmapFactory.Options().apply { inSampleSize = 16 }
-+                    val b = BitmapFactory.decodeFile(f.absolutePath, o) ?: return@runCatching null
-+                    val s = Bitmap.createScaledBitmap(b, 12, 24, true)   // heavy averaging = the blur under the glass
-+                    val px = IntArray(12 * 24); s.getPixels(px, 0, 12, 0, 0, 12, 24)
++                    val px = thumbs[mtime] ?: run {
++                        val f = wallpaperFile(c)
++                        if (!f.exists()) return@runCatching null
++                        val o = BitmapFactory.Options().apply { inSampleSize = 16 }
++                        val b = BitmapFactory.decodeFile(f.absolutePath, o) ?: return@runCatching null
++                        val s = Bitmap.createScaledBitmap(b, 12, 24, true)   // heavy averaging = the blur under the glass
++                        IntArray(12 * 24).also { s.getPixels(it, 0, 12, 0, 0, 12, 24); thumbs.clear(); thumbs[mtime] = it }
++                    }
 +                    GlassAuto.photoStats(px, 12, 24, alpha, page)
 +                }.getOrNull()
 +            }
@@ -13608,13 +13737,14 @@ index 0000000..8a7c755
 +    val st by PlusPrefs.state.collectAsState()
 +    val photoOn = st.wallpaper.isNotEmpty() && st.wallpaperOnHome && st.wallpaper.startsWith("file:")
 +    val stats: GlassAuto.Stats = if (photoOn) {
-+        val f = wallpaperFile(ctx)
++        val mtime = androidx.compose.runtime.remember(st.wallpaper) { wallpaperFile(ctx).lastModified() }   // no disk stat per frame
 +        val page = (if (dark) Color(0xFF161114) else Color(0xFFF4EAE4)).toArgb()
-+        val key = "${f.lastModified()}:${"%.2f".format(st.wallpaperAlpha)}:$dark"
-+        LaunchedEffect(key) { GlassAutoState.loadPhoto(ctx, key, st.wallpaperAlpha, page) }
++        val qa = GlassAutoState.q(st.wallpaperAlpha)
++        val key = "$mtime:$qa:$dark"
++        LaunchedEffect(key) { GlassAutoState.loadPhoto(ctx, key, mtime, qa, page) }
 +        GlassAutoState.photo[key] ?: GlassAutoState.fog(dark, MinesLook.fog(dark), FogWind.density(FogWind.sample.code))
 +    } else GlassAutoState.fog(dark, MinesLook.fog(dark), FogWind.density(FogWind.sample.code))
-+    val r = GlassAuto.solve(dark, GlassAuto.lum(tint.toArgb()), GlassAuto.lum(ink.toArgb()), stats)
++    val r = GlassAutoState.solveCached(dark, tint.toArgb(), ink.toArgb(), stats)
 +    if (dark) GlassAutoState.lastDark = r.second else GlassAutoState.lastLight = r.second
 +    return r
 +}
@@ -15099,7 +15229,7 @@ index 310d404..d4a132a 100644
              busy -> "正在整理…"
              note.isNotBlank() -> note + " · 共 ${entries.size} 段"
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/LinkAll.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/LinkAll.kt
-index f69ee42..44c3194 100644
+index f69ee42..7bd0c94 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/LinkAll.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/LinkAll.kt
 @@ -2,16 +2,20 @@ package com.openminis.app.ui.plus
@@ -15170,7 +15300,7 @@ index f69ee42..44c3194 100644
  
      /** [Mines-38.7] 「忽略」: a platform that cannot be fixed is no longer offered / counted (restore in 关联结果) */
      fun ignored(id: String) = GroupPrefs.get("linkignore_$id") == "1"
-@@ -164,15 +185,40 @@ object LinkAll {
+@@ -164,16 +185,44 @@ object LinkAll {
          return St.NONE
      }
  
@@ -15213,9 +15343,13 @@ index f69ee42..44c3194 100644
 +            }
 +            if (!bad) return St.LINKED
              if (ignored(id)) return St.IGNORED
++            // [Mines-38.9.5 i] an API-key / token service whose key was refused (OpenRouter 401) is NOT a sign-in that expired:
++            // it stays out of 登录 › 过期了; the 服务 row says 「key 无效」 and offers 一键接入 / delete there.
++            if (first?.via in setOf("key", "token", "model") || k.method == com.openminis.app.plus.ConnMethod.KEY) return St.LINKED
              return St.EXPIRED
          }
-@@ -224,6 +270,8 @@ object LinkAll {
+         if (ignored(id)) return St.IGNORED
+@@ -224,6 +273,8 @@ object LinkAll {
                  WebChat.markSignedIn(id, true); setNote(id, null)
                  com.openminis.app.plus.LoginWeb.flush()
                  AiCatalog.spec(id)?.let { com.openminis.app.plus.AccountJar.rememberNow(id, WebChat.urls(it, id)) }
@@ -15224,7 +15358,7 @@ index f69ee42..44c3194 100644
                  done(); return
              }
          }
-@@ -231,10 +279,11 @@ object LinkAll {
+@@ -231,10 +282,11 @@ object LinkAll {
  }
  
  @Composable
@@ -15239,7 +15373,7 @@ index f69ee42..44c3194 100644
  }
  
  /** 一键关联: one step at a time, big type. */
-@@ -242,6 +291,8 @@ private fun BigText(t: String, size: Int = 20, weight: FontWeight = FontWeight.S
+@@ -242,6 +294,8 @@ private fun BigText(t: String, size: Int = 20, weight: FontWeight = FontWeight.S
  fun LinkAllScreen(onBack: () -> Unit, go: (String) -> Unit) {
      val ctx = androidx.compose.ui.platform.LocalContext.current
      remember { GroupPrefs.init(ctx); 0 }
@@ -15248,7 +15382,7 @@ index f69ee42..44c3194 100644
      var tick by remember { mutableIntStateOf(0) }
      var paused by remember { mutableStateOf(false) }
      var last by remember { mutableStateOf<String?>(null) }
-@@ -261,7 +312,7 @@ fun LinkAllScreen(onBack: () -> Unit, go: (String) -> Unit) {
+@@ -261,7 +315,7 @@ fun LinkAllScreen(onBack: () -> Unit, go: (String) -> Unit) {
      val cur = q.getOrNull(LinkAll.index)
      LaunchedEffect(tick, LinkAll.running, paused, cur) {
          if (!LinkAll.running) return@LaunchedEffect
@@ -15257,7 +15391,7 @@ index f69ee42..44c3194 100644
          if (paused) return@LaunchedEffect
          // [Mines-38.7] a platform Mines cannot link by itself (Chrome-only Google, 日历权限, 无障碍, pasted key) is not
          // opened mid-run: it goes to 「需要你操作」 with its one step, and the run moves on
-@@ -284,23 +335,29 @@ fun LinkAllScreen(onBack: () -> Unit, go: (String) -> Unit) {
+@@ -284,23 +338,29 @@ fun LinkAllScreen(onBack: () -> Unit, go: (String) -> Unit) {
              val all = remember(tick) { LinkAll.platforms() }
              val linked = all.count { LinkAll.state(it) == LinkAll.St.LINKED }
              val ign = all.count { LinkAll.state(it) == LinkAll.St.IGNORED }
@@ -15296,7 +15430,7 @@ index f69ee42..44c3194 100644
              }
              Spacer(Modifier.height(16.dp))
              Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-@@ -309,7 +366,7 @@ fun LinkAllScreen(onBack: () -> Unit, go: (String) -> Unit) {
+@@ -309,7 +369,7 @@ fun LinkAllScreen(onBack: () -> Unit, go: (String) -> Unit) {
                      cur?.let { LinkAll.setNote(it, "跳过") }; LinkAll.index++; tick++
                  }
                  PillButton(if (paused) "结束，看结果" else "停一下", Modifier.fillMaxWidth(), primary = false) {
@@ -15305,7 +15439,7 @@ index f69ee42..44c3194 100644
                  }
              }
          }
-@@ -329,30 +386,43 @@ fun LinkSummaryScreen(onBack: () -> Unit, go: (String) -> Unit) {
+@@ -329,30 +389,43 @@ fun LinkSummaryScreen(onBack: () -> Unit, go: (String) -> Unit) {
          val ign = groups[LinkAll.St.IGNORED].orEmpty().size
          Spacer(Modifier.height(8.dp))
          BigText("已关联 $linked 个，共 ${all.size - ign} 个", 18)
@@ -15353,7 +15487,7 @@ index f69ee42..44c3194 100644
          Spacer(Modifier.height(16.dp))
          if (linked + ign < all.size) Row(Modifier.fillMaxWidth().padding(horizontal = 24.dp), verticalAlignment = Alignment.CenterVertically) {
              PillButton("再关联一遍没好的", Modifier.fillMaxWidth()) { LinkAll.start(); go(LinkAll.ROUTE) }
-@@ -380,9 +450,9 @@ fun LinkAllHelpers() {
+@@ -380,9 +453,9 @@ fun LinkAllHelpers() {
          lastUri = if (k > 0) uri else null
          msg = if (k > 0) "已导入 $k 个账号密码，加密存在这台手机里。原文件里是明文密码，最好删掉它。" else "没读到密码。请选 Edge / Chrome 导出的「密码 CSV」文件"
      }
@@ -15366,7 +15500,7 @@ index f69ee42..44c3194 100644
          val u = lastUri
          if (u != null) PillButton("删掉原文件", Modifier.fillMaxWidth()) {
              val ok = runCatching { android.provider.DocumentsContract.deleteDocument(ctx.contentResolver, u) }.getOrDefault(false)
-@@ -391,7 +461,7 @@ fun LinkAllHelpers() {
+@@ -391,7 +464,7 @@ fun LinkAllHelpers() {
          else PillButton(if (n > 0) "再导入一次密码文件" else "导入 Edge 密码文件", Modifier.fillMaxWidth(), primary = false) {
              pick.launch(arrayOf("text/csv", "text/comma-separated-values", "text/plain", "application/vnd.ms-excel", "*/*"))
          }
@@ -15375,7 +15509,7 @@ index f69ee42..44c3194 100644
          PillButton("设置自动填充", Modifier.fillMaxWidth(), primary = false) {
              // Microsoft Authenticator installed → Android asks right away to make it the autofill service
              val ms = "com.azure.authenticator"
-@@ -413,9 +483,9 @@ fun LinkIgnoredScreen(onBack: () -> Unit) {
+@@ -413,9 +486,9 @@ fun LinkIgnoredScreen(onBack: () -> Unit) {
      val list = remember(rev) { LinkAll.ignoredList() }
      PlusPage("已忽略的平台", onBack) {
          Spacer(Modifier.height(8.dp))
@@ -15387,7 +15521,7 @@ index f69ee42..44c3194 100644
              PlusSection("已忽略（${list.size}）") {
                  MinesCard(Modifier.fillMaxWidth().padding(horizontal = MS.PageH)) {
                      list.forEach { id ->
-@@ -433,3 +503,58 @@ fun LinkIgnoredScreen(onBack: () -> Unit) {
+@@ -433,3 +506,58 @@ fun LinkIgnoredScreen(onBack: () -> Unit) {
          Spacer(Modifier.height(24.dp))
      }
  }
@@ -16046,7 +16180,7 @@ index 0000000..4c20132
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/MarketScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/MarketScreen.kt
-index 849e3da..71def22 100644
+index 849e3da..c9fee75 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/MarketScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/MarketScreen.kt
 @@ -2,6 +2,9 @@ package com.openminis.app.ui.plus
@@ -16117,7 +16251,7 @@ index 849e3da..71def22 100644
          if (msg.isNotBlank()) Text(msg, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(16.dp))
          results.forEachIndexed { i, p ->
              val inst = installed[p.name]
-@@ -477,3 +488,330 @@ private fun SkillMarket() {
+@@ -477,3 +488,334 @@ private fun SkillMarket() {
          }
      }
  }
@@ -16415,33 +16549,37 @@ index 849e3da..71def22 100644
 +    AcctHeader(if (loading && items.isEmpty()) "SkillHub 技能 · 正在加载…" else "SkillHub 技能 · 共 $total 个", trailing = "skillhub.cn")
 +    MinesCard(Modifier.fillMaxWidth().padding(horizontal = MS.PageH)) {
 +        items.forEachIndexed { i, s ->
-+            val inst = remember(tick, s.slug) { H.installedSkill(ctx, s.slug) }
-+            val open = expanded == s.slug
++            // [Mines-38.9.5 i] state per publisher + slug: another publisher's same-name skill is 「同名已装」, not 已安装
++            val rk = com.openminis.app.plus.SkillInstallKey.rowKey(s.namespace, s.slug)
++            val st = remember(tick, rk) { H.skillState(ctx, s) }
++            val inst: String? = when (st) { com.openminis.app.plus.SkillInstallKey.State.NONE -> null; com.openminis.app.plus.SkillInstallKey.State.LOCAL -> "local"
++                com.openminis.app.plus.SkillInstallKey.State.OTHER -> "other"; else -> "mine" }
++            val open = expanded == rk
 +            AcctRow({ HubLogo(s.icon, s.name) }, s.name,
 +                s.description.ifBlank { "（没有简介）" } + "\n" + listOfNotNull(s.categoryLabel.takeIf { it.isNotBlank() }, "下载 ${starsText(s.downloads.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())}",
 +                    s.publisher.takeIf { it.isNotBlank() }?.let { if (s.publisherVerified) "$it ✓" else it }, s.version.takeIf { it.isNotBlank() }?.let { "v$it" }).joinToString(" · "),
-+                when (inst) { null -> null; "local" -> com.openminis.app.plus.SessionStatus.Pill.WARN; else -> com.openminis.app.plus.SessionStatus.Pill.OK },
-+                pillLabel = when (inst) { null -> null; "local" -> "同名本地"; else -> "已安装" },
-+                chevron = Chevron.NONE, subtitleLines = if (open) 12 else 3, onClick = { expanded = if (open) null else s.slug },
-+                onLongClick = if (inst != null && inst != "local") ({ scope.launch { status = withContext(Dispatchers.IO) { H.uninstallSkill(ctx, s.slug) }; tick++ } }) else null,
-+                description = "${s.name}，${s.description.take(60)}，" + (if (inst != null) "已安装，长按卸载" else "可安装"),
++                when (inst) { null -> null; "local", "other" -> com.openminis.app.plus.SessionStatus.Pill.WARN; else -> com.openminis.app.plus.SessionStatus.Pill.OK },
++                pillLabel = when (inst) { null -> null; "local" -> "同名本地"; "other" -> "同名已装"; else -> "已安装" },
++                chevron = Chevron.NONE, subtitleLines = if (open) 12 else 3, onClick = { expanded = if (open) null else rk },
++                onLongClick = if (inst == "mine") ({ scope.launch { status = withContext(Dispatchers.IO) { H.uninstallSkill(ctx, s.slug) }; tick++ } }) else null,
++                description = "${s.name}，${s.description.take(60)}，" + (when (inst) { "mine" -> "已安装，长按卸载"; "other" -> "已装了另一位作者的同名技能"; "local" -> "有同名本地技能"; else -> "可安装" }),
 +                extra = {
-+                    if (inst != "local") HubAction(if (busy == s.slug) "…" else if (inst == null) "安装" else "更新", enabled = busy == null) {
-+                        busy = s.slug
++                    if (inst != "local") HubAction(if (busy == rk) "…" else when (inst) { null -> "安装"; "other" -> "替换"; else -> "更新" }, enabled = busy == null) {
++                        busy = rk
 +                        scope.launch {
-+                            status = withContext(Dispatchers.IO) { runCatching { H.installSkill(ctx, s) }.getOrElse { "安装失败：${it.message}" } }
++                            status = withContext(Dispatchers.IO) { runCatching { H.installSkill(ctx, s, replace = inst == "other") }.getOrElse { "安装失败：${it.message}" } }
 +                            busy = null; tick++
 +                        }
 +                    }
 +                })
-+            if (open && inst != null && inst != "local") TextButton(onClick = { scope.launch { status = withContext(Dispatchers.IO) { H.uninstallSkill(ctx, s.slug) }; tick++ } },
++            if (open && inst == "mine") TextButton(onClick = { scope.launch { status = withContext(Dispatchers.IO) { H.uninstallSkill(ctx, s.slug) }; tick++ } },
 +                modifier = Modifier.padding(start = 60.dp)) { Text("卸载", color = Color(0xFFB3261E), fontSize = MT.Button) }
 +            if (i < items.lastIndex) AcctDivider()
 +        }
 +        if (items.size < total && items.isNotEmpty()) TextButton(onClick = {
 +            scope.launch {
 +                withContext(Dispatchers.IO) { runCatching { H.skills(ctx, query, cat, page + 1) } }
-+                    .onSuccess { page++; items = (items + it.items).distinctBy { x -> x.slug } }.onFailure { status = "下一页没读到：${it.message}" }
++                    .onSuccess { page++; items = (items + it.items).distinctBy { x -> com.openminis.app.plus.SkillInstallKey.rowKey(x.namespace, x.slug) } }.onFailure { status = "下一页没读到：${it.message}" }
 +            }
 +        }, modifier = Modifier.fillMaxWidth().padding(8.dp)) { Text("再显示 ${H.PAGE} 个", fontSize = MT.Button) }
 +    }
@@ -16715,7 +16853,7 @@ index 92e996b..216510e 100644
      val Button = 15.sp         // all buttons
      val BodyLH = 22.sp; val SubLH = 18.sp; val CaptionLH = 18.sp
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
-index afd2104..6f099de 100644
+index afd2104..d2fee5e 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
 @@ -1,5 +1,9 @@
@@ -16767,7 +16905,19 @@ index afd2104..6f099de 100644
      fun server(id: String) = "plus_server/$id"
  }
  
-@@ -183,8 +202,9 @@ fun ChatWallpaperLayer(modifier: Modifier = Modifier, home: Boolean = false) {
+@@ -177,14 +196,18 @@ fun ChatWallpaperLayer(modifier: Modifier = Modifier, home: Boolean = false) {
+             // [Mines-38.6] smooth frost: a 48 dp RenderEffect over the full-size photo showed a fine grid / dither on the
+             // emulator (GPU blur of a high-frequency picture). The photo is first shrunk to ~1/16 with filtering (a cheap
+             // pre-blur), drawn back up with high-quality filtering and then only lightly blurred.
+-            val soft = rememberSoftBitmap(bmp)
+-            if (soft != null) Image(soft, null, Modifier.fillMaxSize().then(if (canBlur) Modifier.blur(16.dp) else Modifier),
+-                contentScale = ContentScale.Crop, alpha = st.wallpaperAlpha.coerceIn(0f, 1f), filterQuality = androidx.compose.ui.graphics.FilterQuality.High)
++            // [Mines-38.9.5 i] 38.9.4 smoke: 外观调节 over a photo ran ~200 ms / frame on the emulator (and it died there twice) —
++            // a full-screen RenderEffect blur re-ran on every frame of the animated page. The frost is now baked ONCE off the
++            // main thread into a small smooth bitmap (shrink + 3-pass box blur) and drawn as a plain image: no per-frame blur.
++            val frost = rememberFrostedBitmap(bmp)
++            if (frost != null) Image(frost, null, Modifier.fillMaxSize(),
++                contentScale = ContentScale.Crop, alpha = st.wallpaperAlpha.coerceIn(0f, 1f), filterQuality = androidx.compose.ui.graphics.FilterQuality.Low)
          }
          val veil = if (dark) Color(0xFF14110F) else Color(0xFFF6F2EC)
          val userDim = st.wallpaperDim.coerceIn(0f, 0.95f)
@@ -16779,7 +16929,7 @@ index afd2104..6f099de 100644
          Box(Modifier.fillMaxSize().background(Brush.verticalGradient(
              0f to veil.copy(alpha = top), 0.16f to veil.copy(alpha = top), 0.30f to veil.copy(alpha = body), 1f to veil.copy(alpha = body))))
      }
-@@ -196,8 +216,7 @@ fun ChatWallpaperLayer(modifier: Modifier = Modifier, home: Boolean = false) {
+@@ -196,8 +219,7 @@ fun ChatWallpaperLayer(modifier: Modifier = Modifier, home: Boolean = false) {
   * unchanged otherwise.
   */
  @Composable
@@ -16789,7 +16939,7 @@ index afd2104..6f099de 100644
  
  /** True when a wallpaper is drawn on this screen (bars then go translucent). */
  @Composable
-@@ -266,6 +285,8 @@ fun MinesBackdrop(modifier: Modifier = Modifier) {
+@@ -266,6 +288,8 @@ fun MinesBackdrop(modifier: Modifier = Modifier) {
          Box(modifier) {
              PorcelainBackdrop(Modifier.fillMaxSize())
              ChatWallpaperLayer(Modifier.fillMaxSize(), home = true)
@@ -16798,7 +16948,7 @@ index afd2104..6f099de 100644
          }
      } else PorcelainBackdrop(modifier)
  }
-@@ -273,11 +294,13 @@ fun MinesBackdrop(modifier: Modifier = Modifier) {
+@@ -273,11 +297,13 @@ fun MinesBackdrop(modifier: Modifier = Modifier) {
  @OptIn(ExperimentalMaterial3Api::class)
  @Composable
  fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, actions: (@Composable () -> Unit)? = null,
@@ -16813,7 +16963,7 @@ index afd2104..6f099de 100644
          Scaffold(
              containerColor = Color.Transparent,
              topBar = {
-@@ -293,40 +316,66 @@ fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, action
+@@ -293,40 +319,66 @@ fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, action
                      colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent, scrolledContainerColor = Color.Transparent),
                  )
              },
@@ -16889,7 +17039,7 @@ index afd2104..6f099de 100644
  }
  
  /** A frosted 22 dp card (no blur pass: translucent fill + 1 dp highlight + soft warm shadow). */
-@@ -334,9 +383,16 @@ fun minesGlassFill(strong: Boolean = false): Color {
+@@ -334,9 +386,16 @@ fun minesGlassFill(strong: Boolean = false): Color {
  fun MinesCard(modifier: Modifier = Modifier, strong: Boolean = false, onClick: (() -> Unit)? = null, content: @Composable ColumnScope.() -> Unit) {
      val m = mines()
      val shape = RoundedCornerShape(MS.CardRadius)
@@ -16908,7 +17058,7 @@ index afd2104..6f099de 100644
              .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier),
          content = content,
      )
-@@ -344,10 +400,13 @@ fun MinesCard(modifier: Modifier = Modifier, strong: Boolean = false, onClick: (
+@@ -344,10 +403,13 @@ fun MinesCard(modifier: Modifier = Modifier, strong: Boolean = false, onClick: (
  
  @Composable
  fun PlusSection(title: String?, footer: String? = null, action: String? = null, onAction: (() -> Unit)? = null,
@@ -16923,7 +17073,7 @@ index afd2104..6f099de 100644
              Text(title, fontSize = MT.Section, color = m.ink2, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f), maxLines = 1,
                  overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
              if (action != null && onAction != null) Text(action, fontSize = MT.Sub, color = m.primaryText, fontWeight = FontWeight.Medium,
-@@ -358,9 +417,10 @@ fun PlusSection(title: String?, footer: String? = null, action: String? = null,
+@@ -358,9 +420,10 @@ fun PlusSection(title: String?, footer: String? = null, action: String? = null,
          }
          if (footer != null) Text(
              footer,
@@ -16937,7 +17087,7 @@ index afd2104..6f099de 100644
              lineHeight = MT.CaptionLH,
          )
      }
-@@ -448,6 +508,36 @@ fun PillButton(text: String, modifier: Modifier = Modifier, primary: Boolean = t
+@@ -448,6 +511,36 @@ fun PillButton(text: String, modifier: Modifier = Modifier, primary: Boolean = t
      ) { Text(text, fontSize = MT.Button, fontWeight = FontWeight.SemiBold, color = fg, maxLines = 1, softWrap = false) }
  }
  
@@ -16974,6 +17124,51 @@ index afd2104..6f099de 100644
  private fun Modifier.graphicsLayerAlpha(a: Float): Modifier = if (a >= 1f) this else this.then(Modifier.graphicsLayer { alpha = a })
  
  /** Short hint line with an ⓘ, instead of long paragraphs. */
+@@ -547,3 +640,44 @@ fun rememberSoftBitmap(bmp: androidx.compose.ui.graphics.ImageBitmap?): androidx
+         b.asImageBitmap()
+     }.getOrNull() ?: bmp
+ }
++
++
++/** [Mines-38.9.5 i] the photo frost baked once (Dispatchers.Default): ~1/16 shrink, then 3 box-blur passes at ~160 px wide. */
++@Composable
++fun rememberFrostedBitmap(bmp: androidx.compose.ui.graphics.ImageBitmap?): androidx.compose.ui.graphics.ImageBitmap? {
++    val out by androidx.compose.runtime.produceState<androidx.compose.ui.graphics.ImageBitmap?>(null, bmp) {
++        value = if (bmp == null) null else withContext(Dispatchers.Default) { runCatching { frostBitmap(bmp.asAndroidBitmap()).asImageBitmap() }.getOrNull() }
++    }
++    return out
++}
++
++internal fun frostBitmap(src: android.graphics.Bitmap): android.graphics.Bitmap {
++    var b = src
++    while (maxOf(b.width, b.height) / 2 >= 96) b = android.graphics.Bitmap.createScaledBitmap(b, maxOf(1, b.width / 2), maxOf(1, b.height / 2), true)
++    val w = 160; val h = maxOf(1, (160f * b.height / maxOf(1, b.width)).toInt())
++    val s = android.graphics.Bitmap.createScaledBitmap(b, w, h, true).copy(android.graphics.Bitmap.Config.ARGB_8888, true)
++    val px = IntArray(w * h); s.getPixels(px, 0, w, 0, 0, w, h)
++    repeat(3) { boxBlur(px, w, h, 6) }
++    s.setPixels(px, 0, w, 0, 0, w, h)
++    return s
++}
++
++/** One horizontal + one vertical box pass of [r] px, in place (clamped edges). */
++internal fun boxBlur(px: IntArray, w: Int, h: Int, r: Int) {
++    val tmp = IntArray(px.size); val n = 2 * r + 1
++    fun pass(src: IntArray, dst: IntArray, len: Int, lines: Int, step: Int, lineStep: Int) {
++        for (l in 0 until lines) {
++            var a = 0; var rr = 0; var g = 0; var bb = 0
++            val base = l * lineStep
++            for (k in -r..r) { val c = src[base + k.coerceIn(0, len - 1) * step]; a += c ushr 24; rr += (c shr 16) and 0xFF; g += (c shr 8) and 0xFF; bb += c and 0xFF }
++            for (i in 0 until len) {
++                dst[base + i * step] = ((a / n) shl 24) or ((rr / n) shl 16) or ((g / n) shl 8) or (bb / n)
++                val o = src[base + (i - r).coerceIn(0, len - 1) * step]; val ni = src[base + (i + r + 1).coerceIn(0, len - 1) * step]
++                a += (ni ushr 24) - (o ushr 24); rr += ((ni shr 16) and 0xFF) - ((o shr 16) and 0xFF)
++                g += ((ni shr 8) and 0xFF) - ((o shr 8) and 0xFF); bb += (ni and 0xFF) - (o and 0xFF)
++            }
++        }
++    }
++    pass(px, tmp, w, h, 1, w)      // rows
++    pass(tmp, px, h, w, w, 1)      // columns
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/RouteStatusCard.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/RouteStatusCard.kt
 new file mode 100644
 index 0000000..360b3d3
@@ -20264,10 +20459,10 @@ index 0000000..0806453
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/SessionStatusTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/SessionStatusTest.kt
 new file mode 100644
-index 0000000..a3a3a01
+index 0000000..8625dd7
 --- /dev/null
 +++ b/src/android/app/src/test/java/com/openminis/app/plus/SessionStatusTest.kt
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,117 @@
 +package com.openminis.app.plus
 +
 +import com.openminis.app.plus.SessionStatus.Probe
@@ -20376,6 +20571,14 @@ index 0000000..a3a3a01
 +        assertFalse(IdentityCore.looksLikeSenderName("Microsoft · Outlook"))
 +        assertFalse(IdentityCore.looksLikeSenderName("网易邮箱"))
 +    }
++
++    @Test fun refusedKeyIsKeyInvalidNotLoginExpired() {
++        assertEquals("key 无效", SessionStatus.keyPillLabel("BAD", "HTTP 401 Unauthorized"))
++        assertEquals("key 无效", SessionStatus.keyPillLabel("BAD", "密钥无效（403）"))
++        assertEquals("异常", SessionStatus.keyPillLabel("BAD", "连不上（网络）"))
++        assertEquals("正常", SessionStatus.keyPillLabel("OK", "401"))
++        assertEquals("未检查", SessionStatus.keyPillLabel(null, null))
++    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/SkillHubCnTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/SkillHubCnTest.kt
 new file mode 100644
@@ -20475,6 +20678,38 @@ index 0000000..53d4b5f
 +        assertTrue(SkillHubCn.isInstalled(p, emptySet(), mapOf("dsh-deja" to "github:vshulcz/deja-vu#527884b")))
 +        assertTrue(SkillHubCn.isInstalled(p, setOf("deja-vu"), emptyMap()))
 +        assertFalse(SkillHubCn.isInstalled(p, setOf("other"), mapOf("x" to "^1.0.0")))
++    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/SkillInstallKeyTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/SkillInstallKeyTest.kt
+new file mode 100644
+index 0000000..96ec4df
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/SkillInstallKeyTest.kt
+@@ -0,0 +1,26 @@
++package com.openminis.app.plus
++
++import com.openminis.app.plus.SkillInstallKey.State
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Test
++
++class SkillInstallKeyTest {
++    private val K = SkillInstallKey
++    @Test fun sameNameOtherPublisherIsNotInstalled() {
++        val src = K.source("alice", "weather", "1.0.1")
++        assertEquals("skillhub:alice/weather@1.0.1", src)
++        assertEquals(State.MINE, K.state(src, "alice", "weather"))
++        assertEquals(State.MINE, K.state(src, "Alice", "weather"))
++        assertEquals(State.OTHER, K.state(src, "bob", "weather"))
++        assertEquals(State.NONE, K.state(null, "bob", "weather"))
++        assertEquals(State.LOCAL, K.state("local", "bob", "weather"))
++    }
++    @Test fun legacySourceWithoutNamespaceIsNeverClaimed() {
++        assertEquals(State.OTHER, K.state("skillhub:weather@1.0.1", "alice", "weather"))
++        assertEquals(State.MINE, K.state("skillhub:weather@1.0.1", "", "weather"))
++        assertEquals(Triple("", "weather", "1.0.1"), K.parse("skillhub:weather@1.0.1"))
++        assertNull(K.parse("local"))
++        assertEquals("bob/weather", K.rowKey("bob", "weather")); assertEquals("weather", K.rowKey("", "weather"))
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/TaskProgressCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/TaskProgressCoreTest.kt
