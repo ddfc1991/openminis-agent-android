@@ -134,7 +134,7 @@ index 0000000..a409c2e
 +设置 › 测试与上报 › 隐私政策				
 +设置 › 测试与上报 › 反馈问题				
 diff --git a/src/android/app/src/main/java/com/openminis/app/MainActivity.kt b/src/android/app/src/main/java/com/openminis/app/MainActivity.kt
-index 7660141..d131ed6 100644
+index 7660141..6f6b3da 100644
 --- a/src/android/app/src/main/java/com/openminis/app/MainActivity.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/MainActivity.kt
 @@ -161,6 +161,10 @@ class MainActivity : ComponentActivity() {
@@ -148,16 +148,18 @@ index 7660141..d131ed6 100644
          // [Mines-voiceprint-35.3] a voiceprint recorded while its model was still missing finishes in the background
          runCatching { if (com.openminis.app.plus.Voiceprint.hasPending(this)) com.openminis.app.plus.Voiceprint.finishInBackground(this) }
  
-@@ -628,6 +632,8 @@ class MainActivity : ComponentActivity() {
+@@ -628,6 +632,10 @@ class MainActivity : ComponentActivity() {
                  com.openminis.app.ui.settings.ConfigConfirmDialogHost()
                  // [Mines-jobs-25] Background install / check progress + result popups.
                  com.openminis.app.ui.plus.MinesJobsHost()
 +                // [Mines-38.9] 账号关联: new-device sign-in sheet (是我 / 不是我) + 「已记下 X 账号」 glass toast
 +                com.openminis.app.ui.plus.KeychainHost()
++                // [Mines-38.9.5 i] secure login card (first sign-in / refused password / code that never came)
++                com.openminis.app.ui.plus.LoginCardHost()
                  // [Mines-38.7] blurred copy of the app under glass dialogs / sheets (replaces FLAG_BLUR_BEHIND)
                  com.openminis.app.ui.plus.GlassBackdropLayer()
              }
-@@ -678,10 +684,12 @@ class MainActivity : ComponentActivity() {
+@@ -678,10 +686,12 @@ class MainActivity : ComponentActivity() {
      override fun onPause() {
          super.onPause()
          com.openminis.app.plus.LoginWeb.flush()
@@ -170,7 +172,7 @@ index 7660141..d131ed6 100644
          // [Mines-38.7] leaving the app ends the conversation: organise what changed into 知识库 now (no idle wait)
          runCatching { com.openminis.app.plus.ChatKnowledge.onAppStop(this) }
          // [Mines-38.7] last time the app was used (home greeting 「好久不见」)
-@@ -750,8 +758,14 @@ class MainActivity : ComponentActivity() {
+@@ -750,8 +760,14 @@ class MainActivity : ComponentActivity() {
  
      private fun applySavedLanguage() {
          if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
@@ -1193,10 +1195,10 @@ index 0000000..dcfc972
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/AgentMailbox.kt b/src/android/app/src/main/java/com/openminis/app/plus/AgentMailbox.kt
 new file mode 100644
-index 0000000..4d53d44
+index 0000000..16ed069
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/AgentMailbox.kt
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,161 @@
 +package com.openminis.app.plus
 +
 +import android.content.Context
@@ -1239,6 +1241,9 @@ index 0000000..4d53d44
 +     * A code / link from [site] that arrived after [sinceMs], from switched-on sources only. [site] blank = the old
 +     * behaviour (any code), used by pages that did not say which site they are.
 +     */
++    /** [Mines-38.9.5 i] label of the mailbox the last code was found in (for LoginMemory); "" when none / SMS. */
++    @Volatile var lastVia: String = ""
++
 +    suspend fun find(c: Context, sinceMs: Long, site: String): CodeSourcesCore.Found? = withContext(Dispatchers.IO) {
 +        val off = all(c).filter { !it.second }.map { it.first.label }.toSet()
 +        MailSources.invalidate()
@@ -1247,6 +1252,7 @@ index 0000000..4d53d44
 +        val now = System.currentTimeMillis()
 +        val f = if (site.isBlank()) MailParse.codeFrom(mails, sinceMs)?.let { (code, m) -> CodeSourcesCore.Found(code, null, m.from, m.at) }
 +            else CodeSourcesCore.find(mails, site, sinceMs, now)
++        if (f != null) lastVia = mails.firstOrNull { it.at == f.at && it.from == f.from }?.source.orEmpty()
 +        f?.code?.let { code -> _seen.value = (listOf(Seen(site.ifBlank { CodeSourcesCore.senderDomain(f.from) }, CodeSourcesCore.mask(code), f.from.substringBefore('<').trim().take(20), now)) + _seen.value).take(5) }
 +        f
 +    }
@@ -3777,10 +3783,10 @@ index 0000000..f00f354
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/IdentityStore.kt b/src/android/app/src/main/java/com/openminis/app/plus/IdentityStore.kt
 new file mode 100644
-index 0000000..b43ea04
+index 0000000..93f1486
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/IdentityStore.kt
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,220 @@
 +package com.openminis.app.plus
 +
 +import android.content.Context
@@ -3868,6 +3874,9 @@ index 0000000..b43ea04
 +            else -> Rec(site, name, id?.value.orEmpty(), id?.type, plan.method, sources = setOf("一键关联"), at = System.currentTimeMillis())
 +        }
 +        addRec(c, r)
++        // [Mines-38.9.5 i] remembered for next time (method, account, code mailbox, encrypted session snapshot)
++        runCatching { LoginMemory.record(c, host, if (plan?.method == Method.OAUTH) plan.ident?.value.orEmpty() else id?.value.orEmpty(),
++            LoginMemory.methodOf(plan), if (plan?.method == Method.EMAIL_CODE) CodeSources.lastVia else "") }
 +        if (id != null) { init(c); _idents.value = _idents.value.map { if (it.key == id.key) it.copy(uses = it.uses + 1, at = System.currentTimeMillis()) else it }; save() }
 +    }
 +
@@ -4498,10 +4507,29 @@ index 0000000..e26a8e1
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/LoginAssist.kt b/src/android/app/src/main/java/com/openminis/app/plus/LoginAssist.kt
-index 2069931..6c9d6cb 100644
+index 2069931..20fa494 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/LoginAssist.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/LoginAssist.kt
-@@ -74,35 +74,205 @@ if(/滑块|拖动|人机验证|安全验证|Human Verification|确认您是人
+@@ -69,40 +69,275 @@ if(!bs.length)return 'none';bs[bs.length-1].click();return 'clicked';}catch(e){r
+ if(/扫码登录|扫一扫|用.{0,6}App扫码|二维码/.test(t))return '扫码';
+ if(/滑块|拖动|人机验证|安全验证|Human Verification|确认您是人类|Verify you are human|Just a moment/.test(t))return '验证';return '';})()"""
+ 
++    /** [Mines-38.9.5 i] what the visible sign-in form wants: {"user":"phone|email|user|","pw":bool,"code":bool,"pwEmpty":bool}. */
++    const val FIELDS_JS = """(function(){try{
++function vis(e){var r=e.getBoundingClientRect();return r.width>4&&r.height>4&&getComputedStyle(e).visibility!='hidden';}
++var ins=[].slice.call(document.querySelectorAll('input')).filter(function(e){return vis(e)&&!e.disabled&&!e.readOnly&&e.type!='hidden'&&e.type!='checkbox'&&e.type!='radio';});
++function h(e){return ((e.type||'')+' '+(e.name||'')+' '+(e.id||'')+' '+(e.autocomplete||'')+' '+(e.placeholder||'')+' '+(e.getAttribute('aria-label')||'')).toLowerCase();}
++var pw=ins.filter(function(e){return e.type=='password';});
++var code=ins.find(function(e){return /one-time-code|otp|验证码|code|captcha|短信/.test(h(e))&&e.type!='password';});
++var us=ins.find(function(e){return e!==code&&e.type!='password'&&/user|email|login|account|phone|mobile|tel|账号|邮箱|手机|用户名/.test(h(e));});
++var k='';if(us){var t=h(us);k=(us.type=='tel'||/手机|phone|mobile|tel/.test(t))?'phone':(us.type=='email'||/mail|邮箱/.test(t))?'email':'user';}
++return JSON.stringify({user:k,pw:pw.length>0,pwEmpty:pw.length>0&&!pw[0].value,code:!!code,codeEmpty:!!code&&!code.value});}catch(e){return '{}';}})()"""
++
++    /** Page text that says the password was wrong. */
++    val PW_WRONG = Regex("(?i)(密码错误|密码不正确|密码有误|账号或密码|用户名或密码|incorrect password|wrong password|password is incorrect|invalid password|invalid credentials|incorrect (?:email|username) or password)")
++
+     private suspend fun eval(wv: WebView, js: String): String = suspendCancellableCoroutine { c ->
+         runCatching { wv.evaluateJavascript(js) { r -> if (c.isActive) c.resume(runCatching { org.json.JSONTokener(r ?: "\"\"").nextValue() as? String }.getOrNull().orEmpty()) } }
              .onFailure { if (c.isActive) c.resume("") }
      }
  
@@ -4612,6 +4640,13 @@ index 2069931..6c9d6cb 100644
 +        var firstAt = 0L
 +        var challengeAt = 0L
 +        var challengeAsked = false
++        // [Mines-38.9.5 i] remembered sign-ins + the secure login card
++        var restoredRoot = ""
++        var cardRoot = ""
++        var cardAccount = ""
++        var refusedAsks = 0
++        var codeWaitAt = 0L
++        var codeCardAt = 0L
          while (!isDone()) {
              delay(2000)
              val wv = web() ?: continue
@@ -4687,6 +4722,50 @@ index 2069931..6c9d6cb 100644
 +                    }
 +                }
 +            }
++            // [Mines-38.9.5 i] silent reuse first: put back the encrypted session snapshot when the WebView lost it
++            if (auto && root.isNotBlank() && root != restoredRoot) {
++                restoredRoot = root
++                if (LoginMemory.restoreSession(context, host)) { onStatus("用上次的登录…"); runCatching { wv.reload() }; continue }
++            }
++            // [Mines-38.9.5 i] user 22:42: anything Mines does not have → the secure login card, values straight into the page
++            if (auto && root.isNotBlank() && !(plan?.method == IdentityCore.Method.OAUTH && stage == 1)) {
++                val fj = runCatching { JSONObject(eval(wv, FIELDS_JS)) }.getOrNull()
++                if (fj != null && fj.length() > 0) {
++                    val page = LoginMemoryCore.Page(fj.optString("user"), fj.optBoolean("pw") && fj.optBoolean("pwEmpty", true) || (pwDone && fj.optBoolean("pw")), fj.optBoolean("code") && fj.optBoolean("codeEmpty"))
++                    val saved = SavedLogins.forUrl(context, url)
++                    val memo = LoginMemory.memoFor(context, host)
++                    val refused = pwDone && refusedAsks < 2 && fj.optBoolean("pw") && PW_WRONG.containsMatchIn(eval(wv, ERROR_JS))
++                    if (page.code) { if (codeWaitAt == 0L) { codeWaitAt = System.currentTimeMillis(); hv.armOtp() } } else codeWaitAt = 0L
++                    val waited = if (codeWaitAt == 0L || hv.hasFreshCode()) -1L else System.currentTimeMillis() - codeWaitAt
++                    val haveAcct = saved != null || cardAccount.isNotBlank() || plan?.ident != null
++                    val havePw = saved != null || pwDone
++                    val ask = LoginMemoryCore.cardFields(page, haveAcct, havePw, waited, refused, AutoAccounts.siteOf(host))
++                    val firstCard = ask != null && (ask.refused || ask.fields == listOf(LoginMemoryCore.Field.CODE) || cardRoot != root)
++                    if (ask != null && firstCard && (ask.fields != listOf(LoginMemoryCore.Field.CODE) || System.currentTimeMillis() - codeCardAt > 60_000L)) {
++                        if (ask.refused) refusedAsks++
++                        if (ask.fields == listOf(LoginMemoryCore.Field.CODE)) codeCardAt = System.currentTimeMillis() else cardRoot = root
++                        onStatus(if (ask.refused) "密码不对，等你重新输入" else "等你输入登录信息")
++                        val a = LoginCard.ask(LoginCard.Req(host, AutoAccounts.siteOf(host), ask,
++                            saved?.user ?: memo?.account ?: plan?.ident?.value.orEmpty(), LoginMemoryCore.lastLine(memo)))
++                        if (a == null) { onStatus("已取消登录"); continue }
++                        if (a.code.isNotBlank()) {
++                            if (eval(wv, hv.fillJs(a.code, null)) == "ok") { codeFilledAt = System.currentTimeMillis(); delay(600); if (eval(wv, SUBMIT_JS) == "clicked") submitted = true }
++                        }
++                        if (a.account.isNotBlank() || a.password.isNotBlank()) {
++                            cardAccount = a.account
++                            val e = SavedLogins.Entry(AutoAccounts.siteOf(host), "https://$host/", a.account, a.password)
++                            if (a.save && a.password.isNotBlank()) runCatching { SavedLogins.put(context, e) }
++                            val r = eval(wv, SavedLogins.fillJs(e, true))
++                            if (r != "none") { pwDone = true; onStatus("已填好，正在登录…") }
++                            else if (page.user == "phone" || page.user == "email") {
++                                val rr = eval(wv, if (page.user == "phone") phoneJs(a.account, true) else emailJs(a.account, true))
++                                if (rr != "none") { hv.armOtp(); onStatus("已填好，正在要验证码…") }
++                            }
++                        }
++                        continue
++                    }
++                }
++            }
              val step = eval(wv, USER_STEP_JS)
 -            if (step.isNotBlank()) needsUser(step)
 +            if (step.isNotBlank() && plan?.method != IdentityCore.Method.OAUTH) needsUser(step)
@@ -4715,6 +4794,294 @@ index 2069931..6c9d6cb 100644
              if (!hv.settings.value.otpAutofill) continue
              val scan = hv.parseScan(eval(wv, hv.DETECT_JS))
              if (scan.otpField && scan.otpEmpty && System.currentTimeMillis() - codeFilledAt > 20_000L) {
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/LoginMemory.kt b/src/android/app/src/main/java/com/openminis/app/plus/LoginMemory.kt
+new file mode 100644
+index 0000000..c1fc11f
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/LoginMemory.kt
+@@ -0,0 +1,155 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import android.security.keystore.KeyGenParameterSpec
++import android.security.keystore.KeyProperties
++import android.util.Base64
++import kotlinx.coroutines.CompletableDeferred
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import org.json.JSONArray
++import org.json.JSONObject
++import java.security.KeyStore
++import javax.crypto.Cipher
++import javax.crypto.KeyGenerator
++import javax.crypto.SecretKey
++import javax.crypto.spec.GCMParameterSpec
++
++/**
++ * [Mines-38.9.5 i] user 22:43 「这个账号关联有记录，下次就可以不用那么麻烦了」: every successful sign-in is remembered per site
++ * (LoginMemoryCore.Memo: account, method, code mailbox, the user's pick) plus an encrypted snapshot of the site's session
++ * cookies (Android Keystore AES-GCM, never leaves the phone, never logged, never shown to the AI). Next time:
++ * [restoreSession] (silent reuse) → the saved method (LoginAssist) → [LoginCard] only when both fail.
++ */
++object LoginMemory {
++    private const val PREFS = "mines_login_memory"
++    private const val ALIAS = "mines_login_memory_v1"
++    @Volatile private var cache: List<LoginMemoryCore.Memo>? = null
++
++    private fun p(c: Context) = c.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++
++    private fun key(): SecretKey {
++        val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
++        (ks.getKey(ALIAS, null) as? SecretKey)?.let { return it }
++        val g = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
++        g.init(KeyGenParameterSpec.Builder(ALIAS, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
++            .setBlockModes(KeyProperties.BLOCK_MODE_GCM).setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE).build())
++        return g.generateKey()
++    }
++    private fun enc(s: String): String {
++        val ci = Cipher.getInstance("AES/GCM/NoPadding"); ci.init(Cipher.ENCRYPT_MODE, key())
++        return Base64.encodeToString(ci.iv, Base64.NO_WRAP) + ":" + Base64.encodeToString(ci.doFinal(s.toByteArray()), Base64.NO_WRAP)
++    }
++    private fun dec(s: String): String {
++        val (iv, ct) = s.split(':', limit = 2)
++        val ci = Cipher.getInstance("AES/GCM/NoPadding")
++        ci.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, Base64.decode(iv, Base64.NO_WRAP)))
++        return String(ci.doFinal(Base64.decode(ct, Base64.NO_WRAP)))
++    }
++
++    fun all(c: Context): List<LoginMemoryCore.Memo> {
++        cache?.let { return it }
++        val a = runCatching { JSONArray(p(c).getString("memos", "[]")) }.getOrDefault(JSONArray())
++        val l = (0 until a.length()).mapNotNull { i -> a.optJSONObject(i)?.let { o ->
++            LoginMemoryCore.Memo(o.optString("site"), o.optString("account"), LoginMemoryCore.Method.of(o.optString("method")), o.optString("via"),
++                p(c).contains("ck_" + o.optString("site")), o.optBoolean("chosen"), o.optBoolean("pw"), o.optLong("at"))
++        } }
++        cache = l
++        return l
++    }
++
++    private fun save(c: Context, l: List<LoginMemoryCore.Memo>) {
++        val a = JSONArray()
++        l.forEach { a.put(JSONObject().put("site", it.site).put("account", it.account).put("method", it.method.id).put("via", it.codeVia)
++            .put("chosen", it.chosen).put("pw", it.hasPassword).put("at", it.at)) }
++        p(c).edit().putString("memos", a.toString()).apply()
++        cache = null
++    }
++
++    fun memoFor(c: Context, host: String): LoginMemoryCore.Memo? = LoginMemoryCore.pick(all(c), Keychain.root(host).ifBlank { host })
++
++    /** A sign-in on [host] just succeeded: remember how, and snapshot the session cookies (encrypted). */
++    fun record(c: Context, host: String, account: String, method: LoginMemoryCore.Method, codeVia: String = "", chosen: Boolean = false) {
++        val site = Keychain.root(host).ifBlank { host }
++        if (site.isBlank()) return
++        val hasPw = account.isNotBlank() && runCatching { SavedLogins.find(c, host, account) != null }.getOrDefault(false)
++        save(c, LoginMemoryCore.record(all(c), LoginMemoryCore.Memo(site, account, method, codeVia, false, chosen, hasPw, System.currentTimeMillis())))
++        snapshotSession(c, host)
++    }
++
++    fun methodOf(plan: IdentityCore.Plan?): LoginMemoryCore.Method = when (plan?.method) {
++        IdentityCore.Method.EMAIL_PW, IdentityCore.Method.PHONE_PW, IdentityCore.Method.USER_PW -> LoginMemoryCore.Method.PASSWORD
++        IdentityCore.Method.EMAIL_CODE, IdentityCore.Method.PHONE_SMS -> LoginMemoryCore.Method.CODE
++        IdentityCore.Method.OAUTH -> when (plan.provider) {
++            IdentityCore.IdType.GOOGLE -> LoginMemoryCore.Method.GOOGLE
++            IdentityCore.IdType.GITHUB -> LoginMemoryCore.Method.GITHUB
++            else -> LoginMemoryCore.Method.OTHER_OAUTH
++        }
++        else -> LoginMemoryCore.Method.WEB
++    }
++
++    private fun urls(site: String) = listOf("https://$site", "https://www.$site")
++
++    fun snapshotSession(c: Context, host: String) = runCatching {
++        val site = Keychain.root(host).ifBlank { host }
++        val cm = android.webkit.CookieManager.getInstance()
++        cm.flush()
++        val o = JSONObject()
++        (urls(site) + "https://$host").distinct().forEach { u -> cm.getCookie(u)?.takeIf { it.isNotBlank() }?.let { o.put(u, it) } }
++        if (o.length() > 0) p(c).edit().putString("ck_$site", enc(o.toString())).apply()
++        cache = null
++    }
++
++    /** Silent reuse: when the WebView jar lost the site's cookies (cleared, other profile), put the saved ones back. True = restored now (reload the page). */
++    fun restoreSession(c: Context, host: String): Boolean = runCatching {
++        val site = Keychain.root(host).ifBlank { host }
++        val raw = p(c).getString("ck_$site", null) ?: return false
++        val cm = android.webkit.CookieManager.getInstance()
++        if (!cm.getCookie("https://$site").isNullOrBlank()) return false
++        val o = JSONObject(dec(raw))
++        o.keys().forEach { u -> o.optString(u).split(';').map { it.trim() }.filter { it.contains('=') }.forEach { kv -> cm.setCookie(u, "$kv; path=/; secure") } }
++        cm.flush()
++        true
++    }.getOrDefault(false)
++
++    fun forget(c: Context, host: String) {
++        val site = Keychain.root(host).ifBlank { host }
++        save(c, all(c).filterNot { it.site == site }); p(c).edit().remove("ck_$site").apply()
++    }
++}
++
++/**
++ * [Mines-38.9.5 i] user 22:42 「第一次就搞成你们那种输入进去的」: the secure login card. A sign-in that needs something Mines does
++ * not have asks here (LoginCardHost shows a glass bottom sheet with the site logo + name and only the fields the page
++ * wants); the answer goes straight into the page in the background WebView. Values never reach chat, logs or the AI.
++ */
++object LoginCard {
++    data class Req(val host: String, val name: String, val ask: LoginMemoryCore.Ask, val account: String, val lastLine: String?) {
++        val id = System.nanoTime()
++    }
++    data class Answer(val account: String, val password: String, val code: String, val save: Boolean)
++
++    private val _pending = MutableStateFlow<Req?>(null)
++    val pending: StateFlow<Req?> = _pending.asStateFlow()
++    private var waiter: CompletableDeferred<Answer?>? = null
++
++    /** Shows the card and waits for the user (null = closed). One card at a time. */
++    suspend fun ask(r: Req): Answer? {
++        waiter?.complete(null)
++        val d = CompletableDeferred<Answer?>()
++        waiter = d
++        _pending.value = r
++        return try { d.await() } finally { if (_pending.value?.id == r.id) _pending.value = null }
++    }
++
++    fun answer(a: Answer?) { val w = waiter; waiter = null; _pending.value = null; w?.complete(a) }
++
++    /** smoke: show the card with fake values (no page behind it). */
++    fun demo(refused: Boolean) {
++        val ask = if (refused) LoginMemoryCore.Ask(listOf(LoginMemoryCore.Field.EMAIL, LoginMemoryCore.Field.PASSWORD), "密码不对，重新输入", true)
++            else LoginMemoryCore.Ask(listOf(LoginMemoryCore.Field.EMAIL, LoginMemoryCore.Field.PASSWORD), "登录 Notion", false)
++        waiter?.complete(null); waiter = CompletableDeferred()
++        _pending.value = Req("notion.so", "Notion", ask, "smoke@example.com", "上次用 sm***@example.com 登录 · 密码")
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/LoginMemoryCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/LoginMemoryCore.kt
+new file mode 100644
+index 0000000..6272b6c
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/LoginMemoryCore.kt
+@@ -0,0 +1,121 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-38.9.5 i] user 2026-10-17 22:42 / 22:43: 「登录新的东西…第一次就搞成你们那种输入进去的」「这个账号关联有记录，下次就可以不用那么麻烦了」.
++ *
++ * Pure rules (LoginMemoryCoreTest):
++ *  - [Memo]: what a successful sign-in leaves behind per site — account, method, provider, which mailbox the code came
++ *    in, whether an encrypted session snapshot exists, and whether the user picked this account among several.
++ *  - [replay]: next time → reuse the saved session silently → silent re-login with the saved method → the secure login
++ *    card (only if both fail).
++ *  - [cardFields]: the card asks only for what the page wants (account / password / code), the code only after ~30 s with
++ *    no code from the linked mailboxes / SMS, and 「密码不对，重新输入」 when the saved password was refused.
++ */
++object LoginMemoryCore {
++    enum class Method(val id: String, val label: String) {
++        PASSWORD("password", "密码"), GOOGLE("google", "Google"), GITHUB("github", "GitHub"), CODE("code", "验证码"),
++        OTHER_OAUTH("oauth", "第三方"), WEB("web", "网页");
++        companion object { fun of(id: String?) = values().firstOrNull { it.id == id } ?: WEB }
++    }
++
++    data class Memo(
++        val site: String,
++        val account: String,
++        val method: Method,
++        /** label of the mailbox the last code arrived in ("Gmail", "163 邮箱"…), "" when SMS / none. */
++        val codeVia: String = "",
++        val hasSession: Boolean = false,
++        /** the user chose this account when the site has several */
++        val chosen: Boolean = false,
++        val hasPassword: Boolean = false,
++        val at: Long = 0L,
++    )
++
++    enum class Step { REUSE_SESSION, SILENT_RELOGIN, CARD }
++
++    /** The account to use for [site] when several are remembered: the one the user picked, else the most recent. */
++    fun pick(memos: List<Memo>, site: String): Memo? =
++        memos.filter { it.site == site }.sortedWith(compareByDescending<Memo> { it.chosen }.thenByDescending { it.at }).firstOrNull()
++
++    /** True when [m] can sign in again without asking the user anything. */
++    fun canSilent(m: Memo): Boolean = when (m.method) {
++        Method.PASSWORD -> m.hasPassword && m.account.isNotBlank()
++        Method.GOOGLE, Method.GITHUB, Method.OTHER_OAUTH -> true      // the provider's own session in the WebView
++        Method.CODE -> m.account.isNotBlank()                         // code read from the linked mailbox / SMS
++        Method.WEB -> false
++    }
++
++    /** Next-time order for a site. Unknown site → straight to the card. */
++    fun replay(m: Memo?): List<Step> {
++        if (m == null) return listOf(Step.CARD)
++        val out = ArrayList<Step>()
++        if (m.hasSession) out += Step.REUSE_SESSION
++        if (canSilent(m)) out += Step.SILENT_RELOGIN
++        out += Step.CARD
++        return out
++    }
++
++    /** Merge a new success into the list: one memo per (site, account); a new [chosen] clears the others' flag on that site. */
++    fun record(memos: List<Memo>, m: Memo): List<Memo> {
++        val rest = memos.filterNot { it.site == m.site && it.account.equals(m.account, ignoreCase = true) }
++            .map { if (m.chosen && it.site == m.site) it.copy(chosen = false) else it }
++        val prev = memos.firstOrNull { it.site == m.site && it.account.equals(m.account, ignoreCase = true) }
++        val merged = if (prev == null) m else m.copy(
++            codeVia = m.codeVia.ifBlank { prev.codeVia },
++            hasPassword = m.hasPassword || prev.hasPassword,
++            chosen = m.chosen || prev.chosen,
++        )
++        return (rest + merged).sortedByDescending { it.at }.take(300)
++    }
++
++    /** 「上次用 sm***@example.com 登录 · 密码」 (account masked in the middle). */
++    fun lastLine(m: Memo?): String? {
++        if (m == null || m.account.isBlank()) return null
++        val via = when (m.method) {
++            Method.CODE -> if (m.codeVia.isNotBlank()) " · 验证码（${m.codeVia}）" else " · 验证码"
++            Method.WEB -> ""
++            else -> " · " + m.method.label
++        }
++        return "上次用 ${maskAccount(m.account)} 登录$via"
++    }
++
++    fun maskAccount(a: String): String {
++        val t = a.trim()
++        val at = t.indexOf('@')
++        if (at > 0) {
++            val user = t.substring(0, at)
++            val keep = if (user.length <= 2) user.take(1) else user.take(2)
++            return keep + "***" + t.substring(at)
++        }
++        val d = t.filter { it.isDigit() }
++        if (d.length >= 7 && d.length == t.length) return d.take(3) + "****" + d.takeLast(4)
++        return if (t.length <= 3) t.take(1) + "**" else t.take(2) + "***" + t.takeLast(1)
++    }
++
++    // ───────────────────────── the secure login card ─────────────────────────
++
++    enum class Field(val label: String) { ACCOUNT("账号"), EMAIL("邮箱"), PHONE("手机号"), PASSWORD("密码"), CODE("验证码") }
++
++    /** What the sign-in page shows (from LoginAssist.FIELDS_JS). [user] = "phone" / "email" / "user" / "". */
++    data class Page(val user: String, val password: Boolean, val code: Boolean)
++
++    data class Ask(val fields: List<Field>, val title: String, val refused: Boolean)
++
++    const val CODE_WAIT_MS = 30_000L
++
++    /**
++     * Whether to show the card now and with which fields. [haveAccount] / [havePassword]: something saved to fill;
++     * [codeWaitMs]: how long the page has been waiting for a code with none arriving (−1 = not waiting);
++     * [refused]: the page rejected the saved password.
++     */
++    fun cardFields(page: Page, haveAccount: Boolean, havePassword: Boolean, codeWaitMs: Long, refused: Boolean, siteName: String): Ask? {
++        val acct = when (page.user) { "phone" -> Field.PHONE; "email" -> Field.EMAIL; "user" -> Field.ACCOUNT; else -> null }
++        if (refused && page.password) return Ask(listOfNotNull(acct, Field.PASSWORD), "密码不对，重新输入", true)
++        val f = ArrayList<Field>()
++        if (acct != null && !haveAccount) f += acct
++        if (page.password && !havePassword) { if (acct != null && acct !in f) f += acct; f += Field.PASSWORD }
++        if (page.code && codeWaitMs >= CODE_WAIT_MS) f += Field.CODE
++        if (f.isEmpty()) return null
++        return Ask(f.distinct(), if (f == listOf(Field.CODE)) "输入验证码" else "登录 $siteName", false)
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/LoginWeb.kt b/src/android/app/src/main/java/com/openminis/app/plus/LoginWeb.kt
 index 277080e..c450056 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/LoginWeb.kt
@@ -9270,7 +9637,7 @@ index 1d773a2..5489e65 100644
          coroutineScope {
              val bg = slow.map { id -> async { one(id) } }
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-index af13c1b..aaf33f5 100644
+index af13c1b..003484d 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 @@ -2,6 +2,7 @@ package com.openminis.app.plus.group
@@ -9281,7 +9648,7 @@ index af13c1b..aaf33f5 100644
  import kotlinx.coroutines.runBlocking
  import org.json.JSONArray
  import org.json.JSONObject
-@@ -21,6 +22,112 @@ object GroupSelfTest {
+@@ -21,6 +22,116 @@ object GroupSelfTest {
          val rest = arg.substringAfter(' ', "")
          val parts = rest.split('|')
          when (cmd) {
@@ -9365,6 +9732,10 @@ index af13c1b..aaf33f5 100644
 +                            .put("rows", JSONArray(rows.map { it.name + "|" + it.st.name + "|" + it.reason })).toString()
 +                    }
 +                    "bailian" -> com.openminis.app.plus.RouteStatusCore.bailianBase(arg2, null, GroupPrefs.get("bailian_ws"))
++                    // [Mines-38.9.5 i] secure login card / quote / greeting shots
++                    "card" -> { kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) { com.openminis.app.plus.LoginCard.demo(arg2 == "refused") }; "shown" }
++                    "cardoff" -> { kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) { com.openminis.app.plus.LoginCard.answer(null) }; "closed" }
++                    "chips" -> JSONArray(com.openminis.app.plus.ValueChips.detect(arg2).map { it.kind.name + "|" + it.display + "|" + it.copyable }).toString()
 +                    else -> "i395 seed | accounts | login <site> | gw | bailian <key>"
 +                }
 +            }
@@ -9394,7 +9765,7 @@ index af13c1b..aaf33f5 100644
              "partners" -> {
                  val l = Partners.refresh(context, rescanApps = true)
                  JSONArray(l.map { JSONObject().put("id", it.id).put("name", it.spec.name).put("state", it.state.name).put("model", it.model).put("via", it.via) }).toString()
-@@ -136,6 +243,13 @@ object GroupSelfTest {
+@@ -136,6 +247,13 @@ object GroupSelfTest {
                  GroupStore.add(gid, GroupMsg(GroupStore.newId(), parts.getOrElse(2) { "host" }, "成员A", "", parts.getOrElse(3) { "好的，结论：照这个办。" }))
                  "ok"
              }
@@ -9408,7 +9779,7 @@ index af13c1b..aaf33f5 100644
              "kbrun" -> { val n = com.openminis.app.plus.ChatKnowledge.runNow(context); "organised=$n" }
              "kbstate" -> {
                  val l = com.openminis.app.plus.ChatKnowledge.load(context)
-@@ -238,6 +352,112 @@ object GroupSelfTest {
+@@ -238,6 +356,112 @@ object GroupSelfTest {
              "wallpaper" -> { com.openminis.app.plus.PlusPrefs.init(context)
                  if (parts.getOrElse(0) { "" } == "off") com.openminis.app.plus.PlusPrefs.update(context) { it.copy(wallpaper = "") }
                  com.openminis.app.plus.PlusPrefs.state.value.wallpaper.ifBlank { "none" } }
@@ -12906,10 +13277,10 @@ index 0000000..4ba4344
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/AppAgentsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/AppAgentsScreen.kt
 new file mode 100644
-index 0000000..ffa23c0
+index 0000000..f4da29b
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/AppAgentsScreen.kt
-@@ -0,0 +1,255 @@
+@@ -0,0 +1,252 @@
 +package com.openminis.app.ui.plus
 +
 +import androidx.compose.animation.core.animateDpAsState
@@ -13092,12 +13463,9 @@ index 0000000..ffa23c0
 +                }
 +            }
 +        }
-+        Text("每个服务按它自己的使用条款用；新添加的默认不启用", fontSize = MT.Caption, color = m.ink2,
-+            modifier = Modifier.fillMaxWidth().padding(24.dp), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
 +    }
 +    if (catalog) MinesSheet({ catalog = false }) {
 +        Text("添加 AI 服务", fontSize = MT.PageTitle, fontWeight = FontWeight.SemiBold, color = m.ink, modifier = Modifier.padding(horizontal = 22.dp, vertical = 6.dp))
-+        Text("选你注册过的。添加后去登录一次，Mines 就能把任务交给它（默认不启用）。", fontSize = MT.Sub, color = m.ink2, modifier = Modifier.padding(horizontal = 22.dp))
 +        Spacer(Modifier.height(8.dp))
 +        AppAgents.catalog().forEach { d ->
 +            Row(Modifier.fillMaxWidth().clickable { AppAgents.add(d.id); catalog = false; rev++ }.padding(horizontal = 20.dp, vertical = 10.dp)
@@ -13526,7 +13894,7 @@ index 0000000..48d6b1f
 +    return when { s < 60 -> "刚刚"; s < 3600 -> "${s / 60} 分钟前"; else -> "${s / 3600} 小时前" }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
-index 6a136a6..df62bcf 100644
+index 6a136a6..847980b 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
 @@ -1,7 +1,10 @@
@@ -13549,7 +13917,7 @@ index 6a136a6..df62bcf 100644
      val context = LocalContext.current
      PlusVault.init(context)
      // [Mines-privacy-35.3] no screenshots / recents thumbnail of the account page
-@@ -224,18 +227,11 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+@@ -224,18 +227,10 @@ fun ConnectionsScreen(onBack: () -> Unit) {
          }
      }
      // [Mines-warm-36] design36conn: 「账号连接」 — search, clipboard card, 需要处理 on top, connected services by category
@@ -13568,12 +13936,11 @@ index 6a136a6..df62bcf 100644
 +    // [Mines-38.9.3] 账号 › 服务 (was 「账号连接」): same frame, search, rows and pills as 账号 › 登录
 +    AccountsPage(0, onTab, onBack, title = title) {
 +        AcctSearch(query, "搜索服务", { query = it })
-+        Text("密钥和登录加密存在本机，列表里不显示任何账号信息", fontSize = MT.Caption, color = mines().ink2, maxLines = 1,
-+            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, modifier = Modifier.padding(start = 36.dp, end = 24.dp, top = 8.dp, bottom = 2.dp))
++        // [Mines-38.9.5 i] user 22:24: explanation line removed (was 「密钥和登录加密存在本机，列表里不显示任何账号信息」)
          // [Mines-warm-36] clipboard card: a key the user just copied is recognised here (on this phone only) → 连接
          var clipTick by remember { mutableIntStateOf(0) }
          val lifecycle = androidx.compose.ui.platform.LocalLifecycleOwner.current
-@@ -276,23 +272,7 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+@@ -276,23 +271,7 @@ fun ConnectionsScreen(onBack: () -> Unit) {
          // [Mines-offers-32] free credits for services not connected yet (JSON list, no model)
          val offerList by com.openminis.app.plus.FreeOffers.offers.collectAsState()
          val offers = remember(offerList, entries) { com.openminis.app.plus.FreeOffers.relevant(context) }
@@ -13598,7 +13965,7 @@ index 6a136a6..df62bcf 100644
          val bases = entries.keys.map { PlusVault.baseId(it) }.distinct().sorted().mapNotNull { PlusVault.kind(it) }
              .filter { k -> query.isBlank() || k.name.lowercase().contains(query.trim().lowercase()) || k.id.contains(query.trim().lowercase()) }
              .sortedBy { connCategoryOrder.indexOf(connCategory(it)) }
-@@ -323,11 +303,18 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+@@ -323,11 +302,18 @@ fun ConnectionsScreen(onBack: () -> Unit) {
              }
          }
          // [Mines-warm-36] 需要处理: broken / expiring accounts on top, each with its one fixing action
@@ -13620,7 +13987,7 @@ index 6a136a6..df62bcf 100644
                  problems.take(3).forEachIndexed { i, id ->
                      val k = PlusVault.kind(id) ?: return@forEachIndexed
                      val base = PlusVault.kind(PlusVault.baseId(id)) ?: k
-@@ -336,23 +323,35 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+@@ -336,23 +322,35 @@ fun ConnectionsScreen(onBack: () -> Unit) {
                      val (fg, _) = toneColors(if (bad) Tone.DANGER else Tone.WARNING)
                      val canFix = bad && com.openminis.app.plus.KeyAgent.recipe(id)?.mode == com.openminis.app.plus.KeyAgent.Mode.WEBVIEW
                      val why = ps?.reason?.let { r -> com.openminis.app.plus.AccountLabel.showText(r) }?.takeIf { it.isNotBlank() } ?: if (bad) "连不上" else "要注意"
@@ -13673,7 +14040,7 @@ index 6a136a6..df62bcf 100644
                  }
              }
          }
-@@ -361,6 +360,8 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+@@ -361,6 +359,8 @@ fun ConnectionsScreen(onBack: () -> Unit) {
              // 「N 个账号 · 全部正常」, status dot, chevron), no identity until it is opened; account rows are one line
              // (short label · masked identity, ellipsis), 全部检测 + 添加账号 only inside the opened service.
              var open by remember { mutableStateOf(setOf<String>()) }
@@ -13682,7 +14049,7 @@ index 6a136a6..df62bcf 100644
              val revealUntil by com.openminis.app.plus.Privacy.until.collectAsState()
              var revealTick by remember { mutableStateOf(0) }
              LaunchedEffect(revealUntil) {
-@@ -387,8 +388,8 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+@@ -387,8 +387,8 @@ fun ConnectionsScreen(onBack: () -> Unit) {
                      val cat = connCategory(base)
                      if (i == 0 || connCategory(bases[i - 1]) != cat) {
                          if (i > 0) PlusDivider()
@@ -13693,7 +14060,7 @@ index 6a136a6..df62bcf 100644
                      }
                      val ids = PlusVault.accountsOf(base.id)
                      val def = PlusVault.defaultAccount(base.id)
-@@ -400,28 +401,31 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+@@ -400,28 +400,31 @@ fun ConnectionsScreen(onBack: () -> Unit) {
                          nChecking > 0 -> "检测中…"
                          bad > 0 -> "$bad 个异常"
                          warn > 0 -> "$warn 个要注意"
@@ -13744,7 +14111,7 @@ index 6a136a6..df62bcf 100644
                      if (isOpen) {
                          // 全部检测: one small action for the whole service
                          if (ids.any { PlusVault.hasSecret(it) }) Row(Modifier.fillMaxWidth().padding(start = 58.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-@@ -445,7 +449,9 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+@@ -445,7 +448,9 @@ fun ConnectionsScreen(onBack: () -> Unit) {
                                  else -> Green
                              }
                              Row(
@@ -13755,7 +14122,7 @@ index 6a136a6..df62bcf 100644
                                  verticalAlignment = Alignment.CenterVertically,
                              ) {
                                  androidx.compose.material3.IconButton(onClick = { if (!isDef) PlusVault.setDefault(context, id) }, modifier = Modifier.size(44.dp)) {
-@@ -459,9 +465,9 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+@@ -459,9 +464,9 @@ fun ConnectionsScreen(onBack: () -> Unit) {
                                      fontSize = 15.sp, maxLines = 1, softWrap = false, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                                      color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
                                  Spacer(Modifier.width(6.dp))
@@ -13768,7 +14135,7 @@ index 6a136a6..df62bcf 100644
                                  Spacer(Modifier.width(4.dp))
                                  MinesIcon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
                              }
-@@ -478,6 +484,10 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+@@ -478,6 +483,10 @@ fun ConnectionsScreen(onBack: () -> Unit) {
                                      modifier = Modifier.weight(1f))
                                  if (canFix) Button(onClick = { fixId = id }, modifier = Modifier.heightIn(min = 40.dp),
                                      contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp)) { Text("一键修复", fontSize = 14.sp, maxLines = 1) }
@@ -13779,7 +14146,7 @@ index 6a136a6..df62bcf 100644
                                  if (lowCredit) OutlinedButton(onClick = {
                                      val k = PlusVault.kind(id); val u = k?.panelUrl ?: k?.keyUrl ?: com.openminis.app.plus.KeyAgent.recipe(id)?.url
                                      if (u != null) com.openminis.app.browser.GoogleAuthRouter.openInCustomTab(context, u)
-@@ -495,8 +505,39 @@ fun ConnectionsScreen(onBack: () -> Unit) {
+@@ -495,8 +504,39 @@ fun ConnectionsScreen(onBack: () -> Unit) {
                              Text("添加账号", fontSize = 15.sp, maxLines = 1, color = MaterialTheme.colorScheme.primary)
                          }
                      }
@@ -13820,7 +14187,7 @@ index 6a136a6..df62bcf 100644
              }
          }
          PlusVault.groups.forEach { g ->
-@@ -589,22 +630,23 @@ fun BrandIcon(kind: ConnectionKind, size: Dp = 40.dp) {
+@@ -589,22 +629,23 @@ fun BrandIcon(kind: ConnectionKind, size: Dp = 40.dp) {
  /** [Mines-apps-32] catalog row: logo tile, bold name (+Beta), one gray line, round 「+」 on the right. */
  @Composable
  private fun ConnectionRow(k: ConnectionKind, sub: String, connected: Boolean, onConnect: () -> Unit, onClick: () -> Unit) {
@@ -13849,7 +14216,7 @@ index 6a136a6..df62bcf 100644
                  overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
          }
          Spacer(Modifier.width(8.dp))
-@@ -659,6 +701,17 @@ private fun ConnectionDetailScreen(
+@@ -659,6 +700,17 @@ private fun ConnectionDetailScreen(
                  }
              }
              Spacer(Modifier.height(6.dp))
@@ -13867,7 +14234,7 @@ index 6a136a6..df62bcf 100644
              Text(
                  // [Mines-accounts-31] full identity only here (rows show it masked)
                  if (entry != null) "已连接 · " + com.openminis.app.plus.AccountLabel.method(kind, entry) +
-@@ -671,17 +724,13 @@ private fun ConnectionDetailScreen(
+@@ -671,17 +723,13 @@ private fun ConnectionDetailScreen(
              )
              Spacer(Modifier.height(14.dp))
              if (entry != null) {
@@ -13889,7 +14256,7 @@ index 6a136a6..df62bcf 100644
              } else if (isMcpOnly || kind.method in setOf(ConnMethod.WEB, ConnMethod.KEY, ConnMethod.GOOGLE)) {
                  Button(
                      onClick = {
-@@ -709,6 +758,42 @@ private fun ConnectionDetailScreen(
+@@ -709,6 +757,42 @@ private fun ConnectionDetailScreen(
          }
          if (agentOpen) KeyAgentDialog(kind) { saved -> agentOpen = false; if (saved) Toast.makeText(context, "已连接 ${kind.name}", Toast.LENGTH_SHORT).show() }
  
@@ -13932,7 +14299,7 @@ index 6a136a6..df62bcf 100644
          // [Mines-offers-32] a free offer for this service
          com.openminis.app.plus.FreeOffers.forKind(context, kind.id)?.takeIf { entry == null }?.let { o ->
              PlusSection("免费额度", footer = (com.openminis.app.plus.FreeOffers.needsText(o).ifBlank { "Mines 不会付钱，也不会选付费套餐。" })) {
-@@ -750,7 +835,9 @@ private fun ConnectionDetailScreen(
+@@ -750,7 +834,9 @@ private fun ConnectionDetailScreen(
  
          // ---- how to connect ----
          if (!isMcpOnly) when (kind.method) {
@@ -13943,7 +14310,7 @@ index 6a136a6..df62bcf 100644
                  BigAction(if (entry == null) "连接（打开 ${kind.name} 登录页）" else "重新登录") {
                      if (entry != null && PlusVault.defaultAccount(PlusVault.baseId(kind.id)) != kind.id) PlusVault.setDefault(context, kind.id)
                      PlusConnect.restoreCookies(kind)
-@@ -1037,7 +1124,8 @@ private fun KeyBlock(kind: ConnectionKind, resumes: Int, autoStart: Boolean) {
+@@ -1037,7 +1123,8 @@ private fun KeyBlock(kind: ConnectionKind, resumes: Int, autoStart: Boolean) {
  @Composable
  private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean) {
      val context = LocalContext.current
@@ -13953,7 +14320,7 @@ index 6a136a6..df62bcf 100644
      var found by remember { mutableStateOf<String?>(null) }
      var manual by remember { mutableStateOf("") }
      var account by remember { mutableStateOf(existing?.account ?: "") }
-@@ -1045,7 +1133,21 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
+@@ -1045,7 +1132,21 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
      var voice by remember { mutableStateOf(PlusVault.extra(kind.id, "voice") ?: com.openminis.app.plus.GeminiLive.DEFAULT_VOICE) }
      val needsAccount = kind.id in setOf("gmail", "mail163", "qqmail")
  
@@ -13975,7 +14342,7 @@ index 6a136a6..df62bcf 100644
          if (kind.id == "gemini") { PlusVault.setExtra(kind.id, "model", model); PlusVault.setExtra(kind.id, "voice", voice) }
          PlusVault.save(context, kind, account.ifBlank { existing?.account ?: "" }, secret,
              share = existing?.shareWithAi ?: (kind.envKey != null), via = "key")
-@@ -1062,6 +1164,7 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
+@@ -1062,6 +1163,7 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
      fun autoSave(k: String, from: String) {
          if (autoBusy) return
          if (needsAccount && account.isBlank()) { manual = k; manualOpen = true; autoStatus = "先填上你的邮箱地址，再点「保存并连接」"; return }
@@ -13983,7 +14350,7 @@ index 6a136a6..df62bcf 100644
          autoBusy = true; autoStatus = "$from 里有 ${kind.name} 的${kind.keyLabel}，正在测试…"
          kscope.launch {
              val r = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.KeyTester.test(PlusVault.baseId(kind.id), k) }
-@@ -1096,11 +1199,53 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
+@@ -1096,11 +1198,53 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
              if (k != null && k != PlusVault.secret(kind.id)) { manual = k; autoSave(k, "页面") }
              else if (autoStatus == null) autoStatus = "没能自动拿到${kind.keyLabel}。在官网复制它，回到这里会自动填入；也可以粘贴到下面"
          }
@@ -14038,7 +14405,7 @@ index 6a136a6..df62bcf 100644
          if (needsAccount) OutlinedTextField(account, { account = it }, label = { Text(if (kind.id == "gmail") "Gmail 地址" else "邮箱地址") }, singleLine = true,
              textStyle = MaterialTheme.typography.bodyMedium,
              modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp))
-@@ -1232,3 +1377,79 @@ fun SecureWindow() {
+@@ -1232,3 +1376,79 @@ fun SecureWindow() {
          onDispose { }
      }
  }
@@ -14119,7 +14486,7 @@ index 6a136a6..df62bcf 100644
 +        contentAlignment = Alignment.Center) { Text(text, fontSize = 13.sp, color = m.ink2, maxLines = 1) }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
-index b529a74..87a5688 100644
+index b529a74..f460c7b 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
 @@ -20,7 +20,9 @@ import androidx.compose.foundation.border
@@ -14295,7 +14662,15 @@ index b529a74..87a5688 100644
                      }
                  }
              }
-@@ -344,7 +396,7 @@ fun DigestScreen(onBack: () -> Unit) {
+@@ -284,7 +336,6 @@ fun DigestScreen(onBack: () -> Unit) {
+             Row(Modifier.fillMaxWidth().padding(start = 24.dp, end = 12.dp, top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                 Column(Modifier.weight(1f)) {
+                     Text("消息来源", fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = wm.ink)
+-                    Text("登录的账号越多，消息越全；同一平台可以加多个账号", fontSize = MT.Sub, color = wm.ink2)
+                 }
+                 GlassTextButton("关闭") { sourcesOpen = false }
+             }
+@@ -344,7 +395,7 @@ fun DigestScreen(onBack: () -> Unit) {
          val wm = mines()
          MinesDialog("我关注的", onDismiss = { editFollows = false }, confirm = "保存", onConfirm = {
              Digest.setFollows(context, text.lines()); Digest.setSenders(context, who.lines()); Digest.setLanguages(context, langs); editFollows = false
@@ -14304,7 +14679,7 @@ index b529a74..87a5688 100644
          }) {
              Text("话题：一行一个关键词、币种或项目，命中的排前面", fontSize = MT.Caption, lineHeight = MT.CaptionLH, color = wm.ink2)
              OutlinedTextField(text, { text = it }, minLines = 3, maxLines = 5, modifier = Modifier.fillMaxWidth(),
-@@ -413,7 +465,7 @@ private fun FeedChip(label: String, selected: Boolean, onClick: () -> Unit) {
+@@ -413,7 +464,7 @@ private fun FeedChip(label: String, selected: Boolean, onClick: () -> Unit) {
      // [Mines-design-34] selected = ink pill, others = strong glass + hairline (design33 02-feed)
      val m = mines()
      val shape = RoundedCornerShape(50)
@@ -14313,7 +14688,7 @@ index b529a74..87a5688 100644
          color = if (selected) m.surface else m.ink, maxLines = 1,
          modifier = Modifier.heightIn(min = 44.dp).clip(shape).background(if (selected) m.ink else m.glassStrong)
              .border(1.dp, if (selected) Color.Transparent else m.hairline, shape).clickable(onClick = onClick)
-@@ -431,6 +483,59 @@ private fun repoOf(it: Digest.Item): String? = listOfNotNull(it.url, it.title, i
+@@ -431,6 +482,59 @@ private fun repoOf(it: Digest.Item): String? = listOfNotNull(it.url, it.title, i
      repoRe.find(t)?.groupValues?.get(1)?.removeSuffix(".git")?.trimEnd('.', ')')
  }?.takeIf { r -> r.split('/').let { p -> p.size == 2 && p[0] !in setOf("orgs", "topics", "trending", "settings", "sponsors") } }
  
@@ -14373,7 +14748,7 @@ index b529a74..87a5688 100644
  /** What the card's / sheet's main button says (follows the action, not a generic 开始吧). */
  private val warnRx = Regex("(?i)警告|警惕|小心|注意|风险|骗|钓鱼|假冒|盗号|被盗|漏洞|scam|phishing|warning|beware|exploit|hack")
  private val howRx = Regex("(?i)教程|指南|手把手|入门|步骤|怎么|如何|方法|技巧|攻略|tutorial|guide|how to|tips")
-@@ -477,7 +582,7 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
+@@ -477,7 +581,7 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
                  Box(Modifier.size(32.dp).clip(androidx.compose.foundation.shape.CircleShape)
                      .background(androidx.compose.ui.graphics.Brush.linearGradient(listOf(Color(0xFFE08A6B), Color(0xFFB5532F)))),
                      contentAlignment = Alignment.Center) {
@@ -14382,7 +14757,7 @@ index b529a74..87a5688 100644
                  }
              } else TopicIcon(it, toneFg, 32.dp)
              Spacer(Modifier.width(10.dp))
-@@ -490,7 +595,7 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
+@@ -490,7 +594,7 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
                          Spacer(Modifier.width(6.dp))
                      }
                      Text((if (it.pinned) "置顶 · " else "") + listOfNotNull(sender ?: it.source.takeIf { s -> s.isNotBlank() }, relTime(it.at)).joinToString(" · "),
@@ -14391,7 +14766,7 @@ index b529a74..87a5688 100644
                      val mark = when { isX -> com.openminis.app.R.drawable.ic_brand_x; isGh -> com.openminis.app.R.drawable.ic_brand_github; else -> 0 }
                      if (mark != 0) androidx.compose.foundation.Image(androidx.compose.ui.res.painterResource(mark), contentDescription = it.source,
                          modifier = Modifier.padding(start = 6.dp).size(14.dp))
-@@ -500,10 +605,10 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
+@@ -500,10 +604,10 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
                      modifier = Modifier.padding(top = 4.dp, end = 8.dp))
                  // GitHub: Chinese on top (big), the English name/description underneath in small print
                  if (isGh) feedClean(it.title)?.takeIf { t -> t != headline }?.let { en ->
@@ -14404,7 +14779,7 @@ index b529a74..87a5688 100644
                      modifier = Modifier.padding(top = 6.dp).clip(RoundedCornerShape(50)).background(toneBg).padding(horizontal = 8.dp, vertical = 2.dp)) }
                  if (isX) repoOf(it)?.let { r -> RepoMiniCard(r, null, null) }
                  if (isX) it.image?.let { img ->
-@@ -529,7 +634,7 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
+@@ -529,7 +633,7 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
                      Spacer(Modifier.weight(1f))
                      ActIcon("⋯", "更多", m.ink2, onMore)
                  }
@@ -14413,7 +14788,7 @@ index b529a74..87a5688 100644
              }
          }
      }
-@@ -550,7 +655,7 @@ private fun TextAct(icon: androidx.compose.ui.graphics.vector.ImageVector, label
+@@ -550,7 +654,7 @@ private fun TextAct(icon: androidx.compose.ui.graphics.vector.ImageVector, label
  @Composable
  private fun ActIcon(glyph: String, label: String, color: Color, onClick: () -> Unit) {
      androidx.compose.material3.IconButton(onClick = onClick, modifier = Modifier.size(48.dp).semantics { contentDescription = label }) {
@@ -14422,7 +14797,7 @@ index b529a74..87a5688 100644
      }
  }
  
-@@ -622,21 +727,21 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
+@@ -622,21 +726,21 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
                  Column(Modifier.weight(1f)) {
                      Text(listOfNotNull(Digest.Tab.values().firstOrNull { it == m.tab }?.let { t -> if (t == Digest.Tab.FOLLOW) "X" else t.label }, m.source.takeIf { it.isNotBlank() })
                          .distinct().joinToString(" · "), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = mc.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -14448,7 +14823,7 @@ index b529a74..87a5688 100644
                  }
              }
              m.image?.let { img ->
-@@ -647,7 +752,7 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
+@@ -647,7 +751,7 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
              if (steps.isNotEmpty()) {
                  Row(Modifier.padding(top = 22.dp).fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                      Text("包含的内容", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = mc.ink, modifier = Modifier.weight(1f))
@@ -14457,7 +14832,7 @@ index b529a74..87a5688 100644
                  }
                  Column(Modifier.padding(top = 8.dp).fillMaxWidth().clip(RoundedCornerShape(20.dp)).background(mc.surface2.copy(alpha = if (mc.dark) 1f else 0.7f))) {
                      steps.forEachIndexed { i, (t, sub) ->
-@@ -674,7 +779,7 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
+@@ -674,7 +778,7 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
                      .clickable { openOriginal(context, m) }.heightIn(min = 56.dp).padding(horizontal = 14.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
                      Column(Modifier.weight(1f)) {
                          Text("原文" + (feedClean(com.openminis.app.plus.AccountLabel.maskText(m.sender))?.let { " · $it" } ?: ""), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = mc.ink, maxLines = 1)
@@ -14466,7 +14841,7 @@ index b529a74..87a5688 100644
                      }
                      Text("↗", fontSize = 20.sp, color = mc.ink2)
                  }
-@@ -809,3 +914,18 @@ fun glueNumbers(s: String): String = numUnit.replace(s) { m ->
+@@ -809,3 +913,18 @@ fun glueNumbers(s: String): String = numUnit.replace(s) { m ->
      val tail = m.groupValues[5]
      num + (if (sp.isNotEmpty()) "\u00A0" else "\u2060") + unit + (if (tail.isNotEmpty()) "\u00A0" + tail else "")
  }
@@ -15195,10 +15570,10 @@ index 725fc33..5556b47 100644
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/KeychainScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/KeychainScreen.kt
 new file mode 100644
-index 0000000..f568f04
+index 0000000..893d7cb
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/KeychainScreen.kt
-@@ -0,0 +1,693 @@
+@@ -0,0 +1,692 @@
 +package com.openminis.app.ui.plus
 +
 +import androidx.compose.foundation.Canvas
@@ -15408,7 +15783,6 @@ index 0000000..f568f04
 +    )
 +    MinesSheet(onDismiss) {
 +        Text("添加身份", fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = m.ink, modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp))
-+        Text("选择身份类型并填写账号，一键关联登录时会用到。", fontSize = 13.sp, lineHeight = 18.sp, color = m.ink2, modifier = Modifier.padding(horizontal = 20.dp))
 +        Spacer(Modifier.height(6.dp))
 +        groups.forEach { (gName, types) ->
 +            Text(gName, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = m.ink3, modifier = Modifier.padding(start = 20.dp, top = 8.dp, bottom = 4.dp))
@@ -16776,6 +17150,135 @@ index f69ee42..7bd0c94 100644
 +    }
 +    if (add) AddIdentitySheet({ add = false }) { add = false }
 +}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/LoginCardUi.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/LoginCardUi.kt
+new file mode 100644
+index 0000000..0087874
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/LoginCardUi.kt
+@@ -0,0 +1,123 @@
++package com.openminis.app.ui.plus
++
++import androidx.compose.foundation.border
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.foundation.text.BasicTextField
++import androidx.compose.foundation.text.KeyboardOptions
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.outlined.Lock
++import androidx.compose.material.icons.outlined.Visibility
++import androidx.compose.material.icons.outlined.VisibilityOff
++import androidx.compose.material3.Icon
++import androidx.compose.material3.Switch
++import androidx.compose.material3.SwitchDefaults
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateMapOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.foundation.background
++import androidx.compose.ui.graphics.SolidColor
++import androidx.compose.ui.semantics.contentDescription
++import androidx.compose.ui.semantics.semantics
++import androidx.compose.ui.text.TextStyle
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.input.KeyboardType
++import androidx.compose.ui.text.input.PasswordVisualTransformation
++import androidx.compose.ui.text.input.VisualTransformation
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import com.openminis.app.plus.LoginCard
++import com.openminis.app.plus.LoginMemoryCore.Field
++
++/**
++ * [Mines-38.9.5 i] the secure login card (user 22:42): glass bottom sheet, site logo + name, only the fields the page asks
++ * for, 「保存到保险箱」 on by default, one primary button. Small type (MT tokens), no explanation paragraphs.
++ */
++@Composable
++fun LoginCardHost() {
++    val req by LoginCard.pending.collectAsState()
++    val r = req ?: return
++    val m = mines()
++    val values = remember(r.id) { mutableStateMapOf<Field, String>().apply {
++        r.ask.fields.firstOrNull { it == Field.ACCOUNT || it == Field.EMAIL || it == Field.PHONE }?.let { put(it, r.account) }
++    } }
++    var save by remember(r.id) { mutableStateOf(true) }
++    var show by remember(r.id) { mutableStateOf(false) }
++    val danger = if (m.dark) MinesDesign.DangerDark else MinesDesign.Danger
++    MinesSheet(onDismiss = { LoginCard.answer(null) }) {
++        Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
++            AcctLogo(r.host, r.name)
++            Spacer(Modifier.width(12.dp))
++            Column(Modifier.weight(1f)) {
++                Text(r.name, fontSize = MT.Body, lineHeight = MT.SubLH, fontWeight = FontWeight.SemiBold, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
++                Text(r.ask.title, fontSize = MT.Caption, lineHeight = MT.CaptionLH, color = if (r.ask.refused) danger else m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis)
++            }
++            Icon(Icons.Outlined.Lock, null, tint = m.ink2, modifier = Modifier.size(16.dp))
++        }
++        r.lastLine?.let { line ->
++            Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp).padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
++                Text(line, fontSize = MT.Meta, lineHeight = MT.SubLH, color = m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
++                val acctField = r.ask.fields.firstOrNull { it == Field.ACCOUNT || it == Field.EMAIL || it == Field.PHONE }
++                if (acctField != null) Text("换账号", fontSize = MT.Meta, color = m.primaryText, fontWeight = FontWeight.Medium,
++                    modifier = Modifier.clip(RoundedCornerShape(50)).clickable { values[acctField] = "" }.padding(horizontal = 8.dp, vertical = 6.dp))
++            }
++        }
++        Spacer(Modifier.height(8.dp))
++        r.ask.fields.forEach { f ->
++            val v = values[f].orEmpty()
++            val secret = f == Field.PASSWORD
++            val shape = RoundedCornerShape(14.dp)
++            Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 5.dp).heightIn(min = 46.dp).clip(shape)
++                .background(minesGlassFill(strong = true)).border(1.dp, m.glassBorder, shape).padding(start = 14.dp, end = 6.dp),
++                verticalAlignment = Alignment.CenterVertically) {
++                Text(f.label, fontSize = MT.Caption, color = m.ink2, modifier = Modifier.width(56.dp), maxLines = 1)
++                Box(Modifier.weight(1f).padding(vertical = 12.dp)) {
++                    BasicTextField(v, { values[f] = it }, singleLine = true,
++                        textStyle = TextStyle(fontSize = MT.Body, color = m.ink),
++                        cursorBrush = SolidColor(m.primary),
++                        visualTransformation = if (secret && !show) PasswordVisualTransformation() else VisualTransformation.None,
++                        keyboardOptions = KeyboardOptions(keyboardType = when (f) {
++                            Field.PASSWORD -> KeyboardType.Password; Field.PHONE -> KeyboardType.Phone
++                            Field.EMAIL -> KeyboardType.Email; Field.CODE -> KeyboardType.Number; else -> KeyboardType.Text }),
++                        modifier = Modifier.fillMaxWidth().semantics { contentDescription = f.label })
++                }
++                if (secret) Box(Modifier.size(40.dp).clip(RoundedCornerShape(50)).clickable { show = !show }
++                    .semantics { contentDescription = if (show) "隐藏密码" else "显示密码" }, contentAlignment = Alignment.Center) {
++                    Icon(if (show) Icons.Outlined.VisibilityOff else Icons.Outlined.Visibility, null, tint = m.ink2, modifier = Modifier.size(18.dp))
++                }
++            }
++        }
++        if (r.ask.fields.any { it != Field.CODE }) Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp).padding(top = 6.dp)
++            .clickable { save = !save }.semantics(mergeDescendants = true) { contentDescription = "保存到保险箱" },
++            verticalAlignment = Alignment.CenterVertically) {
++            Text("保存到保险箱", fontSize = MT.Body, color = m.ink, modifier = Modifier.weight(1f))
++            Switch(save, { save = it }, colors = SwitchDefaults.colors(checkedTrackColor = m.primary))
++        }
++        val ready = r.ask.fields.all { values[it].orEmpty().isNotBlank() }
++        Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp), horizontalArrangement = Arrangement.End) {
++            GlassPill(if (r.ask.fields == listOf(Field.CODE)) "确定" else "登录", enabled = ready, modifier = Modifier.fillMaxWidth()) {
++                val acct = r.ask.fields.firstOrNull { it == Field.ACCOUNT || it == Field.EMAIL || it == Field.PHONE }?.let { values[it] }?.trim() ?: r.account
++                LoginCard.answer(LoginCard.Answer(acct, values[Field.PASSWORD].orEmpty(), values[Field.CODE].orEmpty().trim(), save))
++            }
++        }
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/LookScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/LookScreen.kt
 new file mode 100644
 index 0000000..e573bb8
@@ -17021,10 +17524,10 @@ index 0000000..e573bb8
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/MailboxPane.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/MailboxPane.kt
 new file mode 100644
-index 0000000..4c20132
+index 0000000..9e50bb4
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/MailboxPane.kt
-@@ -0,0 +1,359 @@
+@@ -0,0 +1,357 @@
 +package com.openminis.app.ui.plus
 +
 +import androidx.compose.foundation.background
@@ -17161,8 +17664,6 @@ index 0000000..4c20132
 +            .semantics(mergeDescendants = true) { contentDescription = "添加邮箱"; role = Role.Button },
 +            verticalAlignment = Alignment.CenterVertically) {
 +            Text("＋ 添加邮箱", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = m.primaryText)
-+            Spacer(Modifier.width(8.dp))
-+            Text("163 / 126 / QQ 用授权码 · Gmail 在 Mines 内登录", fontSize = 13.sp, color = m.ink3, maxLines = 1, overflow = TextOverflow.Ellipsis)
 +        }
 +    }
 +
@@ -17385,7 +17886,7 @@ index 0000000..4c20132
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/MarketScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/MarketScreen.kt
-index 849e3da..c9fee75 100644
+index 849e3da..f372c8d 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/MarketScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/MarketScreen.kt
 @@ -2,6 +2,9 @@ package com.openminis.app.ui.plus
@@ -17456,7 +17957,7 @@ index 849e3da..c9fee75 100644
          if (msg.isNotBlank()) Text(msg, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(16.dp))
          results.forEachIndexed { i, p ->
              val inst = installed[p.name]
-@@ -477,3 +488,334 @@ private fun SkillMarket() {
+@@ -477,3 +488,332 @@ private fun SkillMarket() {
          }
      }
  }
@@ -17788,8 +18289,6 @@ index 849e3da..c9fee75 100644
 +            }
 +        }, modifier = Modifier.fillMaxWidth().padding(8.dp)) { Text("再显示 ${H.PAGE} 个", fontSize = MT.Button) }
 +    }
-+    Text("技能装到 Mines 的技能目录和 DSH 的 ~/.dsh/skills，两边都能用。有平台签名的会先校验包再装。", fontSize = MT.Caption, color = mines().ink2,
-+        modifier = Modifier.padding(horizontal = 36.dp, vertical = 10.dp))
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt
 index 92e996b..216510e 100644
@@ -18058,7 +18557,7 @@ index 92e996b..216510e 100644
      val Button = 15.sp         // all buttons
      val BodyLH = 22.sp; val SubLH = 18.sp; val CaptionLH = 18.sp
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
-index afd2104..3f05958 100644
+index afd2104..080fdf1 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
 @@ -1,5 +1,9 @@
@@ -18071,7 +18570,15 @@ index afd2104..3f05958 100644
  import com.openminis.app.ui.brand.MinesIcon
  
  import android.graphics.BitmapFactory
-@@ -45,6 +49,8 @@ import androidx.compose.material3.Scaffold
+@@ -14,6 +18,7 @@ import androidx.compose.foundation.Image
+ import androidx.compose.foundation.background
+ import androidx.compose.foundation.border
+ import androidx.compose.foundation.clickable
++import androidx.compose.material.icons.outlined.Info
+ import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.Spacer
+ import androidx.compose.foundation.layout.heightIn
+@@ -45,6 +50,8 @@ import androidx.compose.material3.Scaffold
  import androidx.compose.material3.Text
  import com.openminis.app.ui.theme.TopAppBar
  import androidx.compose.runtime.Composable
@@ -18080,7 +18587,7 @@ index afd2104..3f05958 100644
  import androidx.compose.runtime.collectAsState
  import androidx.compose.runtime.getValue
  import androidx.compose.runtime.produceState
-@@ -87,14 +93,21 @@ object PlusNav {
+@@ -87,14 +94,21 @@ object PlusNav {
      @Volatile var autoClaim: Boolean = false
      /** [Mines-38.7] with route plus_connections: open this account's in-app sign-in page right away */
      @Volatile var openLogin: String? = null
@@ -18102,7 +18609,7 @@ index afd2104..3f05958 100644
      const val PERSONALIZE = "plus_personalize"
      const val VOICE = "plus_voice_live"
      const val SANDBOX = "plus_sandbox"
-@@ -110,7 +123,15 @@ object PlusRoutes {
+@@ -110,7 +124,15 @@ object PlusRoutes {
      const val DIGEST = "plus_digest"
      const val CARDS = "plus_cards"
      const val VOICE_SETTINGS = "plus_voice_settings"
@@ -18118,7 +18625,7 @@ index afd2104..3f05958 100644
      fun server(id: String) = "plus_server/$id"
  }
  
-@@ -177,14 +198,18 @@ fun ChatWallpaperLayer(modifier: Modifier = Modifier, home: Boolean = false) {
+@@ -177,14 +199,18 @@ fun ChatWallpaperLayer(modifier: Modifier = Modifier, home: Boolean = false) {
              // [Mines-38.6] smooth frost: a 48 dp RenderEffect over the full-size photo showed a fine grid / dither on the
              // emulator (GPU blur of a high-frequency picture). The photo is first shrunk to ~1/16 with filtering (a cheap
              // pre-blur), drawn back up with high-quality filtering and then only lightly blurred.
@@ -18142,7 +18649,7 @@ index afd2104..3f05958 100644
          Box(Modifier.fillMaxSize().background(Brush.verticalGradient(
              0f to veil.copy(alpha = top), 0.16f to veil.copy(alpha = top), 0.30f to veil.copy(alpha = body), 1f to veil.copy(alpha = body))))
      }
-@@ -196,8 +221,7 @@ fun ChatWallpaperLayer(modifier: Modifier = Modifier, home: Boolean = false) {
+@@ -196,8 +222,7 @@ fun ChatWallpaperLayer(modifier: Modifier = Modifier, home: Boolean = false) {
   * unchanged otherwise.
   */
  @Composable
@@ -18152,7 +18659,7 @@ index afd2104..3f05958 100644
  
  /** True when a wallpaper is drawn on this screen (bars then go translucent). */
  @Composable
-@@ -266,6 +290,8 @@ fun MinesBackdrop(modifier: Modifier = Modifier) {
+@@ -266,6 +291,8 @@ fun MinesBackdrop(modifier: Modifier = Modifier) {
          Box(modifier) {
              PorcelainBackdrop(Modifier.fillMaxSize())
              ChatWallpaperLayer(Modifier.fillMaxSize(), home = true)
@@ -18161,7 +18668,7 @@ index afd2104..3f05958 100644
          }
      } else PorcelainBackdrop(modifier)
  }
-@@ -273,11 +299,13 @@ fun MinesBackdrop(modifier: Modifier = Modifier) {
+@@ -273,11 +300,13 @@ fun MinesBackdrop(modifier: Modifier = Modifier) {
  @OptIn(ExperimentalMaterial3Api::class)
  @Composable
  fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, actions: (@Composable () -> Unit)? = null,
@@ -18176,7 +18683,7 @@ index afd2104..3f05958 100644
          Scaffold(
              containerColor = Color.Transparent,
              topBar = {
-@@ -293,40 +321,67 @@ fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, action
+@@ -293,40 +322,67 @@ fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, action
                      colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent, scrolledContainerColor = Color.Transparent),
                  )
              },
@@ -18253,7 +18760,7 @@ index afd2104..3f05958 100644
  }
  
  /** A frosted 22 dp card (no blur pass: translucent fill + 1 dp highlight + soft warm shadow). */
-@@ -334,20 +389,40 @@ fun minesGlassFill(strong: Boolean = false): Color {
+@@ -334,35 +390,68 @@ fun minesGlassFill(strong: Boolean = false): Color {
  fun MinesCard(modifier: Modifier = Modifier, strong: Boolean = false, onClick: (() -> Unit)? = null, content: @Composable ColumnScope.() -> Unit) {
      val m = mines()
      val shape = RoundedCornerShape(MS.CardRadius)
@@ -18294,26 +18801,48 @@ index afd2104..3f05958 100644
      val m = mines()
      Column(Modifier.fillMaxWidth().padding(top = MS.L)) {
 -        if (title != null) Row(Modifier.fillMaxWidth().padding(start = 24.dp, end = 24.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+-            Text(title, fontSize = MT.Section, color = m.ink2, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f), maxLines = 1,
 +        // [Mines-38.9.1] section label + footer start where PlusRow content starts (20 dp card inset + 16 dp row inset)
-+        if (title != null) Row(Modifier.fillMaxWidth().padding(start = 36.dp, end = 24.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-             Text(title, fontSize = MT.Section, color = m.ink2, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f), maxLines = 1,
++        // [Mines-38.9.5 i] user 22:24: no explanation paragraphs under cards — the footer text sits behind a small ⓘ
++        // (in the section label row; a label-less section gets the ⓘ alone at the right)
++        if (title != null || footer != null) Row(Modifier.fillMaxWidth().padding(start = 36.dp, end = 20.dp, bottom = if (title != null) 8.dp else 2.dp),
++            verticalAlignment = Alignment.CenterVertically) {
++            if (title != null) Text(title, fontSize = MT.Section, color = m.ink2, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f), maxLines = 1,
                  overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
++            else Spacer(Modifier.weight(1f))
              if (action != null && onAction != null) Text(action, fontSize = MT.Sub, color = m.primaryText, fontWeight = FontWeight.Medium,
-@@ -358,9 +433,10 @@ fun PlusSection(title: String?, footer: String? = null, action: String? = null,
+                 modifier = Modifier.clickable(onClick = onAction).padding(4.dp))
++            if (footer != null) InfoDot(title ?: "说明", footer)
          }
-         if (footer != null) Text(
-             footer,
+         MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
+             Column(Modifier.fillMaxWidth().padding(vertical = 4.dp), content = content)
+         }
+-        if (footer != null) Text(
+-            footer,
 -            fontSize = MT.Caption,
 -            color = m.ink3,
 -            modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp),
-+            fontSize = if (footerStrong) MT.Sub else MT.Caption,
-+            color = if (footerStrong) m.ink2 else m.ink3,
-+            softWrap = true,
-+            modifier = Modifier.fillMaxWidth().padding(start = 36.dp, end = 24.dp, top = 8.dp, bottom = 8.dp),
-             lineHeight = MT.CaptionLH,
-         )
+-            lineHeight = MT.CaptionLH,
+-        )
++        @Suppress("UNUSED_VARIABLE") val strongUnused = footerStrong
++    }
++}
++
++/** [Mines-38.9.5 i] small ⓘ (16 dp icon, 32 dp touch target) → the explanation in a glass dialog. Nothing on screen otherwise. */
++@Composable
++fun InfoDot(title: String, text: String, modifier: Modifier = Modifier) {
++    val m = mines()
++    var open by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
++    Box(modifier.size(32.dp).clip(CircleShape).clickable { open = true }.semantics { contentDescription = "说明：$title" },
++        contentAlignment = Alignment.Center) {
++        androidx.compose.material3.Icon(androidx.compose.material.icons.Icons.Outlined.Info, null, tint = m.ink2, modifier = Modifier.size(16.dp))
++    }
++    if (open) MinesDialog(title, onDismiss = { open = false }, dismiss = "知道了") {
++        Text(text, fontSize = MT.Body, lineHeight = MT.BodyLH, color = m.ink)
      }
-@@ -448,6 +524,36 @@ fun PillButton(text: String, modifier: Modifier = Modifier, primary: Boolean = t
+ }
+ 
+@@ -448,6 +537,36 @@ fun PillButton(text: String, modifier: Modifier = Modifier, primary: Boolean = t
      ) { Text(text, fontSize = MT.Button, fontWeight = FontWeight.SemiBold, color = fg, maxLines = 1, softWrap = false) }
  }
  
@@ -18350,7 +18879,7 @@ index afd2104..3f05958 100644
  private fun Modifier.graphicsLayerAlpha(a: Float): Modifier = if (a >= 1f) this else this.then(Modifier.graphicsLayer { alpha = a })
  
  /** Short hint line with an ⓘ, instead of long paragraphs. */
-@@ -547,3 +653,44 @@ fun rememberSoftBitmap(bmp: androidx.compose.ui.graphics.ImageBitmap?): androidx
+@@ -547,3 +666,44 @@ fun rememberSoftBitmap(bmp: androidx.compose.ui.graphics.ImageBitmap?): androidx
          b.asImageBitmap()
      }.getOrNull() ?: bmp
  }
@@ -18862,7 +19391,7 @@ index 0000000..3e3f1d6
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
-index 95d1b6b..27fffc1 100644
+index 95d1b6b..b607e0a 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
 @@ -1,6 +1,7 @@
@@ -19291,7 +19820,7 @@ index 95d1b6b..27fffc1 100644
 +            Text(k, fontSize = MT.Body, color = m.ink2, modifier = Modifier.width(72.dp)); Text(v, fontSize = MT.Body, color = c)
 +        }
 +        line("现在", "${Math.round(w.temp)}° $words")
-+        line("今天", "${Math.round(w.min)}° ~ ${Math.round(w.max)}° · 降水 ${w.rain}%")
++        line("今天", "${Math.round(w.min)}° ~ ${Math.round(w.max)}° · 降水 ${w.rainProb}%")
 +        val rainLine = w.soon.ifBlank { w.later }
 +        if (rainLine.isNotBlank()) line("下雨", rainLine, if (m.dark) MinesDesign.WarningDark else MinesDesign.Warning)
 +        if (src.isNotBlank()) line("位置", src)
@@ -19664,7 +20193,7 @@ index 0000000..b492416
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
-index c17bd02..ccb997e 100644
+index c17bd02..76f0b89 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
 @@ -9,6 +9,13 @@ import android.webkit.WebChromeClient
@@ -19700,7 +20229,7 @@ index c17bd02..ccb997e 100644
 +            if (!com.openminis.app.plus.WebSessionCore.finishAllowed(st) && st != com.openminis.app.plus.WebSessionCore.St.ERROR &&
 +                st != com.openminis.app.plus.WebSessionCore.St.UNCHECKED) {
 +                finished = false
-+                status = if (external || extBack) com.openminis.app.plus.WebSessionCore.chromeHint(kind.name) else "还没登录上：${kind.name} 还没给 Mines 登录凭证，登录完成后会自动关闭"
++                status = if (external || extBack) com.openminis.app.plus.WebSessionCore.chromeHint(kind.name) else "还没登录上"
 +                return false
 +            }
 +        }
@@ -21786,6 +22315,78 @@ index 0000000..e0b8644
 +        assertNull(KeychainCore.detectAlert("X", "x.com", "a", "Weekly digest", "hello", 0, "邮件"))
 +        assertTrue(KeychainCore.securityUrl("github.com").contains("settings/security"))
 +        assertTrue(KeychainCore.guideFor("okx.com").any { it.contains("提币") })
++    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/LoginMemoryCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/LoginMemoryCoreTest.kt
+new file mode 100644
+index 0000000..09bb83f
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/LoginMemoryCoreTest.kt
+@@ -0,0 +1,66 @@
++package com.openminis.app.plus
++
++import com.openminis.app.plus.LoginMemoryCore.Field
++import com.openminis.app.plus.LoginMemoryCore.Memo
++import com.openminis.app.plus.LoginMemoryCore.Method
++import com.openminis.app.plus.LoginMemoryCore.Page
++import com.openminis.app.plus.LoginMemoryCore.Step
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/** [Mines-38.9.5 i] remembered sign-ins + the secure login card (user 22:42 / 22:43). */
++class LoginMemoryCoreTest {
++    private fun memo(acct: String, m: Method, at: Long, session: Boolean = false, pw: Boolean = false, chosen: Boolean = false, via: String = "") =
++        Memo("notion.so", acct, m, via, session, chosen, pw, at)
++
++    @Test fun replayOrderSessionThenSilentThenCard() {
++        assertEquals(listOf(Step.REUSE_SESSION, Step.SILENT_RELOGIN, Step.CARD), LoginMemoryCore.replay(memo("a@b.com", Method.PASSWORD, 1, session = true, pw = true)))
++        assertEquals(listOf(Step.SILENT_RELOGIN, Step.CARD), LoginMemoryCore.replay(memo("a@b.com", Method.GOOGLE, 1)))
++        assertEquals(listOf(Step.REUSE_SESSION, Step.CARD), LoginMemoryCore.replay(memo("a@b.com", Method.PASSWORD, 1, session = true, pw = false)))
++        assertEquals(listOf(Step.CARD), LoginMemoryCore.replay(null))
++        assertEquals(Step.CARD, LoginMemoryCore.replay(memo("x", Method.CODE, 1)).last())
++    }
++
++    @Test fun recordThenReplayUsesWhatWorked() {
++        var l = LoginMemoryCore.record(emptyList(), memo("a@b.com", Method.CODE, 10, via = "Gmail"))
++        l = LoginMemoryCore.record(l, memo("A@b.com", Method.CODE, 20, session = true))
++        assertEquals(1, l.size)
++        assertEquals("Gmail", l[0].codeVia)          // mailbox kept when the later record did not know it
++        assertTrue(l[0].hasSession)
++        assertEquals(Step.REUSE_SESSION, LoginMemoryCore.replay(LoginMemoryCore.pick(l, "notion.so")).first())
++    }
++
++    @Test fun usersChoiceWinsAmongSeveralAccounts() {
++        var l = LoginMemoryCore.record(emptyList(), memo("old@b.com", Method.PASSWORD, 10, pw = true, chosen = true))
++        l = LoginMemoryCore.record(l, memo("new@b.com", Method.PASSWORD, 50, pw = true))
++        assertEquals("old@b.com", LoginMemoryCore.pick(l, "notion.so")!!.account)
++        l = LoginMemoryCore.record(l, memo("new@b.com", Method.PASSWORD, 60, pw = true, chosen = true))
++        assertEquals("new@b.com", LoginMemoryCore.pick(l, "notion.so")!!.account)
++        assertFalse(l.first { it.account == "old@b.com" }.chosen)
++        assertNull(LoginMemoryCore.pick(l, "github.com"))
++    }
++
++    @Test fun lastLineMasksAccount() {
++        assertEquals("上次用 sm***@example.com 登录 · 密码", LoginMemoryCore.lastLine(memo("smoke@example.com", Method.PASSWORD, 1)))
++        assertEquals("上次用 136****8658 登录 · 验证码（163 邮箱）", LoginMemoryCore.lastLine(memo("13690688658", Method.CODE, 1, via = "163 邮箱")))
++        assertNull(LoginMemoryCore.lastLine(null))
++    }
++
++    @Test fun cardAsksOnlyWhatThePageWants() {
++        val pw = Page("email", password = true, code = false)
++        assertEquals(listOf(Field.EMAIL, Field.PASSWORD), LoginMemoryCore.cardFields(pw, false, false, -1, false, "Notion")!!.fields)
++        assertEquals(listOf(Field.EMAIL, Field.PASSWORD), LoginMemoryCore.cardFields(pw, true, false, -1, false, "Notion")!!.fields)
++        assertNull(LoginMemoryCore.cardFields(pw, true, true, -1, false, "Notion"))
++        val phoneCode = Page("phone", password = false, code = true)
++        assertEquals(listOf(Field.PHONE), LoginMemoryCore.cardFields(phoneCode, false, false, -1, false, "豆包")!!.fields)
++        assertNull(LoginMemoryCore.cardFields(phoneCode, true, false, 10_000, false, "豆包"))          // still waiting for the mailbox / SMS
++        val code = LoginMemoryCore.cardFields(phoneCode, true, false, 31_000, false, "豆包")!!
++        assertEquals(listOf(Field.CODE), code.fields); assertEquals("输入验证码", code.title)
++        val r = LoginMemoryCore.cardFields(pw, true, true, -1, true, "Notion")!!
++        assertEquals("密码不对，重新输入", r.title); assertTrue(r.refused)
++        assertEquals(listOf(Field.EMAIL, Field.PASSWORD), r.fields)
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/MailConfigTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/MailConfigTest.kt
