@@ -3898,20 +3898,21 @@ def b3892_msg(res):
     st = settle(); o["before_state"] = st
     time.sleep(1.5)
     r = shot388("msg-before"); tb = _txt(r); o["before"] = tb[:500]
-    if "Smoke 新消息 #1" not in tb: selftest_fail.append(f"msg3892: open did not read the source (#1 missing) {st}")
+    # first load: nothing counts as new, so #1 sits in score order (may be below the fold) -> check the feed state
+    if "st:msg1" not in (st.get("smoke") or []): selftest_fail.append(f"msg3892: open did not read the source (#1 missing) {st}")
     if "Smoke 新消息 #2" in tb: selftest_fail.append("msg3892: #2 already there before the pull")
     # pull down from under the tabs
     sh(f"input swipe {w//2} {int(h*0.30)} {w//2} {int(h*0.78)} 700")
     time.sleep(0.6); rawshot("msg-pulling")
-    t0 = time.time(); ta = ""
-    for _ in range(40):
-        time.sleep(1.5)
-        ta = _txt(dump())
-        if "Smoke 新消息 #2" in ta and ("新到" in ta or "没有新消息" in ta): break
+    # the result line shows for 6 s: poll the (fast) feed state, then screenshot + dump at once (uiautomator dumps take seconds)
+    t0 = time.time(); st = {}
+    for _ in range(60):
+        st = state()
+        if "st:msg2" in (st.get("smoke") or []) and not st.get("busy"): break
+        time.sleep(0.5)
     o["pull_secs"] = round(time.time() - t0, 1)
-    r = shot388("msg-after"); ta2 = _txt(r); ta = ta2 if "新到" in ta2 or "没有新消息" in ta2 else ta + " " + ta2
-    o["after"] = ta[:600]
-    st = settle(); o["after_state"] = st
+    r = shot388("msg-after"); ta = _txt(r)
+    o["after"] = ta[:600]; o["after_state"] = st
     if "Smoke 新消息 #2" not in ta: selftest_fail.append(f"msg3892: pull did not bring the new card #2 {st}")
     if "新到" not in ta: selftest_fail.append("msg3892: no 「新到 N 条」 result line after the pull")
     if "163 授权码失效" not in ta: selftest_fail.append("msg3892: failed 163 box not named in the result line")
