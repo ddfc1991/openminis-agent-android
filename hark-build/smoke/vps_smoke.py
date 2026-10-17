@@ -3991,11 +3991,13 @@ def b3894_h(res):
             else: tap_text("answer-me-with-html", wait=3)
             shot388("mkt-plugin-intro")
             if tap_text("一键安装", exact=True, wait=3):
-                ok = False
-                for _ in range(60):
+                ok = False; t_end = time.time() + 300; seen = []
+                while time.time() < t_end:   # [h4] cap 5 min (13 min of slow dumps before); keep what the job pill/popup said
                     time.sleep(4); t = _txt(dump())
-                    if "失败" in t or "出错" in t: break
+                    seen += [x for x in ("正在安装", "安装中", "沙箱", "没成功", "失败", "出错", "完成", "已安装") if x in t and x not in seen]
+                    if "失败" in t or "出错" in t or "没成功" in t: break
                     if "完成" in t or "已安装" in t: ok = True; break
+                o["plugin_seen"] = seen
                 r = shot388("mkt-plugin-installing"); o["plugin_task"] = _txt(r)[-400:]
                 for lab in ("关闭", "完成", "好"):
                     if tap_text(lab, exact=True, wait=2): break
@@ -4033,7 +4035,7 @@ def b3894_h(res):
         o["a11y"] = result_json("group", "h394 a11y", timeout=30)
         A = o["a11y"] if isinstance(o["a11y"], dict) else {}
         if A and not A.get("running") and "已开启" in str(A.get("detail")): selftest_fail.append(f"a11y: says 已开启 while not running {A}")
-        route("plus_verify", 10); r = shot388("selfcheck"); t = _txt(r); o["selfcheck"] = t[:600]
+        route("plus_report", 8); tap_text("一键自检", wait=15); r = shot388("selfcheck"); t = _txt(r); o["selfcheck"] = t[:600]   # [h4] 自检 lives in 测试与上报, not 浏览器验证
         if "无障碍" in t and A and not A.get("running") and re.search(r"无障碍[^，。]{0,6}已开启", t): selftest_fail.append("a11y: 自检 page says 无障碍 已开启 while the service is not running")
         back(1)
     step("a11y", a11y)
