@@ -1177,10 +1177,10 @@ index 0000000..dcfc972
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/AgentMailbox.kt b/src/android/app/src/main/java/com/openminis/app/plus/AgentMailbox.kt
 new file mode 100644
-index 0000000..f54f19e
+index 0000000..4d53d44
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/AgentMailbox.kt
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,157 @@
 +package com.openminis.app.plus
 +
 +import android.content.Context
@@ -1255,6 +1255,7 @@ index 0000000..f54f19e
 +    fun ready(id: String): Boolean = when (id) {
 +        "mailtm" -> PlusVault.secretExtra(V, "mailtm_pass") != null && address("mailtm") != null
 +        "selfhost" -> false
++        "agmail" -> false   // key can be saved; its read API is not wired / verified yet — never claimed as a code source
 +        else -> key(id) != null
 +    }
 +
@@ -7969,10 +7970,10 @@ index 0000000..a098577
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/WorkspaceStore.kt b/src/android/app/src/main/java/com/openminis/app/plus/WorkspaceStore.kt
 new file mode 100644
-index 0000000..75dafde
+index 0000000..295d217
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/WorkspaceStore.kt
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,204 @@
 +package com.openminis.app.plus
 +
 +import android.app.NotificationChannel
@@ -8031,6 +8032,8 @@ index 0000000..75dafde
 +        return WorkspaceCore.primary(ids, GroupPrefs.get(PRIMARY))
 +    }
 +    fun setPrimary(id: String) = GroupPrefs.put(PRIMARY, id)
++    /** Re-emits the list so cards re-read the 主设备 after [setPrimary]. */
++    fun touch() { _metas.value = _metas.value.toList() }
 +
 +    /** Servers with the 主设备 first (used by PlusVps.orderedTargets). */
 +    fun primaryFirst(list: List<VpsServer>): List<VpsServer> {
@@ -11585,7 +11588,7 @@ index 0000000..71ab22c
 +/** For self-hosted services whose sign-in is a web page: no Mines-made form. */
 +fun usesSiteLogin(id: String): Boolean = PresetRegistry.loginFlowOf(id) is com.openminis.app.plus.group.LoginFlow.PasswordJwt
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt b/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
-index fff9cbd..38c142f 100644
+index fff9cbd..972a665 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
 @@ -533,6 +533,11 @@ fun AppNavigation(
@@ -11600,7 +11603,17 @@ index fff9cbd..38c142f 100644
          com.openminis.app.ui.plus.PlusNav.pending?.let { r ->
              com.openminis.app.ui.plus.PlusNav.pending = null
              navController.safeNavigate(r)
-@@ -700,12 +705,32 @@ fun AppNavigation(
+@@ -688,6 +693,9 @@ fun AppNavigation(
+         composable(com.openminis.app.ui.plus.PlusRoutes.VOICE_SETTINGS) {
+             com.openminis.app.ui.plus.VoiceSettingsScreen(onBack = { navController.safePopBackStack() })
+         }
++        composable(com.openminis.app.ui.plus.PlusRoutes.CODESRC) {
++            com.openminis.app.ui.plus.CodeSourcesScreen(onBack = { navController.safePopBackStack() })
++        }
+         composable(com.openminis.app.ui.plus.PlusRoutes.CARDS) {
+             com.openminis.app.ui.plus.PayCardsScreen(onBack = { navController.safePopBackStack() })
+         }
+@@ -700,12 +708,32 @@ fun AppNavigation(
          composable(com.openminis.app.ui.plus.PlusRoutes.UPDATE) {
              com.openminis.app.ui.plus.UpdateScreen(onBack = { navController.safePopBackStack() })
          }
@@ -12139,6 +12152,209 @@ index 0000000..ffa23c0
 +            modifier = Modifier.padding(start = 6.dp))
 +        if (!t.running) Text("关闭", fontSize = 13.sp, color = m.ink2, modifier = Modifier.clickable(onClick = onClose).padding(6.dp))
 +    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/CodeSourcesScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/CodeSourcesScreen.kt
+new file mode 100644
+index 0000000..48d6b1f
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/CodeSourcesScreen.kt
+@@ -0,0 +1,197 @@
++package com.openminis.app.ui.plus
++
++import android.widget.Toast
++import androidx.compose.foundation.background
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.semantics.contentDescription
++import androidx.compose.ui.semantics.semantics
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.input.PasswordVisualTransformation
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import com.openminis.app.browser.GoogleAuthRouter
++import com.openminis.app.plus.AgentMailbox
++import com.openminis.app.plus.CodeSources
++import com.openminis.app.plus.CodeSourcesCore
++import com.openminis.app.ui.brand.MinesIcon
++import com.openminis.app.ui.brand.MinesIcons
++import kotlinx.coroutines.launch
++
++/**
++ * [Mines-38.9.5 i] 「验证码与 AI 邮箱」 (账号与 AI 服务 › 账号). user 19:34–19:36:
++ *  - 验证码来源 (default): the user's own linked mailboxes, one switch each; Mines reads only recent mail of the site it
++ *    is signing into and takes only the code / link (never stores the mail). The last codes are shown masked.
++ *  - AI 邮箱: ready-made agent mailboxes with their free limits — AgentMail (key), AGmail (key), Mail.tm (临时 · 一次性,
++ *    attribution link). No paid self-run mailbox.
++ *  - 高级 · 可选: 自建域名 / Cloudflare, hidden until the user opens it; shows 未开通 (no fake data).
++ * Small type, short written wording (user: 不要大字, 少大白话).
++ */
++@Composable
++fun CodeSourcesScreen(onBack: () -> Unit) {
++    val ctx = LocalContext.current
++    val m = mines()
++    val scope = rememberCoroutineScope()
++    var rev by remember { mutableIntStateOf(0) }
++    val boxes = remember(rev) { runCatching { CodeSources.all(ctx) }.getOrDefault(emptyList()) }
++    val seen by CodeSources.seen.collectAsState()
++    var keyFor by remember { mutableStateOf<CodeSourcesCore.Provider?>(null) }
++    var busy by remember { mutableStateOf<String?>(null) }
++    var showAdv by remember { mutableStateOf(false) }
++
++    PlusPage("验证码与 AI 邮箱", onBack) {
++        PlusSection("验证码来源", footer = "登录需要验证码时，只读取该网站最近 10 分钟的邮件，只取验证码或登录链接，不保存邮件内容。") {
++            val own = boxes.filter { !it.first.id.startsWith("ai:") }
++            if (own.isEmpty()) PlusRow(MinesIcons.named("mail"), "暂无关联邮箱", "在「账号」中添加 Gmail（应用专用密码）或 163 / QQ（授权码）", chevron = false)
++            own.forEachIndexed { i, (b, on) ->
++                if (i > 0) CsDivider()
++                PlusRow(MinesIcons.named("mail"), b.label, b.how, chevron = false, trailing = {
++                    MinesSwitch(on, (if (on) "关闭 " else "打开 ") + b.label + " 作为验证码来源") { v -> CodeSources.setOn(b.id, v); rev++ }
++                })
++            }
++        }
++        if (seen.isNotEmpty()) PlusSection("最近读取") {
++            seen.forEachIndexed { i, s ->
++                if (i > 0) CsDivider()
++                PlusRow(MinesIcons.named("key-round"), "${s.site} · ${s.masked}", "${s.source} · ${csAgo(s.at)}", chevron = false)
++            }
++        }
++
++        PlusSection("AI 邮箱", footer = "供 Mines 注册网站时收验证码，均为免费档。在官网注册后填入 API Key，Key 加密存在本机。") {
++            val list = CodeSourcesCore.PROVIDERS.filter { !it.advanced }
++            list.forEachIndexed { i, p ->
++                if (i > 0) CsDivider()
++                CsProviderRow(p, rev, busy == p.id,
++                    onOpen = { GoogleAuthRouter.openInCustomTab(ctx, p.url) },
++                    onKey = { keyFor = p },
++                    onOpenMailTm = {
++                        busy = p.id
++                        scope.launch {
++                            val why = AgentMailbox.openMailTm(); busy = null; rev++
++                            Toast.makeText(ctx, why ?: "已开通：${AgentMailbox.address("mailtm")}", Toast.LENGTH_SHORT).show()
++                        }
++                    },
++                    onDisconnect = { AgentMailbox.disconnect(p.id); rev++ },
++                )
++            }
++            Text("Mail.tm 临时邮箱由 mail.tm 提供", fontSize = MT.Meta, color = m.primaryText,
++                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp).clickable { GoogleAuthRouter.openInCustomTab(ctx, "https://mail.tm") }
++                    .semantics { contentDescription = "打开 mail.tm 官网" })
++        }
++
++        Row(Modifier.fillMaxWidth().clickable { showAdv = !showAdv }.padding(horizontal = 26.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
++            Text("高级 · 可选", fontSize = MT.Meta, color = m.ink2, modifier = Modifier.weight(1f))
++            MinesIcon(MinesIcons.named(if (showAdv) "chevron-up" else "chevron-down")!!, if (showAdv) "收起高级选项" else "展开高级选项", tint = m.ink3, modifier = Modifier.size(16.dp))
++        }
++        if (showAdv) PlusSection(null, footer = "需要自己的域名和 Cloudflare 账号；多数用户不需要。") {
++            CodeSourcesCore.PROVIDERS.filter { it.advanced }.forEach { p ->
++                PlusRow(MinesIcons.named("globe"), p.name, p.limits, value = "未开通", chevron = false)
++            }
++        }
++        Spacer(Modifier.size(24.dp))
++    }
++
++    keyFor?.let { p ->
++        var text by remember(p.id) { mutableStateOf("") }
++        var err by remember(p.id) { mutableStateOf<String?>(null) }
++        AlertDialog(
++            onDismissRequest = { keyFor = null },
++            title = { Text("${p.name} API Key", fontSize = MT.PageTitle) },
++            text = {
++                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
++                    Text(p.note.ifBlank { "在官网控制台创建后粘贴" }, fontSize = MT.Sub, color = m.ink2)
++                    OutlinedTextField(text, { text = it.trim(); err = null }, singleLine = true, visualTransformation = PasswordVisualTransformation(),
++                        placeholder = { Text("粘贴 API Key", fontSize = MT.Sub) }, modifier = Modifier.fillMaxWidth())
++                    err?.let { Text(it, fontSize = MT.Sub, color = toneColors(Tone.DANGER).first) }
++                }
++            },
++            confirmButton = {
++                TextButton(enabled = busy == null, onClick = {
++                    if (!AgentMailbox.looksLikeKey(text)) { err = "格式不对"; return@TextButton }
++                    if (p.id == "agentmail") {
++                        busy = p.id
++                        scope.launch {
++                            val why = AgentMailbox.connectAgentMail(text); busy = null
++                            if (why == null) { keyFor = null; rev++; Toast.makeText(ctx, "已开通：${AgentMailbox.address("agentmail")}", Toast.LENGTH_SHORT).show() } else err = why
++                        }
++                    } else { AgentMailbox.setKey(p.id, text); keyFor = null; rev++ }
++                }) { Text(if (busy == p.id) "验证中…" else "保存") }
++            },
++            dismissButton = { TextButton(onClick = { keyFor = null }) { Text("取消") } },
++        )
++    }
++}
++
++@Composable
++private fun CsProviderRow(
++    p: CodeSourcesCore.Provider, rev: Int, busy: Boolean,
++    onOpen: () -> Unit, onKey: () -> Unit, onOpenMailTm: () -> Unit, onDisconnect: () -> Unit,
++) {
++    val m = mines()
++    val ready = remember(rev) { AgentMailbox.ready(p.id) }
++    val keyOnly = remember(rev) { !ready && AgentMailbox.key(p.id) != null }
++    val addr = remember(rev) { AgentMailbox.address(p.id) }
++    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp)) {
++        Row(verticalAlignment = Alignment.CenterVertically) {
++            Text(p.name, fontSize = MT.Body, fontWeight = FontWeight.Medium, color = m.ink)
++            if (p.temporary) { Spacer(Modifier.width(6.dp)); CsTag("临时 · 一次性", Tone.WARNING) }
++            Spacer(Modifier.weight(1f))
++            when {
++                ready -> CsTag("已开通", Tone.SUCCESS)
++                keyOnly -> CsTag("已存 Key", Tone.NEUTRAL)
++                else -> CsTag("未开通", Tone.NEUTRAL)
++            }
++        }
++        Text(p.limits, fontSize = MT.Sub, color = m.ink2, modifier = Modifier.padding(top = 2.dp))
++        if (ready && addr != null) Text(addr, fontSize = MT.Sub, color = m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis)
++        if (keyOnly) Text("读码接口尚未接通（未验证）", fontSize = MT.Sub, color = m.ink3)
++        Row(Modifier.padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++            if (ready || keyOnly) SmallPill("断开") { onDisconnect() }
++            else if (p.needsKey) { SmallPill("打开官网") { onOpen() }; SmallPill("填 API Key") { onKey() } }
++            else SmallPill(if (busy) "开通中…" else "开通临时邮箱") { if (!busy) onOpenMailTm() }
++        }
++    }
++}
++
++@Composable
++private fun CsTag(text: String, tone: Tone) {
++    val (fg, bg) = toneColors(tone)
++    Text(text, fontSize = MT.Meta, color = fg, fontWeight = FontWeight.Medium,
++        modifier = Modifier.clip(RoundedCornerShape(50)).background(bg).padding(horizontal = 8.dp, vertical = 2.dp))
++}
++
++@Composable
++private fun CsDivider() {
++    val m = mines()
++    androidx.compose.foundation.layout.Box(Modifier.padding(horizontal = 16.dp).fillMaxWidth().height(1.dp).background(m.hairline))
++}
++
++private fun csAgo(at: Long): String {
++    val s = ((System.currentTimeMillis() - at) / 1000).coerceAtLeast(0)
++    return when { s < 60 -> "刚刚"; s < 3600 -> "${s / 60} 分钟前"; else -> "${s / 3600} 小时前" }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
 index 6a136a6..d9840b6 100644
@@ -16499,7 +16715,7 @@ index 92e996b..216510e 100644
      val Button = 15.sp         // all buttons
      val BodyLH = 22.sp; val SubLH = 18.sp; val CaptionLH = 18.sp
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
-index afd2104..6f7132b 100644
+index afd2104..6f099de 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
 @@ -1,5 +1,9 @@
@@ -16535,7 +16751,7 @@ index afd2104..6f7132b 100644
      fun go(route: String) { navigate?.invoke(route) ?: run { pending = route } }
  }
  
-@@ -110,6 +121,13 @@ object PlusRoutes {
+@@ -110,7 +121,15 @@ object PlusRoutes {
      const val DIGEST = "plus_digest"
      const val CARDS = "plus_cards"
      const val VOICE_SETTINGS = "plus_voice_settings"
@@ -16547,9 +16763,11 @@ index afd2104..6f7132b 100644
 +    const val LOOK = "plus_look"
 +    const val EXPERIENCE = "plus_experience"
      const val SERVER = "plus_server/{id}"
++    const val CODESRC = "plus_code_sources"   // [Mines-38.9.5 i] 验证码与 AI 邮箱
      fun server(id: String) = "plus_server/$id"
  }
-@@ -183,8 +201,9 @@ fun ChatWallpaperLayer(modifier: Modifier = Modifier, home: Boolean = false) {
+ 
+@@ -183,8 +202,9 @@ fun ChatWallpaperLayer(modifier: Modifier = Modifier, home: Boolean = false) {
          }
          val veil = if (dark) Color(0xFF14110F) else Color(0xFFF6F2EC)
          val userDim = st.wallpaperDim.coerceIn(0f, 0.95f)
@@ -16561,7 +16779,7 @@ index afd2104..6f7132b 100644
          Box(Modifier.fillMaxSize().background(Brush.verticalGradient(
              0f to veil.copy(alpha = top), 0.16f to veil.copy(alpha = top), 0.30f to veil.copy(alpha = body), 1f to veil.copy(alpha = body))))
      }
-@@ -196,8 +215,7 @@ fun ChatWallpaperLayer(modifier: Modifier = Modifier, home: Boolean = false) {
+@@ -196,8 +216,7 @@ fun ChatWallpaperLayer(modifier: Modifier = Modifier, home: Boolean = false) {
   * unchanged otherwise.
   */
  @Composable
@@ -16571,7 +16789,7 @@ index afd2104..6f7132b 100644
  
  /** True when a wallpaper is drawn on this screen (bars then go translucent). */
  @Composable
-@@ -266,6 +284,8 @@ fun MinesBackdrop(modifier: Modifier = Modifier) {
+@@ -266,6 +285,8 @@ fun MinesBackdrop(modifier: Modifier = Modifier) {
          Box(modifier) {
              PorcelainBackdrop(Modifier.fillMaxSize())
              ChatWallpaperLayer(Modifier.fillMaxSize(), home = true)
@@ -16580,7 +16798,7 @@ index afd2104..6f7132b 100644
          }
      } else PorcelainBackdrop(modifier)
  }
-@@ -273,11 +293,13 @@ fun MinesBackdrop(modifier: Modifier = Modifier) {
+@@ -273,11 +294,13 @@ fun MinesBackdrop(modifier: Modifier = Modifier) {
  @OptIn(ExperimentalMaterial3Api::class)
  @Composable
  fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, actions: (@Composable () -> Unit)? = null,
@@ -16595,7 +16813,7 @@ index afd2104..6f7132b 100644
          Scaffold(
              containerColor = Color.Transparent,
              topBar = {
-@@ -293,40 +315,66 @@ fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, action
+@@ -293,40 +316,66 @@ fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, action
                      colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent, scrolledContainerColor = Color.Transparent),
                  )
              },
@@ -16671,7 +16889,7 @@ index afd2104..6f7132b 100644
  }
  
  /** A frosted 22 dp card (no blur pass: translucent fill + 1 dp highlight + soft warm shadow). */
-@@ -334,9 +382,16 @@ fun minesGlassFill(strong: Boolean = false): Color {
+@@ -334,9 +383,16 @@ fun minesGlassFill(strong: Boolean = false): Color {
  fun MinesCard(modifier: Modifier = Modifier, strong: Boolean = false, onClick: (() -> Unit)? = null, content: @Composable ColumnScope.() -> Unit) {
      val m = mines()
      val shape = RoundedCornerShape(MS.CardRadius)
@@ -16690,7 +16908,7 @@ index afd2104..6f7132b 100644
              .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier),
          content = content,
      )
-@@ -344,10 +399,13 @@ fun MinesCard(modifier: Modifier = Modifier, strong: Boolean = false, onClick: (
+@@ -344,10 +400,13 @@ fun MinesCard(modifier: Modifier = Modifier, strong: Boolean = false, onClick: (
  
  @Composable
  fun PlusSection(title: String?, footer: String? = null, action: String? = null, onAction: (() -> Unit)? = null,
@@ -16705,7 +16923,7 @@ index afd2104..6f7132b 100644
              Text(title, fontSize = MT.Section, color = m.ink2, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f), maxLines = 1,
                  overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
              if (action != null && onAction != null) Text(action, fontSize = MT.Sub, color = m.primaryText, fontWeight = FontWeight.Medium,
-@@ -358,9 +416,10 @@ fun PlusSection(title: String?, footer: String? = null, action: String? = null,
+@@ -358,9 +417,10 @@ fun PlusSection(title: String?, footer: String? = null, action: String? = null,
          }
          if (footer != null) Text(
              footer,
@@ -16719,7 +16937,7 @@ index afd2104..6f7132b 100644
              lineHeight = MT.CaptionLH,
          )
      }
-@@ -448,6 +507,36 @@ fun PillButton(text: String, modifier: Modifier = Modifier, primary: Boolean = t
+@@ -448,6 +508,36 @@ fun PillButton(text: String, modifier: Modifier = Modifier, primary: Boolean = t
      ) { Text(text, fontSize = MT.Button, fontWeight = FontWeight.SemiBold, color = fg, maxLines = 1, softWrap = false) }
  }
  
@@ -16914,12 +17132,41 @@ index 0000000..360b3d3
 +    RouteStatusCore.St.WARN -> Color(0xFFE07B39)
 +    RouteStatusCore.St.UNCHECKED -> Color(0xFF8A8A8A)
 +}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt
+index 4ee1029..4297702 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt
+@@ -147,6 +147,24 @@ fun ServerDetailScreen(serverId: String, onBack: () -> Unit, onOpenTerminal: (St
+             }
+         }
+         LinkSection(server)
++        // [Mines-38.9.5 i] 在跑什么 (read-only probe: ps / ss / docker ps / systemctl, ≤ every 30 min) + 到期 / 限制 / IP 归属地
++        run {
++            remember { com.openminis.app.plus.WorkspaceStore.init(context); 0 }
++            val metas by com.openminis.app.plus.WorkspaceStore.metas.collectAsState()
++            val meta = metas.firstOrNull { it.id == server.id }
++            val now = remember(metas) { System.currentTimeMillis() }
++            LaunchedEffect(server.id) { runCatching { com.openminis.app.plus.WorkspaceStore.probeRunningAsync(context, server) } }
++            PlusSection("在跑什么", footer = "只读检测，不改动服务器上的任何程序。") {
++                val lines = meta?.let { com.openminis.app.plus.WorkspaceCore.cardLines(it, now) }.orEmpty()
++                lines.forEach { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(horizontal = 16.dp, vertical = 3.dp)) }
++                val items = meta?.running.orEmpty()
++                if (items.isEmpty()) Text(if (meta?.runningAt ?: 0L > 0L) "没有发现在跑的服务" else "检测中…", style = MaterialTheme.typography.bodySmall,
++                    color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
++                items.forEach { Text("• $it", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp)) }
++                meta?.notes?.forEach { Text("备注：$it", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp)) }
++                Spacer(Modifier.padding(4.dp))
++            }
++        }
+         PlusSection("操作") {
+             Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                 val entry = "${server.user}@${server.host}:${server.port}" +
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/TaskProgressUi.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/TaskProgressUi.kt
 new file mode 100644
-index 0000000..e14d035
+index 0000000..3e3f1d6
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/TaskProgressUi.kt
-@@ -0,0 +1,272 @@
+@@ -0,0 +1,273 @@
 +package com.openminis.app.ui.plus
 +
 +import android.os.Build
@@ -16959,6 +17206,7 @@ index 0000000..e14d035
 +import androidx.compose.runtime.collectAsState
 +import androidx.compose.runtime.getValue
 +import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
 +import androidx.compose.ui.Alignment
 +import androidx.compose.ui.Modifier
 +import androidx.compose.ui.draw.clip
@@ -18055,7 +18303,7 @@ index c17bd02..a2babae 100644
 +/** [Mines-38.8] porcelain glass base for the sign-in page chrome (same as the light glass veil). */
 +private val PORCELAIN = androidx.compose.ui.graphics.Color(0xFFFBF7F2)
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt
-index 5f57c45..a10bc08 100644
+index 5f57c45..92f443a 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt
 @@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Row
@@ -18126,16 +18374,19 @@ index 5f57c45..a10bc08 100644
              if (st.servers.size > 1) {
                  PlusDivider()
                  // [Mines-keys-32] Termix-style one tap: put the phone's key on every server
-@@ -192,7 +193,7 @@ fun WorkLocationScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onO
+@@ -192,7 +193,10 @@ fun WorkLocationScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onO
              }
          }
  
 -        PlusSection("连接", footer = "所有服务器都连不上时，自动回到本机继续，不会卡住。") {
++        // [Mines-38.9.5 i] cloud browsers / remote desktops the agent registered (workspace_register)
++        WsOtherSection()
++
 +        PlusSection("连接", footer = "所有服务器都连不上时，自动回到本机继续，不会卡住。", footerStrong = true) {
              Row(
                  Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
                  verticalAlignment = Alignment.CenterVertically,
-@@ -211,7 +212,7 @@ fun WorkLocationScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onO
+@@ -211,7 +215,7 @@ fun WorkLocationScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onO
      authorizing?.let { srv ->
          AuthorizeDialog(srv, onDismiss = { authorizing = null; check() })
      }
@@ -18144,7 +18395,7 @@ index 5f57c45..a10bc08 100644
  
      if (adding || editing != null) {
          ServerDialog(
-@@ -295,50 +296,83 @@ private fun ModeCard(
+@@ -295,50 +299,96 @@ private fun ModeCard(
  }
  
  @Composable
@@ -18155,6 +18406,12 @@ index 5f57c45..a10bc08 100644
 +    // [Mines-38.9.4] alignment: dot centred on the title line; 编辑 + switch centred on the title block
 +    // (name + address line); everything below (reason, 信任新指纹, 测试连接) starts at the title's left edge.
 +    val hostKeyChanged = s.lastError.contains("指纹变了")
++    // [Mines-38.9.5 i] 工作位置 card: provider / account, 到期, 限制, 费用, IP 归属地, 凭据 (vault ref only), 在跑什么
++    remember { com.openminis.app.plus.WorkspaceStore.init(rowCtx); 0 }
++    val metas by com.openminis.app.plus.WorkspaceStore.metas.collectAsState()
++    val meta = metas.firstOrNull { it.id == s.id }
++    val now = remember(metas) { System.currentTimeMillis() }
++    val isPrimary = remember(metas, s.id) { com.openminis.app.plus.WorkspaceStore.primaryId() == s.id }
      Row(
 -        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 12.dp),
 -        verticalAlignment = Alignment.CenterVertically,
@@ -18191,7 +18448,12 @@ index 5f57c45..a10bc08 100644
 -            )
 +            Row(verticalAlignment = Alignment.CenterVertically) {
 +                Column(Modifier.weight(1f)) {
-+                    Text(s.name.ifBlank { s.host }, style = MaterialTheme.typography.bodyLarge)
++                    // [Mines-38.9.5 i] 主设备 tag next to the name
++                    Row(verticalAlignment = Alignment.CenterVertically) {
++                        Text(s.name.ifBlank { s.host }, style = MaterialTheme.typography.bodyLarge)
++                        if (isPrimary) { Spacer(Modifier.width(6.dp)); WsTag("主设备", Tone.ACCENT) }
++                        if (meta != null && com.openminis.app.plus.WorkspaceCore.expired(meta, now)) { Spacer(Modifier.width(6.dp)); WsTag("已到期", Tone.DANGER) }
++                    }
 +                    // [Mines-38.9.3] 「· 1 / ms ·」 wrapped mid-token: each part keeps its own spaces (NBSP), lines break only between parts;
 +                    // a 1–4 ms "direct" time while a VPN / TUN is on is the phone's tunnel → 经代理
 +                    val parts = listOf("${s.target}:${s.port}") + when {
@@ -18213,6 +18475,7 @@ index 5f57c45..a10bc08 100644
 +                TextButton(onClick = onEdit) { Text("编辑") }
 +                Switch(s.enabled, onCheckedChange = onToggle)
 +            }
++            if (meta != null) WsMetaLines(meta, now)
              // [Mines-vps-link] Say why, not just 连不上. [Mines-vps-28] with the failure class first.
 -            if (s.enabled && s.lastError.isNotBlank() && (s.lastLatencyMs == -2 || !s.authorized)) {
 -                Text("原因：" + PlusVps.kind(s.lastError) + " · " + s.lastError, style = MaterialTheme.typography.bodySmall, color = Red, maxLines = 3,
@@ -18240,6 +18503,7 @@ index 5f57c45..a10bc08 100644
 +                    if (hostKeyChanged) Button(onClick = onTrustKey, modifier = Modifier.heightIn(min = 40.dp)) { Text("信任新指纹") }
 +                    ServerLink("测试连接", onTest)
 +                    if (!s.authorized && s.lastLatencyMs >= 0 && !hostKeyChanged) ServerLink("授权（输一次密码）", onAuthorize)
++                    if (!isPrimary) ServerLink("设为主设备") { com.openminis.app.plus.WorkspaceStore.setPrimary(s.id); com.openminis.app.plus.WorkspaceStore.touch() }
                  }
              }
          }
@@ -18256,7 +18520,7 @@ index 5f57c45..a10bc08 100644
      }
  }
  
-@@ -486,7 +520,7 @@ internal fun safeToast(context: android.content.Context, text: String) {
+@@ -486,7 +536,7 @@ internal fun safeToast(context: android.content.Context, text: String) {
   * fastest route that works (a proxy route is saved as the server's relay).
   */
  @Composable
@@ -18265,7 +18529,7 @@ index 5f57c45..a10bc08 100644
      val context = LocalContext.current
      var tries by remember { mutableStateOf<List<PlusVps.RouteTry>?>(null) }
      var summary by remember { mutableStateOf<String?>(null) }
-@@ -513,8 +547,9 @@ internal fun TestRoutesDialog(server: VpsServer, onDismiss: () -> Unit) {
+@@ -513,8 +563,9 @@ internal fun TestRoutesDialog(server: VpsServer, onDismiss: () -> Unit) {
                  } else {
                      t.forEach { r ->
                          Text(
@@ -18277,7 +18541,7 @@ index 5f57c45..a10bc08 100644
                              color = if (r.ok) Green else Red, style = MaterialTheme.typography.bodyMedium,
                          )
                      }
-@@ -522,10 +557,42 @@ internal fun TestRoutesDialog(server: VpsServer, onDismiss: () -> Unit) {
+@@ -522,10 +573,42 @@ internal fun TestRoutesDialog(server: VpsServer, onDismiss: () -> Unit) {
                  }
              }
          },
@@ -18321,7 +18585,7 @@ index 5f57c45..a10bc08 100644
  
  /**
   * [Mines-keys-32] 一键给所有服务器装钥匙: tries each server with the phone's key;
-@@ -540,7 +607,10 @@ private fun BatchKeyRow(servers: List<com.openminis.app.plus.VpsServer>) {
+@@ -540,7 +623,10 @@ private fun BatchKeyRow(servers: List<com.openminis.app.plus.VpsServer>) {
      var msg by remember { mutableStateOf<String?>(null) }
      var need by remember { mutableStateOf<List<com.openminis.app.plus.VpsServer>>(emptyList()) }
      var pw by remember { mutableStateOf("") }
@@ -18333,7 +18597,7 @@ index 5f57c45..a10bc08 100644
          busy = true; msg = "正在逐台检查钥匙…"
          scope.launch {
              val res = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-@@ -553,10 +623,7 @@ private fun BatchKeyRow(servers: List<com.openminis.app.plus.VpsServer>) {
+@@ -553,10 +639,7 @@ private fun BatchKeyRow(servers: List<com.openminis.app.plus.VpsServer>) {
              busy = false
              msg = if (need.isEmpty()) "全部 $ok 台都已经装好钥匙" else "$ok 台已装好，${need.size} 台还需要输一次密码"
          }
@@ -18345,6 +18609,63 @@ index 5f57c45..a10bc08 100644
      if (need.isNotEmpty() && !busy) AlertDialog(
          onDismissRequest = { need = emptyList() },
          title = { Text("输入服务器密码") },
+@@ -585,3 +668,56 @@ private fun BatchKeyRow(servers: List<com.openminis.app.plus.VpsServer>) {
+         dismissButton = { TextButton(onClick = { need = emptyList() }) { Text("取消") } },
+     )
+ }
++
++
++// ---------------- [Mines-38.9.5 i] 工作位置 new fields ----------------
++
++@Composable
++private fun WsTag(text: String, tone: Tone) {
++    val (fg, bg) = toneColors(tone)
++    Text(text, fontSize = MT.Meta, color = fg, fontWeight = FontWeight.Medium,
++        modifier = Modifier.clip(RoundedCornerShape(50)).background(bg).padding(horizontal = 7.dp, vertical = 1.dp))
++}
++
++@Composable
++private fun WsMetaLines(m: com.openminis.app.plus.WorkspaceCore.Meta, now: Long) {
++    val expired = com.openminis.app.plus.WorkspaceCore.expired(m, now)
++    val ink = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (expired) 0.6f else 1f)
++    com.openminis.app.plus.WorkspaceCore.cardLines(m, now).forEach { line ->
++        Text(line, style = MaterialTheme.typography.bodySmall, color = if (line.startsWith("到期") && expired) Red else ink, modifier = Modifier.padding(top = 2.dp))
++    }
++    if (m.running.isNotEmpty()) Text("在跑：" + m.running.take(6).joinToString("、") + if (m.running.size > 6) " 等 ${m.running.size} 项" else "",
++        style = MaterialTheme.typography.bodySmall, color = ink, maxLines = 3, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 2.dp))
++    if (m.notes.isNotEmpty()) Text("备注：" + m.notes.takeLast(3).joinToString("；"), style = MaterialTheme.typography.bodySmall, color = ink,
++        maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 2.dp))
++}
++
++@Composable
++private fun WsOtherSection() {
++    val c = LocalContext.current
++    remember { com.openminis.app.plus.WorkspaceStore.init(c); 0 }
++    val metas by com.openminis.app.plus.WorkspaceStore.metas.collectAsState()
++    val others = metas.filter { it.kind != com.openminis.app.plus.WorkspaceCore.Kind.SERVER }
++    if (others.isEmpty()) return
++    val now = remember(metas) { System.currentTimeMillis() }
++    val primary = remember(metas) { com.openminis.app.plus.WorkspaceStore.primaryId() }
++    PlusSection("电脑与云浏览器", footer = "Mines 注册或领到的会自动加到这里，到期前会提醒。") {
++        others.forEachIndexed { i, m ->
++            if (i > 0) PlusDivider()
++            Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp)) {
++                Row(verticalAlignment = Alignment.CenterVertically) {
++                    Text(m.name.ifBlank { m.host }, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f, fill = false))
++                    Spacer(Modifier.width(6.dp)); WsTag(m.kind.label, Tone.NEUTRAL)
++                    if (primary == m.id) { Spacer(Modifier.width(6.dp)); WsTag("主设备", Tone.ACCENT) }
++                    if (com.openminis.app.plus.WorkspaceCore.expired(m, now)) { Spacer(Modifier.width(6.dp)); WsTag("已到期", Tone.DANGER) }
++                }
++                if (m.host.isNotBlank() && m.name.isNotBlank()) Text(m.host, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
++                WsMetaLines(m, now)
++                Row(Modifier.padding(top = 2.dp), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
++                    if (primary != m.id) ServerLink("设为主设备") { com.openminis.app.plus.WorkspaceStore.setPrimary(m.id); com.openminis.app.plus.WorkspaceStore.touch() }
++                    ServerLink("移除") { com.openminis.app.plus.WorkspaceStore.remove(m.id) }
++                }
++            }
++        }
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/sandbox/FilePreviewScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/sandbox/FilePreviewScreen.kt
 index 18df8e8..3b20621 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/sandbox/FilePreviewScreen.kt
@@ -18799,7 +19120,7 @@ index 06838e8..e251e33 100644
              if (groups.isEmpty()) {
                  item("empty_state") {
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt
-index c053468..3484d5d 100644
+index c053468..067e835 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsScreen.kt
 @@ -3,6 +3,9 @@ package com.openminis.app.ui.settings
@@ -18897,7 +19218,7 @@ index c053468..3484d5d 100644
                  SettingsItem(icon = Icons.Outlined.Shield, iconColor = Color(0xFF007AFF), title = "手机权限",
                      subtitle = "开了哪些、用来做什么，没开的一步步带你开",
                      onClick = { onPlusClick(com.openminis.app.ui.plus.PermGuide.ROUTE) })
-@@ -234,8 +249,8 @@ fun SettingsScreen(
+@@ -234,11 +249,19 @@ fun SettingsScreen(
                  SettingsItem(
                      icon = Icons.Outlined.Key,
                      iconColor = Color(0xFFFF9500),
@@ -18908,7 +19229,18 @@ index c053468..3484d5d 100644
                      alert = if (acctTodo > 0) "$acctTodo 个要处理" else null,
                      onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.CONNECTIONS) },
                  )
-@@ -262,6 +277,14 @@ fun SettingsScreen(
++                // [Mines-38.9.5 i] 验证码来源 + AI 邮箱
++                SettingsItem(
++                    icon = Icons.Outlined.Email,
++                    iconColor = Color(0xFF34AADC),
++                    title = "验证码与 AI 邮箱",
++                    subtitle = "登录时从你的邮箱读验证码；给 Mines 一个收码邮箱",
++                    onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.CODESRC) },
++                )
+                 SettingsItem(
+                     icon = Icons.Outlined.VerifiedUser,
+                     iconColor = Color(0xFF5856D6),
+@@ -262,6 +285,14 @@ fun SettingsScreen(
                      title = "插件",
                      subtitle = "安装 dsh 插件，给 AI 加新工具",
                      onClick = { onPlusClick(com.openminis.app.ui.plus.PlusRoutes.PLUGINS) },
@@ -18923,7 +19255,7 @@ index c053468..3484d5d 100644
                      showDivider = false,
                  )
              }
-@@ -394,6 +417,17 @@ fun SettingsScreen(
+@@ -394,6 +425,17 @@ fun SettingsScreen(
              }
  
              if (grp == "look") {
@@ -18941,7 +19273,7 @@ index c053468..3484d5d 100644
              // -- Appearance --
              SettingsSection(title = stringResource(R.string.settings_section_appearance)) {
                  SettingsItem(
-@@ -765,7 +799,7 @@ private fun SettingsSection(
+@@ -765,7 +807,7 @@ private fun SettingsSection(
          com.openminis.app.ui.plus.MinesCard(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
              Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) { content() }
          }
@@ -18950,7 +19282,7 @@ index c053468..3484d5d 100644
              modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp))
      }
  }
-@@ -797,9 +831,9 @@ private fun SettingsItem(
+@@ -797,9 +839,9 @@ private fun SettingsItem(
              Spacer(Modifier.width(14.dp))
              Column(Modifier.weight(1f)) {
                  Text(title, fontSize = 15.sp, lineHeight = 21.sp, fontWeight = FontWeight.Medium, color = mc.ink)
