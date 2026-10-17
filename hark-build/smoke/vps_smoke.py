@@ -73,6 +73,10 @@ try:
     FIX3891 = "fix3891" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
 except Exception:
     FIX3891 = False
+try:
+    MSG3892 = "msg3892" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
+except Exception:
+    MSG3892 = False
 FONT_SCALE = "1.18"
 step_no = 0
 crashed = []
@@ -3190,7 +3194,7 @@ def main():
         except Exception as e:
             print("fast prep error", e, flush=True)
         if UI388: fns = (b388_ui, b389_ui, b3891_fb, b3891_ui) if UI3891 else (b388_ui, b389_ui) if UI389 else (b388_ui,)
-        elif FIX3891: fns = (b3891_fix,)   # [38.9.1 e] states smoke d missed
+        elif FIX3891: fns = ((b3892_msg,) if MSG3892 else ()) + (b3891_fix,)   # [38.9.1 e] states smoke d missed; [38.9.2 f] 消息 pull first
         elif UI3891: fns = (b3891_fb, b3891_ui)   # [38.9.1 d] feedback round first, then the 38.9.1 pages
         elif HUB: fns = ()
         elif B388: fns = (b387_linkall, b387_noblack, b388_weblogin, b388_mailbox, b388_presets)
@@ -3869,6 +3873,70 @@ def b3891_fix(res):
     step("mail", mail)
     r8["fix3891"] = o
     print("FIX3891 RESULT " + json.dumps(o, ensure_ascii=False)[:4000], flush=True)
+
+
+def b3892_msg(res):
+    """[38.9.2 f] 消息 pull-to-refresh (user: 「下拉不更新」): fake source brings one new card per read + a 163 box with a wrong
+    授权码 on the runner's fake IMAP. Open 消息 (resume refresh = read 1) -> pull -> 'Smoke 新消息 #2' on top, line 新到 1 条 · 163 授权码失效,
+    spinner ends; then leave the app > 30 s and come back -> read 3 without a pull."""
+    r8 = R8(res); o = {}
+    w, h = SCREEN
+    def state():
+        st = result_json("msgfeed", "state", timeout=30)
+        return st if isinstance(st, dict) else {}
+    def settle(limit=40):
+        st = {}
+        for _ in range(limit):
+            st = state()
+            if st and not st.get("busy"): return st
+            time.sleep(1.5)
+        return st
+    theme388(1)
+    o["seed"] = result_json("msgfeed", "seed", timeout=30)
+    o["badbox"] = result_json("msgfeed", "badbox 10.0.2.2:1143", timeout=30)
+    o["open"] = result_json("msgfeed", "open", timeout=30); time.sleep(4)
+    st = settle(); o["before_state"] = st
+    time.sleep(1.5)
+    r = shot388("msg-before"); tb = _txt(r); o["before"] = tb[:500]
+    if "Smoke 新消息 #1" not in tb: selftest_fail.append(f"msg3892: open did not read the source (#1 missing) {st}")
+    if "Smoke 新消息 #2" in tb: selftest_fail.append("msg3892: #2 already there before the pull")
+    # pull down from under the tabs
+    sh(f"input swipe {w//2} {int(h*0.30)} {w//2} {int(h*0.78)} 700")
+    time.sleep(0.6); rawshot("msg-pulling")
+    t0 = time.time(); ta = ""
+    for _ in range(40):
+        time.sleep(1.5)
+        ta = _txt(dump())
+        if "Smoke 新消息 #2" in ta and ("新到" in ta or "没有新消息" in ta): break
+    o["pull_secs"] = round(time.time() - t0, 1)
+    r = shot388("msg-after"); ta2 = _txt(r); ta = ta2 if "新到" in ta2 or "没有新消息" in ta2 else ta + " " + ta2
+    o["after"] = ta[:600]
+    st = settle(); o["after_state"] = st
+    if "Smoke 新消息 #2" not in ta: selftest_fail.append(f"msg3892: pull did not bring the new card #2 {st}")
+    if "新到" not in ta: selftest_fail.append("msg3892: no 「新到 N 条」 result line after the pull")
+    if "163 授权码失效" not in ta: selftest_fail.append("msg3892: failed 163 box not named in the result line")
+    if (st.get("top") or [""])[0] != "st:msg2": selftest_fail.append(f"msg3892: new card not on top {st.get('top')}")
+    if st.get("busy"): selftest_fail.append("msg3892: still busy after the pull")
+    # spinner gone: the dump must not show the refresh indicator any more (it has no text; check the busy flag + screen line)
+    # leave the app > 30 s and come back: ON_RESUME re-reads (read 3) without a pull
+    sh("input keyevent KEYCODE_HOME"); time.sleep(33)
+    sh(f"monkey -p {PKG} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1"); time.sleep(4)
+    st = settle(); time.sleep(1.5)
+    r = shot388("msg-resume"); tr = _txt(r); o["resume"] = tr[:500]; o["resume_state"] = st
+    if "st:msg3" not in (st.get("smoke") or []): selftest_fail.append(f"msg3892: coming back did not refresh (no #3) {st}")
+    # dark theme look of the line
+    theme388(2)   # force-stops the app: seed again
+    result_json("msgfeed", "seed", timeout=30); result_json("msgfeed", "badbox 10.0.2.2:1143", timeout=30)
+    result_json("msgfeed", "open", timeout=30); time.sleep(3); settle()
+    sh(f"input swipe {w//2} {int(h*0.30)} {w//2} {int(h*0.78)} 700")
+    for _ in range(30):
+        time.sleep(1.5)
+        if "新到" in _txt(dump()): break
+    shot388("msg-after-dark")
+    theme388(1)
+    o["off"] = result_json("msgfeed", "off", timeout=30)
+    r8["msg3892"] = o
+    print("MSG3892 RESULT " + json.dumps(o, ensure_ascii=False)[:4000], flush=True)
 
 
 def b3891_fb(res):
