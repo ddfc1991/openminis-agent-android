@@ -81,6 +81,10 @@ try:
     ACCT3893 = "acct3893" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
 except Exception:
     ACCT3893 = False
+try:
+    H3894 = "h3894" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
+except Exception:
+    H3894 = False
 FONT_SCALE = "1.18"
 step_no = 0
 crashed = []
@@ -3208,6 +3212,7 @@ def main():
         elif B388: fns = (b387_linkall, b387_noblack, b388_weblogin, b388_mailbox, b388_presets)
         else: fns = (b387_linkall, b387_noblack, b387_persist, b387_platforms)
         if HUB: fns = tuple(fns) + (b3891_hub,)   # [38.9.1 c] hub runs after the UI passes
+        if H3894: fns = (b3894_h,) + tuple(fns)   # [38.9.4 h] SkillHub market, Memoh, a11y wording, 账号 entries, glass / opaque reading, g2 defects first
         for fn in fns:
             try:
                 fn(res)
@@ -3949,6 +3954,172 @@ def b3892_msg(res):
     r8["msg3892"] = o
     print("MSG3892 RESULT " + json.dumps(o, ensure_ascii=False)[:4000], flush=True)
 
+
+
+def b3894_h(res):
+    """[38.9.4 h] SkillHub (skillhub.cn) market: list >= 10, search, install one verified small plugin (QingYunA/answer-me-with-html)
+    + one skill (weather) → 已安装; Memoh hosted state after a fake app.memoh.net cookie sign-in (not 「还没登录」); 自检 无障碍
+    wording (never 已开启 while the service is not running); ☰ 「账号」 entry and the 设置 账号 card; glass shots light + dark
+    (设置, 账号, 选择会话, 知识库, dialog, md viewer opaque paper, 工作位置); g2 defects: 登录 summary vs 豆包 row, offers collapsed
+    below connected services, masked phone on the detail page."""
+    r8 = R8(res); o = {}
+    def step(name, f):
+        try: f()
+        except Exception as e:
+            import traceback; traceback.print_exc(); page_missing.append(f"h3894 {name} error {e}")
+        if not alive(): crashed.append(f"h3894 {name}"); relaunch()
+    theme388(1)
+    # 1 SkillHub market
+    def mkt():
+        o["list"] = result_json("group", "h394 list", timeout=90)
+        L = o["list"] if isinstance(o["list"], dict) else {}
+        if (L.get("plugins") or 0) < 10: selftest_fail.append(f"mkt3894: SkillHub plugins {L.get('plugins')} < 10 ({L.get('err')})")
+        if (L.get("skills") or 0) < 10: selftest_fail.append(f"mkt3894: SkillHub skills {L.get('skills')} < 10 ({L.get('err')})")
+        o["search"] = result_json("group", "h394 search weather", timeout=60)
+        S = o["search"] if isinstance(o["search"], dict) else {}
+        if not S.get("skills"): selftest_fail.append(f"mkt3894: search 'weather' found no skills {S}")
+        result_json("group", "h394 open 0", timeout=20); time.sleep(8)
+        r = shot388("mkt-plugins"); t = _txt(r); o["plugins_page"] = t[:500]
+        if "SkillHub 插件" not in t: selftest_fail.append("mkt3894: 插件 tab not showing SkillHub list")
+        if tap_text("搜索 SkillHub 插件", wait=1.5):
+            type_text("answer-me-with-html"); time.sleep(1); sh("input keyevent KEYCODE_BACK"); time.sleep(5)
+        r = shot388("mkt-plugin-search"); t = _txt(r); o["plugin_search"] = t[:400]
+        if "answer-me-with-html" not in t: selftest_fail.append("mkt3894: plugin search did not find answer-me-with-html")
+        elif "已安装" not in t:
+            rows = [d for d in all_desc(r, "answer-me-with-html")]
+            if rows: sh(f"input tap {rows[0][0]} {rows[0][1]}"); time.sleep(3)
+            else: tap_text("answer-me-with-html", wait=3)
+            shot388("mkt-plugin-intro")
+            if tap_text("一键安装", exact=True, wait=3):
+                ok = False
+                for _ in range(60):
+                    time.sleep(4); t = _txt(dump())
+                    if "失败" in t or "出错" in t: break
+                    if "完成" in t or "已安装" in t: ok = True; break
+                r = shot388("mkt-plugin-installing"); o["plugin_task"] = _txt(r)[-400:]
+                for lab in ("关闭", "完成", "好"):
+                    if tap_text(lab, exact=True, wait=2): break
+                time.sleep(3); r = shot388("mkt-plugin-installed"); t = _txt(r); o["plugin_after"] = t[:400]
+                if "已安装" not in t:
+                    back(1); result_json("group", "h394 open 0", timeout=20); time.sleep(6)
+                    if tap_text("搜索 SkillHub 插件", wait=1.5): type_text("answer-me-with-html"); sh("input keyevent KEYCODE_BACK"); time.sleep(5)
+                    r = shot388("mkt-plugin-installed2"); t = _txt(r)
+                if "已安装" not in t: selftest_fail.append(f"mkt3894: plugin not 已安装 after install ({o.get('plugin_task','')[-160:]})")
+            else: selftest_fail.append("mkt3894: 一键安装 button not found in the plugin intro")
+        back(1); time.sleep(1)
+        o["skill"] = result_json("group", "h394 skill weather", timeout=120)
+        K = o["skill"] if isinstance(o["skill"], dict) else {}
+        if not K.get("installed"): selftest_fail.append(f"mkt3894: skill weather not installed {o['skill']}")
+        result_json("group", "h394 open 1", timeout=20); time.sleep(8)
+        if tap_text("搜索 SkillHub 技能", wait=1.5):
+            type_text("weather"); time.sleep(1); sh("input keyevent KEYCODE_BACK"); time.sleep(5)
+        r = shot388("mkt-skill-installed"); t = _txt(r); o["skill_page"] = t[:400]
+        if "已安装" not in t: selftest_fail.append("mkt3894: 技能 tab does not show 已安装 for weather")
+        back(1)
+    step("mkt", mkt)
+    # 2 Memoh hosted sign-in state
+    def memoh():
+        result_json("group", "agents clear", timeout=20); result_json("group", "agents add memoh", timeout=20)
+        o["memoh"] = result_json("group", "h394 memoh fake", timeout=90)
+        M = o["memoh"] if isinstance(o["memoh"], dict) else {}
+        if not M.get("hosted"): selftest_fail.append(f"memoh: hosted base not recognised {M}")
+        if any("还没登录" in m for m in (M.get("members") or [])): selftest_fail.append(f"memoh: still 还没登录 after a hosted sign-in {M.get('members')}")
+        route("plus_app_agents", 6); r = shot388("memoh-agents"); t = _txt(r); o["memoh_page"] = t[:400]
+        if "需要登录" in t and "Memoh" in t: page_missing.append("memoh: 应用代理 still shows 需要登录 (fake cookie rejected by the real site is possible)")
+        back(1)
+    step("memoh", memoh)
+    # 3 自检 无障碍 wording
+    def a11y():
+        o["a11y"] = result_json("group", "h394 a11y", timeout=30)
+        A = o["a11y"] if isinstance(o["a11y"], dict) else {}
+        if A and not A.get("running") and "已开启" in str(A.get("detail")): selftest_fail.append(f"a11y: says 已开启 while not running {A}")
+        route("plus_verify", 10); r = shot388("selfcheck"); t = _txt(r); o["selfcheck"] = t[:600]
+        if "无障碍" in t and A and not A.get("running") and re.search(r"无障碍[^，。]{0,6}已开启", t): selftest_fail.append("a11y: 自检 page says 无障碍 已开启 while the service is not running")
+        back(1)
+    step("a11y", a11y)
+    # 4 ☰ 账号 entry + 设置 账号 card
+    def entries():
+        b381_home(); time.sleep(1)
+        if tap_text("更多", exact=True, wait=2):
+            r = shot388("menu-light"); t = _txt(r)
+            if "账号" not in t: selftest_fail.append("h3894: ☰ menu has no 账号 entry")
+            if tap_text("账号", exact=True, wait=4):
+                r = shot388("menu-accounts"); t = _txt(r)
+                if "服务" not in t or "登录" not in t: selftest_fail.append("h3894: ☰ 账号 did not open the 账号 page")
+                back(1)
+        else: page_missing.append("h3894: ☰ 更多 not found")
+        route("settings", 5); r = shot388("settings-light"); t = _txt(r); o["settings"] = t[:500]
+        if "账号" not in t: selftest_fail.append("h3894: 设置 has no 账号 card")
+        if t.count("账号") > 3: page_missing.append(f"h3894: 设置 shows 账号 {t.count('账号')} times (duplicate row?)")
+        if tap_text("账号", wait=4):
+            r = shot388("settings-accounts"); t = _txt(r)
+            if "服务" not in t: selftest_fail.append("h3894: 设置 账号 card did not open the 账号 page")
+            back(1)
+        back(1)
+    step("entries", entries)
+    # 5 g2 defects on the 账号 page
+    def g2():
+        o["seed"] = result_json("group", "acct393 seed", timeout=60)
+        result_json("group", "linkmark doubao|0", timeout=20)
+        route("plus_connections", 8); time.sleep(2)
+        r = shot388("acct-svc-offers"); t = _txt(r); o["svc"] = t[:600]
+        if "帮我领" in t: selftest_fail.append("g2: free offers expanded at the top of 服务 (want collapsed below connected services)")
+        if not tap_text("登录 标签", wait=4): tap_text("登录", exact=True, wait=4)
+        time.sleep(3); scroll_down(); r = shot388("acct-login-summary"); t = _txt(r); o["login"] = t[:700]
+        rows = [d for d in all_desc(r, "豆包")]
+        if rows and ("未检查" in rows[0][2] or "正在确认" in rows[0][2]) and "过期了" in t:
+            selftest_fail.append("g2: 一键关联的结果 says 过期了 while the 豆包 row is 未检查")
+        if not rows:
+            sh("input swipe 540 600 540 1800 300"); time.sleep(1.5); r = dump(); rows = [d for d in all_desc(r, "豆包")]
+        if rows:
+            sh(f"input tap {rows[0][0]} {rows[0][1]}"); time.sleep(4)
+            r = shot388("acct-detail-masked"); t = _txt(r); o["detail"] = t[:500]
+            if "13800138000" in t: selftest_fail.append("g2: detail page shows the full phone number")
+            back(1)
+        else: page_missing.append("g2: 豆包 row not found")
+        back(1)
+    step("g2", g2)
+    # 6 glass / opaque shots, light + dark
+    def glass(sfx):
+        route("settings", 5); shot388("glass-settings-" + sfx); back(1)
+        route("plus_connections", 6); shot388("glass-accounts-" + sfx); back(1)
+        b381_home(); time.sleep(1)
+        if tap_text("更多", exact=True, wait=2):
+            shot388("glass-menu-" + sfx)
+            if tap_text("选择对话", wait=3) or tap_text("选择会话", wait=3):
+                r = shot388("glass-select-" + sfx)
+                if sfx == "light" and "✕" not in _txt(r) and "取消" not in _txt(r): page_missing.append("h3894: 选择会话 ✕ / 取消 not found")
+                back(1)
+            else: back(1)
+        route("plus_knowledge", 8); shot388("glass-kb-" + sfx); back(1)
+        route("plus_work_location", 8); r = shot388("glass-work-" + sfx); o["work_" + sfx] = _txt(r)[:500]
+        if tap_text("添加服务器", wait=3): shot388("glass-dialog-" + sfx); back(1); time.sleep(1)
+        back(1)
+        b381_home(); time.sleep(1)
+        if not tap_text("你好，我是测试模型。", wait=5): tap_text("GARBAGETEST", wait=5)
+        result_json("group", "mdview", timeout=20); time.sleep(4); r = shot388("glass-md-" + sfx); o["md_" + sfx] = _txt(r)[:200]
+        back(1)
+    step("glass-light", lambda: glass("light"))
+    theme388(2)
+    step("glass-dark", lambda: glass("dark"))
+    theme388(1)
+    # 7 glass 自动 over a photo wallpaper (the loud generated one = worst case) + 外观调节 showing 自动 (现在 N%)
+    def photo(sfx):
+        route("plus_look", 6); r = shot388("look-auto-" + sfx); t = _txt(r); o["look_" + sfx] = t[:400]
+        if "自动" not in t: selftest_fail.append(f"glass auto: 外观调节 does not show 自动 ({sfx})")
+        back(1)
+        route("settings", 5); shot388("photo-settings-" + sfx); back(1)
+        route("plus_connections", 6); shot388("photo-accounts-" + sfx); back(1)
+        b381_home(); time.sleep(2); shot388("photo-home-" + sfx)
+    def photo_all():
+        o["wall"] = selftest_json("uiprep", "杨arling|gen", timeout=20); time.sleep(2)
+        theme388(1); photo("light")
+        theme388(2); photo("dark")
+        theme388(1)
+        result_json("group", "wallpaper off")
+    step("glass-photo", photo_all)
+    r8["h3894"] = o
+    print("H3894 RESULT " + json.dumps(o, ensure_ascii=False)[:5000], flush=True)
 
 def b3893_acct(res):
     """[38.9.3 g] user 2026-10-17 「动不动就账号失效登录，而且ui都不一样，没对齐」: ONE 「账号」 page with 服务 / 登录 tabs, the same row +
