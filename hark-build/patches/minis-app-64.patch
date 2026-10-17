@@ -2876,21 +2876,30 @@ index 0000000..d5b6d9a
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/HomeGreeting.kt b/src/android/app/src/main/java/com/openminis/app/plus/HomeGreeting.kt
-index 44e47ed..ddb8bc5 100644
+index 44e47ed..d67a3f5 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/HomeGreeting.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/HomeGreeting.kt
-@@ -26,7 +26,9 @@ import java.util.concurrent.TimeUnit
-  * there, otherwise from the IP (ipapi.co → ip-api.com). Cached 1 h; any failure → time-only greeting.
+@@ -22,11 +22,16 @@ import java.util.concurrent.TimeUnit
+  * a plain warm line for the slot. Every category has several lines; one is picked at random and the same sentence is not
+  * used twice on the same day. Short, warm, plain words (read aloud well for TalkBack).
+  *
+- * Weather: open-meteo.com (no key), place from the phone's last known network / GPS location when the permission is
+- * there, otherwise from the IP (ipapi.co → ip-api.com). Cached 1 h; any failure → time-only greeting.
++ * Weather: open-meteo.com (no key). [Mines-38.9.5 i] user 22:35 「天气不能对 VPN」: the place is ONLY the phone's own location
++ * (coarse, fix cached 30 min) or a city the user typed (HomeWeatherCore.order) — never the network address. Cached 1 h;
++ * any failure → no weather shown.
   */
  object HomeGreeting {
 -    data class Weather(val code: Int, val temp: Double, val max: Double, val min: Double, val maxYesterday: Double?, val rainProb: Int, val place: String = "")
 +    data class Weather(val code: Int, val temp: Double, val max: Double, val min: Double, val maxYesterday: Double?, val rainProb: Int, val place: String = "",
 +                       /** [Mines-38.8] short 「傍晚可能有雨」 hint for later today (rain probability >= 60 %), never replaces the current word. */
-+                       val later: String = "")
++                       val later: String = "",
++                       /** [Mines-38.9.5 i] 「1 小时后有雨」 / 「正在下雨」 from the hourly forecast ("" = dry for the next 6 h). */
++                       val soon: String = "")
      data class Ctx(val hour: Int, val minute: Int, val dow: Int, val month: Int, val day: Int, val weather: Weather?, val battery: Int, val charging: Boolean, val awayDays: Int)
      data class Greeting(val title: String, val care: String, val kind: String)
  
-@@ -105,6 +107,10 @@ object HomeGreeting {
+@@ -105,9 +110,14 @@ object HomeGreeting {
                  "cold" -> Weather(2, 2.0, 6.0, -1.0, 7.0, 0)
                  "drop" -> Weather(3, 12.0, 14.0, 9.0, 22.0, 10)
                  "clear" -> Weather(0, 22.0, 25.0, 15.0, 24.0, 0)
@@ -2901,7 +2910,20 @@ index 44e47ed..ddb8bc5 100644
                  "none" -> null
                  else -> w
              }
-@@ -211,22 +217,48 @@ object HomeGreeting {
++            if (o.has("soon")) w = w?.copy(soon = o.optString("soon"))
+         }
+         return Ctx(hour, cal.get(Calendar.MINUTE), dow, month, day, w, bat, charging && o?.has("battery") != true, awayDays)
+     }
+@@ -138,7 +148,7 @@ object HomeGreeting {
+     }
+ 
+     /** The app came to the front (for 「好久不见」). The away gap is read before this. */
+-    fun markOpened(c: Context) { prefs(c).edit().putLong("last_open", System.currentTimeMillis()).apply() }
++    fun markOpened(c: Context) { val p = prefs(c); p.edit().putLong("last_open", System.currentTimeMillis()).putInt("g_open", p.getInt("g_open", 0) + 1).apply(); _tick.value++ }
+ 
+     private fun slotOf(h: Int) = slots.firstOrNull { h in it.first } ?: slots.last()
+ 
+@@ -211,63 +221,239 @@ object HomeGreeting {
  
      private val http = OkHttpClient.Builder().connectTimeout(6, TimeUnit.SECONDS).readTimeout(8, TimeUnit.SECONDS).callTimeout(15, TimeUnit.SECONDS).build()
  
@@ -2928,7 +2950,7 @@ index 44e47ed..ddb8bc5 100644
 +        val o = JSONObject(p.getString("w", null) ?: return null)
          Weather(o.getInt("code"), o.getDouble("temp"), o.getDouble("max"), o.getDouble("min"),
 -            if (o.has("maxY")) o.getDouble("maxY") else null, o.optInt("rain"), o.optString("place"))
-+            if (o.has("maxY")) o.getDouble("maxY") else null, o.optInt("rain"), o.optString("place"), o.optString("later"))
++            if (o.has("maxY")) o.getDouble("maxY") else null, o.optInt("rain"), o.optString("place"), o.optString("later"), o.optString("soon"))
      }.getOrNull()
  
 -    /** Fetches the weather at most once an hour (no key). Silent on failure. */
@@ -2951,12 +2973,19 @@ index 44e47ed..ddb8bc5 100644
 +        p.edit().putLong("w_try", now).apply()
          val url = "https://api.open-meteo.com/v1/forecast?latitude=${loc.first}&longitude=${loc.second}" +
 -            "&current=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code,sunrise,sunset" +
-+            "&current=temperature_2m,weather_code,precipitation,is_day,wind_speed_10m,wind_direction_10m&wind_speed_unit=ms&hourly=precipitation_probability" +
+-            "&past_days=1&forecast_days=1&timezone=auto"
++            "&current=temperature_2m,weather_code,precipitation,is_day,wind_speed_10m,wind_direction_10m&wind_speed_unit=ms&hourly=precipitation_probability,precipitation" +
 +            "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code,sunrise,sunset" +
-             "&past_days=1&forecast_days=1&timezone=auto"
++            "&past_days=1&forecast_days=2&timezone=auto"
          val o = runCatching { http.newCall(Request.Builder().url(url).build()).execute().use { r -> if (r.isSuccessful) JSONObject(r.body?.string().orEmpty()) else null } }.getOrNull()
              ?: return@withContext
-@@ -238,31 +270,113 @@ object HomeGreeting {
+         runCatching {
+             val cur = o.getJSONObject("current"); val d = o.getJSONObject("daily")
+             val maxA = d.getJSONArray("temperature_2m_max"); val minA = d.getJSONArray("temperature_2m_min")
+             val prA = d.optJSONArray("precipitation_probability_max"); val codeA = d.optJSONArray("weather_code")
+-            val i = maxA.length() - 1
++            // [Mines-38.9.5 i] forecast_days=2 → today is the second-to-last daily entry (past_days=1 first)
++            val i = (maxA.length() - 2).coerceAtLeast(0)
              // [Mines-38.7] sunrise / sunset for the day ↔ night switch
              runCatching { DayNight.saveSun(c, d.optJSONArray("sunrise")?.optString(i), d.optJSONArray("sunset")?.optString(i)) }
              val dayCode = codeA?.optInt(i) ?: 0
@@ -2966,10 +2995,16 @@ index 44e47ed..ddb8bc5 100644
 +            // the word / icon is what it is like outside NOW (was: the day's worst code, so a sunny afternoon showed 阵雨)
 +            val code = cur.optInt("weather_code", dayCode)
 +            val later = laterRainHint(o, code)
++            val soon = runCatching {
++                val h = o.getJSONObject("hourly"); val tA = h.getJSONArray("time"); val pA = h.optJSONArray("precipitation_probability"); val mA = h.optJSONArray("precipitation")
++                HomeWeatherCore.rainSoon(cur.optString("time"), (0 until tA.length()).map { tA.optString(it) },
++                    (0 until tA.length()).map { pA?.optInt(it, 0) ?: 0 }, (0 until tA.length()).map { mA?.optDouble(it, 0.0) ?: 0.0 },
++                    code in 51..67 || code in 80..82 || code in 95..99)
++            }.getOrDefault("")
              val j = JSONObject().put("code", code)
                  .put("temp", cur.optDouble("temperature_2m")).put("max", maxA.optDouble(i)).put("min", minA.optDouble(i))
 -                .put("rain", prA?.optInt(i) ?: 0).put("place", loc.third)
-+                .put("rain", prA?.optInt(i) ?: 0).put("place", loc.third).put("later", later)
++                .put("rain", prA?.optInt(i) ?: 0).put("place", loc.third).put("later", later).put("soon", soon)
 +                .put("precip", cur.optDouble("precipitation", 0.0)).put("isDay", cur.optInt("is_day", 1))
 +                .put("wind", cur.optDouble("wind_speed_10m", 0.0)).put("windDir", cur.optDouble("wind_direction_10m", 270.0))
              if (i >= 1) j.put("maxY", maxA.optDouble(i - 1))
@@ -3006,8 +3041,12 @@ index 44e47ed..ddb8bc5 100644
 +            if (pr.optInt(k, 0) >= 60) return when (hh) {
 +                in 0..10 -> "上午可能有雨"; in 11..12 -> "中午可能有雨"; in 13..16 -> "下午可能有雨"
 +                in 17..18 -> "傍晚可能有雨"; else -> "夜里可能有雨"
-+            }
-+        }
+             }
+         }
+-        for (u in listOf("https://ipapi.co/json/", "http://ip-api.com/json/?fields=lat,lon,city")) {
+-            val o = runCatching { http.newCall(Request.Builder().url(u).header("User-Agent", "Mines").build()).execute().use { r -> if (r.isSuccessful) JSONObject(r.body?.string().orEmpty()) else null } }.getOrNull() ?: continue
+-            val lat = o.optDouble("latitude", o.optDouble("lat", Double.NaN)); val lon = o.optDouble("longitude", o.optDouble("lon", Double.NaN))
+-            if (!lat.isNaN() && !lon.isNaN()) return Triple(lat, lon, o.optString("city"))
 +        ""
 +    }.getOrDefault("")
 +
@@ -3015,11 +3054,6 @@ index 44e47ed..ddb8bc5 100644
 +        val r = FloatArray(1); android.location.Location.distanceBetween(a, b, c2, d, r); return r[0] / 1000.0
 +    }
 +
-+    private fun vpnActive(c: Context): Boolean = runCatching {
-+        val cm = c.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
-+        @Suppress("DEPRECATION")
-+        cm.allNetworks.any { n -> cm.getNetworkCapabilities(n)?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) == true }
-+    }.getOrDefault(false)
 +
 +    private val _askLocation = MutableStateFlow(false)
 +    /** [Mines-38.8] true once when there is no location permission and no remembered place: the home asks in plain words. */
@@ -3054,38 +3088,256 @@ index 44e47ed..ddb8bc5 100644
 +        }
 +    }
 +
++    /** [Mines-38.9.5 i] a city the user set (fallback when there is no device location): name + coordinates. */
++    fun manualCity(c: Context): Triple<Double, Double, String>? {
++        val p = prefs(c)
++        val n = p.getString("city_name", null) ?: return null
++        return Triple(p.getFloat("city_lat", 0f).toDouble(), p.getFloat("city_lon", 0f).toDouble(), n)
++    }
++
++    /** Looks [name] up with open-meteo's geocoding (by name — not by network address) and saves it; null = not found. */
++    suspend fun setManualCity(c: Context, name: String?): String? = withContext(Dispatchers.IO) {
++        val p = prefs(c)
++        if (name.isNullOrBlank()) { p.edit().remove("city_name").remove("city_lat").remove("city_lon").putLong("w_at", 0L).apply(); _tick.value++; return@withContext null }
++        val u = "https://geocoding-api.open-meteo.com/v1/search?count=1&language=zh&name=" + java.net.URLEncoder.encode(name.trim(), "UTF-8")
++        val r = runCatching { http.newCall(Request.Builder().url(u).build()).execute().use { if (it.isSuccessful) JSONObject(it.body?.string().orEmpty()) else null } }.getOrNull()
++            ?.optJSONArray("results")?.optJSONObject(0) ?: return@withContext null
++        val nm = r.optString("name", name.trim())
++        p.edit().putString("city_name", nm).putFloat("city_lat", r.optDouble("latitude").toFloat()).putFloat("city_lon", r.optDouble("longitude").toFloat())
++            .putLong("w_at", 0L).putLong("w_try", 0L).putLong("w_loc_try", 0L).apply()
++        refreshWeather(c)
++        nm
++    }
++
++    /** Where the shown weather is for: 「手机定位」 or 「手动城市」 (detail sheet). */
++    fun placeSource(c: Context): String = prefs(c).getString("w_src", "") ?: ""
++
++    /** City name for a device fix, from the phone's own Geocoder (offline-capable on most phones); "" when unavailable. */
++    @Suppress("DEPRECATION")
++    private fun cityOf(c: Context, lat: Double, lon: Double): String = runCatching {
++        if (!android.location.Geocoder.isPresent()) return ""
++        val a = android.location.Geocoder(c, java.util.Locale.SIMPLIFIED_CHINESE).getFromLocation(lat, lon, 1)?.firstOrNull() ?: return ""
++        (a.locality ?: a.subAdminArea ?: a.adminArea ?: "").removeSuffix("市")
++    }.getOrDefault("")
++
 +    /**
-+     * (lat, lon, place). [Mines-38.8] order: a fresh network fix → the newest last-known fix if under 2 h old → the last good
-+     * real location we remembered → an older last-known fix → the IP's city ONLY when no VPN is on (the user always runs a
-+     * VPN, so the IP says the exit country, e.g. Singapore, not where they are). Nothing at all → ask once for coarse location.
++     * (lat, lon, place). [Mines-38.9.5 i] ONLY device-based (HomeWeatherCore.order): a device fix younger than 30 min →
++     * a fresh network fix → the newest last-known fix → the city the user set → an older remembered fix. No IP lookup at all:
++     * the user always runs a VPN, so the network address says the exit country. Nothing → ask once for coarse location;
++     * the weather stays hidden meanwhile.
 +     */
 +    private suspend fun location(c: Context): Triple<Double, Double, String>? {
 +        val p = prefs(c)
 +        val ok = androidx.core.content.ContextCompat.checkSelfPermission(c, android.Manifest.permission.ACCESS_COARSE_LOCATION) ==
 +            android.content.pm.PackageManager.PERMISSION_GRANTED
++        val fixAt = p.getLong("loc_at", 0L)
++        val fixAge = if (p.contains("loc_lat") && fixAt > 0) System.currentTimeMillis() - fixAt else null
++        fun remembered() = Triple(p.getFloat("loc_lat", 0f).toDouble(), p.getFloat("loc_lon", 0f).toDouble(), p.getString("loc_city", "") ?: "")
 +        fun remember(l: android.location.Location): Triple<Double, Double, String> {
-+            p.edit().putFloat("loc_lat", l.latitude.toFloat()).putFloat("loc_lon", l.longitude.toFloat()).putLong("loc_at", System.currentTimeMillis()).apply()
-+            return Triple(l.latitude, l.longitude, "")
++            val city = cityOf(c, l.latitude, l.longitude)
++            p.edit().putFloat("loc_lat", l.latitude.toFloat()).putFloat("loc_lon", l.longitude.toFloat()).putLong("loc_at", System.currentTimeMillis())
++                .putString("loc_city", city).putString("w_src", "手机定位").apply()
++            return Triple(l.latitude, l.longitude, city)
 +        }
-+        var stale: android.location.Location? = null
-+        if (ok) runCatching {
-+            val lm = c.getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
-+            freshFix(lm)?.let { return remember(it) }
-+            @Suppress("MissingPermission")
-+            val l = listOf(android.location.LocationManager.NETWORK_PROVIDER, android.location.LocationManager.GPS_PROVIDER, android.location.LocationManager.PASSIVE_PROVIDER)
-+                .mapNotNull { pr -> runCatching { lm.getLastKnownLocation(pr) }.getOrNull() }.maxByOrNull { it.time }
-+            if (l != null) {
-+                if (System.currentTimeMillis() - l.time <= 2 * 3600_000L) return remember(l)
-+                stale = l
-             }
++        val lm = c.getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
++        for (src in HomeWeatherCore.order(ok, fixAge, p.contains("city_name"))) {
++            when (src) {
++                HomeWeatherCore.LocSource.CACHED_FIX -> { p.edit().putString("w_src", "手机定位").apply(); return remembered() }
++                HomeWeatherCore.LocSource.FRESH_FIX -> runCatching { freshFix(lm) }.getOrNull()?.let { return remember(it) }
++                HomeWeatherCore.LocSource.LAST_KNOWN_FIX -> {
++                    @Suppress("MissingPermission")
++                    val l = runCatching {
++                        listOf(android.location.LocationManager.NETWORK_PROVIDER, android.location.LocationManager.GPS_PROVIDER, android.location.LocationManager.PASSIVE_PROVIDER)
++                            .mapNotNull { pr -> runCatching { lm.getLastKnownLocation(pr) }.getOrNull() }.maxByOrNull { it.time }
++                    }.getOrNull()
++                    if (l != null && System.currentTimeMillis() - l.time <= 2 * 3600_000L) return remember(l)
++                }
++                HomeWeatherCore.LocSource.MANUAL_CITY -> manualCity(c)?.let { p.edit().putString("w_src", "手动城市").apply(); return it }
++                HomeWeatherCore.LocSource.STALE_FIX -> { p.edit().putString("w_src", "手机定位").apply(); return remembered() }
++            }
          }
-+        if (p.contains("loc_lat")) return Triple(p.getFloat("loc_lat", 0f).toDouble(), p.getFloat("loc_lon", 0f).toDouble(), "")
-+        stale?.let { return Triple(it.latitude, it.longitude, "") }
 +        if (!ok && !p.getBoolean("loc_asked", false)) _askLocation.value = true
-+        if (vpnActive(c)) return null
-         for (u in listOf("https://ipapi.co/json/", "http://ip-api.com/json/?fields=lat,lon,city")) {
-             val o = runCatching { http.newCall(Request.Builder().url(u).header("User-Agent", "Mines").build()).execute().use { r -> if (r.isSuccessful) JSONObject(r.body?.string().orEmpty()) else null } }.getOrNull() ?: continue
-             val lat = o.optDouble("latitude", o.optDouble("lat", Double.NaN)); val lon = o.optDouble("longitude", o.optDouble("lon", Double.NaN))
+         return null
+     }
++
++    // ---------------- varied greeting (user 22:34 「晚上好主人太单调了」) ----------------
++
++    /** Counts this app open (for the greeting rotation). */
++    fun openSeed(c: Context): Int = prefs(c).getInt("g_open", 0)
++
++    /** The greeting for this open: time of day · weather · weekday / holiday · task status; never the same as the last one shown. */
++    fun variedGreeting(c: Context, x: Ctx, running: Int, waiting: Int, failed: Int, name: String?): String {
++        val p = prefs(c)
++        val seed = p.getInt("g_open", 0)
++        val shownFor = p.getInt("g_seed", -1)
++        val cur = p.getString("g_cur", null)
++        val w = x.weather
++        val key = "%02d%02d".format(x.month, x.day)
++        val year = Calendar.getInstance().get(Calendar.YEAR)
++        val kind = when {
++            w == null -> null
++            isSnow(w) -> "snow"
++            w.code in 51..67 || w.code in 80..82 || w.code in 95..99 -> "rain"
++            w.code in 45..48 -> "fog"
++            w.code == 0 -> "clear"
++            else -> "cloudy"
++        }
++        val input = HomeWeatherCore.GreetIn(x.hour, x.dow, holidays[key] ?: holidays["$year$key"], kind, w?.temp?.let { Math.round(it).toInt() },
++            w?.soon.orEmpty(), running, waiting, failed, name)
++        // same open + still a valid phrase for now → keep it (no flicker on recomposition)
++        if (shownFor == seed && cur != null && cur in HomeWeatherCore.candidates(input)) return cur
++        val g = HomeWeatherCore.choose(input, cur, seed)
++        p.edit().putInt("g_seed", seed).putString("g_cur", g).apply()
++        return g
++    }
+ }
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/HomeWeatherCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/HomeWeatherCore.kt
+new file mode 100644
+index 0000000..89bd621
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/HomeWeatherCore.kt
+@@ -0,0 +1,141 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-38.9.5 i] user 2026-10-17 22:34–22:35: 「首页天气加回去，还有晚上好主人太单调了」「天气不能对 VPN」.
++ * Pure pieces (unit-tested in HomeWeatherCoreTest):
++ *  - [LocSource]: where the home weather's place comes from — the phone's own location only (fix cached 30 min), then a
++ *    city the user typed. There is deliberately NO IP-based source: behind the user's VPN the IP says the exit country.
++ *  - [rainSoon]: 「1 小时后有雨」 from the hourly forecast.
++ *  - [Greet]: a short varied greeting (time of day · weather · weekday / holiday · task status), never the same twice in a row.
++ */
++object HomeWeatherCore {
++
++    /** Every way the home weather may learn where the phone is. No member may be IP / network-address based. */
++    enum class LocSource { CACHED_FIX, FRESH_FIX, LAST_KNOWN_FIX, MANUAL_CITY, STALE_FIX }
++
++    const val FIX_CACHE_MS = 30 * 60_000L
++
++    /**
++     * The order to try. [fixAgeMs] = age of the remembered device fix (null = none). A device fix younger than 30 min is
++     * reused without asking the radio again; a city the user set beats an old fix (they moved, or have no permission).
++     */
++    fun order(hasPermission: Boolean, fixAgeMs: Long?, manualCity: Boolean): List<LocSource> {
++        val out = ArrayList<LocSource>()
++        if (fixAgeMs != null && fixAgeMs in 0..FIX_CACHE_MS) out += LocSource.CACHED_FIX
++        if (hasPermission) { out += LocSource.FRESH_FIX; out += LocSource.LAST_KNOWN_FIX }
++        if (manualCity) out += LocSource.MANUAL_CITY
++        if (fixAgeMs != null && fixAgeMs > FIX_CACHE_MS) out += LocSource.STALE_FIX
++        return out
++    }
++
++    /**
++     * 「1 小时后有雨」 / 「现在在下雨」 / 「下午 3 点有雨」 — the first of the next [horizon] hours whose precipitation probability is
++     * ≥ 50 % or precipitation ≥ 0.2 mm. [times] are local ISO hours ("2026-10-17T23:00"), [now] the place's local time.
++     * Empty when dry. [rainingNow] = the current code is rain / drizzle / showers / thunder.
++     */
++    fun rainSoon(now: String, times: List<String>, prob: List<Int>, mm: List<Double>, rainingNow: Boolean, horizon: Int = 6): String {
++        if (rainingNow) return "正在下雨"
++        if (now.length < 13) return ""
++        val nowKey = now.take(13)
++        val idx = times.indexOfFirst { it.take(13) == nowKey }
++        if (idx < 0) return ""
++        val nowMin = now.substring(14, 16).toIntOrNull() ?: 0
++        for (k in 1..horizon) {
++            val i = idx + k
++            if (i >= times.size) break
++            val p = prob.getOrNull(i) ?: 0
++            val r = mm.getOrNull(i) ?: 0.0
++            if (p >= 50 || r >= 0.2) {
++                // the hour slot starts (k*60 - nowMin) minutes from now
++                val mins = k * 60 - nowMin
++                return when {
++                    mins <= 45 -> "快下雨了"
++                    mins <= 90 -> "1 小时后有雨"
++                    mins <= 150 -> "2 小时后有雨"
++                    else -> {
++                        val hh = times[i].substring(11, 13).toInt()
++                        val day = if (times[i].take(10) != now.take(10)) "明天" else ""
++                        day + slotWord(hh) + " ${if (hh % 12 == 0) 12 else hh % 12} 点有雨"
++                    }
++                }
++            }
++        }
++        return ""
++    }
++
++    fun slotWord(h: Int): String = when (h) {
++        in 0..4 -> "凌晨"; in 5..7 -> "清晨"; in 8..10 -> "上午"; in 11..12 -> "中午"
++        in 13..16 -> "下午"; in 17..18 -> "傍晚"; in 19..21 -> "晚上"; else -> "深夜"
++    }
++
++    // ───────────────────────────── greeting ─────────────────────────────
++
++    data class GreetIn(
++        val hour: Int,
++        /** java.util.Calendar day of week: 1 = Sunday … 7 = Saturday. */
++        val dow: Int,
++        val holiday: String? = null,
++        /** "rain" "snow" "hot" "cold" "clear" "cloudy" "fog" or null (no weather). */
++        val weather: String? = null,
++        val temp: Int? = null,
++        /** [rainSoon] text, "" when dry. */
++        val rainSoon: String = "",
++        val running: Int = 0,
++        val waiting: Int = 0,
++        val failed: Int = 0,
++        /** The user's name; optional, "主人" counts as none. */
++        val name: String? = null,
++    )
++
++    const val MAX_LEN = 14
++
++    /** Every phrase that fits now, important ones (rain, failures) first and repeated so they come up more often. */
++    fun candidates(i: GreetIn): List<String> {
++        val slot = slotWord(i.hour)
++        val base = when (slot) {
++            "凌晨" -> listOf("凌晨了，快去睡", "这么晚还醒着", "夜很深了")
++            "清晨" -> listOf("清晨好", "早呀，天刚亮", "清晨好，慢慢来")
++            "上午" -> listOf("上午好", "早上好", "上午好，慢慢来")
++            "中午" -> listOf("中午好", "午安", "中午了，记得吃饭")
++            "下午" -> listOf("下午好", "午后好", "下午好，喝口水")
++            "傍晚" -> listOf("傍晚好", "傍晚了，辛苦啦", "黄昏好")
++            "晚上" -> listOf("晚上好", "晚上好，歇一歇", "忙完了吗")
++            else -> listOf("夜深了，早点睡", "深夜了，别熬太晚", "夜深了")
++        }
++        val important = ArrayList<String>()
++        val extra = ArrayList<String>()
++        when {
++            i.rainSoon == "正在下雨" || i.weather == "rain" -> important += listOf("下雨了，出门带伞", "${slot}下雨，路上慢点")
++            i.rainSoon.isNotBlank() -> important += listOf("${i.rainSoon}，带把伞", i.rainSoon + "，记得带伞")
++            i.weather == "snow" -> important += listOf("下雪了，路滑慢走", "下雪了，穿暖和点")
++        }
++        if (i.temp != null) when {
++            i.weather != "rain" && i.temp >= 33 -> extra += listOf("今天 ${i.temp}°，多喝水", "${i.temp}° 好热，少晒太阳")
++            i.temp <= 5 -> extra += listOf("${i.temp}°，穿暖和点", "外面 ${i.temp}°，注意保暖")
++        }
++        if (i.weather == "clear" && i.hour in 7..17) extra += listOf("天气不错，${slot}好")
++        if (i.weather == "fog") extra += listOf("有雾，路上慢点")
++        if (i.holiday != null && i.hour in 6..22) important += listOf("${i.holiday}快乐", "${i.holiday}快乐，歇一歇")
++        val weekend = i.dow == 7 || i.dow == 1
++        if (i.hour in 6..21) when {
++            weekend -> extra += listOf("周末${slot}好", "周末愉快")
++            i.dow == 6 -> extra += listOf("周五了，快周末啦", "周五${slot}好")
++            i.dow == 2 -> extra += listOf("周一，慢慢进入状态", "周一${slot}好")
++        }
++        if (i.failed > 0) important += listOf("${i.failed} 个任务出错了", "${slot}好，${i.failed} 个任务出错")
++        if (i.waiting > 0) extra += listOf("${i.waiting} 件事等你看", "${slot}好，${i.waiting} 件事等你")
++        if (i.running > 0) extra += listOf("${i.running} 个任务在跑", "${slot}好，${i.running} 个任务在跑")
++        val name = i.name?.trim()?.takeIf { it.isNotEmpty() && it != "主人" }
++        val named = if (name != null) base.take(2).map { it.substringBefore('，') + "，" + name } else emptyList()
++        val all = important + important + important + extra + extra + base + named
++        return all.filter { it.length <= MAX_LEN + (name?.length ?: 0) }.ifEmpty { base }
++    }
++
++    /** One phrase for this open: never [last], otherwise chosen by [seed] (a per-open counter). */
++    fun choose(i: GreetIn, last: String?, seed: Int): String {
++        val c = candidates(i)
++        val pool = c.filter { it != last }.ifEmpty { c }
++        val s = ((seed.toLong() * 2654435761L) ushr 8).toInt() and Int.MAX_VALUE
++        return pool[s % pool.size]
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/HumanVerify.kt b/src/android/app/src/main/java/com/openminis/app/plus/HumanVerify.kt
 index 7eb3e58..32c8352 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/HumanVerify.kt
@@ -7784,6 +8036,204 @@ index 0000000..32dd782
 +        )
 +    }.getOrNull()
 +}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ValueChips.kt b/src/android/app/src/main/java/com/openminis/app/plus/ValueChips.kt
+new file mode 100644
+index 0000000..a282372
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/ValueChips.kt
+@@ -0,0 +1,192 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-38.9.5 i] Copyable values in a chat message (user 2026-10-17 22:23): URLs, API base URLs,
++ * emails, account names, phone numbers, IP[:port], file paths, verification codes, order numbers.
++ * Each becomes a small chip under the message: tap copies exactly [ValueChip.value], long-press
++ * opens / shares it. Secrets (API keys, passwords, tokens, JWTs) are detected FIRST so no other
++ * chip can expose them; they come back masked with copyable = false.
++ *
++ * Pure Kotlin (no Android) so it is unit-tested in ValueChipsTest.
++ */
++object ValueChips {
++    enum class Kind(val label: String, val mono: Boolean) {
++        SECRET("密钥", true), URL("链接", false), API("接口", true), EMAIL("邮箱", false),
++        IP("IP", true), CODE("验证码", true), ORDER("单号", true), PHONE("电话", true),
++        PATH("路径", true), ACCOUNT("账号", false),
++    }
++
++    data class ValueChip(
++        val kind: Kind,
++        /** What a tap copies. For SECRET this is "" — never copyable. */
++        val value: String,
++        /** What the chip shows (masked for SECRET, middle-ellipsized when long). */
++        val display: String,
++        val copyable: Boolean,
++        val start: Int,
++        val end: Int,
++    )
++
++    const val MAX_CHIPS = 12
++    private const val MAX_DISPLAY = 28
++
++    private data class Cand(val kind: Kind, val s: Int, val e: Int, val value: String, val prio: Int)
++
++    // ── patterns ─────────────────────────────────────────────────────────────
++    private val secretToken = Regex(
++        "(?<![A-Za-z0-9_-])(" +
++            "sk-(?:ws-|proj-|ant-|or-v1-)?[A-Za-z0-9_-]{16,}" +
++            "|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}" +
++            "|xox[abposr]-[A-Za-z0-9-]{10,}" +
++            "|AKIA[0-9A-Z]{16}" +
++            "|AIza[0-9A-Za-z_-]{30,}" +
++            "|nm_[A-Za-z0-9]{16,}" +
++            "|pat_[A-Za-z0-9]{20,}" +
++            "|eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{6,}" +
++            ")",
++    )
++    private val secretLabelled = Regex(
++        "(?i)(密码|口令|授权码|密钥|令牌|password|passwd|pwd|token|secret|api[ _-]?key|access[ _-]?key|apikey)" +
++            "\\s*(?:是|为)?\\s*[:：=]\\s*[`\"'“]?([^\\s`\"'”，,。；;）)]{4,})",
++    )
++    private val url = Regex("(?i)\\bhttps?://[^\\s<>\"'`，。；、）)\\]】」』]+")
++    private val email = Regex("(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)*\\.[A-Za-z]{2,}(?![A-Za-z0-9-])")
++    private val ip = Regex("(?<![0-9.])((?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)(?:\\.(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)){3})(?::(\\d{1,5}))?(?![0-9.]*\\d)")
++    private val code = Regex("(?i)(验证码|校验码|动态码|确认码|code|otp)\\s*(?:是|为)?\\s*[:：]?\\s*([A-Za-z0-9]{4,8})(?![A-Za-z0-9])")
++    private val order = Regex("(?i)(订单号|订单编号|单号|运单号|交易号|流水号|工单号|order\\s*(?:no\\.?|number|id|#))\\s*(?:是|为)?\\s*[:：#]?\\s*([A-Za-z0-9][A-Za-z0-9-]{5,31})(?![A-Za-z0-9-])")
++    private val phone = Regex("(?<![0-9+])(\\+?86[ -]?)?(1[3-9]\\d[ -]?\\d{4}[ -]?\\d{4})(?!\\d)|(?<![0-9+A-Za-z])(\\+\\d{1,3}[ -]?\\d{2,4}[ -]?\\d{3,4}(?:[ -]?\\d{3,4})?)(?!\\d)")
++    private val path = Regex("(?<![A-Za-z0-9_/:.~-])(~?/(?:[A-Za-z0-9_.@+-]+/)+[A-Za-z0-9_.@+-]*|[A-Za-z]:\\\\(?:[^\\\\\\s:*?\"<>|]+\\\\)*[^\\\\\\s:*?\"<>|]*)")
++    private val account = Regex("(账号|帐号|用户名|用户 ID|用户ID|登录名|username|user|login)\\s*(?:是|为)?\\s*[:：]\\s*([A-Za-z0-9_.@+-]{3,64})", RegexOption.IGNORE_CASE)
++
++    private val trailing = ".,;:!?。，；：！？)]}>'\"`*_"
++
++    private fun trimUrl(s: String): String {
++        var t = s
++        while (t.isNotEmpty() && t.last() in trailing) {
++            // keep a closing paren that has its opener inside the URL (wikipedia-style)
++            if (t.last() == ')' && t.count { it == '(' } >= t.count { it == ')' }) break
++            t = t.dropLast(1)
++        }
++        return t
++    }
++
++    /** True for API base URLs (OpenAI-compatible /v1, /compatible-mode/…, /api, api.* hosts). */
++    fun isApiBase(u: String): Boolean {
++        val noQ = u.substringBefore('?').substringBefore('#').trimEnd('/')
++        val afterScheme = noQ.substringAfter("://")
++        val host = afterScheme.substringBefore('/').lowercase()
++        val p = afterScheme.substringAfter('/', "").lowercase()
++        if (Regex("(^|/)v\\d+(beta\\d*)?$").containsMatchIn(p)) return true
++        if (p.contains("compatible-mode") || p.endsWith("/openai") || p == "api" || p.endsWith("/api")) return true
++        return host.startsWith("api.") && p.isEmpty()
++    }
++
++    /** Masked view of a secret: a short recognisable head + dots. Never the tail, never the middle. */
++    fun mask(secret: String): String {
++        val head = when {
++            secret.startsWith("sk-ws-") -> "sk-ws-"
++            secret.startsWith("sk-") -> "sk-"
++            secret.startsWith("github_pat_") -> "github_pat_"
++            Regex("^gh[pousr]_").containsMatchIn(secret) -> secret.take(4)
++            secret.startsWith("eyJ") -> "JWT "
++            secret.startsWith("AKIA") -> "AKIA"
++            secret.startsWith("AIza") -> "AIza"
++            secret.startsWith("nm_") -> "nm_"
++            secret.startsWith("pat_") -> "pat_"
++            secret.startsWith("xox") -> secret.take(5)
++            else -> ""
++        }
++        return head + "••••••"
++    }
++
++    fun ellipsize(s: String, max: Int = MAX_DISPLAY): String =
++        if (s.length <= max) s else s.take(max * 2 / 3 - 1) + "…" + s.takeLast(max / 3)
++
++    fun detect(text: String): List<ValueChip> {
++        if (text.isBlank()) return emptyList()
++        val c = ArrayList<Cand>()
++        secretToken.findAll(text).forEach { m -> c += Cand(Kind.SECRET, m.range.first, m.range.last + 1, m.value, 0) }
++        secretLabelled.findAll(text).forEach { m ->
++            val g = m.groups[2]!!
++            c += Cand(Kind.SECRET, g.range.first, g.range.last + 1, g.value, 0)
++        }
++        url.findAll(text).forEach { m ->
++            val v = trimUrl(m.value)
++            if (v.length > 10) c += Cand(if (isApiBase(v)) Kind.API else Kind.URL, m.range.first, m.range.first + v.length, v, 1)
++        }
++        email.findAll(text).forEach { m -> c += Cand(Kind.EMAIL, m.range.first, m.range.last + 1, m.value, 2) }
++        ip.findAll(text).forEach { m ->
++            val port = m.groups[2]?.value?.toIntOrNull()
++            if (port != null && port !in 1..65535) return@forEach
++            val v = m.value
++            // version numbers like 1.2.3.4 without a port are only taken when they look routable
++            if (port == null && v.startsWith("0.")) return@forEach
++            c += Cand(Kind.IP, m.range.first, m.range.last + 1, v, 3)
++        }
++        code.findAll(text).forEach { m ->
++            val g = m.groups[2]!!
++            if (g.value.any { it.isDigit() }) c += Cand(Kind.CODE, g.range.first, g.range.last + 1, g.value, 4)
++        }
++        order.findAll(text).forEach { m ->
++            val g = m.groups[2]!!
++            if (g.value.any { it.isDigit() }) c += Cand(Kind.ORDER, g.range.first, g.range.last + 1, g.value, 4)
++        }
++        phone.findAll(text).forEach { m ->
++            val v = m.value.trim()
++            val digits = v.filter { it.isDigit() }
++            if (digits.length in 8..15) c += Cand(Kind.PHONE, m.range.first, m.range.last + 1, v.replace(" ", "").replace("-", ""), 5)
++        }
++        path.findAll(text).forEach { m ->
++            val v = m.value.trimEnd('.', ',', '。', '，', ')', '）')
++            val segs = v.split('/', '\\').count { it.isNotEmpty() }
++            if (segs >= 2) c += Cand(Kind.PATH, m.range.first, m.range.first + v.length, v, 6)
++        }
++        account.findAll(text).forEach { m ->
++            val g = m.groups[2]!!
++            c += Cand(Kind.ACCOUNT, g.range.first, g.range.last + 1, g.value, 7)
++        }
++
++        // Accept by priority (secrets first), then earliest / longest; never overlap an accepted span.
++        val taken = ArrayList<Cand>()
++        for (cand in c.sortedWith(compareBy<Cand>({ it.prio }, { it.s }, { -(it.e - it.s) }))) {
++            if (taken.any { cand.s < it.e && it.s < cand.e }) continue
++            taken += cand
++        }
++        val out = ArrayList<ValueChip>()
++        val seen = HashSet<String>()
++        for (t in taken.sortedBy { it.s }) {
++            if (t.kind == Kind.SECRET) {
++                out += ValueChip(Kind.SECRET, "", mask(t.value), false, t.s, t.e)
++                continue
++            }
++            val key = t.kind.name + "|" + t.value
++            if (!seen.add(key)) continue
++            out += ValueChip(t.kind, t.value, ellipsize(t.value), true, t.s, t.e)
++        }
++        // Secrets stay (so the user sees one was there, masked) but count towards the cap last.
++        return out.take(MAX_CHIPS)
++    }
++}
++
++/**
++ * [Mines-38.9.5 i] 「引用回复」: the quoted text sits as a small collapsible block above the input
++ * and goes out as a Markdown quote ahead of the next message.
++ */
++object QuoteReply {
++    const val MAX_QUOTE = 2000
++
++    /** One-line preview for the collapsed block. */
++    fun preview(q: String, max: Int = 60): String {
++        val one = q.trim().replace(Regex("\\s+"), " ")
++        return if (one.length <= max) one else one.take(max - 1) + "…"
++    }
++
++    /** Markdown sent to the model: every quoted line prefixed with "> ", then a blank line, then the message. */
++    fun compose(quote: String?, message: String): String {
++        val q = quote?.trim().orEmpty()
++        if (q.isEmpty()) return message
++        val capped = if (q.length > MAX_QUOTE) q.take(MAX_QUOTE - 1) + "…" else q
++        val quoted = capped.lines().joinToString("\n") { if (it.isBlank()) ">" else "> $it" }
++        return if (message.isBlank()) quoted else "$quoted\n\n$message"
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/VoiceIntents.kt b/src/android/app/src/main/java/com/openminis/app/plus/VoiceIntents.kt
 index f1711e3..b5daa34 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/VoiceIntents.kt
@@ -11116,7 +11566,7 @@ index 917c7bb..1153000 100644
                  // An all-zero row carries nothing worth a capsule.
                  if (u.inputTokens == 0 && u.outputTokens == 0 &&
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt
-index aadbc71..e0ce0a2 100644
+index aadbc71..e54f756 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt
 @@ -3075,8 +3075,10 @@ fun ChatScreen(
@@ -11141,7 +11591,69 @@ index aadbc71..e0ce0a2 100644
              )
          },
          snackbarHost = { SnackbarHost(snackbarHostState) },
-@@ -4810,6 +4812,18 @@ fun ChatScreen(
+@@ -4463,6 +4465,7 @@ fun ChatScreen(
+                                 // bubble shows its own action menu (Copy /
+                                 // Retry / Edit) instead of starting text
+                                 // selection, matching iOS UX.
++                                androidx.compose.foundation.layout.Column(Modifier.fillMaxWidth()) {
+                                 UserMessageBubble(
+                                 message = item.message,
+                                 // [T-android-candidate-bubble-gap] extra top
+@@ -4473,6 +4476,10 @@ fun ChatScreen(
+                                     val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                     clipboard.setPrimaryClip(android.content.ClipData.newPlainText("message", item.message.content))
+                                 },
++                                onQuote = {
++                                    viewModel.setQuoteDraft(item.message.content)
++                                    try { inputFocusRequester.requestFocus() } catch (_: IllegalStateException) {}
++                                },
+                                 // T119: pass null while a turn is in flight so
+                                 // the long-press menu hides Retry; once the
+                                 // stream stops (cancel or natural end) the
+@@ -4541,6 +4548,8 @@ fun ChatScreen(
+                                     }
+                                 },
+                             )
++                            if (!item.message.isQueued) com.openminis.app.ui.plus.ValueChipRow(item.message.content, alignEnd = true)
++                            }
+                             } // close UserBubble SideEffect + UserMessageBubble block
+                             is FlatChatItem.AssistantHeader -> AssistantHeader()
+                             is FlatChatItem.AssistantText -> BoundsTrackedBlock(
+@@ -4551,6 +4560,7 @@ fun ChatScreen(
+                                 // T-android-gc-storm-issue17: collapse oversized frozen
+                                 // assistant text before feeding the markdown parser, which
+                                 // is the GC-storm hotspot for legacy sessions.
++                                androidx.compose.foundation.layout.Column(Modifier.fillMaxWidth()) {
+                                 LargeContentGuard(
+                                     content = item.block.content,
+                                     isStreaming = item.isStreaming,
+@@ -4568,12 +4578,16 @@ fun ChatScreen(
+                                         ),
+                                     )
+                                 }
++                                // [Mines-38.9.5 i] copy chips (links, emails, IP:port, codes, paths…); secrets masked
++                                if (!item.isStreaming) com.openminis.app.ui.plus.ValueChipRow(item.block.content)
++                                }
+                             }
+                             is FlatChatItem.AssistantMarkdownBlock -> com.openminis.app.ui.plus.ReplyCardSlice(minesCardSeg[item.key] ?: 3) { BoundsTrackedBlock(
+                                 messageId = item.messageId,
+                                 slotKey = "mdblock:${item.parentBlockId}:${item.blockIndex}",
+                                 markdown = item.messageMarkdown,
+                             ) {
++                                androidx.compose.foundation.layout.Column(Modifier.fillMaxWidth()) {
+                                 LargeContentGuard(
+                                     content = item.rawText,
+                                     isStreaming = item.isStreaming,
+@@ -4591,6 +4605,8 @@ fun ChatScreen(
+                                         ),
+                                     )
+                                 }
++                                if (!item.isStreaming) com.openminis.app.ui.plus.ValueChipRow(item.rawText)
++                                }
+                             } }
+                             is FlatChatItem.AssistantThinking -> {
+                                 // T300: hide Deep Thinking block when the user
+@@ -4810,6 +4826,18 @@ fun ChatScreen(
                                      ) {
                                          UsageCapsule(usage = item.usage, completedAt = item.completedAt)
                                      }
@@ -11160,7 +11672,19 @@ index aadbc71..e0ce0a2 100644
                                  }
                              }
                              is FlatChatItem.AssistantError -> InlineErrorBanner(
-@@ -6176,6 +6190,11 @@ fun ChatScreen(
+@@ -4929,6 +4957,11 @@ fun ChatScreen(
+                             try { inputFocusRequester.requestFocus() } catch (_: IllegalStateException) {}
+                             keyboardController?.show()
+                         },
++                        onQuote = { snippet ->
++                            viewModel.setQuoteDraft(snippet)
++                            try { inputFocusRequester.requestFocus() } catch (_: IllegalStateException) {}
++                            keyboardController?.show()
++                        },
+                         // [T-android-selection-readaloud] Speak the selection
+                         // through the same screen-scoped lazy player the
+                         // Compose-SelectionContainer toolbar uses.
+@@ -6176,6 +6209,15 @@ fun ChatScreen(
                      // text is already delta-appended into `inputText` by the
                      // mic button's callback, so when recording ends the field
                      // shows the full recognized string automatically.
@@ -11169,11 +11693,50 @@ index aadbc71..e0ce0a2 100644
 +                        val minesStreaming by viewModel.isStreaming.collectAsState()
 +                        com.openminis.app.ui.plus.ChatProgressStatus(viewModel.realSessionId.ifEmpty { viewModel.sessionId }, minesStreaming)
 +                    }
++                    run {
++                        val minesQuote by viewModel.quoteDraft.collectAsState()
++                        minesQuote?.let { q -> com.openminis.app.ui.plus.QuoteDraftBlock(q) { viewModel.setQuoteDraft(null) } }
++                    }
                      val recSttState by com.openminis.app.speech.SpeechRecognitionManager
                          .state.collectAsState()
                      val recIsRecording = recSttState == com.openminis.app.speech.RecognitionState.RECORDING ||
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatUserMessageUI.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatUserMessageUI.kt
+index d99b975..794bc2b 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatUserMessageUI.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatUserMessageUI.kt
+@@ -231,6 +231,7 @@ import androidx.compose.foundation.layout.offset
+ import androidx.compose.foundation.rememberScrollState
+ import androidx.compose.material.icons.filled.Cancel
+ import androidx.compose.material.icons.filled.ContentCopy
++import androidx.compose.material.icons.filled.FormatQuote
+ import androidx.compose.material.icons.outlined.Public
+ import androidx.compose.material.icons.filled.SkipNext
+ import androidx.compose.material.icons.filled.SkipPrevious
+@@ -300,6 +301,8 @@ internal fun UserMessageBubble(
+     onCompactAbove: (() -> Unit)? = null,
+     onWithdraw: (() -> Unit)? = null,
+     onPreviewFile: (Uri, String) -> Unit = { _, _ -> },
++    /** [Mines-38.9.5 i] 「引用回复」 the whole message. */
++    onQuote: (() -> Unit)? = null,
+ ) {
+     var showMenu by remember { mutableStateOf(false) }
+     val isQueued = message.isQueued
+@@ -494,6 +497,13 @@ internal fun UserMessageBubble(
+                     onClick = { showMenu = false; onCopy() },
+                     leadingIcon = { Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(18.dp)) },
+                 )
++                if (onQuote != null) {
++                    DropdownMenuItem(
++                        text = { Text("引用回复") },
++                        onClick = { showMenu = false; onQuote() },
++                        leadingIcon = { Icon(Icons.Default.FormatQuote, contentDescription = null, modifier = Modifier.size(18.dp)) },
++                    )
++                }
+                 // T119: while the model is generating, hide every action that
+                 // would mutate the in-flight turn. Retry truncates history and
+                 // restarts the stream, which corrupts state if it races a live
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
-index e0d0cae..04bf1f5 100644
+index e0d0cae..500b8da 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
 @@ -89,6 +89,7 @@ import kotlinx.coroutines.flow.combine
@@ -11184,7 +11747,19 @@ index e0d0cae..04bf1f5 100644
  import kotlinx.coroutines.flow.stateIn
  import kotlinx.coroutines.launch
  import kotlinx.coroutines.withContext
-@@ -1620,10 +1621,17 @@ class ChatViewModel(
+@@ -959,6 +960,11 @@ class ChatViewModel(
+         _inputText.value = joined
+     }
+ 
++    // [Mines-38.9.5 i] 「引用回复」: quoted text waits above the input and goes out as a Markdown quote with the next send
++    private val _quoteDraft = MutableStateFlow<String?>(null)
++    val quoteDraft: StateFlow<String?> = _quoteDraft.asStateFlow()
++    fun setQuoteDraft(text: String?) { _quoteDraft.value = text?.trim()?.takeIf { it.isNotEmpty() } }
++
+     private val _isStreaming = MutableStateFlow(false)
+     val isStreaming: StateFlow<Boolean> = _isStreaming.asStateFlow()
+ 
+@@ -1620,10 +1626,17 @@ class ChatViewModel(
      }
  
      /** `"estimatedRequestTokens":…,"estimatedFixedTokens":…` for the usage row, or "". Same keys as iOS StoredTokenUsage. */
@@ -11204,7 +11779,7 @@ index e0d0cae..04bf1f5 100644
  
      // ---- [T-android-context-usage-hint] Context-window pressure surface ----
      //
-@@ -5797,6 +5805,15 @@ class ChatViewModel(
+@@ -5797,6 +5810,15 @@ class ChatViewModel(
       */
      private val recentlyFailedEntryIds = java.util.Collections.synchronizedSet(mutableSetOf<String>())
  
@@ -11220,7 +11795,7 @@ index e0d0cae..04bf1f5 100644
      init {
          loadSession()
          // [T-android-context-usage-hint] Loop-END path for the usage line.
-@@ -5814,9 +5831,12 @@ class ChatViewModel(
+@@ -5814,9 +5836,12 @@ class ChatViewModel(
          viewModelScope.launch {
              var wasStreaming = false
              isStreaming.collect { streaming ->
@@ -11233,7 +11808,18 @@ index e0d0cae..04bf1f5 100644
                  if (lastTurnWasCancelled) {
                      lastTurnWasCancelled = false
                      return@collect
-@@ -9525,6 +9545,9 @@ class ChatViewModel(
+@@ -9058,7 +9083,9 @@ class ChatViewModel(
+         // [T-android-stop-sibling-subagent] New work in this session lifts the
+         // stop: delegations from here on may drive the turn again.
+         com.openminis.app.agent.jobs.AgentJobRegistry.clearDelegationMute(activeSessionId)
+-        sendMessage(text, skipContextCheck = false, headless = false)
++        val q = _quoteDraft.value
++        val out = if (q != null) { _quoteDraft.value = null; com.openminis.app.plus.QuoteReply.compose(q, text) } else text
++        sendMessage(out, skipContextCheck = false, headless = false)
+     }
+ 
+     /**
+@@ -9525,6 +9552,9 @@ class ChatViewModel(
              // [Mines-38.1b] the banner showed 「Provider error: 模型输出变成了乱码…」 — drop the English
              // exception prefix when the reason itself is already a Chinese sentence
              .replace(Regex("^(Provider error|Transient error): (?=[^\\n]*[\\u4e00-\\u9fff])"), "")
@@ -11243,7 +11829,7 @@ index e0d0cae..04bf1f5 100644
          // T-streaming-side-channel: before mutating the canonical message,
          // drain any in-flight streaming delta so the error frame carries
          // the actual accumulated content (otherwise the user sees content
-@@ -9571,6 +9594,7 @@ class ChatViewModel(
+@@ -9571,6 +9601,7 @@ class ChatViewModel(
       * Mirrors iOS streamWithAutoRetry: `chatMessage?.error = desc` without dropping the loop.
       */
      private fun setTransientInlineError(errorText: String) {
@@ -11251,7 +11837,7 @@ index e0d0cae..04bf1f5 100644
          val msgs = _messages.value.toMutableList()
          val lastAssistantIdx = msgs.indexOfLast { it.role == "assistant" }
          if (lastAssistantIdx < 0) return
-@@ -9581,6 +9605,7 @@ class ChatViewModel(
+@@ -9581,6 +9612,7 @@ class ChatViewModel(
  
      /** Clear any inline error on the last assistant message (used after successful retry). */
      private fun clearInlineError() {
@@ -11259,7 +11845,7 @@ index e0d0cae..04bf1f5 100644
          val msgs = _messages.value.toMutableList()
          val lastAssistantIdx = msgs.indexOfLast { it.role == "assistant" }
          if (lastAssistantIdx < 0) return
-@@ -10763,6 +10788,10 @@ class ChatViewModel(
+@@ -10763,6 +10795,10 @@ class ChatViewModel(
          // [Mines-loop-34] same failing tool + same error 3× → stop; weak-model hint once per run
          val failGuard = com.openminis.app.agent.FailurePatternGuard()
          var weakModelHinted = false
@@ -11270,7 +11856,7 @@ index e0d0cae..04bf1f5 100644
          turnLoop@ for (turn in 0 until turnCap) {
              // [T-android-switch-model-next-request] The user picked another
              // model while this turn ran. Apply it HERE, before the next
-@@ -11356,7 +11385,10 @@ class ChatViewModel(
+@@ -11356,7 +11392,10 @@ class ChatViewModel(
                              thinkingLevel = if (currentProvider.model.supportsReasoning == true) (turnThinkingOverride ?: _thinkingLevel.value) else ThinkingLevel.OFF,
                          )
                      }
@@ -11282,7 +11868,7 @@ index e0d0cae..04bf1f5 100644
                  // [T-STALL-DIAG] Mark first byte back from the provider and log
                  // the time-to-first-chunk once per turn.
                  if (firstChunkSeen.compareAndSet(false, true)) {
-@@ -12138,7 +12170,7 @@ class ChatViewModel(
+@@ -12138,7 +12177,7 @@ class ChatViewModel(
                      val next = nextCandidate?.provider
                      if (next != null && nextCandidate != null) {
                          val reason = when {
@@ -11291,7 +11877,7 @@ index e0d0cae..04bf1f5 100644
                              actual is com.openminis.app.data.model.LLMError.ProviderError -> actual.detail
                              else -> actual.message ?: "Error"
                          }
-@@ -12227,7 +12259,8 @@ class ChatViewModel(
+@@ -12227,7 +12266,8 @@ class ChatViewModel(
                                  persistBinding("""{"type":"entry","entryId":"${newEntry.id}"}""")
                              }
                          }
@@ -11301,7 +11887,7 @@ index e0d0cae..04bf1f5 100644
                          allToolBlocks.removeAll { it.kind == "info" }
                          allToolBlocks.add(0, AssistantBlock(
                              id = "fallback_info_$turn",
-@@ -12343,6 +12376,11 @@ class ChatViewModel(
+@@ -12343,6 +12383,11 @@ class ChatViewModel(
                  val turnParts = buildTurnParts(allToolBlocks, turnStartBlockIndex, toolInputMap)
                  val blockMeta = allToolBlocks.filter { it.kind == "tool_use" }.associateBy { it.id }
                  persistAssistantTurn(turnParts, lastUsage, turnReasoningContent, blockMeta, uiAssistantId = assistantId, streamMs = turnStreamMs)
@@ -11313,7 +11899,7 @@ index e0d0cae..04bf1f5 100644
                  // [T-error-persist-android] Empty-response hint: the model ended a
                  // turn (finish=stop/end_turn) with no visible text anywhere in the
                  // reply and no tool blocks — the user just sees a blank bubble.
-@@ -12945,6 +12983,30 @@ class ChatViewModel(
+@@ -12945,6 +12990,30 @@ class ChatViewModel(
                  .filterIsInstance<AgentContentPart.ToolResult>()
                  .firstNotNullOfOrNull { failGuard.onResult(it.name, it.isError, it.content) }
              if (failStop != null) AppLogger.warning(TAG_STREAM, "[FailGuard] turn=$turn $failStop")
@@ -11344,7 +11930,7 @@ index e0d0cae..04bf1f5 100644
              // [Mines-loop-34] weak / flash model on a long tool run → one gentle hint to switch in 模型路由
              if (!weakModelHinted && helperConfig == null && runGuard.toolCalls >= 15 &&
                  com.openminis.app.plus.ModelHealth.isWeak(currentProvider.model.id, currentProvider.model.displayName)) {
-@@ -13355,6 +13417,17 @@ class ChatViewModel(
+@@ -13355,6 +13424,17 @@ class ChatViewModel(
                  kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.MinesSelfCheckTool.run(context, argsJson) }
              com.openminis.app.plus.KnowledgeBase.TOOL_NAME ->
                  kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.KnowledgeBase.runTool(context, argsJson) }
@@ -11362,7 +11948,7 @@ index e0d0cae..04bf1f5 100644
              else -> ToolExecutionResult("Unknown tool: $name", false)
          }
      }
-@@ -15429,7 +15502,7 @@ CLI tools at /usr/local/bin with the `android-` prefix give you access to Androi
+@@ -15429,7 +15509,7 @@ CLI tools at /usr/local/bin with the `android-` prefix give you access to Androi
  - android-speech — microphone transcription (`listen [--language BCP47] [--max N] [--timeout SEC]`; `status`). Requires RECORD_AUDIO.
  - android-weather <latitude> <longitude> — Open-Meteo forecast (current + hourly + daily). No API key needed.
  - android-shizuku-cli — invoke privileged Android system APIs (package management, settings, system commands) via Shizuku when granted. Curated subcommands return structured JSON; for anything not covered, fall back to `android-shizuku-cli exec <any shell command>` which runs the command via `sh -c` with Shizuku privilege (same surface as `adb shell`). Run with no args (or --help) for the subcommand list.
@@ -11371,7 +11957,7 @@ index e0d0cae..04bf1f5 100644
  - minis-open <url-or-path>: Opens a resource inside Minis without leaving the chat. Accepts http/https URLs (→ built-in WebKit preview) and chat-resource file paths under /var/minis/** (→ built-in file preview, routed by extension: images to the image viewer, .md to markdown preview, .html to HTML preview, .pdf/office docs to QuickLook, audio/video to the media player, else share sheet). Examples: minis-open https://example.com, minis-open /var/minis/workspace/report.md, minis-open /var/minis/attachments/chart.png. Prefer this over android-open for anything that can be previewed in-app so the user doesn't lose conversation context. Run android-open via shell_execute for non-web schemes (tel:, mailto:, geo:, intent:, etc.) or when the user explicitly wants the system handler.
  - minis-sessions-cli: Read chat history. `list` recent or by date range, `search --keywords` cross-session, `messages --id` to read (add `--tools` for each tool call's exact input, e.g. the shell command, and its output). Run --help for full options.
  - minis-model-use: Invoke other LLM models pre-configured by the user. Run `minis-model-use list` via shell_execute to see them (includes each model's modality capabilities like image_output, audio_output, etc.), `minis-model-use search <query>` to filter by name/provider. `minis-model-use run --model <id_or_name>` sends an OpenAI-compatible messages request; pass input via --input <json_file> or stdin, output goes to stdout or --output <path>. The OpenAI shape is the PRIMARY input for every model and modality; standard params are auto-converted to the underlying provider, so do not hand-write provider-native bodies as the primary input. For provider-specific extras the standard schema doesn't model (web-search plugins, image-to-image fields, TTS/video or other custom endpoints), escape hatches exist for OpenAI-compatible providers (they error or are ignored on Anthropic/Gemini models): `extra_body` (object merged verbatim into the request body), a custom `endpoint` path, and a top-level `passthrough` envelope for fully verbatim requests with RAW (unparsed) responses. Results may carry `warnings` (fields that were ignored/downgraded and why) and `applied_extras` (which extras actually took effect) — read them to self-correct. Run --help for the full contract before using these. Models may support multimodal output (image generation, TTS/audio, video) — check the modalities field in list output. For image_output models, pass generation params in the input JSON: top-level `n`/`size`/`quality`/`prompt` (OpenAI /images/generations style) or `generation_config.{aspect_ratio,image_size,number_of_images,person_generation}` (Gemini). Run with --help for full usage.${modelUseDelegateNote}
-@@ -15503,6 +15576,18 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15503,6 +15583,18 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                  append("\n\n")
                  append(dailyMemoryFragment)
              }
@@ -11390,7 +11976,7 @@ index e0d0cae..04bf1f5 100644
              // Runtime context goes last so the prefix above stays byte-stable
              // across requests within the same day. Keep ordering deterministic
              // (date → tz → lang → model count) — any reorder defeats the cache.
-@@ -17756,3 +17841,28 @@ internal fun warmUpBudget(window: Int?, compactThreshold: Int?, ratio: Double, f
+@@ -17756,3 +17848,28 @@ internal fun warmUpBudget(window: Int?, compactThreshold: Int?, ratio: Double, f
      val line = if (threshold > 0) threshold else w
      return (line / ratio).toInt() - fixedTokens
  }
@@ -11432,6 +12018,47 @@ index 83af099..00b4c8a 100644
          color = ChatColors.secondaryText,
      )
  }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/MinisTextKitGesture.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/MinisTextKitGesture.kt
+index 8c7fdc6..8896800 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/chat/MinisTextKitGesture.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/MinisTextKitGesture.kt
+@@ -863,6 +863,8 @@ data class SelectionToolbarActions(
+     val resolveSelectionMarkdown: () -> String?,
+     /** Append the currently-selected plain text to the chat composer. Null hides the button. */
+     val onAddToInput: ((String) -> Unit)? = null,
++    /** [Mines-38.9.5 i] 「引用回复」: quote the selection (or, from the overflow, the whole message) above the input. */
++    val onQuote: ((String) -> Unit)? = null,
+     /**
+      * [T-android-selection-readaloud] Speak the currently-selected plain text
+      * through Minis TTS. Null hides the button. Mirrors iOS's "Read Selection".
+@@ -1120,6 +1122,13 @@ fun MinisSelectionToolbarHost(
+                     // read-aloud and so was folded into the "⋯" overflow; the
+                     // bar now keeps up to four actions inline when they fit,
+                     // so read-aloud stays visible too (see inlineCount below).
++                    if (actions?.onQuote != null) {
++                        add(SelectionAction("引用回复") {
++                            val text = controller.selectedPlainText()
++                            if (text.isNotEmpty()) actions.onQuote.invoke(text)
++                            controller.clearSelection()
++                        })
++                    }
+                     if (actions?.onAddToInput != null) {
+                         add(SelectionAction(labelAddToInput) {
+                             val text = controller.selectedPlainText()
+@@ -1239,6 +1248,13 @@ fun MinisSelectionToolbarHost(
+                             )
+                         }
+                     }
++                    if (actions?.onQuote != null) {
++                        add(SelectionAction("引用整条消息") {
++                            val whole = actions.resolveSelectionMarkdown.invoke() ?: controller.selectedPlainText()
++                            if (whole.isNotEmpty()) actions.onQuote.invoke(whole)
++                            controller.clearSelection()
++                        })
++                    }
+                     if (tableActions != null) {
+                         add(SelectionAction(labelCopyTable) {
+                             tableActions.copyTableMarkdown()
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/SessionSkillsSheet.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/SessionSkillsSheet.kt
 index 0baa44f..124c152 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/SessionSkillsSheet.kt
@@ -12536,6 +13163,163 @@ index 0000000..ffa23c0
 +        if (!t.running && !t.ok && (t.reason.contains("登录"))) WarmPrimaryPill("去登录", onClick = onLogin, height = 34.dp, fontSize = 13,
 +            modifier = Modifier.padding(start = 6.dp))
 +        if (!t.running) Text("关闭", fontSize = 13.sp, color = m.ink2, modifier = Modifier.clickable(onClick = onClose).padding(6.dp))
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ChatChipsUi.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ChatChipsUi.kt
+new file mode 100644
+index 0000000..ea7dd8b
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ChatChipsUi.kt
+@@ -0,0 +1,151 @@
++package com.openminis.app.ui.plus
++
++import android.content.ClipData
++import android.content.ClipboardManager
++import android.content.Context
++import android.content.Intent
++import android.net.Uri
++import android.widget.Toast
++import androidx.compose.animation.animateContentSize
++import androidx.compose.foundation.ExperimentalFoundationApi
++import androidx.compose.foundation.background
++import androidx.compose.foundation.border
++import androidx.compose.foundation.combinedClickable
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.ExperimentalLayoutApi
++import androidx.compose.foundation.layout.FlowRow
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.layout.widthIn
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.Close
++import androidx.compose.material.icons.filled.FormatQuote
++import androidx.compose.material3.Icon
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.semantics.contentDescription
++import androidx.compose.ui.semantics.semantics
++import androidx.compose.ui.text.font.FontFamily
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import com.openminis.app.plus.QuoteReply
++import com.openminis.app.plus.ValueChips
++
++/** [Mines-38.9.5 i] chip glass: the same tokens as every other glass surface (GlassAuto fill, hairline border). */
++@Composable
++internal fun chipGlass(): Pair<Color, Color> {
++    val m = mines()
++    return minesGlassFill(strong = true) to m.glassBorder
++}
++
++/**
++ * Small glass chips for the copyable values in one message (ValueChips.detect). Tap = copy exactly that value +
++ * 「已复制」; long-press = open (links, API bases, mail, phone) or share. Secrets are shown masked and never copied.
++ */
++@OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
++@Composable
++fun ValueChipRow(text: String, modifier: Modifier = Modifier, alignEnd: Boolean = false) {
++    val chips = remember(text) { ValueChips.detect(text) }
++    if (chips.isEmpty()) return
++    val m = mines()
++    val ctx = LocalContext.current
++    val (fill, border) = chipGlass()
++    FlowRow(
++        modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 2.dp, bottom = 4.dp),
++        horizontalArrangement = Arrangement.spacedBy(6.dp, if (alignEnd) Alignment.End else Alignment.Start),
++        verticalArrangement = Arrangement.spacedBy(6.dp),
++    ) {
++        chips.forEach { c ->
++            val shape = RoundedCornerShape(50)
++            val desc = if (c.copyable) "${c.kind.label} ${c.value}，点按复制，长按打开或分享" else "${c.kind.label}已隐藏，不能复制"
++            Row(
++                Modifier.heightIn(min = 28.dp).widthIn(max = 260.dp).clip(shape).background(fill).border(0.75.dp, border, shape)
++                    .combinedClickable(
++                        onClick = {
++                            if (c.copyable) copyValue(ctx, c.value) else toast(ctx, "密钥已隐藏，不能复制")
++                        },
++                        onLongClick = { if (c.copyable) openOrShare(ctx, c) else toast(ctx, "密钥已隐藏，不能复制") },
++                    )
++                    .semantics(mergeDescendants = true) { contentDescription = desc }
++                    .padding(horizontal = 10.dp, vertical = 4.dp),
++                verticalAlignment = Alignment.CenterVertically,
++            ) {
++                Text(c.kind.label, fontSize = MT.Meta, lineHeight = MT.SubLH, color = if (c.copyable) m.primaryText else m.ink2,
++                    fontWeight = FontWeight.Medium, maxLines = 1)
++                Spacer(Modifier.width(5.dp))
++                Text(c.display, fontSize = MT.Meta, lineHeight = MT.SubLH, color = m.ink,
++                    fontFamily = if (c.kind.mono) FontFamily.Monospace else FontFamily.Default,
++                    maxLines = 1, overflow = TextOverflow.Ellipsis)
++            }
++        }
++    }
++}
++
++private fun toast(ctx: Context, s: String) = Toast.makeText(ctx, s, Toast.LENGTH_SHORT).show()
++
++private fun copyValue(ctx: Context, v: String) {
++    val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
++    cm.setPrimaryClip(ClipData.newPlainText("value", v))
++    toast(ctx, "已复制")
++}
++
++private fun openOrShare(ctx: Context, c: ValueChips.ValueChip) {
++    val v = c.value
++    val view: Intent? = when (c.kind) {
++        ValueChips.Kind.URL, ValueChips.Kind.API -> Intent(Intent.ACTION_VIEW, Uri.parse(v))
++        ValueChips.Kind.EMAIL -> Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:$v"))
++        ValueChips.Kind.PHONE -> Intent(Intent.ACTION_DIAL, Uri.parse("tel:$v"))
++        else -> null
++    }
++    val share = Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, v), null)
++    try {
++        ctx.startActivity((view ?: share).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
++    } catch (_: Exception) {
++        try { ctx.startActivity(share.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) } catch (_: Exception) { toast(ctx, "没有能打开它的应用") }
++    }
++}
++
++/** 「引用回复」 block above the input: collapsed to one line, tap to expand, × to drop. Sent as a Markdown quote. */
++@Composable
++fun QuoteDraftBlock(quote: String, onClear: () -> Unit) {
++    val m = mines()
++    var open by remember(quote) { mutableStateOf(false) }
++    val (fill, border) = chipGlass()
++    val shape = RoundedCornerShape(12.dp)
++    Row(
++        Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp).clip(shape).background(fill).border(0.75.dp, border, shape)
++            .clickable { open = !open }.animateContentSize()
++            .semantics(mergeDescendants = true) { contentDescription = "引用：" + QuoteReply.preview(quote, 120) + "。点按展开" },
++        verticalAlignment = Alignment.Top,
++    ) {
++        Box(Modifier.padding(start = 8.dp, top = 8.dp, bottom = 8.dp).width(3.dp).height(if (open) 48.dp else 18.dp).clip(RoundedCornerShape(2.dp)).background(m.primary))
++        Icon(Icons.Filled.FormatQuote, null, tint = m.icon, modifier = Modifier.padding(start = 6.dp, top = 8.dp).size(16.dp))
++        Column(Modifier.weight(1f).padding(start = 4.dp, top = 7.dp, bottom = 7.dp)) {
++            Text(if (open) quote.take(QuoteReply.MAX_QUOTE) else QuoteReply.preview(quote), fontSize = MT.Caption, lineHeight = MT.CaptionLH,
++                color = m.ink2, maxLines = if (open) 6 else 1, overflow = TextOverflow.Ellipsis)
++        }
++        Box(Modifier.size(36.dp).clickable(onClick = onClear).semantics { contentDescription = "取消引用" }, contentAlignment = Alignment.Center) {
++            Icon(Icons.Filled.Close, null, tint = m.ink2, modifier = Modifier.size(16.dp))
++        }
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/CodeSourcesScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/CodeSourcesScreen.kt
@@ -18078,7 +18862,7 @@ index 0000000..3e3f1d6
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
-index 95d1b6b..f179b72 100644
+index 95d1b6b..27fffc1 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
 @@ -1,6 +1,7 @@
@@ -18112,7 +18896,7 @@ index 95d1b6b..f179b72 100644
      val context = LocalContext.current
      PlusPrefs.init(context)
      PlusVault.init(context)
-@@ -98,7 +102,25 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier, onSearch:
+@@ -98,7 +102,26 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier, onSearch:
      // [Mines-38.7] greeting with care: 8 time slots + weather (open-meteo, no key) + battery + late night + weekend /
      // holiday + 好久不见, several lines per case, no sentence twice a day (HomeGreeting)
      val gTick by com.openminis.app.plus.HomeGreeting.tick.collectAsState()
@@ -18129,17 +18913,18 @@ index 95d1b6b..f179b72 100644
 +        if (granted) runCatching { context.getSharedPreferences("mines_greeting", android.content.Context.MODE_PRIVATE).edit().putLong("w_loc_try", 0L).putLong("w_try", 0L).apply() }
 +    }
 +    val wScope = androidx.compose.runtime.rememberCoroutineScope()
-+    if (askLoc) MinesDialog("看你那里的天气", onDismiss = { com.openminis.app.plus.HomeGreeting.locationAsked(context) },
-+        confirm = "允许", onConfirm = {
++    // [Mines-38.9.5 i] user 22:34/22:35: ask the system once for coarse location (no Mines explanation text); the weather
++    // stays hidden until the phone (or a city the user set) says where it is — never the VPN's IP
++    LaunchedEffect(askLoc) {
++        if (askLoc) {
 +            locLauncher.launch(android.Manifest.permission.ACCESS_COARSE_LOCATION)
 +            wScope.launch { kotlinx.coroutines.delay(1500); runCatching { com.openminis.app.plus.HomeGreeting.refreshWeather(context) } }
-+        }, dismiss = "不用") {
-+        Text("开着 VPN 时，网络位置不准。允许 Mines 知道你大概在哪个城市（不是精确位置），首页天气才对。", fontSize = MT.Body, lineHeight = MT.BodyLH, color = mines().ink2)
++        }
 +    }
      val greeting = androidx.compose.runtime.remember(gTick, hour) {
          val snap = DeviceSnap.read(context)
          val charging = runCatching { context.getSystemService(android.os.BatteryManager::class.java)?.isCharging == true }.getOrDefault(false)
-@@ -143,21 +165,78 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier, onSearch:
+@@ -143,21 +166,90 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier, onSearch:
                  .clickable { switcher = true }.semantics { contentDescription = "换角色：$name" },
                  contentAlignment = Alignment.Center) { PetAvatar(size = 100.dp) }
          }
@@ -18176,12 +18961,20 @@ index 95d1b6b..f179b72 100644
 +            else -> "都在正常跑" to okC
 +        }
 +        @Suppress("UNUSED_VARIABLE") val okUnused = okC
-+        val slot = when (hour) { in 5..8 -> "早上好"; in 9..10 -> "上午好"; in 11..12 -> "中午好"; in 13..17 -> "下午好"; in 18..22 -> "晚上好"; else -> "夜深了" }
-+        val hello = if (who.isBlank()) slot else "$slot，$who"
++        // [Mines-38.9.5 i] user 22:34 「晚上好主人太单调了」: varied greeting — time of day · weather (rain soon → 带伞) ·
++        // weekday / holiday · task status, from a pool, never the same phrase on two opens in a row; name optional
++        val tasksAll by com.openminis.app.plus.TaskProgress.tasks.collectAsState()
++        val tSum = androidx.compose.runtime.remember(tasksAll) { com.openminis.app.plus.TaskProgressCore.summary(tasksAll.values, System.currentTimeMillis()) }
++        val hello = androidx.compose.runtime.remember(gTick, hour, tSum.running, tSum.waiting, tSum.error) {
++            runCatching {
++                com.openminis.app.plus.HomeGreeting.variedGreeting(context, com.openminis.app.plus.HomeGreeting.context(context, 80, true),
++                    tSum.running, tSum.waiting, tSum.error, who)
++            }.getOrDefault(greet)
++        }
 +        // [Mines-38.9.1] user: 「晚上好这里高一点」 — the greeting moves up into the space the plate's status line left
 +        Row(Modifier.fillMaxWidth().padding(start = 24.dp, end = 16.dp, top = 0.dp).offset(y = (-8).dp).heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
 +            if (!searching) {
-+                Text(hello, fontSize = 22.sp, lineHeight = 28.sp, fontWeight = FontWeight.Medium, color = m.ink, maxLines = 1, style = fogGlow(),
++                Text(hello, fontSize = MT.PageTitle, lineHeight = 24.sp, fontWeight = FontWeight.Medium, color = m.ink, maxLines = 1, style = fogGlow(),
 +                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
 +                    modifier = Modifier.weight(1f).semantics { contentDescription = "$hello。$lineText" })
 +                Spacer(Modifier.width(8.dp))
@@ -18215,7 +19008,7 @@ index 95d1b6b..f179b72 100644
 +                }
 +            }
 +        }
-+        Row(Modifier.padding(start = 24.dp).offset(y = (-8).dp), verticalAlignment = Alignment.CenterVertically) {
++        Row(Modifier.fillMaxWidth().padding(start = 24.dp, end = 16.dp).offset(y = (-8).dp), verticalAlignment = Alignment.CenterVertically) {
 +            // [Mines-38.9.5 i] user 19:26: 「都在正常跑」 becomes the conversation summary (进行中 N · 等你 N · 出错 N · 完成 N);
 +            // device warnings (电量 / 网络 / 存储 / 服务器) still come first
 +            val summarised = lineText == "都在正常跑" && TaskSummaryLine()
@@ -18225,6 +19018,10 @@ index 95d1b6b..f179b72 100644
 +                Text(lineText, fontSize = 13.sp, lineHeight = 18.sp, style = fogGlow(),
 +                    color = if (lineColor == okC) m.ink2 else lineColor, maxLines = 1, softWrap = false)
 +            }
++            // [Mines-38.9.5 i] user 22:34 「首页天气加回去」: small weather at the end of this line (icon · temp · condition · city,
++            // or the rain-soon hint in amber); tap → detail. Gone when there is no device location / city.
++            Spacer(Modifier.weight(1f).widthIn(min = 8.dp))
++            HomeWeatherMini()
 +        }
 +        Row(Modifier.fillMaxWidth().padding(start = 24.dp, end = 12.dp, top = 0.dp, bottom = 0.dp).offset(y = (-6).dp), verticalAlignment = Alignment.CenterVertically) {
 +            Text(if (searching && query.isNotBlank()) "找到 $resultCount 个对话 · 按最近" else "最近对话", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = m.ink2, style = fogGlow(), modifier = Modifier.weight(1f))
@@ -18232,7 +19029,7 @@ index 95d1b6b..f179b72 100644
          }
      }
  }
-@@ -203,6 +282,65 @@ fun HomeAvatar(modifier: Modifier = Modifier) {
+@@ -203,6 +295,65 @@ fun HomeAvatar(modifier: Modifier = Modifier) {
      }
  }
  
@@ -18298,7 +19095,7 @@ index 95d1b6b..f179b72 100644
  /** [Mines-38.7] the home weather as the sprite / big picture / pill need it; null = no weather (nothing shown). */
  class HomeWx(val icon: String, val words: String, val temp: Int, val extra: String, val night: Boolean) {
      val spoken get() = "$words $temp 度"
-@@ -219,7 +357,8 @@ fun homeWeather(): HomeWx? {
+@@ -219,7 +370,8 @@ fun homeWeather(): HomeWx? {
      val forced = com.openminis.app.plus.HomeGreeting.override?.optInt("hour", -1)?.takeIf { it >= 0 }
      val night = if (forced != null) forced >= 19 || forced < 6 else sunNight
      val (icon, words) = com.openminis.app.plus.HomeGreeting.describe(w.code, if (night) 23 else 12)
@@ -18308,7 +19105,7 @@ index 95d1b6b..f179b72 100644
      return HomeWx(icon, words, Math.round(w.temp).toInt(), extra, night)
  }
  
-@@ -234,7 +373,7 @@ fun HomeWeatherPill() {
+@@ -234,7 +386,7 @@ fun HomeWeatherPill() {
      androidx.compose.animation.AnimatedVisibility(HomeOrbit.open,
          enter = androidx.compose.animation.fadeIn() + androidx.compose.animation.expandVertically(),
          exit = androidx.compose.animation.fadeOut() + androidx.compose.animation.shrinkVertically()) {
@@ -18317,7 +19114,7 @@ index 95d1b6b..f179b72 100644
          Row(Modifier.padding(top = 10.dp, bottom = 2.dp).heightIn(min = 36.dp)
              .clip(RoundedCornerShape(50)).background(fill).border(1.dp, m.hairline.copy(alpha = 0.18f), RoundedCornerShape(50))
              .padding(horizontal = 14.dp, vertical = 4.dp)
-@@ -242,7 +381,7 @@ fun HomeWeatherPill() {
+@@ -242,7 +394,7 @@ fun HomeWeatherPill() {
              verticalAlignment = Alignment.CenterVertically) {
              Text("${wx.temp}°", fontSize = 18.sp, lineHeight = 22.sp, fontWeight = FontWeight.Bold, color = m.ink, maxLines = 1, softWrap = false)
              Spacer(Modifier.width(6.dp))
@@ -18326,7 +19123,7 @@ index 95d1b6b..f179b72 100644
          }
      }
  }
-@@ -287,7 +426,8 @@ class WeatherOrbitState {
+@@ -287,7 +439,8 @@ class WeatherOrbitState {
   * face's upper right, a tap shows the pill.
   */
  @Composable
@@ -18336,7 +19133,7 @@ index 95d1b6b..f179b72 100644
      val ctx = LocalContext.current
      val m = mines()
      val still = remember { AnimeWeather.still(ctx) }
-@@ -315,9 +455,9 @@ private fun WeatherOrbit(st: WeatherOrbitState, wx: HomeWx, front: Boolean, onTa
+@@ -315,9 +468,9 @@ private fun WeatherOrbit(st: WeatherOrbitState, wx: HomeWx, front: Boolean, onTa
      }
      val a = st.angle
      val f = st.fly.value
@@ -18349,7 +19146,7 @@ index 95d1b6b..f179b72 100644
      // faint dashed orbit line (back layer, while circling)
      if (!front && !still && f < 0.02f) {
          androidx.compose.foundation.Canvas(Modifier.size(1.dp)) {
-@@ -338,7 +478,7 @@ private fun WeatherOrbit(st: WeatherOrbitState, wx: HomeWx, front: Boolean, onTa
+@@ -338,7 +491,7 @@ private fun WeatherOrbit(st: WeatherOrbitState, wx: HomeWx, front: Boolean, onTa
      val tx = 0f; val ty = -82f
      val x = ox + (tx - ox) * f
      val y = oy + (ty - oy) * f - kotlin.math.sin(Math.PI.toFloat() * f) * 22f
@@ -18358,7 +19155,7 @@ index 95d1b6b..f179b72 100644
      val scale = sc0 + (1f - sc0) * f
      val alpha = al0 + (1f - al0) * f
      // faint trail of light dots behind the sprite while it circles
-@@ -407,7 +547,7 @@ private fun StatusTile(modifier: Modifier, icon: String, value: String, label: S
+@@ -407,7 +560,7 @@ private fun StatusTile(modifier: Modifier, icon: String, value: String, label: S
              Text(label, fontSize = MT.Meta, color = m.ink2, maxLines = 1, softWrap = false, modifier = Modifier.weight(1f))
              Box(Modifier.size(6.dp).clip(CircleShape).background(dot))
          }
@@ -18367,7 +19164,7 @@ index 95d1b6b..f179b72 100644
              overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, modifier = Modifier.padding(top = 2.dp))
      }
  }
-@@ -473,7 +613,7 @@ private fun FeedRow(item: com.openminis.app.plus.Digest.Item) {
+@@ -473,7 +626,7 @@ private fun FeedRow(item: com.openminis.app.plus.Digest.Item) {
          ToneBubble(com.openminis.app.ui.brand.MinesIcons.named(icon)!!, tone)
          Spacer(Modifier.width(14.dp))
          Column(Modifier.weight(1f)) {
@@ -18376,7 +19173,7 @@ index 95d1b6b..f179b72 100644
                  maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
              val sub = it.summary.takeIf { s -> s.isNotBlank() && s != it.headline } ?: it.source
              Text(sub, fontSize = 15.sp, lineHeight = 20.sp, color = m.ink2, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
-@@ -514,7 +654,7 @@ private fun MessagesBar(count: Int, onClick: () -> Unit) {
+@@ -514,7 +667,7 @@ private fun MessagesBar(count: Int, onClick: () -> Unit) {
      ) {
          MinesIcon(com.openminis.app.ui.brand.MinesIcons.named("mail")!!, null, tint = m.ink2, modifier = Modifier.size(20.dp))
          Spacer(Modifier.width(10.dp))
@@ -18385,7 +19182,7 @@ index 95d1b6b..f179b72 100644
          if (count > 0) {
              Box(Modifier.heightIn(min = 22.dp).clip(RoundedCornerShape(50)).background(MinesDesign.DangerFill).padding(horizontal = 7.dp),
                  contentAlignment = Alignment.Center) {
-@@ -542,10 +682,10 @@ fun HomeWeatherChip(modifier: Modifier = Modifier) {
+@@ -542,10 +695,10 @@ fun HomeWeatherChip(modifier: Modifier = Modifier) {
      val hour = (com.openminis.app.plus.HomeGreeting.override?.optInt("hour", -1)?.takeIf { it >= 0 }) ?: Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
      val (icon, words) = com.openminis.app.plus.HomeGreeting.describe(w.code, hour)
      val night = hour >= 19 || hour < 6
@@ -18398,7 +19195,7 @@ index 95d1b6b..f179b72 100644
      Row(modifier.padding(top = 4.dp, bottom = 6.dp).clip(RoundedCornerShape(50)).background(fill)
          .border(1.dp, m.hairline.copy(alpha = 0.18f), RoundedCornerShape(50))
          .padding(start = 8.dp, end = 16.dp, top = 3.dp, bottom = 3.dp)
-@@ -556,6 +696,40 @@ fun HomeWeatherChip(modifier: Modifier = Modifier) {
+@@ -556,6 +709,107 @@ fun HomeWeatherChip(modifier: Modifier = Modifier) {
          Spacer(Modifier.width(6.dp))
          Text("$t°", fontSize = 18.sp, lineHeight = 22.sp, fontWeight = FontWeight.Bold, color = m.ink, maxLines = 1)
          Spacer(Modifier.width(8.dp))
@@ -18437,6 +19234,73 @@ index 95d1b6b..f179b72 100644
 +        androidx.compose.foundation.Canvas(Modifier.size(14.dp)) {
 +            drawCircle(color.copy(alpha = 0.10f + 0.28f * (1f - t)), radius = size.minDimension / 2f * (0.55f + 0.45f * t))
 +            drawCircle(color.copy(alpha = 0.75f + 0.25f * t), radius = 3.5.dp.toPx())
++        }
++    }
++}
++
++
++/** [Mines-38.9.5 i] the home's small weather (status line, right): 「☁ 24° 多云 · 新加坡」 or 「☂ 24° · 1 小时后有雨」; tap → [HomeWeatherSheet]. */
++@Composable
++fun HomeWeatherMini() {
++    val context = LocalContext.current
++    val m = mines()
++    val tick by com.openminis.app.plus.HomeGreeting.tick.collectAsState()
++    LaunchedEffect(Unit) { runCatching { com.openminis.app.plus.HomeGreeting.refreshWeather(context) } }
++    val w = androidx.compose.runtime.remember(tick) { com.openminis.app.plus.HomeGreeting.weatherNow(context) } ?: return
++    var open by androidx.compose.runtime.saveable.rememberSaveable { androidx.compose.runtime.mutableStateOf(false) }
++    val hour = (com.openminis.app.plus.HomeGreeting.override?.optInt("hour", -1)?.takeIf { it >= 0 }) ?: Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
++    val (icon0, words) = com.openminis.app.plus.HomeGreeting.describe(w.code, hour)
++    val t = Math.round(w.temp).toInt()
++    val soon = w.soon.takeIf { it.isNotBlank() && it != "正在下雨" }
++    val icon = if (soon != null) "cloud-rain" else icon0
++    val tail = soon ?: w.place.takeIf { it.isNotBlank() && it.length <= 6 }
++    val warnC = if (m.dark) MinesDesign.WarningDark else MinesDesign.Warning
++    val shape = RoundedCornerShape(50)
++    Row(Modifier.clip(shape).clickable { open = true }.padding(horizontal = 6.dp, vertical = 2.dp)
++        .semantics(mergeDescendants = true) { contentDescription = "天气：$words，$t 度" + (w.place.takeIf { it.isNotBlank() }?.let { "，$it" } ?: "") + (soon?.let { "，$it" } ?: "") + "。点按看详情" },
++        verticalAlignment = Alignment.CenterVertically) {
++        AnimeWeatherIcon(icon, 18.dp)
++        Spacer(Modifier.width(4.dp))
++        Text("$t° $words", fontSize = MT.Meta, lineHeight = MT.SubLH, color = m.ink2, maxLines = 1, softWrap = false, style = fogGlow())
++        if (tail != null) {
++            Text(" · $tail", fontSize = MT.Meta, lineHeight = MT.SubLH, color = if (soon != null) warnC else m.ink2, fontWeight = if (soon != null) FontWeight.Medium else FontWeight.Normal,
++                maxLines = 1, softWrap = false, style = fogGlow())
++        }
++    }
++    if (open) HomeWeatherSheet(w, words, onDismiss = { open = false })
++}
++
++@Composable
++private fun HomeWeatherSheet(w: com.openminis.app.plus.HomeGreeting.Weather, words: String, onDismiss: () -> Unit) {
++    val context = LocalContext.current
++    val m = mines()
++    val scope = androidx.compose.runtime.rememberCoroutineScope()
++    var editing by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
++    var city by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(com.openminis.app.plus.HomeGreeting.manualCity(context)?.third.orEmpty()) }
++    var err by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf<String?>(null) }
++    val src = com.openminis.app.plus.HomeGreeting.placeSource(context)
++    MinesDialog(w.place.ifBlank { "天气" }, onDismiss = onDismiss,
++        confirm = if (editing) "保存" else null,
++        onConfirm = if (editing) ({
++            scope.launch {
++                val r = com.openminis.app.plus.HomeGreeting.setManualCity(context, city)
++                if (city.isBlank() || r != null) { editing = false; err = null; onDismiss() } else err = "没找到这个城市"
++            }
++        }) else null, dismiss = if (editing) "取消" else "关闭") {
++        @Composable fun line(k: String, v: String, c: Color = m.ink) = Row(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
++            Text(k, fontSize = MT.Body, color = m.ink2, modifier = Modifier.width(72.dp)); Text(v, fontSize = MT.Body, color = c)
++        }
++        line("现在", "${Math.round(w.temp)}° $words")
++        line("今天", "${Math.round(w.min)}° ~ ${Math.round(w.max)}° · 降水 ${w.rain}%")
++        val rainLine = w.soon.ifBlank { w.later }
++        if (rainLine.isNotBlank()) line("下雨", rainLine, if (m.dark) MinesDesign.WarningDark else MinesDesign.Warning)
++        if (src.isNotBlank()) line("位置", src)
++        if (!editing) Text("设置城市", fontSize = MT.Body, color = m.primaryText, fontWeight = FontWeight.Medium,
++            modifier = Modifier.padding(top = 6.dp).clip(RoundedCornerShape(50)).clickable { editing = true }.padding(horizontal = 4.dp, vertical = 8.dp))
++        else {
++            androidx.compose.material3.OutlinedTextField(city, { city = it; err = null }, singleLine = true, modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
++                textStyle = androidx.compose.ui.text.TextStyle(fontSize = MT.Body, color = m.ink), placeholder = { Text("城市（留空 = 用手机定位）", fontSize = MT.Body, color = m.ink3) })
++            err?.let { Text(it, fontSize = MT.Caption, color = if (m.dark) MinesDesign.DangerDark else MinesDesign.Danger, modifier = Modifier.padding(top = 4.dp)) }
 +        }
      }
  }
@@ -20636,6 +21500,95 @@ index 0000000..e83c35b
 +        assertTrue(GlassAuto.solveBand(false, lightTint, lightInk2, busy) >= GlassAuto.solveBand(false, lightTint, lightInk2, calm))
 +    }
 +}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/HomeWeatherCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/HomeWeatherCoreTest.kt
+new file mode 100644
+index 0000000..f3440f2
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/HomeWeatherCoreTest.kt
+@@ -0,0 +1,83 @@
++package com.openminis.app.plus
++
++import com.openminis.app.plus.HomeWeatherCore.GreetIn
++import com.openminis.app.plus.HomeWeatherCore.LocSource
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNotEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import java.io.File
++
++/** [Mines-38.9.5 i] home weather never located by IP (user runs a VPN), rain-soon hint, varied greeting. */
++class HomeWeatherCoreTest {
++
++    @Test fun noIpBasedLocationSource() {
++        LocSource.values().forEach { assertFalse(it.name, it.name.contains("IP")) }
++        for (perm in listOf(true, false)) for (age in listOf(null, 0L, 10 * 60_000L, 3 * 3600_000L)) for (city in listOf(true, false)) {
++            val o = HomeWeatherCore.order(perm, age, city)
++            assertTrue(o.all { it in LocSource.values() })
++        }
++        // no permission, no fix, no city → nothing (the weather hides), never a network guess
++        assertTrue(HomeWeatherCore.order(false, null, false).isEmpty())
++    }
++
++    /** The weather / location code must not call any IP-geolocation service (VPN exit ≠ where the user is). */
++    @Test fun weatherSourcesHaveNoIpGeolocation() {
++        val banned = Regex("(?i)ipapi|ip-api|ipinfo|ipify|ipwho|geoip|ip\\.sb|ipgeolocation|myip|ifconfig\\.co|freegeoip|extreme-ip|db-ip")
++        val dir = listOf("src/main/java/com/openminis/app/plus", "app/src/main/java/com/openminis/app/plus").map { File(it) }.first { it.isDirectory }
++        for (f in listOf("HomeGreeting.kt", "HomeWeatherCore.kt")) {
++            val code = File(dir, f).readLines().filterNot { it.trimStart().startsWith("*") || it.trimStart().startsWith("//") }.joinToString("\n")
++            assertFalse("$f calls an IP geolocation service", banned.containsMatchIn(code))
++        }
++    }
++
++    @Test fun cachedFixFirstWithin30Min() {
++        assertEquals(listOf(LocSource.CACHED_FIX, LocSource.FRESH_FIX, LocSource.LAST_KNOWN_FIX), HomeWeatherCore.order(true, 10 * 60_000L, false))
++        assertEquals(listOf(LocSource.FRESH_FIX, LocSource.LAST_KNOWN_FIX, LocSource.MANUAL_CITY, LocSource.STALE_FIX), HomeWeatherCore.order(true, 2 * 3600_000L, true))
++        assertEquals(listOf(LocSource.MANUAL_CITY), HomeWeatherCore.order(false, null, true))
++    }
++
++    private val times = (20..23).map { "2026-10-17T%02d:00".format(it) } + (0..5).map { "2026-10-18T%02d:00".format(it) }
++
++    @Test fun rainInOneHour() {
++        val prob = listOf(10, 20, 70, 80, 0, 0, 0, 0, 0, 0)
++        assertEquals("1 小时后有雨", HomeWeatherCore.rainSoon("2026-10-17T21:00", times, prob, List(10) { 0.0 }, false))
++        assertEquals("快下雨了", HomeWeatherCore.rainSoon("2026-10-17T21:50", times, prob, List(10) { 0.0 }, false))
++    }
++
++    @Test fun rainLaterAndTomorrow() {
++        val prob = listOf(0, 0, 0, 0, 0, 0, 90, 0, 0, 0)
++        assertEquals("明天凌晨 2 点有雨", HomeWeatherCore.rainSoon("2026-10-17T21:00", times, prob, List(10) { 0.0 }, false))
++        assertEquals("", HomeWeatherCore.rainSoon("2026-10-17T20:00", times, List(10) { 0 }, List(10) { 0.0 }, false))
++        assertEquals("正在下雨", HomeWeatherCore.rainSoon("2026-10-17T20:00", times, List(10) { 0 }, List(10) { 0.0 }, true))
++        // millimetres alone also count
++        val mm = List(10) { if (it == 2) 0.6 else 0.0 }
++        assertEquals("2 小时后有雨", HomeWeatherCore.rainSoon("2026-10-17T20:05", times, List(10) { 0 }, mm, false))
++    }
++
++    @Test fun greetingVariesAndNeverRepeatsBackToBack() {
++        val i = GreetIn(hour = 22, dow = 7, weather = "cloudy", temp = 26, running = 3, name = "主人")
++        var last: String? = null
++        val seen = HashSet<String>()
++        for (seed in 0 until 40) {
++            val g = HomeWeatherCore.choose(i, last, seed)
++            assertNotEquals(last, g)
++            assertFalse(g.contains("主人"))
++            assertTrue(g, g.length <= HomeWeatherCore.MAX_LEN)
++            seen += g; last = g
++        }
++        assertTrue("only ${seen.size} different greetings", seen.size >= 4)
++    }
++
++    @Test fun greetingMixesRainTasksAndSlots() {
++        val c = HomeWeatherCore.candidates(GreetIn(hour = 18, dow = 6, rainSoon = "1 小时后有雨", running = 2, failed = 1, name = "杨arling"))
++        assertTrue(c.contains("1 小时后有雨，带把伞"))
++        assertTrue(c.contains("1 个任务出错了"))
++        assertTrue(c.contains("2 个任务在跑"))
++        assertTrue(c.contains("周五了，快周末啦"))
++        assertTrue(c.contains("傍晚好，杨arling"))
++        val slots = mapOf(6 to "清晨", 9 to "上午", 12 to "中午", 15 to "下午", 18 to "傍晚", 23 to "深夜")
++        slots.forEach { (h, w) -> assertEquals(w, HomeWeatherCore.slotWord(h)) }
++    }
++}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/IdentityCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/IdentityCoreTest.kt
 new file mode 100644
 index 0000000..8aa98d7
@@ -21350,6 +22303,115 @@ index 0000000..9b9fd04
 +        val t = C.step(C.plan(null, "s", "目标", listOf("一", "二"), 1), 0, null, StepSt.DONE, "ok", 2).copy(retries = 2, account = "aliyun")
 +        val back = C.fromJson(C.toJson(t)); assertNotNull(back); assertEquals(t, back)
 +        assertTrue(C.spoken(t).startsWith("进行中，1/2 步"))
++    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/ValueChipsTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/ValueChipsTest.kt
+new file mode 100644
+index 0000000..dd20bfd
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/ValueChipsTest.kt
+@@ -0,0 +1,103 @@
++package com.openminis.app.plus
++
++import com.openminis.app.plus.ValueChips.Kind
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/** [Mines-38.9.5 i] copy chips + 引用回复 (user 2026-10-17 22:23). */
++class ValueChipsTest {
++    private fun kinds(t: String) = ValueChips.detect(t).map { it.kind to it.value }
++
++    @Test fun urlTrimsTrailingPunctuation() {
++        assertEquals(listOf(Kind.URL to "https://github.com/ddfc1991/x"), kinds("看这里：https://github.com/ddfc1991/x。"))
++    }
++
++    @Test fun apiBaseIsSeparateKind() {
++        val k = kinds("接口地址 http://8.217.89.133:8787/v1 和 https://ws-abc.cn-beijing.maas.aliyuncs.com/compatible-mode/v1")
++        assertEquals(listOf(Kind.API, Kind.API), k.map { it.first })
++        assertEquals("http://8.217.89.133:8787/v1", k[0].second)
++    }
++
++    @Test fun ipPortNotInsideUrl() {
++        val k = kinds("服务器 38.76.209.77:8090 已启动，地址 http://38.76.209.77:8090/m3894/a.apk")
++        assertEquals(Kind.IP to "38.76.209.77:8090", k[0])
++        assertEquals(Kind.URL, k[1].first)
++        assertEquals(2, k.size)
++    }
++
++    @Test fun invalidIpAndVersionsIgnored() {
++        assertTrue(kinds("版本 1.23.5 和 300.1.1.1").none { it.first == Kind.IP })
++    }
++
++    @Test fun emailAndAccount() {
++        val k = kinds("邮箱 smoke@example.com，账号：demo_user")
++        assertEquals(listOf(Kind.EMAIL to "smoke@example.com", Kind.ACCOUNT to "demo_user"), k)
++    }
++
++    @Test fun phoneNumbers() {
++        assertEquals(listOf(Kind.PHONE to "13690688658"), kinds("手机 136 9068 8658 收到"))
++        assertEquals(Kind.PHONE, kinds("call +65 6123 4567")[0].first)
++    }
++
++    @Test fun codesAndOrders() {
++        assertEquals(listOf(Kind.CODE to "482913"), kinds("你的验证码是 482913，5 分钟内有效"))
++        assertEquals(listOf(Kind.ORDER to "SF1234567890"), kinds("运单号：SF1234567890"))
++        assertTrue(kinds("code: abcdef").isEmpty())   // no digit → not a code
++    }
++
++    @Test fun paths() {
++        val k = kinds("APK 在 /workspace/work/apk/mines-38.9.5.apk ，配置 ~/.dsh/auth.json")
++        assertEquals(listOf(Kind.PATH to "/workspace/work/apk/mines-38.9.5.apk", Kind.PATH to "~/.dsh/auth.json"), k)
++        assertTrue(kinds("比例 1/2").isEmpty())
++    }
++
++    @Test fun secretsMaskedAndNeverCopyable() {
++        val t = "key sk-ws-AbCdEf0123456789xyzQW 和 ghp_abcdefghijklmnopqrstuvwxyz0123 密码：Hunter2!x"
++        val chips = ValueChips.detect(t)
++        assertEquals(3, chips.size)
++        chips.forEach {
++            assertEquals(Kind.SECRET, it.kind)
++            assertFalse(it.copyable)
++            assertEquals("", it.value)
++            assertFalse(it.display.contains("0123"))
++            assertFalse(it.display.contains("Hunter"))
++        }
++        assertEquals("sk-ws-••••••", chips[0].display)
++    }
++
++    @Test fun secretInsideUrlWinsOverUrl() {
++        val chips = ValueChips.detect("https://api.example.com/v1?token=sk-AbCdEf0123456789xyzQW")
++        assertTrue(chips.any { it.kind == Kind.SECRET })
++        assertTrue(chips.none { it.copyable && it.value.contains("sk-AbCd") })
++    }
++
++    @Test fun jwtIsSecret() {
++        val c = ValueChips.detect("token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTYifQ.abcdefghijk")
++        assertEquals(Kind.SECRET, c.single().kind)
++    }
++
++    @Test fun dedupeAndCap() {
++        val t = (1..20).joinToString(" ") { "https://a.example.com/p$it" } + " https://a.example.com/p1"
++        val c = ValueChips.detect(t)
++        assertEquals(ValueChips.MAX_CHIPS, c.size)
++        assertEquals(c.size, c.map { it.value }.toSet().size)
++    }
++
++    @Test fun longValueEllipsizedButCopiesWhole() {
++        val u = "https://example.com/" + "a".repeat(80)
++        val c = ValueChips.detect(u).single()
++        assertEquals(u, c.value)
++        assertTrue(c.display.length <= 28)
++        assertTrue(c.display.contains("…"))
++    }
++
++    @Test fun quoteCompose() {
++        assertEquals("> 第一行\n>\n> 第二行\n\n好的", QuoteReply.compose("第一行\n\n第二行", "好的"))
++        assertEquals("你好", QuoteReply.compose(null, "你好"))
++        assertEquals("> 只引用", QuoteReply.compose("只引用", ""))
++        assertEquals("a b c", QuoteReply.preview("a\n b   c"))
++        assertTrue(QuoteReply.preview("x".repeat(100)).length == 60)
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/WebSessionCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/WebSessionCoreTest.kt
