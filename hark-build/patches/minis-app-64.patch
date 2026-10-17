@@ -2673,10 +2673,10 @@ index 0000000..5ea6c4c
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/GlassAuto.kt b/src/android/app/src/main/java/com/openminis/app/plus/GlassAuto.kt
 new file mode 100644
-index 0000000..6b0b2fe
+index 0000000..d5b6d9a
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/GlassAuto.kt
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,182 @@
 +package com.openminis.app.plus
 +
 +import kotlin.math.pow
@@ -2684,23 +2684,31 @@ index 0000000..6b0b2fe
 +
 +/**
 + * [Mines-38.9.4] user 2026-10-17 16:59 「那个磨砂玻璃可以调节一下，不用户自己调节」: the frosted glass picks its own tint.
++ * [Mines-38.9.5 i] user 21:22 on the 38.9.4 sheets: auto was too white (light 86 %, dark 73 %); the 38.9.3 look (slider
++ * ~30 %) is the one they like. So the glass now stays THIN — light 30–40 %, dark 35–45 %, hard cap light 45 % / dark 50 %
++ * (strong variant included) — and readability comes from the text instead of from whitening the whole card:
++ *  1. secondary text (ink2) is pulled toward the primary ink just as far as the worst band needs ([Plan.ink2]);
++ *  2. where even that is not enough, text rows on those bands get a soft halo / scrim in the glass tint behind the glyphs
++ *     ([Plan.halo] per band, 0…[HALO_MAX]), not a denser card.
 + *
 + * What is behind the glass is measured (the fog as it is drawn — base colour + the 4 drifting blobs at the current
 + * 雾气浓淡 / weather density, sampled on a 12 × 24 grid at 4 moments of its 24 s loop — or the photo wallpaper on a
 + * 12 × 24 thumbnail). Per vertical band of the screen it keeps the WORST luminance for the text colour (darkest
 + * spot for dark ink on light glass, brightest for light ink on dark glass), pushed a little further by how busy the
-+ * background is (std-dev), and then picks the LOWEST glass alpha that keeps the secondary text (ink2) at ≥ 4.5:1.
-+ * Light glass stays inside 50–62 %, dark inside 45–55 % whenever that is enough; if a photo is so dark / bright that it
-+ * is not, readability wins and the alpha goes up (to 88 % at most).
++ * background is (std-dev).
 + *
 + * Pure (no Android types) so it is unit-tested: GlassAutoTest.
 + */
 +object GlassAuto {
 +    const val BANDS = 6
-+    const val LIGHT_MIN = 0.50f; const val LIGHT_MAX = 0.62f
-+    const val DARK_MIN = 0.45f; const val DARK_MAX = 0.55f
-+    const val HARD_MAX = 0.88f
++    const val LIGHT_MIN = 0.30f; const val LIGHT_MAX = 0.40f; const val LIGHT_CAP = 0.45f
++    const val DARK_MIN = 0.35f; const val DARK_MAX = 0.45f; const val DARK_CAP = 0.50f
 +    const val TARGET = 4.5f
++    /** strongest halo behind text rows (tint alpha at the glyph centre; it fades out over ~6 dp) */
++    const val HALO_MAX = 0.70f
++    fun min(dark: Boolean) = if (dark) DARK_MIN else LIGHT_MIN
++    fun max(dark: Boolean) = if (dark) DARK_MAX else LIGHT_MAX
++    fun cap(dark: Boolean) = if (dark) DARK_CAP else LIGHT_CAP
 +
 +    /** Per band (top → bottom): darkest / brightest luminance (after the busy-ness margin), mean, std-dev. */
 +    data class Band(val lo: Float, val hi: Float, val mean: Float, val sd: Float)
@@ -2721,22 +2729,53 @@ index 0000000..6b0b2fe
 +
 +    // ---------------- the solver ----------------
 +
-+    /** Lowest alpha (0.01 steps) keeping [ink] ≥ [TARGET]:1 on the glass over the worst spot of [band]. */
++    private fun worst(dark: Boolean, band: Band) = if (dark) band.hi else band.lo
++
++    /** Lowest alpha (0.01 steps) in [min]…[max] keeping [ink] ≥ [TARGET]:1 over the worst spot of [band]; [max] when none does
++     *  (the glass never goes denser than that — the text gets help instead, see [plan]). */
 +    fun solveBand(dark: Boolean, tint: Float, ink: Float, band: Band): Float {
-+        val lo = if (dark) DARK_MIN else LIGHT_MIN
-+        val worst = if (dark) band.hi else band.lo
-+        var a = lo
-+        while (a <= HARD_MAX + 1e-4f) {
-+            if (contrast(ink, over(tint, a, worst)) >= TARGET) break
++        var a = min(dark)
++        while (a <= max(dark) + 1e-4f) {
++            if (contrast(ink, over(tint, a, worst(dark, band))) >= TARGET) return a
 +            a += 0.01f
 +        }
-+        return a.coerceAtMost(HARD_MAX)
++        return max(dark)
 +    }
 +
 +    /** Alpha per band and the screen-wide one (the max: a card can scroll over any band). */
 +    fun solve(dark: Boolean, tint: Float, ink: Float, s: Stats): Pair<List<Float>, Float> {
 +        val per = s.bands.map { solveBand(dark, tint, ink, it) }
-+        return per to (per.maxOrNull() ?: if (dark) DARK_MIN else LIGHT_MIN)
++        return per to (per.maxOrNull() ?: min(dark))
++    }
++
++    /** Glass alpha per band + screen-wide, the secondary-text colour to use, and the halo behind text rows per band. */
++    data class Plan(val per: List<Float>, val all: Float, val ink2: Int, val inkMix: Float, val halo: List<Float>)
++
++    /** [ink2] pulled toward [ink] by [t] (0 = ink2, 1 = ink), in sRGB like the GPU. */
++    fun mixInk(ink2: Int, ink: Int, t: Float): Int = blend(ink, ink2, t.coerceIn(0f, 1f))
++
++    /** Contrast of text [inkLum] over the glass at [a] with a halo of [halo] (tint coverage behind the glyphs) over [bg]. */
++    fun textContrast(tint: Float, a: Float, halo: Float, bg: Float, inkLum: Float): Float =
++        contrast(inkLum, over(tint, a + (1 - a) * halo.coerceIn(0f, 1f), bg))
++
++    /**
++     * Thin glass first, then the text: per band the lowest alpha in min…max that already gives ink2 ≥ 4.5:1 (else max);
++     * then ONE ink2 for the screen = the least pull toward [ink] that makes every band pass at its own alpha; where even the
++     * primary ink is not enough, the lowest halo (0.05 steps, ≤ [HALO_MAX]) that does.
++     */
++    fun plan(dark: Boolean, tint: Int, ink2: Int, ink: Int, s: Stats): Plan {
++        val tl = lum(tint)
++        val (per, all) = solve(dark, tl, lum(ink2), s)
++        var t = 0f
++        while (t < 1f && s.bands.indices.any { i -> textContrast(tl, per[i], 0f, worst(dark, s.bands[i]), lum(mixInk(ink2, ink, t))) < TARGET }) t += 0.05f
++        t = t.coerceAtMost(1f)
++        val ink2n = mixInk(ink2, ink, t); val il = lum(ink2n)
++        val halo = s.bands.indices.map { i ->
++            var h = 0f
++            while (h < HALO_MAX && textContrast(tl, per[i], h, worst(dark, s.bands[i]), il) < TARGET) h += 0.05f
++            (Math.round(h.coerceAtMost(HALO_MAX) * 20f) / 20f)
++        }
++        return Plan(per, all, ink2n, t, halo)
 +    }
 +
 +    /** Worst spot = 10th / 90th percentile; busy backgrounds read worse through frost, so it is widened by ¼ std-dev (≤ 0.04). */
@@ -13656,10 +13695,10 @@ index 0000000..8ac6e59
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassAutoUi.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassAutoUi.kt
 new file mode 100644
-index 0000000..c95fb58
+index 0000000..6bc0f8d
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassAutoUi.kt
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,117 @@
 +package com.openminis.app.ui.plus
 +
 +import android.graphics.Bitmap
@@ -13668,6 +13707,7 @@ index 0000000..c95fb58
 +import androidx.compose.runtime.LaunchedEffect
 +import androidx.compose.runtime.collectAsState
 +import androidx.compose.runtime.getValue
++import androidx.compose.runtime.setValue
 +import androidx.compose.runtime.mutableStateMapOf
 +import androidx.compose.ui.graphics.Color
 +import androidx.compose.ui.graphics.toArgb
@@ -13680,7 +13720,8 @@ index 0000000..c95fb58
 +
 +/**
 + * [Mines-38.9.4] 外观调节 › 玻璃 = 自动 (default): the glass alpha comes from what is behind it ([GlassAuto]) — the fog at
-+ * its current 浓淡 / weather density, or the photo wallpaper — per screen band, lowest alpha with ink2 ≥ 4.5:1.
++ * its current 浓淡 / weather density, or the photo wallpaper — per screen band. [Mines-38.9.5 i] thin glass (light 30–40 %,
++ * dark 35–45 %); readability from a darker ink2 + a halo behind text rows on the worst bands (GlassAuto.plan).
 + */
 +object GlassAutoState {
 +    private val fogCache = ConcurrentHashMap<String, GlassAuto.Stats>()
@@ -13691,12 +13732,21 @@ index 0000000..c95fb58
 +    // string formatting on EVERY recomposition, and each slider step re-decoded the photo. Now: thumbnail decoded once per
 +    // file version, stats per (version, alpha in 0.05 steps), solver results memoised per (mode, tint, ink, stats).
 +    private val thumbs = ConcurrentHashMap<Long, IntArray>()
-+    private data class SolveKey(val dark: Boolean, val tint: Int, val ink: Int, val stats: Int)
-+    private val solved = ConcurrentHashMap<SolveKey, Pair<List<Float>, Float>>()
-+    fun solveCached(dark: Boolean, tint: Int, ink: Int, s: GlassAuto.Stats): Pair<List<Float>, Float> {
++    private data class SolveKey(val dark: Boolean, val tint: Int, val ink2: Int, val ink: Int, val stats: Int)
++    private val solved = ConcurrentHashMap<SolveKey, GlassAuto.Plan>()
++    fun planCached(dark: Boolean, tint: Int, ink2: Int, ink: Int, s: GlassAuto.Stats): GlassAuto.Plan {
 +        if (solved.size > 64) solved.clear()
-+        return solved.getOrPut(SolveKey(dark, tint, ink, System.identityHashCode(s))) { GlassAuto.solve(dark, GlassAuto.lum(tint), GlassAuto.lum(ink), s) }
++        return solved.getOrPut(SolveKey(dark, tint, ink2, ink, System.identityHashCode(s))) { GlassAuto.plan(dark, tint, ink2, ink, s) }
 +    }
++    /** [Mines-38.9.5 i] the readable secondary text for the current backdrop (null = not measured yet → palette ink2) and how
++     *  far it was pulled toward the primary ink; snapshot state, so [MinesLook.apply] / the theme recompose when it changes. */
++    var ink2Light by androidx.compose.runtime.mutableStateOf<Int?>(null)
++    var ink2Dark by androidx.compose.runtime.mutableStateOf<Int?>(null)
++    var mixLight by androidx.compose.runtime.mutableStateOf(0f)
++    var mixDark by androidx.compose.runtime.mutableStateOf(0f)
++    /** halo behind text rows per screen band (0 = none) for the current backdrop */
++    var haloLight by androidx.compose.runtime.mutableStateOf<List<Float>>(emptyList())
++    var haloDark by androidx.compose.runtime.mutableStateOf<List<Float>>(emptyList())
 +    fun q(v: Float): Float = (Math.round(v * 20f) / 20f)
 +    /** last screen-wide auto alpha per mode (feeds [MinesLook.glassScale] for the palette glass tokens) */
 +    @Volatile var lastLight = MinesLook.NOMINAL_LIGHT
@@ -13744,9 +13794,27 @@ index 0000000..c95fb58
 +        LaunchedEffect(key) { GlassAutoState.loadPhoto(ctx, key, mtime, qa, page) }
 +        GlassAutoState.photo[key] ?: GlassAutoState.fog(dark, MinesLook.fog(dark), FogWind.density(FogWind.sample.code))
 +    } else GlassAutoState.fog(dark, MinesLook.fog(dark), FogWind.density(FogWind.sample.code))
-+    val r = GlassAutoState.solveCached(dark, tint.toArgb(), ink.toArgb(), stats)
-+    if (dark) GlassAutoState.lastDark = r.second else GlassAutoState.lastLight = r.second
-+    return r
++    // the BASE palette inks (not mines().ink2, which this very plan may have darkened → no feedback loop)
++    val ink2 = (if (dark) MinesDesign.Ink2Dark else MinesDesign.Ink2).toArgb()
++    val ink1 = (if (dark) MinesDesign.InkDark else MinesDesign.Ink).toArgb()
++    val p = GlassAutoState.planCached(dark, tint.toArgb(), ink2, ink1, stats)
++    if (dark) GlassAutoState.lastDark = p.all else GlassAutoState.lastLight = p.all
++    androidx.compose.runtime.SideEffect { if (dark) {
++        if (GlassAutoState.ink2Dark != p.ink2) { GlassAutoState.ink2Dark = p.ink2; GlassAutoState.mixDark = p.inkMix }
++        if (GlassAutoState.haloDark != p.halo) GlassAutoState.haloDark = p.halo
++    } else {
++        if (GlassAutoState.ink2Light != p.ink2) { GlassAutoState.ink2Light = p.ink2; GlassAutoState.mixLight = p.inkMix }
++        if (GlassAutoState.haloLight != p.halo) GlassAutoState.haloLight = p.halo
++    } }
++    return p.per to p.all
++}
++
++/** [Mines-38.9.5 i] halo behind text on the given screen bands (null = worst on screen); 0 when the glass is manual. */
++fun glassAutoHalo(dark: Boolean, bands: IntRange?): Float {
++    if (!MinesLook.glassAuto(dark)) return 0f
++    val h = if (dark) GlassAutoState.haloDark else GlassAutoState.haloLight
++    if (h.isEmpty()) return 0f
++    return bands?.let { r -> r.mapNotNull { h.getOrNull(it) }.maxOrNull() } ?: h.max()
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassDialogs.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassDialogs.kt
 index 8a17234..124663c 100644
@@ -15582,10 +15650,10 @@ index f69ee42..7bd0c94 100644
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/LookScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/LookScreen.kt
 new file mode 100644
-index 0000000..948fb54
+index 0000000..e573bb8
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/LookScreen.kt
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,237 @@
 +package com.openminis.app.ui.plus
 +
 +import android.content.Context
@@ -15618,6 +15686,7 @@ index 0000000..948fb54
 +import androidx.compose.ui.Modifier
 +import androidx.compose.ui.draw.clip
 +import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.toArgb
 +import androidx.compose.ui.platform.LocalContext
 +import androidx.compose.ui.semantics.contentDescription
 +import androidx.compose.ui.semantics.semantics
@@ -15693,6 +15762,14 @@ index 0000000..948fb54
 +    fun apply(m: MinesColors): MinesColors {
 +        val a = accent(m.dark)
 +        val k = glassScale(m.dark)
++        // [Mines-38.9.5 i] glass 自动 keeps the card thin; secondary text is pulled toward the primary ink as far as the
++        // backdrop needs (GlassAuto.plan) instead — ink3 by the same amount.
++        val m = if (glassAuto(m.dark)) {
++            val i2 = if (m.dark) GlassAutoState.ink2Dark else GlassAutoState.ink2Light
++            val t = if (m.dark) GlassAutoState.mixDark else GlassAutoState.mixLight
++            if (i2 == null || t <= 0f) m else m.copy(ink2 = Color(i2),
++                ink3 = Color(com.openminis.app.plus.GlassAuto.mixInk(m.ink3.toArgb(), m.ink.toArgb(), t)))
++        } else m
 +        val withGlass = if (k == 1f) m else m.copy(glass = m.glass.copy(alpha = (m.glass.alpha * k).coerceIn(0.05f, 0.98f)),
 +            glassStrong = m.glassStrong.copy(alpha = (m.glassStrong.alpha * k).coerceIn(0.05f, 0.98f)))
 +        if (a.id == "claude") return withGlass
@@ -16853,7 +16930,7 @@ index 92e996b..216510e 100644
      val Button = 15.sp         // all buttons
      val BodyLH = 22.sp; val SubLH = 18.sp; val CaptionLH = 18.sp
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
-index afd2104..d2fee5e 100644
+index afd2104..1fad6b1 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
 @@ -1,5 +1,9 @@
@@ -16963,7 +17040,7 @@ index afd2104..d2fee5e 100644
          Scaffold(
              containerColor = Color.Transparent,
              topBar = {
-@@ -293,40 +319,66 @@ fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, action
+@@ -293,40 +319,67 @@ fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, action
                      colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent, scrolledContainerColor = Color.Transparent),
                  )
              },
@@ -17024,7 +17101,8 @@ index afd2104..d2fee5e 100644
 +    if (MinesLook.glassAuto(m.dark)) {
 +        val (per, all) = glassAutoAlphas(m.dark, tint, m.ink2)
 +        val a = bands?.let { r -> r.mapNotNull { per.getOrNull(it) }.maxOrNull() } ?: all
-+        return tint.copy(alpha = (a + (if (strong) 0.06f else 0f)).coerceIn(0.05f, 0.94f))
++        // [Mines-38.9.5 i] never denser than the cap (light 45 % / dark 50 %), strong variant included
++        return tint.copy(alpha = (a + (if (strong) 0.05f else 0f)).coerceIn(0.05f, com.openminis.app.plus.GlassAuto.cap(m.dark)))
 +    }
 +    // [Mines-38.9.4] user 2026-10-17 「要磨砂底，不要白底」 (approved mock-27): ONE frosted-glass token for cards, lists, bars,
 +    // menus — warm white ~58 % light / dark tint ~50 % over the (already blurred) fog or photo wallpaper, 1 dp white
@@ -17039,7 +17117,7 @@ index afd2104..d2fee5e 100644
  }
  
  /** A frosted 22 dp card (no blur pass: translucent fill + 1 dp highlight + soft warm shadow). */
-@@ -334,9 +386,16 @@ fun minesGlassFill(strong: Boolean = false): Color {
+@@ -334,20 +387,40 @@ fun minesGlassFill(strong: Boolean = false): Color {
  fun MinesCard(modifier: Modifier = Modifier, strong: Boolean = false, onClick: (() -> Unit)? = null, content: @Composable ColumnScope.() -> Unit) {
      val m = mines()
      val shape = RoundedCornerShape(MS.CardRadius)
@@ -17056,9 +17134,21 @@ index afd2104..d2fee5e 100644
 +        }.shadow(0.dp /* [Mines-38.8] glass: an elevation shadow would show through as a grey core */, shape, clip = false, ambientColor = Color(0xFF3C2814).copy(alpha = 0.10f), spotColor = Color(0xFF3C2814).copy(alpha = 0.12f))
 +            .clip(shape).background(minesGlassFill(strong, bands)).border(1.dp, m.glassBorder, shape)
              .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier),
-         content = content,
-     )
-@@ -344,10 +403,13 @@ fun MinesCard(modifier: Modifier = Modifier, strong: Boolean = false, onClick: (
+-        content = content,
+-    )
++    ) {
++        // [Mines-38.9.5 i] glass 自动 over a hard spot: a soft halo in the glass tint behind the text rows of THIS card
++        // (only on the bands that need it) instead of whitening the whole card
++        val halo = glassAutoHalo(m.dark, bands)
++        if (halo > 0f) {
++            val tint = if (m.dark) Color(0xFF221B1E) else LightGlassTint
++            val px = with(androidx.compose.ui.platform.LocalDensity.current) { 6.dp.toPx() }
++            val base = androidx.compose.material3.LocalTextStyle.current
++            androidx.compose.runtime.CompositionLocalProvider(androidx.compose.material3.LocalTextStyle provides base.copy(
++                shadow = androidx.compose.ui.graphics.Shadow(tint.copy(alpha = halo), androidx.compose.ui.geometry.Offset.Zero, px))) { content() }
++        } else content()
++    }
+ }
  
  @Composable
  fun PlusSection(title: String?, footer: String? = null, action: String? = null, onAction: (() -> Unit)? = null,
@@ -17073,7 +17163,7 @@ index afd2104..d2fee5e 100644
              Text(title, fontSize = MT.Section, color = m.ink2, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f), maxLines = 1,
                  overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
              if (action != null && onAction != null) Text(action, fontSize = MT.Sub, color = m.primaryText, fontWeight = FontWeight.Medium,
-@@ -358,9 +420,10 @@ fun PlusSection(title: String?, footer: String? = null, action: String? = null,
+@@ -358,9 +431,10 @@ fun PlusSection(title: String?, footer: String? = null, action: String? = null,
          }
          if (footer != null) Text(
              footer,
@@ -17087,7 +17177,7 @@ index afd2104..d2fee5e 100644
              lineHeight = MT.CaptionLH,
          )
      }
-@@ -448,6 +511,36 @@ fun PillButton(text: String, modifier: Modifier = Modifier, primary: Boolean = t
+@@ -448,6 +522,36 @@ fun PillButton(text: String, modifier: Modifier = Modifier, primary: Boolean = t
      ) { Text(text, fontSize = MT.Button, fontWeight = FontWeight.SemiBold, color = fg, maxLines = 1, softWrap = false) }
  }
  
@@ -17124,7 +17214,7 @@ index afd2104..d2fee5e 100644
  private fun Modifier.graphicsLayerAlpha(a: Float): Modifier = if (a >= 1f) this else this.then(Modifier.graphicsLayer { alpha = a })
  
  /** Short hint line with an ⓘ, instead of long paragraphs. */
-@@ -547,3 +640,44 @@ fun rememberSoftBitmap(bmp: androidx.compose.ui.graphics.ImageBitmap?): androidx
+@@ -547,3 +651,44 @@ fun rememberSoftBitmap(bmp: androidx.compose.ui.graphics.ImageBitmap?): androidx
          b.asImageBitmap()
      }.getOrNull() ?: bmp
  }
@@ -19988,44 +20078,60 @@ index 0000000..e9baf52
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/GlassAutoTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/GlassAutoTest.kt
 new file mode 100644
-index 0000000..a3c2d8c
+index 0000000..e83c35b
 --- /dev/null
 +++ b/src/android/app/src/test/java/com/openminis/app/plus/GlassAutoTest.kt
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,116 @@
 +package com.openminis.app.plus
 +
 +import org.junit.Assert.assertEquals
 +import org.junit.Assert.assertTrue
 +import org.junit.Test
 +
++/** [Mines-38.9.5 i] thin glass (light 30–40 % / dark 35–45 %, cap 45 / 50 %), readability from ink2 + halo. */
 +class GlassAutoTest {
-+    private val lightTint = GlassAuto.lum(0xFFFFF5EF.toInt())
-+    private val darkTint = GlassAuto.lum(0xFF221B1E.toInt())
-+    private val lightInk2 = GlassAuto.lum(0xFF6B5A50.toInt())
-+    private val darkInk2 = GlassAuto.lum(0xFFCDC0B8.toInt())
++    private val lightTintC = 0xFFFFF5EF.toInt(); private val darkTintC = 0xFF221B1E.toInt()
++    private val lightInk2C = 0xFF6B5A50.toInt(); private val darkInk2C = 0xFFCDC0B8.toInt()
++    private val lightInkC = 0xFF2A1E1A.toInt(); private val darkInkC = 0xFFF6F0EB.toInt()
++    private val lightTint = GlassAuto.lum(lightTintC)
++    private val darkTint = GlassAuto.lum(darkTintC)
++    private val lightInk2 = GlassAuto.lum(lightInk2C)
++    private val darkInk2 = GlassAuto.lum(darkInk2C)
 +
-+    private fun check(dark: Boolean, tint: Float, ink: Float, s: GlassAuto.Stats, a: Float) {
-+        for (b in s.bands) {
++    private fun plan(dark: Boolean, s: GlassAuto.Stats) =
++        if (dark) GlassAuto.plan(true, darkTintC, darkInk2C, darkInkC, s) else GlassAuto.plan(false, lightTintC, lightInk2C, lightInkC, s)
++
++    /** every band: the planned ink2 with its halo reaches 4.5:1, or the halo is at its maximum */
++    private fun readable(dark: Boolean, s: GlassAuto.Stats, p: GlassAuto.Plan) {
++        val tint = if (dark) darkTint else lightTint
++        s.bands.forEachIndexed { i, b ->
 +            val worst = if (dark) b.hi else b.lo
-+            assertTrue("contrast ${GlassAuto.contrast(ink, GlassAuto.over(tint, a, worst))} at a=$a", GlassAuto.contrast(ink, GlassAuto.over(tint, a, worst)) >= 4.5f || a >= GlassAuto.HARD_MAX)
++            val c = GlassAuto.textContrast(tint, p.per[i], p.halo[i], worst, GlassAuto.lum(p.ink2))
++            assertTrue("band $i contrast $c a=${p.per[i]} halo=${p.halo[i]}", c >= 4.5f || p.halo[i] >= GlassAuto.HALO_MAX - 1e-4f)
 +        }
 +    }
 +
-+    @Test fun fogLightStaysInRangeAndReadable() {
-+        val s = GlassAuto.fogStats(false, 1.25f, 1.05f)
-+        val (per, a) = GlassAuto.solve(false, lightTint, lightInk2, s)
-+        println("fog light a=$a per band=$per")
-+        // default fog (雾气浓淡 1.25): ink2 #6B5A50 needs a little more than 62 % over the darkest blob; readability wins
-+        assertTrue("a=$a", a in GlassAuto.LIGHT_MIN..0.72f)
-+        check(false, lightTint, lightInk2, s, a)
++    private fun thin(dark: Boolean, p: GlassAuto.Plan) {
++        p.per.forEach { assertTrue("a=$it", it >= GlassAuto.min(dark) - 1e-4f && it <= GlassAuto.max(dark) + 1e-4f) }
++        assertTrue(p.all <= GlassAuto.cap(dark))
 +    }
 +
-+    @Test fun fogDarkStaysInRangeAndReadable() {
++    @Test fun fogLightIsThinAndReadable() {
++        val s = GlassAuto.fogStats(false, 1.25f, 1.05f)
++        val p = plan(false, s)
++        println("fog light a=${p.all} per=${p.per} mix=${p.inkMix} halo=${p.halo}")
++        thin(false, p)
++        assertTrue("a=${p.all}", p.all <= 0.40f + 1e-4f)   // the 38.9.3 look, not 86 %
++        readable(false, s, p)
++    }
++
++    @Test fun fogDarkIsThinAndReadable() {
 +        val s = GlassAuto.fogStats(true, 1.2f, 1.05f)
-+        val (per, a) = GlassAuto.solve(true, darkTint, darkInk2, s)
-+        println("fog dark a=$a per band=$per")
-+        assertTrue("a=$a", a in GlassAuto.DARK_MIN..GlassAuto.DARK_MAX + 0.001f)
-+        check(true, darkTint, darkInk2, s, a)
++        val p = plan(true, s)
++        println("fog dark a=${p.all} per=${p.per} mix=${p.inkMix} halo=${p.halo}")
++        thin(true, p)
++        assertTrue("a=${p.all}", p.all <= 0.45f + 1e-4f)
++        readable(true, s, p)
 +    }
 +
 +    @Test fun thinFogIsMoreTransparentThanDenseFog() {
@@ -20035,27 +20141,55 @@ index 0000000..a3c2d8c
 +        assertTrue(thin <= dense)
 +    }
 +
-+    @Test fun lightPlainBackgroundUsesTheMostTransparentGlass() {
++    @Test fun lightPlainBackgroundUsesTheMostTransparentGlassAndTheUsualInk() {
 +        val px = IntArray(12 * 24) { 0xFFF4EAE4.toInt() }
-+        val (_, a) = GlassAuto.solve(false, lightTint, lightInk2, GlassAuto.statsOf(px, 12, 24))
-+        assertEquals(GlassAuto.LIGHT_MIN, a, 0.001f)
++        val s = GlassAuto.statsOf(px, 12, 24)
++        val p = plan(false, s)
++        assertEquals(GlassAuto.LIGHT_MIN, p.all, 0.001f)
++        assertEquals(0f, p.inkMix, 0.001f)
++        assertEquals(lightInk2C, p.ink2)
++        p.halo.forEach { assertEquals(0f, it, 0.001f) }
 +    }
 +
-+    @Test fun darkPhotoUnderLightGlassGoesDenserButStaysReadable() {
++    @Test fun darkPhotoUnderLightGlassStaysUnderTheCapAndHelpsTheText() {
++        // the case that made 38.9.4 go to 86 %: a dark photo under light glass
 +        val px = IntArray(12 * 24) { i -> if (i % 3 == 0) 0xFF101010.toInt() else 0xFF404040.toInt() }
 +        val s = GlassAuto.photoStats(px, 12, 24, 1f, 0xFFF4EAE4.toInt())
-+        val (per, a) = GlassAuto.solve(false, lightTint, lightInk2, s)
-+        assertTrue("a=$a", a > GlassAuto.LIGHT_MAX)
-+        assertEquals(GlassAuto.BANDS, per.size)
-+        check(false, lightTint, lightInk2, s, a)
++        val p = plan(false, s)
++        println("dark photo light a=${p.all} mix=${p.inkMix} halo=${p.halo}")
++        assertEquals(GlassAuto.BANDS, p.per.size)
++        assertTrue("a=${p.all}", p.all <= GlassAuto.LIGHT_CAP)
++        assertTrue("ink2 pulled toward ink", p.inkMix > 0f)
++        assertTrue("halo on the hard bands", p.halo.any { it > 0f })
++        readable(false, s, p)
 +    }
 +
-+    @Test fun brightPhotoUnderDarkGlassGoesDenser() {
++    @Test fun brightPhotoUnderDarkGlassStaysUnderTheCap() {
 +        val px = IntArray(12 * 24) { 0xFFF8F8F8.toInt() }
 +        val s = GlassAuto.statsOf(px, 12, 24)
-+        val (_, a) = GlassAuto.solve(true, darkTint, darkInk2, s)
-+        assertTrue("a=$a", a > GlassAuto.DARK_MAX)
-+        check(true, darkTint, darkInk2, s, a)
++        val p = plan(true, s)
++        println("bright photo dark a=${p.all} mix=${p.inkMix} halo=${p.halo}")
++        assertTrue("a=${p.all}", p.all <= GlassAuto.DARK_CAP)
++        assertTrue(p.inkMix > 0f || p.halo.any { it > 0f })
++        readable(true, s, p)
++    }
++
++    @Test fun haloOnlyWhereNeeded() {
++        // top half dark (hard for dark ink), bottom half page colour (easy)
++        val px = IntArray(12 * 24) { i -> if (i / 12 < 12) 0xFF202020.toInt() else 0xFFF4EAE4.toInt() }
++        val s = GlassAuto.photoStats(px, 12, 24, 1f, 0xFFF4EAE4.toInt())
++        val p = plan(false, s)
++        println("split a=${p.per} halo=${p.halo}")
++        assertTrue(p.halo.first() >= p.halo.last())
++        assertEquals(0f, p.halo.last(), 0.001f)
++        readable(false, s, p)
++    }
++
++    @Test fun mixInkEndsAtTheInks() {
++        assertEquals(lightInk2C, GlassAuto.mixInk(lightInk2C, lightInkC, 0f))
++        assertEquals(lightInkC, GlassAuto.mixInk(lightInk2C, lightInkC, 1f))
++        assertTrue(GlassAuto.lum(GlassAuto.mixInk(lightInk2C, lightInkC, 0.5f)) < lightInk2)
++        assertTrue(GlassAuto.lum(GlassAuto.mixInk(darkInk2C, darkInkC, 0.5f)) > darkInk2)
 +    }
 +
 +    @Test fun busyBandNeedsMoreThanCalmBand() {
