@@ -85,6 +85,10 @@ try:
     H3894 = "h3894" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
 except Exception:
     H3894 = False
+try:
+    I395 = "i395" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
+except Exception:
+    I395 = False
 FONT_SCALE = "1.18"
 step_no = 0
 crashed = []
@@ -3212,7 +3216,8 @@ def main():
         elif B388: fns = (b387_linkall, b387_noblack, b388_weblogin, b388_mailbox, b388_presets)
         else: fns = (b387_linkall, b387_noblack, b387_persist, b387_platforms)
         if HUB: fns = tuple(fns) + (b3891_hub,)   # [38.9.1 c] hub runs after the UI passes
-        if H3894: fns = (b3894_h,) + tuple(fns)   # [38.9.4 h] SkillHub market, Memoh, a11y wording, 账号 entries, glass / opaque reading, g2 defects first
+        if I395: fns = (b395_i,)   # [38.9.5 i] build-i gate only: 一键关联 / 一键重新登录, gateway, new screens light + dark
+        elif H3894: fns = (b3894_h,) + tuple(fns)   # [38.9.4 h] SkillHub market, Memoh, a11y wording, 账号 entries, glass / opaque reading, g2 defects first
         for fn in fns:
             try:
                 fn(res)
@@ -4501,6 +4506,138 @@ def b3891_ui(res):
     r8["ui3891"] = o
     print("UI3891 RESULT " + json.dumps(o, ensure_ascii=False)[:5000], flush=True)
 
+
+
+def b395_i(res):
+    """[38.9.5 i] seeded like the user's phone (Google / GitHub signed in, 阿里云 过期了, 163 未检查, 硅基 忽略, 5 chats with goal
+    tables, a cloud browser via workspace_register). Checks: accounts(list) for the agent never leaks a secret and offers ways
+    in; one hidden re-login attempt per site answers with a plain reason (no endless spinner); the 免登录 AI gateway answers on
+    127.0.0.1 at launch; screenshots light + dark of every changed screen."""
+    r8 = R8(res); o = {}
+    def step(name, f):
+        try: f()
+        except Exception as e:
+            import traceback; traceback.print_exc(); page_missing.append(f"i395 {name} error {e}")
+        if not alive(): crashed.append(f"i395 {name}"); relaunch()
+    o["seed"] = result_json("group", "i395 seed", timeout=90)
+    sd = o["seed"] if isinstance(o["seed"], dict) else {}
+    if not sd.get("ignored"): selftest_fail.append("i395: 硅基流动 not 忽略 by default/after seed")
+    if "已加到" not in str(sd.get("ws", "")): selftest_fail.append(f"i395: workspace_register failed: {sd.get('ws')}")
+    acc = selftest("group", "i395 accounts", timeout=60); o["accounts"] = acc[-1500:]
+    if re.search(r"sk-[A-Za-z0-9]{10,}|password|密码：", acc): selftest_fail.append("i395: accounts(list) shows a secret")
+    for site in ("github.com", "aliyun.com", "mail.163.com", "accounts.google.com"):
+        o["login_" + site] = result_json("group", f"i395 login {site}", timeout=150)
+        v = o["login_" + site]
+        if not isinstance(v, dict) or not v.get("line"): selftest_fail.append(f"i395: re-login {site} gave no answer: {v}")
+    o["gw"] = result_json("group", "i395 gw", timeout=60)
+    gw = o["gw"] if isinstance(o["gw"], dict) else {}
+    if not str(gw.get("models", "")).startswith("200"): selftest_fail.append(f"i395: gateway not answering on 127.0.0.1: {gw.get('models')}")
+    o["bailian"] = selftest("group", "i395 bailian sk-ws-abcdEFGH12345678", timeout=20)[-200:]
+    if "maas.aliyuncs.com" not in o["bailian"]: selftest_fail.append("i395: sk-ws key not sent to the workspace endpoint")
+    def pages(sfx):
+        r = b381_home(); time.sleep(3); r = shot388(f"i395-home-{sfx}"); t = _txt(r); o["home_" + sfx] = t[:500]
+        rows = all_desc(r, "进度：")
+        o["rings_" + sfx] = len(rows)
+        if not rows: page_missing.append(f"i395 {sfx}: no 「⋯」 progress pill on home")
+        else:
+            sh(f"input tap {rows[0][0]} {rows[0][1]}"); time.sleep(3); r = shot388(f"i395-progress-{sfx}"); o["sheet_" + sfx] = _txt(r)[:400]
+            back(1); time.sleep(2)
+            # chat stop divider: open the 已停止 / 出错 chat through its card's 进入对话
+            r = dump(); st = [x for x in all_desc(r, "进度：已停止")] or [x for x in all_desc(r, "进度：出错")]
+            if st:
+                sh(f"input tap {st[0][0]} {st[0][1]}"); time.sleep(3)
+                if tap_text("进入对话", wait=4):
+                    time.sleep(3); r = shot388(f"i395-chatstop-{sfx}"); t = _txt(r); o["chatstop_" + sfx] = t[-300:]
+                    if "已停止" not in t and "出错" not in t: page_missing.append(f"i395 {sfx}: chat stop divider not seen")
+                    back(1); time.sleep(2)
+                else: back(1); time.sleep(1)
+            else: page_missing.append(f"i395 {sfx}: no 已停止/出错 row for the chat divider")
+        route("plus_keychain", 6); r = shot388(f"i395-accounts-{sfx}"); o["kc_" + sfx] = _txt(r)[:500]
+        rows = all_desc(r, "添加：关联账号或添加身份")
+        if rows:
+            sh(f"input tap {rows[0][0]} {rows[0][1]}"); time.sleep(2); r = shot388(f"i395-acctmenu-{sfx}"); t = _txt(r); o["menu_" + sfx] = t[:200]
+            if "关联账号" not in t or "添加身份" not in t: selftest_fail.append(f"i395 {sfx}: account menu items missing: {t[:120]}")
+            if tap_text("添加身份", wait=3):
+                r = shot388(f"i395-addident-{sfx}"); t = _txt(r)
+                for g in ("常用", "社交", "其他"):
+                    if g not in t: page_missing.append(f"i395 {sfx}: 添加身份 group {g} not seen")
+                back(1); time.sleep(1)
+            else: back(1)
+        else: page_missing.append(f"i395 {sfx}: account + menu not found")
+        back(1); time.sleep(1)
+        route("plus_connections", 6); r = shot388(f"i395-services-{sfx}"); o["svc_" + sfx] = _txt(r)[:500]
+        if not tap_text("登录 标签", wait=3): tap_text("登录", exact=True, wait=3)
+        time.sleep(2); r = shot388(f"i395-logins-{sfx}"); o["logins_" + sfx] = _txt(r)[:600]
+        back(1); time.sleep(1)
+        route("plus_code_sources", 5); r = shot388(f"i395-codesrc-{sfx}"); t = _txt(r); o["codesrc_" + sfx] = t[:500]
+        for want in ("验证码来源", "AI 邮箱", "AgentMail", "Mail.tm"):
+            if want not in t:
+                scroll_down(); t += " " + _txt(dump())
+            if want not in t: selftest_fail.append(f"i395 {sfx}: 验证码与 AI 邮箱 page lacks {want}")
+        scroll_down(); shot388(f"i395-codesrc2-{sfx}")
+        back(1); time.sleep(1)
+        route("model_groups", 6); r = shot388(f"i395-modelgroups-{sfx}"); t = _txt(r); o["mg_" + sfx] = t[:500]
+        if "免登录 AI" not in t: selftest_fail.append(f"i395 {sfx}: 模型组 route status card missing")
+        back(1); time.sleep(1)
+        route("plus_work_location", 6); scroll_down(); r = shot388(f"i395-work-{sfx}"); t = _txt(r); o["work_" + sfx] = t[:600]
+        if "免费云浏览器" not in t:
+            scroll_down(); r = shot388(f"i395-work2-{sfx}"); t = _txt(r)
+        if "免费云浏览器" not in t: selftest_fail.append(f"i395 {sfx}: registered cloud browser not on 工作位置")
+        elif "到期" not in t: selftest_fail.append(f"i395 {sfx}: cloud browser card has no 到期 line")
+        back(1); time.sleep(1)
+        route("plus_app_agents", 5); shot388(f"i395-agents-{sfx}"); back(1); time.sleep(1)
+        # glass 自动 (thin again in i5): 外观调节 over the fog, top + glass section
+        route("plus_look", 6); r = shot388(f"i395-look-{sfx}"); o["look_" + sfx] = _txt(r)[:300]
+        scroll_down(); time.sleep(1); r = shot388(f"i395-look2-{sfx}"); t = _txt(r)
+        m_ = re.search(r"现在 (\d+)%", t + " " + o["look_" + sfx]); o["glass_" + sfx] = m_.group(1) if m_ else "?"
+        if m_ and int(m_.group(1)) > (45 if sfx == "light" else 50): selftest_fail.append(f"i395 {sfx}: glass auto {m_.group(1)}% over the cap")
+        back(1); time.sleep(1)
+    theme388(1)
+    step("light", lambda: pages("light"))
+    theme388(2)
+    step("dark", lambda: pages("dark"))
+    theme388(1)
+    # 38.9.4 smoke fixes: refused key = 「key 无效」 on 服务, not 登录 › 过期了 (seeded OpenRouter key gets 401 from the real site)
+    def keybad():
+        result_json("group", "acct393 seed", timeout=60); time.sleep(20)
+        route("plus_connections", 8); time.sleep(3); r = shot388("i395-keybad-svc"); t = _txt(r); o["keybad_svc"] = t[:500]
+        if not tap_text("登录 标签", wait=3): tap_text("登录", exact=True, wait=3)
+        time.sleep(3); r = shot388("i395-keybad-login"); t = _txt(r); o["keybad_login"] = t[:600]
+        if "OpenRouter" in t and "过期" in t: selftest_fail.append("i395: refused OpenRouter key still under 登录 › 过期了")
+        back(1)
+    step("keybad", keybad)
+    # 外观调节 over a photo wallpaper: frame time (emulator died here twice on 38.9.4)
+    def lookperf():
+        o["wall"] = selftest_json("uiprep", "杨arling|gen", timeout=20); time.sleep(2)
+        sh(f"dumpsys gfxinfo {PKG} reset"); route("plus_look", 6)
+        for _ in range(3): scroll_down(); time.sleep(1)
+        shot388("i395-look-photo")
+        t = _txt(dump()); m_ = re.search(r"现在 (\d+)%", t); o["glass_photo"] = m_.group(1) if m_ else "?"
+        g = sh(f"dumpsys gfxinfo {PKG}", timeout=30)
+        o["gfx"] = " | ".join(l.strip() for l in g.splitlines() if re.search(r"Total frames|Janky frames|50th percentile|90th percentile|99th percentile", l))[:400]
+        print("I395 GFX", o["gfx"], flush=True)
+        back(1); time.sleep(1)
+        r = b381_home(); time.sleep(3); shot388("i395-home-photo-light")
+        theme388(2); time.sleep(3); route("plus_look", 6); scroll_down(); time.sleep(1); shot388("i395-look-photo-dark")
+        back(1); r = b381_home(); time.sleep(3); shot388("i395-home-photo-dark"); theme388(1)
+        result_json("group", "wallpaper off")
+    step("lookperf", lookperf)
+    # SkillHub same-slug rows: only the installed publisher's row says 已安装
+    o["skill"] = result_json("group", "h394 skill weather", timeout=120)
+    sk = o["skill"] if isinstance(o["skill"], dict) else {}
+    stt = sk.get("states") or []
+    if stt and sum(1 for x in stt if x.endswith(":MINE")) != 1: selftest_fail.append(f"i395: SkillHub same-slug states {stt} (want exactly one MINE)")
+    if len(stt) > 1 and "没有覆盖" not in str(sk.get("other", "")): selftest_fail.append(f"i395: installing another publisher's same-slug skill did not refuse: {sk.get('other')}")
+    def skillshot():
+        result_json("group", "h394 open 1", timeout=20); time.sleep(8)
+        if tap_text("搜索 SkillHub 技能", wait=1.5):
+            type_text("weather"); time.sleep(1); sh("input keyevent KEYCODE_BACK"); time.sleep(5)
+        r = shot388("i395-skill-sameslug"); t = _txt(r); o["skill_page"] = t[:400]
+        if t.count("已安装") > 1: selftest_fail.append("i395: more than one same-slug row says 已安装 on the market page")
+        back(1)
+    step("skillshot", skillshot)
+    r8["i395"] = o
+    print("I395 RESULT " + json.dumps(o, ensure_ascii=False)[:6000], flush=True)
 
 def finish(lc):
     lc.terminate()
