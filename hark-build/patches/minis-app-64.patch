@@ -559,6 +559,22 @@ index 01a71ee..728dddf 100644
      }
  
      /** Snapshot of the shared store for [urls] (cookies per url). */
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/AccountPatrol.kt b/src/android/app/src/main/java/com/openminis/app/plus/AccountPatrol.kt
+index 3b271d6..d71e078 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/AccountPatrol.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/AccountPatrol.kt
+@@ -64,6 +64,11 @@ object AccountPatrol {
+         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("status", o.toString()).apply()
+     }
+ 
++    /** [Mines-38.9.3] smoke only: put a known patrol result on one account (no network). */
++    fun smokeSet(context: Context, id: String, level: Level, reason: String) {
++        load(context); _status.value = _status.value + (id to Status(level, reason, System.currentTimeMillis())); save(context)
++    }
++
+     /** Problems for 消息汇总 (要处理). */
+     fun problems(): List<Pair<String, Status>> = _status.value.filter { it.value.level != Level.OK }.toList()
+ 
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/AddressFix.kt b/src/android/app/src/main/java/com/openminis/app/plus/AddressFix.kt
 new file mode 100644
 index 0000000..dcfc972
@@ -5637,10 +5653,10 @@ index 1d773a2..5489e65 100644
          coroutineScope {
              val bg = slow.map { id -> async { one(id) } }
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-index af13c1b..f93b4e5 100644
+index af13c1b..aa86f5a 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-@@ -21,6 +21,39 @@ object GroupSelfTest {
+@@ -21,6 +21,65 @@ object GroupSelfTest {
          val rest = arg.substringAfter(' ', "")
          val parts = rest.split('|')
          when (cmd) {
@@ -5653,6 +5669,32 @@ index af13c1b..f93b4e5 100644
 +                    com.openminis.app.plus.IdentityStore.addIdent(context, com.openminis.app.plus.IdentityCore.Ident(t, v, source = "smoke", signedIn = t == com.openminis.app.plus.IdentityCore.IdType.GOOGLE))
 +                }
 +                JSONArray(com.openminis.app.plus.IdentityStore.current(context).map { it.type.id + ":" + it.value }).toString()
++            }
++            // [Mines-38.9.3] 账号 page smoke: 'acct393 seed' = an API-key-only OpenRouter (patrol OK) + the stale records the user's
++            // phone had (OpenRouter imported from 账号连接 as 过期了, a 豆包 过期了 never confirmed, a mail-sender-named row);
++            // 'acct393 state' = what 账号 › 登录 shows (site / status / source) + OpenRouter's 服务 pill
++            "acct393" -> {
++                val V = com.openminis.app.plus.PlusVault; V.init(context)
++                val S = com.openminis.app.plus.IdentityStore; S.init(context)
++                val now = System.currentTimeMillis()
++                if (rest.trim() == "seed") {
++                    val k = V.kind("openrouter") ?: return@runBlocking "no openrouter"
++                    V.save(context, k, "smoke", "sk-or-v1-smoke393", false, "key")
++                    com.openminis.app.plus.AccountPatrol.smokeSet(context, "openrouter", com.openminis.app.plus.AccountPatrol.Level.OK, "密钥有效")
++                    S.addRec(context, com.openminis.app.plus.IdentityCore.Rec("openrouter.ai", "OpenRouter", "", null, com.openminis.app.plus.IdentityCore.Method.KEY,
++                        status = com.openminis.app.plus.IdentityCore.EXPIRED, sources = setOf("账号连接"), at = now))
++                    S.addRec(context, com.openminis.app.plus.IdentityCore.Rec("doubao.com", "豆包", "13800138000", null, com.openminis.app.plus.IdentityCore.Method.PHONE_SMS,
++                        status = com.openminis.app.plus.IdentityCore.EXPIRED, sources = setOf("网页登录"), at = now))
++                    com.openminis.app.plus.AutoAccounts.record(context, "Matt from WarpStati.", "warpstatic.com", "smoke@example.com", com.openminis.app.plus.AutoAccounts.LINKED, "邮件")
++                }
++                S.sync(context, force = true)
++                val l = com.openminis.app.plus.Keychain.all(context)
++                JSONObject().put("login", JSONArray(l.map { it.site + "|" + it.status.name + "|" + it.source }))
++                    .put("openrouterInLogin", l.any { it.host.contains("openrouter") })
++                    .put("badNames", JSONArray(l.filter { com.openminis.app.plus.IdentityCore.looksLikeSenderName(it.site) }.map { it.site }))
++                    .put("expired", l.count { it.status == com.openminis.app.plus.KeychainCore.Status.EXPIRED })
++                    .put("orPill", com.openminis.app.plus.SessionStatus.keyPill(com.openminis.app.plus.AccountPatrol.status.value["openrouter"]?.level?.name).name)
++                    .put("auto", JSONArray(com.openminis.app.plus.AutoAccounts.list.value.map { it.site + "|" + it.host + "|" + it.source })).toString()
 +            }
 +            // [Mines-38.9.1] 应用代理: 'agents' list (mine + enabled), 'agents clear', 'agents add <id>'
 +            "agents" -> {
@@ -5680,7 +5722,7 @@ index af13c1b..f93b4e5 100644
              "partners" -> {
                  val l = Partners.refresh(context, rescanApps = true)
                  JSONArray(l.map { JSONObject().put("id", it.id).put("name", it.spec.name).put("state", it.state.name).put("model", it.model).put("via", it.via) }).toString()
-@@ -136,6 +169,13 @@ object GroupSelfTest {
+@@ -136,6 +195,13 @@ object GroupSelfTest {
                  GroupStore.add(gid, GroupMsg(GroupStore.newId(), parts.getOrElse(2) { "host" }, "成员A", "", parts.getOrElse(3) { "好的，结论：照这个办。" }))
                  "ok"
              }
@@ -5694,7 +5736,7 @@ index af13c1b..f93b4e5 100644
              "kbrun" -> { val n = com.openminis.app.plus.ChatKnowledge.runNow(context); "organised=$n" }
              "kbstate" -> {
                  val l = com.openminis.app.plus.ChatKnowledge.load(context)
-@@ -238,6 +278,55 @@ object GroupSelfTest {
+@@ -238,6 +304,55 @@ object GroupSelfTest {
              "wallpaper" -> { com.openminis.app.plus.PlusPrefs.init(context)
                  if (parts.getOrElse(0) { "" } == "off") com.openminis.app.plus.PlusPrefs.update(context) { it.copy(wallpaper = "") }
                  com.openminis.app.plus.PlusPrefs.state.value.wallpaper.ifBlank { "none" } }
