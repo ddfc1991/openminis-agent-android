@@ -4509,6 +4509,15 @@ def b3891_ui(res):
 
 
 
+def set_zh():
+    """[i11] the user's phone is Chinese: run the build-i screens with the app's language = 简体中文 (per-app locale, API 33+),
+    so the sheets show what the user sees (English emulator → 「Model Groups」 etc. came from the English fallback)."""
+    print("I11 locale", sh(f"cmd locale set-app-locales {PKG} --locales zh-CN 2>&1 || true")[-120:], flush=True)
+    adb("shell", "am", "force-stop", PKG); time.sleep(1)
+    adb("shell", "monkey", "-p", PKG, "-c", "android.intent.category.LAUNCHER", "1"); time.sleep(8)
+    dismiss_dialogs()
+
+
 def b395_i(res):
     """[38.9.5 i] seeded like the user's phone (Google / GitHub signed in, 阿里云 过期了, 163 未检查, 硅基 忽略, 5 chats with goal
     tables, a cloud browser via workspace_register). Checks: accounts(list) for the agent never leaks a secret and offers ways
@@ -4520,6 +4529,7 @@ def b395_i(res):
         except Exception as e:
             import traceback; traceback.print_exc(); page_missing.append(f"i395 {name} error {e}")
         if not alive(): crashed.append(f"i395 {name}"); relaunch()
+    set_zh()
     o["seed"] = result_json("group", "i395 seed", timeout=90)
     sd = o["seed"] if isinstance(o["seed"], dict) else {}
     if not sd.get("ignored"): selftest_fail.append("i395: 硅基流动 not 忽略 by default/after seed")
@@ -4530,6 +4540,7 @@ def b395_i(res):
         o["login_" + site] = result_json("group", f"i395 login {site}", timeout=150)
         v = o["login_" + site]
         if not isinstance(v, dict) or not v.get("line"): selftest_fail.append(f"i395: re-login {site} gave no answer: {v}")
+        elif not v.get("ok") and "：" not in v.get("line", ""): selftest_fail.append(f"i395: re-login {site} failed without a reason: {v}")
     o["gw"] = result_json("group", "i395 gw", timeout=60)
     gw = o["gw"] if isinstance(o["gw"], dict) else {}
     if not str(gw.get("models", "")).startswith("200"): selftest_fail.append(f"i395: gateway not answering on 127.0.0.1: {gw.get('models')}")
@@ -4580,6 +4591,9 @@ def b395_i(res):
         back(1); time.sleep(1)
         route("model_groups", 6); r = shot388(f"i395-modelgroups-{sfx}"); t = _txt(r); o["mg_" + sfx] = t[:500]
         if "免登录 AI" not in t: selftest_fail.append(f"i395 {sfx}: 模型组 route status card missing")
+        for en in ("Model Groups", "Groups"):   # [i11] Chinese UI
+            if en in t: selftest_fail.append(f"i395 {sfx}: 模型组 page still shows English 「{en}」")
+        if "没登录 重新登录" in t: selftest_fail.append(f"i395 {sfx}: never-signed route row says 重新登录 (want 登录)")
         back(1); time.sleep(1)
         route("plus_work_location", 6); scroll_down(); r = shot388(f"i395-work-{sfx}"); t = _txt(r); o["work_" + sfx] = t[:600]
         if "免费云浏览器" not in t:
@@ -4634,13 +4648,16 @@ def b395_i(res):
         if tap_text("搜索 SkillHub 技能", wait=1.5):
             type_text("weather"); time.sleep(1); sh("input keyevent KEYCODE_BACK"); time.sleep(5)
         r = shot388("i395-skill-sameslug"); t = _txt(r); o["skill_page"] = t[:400]
-        if t.count("已安装") > 1: selftest_fail.append("i395: more than one same-slug row says 已安装 on the market page")
+        # [i11] count ROWS whose pill says 已安装 (the installed row's own description also contains 「已安装，长按卸载」)
+        inst_rows = all_desc(r, "状态：已安装"); o["skill_rows_installed"] = len(inst_rows); o["skill_rows_other"] = len(all_desc(r, "状态：同名已装"))
+        if len(inst_rows) > 1: selftest_fail.append(f"i395: {len(inst_rows)} same-slug rows say 已安装 on the market page")
         back(1)
     # [i6] user 22:02–22:04: ☰ 「AI 服务」 + glass menu, Notion truthful web sign-in, 脑图 sci-fi
     def menu_ai(sfx):
         r = b381_home(); time.sleep(2)
         menu = node_bounds(r, lambda n: (n.get("content-desc") or "") == "更多")
-        if menu: sh(f"input tap {menu[0]} {menu[1]}")
+        # [i11] tap the CENTRE (node_bounds = x1,y1,x2,y2; the old tap hit the circle's corner and never opened the menu)
+        if menu: sh(f"input tap {(menu[0] + menu[2]) // 2} {(menu[1] + menu[3]) // 2}")
         else: tap_text("更多", wait=2)
         time.sleep(2); r = shot388(f"i395-menu-{sfx}"); t = _txt(r); o["menu_home_" + sfx] = t[:300]
         if "AI 服务" not in t: selftest_fail.append(f"i395 {sfx}: ☰ menu has no 「AI 服务」: {t[:120]}")
@@ -4657,6 +4674,9 @@ def b395_i(res):
         if "已连接 · 断开" in t: selftest_fail.append("i395: Notion button still 「已连接 · 断开」")
         if "未登录" not in t and "已登录" not in t and "检查" not in t: selftest_fail.append(f"i395: Notion hero has no truthful login state: {t[:160]}")
         if "已登录" in t and "未登录" not in t: selftest_fail.append("i395: Notion says 已登录 with a fake cookie (getSpaces must refuse it)")
+        # [i11] never signed in → the button says 登录 (not 重新登录); no lone ⓘ above it
+        if "未登录" in t and "重新登录" in t: selftest_fail.append("i395: Notion 未登录 but the button says 重新登录")
+        if "说明：说明" in t: selftest_fail.append("i395: Notion still has the lone ⓘ above the button")
         back(1); time.sleep(1)
         selftest("group", "connfake notion|off", timeout=30)
     step("notion", notion)
@@ -4704,6 +4724,7 @@ def b395_i2(res):
         except Exception as e:
             import traceback; traceback.print_exc(); page_missing.append(f"i395b {name} error {e}")
         if not alive(): crashed.append(f"i395b {name}"); relaunch()
+    set_zh()
     result_json("group", "i395 seed", timeout=90)
     # varied greeting: 6 opens, never the same phrase twice in a row
     gs = [selftest("group", "greetvar", timeout=20).strip()[-40:] for _ in range(6)]
@@ -4728,12 +4749,17 @@ def b395_i2(res):
             tap_text("开个新对话", wait=4); time.sleep(3)
         r = dump(); e = edits(r)
         if not e: page_missing.append(f"i395b {sfx}: no chat input"); return
-        if sfx == "light":
-            sh(f"input tap {e[-1][0]} {e[-1][1]}"); time.sleep(0.6)
-            type_text("srv 38.76.209.77:8090 code 482913 mail smoke@example.com api http://8.217.89.133:8787/v1 path /workspace/work/apk/a.apk key sk-ws-AbCdEf0123456789xyzQW")
-            sh("input keyevent KEYCODE_BACK"); time.sleep(0.6)
-            tap_any(["Send", "发送"], wait=6) or sh("input keyevent KEYCODE_ENTER")
-            time.sleep(8)
+        # [i11] both themes type and send (dark used to reuse a message that was not there after the theme restart → no chips);
+        # the fake sk-ws test key goes FIRST and the text is typed in short chunks (one long `input text` was cut after 「path」)
+        sh(f"input tap {e[-1][0]} {e[-1][1]}"); time.sleep(0.6)
+        for chunk in ("key sk-ws-AbCdEf0123456789xyzQW ", "srv 38.76.209.77:8090 code 482913 ", "mail smoke@example.com ", "api http://8.217.89.133:8787/v1"):
+            type_text(chunk); time.sleep(0.4)
+        sh("input keyevent KEYCODE_BACK"); time.sleep(0.6)
+        r0 = dump()
+        sb = node_bounds(r0, lambda n: (n.get("content-desc") or "") in ("Send", "发送"))
+        if sb: sh(f"input tap {(sb[0] + sb[2]) // 2} {(sb[1] + sb[3]) // 2}")
+        elif not tap_any(["Send", "发送"], wait=1): sh("input keyevent KEYCODE_ENTER")
+        time.sleep(10)
         r = shot388(f"i395b-chips-{sfx}"); t = _txt(r); o["chips_" + sfx] = t[-500:]
         if "482913" in t and "验证码" not in t and "code" in t: pass
         if "sk-ws-AbCd" in t and "sk-ws-••••••" not in t: pass  # the bubble shows the raw text the user typed; the chip must be masked
