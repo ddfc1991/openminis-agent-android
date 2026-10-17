@@ -1,5 +1,5 @@
 diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
-index e0c88bb..8b368dc 100644
+index e0c88bb..c9c71b8 100644
 --- a/src/android/app/build.gradle.kts
 +++ b/src/android/app/build.gradle.kts
 @@ -38,8 +38,8 @@ android {
@@ -8,8 +8,8 @@ index e0c88bb..8b368dc 100644
          targetSdk = 35
 -        versionCode = 35
 -        versionName = "1.21"
-+        versionCode = 38
-+        versionName = "1.23.1"
++        versionCode = 39
++        versionName = "1.23.2"
  
          testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
  
@@ -1141,18 +1141,218 @@ index 0000000..53d263d
 +        record(c, site, root(host), to, if (done) LINKED else USER, "邮件")
 +    }
 +}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/AutoSources.kt b/src/android/app/src/main/java/com/openminis/app/plus/AutoSources.kt
+index fa1c84b..e25c816 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/AutoSources.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/AutoSources.kt
+@@ -173,22 +173,31 @@ object AutoSources {
+ 
+     @Volatile private var xAt = 0L
+ 
+-    /** Mentions + followed keywords; at most every 10 minutes. */
+-    suspend fun readX(context: Context): Boolean {
+-        if (!xSignedIn() || System.currentTimeMillis() - xAt < 10 * 60_000L) return false
++    /** [Mines-38.9.2] how an X read went (FAILED = signed in but every page came back empty / unreadable). */
++    enum class XRead { SKIPPED, OK, EMPTY, TIMEOUT, FAILED }
++
++    /** Mentions + followed keywords. Background: at most every 10 minutes; a pull passes maxAgeMs = 0 and a deadline. */
++    suspend fun readX(context: Context, maxAgeMs: Long = 10 * 60_000L, deadlineMs: Long = Long.MAX_VALUE): XRead {
++        if (!xSignedIn()) return XRead.SKIPPED
++        if (System.currentTimeMillis() - xAt < maxAgeMs) return XRead.SKIPPED
+         xAt = System.currentTimeMillis()
+         val out = ArrayList<Digest.Item>()
+         val pages = listOf("https://x.com/notifications/mentions" to "@你") +
+             Digest.follows(context).take(2).map { q -> "https://x.com/search?q=" + java.net.URLEncoder.encode(q, "UTF-8") + "&f=live" to q }
++        var timedOut = false; var read = 0
+         for ((u, q) in pages) {
+-            val json = withTimeoutOrNull(30_000L) {
+-                HiddenWeb.read(context, u, DigestX.EXTRACT_JS, timeoutMs = 28_000L, settleMs = 1500, until = { it.length > 10 && it != "[]" })
+-            } ?: continue
++            val left = deadlineMs - System.currentTimeMillis()
++            if (left < 3_000L) { timedOut = true; break }
++            val json = withTimeoutOrNull(minOf(30_000L, left)) {
++                HiddenWeb.read(context, u, DigestX.EXTRACT_JS, timeoutMs = minOf(28_000L, left - 1_000L), settleMs = 1500, until = { it.length > 10 && it != "[]" })
++            }
++            if (json == null) { if (System.currentTimeMillis() >= deadlineMs - 500) timedOut = true; continue }
++            read++
+             out += DigestX.parse(json, q)
+         }
+-        if (out.isEmpty()) return false
++        if (out.isEmpty()) return when { timedOut && read == 0 -> XRead.TIMEOUT; read == 0 -> XRead.FAILED; else -> XRead.EMPTY }
+         DigestX.store(out.distinctBy { it.id })
+-        return true
++        return XRead.OK
+     }
+ 
+     // ---------------- balances through console sessions ----------------
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt b/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt
-index 2bfd012..31612b3 100644
+index 2bfd012..de873da 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/Digest.kt
-@@ -364,6 +364,7 @@ object Digest {
-                     async { runCatching { githubNotifications() }.getOrElse { errs += errLine("GitHub", it); emptyList() } },
-                     async { runCatching { trending(c) }.getOrElse { errs += errLine("Trending", it); emptyList() } },
+@@ -1,7 +1,11 @@
+ package com.openminis.app.plus
+ 
+ import android.content.Context
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Deferred
+ import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.launch
+ import kotlinx.coroutines.async
+ import kotlinx.coroutines.awaitAll
+ import kotlinx.coroutines.coroutineScope
+@@ -68,6 +72,19 @@ object Digest {
+     private val _busy = MutableStateFlow(false)
+     val busy: StateFlow<Boolean> = _busy.asStateFlow()
+     @Volatile var lastError: String? = null; private set
++    /** [Mines-38.9.2] when the last refresh finished (0 = never this process); the page refreshes on open when older than 30 s */
++    @Volatile var lastRefreshAt = 0L; private set
++    /** [Mines-38.9.2] cards that arrived with the last open/pull: shown first (after 置顶) until the next one */
++    private val _fresh = MutableStateFlow<Set<String>>(emptySet())
++    val fresh: StateFlow<Set<String>> = _fresh.asStateFlow()
++    private val gate = FeedRefresh.Gate()
++    /** reads started from the page run here, so leaving the page never cancels a read half-way */
++    private val bg = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++    @Volatile private var extrasRunning = false
++    /** adb self-test only (msgfeed): a fake source; called once per refresh with the read number (1, 2, …) */
++    @Volatile var testSource: ((Int) -> List<Item>)? = null
++    @Volatile private var testReads = 0
++    fun resetTestReads() { testReads = 0 }
+ 
+     private const val PREFS = "mines_digest"
+     private val http = OkHttpClient.Builder().connectTimeout(8, TimeUnit.SECONDS).readTimeout(15, TimeUnit.SECONDS).callTimeout(25, TimeUnit.SECONDS).build()
+@@ -230,7 +247,9 @@ object Digest {
+     }
+ 
+     private var lastRaw: List<Item> = emptyList()
+-    fun rerank(c: Context) { _items.value = scoreAll(c, lastRaw) }
++    fun rerank(c: Context) { publish(scoreAll(c, lastRaw)) }
++    /** [Mines-38.9.2] new cards (this open / pull) go to the top, right after 置顶 */
++    private fun publish(scored: List<Item>) { _items.value = FeedRefresh.freshFirst(scored, _fresh.value, { it.id }, { it.pinned }) }
+ 
+     /** [Mines-feed-35.3] adb self-test only: extra cards that survive refresh (smoke taps their buttons). */
+     @Volatile private var injected: List<Item> = emptyList()
+@@ -268,7 +287,10 @@ object Digest {
+     private fun githubNotifications(): List<Item> {
+         val t = ghToken() ?: return emptyList()
+         val body = http.newCall(Request.Builder().url("https://api.github.com/notifications?per_page=40")
+-            .header("Authorization", "Bearer $t").header("Accept", "application/vnd.github+json").build()).execute().use { if (it.isSuccessful) it.body?.string() else null } ?: return emptyList()
++            .header("Authorization", "Bearer $t").header("Accept", "application/vnd.github+json").build()).execute().use {
++                if (it.code == 401) throw FeedRefresh.SourceFail("GitHub 令牌失效")   // [Mines-38.9.2] was a silent empty list
++                if (it.isSuccessful) it.body?.string() else throw FeedRefresh.SourceFail("GitHub 返回 ${it.code}")
++            } ?: return emptyList()
+         val a = JSONArray(body)
+         return (0 until a.length()).map { i ->
+             val n = a.getJSONObject(i)
+@@ -352,43 +374,87 @@ object Digest {
+ 
+     private fun oneLine(s: String) = s.replace(Regex("\\s+"), " ").trim().take(140)
+ 
+-    suspend fun refresh(c: Context) = withContext(Dispatchers.IO) {
+-        if (_busy.value) return@withContext
++    /**
++     * [Mines-38.9.2] Re-read the sources. BACKGROUND (patrol, home card) skips when a refresh is running and may use
++     * each source's cache; OPEN (page opened / resumed) and PULL wait for a running one and then read again —
++     * PULL with no cache at all. Returns what was new and which sources failed (null = skipped).
++     */
++    suspend fun refresh(c: Context, mode: FeedRefresh.Mode = FeedRefresh.Mode.BACKGROUND): FeedRefresh.Outcome? = withContext(Dispatchers.IO) {
++        val out = gate.run(waitIfBusy = mode != FeedRefresh.Mode.BACKGROUND) { readAll(c, mode) }
++        if (out != null) slowExtras(c, mode)
++        out
++    }
++
++    /** The page's pull / open: runs in Digest's own scope (survives leaving the page); the caller awaits the outcome. */
++    fun refreshAsync(c: Context, mode: FeedRefresh.Mode): Deferred<FeedRefresh.Outcome?> {
++        val app = c.applicationContext
++        return bg.async { refresh(app, mode) }
++    }
++
++    private suspend fun readAll(c: Context, mode: FeedRefresh.Mode): FeedRefresh.Outcome {
+         _busy.value = true
+         try {
+             PlusVault.init(c)
+-            val errs = ArrayList<String>()
++            val before = _items.value.map { it.id }.toSet()
++            val errs = java.util.Collections.synchronizedList(ArrayList<String>())   // sources run in parallel
++            val live = mode != FeedRefresh.Mode.BACKGROUND
+             val parts = coroutineScope {
+                 listOf(
+                     async { notifications(c) },
+-                    async { runCatching { githubNotifications() }.getOrElse { errs += errLine("GitHub", it); emptyList() } },
+-                    async { runCatching { trending(c) }.getOrElse { errs += errLine("Trending", it); emptyList() } },
++                    async { runCatching { githubNotifications() }.getOrElse { errs += FeedRefresh.netFail("GitHub", it); emptyList() } },
++                    async { runCatching { trending(c) }.getOrElse { errs += FeedRefresh.netFail("GitHub 热门", it); emptyList() } },
                      async { patrol() },
+-                    async { DigestX.cached() },
 +                    async { runCatching { Keychain.digestItems(c) }.getOrDefault(emptyList()) },   // [Mines-38.9] new-device sign-ins
-                     async { DigestX.cached() },
++                    // [Mines-38.9.2] X is read with the other sources on open / pull (was: only after, at most every 10 min)
++                    async {
++                        if (live) runCatching {
++                            when (AutoSources.readX(c, FeedRefresh.maxAgeMs(mode, 10 * 60_000L), deadlineMs = System.currentTimeMillis() + 25_000L)) {
++                                AutoSources.XRead.TIMEOUT -> { errs.add("X 读取超时") }
++                                AutoSources.XRead.FAILED -> { errs.add("X 没读到（登录可能过期）") }
++                                else -> Unit
++                            }
++                        }
++                        DigestX.cached()
++                    },
                      async { runCatching { FreeOffers.load(c); offers(c) }.getOrDefault(emptyList()) },
                      // [Mines-sources-33] every signed-in source feeds the digest with no setup
+-                    async { runCatching { MailSources.digestItems(c) }.getOrElse { errs += errLine("邮箱", it); emptyList() } },
++                    async { runCatching { MailSources.digestItems(c, FeedRefresh.maxAgeMs(mode, 5 * 60_000L), errs) }.getOrElse { errs += FeedRefresh.netFail("邮箱", it); emptyList() } },
+                     async { runCatching { AutoSources.githubWebItems() }.getOrDefault(emptyList()) },
+-                    async { runCatching { SourceAccounts.items(c) }.getOrDefault(emptyList()) },  // [Mines-38.5] 微博 / B站 / 知乎
++                    async { runCatching { SourceAccounts.items(c, FeedRefresh.maxAgeMs(mode, 10 * 60_000L)) }.getOrDefault(emptyList()) },  // [Mines-38.5] 微博 / B站 / 知乎
+                     async { injected.map { it.copy() } },
++                    async { testSource?.let { f -> runCatching { f(++testReads) }.getOrDefault(emptyList()) } ?: emptyList() },
+                 ).awaitAll()
+             }
+             lastRaw = mergeDupes(parts.flatten())
+-            // link previews for the top cards (cached forever per url)
+-            runCatching { DigestWriter.previews(c, lastRaw.filter { it.url != null }.take(20)) }
+-            lastError = errs.joinToString("；").ifBlank { null }
+-            _items.value = scoreAll(c, lastRaw)
+-            // [Mines-feed-32] headlines for the top cards: free model, batched, cached, daily cap
+-            runCatching { if (DigestWriter.writeAll(c, _items.value.take(36))) _items.value = scoreAll(c, lastRaw) }
++            val fails = errs.toList().distinct()
++            lastError = fails.joinToString("；").ifBlank { null }
++            val scored = scoreAll(c, lastRaw)
++            val fresh = FeedRefresh.freshIds(before, scored.map { it.id }, countAll = mode == FeedRefresh.Mode.PULL || lastRefreshAt > 0)
++            if (live) _fresh.value = fresh.toSet()
++            publish(scored)
++            lastRefreshAt = System.currentTimeMillis()
++            return FeedRefresh.Outcome(fresh, fails)
+         } finally { _busy.value = false }
+-        // [Mines-sources-33] X through the signed-in session, read off-screen after the fast sources
+-        runCatching {
+-            if (AutoSources.readX(c)) {
+-                lastRaw = mergeDupes(lastRaw.filterNot { it.source == "X" } + DigestX.cached())
+-                _items.value = scoreAll(c, lastRaw)
+-            }
++    }
++
++    /** Link previews + model headlines (slow, network / model) — after the cards are on screen, never under the spinner. */
++    private fun slowExtras(c: Context, mode: FeedRefresh.Mode) {
++        if (extrasRunning) return
++        extrasRunning = true
++        bg.launch {
++            try {
++                runCatching { DigestWriter.previews(c, lastRaw.filter { it.url != null }.take(20)); publish(scoreAll(c, lastRaw)) }
++                // [Mines-feed-32] headlines for the top cards: free model, batched, cached, daily cap
++                runCatching { if (DigestWriter.writeAll(c, _items.value.take(36))) publish(scoreAll(c, lastRaw)) }
++                // [Mines-sources-33] background refreshes read X off-screen after the fast sources (throttled 10 min)
++                if (mode == FeedRefresh.Mode.BACKGROUND) runCatching {
++                    if (AutoSources.readX(c) == AutoSources.XRead.OK) {
++                        lastRaw = mergeDupes(lastRaw.filterNot { it.source == "X" } + DigestX.cached())
++                        publish(scoreAll(c, lastRaw))
++                    }
++                }
++            } finally { extrasRunning = false }
+         }
+-        Unit
+     }
+ }
+ 
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Experience.kt b/src/android/app/src/main/java/com/openminis/app/plus/Experience.kt
 new file mode 100644
 index 0000000..e0e3e5b
@@ -1340,6 +1540,128 @@ index 0000000..226ed97
 +            }
 +            runCatching { miss.writeText("") ; miss.setLastModified(System.currentTimeMillis()) }
 +            null
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/FeedRefresh.kt b/src/android/app/src/main/java/com/openminis/app/plus/FeedRefresh.kt
+new file mode 100644
+index 0000000..89968a0
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/FeedRefresh.kt
+@@ -0,0 +1,116 @@
++package com.openminis.app.plus
++
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
++
++/**
++ * [Mines-38.9.2] 消息 pull-to-refresh, the parts that need no Android (unit-tested in FeedRefreshTest).
++ *
++ * User report on 38.9.1 (2026-10-17): 「消息没做好，下拉不更新」. Root causes in 38.9.1:
++ *  1. Digest.refresh() returned at once when a refresh was already running (`if (busy) return`). Opening the page
++ *     always starts one and it stayed "busy" through link previews + model headlines, so a pull in that window did nothing.
++ *  2. When it did run, every source came from a cache: mail 5 min, X 10 min, 微博/B站/知乎 10 min.
++ *  3. The spinner was a fake ≤4 s timer, not tied to the read; failures were swallowed (IMAP login refused → empty list).
++ *  4. Coming back to the page (ON_RESUME) did not refresh; 邮箱 tab had the same "busy → skip" bug.
++ * Now: a pull waits for a running refresh and then reads every source again with no cache ([Gate], [Mode.PULL]),
++ * the spinner lasts exactly as long as that read, new cards go to the top, and one short Chinese line says what happened.
++ */
++object FeedRefresh {
++    /** BACKGROUND = patrol / home card (skips when one is running, caches allowed); OPEN = page opened or resumed;
++     *  PULL = the user pulled down (waits for a running one, then no cache at all). */
++    enum class Mode { BACKGROUND, OPEN, PULL }
++
++    /** How old a source's cached read may be for this refresh. */
++    fun maxAgeMs(mode: Mode, background: Long): Long = when (mode) {
++        Mode.PULL -> 0L
++        Mode.OPEN -> minOf(background, 60_000L)
++        Mode.BACKGROUND -> background
++    }
++
++    /** What one refresh found: ids of cards that were not there before, and one plain line per source that failed. */
++    data class Outcome(val fresh: List<String>, val fails: List<String>)
++
++    /** Cards that are new since [before]. On the very first load (nothing shown yet) nothing counts as new unless [countAll]. */
++    fun freshIds(before: Set<String>, after: List<String>, countAll: Boolean): List<String> =
++        if (before.isEmpty() && !countAll) emptyList() else after.filter { it !in before }.distinct()
++
++    /** The short line under the tabs after a pull: 「新到 3 条」 / 「没有新消息」 / + 「163 授权码失效」 per failed source. */
++    fun line(o: Outcome?): String {
++        if (o == null) return "没有新消息"
++        val head = if (o.fresh.isNotEmpty()) "新到 ${o.fresh.size} 条" else "没有新消息"
++        val f = o.fails.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
++        if (f.isEmpty()) return head
++        val shown = f.take(2).joinToString("；") + (if (f.size > 2) " 等 ${f.size} 处没读到" else "")
++        return "$head · $shown"
++    }
++
++    /** Pinned cards first, then the cards that just arrived (in their score order), then the rest (stable). */
++    fun <T> freshFirst(list: List<T>, fresh: Set<String>, id: (T) -> String, pinned: (T) -> Boolean): List<T> {
++        if (fresh.isEmpty()) return list
++        val (p, rest) = list.partition(pinned)
++        val (n, old) = rest.partition { id(it) in fresh }
++        return p + n + old
++    }
++
++    /** The mailbox as the user knows it: 「163」「QQ 邮箱」「Gmail」…, with the start of the address when they have several there. */
++    fun mailLabel(address: String, many: Boolean = false): String {
++        val d = address.substringAfter('@', "").lowercase()
++        val p = when {
++            d == "gmail.com" || d == "googlemail.com" -> "Gmail"
++            d == "163.com" || d == "vip.163.com" -> "163"
++            d == "126.com" -> "126"
++            d == "yeah.net" -> "yeah"
++            d == "qq.com" || d == "foxmail.com" || d == "vip.qq.com" -> "QQ 邮箱"
++            d.contains("outlook") || d.contains("hotmail") || d == "live.com" -> "Outlook"
++            d == "sina.com" || d == "sina.cn" -> "新浪邮箱"
++            d.endsWith("aliyun.com") -> "阿里邮箱"
++            else -> d.substringBefore('.').ifBlank { "邮箱" }
++        }
++        return if (many) "$p ${address.substringBefore('@').take(4)}…" else p
++    }
++
++    /** The mail server refused LOGIN (wrong / expired 授权码 or app password). */
++    class LoginRejected(val server: String) : Exception(server)
++    /** A failure that already carries its plain line (e.g. 「Gmail 网页登录过期」). */
++    class SourceFail(val line: String) : Exception(line)
++
++    /** One plain line for a mailbox that could not be read. */
++    fun mailFail(label: String, t: Throwable?): String = when (t) {
++        null -> "$label 连接超时"
++        is SourceFail -> t.line
++        is LoginRejected -> when {
++            label.startsWith("Gmail") -> "$label 应用专用密码失效"
++            t.server.lowercase().contains("unsafe login") -> "$label 拦了登录（Unsafe Login）"
++            else -> "$label 授权码失效"
++        }
++        else -> netFail(label, t)
++    }
++
++    /** Network-ish failures of any source, in plain words. */
++    fun netFail(label: String, t: Throwable): String {
++        var e: Throwable? = t
++        while (e != null) {
++            when (e) {
++                is SourceFail -> return e.line
++                is java.net.SocketTimeoutException, is java.io.InterruptedIOException -> return "$label 连接超时"
++                is java.net.UnknownHostException, is java.net.ConnectException, is java.net.NoRouteToHostException -> return "$label 网络不通"
++                is javax.net.ssl.SSLException -> return "$label 加密连接失败"
++            }
++            e = e.cause
++        }
++        return "$label 暂时读不到"
++    }
++
++    /**
++     * Only one refresh at a time. A background caller skips when one is running (returns null); a pull or a page
++     * open waits for the running one to end and then runs its own read — so it never silently does nothing.
++     */
++    class Gate {
++        private val mutex = Mutex()
++        val running: Boolean get() = mutex.isLocked
++        suspend fun <T> run(waitIfBusy: Boolean, block: suspend () -> T): T? {
++            if (!waitIfBusy && mutex.isLocked) return null
++            return mutex.withLock { block() }
 +        }
 +    }
 +}
@@ -3061,10 +3383,10 @@ index 0000000..3033598
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MailInbox.kt b/src/android/app/src/main/java/com/openminis/app/plus/MailInbox.kt
 new file mode 100644
-index 0000000..91ca86a
+index 0000000..43e01c1
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/MailInbox.kt
-@@ -0,0 +1,338 @@
+@@ -0,0 +1,361 @@
 +package com.openminis.app.plus
 +
 +import android.content.Context
@@ -3181,12 +3503,23 @@ index 0000000..91ca86a
 +
 +    // ---------------- reading ----------------
 +
-+    /** Re-read every account in parallel (each one on its own: one broken mailbox never hides the others). */
-+    suspend fun refresh(context: Context, force: Boolean = false) = withContext(Dispatchers.IO) {
-+        if (fake) return@withContext
-+        if (!force && System.currentTimeMillis() - lastAt < 30_000L && _mails.value.isNotEmpty()) return@withContext
-+        if (_busy.value) return@withContext
++    private val gate = FeedRefresh.Gate()
++
++    /**
++     * Re-read every account in parallel (each one on its own: one broken mailbox never hides the others).
++     * [Mines-38.9.2] a forced read (pull, 重试) waits for a running one and then reads again (it used to return at once
++     * while busy, so a pull right after opening the tab did nothing). Returns new mail + one line per box that failed.
++     */
++    suspend fun refresh(context: Context, force: Boolean = false): FeedRefresh.Outcome? = withContext(Dispatchers.IO) {
++        if (fake) return@withContext FeedRefresh.Outcome(emptyList(), emptyList())
++        if (!force && System.currentTimeMillis() - lastAt < 30_000L && _mails.value.isNotEmpty()) return@withContext null
++        gate.run(waitIfBusy = force) { readAll(context) }
++    }
++
++    private suspend fun readAll(context: Context): FeedRefresh.Outcome {
 +        _busy.value = true
++        val before = _mails.value.map { it.id }.toSet()
++        val fails = ArrayList<String>()
 +        try {
 +            val accts = load(context)
 +            accts.forEach { a -> setState(context, a.id, (_states.value[a.id] ?: AcctState(St.NEW)).copy(st = St.CHECKING)) }
@@ -3209,6 +3542,16 @@ index 0000000..91ca86a
 +                    }
 +                    // keep this account's mail from the last good read
 +                    all += _mails.value.filter { it.accountId == a.id }
++                    val many = got.count { (b, _) -> b.provider == a.provider } > 1
++                    val name = FeedRefresh.mailLabel(a.address, many).let { if (a.id == "gmail_web") "Gmail" else it }
++                    fails += when {
++                        a.id == "gmail_web" && st == St.AUTH -> "Gmail 网页登录过期"
++                        st == St.AUTH && a.provider == "Gmail" -> "$name 应用专用密码失效"
++                        st == St.AUTH -> "$name 授权码失效"
++                        kind == MailImap.Fail.PROTOCOL -> "$name ${e.message ?: "没接受"}".take(40)
++                        (e.message ?: "").contains("秒没读完") -> "$name 连接超时"
++                        else -> "$name 连不上"
++                    }
 +                    setState(context, a.id, AcctState(st, msg, System.currentTimeMillis(), _states.value[a.id]?.unread ?: 0))
 +                }
 +            }
@@ -3217,7 +3560,9 @@ index 0000000..91ca86a
 +            if (!fake) _mails.value.take(60).forEach { m -> runCatching { AutoAccounts.onMail(context, m.from, m.fromAddr, m.subject, m.address) } }
 +            // [Mines-38.9] new-device / abnormal sign-in mails → 账号关联 alert (是我 / 不是我)
 +            _mails.value.take(80).forEach { m -> runCatching { Keychain.onMail(context, m) } }
++            val countAll = lastAt > 0
 +            lastAt = System.currentTimeMillis()
++            return FeedRefresh.Outcome(FeedRefresh.freshIds(before, _mails.value.map { it.id }, countAll), fails)
 +        } finally { _busy.value = false }
 +    }
 +
@@ -3404,10 +3749,21 @@ index 0000000..91ca86a
 +    fun unreadTotal(): Int = _states.value.values.sumOf { it.unread.coerceAtLeast(0) }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MailSources.kt b/src/android/app/src/main/java/com/openminis/app/plus/MailSources.kt
-index 928ae75..54e348b 100644
+index 928ae75..9a65ebc 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/MailSources.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/MailSources.kt
-@@ -58,6 +58,7 @@ object MailSources {
+@@ -41,6 +41,10 @@ object MailSources {
+ 
+     /** Test hook (adb-only SelfTestProvider): an extra Atom feed URL read like Gmail's. */
+     @Volatile var testFeedUrl: String? = null
++    /** [Mines-38.9.2] adb self-test only (msgfeed): extra IMAP boxes (label, host|user, pass) read like real ones. */
++    @Volatile var testBoxes: List<Triple<String, String, String>> = emptyList()
++    /** the failures of the last real read, repeated when a later caller is served from the cache */
++    @Volatile private var lastFails: List<String> = emptyList()
+ 
+     @Volatile private var cache: List<MailParse.Mail> = emptyList()
+     @Volatile private var cacheAt = 0L
+@@ -58,6 +62,7 @@ object MailSources {
      private fun imapHost(email: String, kindBase: String): String? {
          val d = email.substringAfter('@', "").lowercase()
          return when {
@@ -3415,7 +3771,106 @@ index 928ae75..54e348b 100644
              kindBase == "gmail" || d == "gmail.com" || d == "googlemail.com" -> "imap.gmail.com"
              d == "163.com" -> "imap.163.com"
              d == "126.com" -> "imap.126.com"
-@@ -178,7 +179,10 @@ object MailSources {
+@@ -79,7 +84,7 @@ object MailSources {
+                 val host = imapHost(user, base) ?: return@mapNotNull null
+                 Triple(label(base), "$host|$user", pass.replace(" ", ""))
+             }
+-        }
++        } + testBoxes
+ 
+     private fun label(base: String) = when (base) { "gmail" -> "Gmail"; "mail163" -> "网易邮箱"; "qqmail" -> "QQ 邮箱"; else -> base }
+ 
+@@ -96,21 +101,42 @@ object MailSources {
+ 
+     // ---------------- reading ----------------
+ 
+-    /** Recent mail from every usable mailbox (cached for [maxAgeMs]). Never throws. */
+-    suspend fun recent(context: Context, maxAgeMs: Long = 60_000L): List<MailParse.Mail> = withContext(Dispatchers.IO) {
+-        if (System.currentTimeMillis() - cacheAt < maxAgeMs) return@withContext cache
++    /**
++     * Recent mail from every usable mailbox (cached for [maxAgeMs]). Never throws.
++     * [Mines-38.9.2] each box that can't be read adds one plain line to [fails] (「163 授权码失效」, 「Gmail 网页登录过期」…);
++     * before, a refused login or a timeout just gave an empty list and the pull looked like 「no new mail」.
++     */
++    suspend fun recent(context: Context, maxAgeMs: Long = 60_000L, fails: MutableList<String>? = null): List<MailParse.Mail> = withContext(Dispatchers.IO) {
++        if (System.currentTimeMillis() - cacheAt < maxAgeMs) { fails?.addAll(lastFails); return@withContext cache }
+         PlusVault.init(context)
++        val bad = java.util.Collections.synchronizedList(ArrayList<String>())
+         val jobs = coroutineScope {
+             val list = ArrayList<kotlinx.coroutines.Deferred<List<MailParse.Mail>>>()
+             testFeedUrl?.let { u -> list += async { runCatching { atomAt(u, "Gmail") }.getOrDefault(emptyList()) } }
+-            if (gmailWebSignedIn()) list += async { runCatching { gmailAtom() }.getOrDefault(emptyList()) }
+-            if (PlusVault.defaultAccount("microsoft") != null) list += async { runCatching { outlook(context) }.getOrDefault(emptyList()) }
+-            imapAccounts().forEach { (l, hu, p) ->
+-                list += async { withTimeoutOrNull(20_000L) { runCatching { Imap.recent(hu.substringBefore('|'), hu.substringAfter('|'), p, l) }.getOrNull() }.orEmpty() }
++            if (gmailWebSignedIn()) list += async { runCatching { gmailAtomChecked() }.getOrElse { bad += FeedRefresh.mailFail("Gmail", it); emptyList() } }
++            if (PlusVault.defaultAccount("microsoft") != null) list += async { runCatching { outlook(context) }.getOrElse { bad += FeedRefresh.mailFail("Outlook", it); emptyList() } }
++            val boxes = imapAccounts()
++            boxes.forEach { (l, hu, p) ->
++                val user = hu.substringAfter('|')
++                val host = hu.substringBefore('|')
++                // the name the user knows: 「163」/「QQ 邮箱」…, with the start of the address when they have several there
++                val base = if (host == "smoke") l else FeedRefresh.mailLabel(user)
++                val many = boxes.count { (l2, hu2, _) -> (if (hu2.startsWith("smoke|")) l2 else FeedRefresh.mailLabel(hu2.substringAfter('|'))) == base } > 1
++                val name = if (many) "$base ${user.substringBefore('@').take(4)}…" else base
++                list += async {
++                    val r = withTimeoutOrNull(20_000L) { runCatching { Imap.recent(host, user, p, l) } }
++                    when {
++                        r == null -> { bad.add(FeedRefresh.mailFail(name, null)); emptyList<MailParse.Mail>() }
++                        r.isFailure -> { bad.add(FeedRefresh.mailFail(name, r.exceptionOrNull())); emptyList<MailParse.Mail>() }
++                        else -> r.getOrDefault(emptyList())
++                    }
++                }
+             }
+             list.awaitAll()
+         }
+         val all = jobs.flatten().distinctBy { it.id }.sortedByDescending { it.at }
++        lastFails = bad.toList()
++        fails?.addAll(lastFails)
+         cache = all; cacheAt = System.currentTimeMillis()
+         all
+     }
+@@ -133,6 +159,14 @@ object MailSources {
+ 
+     private fun atomAt(url: String, source: String): List<MailParse.Mail> = MailParse.atom(cookieGet(url).orEmpty(), source).orEmpty()
+ 
++    /** [Mines-38.9.2] like [gmailAtom] but says why u/0 could not be read (no network vs. signed out). */
++    private fun gmailAtomChecked(): List<MailParse.Mail> {
++        val body = cookieGet("https://mail.google.com/mail/u/0/feed/atom") ?: throw FeedRefresh.SourceFail("Gmail 网页登录过期")
++        val a = MailParse.atom(body, "Gmail") ?: throw FeedRefresh.SourceFail("Gmail 网页登录过期")
++        val b = runCatching { atomAt("https://mail.google.com/mail/u/1/feed/atom", "Gmail") }.getOrDefault(emptyList())
++        return a + b.filter { m -> a.none { it.id == m.id } }
++    }
++
+     /** Gmail inbox (u/0 and u/1 when the user has two accounts signed in). */
+     private fun gmailAtom(): List<MailParse.Mail> {
+         val a = atomAt("https://mail.google.com/mail/u/0/feed/atom", "Gmail")
+@@ -144,7 +178,10 @@ object MailSources {
+         val token = PlusConnect.microsoftToken(context) ?: return emptyList()
+         val url = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?\$top=15&\$orderby=receivedDateTime%20desc&\$select=id,subject,bodyPreview,from,receivedDateTime,webLink"
+         val body = http.newCall(Request.Builder().url(url).header("Authorization", "Bearer $token").header("Accept", "application/json").build())
+-            .execute().use { if (it.isSuccessful) it.body?.string() else null } ?: return emptyList()
++            .execute().use {
++                if (it.code == 401) throw FeedRefresh.SourceFail("Outlook 授权过期")
++                if (it.isSuccessful) it.body?.string() else null
++            } ?: return emptyList()
+         val arr = JSONObject(body).optJSONArray("value") ?: return emptyList()
+         return (0 until arr.length()).map { i ->
+             val o = arr.getJSONObject(i)
+@@ -159,10 +196,10 @@ object MailSources {
+     private val noisy = Regex("(?i)newsletter|unsubscribe|digest|promo|marketing|退订|广告|推广")
+ 
+     /** Mail as feed items: security / code / personal mail first, newsletters dropped. */
+-    suspend fun digestItems(context: Context): List<Digest.Item> {
++    suspend fun digestItems(context: Context, maxAgeMs: Long = 5 * 60_000L, fails: MutableList<String>? = null): List<Digest.Item> {
+         if (!available(context)) return emptyList()
+         val since = System.currentTimeMillis() - 3 * 86_400_000L
+-        return recent(context, 5 * 60_000L).filter { it.at == 0L || it.at >= since }.filterNot { noisy.containsMatchIn(it.subject + " " + it.from) }.take(25).map { m ->
++        return recent(context, maxAgeMs, fails).filter { it.at == 0L || it.at >= since }.filterNot { noisy.containsMatchIn(it.subject + " " + it.from) }.take(25).map { m ->
+             val hasCode = MailParse.extractCode(m.subject + " " + m.text) != null
+             // a code never reaches the feed: say that there is one, not what it is
+             val summary = if (hasCode) "一封验证码邮件（Mines 需要时会自动填，不在这里显示）" else m.text.replace(Regex("\\s+"), " ").take(140)
+@@ -178,7 +215,10 @@ object MailSources {
  
          /** Newest [max] messages of INBOX (first 12 KB of each). */
          fun recent(host: String, user: String, pass: String, label: String, max: Int = 8): List<MailParse.Mail> {
@@ -3427,7 +3882,16 @@ index 928ae75..54e348b 100644
              s.use { sock ->
                  val inp = BufferedInputStream(sock.inputStream)
                  val out = sock.outputStream
-@@ -218,13 +222,13 @@ object MailSources {
+@@ -187,7 +227,7 @@ object MailSources {
+                 fun cmd(c: String): List<Any> { n++; val tag = "m$n"; send(out, "$tag $c"); return readTagged(inp, tag) }
+                 if (host.contains("163") || host.contains("126") || host.contains("yeah")) cmd("ID (\"name\" \"Mines\" \"version\" \"33\" \"vendor\" \"Mines\")")
+                 val login = cmd("LOGIN ${q(user)} ${q(pass)}")
+-                if (!lastOk(login)) throw IllegalStateException("IMAP 登录失败")
++                if (!lastOk(login)) throw FeedRefresh.LoginRejected(login.filterIsInstance<String>().lastOrNull().orEmpty().take(120))   // [Mines-38.9.2] → 「163 授权码失效」
+                 val sel = cmd("SELECT INBOX")
+                 val exists = sel.filterIsInstance<String>().firstNotNullOfOrNull { Regex("^\\* (\\d+) EXISTS").find(it)?.groupValues?.get(1)?.toIntOrNull() } ?: 0
+                 if (exists == 0) return emptyList()
+@@ -218,13 +258,13 @@ object MailSources {
              }
          }
  
@@ -3445,7 +3909,7 @@ index 928ae75..54e348b 100644
              val b = ByteArrayOutputStream()
              while (true) {
                  val c = inp.read()
-@@ -236,7 +240,7 @@ object MailSources {
+@@ -236,7 +276,7 @@ object MailSources {
          }
  
          /** Lines (String) and literals (ByteArray) up to and including the tagged status line. */
@@ -3745,7 +4209,7 @@ index 44c570e..987447d 100644
  
      /** RFC-4180-ish CSV line split (quotes, doubled quotes). */
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
-index 787c5f7..9f90803 100644
+index 787c5f7..9844747 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/SelfTestProvider.kt
 @@ -402,12 +402,18 @@ class SelfTestProvider : ContentProvider() {
@@ -3778,7 +4242,7 @@ index 787c5f7..9f90803 100644
                          PlusVault.kind("sensenova")?.let { k ->
                              if (!PlusVault.hasSecret("sensenova")) PlusVault.save(c, k, "商汤", "sk-smokesense00000000000001", share = false, via = "key")
                              repeat(2) { n -> val id = PlusVault.newAccountId("sensenova")
-@@ -603,6 +609,34 @@ class SelfTestProvider : ContentProvider() {
+@@ -603,6 +609,80 @@ class SelfTestProvider : ContentProvider() {
                  out.putString("result", res.get() ?: "{\"ok\":false,\"error\":\"timeout\"}")
              }
              "group" -> out.putString("result", com.openminis.app.plus.group.GroupSelfTest.handle(context!!, arg ?: "")) // [Mines-group-37]
@@ -3808,6 +4272,52 @@ index 787c5f7..9f90803 100644
 +                j.put("states", org.json.JSONObject(MailInbox.states.value.mapValues { (_, v) -> v.st.name + ":" + v.msg.take(60) + ":" + v.unread }))
 +                j.put("mails", MailInbox.mails.value.size)
 +                j.put("subjects", org.json.JSONArray(MailInbox.mails.value.take(5).map { it.subject.take(40) + (if (it.unread) " *" else "") }))
++                out.putString("result", j.toString())
++            }
++            // [Mines-38.9.2] 消息 pull-to-refresh: a fake source that brings one new card per read, a 163 box with a wrong
++            // 授权码 on the runner's fake IMAP (the real IMAP path → 「163 授权码失效」), open 消息, state for the smoke
++            "msgfeed" -> {
++                val c = context!!.applicationContext
++                val a = arg ?: ""
++                val j = org.json.JSONObject()
++                when {
++                    a == "seed" -> {
++                        Digest.resetTestReads()
++                        Digest.testSource = { n ->
++                            val now = System.currentTimeMillis()
++                            (1..n).map { i ->
++                                Digest.Item("st:msg$i", "Smoke", "smoke:msg", "Smoke 来源", "Smoke 新消息 #$i", "第 $i 次读取送来的消息", now - (n - i) * 1000L)
++                                    .also { it.headline = "Smoke 新消息 #$i"; it.brief = "第 $i 次读取送来的消息" }
++                            }
++                        }
++                        j.put("ok", true)
++                    }
++                    a.startsWith("badbox ") -> {
++                        MailImap.plainOverride = a.removePrefix("badbox ").trim().ifBlank { null }
++                        MailSources.testBoxes = listOf(Triple("163", "smoke|smoke163@smoke.test", "wrongcode"))
++                        MailSources.invalidate()
++                        j.put("ok", true)
++                    }
++                    a == "off" -> { Digest.testSource = null; MailSources.testBoxes = emptyList(); MailSources.invalidate(); j.put("ok", true) }
++                    a == "pull" -> {
++                        val o = kotlinx.coroutines.runBlocking { Digest.refresh(c, FeedRefresh.Mode.PULL) }
++                        j.put("line", FeedRefresh.line(o)).put("fresh", org.json.JSONArray(o?.fresh ?: emptyList<String>()))
++                    }
++                    a == "open" -> {
++                        val l = java.util.concurrent.CountDownLatch(1)
++                        android.os.Handler(android.os.Looper.getMainLooper()).post {
++                            com.openminis.app.ui.plus.PlusNav.digestTab = "FOR_YOU"
++                            com.openminis.app.ui.plus.PlusNav.go(com.openminis.app.ui.plus.PlusRoutes.DIGEST); l.countDown() }
++                        l.await(5, TimeUnit.SECONDS); j.put("ok", true)
++                    }
++                }
++                j.put("items", Digest.items.value.size)
++                j.put("smoke", org.json.JSONArray(Digest.items.value.filter { it.id.startsWith("st:msg") }.map { it.id }))
++                j.put("top", org.json.JSONArray(Digest.items.value.take(3).map { it.id }))
++                j.put("fresh", j.opt("fresh") ?: org.json.JSONArray(Digest.fresh.value.toList()))
++                j.put("lastError", Digest.lastError ?: "")
++                j.put("lastRefreshAgoMs", if (Digest.lastRefreshAt == 0L) -1 else System.currentTimeMillis() - Digest.lastRefreshAt)
++                j.put("busy", Digest.busy.value)
 +                out.putString("result", j.toString())
 +            }
              // [Mines-38.6] F: one real read of 微博 / B站 / 知乎 (own session + a public endpoint each)
@@ -4154,6 +4664,21 @@ index cc21c33..778a30a 100644
          val code = HumanVerify.extractCode(text) ?: return
          HumanVerify.init(c)
          if (!HumanVerify.settings.value.otpAutofill) return
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SourceAccounts.kt b/src/android/app/src/main/java/com/openminis/app/plus/SourceAccounts.kt
+index 2b50977..3f3e165 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/SourceAccounts.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/SourceAccounts.kt
+@@ -194,8 +194,8 @@ object SourceAccounts {
+         return verdict("site:www.zhihu.com", "知乎", code, body, n, code == 401 || o?.optJSONObject("error")?.optInt("code") == 100)
+     }
+ 
+-    suspend fun items(context: Context): List<Digest.Item> = withContext(Dispatchers.IO) {
+-        if (System.currentTimeMillis() - lastRead < 10 * 60_000L) return@withContext cache
++    suspend fun items(context: Context, maxAgeMs: Long = 10 * 60_000L): List<Digest.Item> = withContext(Dispatchers.IO) {
++        if (System.currentTimeMillis() - lastRead < maxAgeMs) return@withContext cache   // [Mines-38.9.2] a pull passes 0
+         lastRead = System.currentTimeMillis()
+         val out = ArrayList<Digest.Item>()
+         // [Mines-38.7] every signed-in account of a platform is read with ITS OWN session (isolated store / saved set);
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/VpsSsh.kt b/src/android/app/src/main/java/com/openminis/app/plus/VpsSsh.kt
 index 9e2ca88..61bb5a4 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/VpsSsh.kt
@@ -7871,18 +8396,20 @@ index 6a136a6..4f1d2b7 100644
 +    } else com.openminis.app.plus.KeyTester.test(PlusVault.baseId(kind.id), secret)
 +}.getOrNull()
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
-index b529a74..2febbff 100644
+index b529a74..b0e43af 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
-@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.height
+@@ -20,7 +20,9 @@ import androidx.compose.foundation.border
+ import androidx.compose.foundation.layout.height
  import androidx.compose.ui.semantics.contentDescription
  import androidx.compose.ui.semantics.semantics
++import androidx.compose.ui.semantics.liveRegion
  import androidx.compose.material.icons.Icons
 +import androidx.compose.material.icons.filled.Check
  import androidx.compose.material.icons.automirrored.filled.ArrowBack
  import androidx.compose.material.icons.outlined.Tune
  import androidx.compose.material.icons.outlined.FavoriteBorder
-@@ -86,13 +87,16 @@ fun DigestScreen(onBack: () -> Unit) {
+@@ -86,20 +88,38 @@ fun DigestScreen(onBack: () -> Unit) {
      val vault by com.openminis.app.plus.PlusVault.entries.collectAsState()
      val scope = rememberCoroutineScope()
      // [Mines-feed-35.1] tab by name ("ALL" = 全部); null = not chosen yet → X when it has items
@@ -7900,7 +8427,30 @@ index b529a74..2febbff 100644
      var resumes by remember { mutableStateOf(0) }
      val owner = androidx.compose.ui.platform.LocalLifecycleOwner.current
      androidx.compose.runtime.DisposableEffect(owner) {
-@@ -133,13 +137,14 @@ fun DigestScreen(onBack: () -> Unit) {
+         val obs = androidx.lifecycle.LifecycleEventObserver { _, e -> if (e == androidx.lifecycle.Lifecycle.Event.ON_RESUME) resumes++ }
+         owner.lifecycle.addObserver(obs); onDispose { owner.lifecycle.removeObserver(obs) }
+     }
+-    LaunchedEffect(Unit) { Digest.refresh(context); xTick++ }
++    // [Mines-38.9.2] the feed re-reads its sources whenever the page is opened or comes back (ON_RESUME also fires on the
++    // first open), unless the last read is under 30 s old. Was: one cached refresh on first composition only.
++    var resultLine by remember { mutableStateOf<String?>(null) }
++    var pulled by remember { mutableStateOf(false) }
++    val listState = androidx.compose.foundation.lazy.rememberLazyListState()
++    LaunchedEffect(resumes) {
++        if (resumes == 0 || pulled) return@LaunchedEffect
++        if (System.currentTimeMillis() - Digest.lastRefreshAt > 30_000L) {
++            val o = Digest.refreshAsync(context, com.openminis.app.plus.FeedRefresh.Mode.OPEN).await()
++            xTick++
++            // on open, only say something when there is something to say
++            if (o != null && (o.fresh.isNotEmpty() || o.fails.isNotEmpty()) && Digest.lastRefreshAt > 0) resultLine = com.openminis.app.plus.FeedRefresh.line(o)
++        }
++        runCatching { com.openminis.app.plus.MailInbox.refresh(context) }   // 邮箱: its own 30 s guard
++    }
++    LaunchedEffect(resultLine) { if (resultLine != null) { delay(6000); resultLine = null } }
+     // [Mines-sources-33] X is read off-screen by Digest.refresh (AutoSources.readX) whenever the X session exists
+ 
+     val haptic = androidx.compose.ui.platform.LocalHapticFeedback.current
+@@ -133,13 +153,14 @@ fun DigestScreen(onBack: () -> Unit) {
                  androidx.compose.material3.Snackbar(
                      modifier = Modifier.padding(12.dp),
                      action = { androidx.compose.material3.TextButton(onClick = { d.performAction() }, modifier = Modifier.semantics { contentDescription = "撤销忽略" }) {
@@ -7918,28 +8468,41 @@ index b529a74..2febbff 100644
                      modifier = Modifier.background(androidx.compose.ui.graphics.Brush.verticalGradient(listOf(mines().bg.copy(alpha = 0.96f), mines().bg.copy(alpha = 0.90f), mines().bg.copy(alpha = 0f))))
                          .statusBarsPadding().padding(bottom = 2.dp),
                      leading = { WarmRoundButton(Icons.AutoMirrored.Filled.ArrowBack, "返回", onClick = onBack) },
-@@ -158,8 +163,19 @@ fun DigestScreen(onBack: () -> Unit) {
+@@ -158,37 +179,67 @@ fun DigestScreen(onBack: () -> Unit) {
              },
          ) { pad ->
            // [Mines-feed-32] pull down to refresh (no big 刷新 button)
-+          // [Mines-38.8] user 2026-10-16: the refresh circle hung over the 「账号异常」 tab whenever a background refresh ran
-+          // (busy). Now it only shows for a pull the user made, and folds away when that refresh ends or after 4 s at most;
-+          // background work shows in the plate line under the face (「正在替你看…」) only.
-+          var pulled by remember { mutableStateOf(false) }
-+          LaunchedEffect(pulled) {
-+              if (!pulled) return@LaunchedEffect
-+              delay(700)
-+              var waited = 700L
-+              while (waited < 4000L && (busy || (curTab == MAIL_TAB && mailBusy))) { delay(200); waited += 200 }
-+              pulled = false
++          // [Mines-38.9.2] user 2026-10-17 「下拉不更新」: the pull now really re-reads every source with no cache (waiting for a
++          // read that is already running instead of being dropped), the circle stays exactly as long as that read (cap 60 s),
++          // new cards go to the top, and one line says what happened: 「新到 3 条」/「没有新消息」/「163 授权码失效」.
++          // Background refreshes never show the circle (38.8 rule) — only the plate line under the face.
++          fun pull() {
++              if (pulled) return
++              pulled = true
++              haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.TextHandleMove)
++              val tab = curTab
++              scope.launch {
++                  val line = try {
++                      kotlinx.coroutines.withTimeoutOrNull(60_000L) {
++                          if (tab == MAIL_TAB) com.openminis.app.plus.FeedRefresh.line(com.openminis.app.plus.MailInbox.refresh(context, force = true))
++                          else com.openminis.app.plus.FeedRefresh.line(Digest.refreshAsync(context, com.openminis.app.plus.FeedRefresh.Mode.PULL).await())
++                      } ?: "还在读，读完会自动更新"
++                  } finally { pulled = false }
++                  xTick++
++                  resultLine = line
++                  runCatching { listState.animateScrollToItem(0) }
++              }
 +          }
            androidx.compose.material3.pulltorefresh.PullToRefreshBox(
 -            isRefreshing = busy, onRefresh = { scope.launch { Digest.refresh(context) }; xTick++ },
-+            isRefreshing = pulled, onRefresh = { pulled = true; if (curTab == MAIL_TAB) mailTick++ else { scope.launch { Digest.refresh(context) }; xTick++ } },
++            isRefreshing = pulled, onRefresh = { pull() },
              modifier = Modifier.fillMaxSize().padding(pad),
            ) {
              androidx.compose.foundation.lazy.LazyColumn(
-@@ -169,26 +185,32 @@ fun DigestScreen(onBack: () -> Unit) {
+                 Modifier.fillMaxSize(),
++                state = listState,
+                 contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 40.dp),
+             ) {
                  // [Mines-38.1] 「接入更多来源」 card removed: sources live behind ⚙ → 消息来源 and a faint 「＋ 添加来源」 row at the end
                  // ---- [Mines-warm-36] 「N 件要处理」 strip + 4 tabs: 账号异常 / X / GitHub / 值得关注 (其他 only when it has items) ----
                  item(key = "chips") {
@@ -7960,7 +8523,9 @@ index b529a74..2febbff 100644
                      } + (items.count { it.tab == Digest.Tab.OTHER }.takeIf { it > 0 }?.let { listOf(WarmTab(Digest.Tab.OTHER.name, "其他", it)) } ?: emptyList())
                      WarmTabs(tabs, curTab, onSelect = { k -> tabSel = k })
 -                    feedClean(Digest.lastError)?.let { Text(it, fontSize = 12.sp, color = mines().ink3, maxLines = 1, overflow = TextOverflow.Ellipsis,
-+                    feedClean(Digest.lastError)?.let { Text(it, fontSize = 13.sp, color = mines().ink3, maxLines = 1, overflow = TextOverflow.Ellipsis,
++                    val rl = resultLine
++                    if (rl != null) RefreshResultLine(rl)
++                    else if (curTab != MAIL_TAB) feedClean(Digest.lastError)?.let { Text(it, fontSize = 13.sp, color = mines().ink3, maxLines = 1, overflow = TextOverflow.Ellipsis,
                          modifier = Modifier.padding(horizontal = 24.dp)) }
                  }
 -                val shown = (if (curTab == "ALL" || curTab == FOR_YOU) items else items.filter { tabOf(it).name == curTab }).take(80)
@@ -7979,7 +8544,7 @@ index b529a74..2febbff 100644
                  }
                  val now = System.currentTimeMillis()
                  val startOfDay = java.util.Calendar.getInstance().apply { set(java.util.Calendar.HOUR_OF_DAY, 0); set(java.util.Calendar.MINUTE, 0); set(java.util.Calendar.SECOND, 0) }.timeInMillis
-@@ -202,7 +224,8 @@ fun DigestScreen(onBack: () -> Unit) {
+@@ -202,7 +253,8 @@ fun DigestScreen(onBack: () -> Unit) {
                      } }
                      list.forEach { m ->
                          item(key = m.id) {
@@ -7989,7 +8554,7 @@ index b529a74..2febbff 100644
                                  onOpen = { Digest.opened(context, m); detailFor = m },
                                  onLong = { menuFor = m },
                                  onLike = { Digest.like(context, m); android.widget.Toast.makeText(context, "好的，以后多推这类", android.widget.Toast.LENGTH_SHORT).show() },
-@@ -217,7 +240,7 @@ fun DigestScreen(onBack: () -> Unit) {
+@@ -217,7 +269,7 @@ fun DigestScreen(onBack: () -> Unit) {
                          }
                      }
                  }
@@ -7998,7 +8563,7 @@ index b529a74..2febbff 100644
                      @Suppress("UNUSED_EXPRESSION") resumes
                      @Suppress("UNUSED_EXPRESSION") vault
                      val rows = com.openminis.app.plus.AutoSources.missing(context)
-@@ -226,7 +249,7 @@ fun DigestScreen(onBack: () -> Unit) {
+@@ -226,7 +278,7 @@ fun DigestScreen(onBack: () -> Unit) {
                          verticalAlignment = Alignment.CenterVertically) {
                          Text("＋ 添加来源", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = mines().primaryText)
                          Spacer(Modifier.width(8.dp))
@@ -8007,7 +8572,16 @@ index b529a74..2febbff 100644
                      }
                  }
              }
-@@ -413,7 +436,7 @@ private fun FeedChip(label: String, selected: Boolean, onClick: () -> Unit) {
+@@ -344,7 +396,7 @@ fun DigestScreen(onBack: () -> Unit) {
+         val wm = mines()
+         MinesDialog("我关注的", onDismiss = { editFollows = false }, confirm = "保存", onConfirm = {
+             Digest.setFollows(context, text.lines()); Digest.setSenders(context, who.lines()); Digest.setLanguages(context, langs); editFollows = false
+-            scope.launch { Digest.refresh(context) }; xTick++
++            scope.launch { Digest.refreshAsync(context, com.openminis.app.plus.FeedRefresh.Mode.OPEN).await(); xTick++ }
+         }) {
+             Text("话题：一行一个关键词、币种或项目，命中的排前面", fontSize = MT.Caption, lineHeight = MT.CaptionLH, color = wm.ink2)
+             OutlinedTextField(text, { text = it }, minLines = 3, maxLines = 5, modifier = Modifier.fillMaxWidth(),
+@@ -413,7 +465,7 @@ private fun FeedChip(label: String, selected: Boolean, onClick: () -> Unit) {
      // [Mines-design-34] selected = ink pill, others = strong glass + hairline (design33 02-feed)
      val m = mines()
      val shape = RoundedCornerShape(50)
@@ -8016,7 +8590,7 @@ index b529a74..2febbff 100644
          color = if (selected) m.surface else m.ink, maxLines = 1,
          modifier = Modifier.heightIn(min = 44.dp).clip(shape).background(if (selected) m.ink else m.glassStrong)
              .border(1.dp, if (selected) Color.Transparent else m.hairline, shape).clickable(onClick = onClick)
-@@ -431,6 +454,59 @@ private fun repoOf(it: Digest.Item): String? = listOfNotNull(it.url, it.title, i
+@@ -431,6 +483,59 @@ private fun repoOf(it: Digest.Item): String? = listOfNotNull(it.url, it.title, i
      repoRe.find(t)?.groupValues?.get(1)?.removeSuffix(".git")?.trimEnd('.', ')')
  }?.takeIf { r -> r.split('/').let { p -> p.size == 2 && p[0] !in setOf("orgs", "topics", "trending", "settings", "sponsors") } }
  
@@ -8076,7 +8650,7 @@ index b529a74..2febbff 100644
  /** What the card's / sheet's main button says (follows the action, not a generic 开始吧). */
  private val warnRx = Regex("(?i)警告|警惕|小心|注意|风险|骗|钓鱼|假冒|盗号|被盗|漏洞|scam|phishing|warning|beware|exploit|hack")
  private val howRx = Regex("(?i)教程|指南|手把手|入门|步骤|怎么|如何|方法|技巧|攻略|tutorial|guide|how to|tips")
-@@ -477,7 +553,7 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
+@@ -477,7 +582,7 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
                  Box(Modifier.size(32.dp).clip(androidx.compose.foundation.shape.CircleShape)
                      .background(androidx.compose.ui.graphics.Brush.linearGradient(listOf(Color(0xFFE08A6B), Color(0xFFB5532F)))),
                      contentAlignment = Alignment.Center) {
@@ -8085,7 +8659,7 @@ index b529a74..2febbff 100644
                  }
              } else TopicIcon(it, toneFg, 32.dp)
              Spacer(Modifier.width(10.dp))
-@@ -490,7 +566,7 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
+@@ -490,7 +595,7 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
                          Spacer(Modifier.width(6.dp))
                      }
                      Text((if (it.pinned) "置顶 · " else "") + listOfNotNull(sender ?: it.source.takeIf { s -> s.isNotBlank() }, relTime(it.at)).joinToString(" · "),
@@ -8094,7 +8668,7 @@ index b529a74..2febbff 100644
                      val mark = when { isX -> com.openminis.app.R.drawable.ic_brand_x; isGh -> com.openminis.app.R.drawable.ic_brand_github; else -> 0 }
                      if (mark != 0) androidx.compose.foundation.Image(androidx.compose.ui.res.painterResource(mark), contentDescription = it.source,
                          modifier = Modifier.padding(start = 6.dp).size(14.dp))
-@@ -500,10 +576,10 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
+@@ -500,10 +605,10 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
                      modifier = Modifier.padding(top = 4.dp, end = 8.dp))
                  // GitHub: Chinese on top (big), the English name/description underneath in small print
                  if (isGh) feedClean(it.title)?.takeIf { t -> t != headline }?.let { en ->
@@ -8107,7 +8681,7 @@ index b529a74..2febbff 100644
                      modifier = Modifier.padding(top = 6.dp).clip(RoundedCornerShape(50)).background(toneBg).padding(horizontal = 8.dp, vertical = 2.dp)) }
                  if (isX) repoOf(it)?.let { r -> RepoMiniCard(r, null, null) }
                  if (isX) it.image?.let { img ->
-@@ -529,7 +605,7 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
+@@ -529,7 +634,7 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
                      Spacer(Modifier.weight(1f))
                      ActIcon("⋯", "更多", m.ink2, onMore)
                  }
@@ -8116,7 +8690,7 @@ index b529a74..2febbff 100644
              }
          }
      }
-@@ -550,7 +626,7 @@ private fun TextAct(icon: androidx.compose.ui.graphics.vector.ImageVector, label
+@@ -550,7 +655,7 @@ private fun TextAct(icon: androidx.compose.ui.graphics.vector.ImageVector, label
  @Composable
  private fun ActIcon(glyph: String, label: String, color: Color, onClick: () -> Unit) {
      androidx.compose.material3.IconButton(onClick = onClick, modifier = Modifier.size(48.dp).semantics { contentDescription = label }) {
@@ -8125,7 +8699,7 @@ index b529a74..2febbff 100644
      }
  }
  
-@@ -622,21 +698,21 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
+@@ -622,21 +727,21 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
                  Column(Modifier.weight(1f)) {
                      Text(listOfNotNull(Digest.Tab.values().firstOrNull { it == m.tab }?.let { t -> if (t == Digest.Tab.FOLLOW) "X" else t.label }, m.source.takeIf { it.isNotBlank() })
                          .distinct().joinToString(" · "), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = mc.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -8151,7 +8725,7 @@ index b529a74..2febbff 100644
                  }
              }
              m.image?.let { img ->
-@@ -647,7 +723,7 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
+@@ -647,7 +752,7 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
              if (steps.isNotEmpty()) {
                  Row(Modifier.padding(top = 22.dp).fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                      Text("包含的内容", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = mc.ink, modifier = Modifier.weight(1f))
@@ -8160,7 +8734,7 @@ index b529a74..2febbff 100644
                  }
                  Column(Modifier.padding(top = 8.dp).fillMaxWidth().clip(RoundedCornerShape(20.dp)).background(mc.surface2.copy(alpha = if (mc.dark) 1f else 0.7f))) {
                      steps.forEachIndexed { i, (t, sub) ->
-@@ -674,7 +750,7 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
+@@ -674,7 +779,7 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
                      .clickable { openOriginal(context, m) }.heightIn(min = 56.dp).padding(horizontal = 14.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
                      Column(Modifier.weight(1f)) {
                          Text("原文" + (feedClean(com.openminis.app.plus.AccountLabel.maskText(m.sender))?.let { " · $it" } ?: ""), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = mc.ink, maxLines = 1)
@@ -8169,6 +8743,25 @@ index b529a74..2febbff 100644
                      }
                      Text("↗", fontSize = 20.sp, color = mc.ink2)
                  }
+@@ -809,3 +914,18 @@ fun glueNumbers(s: String): String = numUnit.replace(s) { m ->
+     val tail = m.groupValues[5]
+     num + (if (sp.isNotEmpty()) "\u00A0" else "\u2060") + unit + (if (tail.isNotEmpty()) "\u00A0" + tail else "")
+ }
++
++/**
++ * [Mines-38.9.2] the one line after a pull: 「新到 3 条」 / 「没有新消息」 / 「没有新消息 · 163 授权码失效」.
++ * Readable (15 sp, contrast-checked ink / danger colour, wraps to 2 lines), and read out by TalkBack (polite live region).
++ */
++@Composable
++internal fun RefreshResultLine(text: String) {
++    val failed = text.contains(" · ")
++    val (fg, bgc) = toneColors(if (failed) Tone.WARNING else if (text.startsWith("新到")) Tone.SUCCESS else Tone.NEUTRAL)
++    Box(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
++        Text(text, fontSize = 15.sp, lineHeight = 20.sp, fontWeight = FontWeight.Medium, color = fg, maxLines = 2, overflow = TextOverflow.Ellipsis,
++            modifier = Modifier.clip(RoundedCornerShape(12.dp)).background(bgc).padding(horizontal = 12.dp, vertical = 6.dp)
++                .semantics { liveRegion = androidx.compose.ui.semantics.LiveRegionMode.Polite; contentDescription = "刷新结果：$text" })
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ExperienceScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ExperienceScreen.kt
 new file mode 100644
 index 0000000..3101d9e
@@ -12715,6 +13308,96 @@ index 0000000..5ff2ed3
 +        assertEquals(emptyList<String>(), AddressFix.candidates("someone.else@gmail.com", known))     // different person
 +        assertEquals(emptyList<String>(), AddressFix.candidates("alex.demo7400@163.com", known))      // other domain
 +        assertTrue(AddressFix.reason("x@gmail.com", known).startsWith("地址和应用专用密码对不上"))
++    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/FeedRefreshTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/FeedRefreshTest.kt
+new file mode 100644
+index 0000000..e9baf52
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/FeedRefreshTest.kt
+@@ -0,0 +1,84 @@
++package com.openminis.app.plus
++
++import com.openminis.app.plus.FeedRefresh.Mode
++import com.openminis.app.plus.FeedRefresh.Outcome
++import kotlinx.coroutines.CompletableDeferred
++import kotlinx.coroutines.async
++import kotlinx.coroutines.test.runTest
++import kotlinx.coroutines.yield
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/** [Mines-38.9.2] 消息 pull-to-refresh: a pull is never dropped, never served from a cache, and says what happened. */
++class FeedRefreshTest {
++
++    /** The 38.9.1 bug: a pull while the open-refresh was still running did nothing. Now it waits, then reads again. */
++    @Test fun pullWaitsForRunningRefreshThenReadsAgain() = runTest {
++        val gate = FeedRefresh.Gate()
++        var reads = 0
++        val release = CompletableDeferred<Unit>()
++        val first = async { gate.run(waitIfBusy = true) { reads++; release.await(); "open" } }
++        yield()
++        assertTrue(gate.running)
++        // a background refresh while one runs: skipped, as before
++        assertNull(gate.run(waitIfBusy = false) { reads++; "bg" })
++        // the user's pull while one runs: must not be dropped
++        val pull = async { gate.run(waitIfBusy = true) { reads++; "pull" } }
++        yield()
++        assertEquals(1, reads)
++        release.complete(Unit)
++        assertEquals("open", first.await())
++        assertEquals("pull", pull.await())
++        assertEquals(2, reads)
++    }
++
++    @Test fun pullIgnoresEveryCache() {
++        assertEquals(0L, FeedRefresh.maxAgeMs(Mode.PULL, 5 * 60_000L))
++        assertEquals(0L, FeedRefresh.maxAgeMs(Mode.PULL, 10 * 60_000L))
++        assertEquals(60_000L, FeedRefresh.maxAgeMs(Mode.OPEN, 10 * 60_000L))
++        assertEquals(5 * 60_000L, FeedRefresh.maxAgeMs(Mode.BACKGROUND, 5 * 60_000L))
++    }
++
++    @Test fun freshIds() {
++        assertEquals(listOf("c"), FeedRefresh.freshIds(setOf("a", "b"), listOf("c", "a", "b"), countAll = false))
++        // first load of the page: nothing is "new"
++        assertEquals(emptyList<String>(), FeedRefresh.freshIds(emptySet(), listOf("a", "b"), countAll = false))
++        // a pull on an empty feed: everything that appeared is new
++        assertEquals(listOf("a", "b"), FeedRefresh.freshIds(emptySet(), listOf("a", "b", "a"), countAll = true))
++    }
++
++    @Test fun resultLine() {
++        assertEquals("新到 3 条", FeedRefresh.line(Outcome(listOf("a", "b", "c"), emptyList())))
++        assertEquals("没有新消息", FeedRefresh.line(Outcome(emptyList(), emptyList())))
++        assertEquals("没有新消息", FeedRefresh.line(null))
++        assertEquals("没有新消息 · 163 授权码失效", FeedRefresh.line(Outcome(emptyList(), listOf("163 授权码失效", "163 授权码失效"))))
++        assertEquals("新到 1 条 · 163 授权码失效；X 读取超时 等 3 处没读到",
++            FeedRefresh.line(Outcome(listOf("x"), listOf("163 授权码失效", "X 读取超时", "GitHub 令牌失效"))))
++    }
++
++    @Test fun newCardsGoToTheTopAfterPinned() {
++        data class C(val id: String, val pinned: Boolean = false)
++        val list = listOf(C("p", true), C("a"), C("b"), C("n1"), C("c"), C("n2"))
++        val out = FeedRefresh.freshFirst(list, setOf("n1", "n2"), { it.id }, { it.pinned })
++        assertEquals(listOf("p", "n1", "n2", "a", "b", "c"), out.map { it.id })
++        assertEquals(list, FeedRefresh.freshFirst(list, emptySet(), { it.id }, { it.pinned }))
++    }
++
++    @Test fun mailFailureLines() {
++        assertEquals("163", FeedRefresh.mailLabel("demo@163.com"))
++        assertEquals("QQ 邮箱", FeedRefresh.mailLabel("demo@qq.com"))
++        assertEquals("163 demo…", FeedRefresh.mailLabel("demo.one@163.com", many = true))
++        assertEquals("163 授权码失效", FeedRefresh.mailFail("163", FeedRefresh.LoginRejected("m2 NO LOGIN Login error password error")))
++        assertEquals("Gmail 应用专用密码失效", FeedRefresh.mailFail("Gmail", FeedRefresh.LoginRejected("NO [AUTHENTICATIONFAILED]")))
++        assertEquals("163 拦了登录（Unsafe Login）", FeedRefresh.mailFail("163", FeedRefresh.LoginRejected("NO SELECT Unsafe Login. Please contact kefu@188.com")))
++        assertEquals("163 连接超时", FeedRefresh.mailFail("163", null))
++        assertEquals("163 连接超时", FeedRefresh.mailFail("163", java.net.SocketTimeoutException("read timed out")))
++        assertEquals("QQ 邮箱 网络不通", FeedRefresh.mailFail("QQ 邮箱", java.net.UnknownHostException("imap.qq.com")))
++        assertEquals("Gmail 网页登录过期", FeedRefresh.mailFail("Gmail", FeedRefresh.SourceFail("Gmail 网页登录过期")))
++        assertEquals("GitHub 令牌失效", FeedRefresh.netFail("GitHub", RuntimeException("wrap", FeedRefresh.SourceFail("GitHub 令牌失效"))))
++        assertEquals("GitHub 加密连接失败", FeedRefresh.netFail("GitHub", javax.net.ssl.SSLHandshakeException("bad cert")))
++        assertEquals("GitHub 暂时读不到", FeedRefresh.netFail("GitHub", IllegalStateException()))
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/IdentityCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/IdentityCoreTest.kt
