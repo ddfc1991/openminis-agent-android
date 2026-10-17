@@ -1917,6 +1917,155 @@ index 0000000..5ea6c4c
 +
 +    fun proxyOn(c: Context?): Boolean = runCatching { c != null && VpsSsh.vpnActive(c) }.getOrDefault(false)
 +}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/GlassAuto.kt b/src/android/app/src/main/java/com/openminis/app/plus/GlassAuto.kt
+new file mode 100644
+index 0000000..6b0b2fe
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/GlassAuto.kt
+@@ -0,0 +1,143 @@
++package com.openminis.app.plus
++
++import kotlin.math.pow
++import kotlin.math.sqrt
++
++/**
++ * [Mines-38.9.4] user 2026-10-17 16:59 「那个磨砂玻璃可以调节一下，不用户自己调节」: the frosted glass picks its own tint.
++ *
++ * What is behind the glass is measured (the fog as it is drawn — base colour + the 4 drifting blobs at the current
++ * 雾气浓淡 / weather density, sampled on a 12 × 24 grid at 4 moments of its 24 s loop — or the photo wallpaper on a
++ * 12 × 24 thumbnail). Per vertical band of the screen it keeps the WORST luminance for the text colour (darkest
++ * spot for dark ink on light glass, brightest for light ink on dark glass), pushed a little further by how busy the
++ * background is (std-dev), and then picks the LOWEST glass alpha that keeps the secondary text (ink2) at ≥ 4.5:1.
++ * Light glass stays inside 50–62 %, dark inside 45–55 % whenever that is enough; if a photo is so dark / bright that it
++ * is not, readability wins and the alpha goes up (to 88 % at most).
++ *
++ * Pure (no Android types) so it is unit-tested: GlassAutoTest.
++ */
++object GlassAuto {
++    const val BANDS = 6
++    const val LIGHT_MIN = 0.50f; const val LIGHT_MAX = 0.62f
++    const val DARK_MIN = 0.45f; const val DARK_MAX = 0.55f
++    const val HARD_MAX = 0.88f
++    const val TARGET = 4.5f
++
++    /** Per band (top → bottom): darkest / brightest luminance (after the busy-ness margin), mean, std-dev. */
++    data class Band(val lo: Float, val hi: Float, val mean: Float, val sd: Float)
++    data class Stats(val bands: List<Band>) {
++        val worstLo: Float get() = bands.minOf { it.lo }
++        val worstHi: Float get() = bands.maxOf { it.hi }
++    }
++
++    // ---------------- colour maths (sRGB, WCAG) ----------------
++
++    private fun lin(c: Float): Float = if (c <= 0.04045f) c / 12.92f else ((c + 0.055f) / 1.055f).toDouble().pow(2.4).toFloat()
++    private fun srgb(l: Float): Float { val c = l.coerceIn(0f, 1f); return if (c <= 0.0031308f) 12.92f * c else (1.055 * c.toDouble().pow(1 / 2.4) - 0.055).toFloat() }
++    fun lum(argb: Int): Float = 0.2126f * lin(((argb shr 16) and 0xFF) / 255f) + 0.7152f * lin(((argb shr 8) and 0xFF) / 255f) + 0.0722f * lin((argb and 0xFF) / 255f)
++    fun contrast(a: Float, b: Float): Float = (maxOf(a, b) + 0.05f) / (minOf(a, b) + 0.05f)
++
++    /** Luminance of a glass of luminance [tint] at [alpha] over a backdrop of luminance [bg] (blended in sRGB, like the GPU). */
++    fun over(tint: Float, alpha: Float, bg: Float): Float = lin(alpha * srgb(tint) + (1 - alpha) * srgb(bg))
++
++    // ---------------- the solver ----------------
++
++    /** Lowest alpha (0.01 steps) keeping [ink] ≥ [TARGET]:1 on the glass over the worst spot of [band]. */
++    fun solveBand(dark: Boolean, tint: Float, ink: Float, band: Band): Float {
++        val lo = if (dark) DARK_MIN else LIGHT_MIN
++        val worst = if (dark) band.hi else band.lo
++        var a = lo
++        while (a <= HARD_MAX + 1e-4f) {
++            if (contrast(ink, over(tint, a, worst)) >= TARGET) break
++            a += 0.01f
++        }
++        return a.coerceAtMost(HARD_MAX)
++    }
++
++    /** Alpha per band and the screen-wide one (the max: a card can scroll over any band). */
++    fun solve(dark: Boolean, tint: Float, ink: Float, s: Stats): Pair<List<Float>, Float> {
++        val per = s.bands.map { solveBand(dark, tint, ink, it) }
++        return per to (per.maxOrNull() ?: if (dark) DARK_MIN else LIGHT_MIN)
++    }
++
++    /** Worst spot = 10th / 90th percentile; busy backgrounds read worse through frost, so it is widened by ¼ std-dev (≤ 0.04). */
++    private fun band(ls: List<Float>): Band {
++        if (ls.isEmpty()) return Band(0.5f, 0.5f, 0.5f, 0f)
++        val mean = ls.average().toFloat()
++        val sd = sqrt(ls.map { (it - mean) * (it - mean) }.average()).toFloat()
++        val m = (sd * 0.25f).coerceAtMost(0.04f)
++        val sorted = ls.sorted()
++        val p05 = sorted[(sorted.size * 0.10f).toInt().coerceIn(0, sorted.lastIndex)]
++        val p95 = sorted[(sorted.size * 0.90f).toInt().coerceIn(0, sorted.lastIndex)]
++        return Band((p05 - m).coerceIn(0f, 1f), (p95 + m).coerceIn(0f, 1f), mean, sd)
++    }
++
++    /** [px] row-major ARGB of a w × h thumbnail of what is behind the glass. */
++    fun statsOf(px: IntArray, w: Int, h: Int): Stats {
++        val rows = (0 until BANDS).map { b ->
++            val y0 = h * b / BANDS; val y1 = maxOf(y0 + 1, h * (b + 1) / BANDS)
++            val ls = ArrayList<Float>()
++            for (y in y0 until minOf(y1, h)) for (x in 0 until w) ls += lum(px[y * w + x])
++            band(ls)
++        }
++        return Stats(rows)
++    }
++
++    /** Photo thumbnail drawn at [photoAlpha] over the page colour [page]. */
++    fun photoStats(px: IntArray, w: Int, h: Int, photoAlpha: Float, page: Int): Stats {
++        val a = photoAlpha.coerceIn(0f, 1f)
++        val out = IntArray(px.size) { i -> blend(px[i], page, a) }
++        return statsOf(out, w, h)
++    }
++
++    // ---------------- the fog, as PorcelainBackdrop draws it ----------------
++
++    private val SPOTS = arrayOf(   // (cx, cy, ax, ay, kx, ky, phase, radius × width) — keep in step with PorcelainBackdrop
++        floatArrayOf(0.24f, 0.17f, 230f, 210f, 1f, 1f, 0.0f, 0.50f),
++        floatArrayOf(0.80f, 0.40f, 210f, 250f, 1f, 2f, 1.9f, 0.48f),
++        floatArrayOf(0.24f, 0.66f, 230f, 190f, 2f, 1f, 3.6f, 0.46f),
++        floatArrayOf(0.78f, 0.88f, 190f, 230f, 1f, 1f, 4.8f, 0.48f),
++    )
++    private val LIGHT_BASE = 0xFFF4EAE4.toInt(); private val DARK_BASE = 0xFF161114.toInt()
++    private val LIGHT_COLS = intArrayOf(0xFFF0844E.toInt(), 0xFFA07CF0.toInt(), 0xFFFF9F45.toInt(), 0xFFEC72A4.toInt())
++    private val DARK_COLS = intArrayOf(0xFF963A42.toInt(), 0xFF563296.toInt(), 0xFFA85C1C.toInt(), 0xFF8C2E60.toInt())
++    private val LIGHT_A = floatArrayOf(1.0f, 1.0f, 0.95f, 0.95f); private val DARK_A = floatArrayOf(0.90f, 0.85f, 0.75f, 0.78f)
++
++    fun blend(top: Int, under: Int, a: Float): Int {
++        fun ch(s: Int) = ((((top shr s) and 0xFF) * a + ((under shr s) and 0xFF) * (1 - a)).toInt()).coerceIn(0, 255)
++        return (0xFF shl 24) or (ch(16) shl 16) or (ch(8) shl 8) or ch(0)
++    }
++
++    /** Fog stats: [fogK] = 外观调节 › 雾气浓淡, [dens] = weather density; 12 × 24 grid × 4 moments of the 24 s loop. */
++    fun fogStats(dark: Boolean, fogK: Float, dens: Float, aspect: Float = 2.19f): Stats {
++        val w = 12; val h = 24
++        val base = if (dark) DARK_BASE else LIGHT_BASE
++        val cols = if (dark) DARK_COLS else LIGHT_COLS
++        val als = (if (dark) DARK_A else LIGHT_A).map { (it * fogK).coerceIn(0f, 1f) }
++        val W = 1080f; val H = W * aspect
++        val perBand = List(BANDS) { ArrayList<Float>() }
++        for (t in floatArrayOf(0f, 6f, 12f, 18f)) {
++            val om = (2.0 * Math.PI * t / 24.0).toFloat()
++            val centres = SPOTS.mapIndexed { i, sp ->
++                val cx = sp[0] * W + 1.7f * sp[2] * kotlin.math.cos(sp[4] * om + sp[6])
++                val cy = sp[1] * H + 1.7f * sp[3] * kotlin.math.sin(sp[5] * om + sp[6])
++                val r = sp[7] * W * 1.6f * 1.12f
++                val a = (als[i] * dens).coerceIn(0f, 1f)   // breathing peak (0.74 + 0.26) = 1
++                floatArrayOf(cx, cy, r, a)
++            }
++            for (gy in 0 until h) for (gx in 0 until w) {
++                val x = (gx + 0.5f) * W / w; val y = (gy + 0.5f) * H / h
++                var c = base
++                centres.forEachIndexed { i, s ->
++                    val dx = x - s[0]; val dy = (y - s[1]) / 1.15f
++                    val d = sqrt(dx * dx + dy * dy) / s[2]       // 0 … 1 of the gradient radius
++                    val fall = if (d >= 1f) 0f else kotlin.math.exp(-2.0 * (d * 1.6) * (d * 1.6)).toFloat()
++                    val a = s[3] * fall
++                    if (a > 0.002f) c = blend(cols[i], c, a)
++                }
++                perBand[(gy * BANDS / h).coerceIn(0, BANDS - 1)] += lum(c)
++            }
++        }
++        return Stats(perBand.map { band(it) })
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/HomeGreeting.kt b/src/android/app/src/main/java/com/openminis/app/plus/HomeGreeting.kt
 index 44e47ed..ddb8bc5 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/HomeGreeting.kt
@@ -10883,6 +11032,85 @@ index 0000000..8ac6e59
 +        }
 +    }
 +}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassAutoUi.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassAutoUi.kt
+new file mode 100644
+index 0000000..8a7c755
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassAutoUi.kt
+@@ -0,0 +1,73 @@
++package com.openminis.app.ui.plus
++
++import android.graphics.Bitmap
++import android.graphics.BitmapFactory
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateMapOf
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.toArgb
++import androidx.compose.ui.platform.LocalContext
++import com.openminis.app.plus.GlassAuto
++import com.openminis.app.plus.PlusPrefs
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++import java.util.concurrent.ConcurrentHashMap
++
++/**
++ * [Mines-38.9.4] 外观调节 › 玻璃 = 自动 (default): the glass alpha comes from what is behind it ([GlassAuto]) — the fog at
++ * its current 浓淡 / weather density, or the photo wallpaper — per screen band, lowest alpha with ink2 ≥ 4.5:1.
++ */
++object GlassAutoState {
++    private val fogCache = ConcurrentHashMap<String, GlassAuto.Stats>()
++    /** photo stats by "<mtime>:<alpha>:<dark>" (state map: cards recompose when a photo has been measured) */
++    val photo = mutableStateMapOf<String, GlassAuto.Stats>()
++    private val loading = ConcurrentHashMap.newKeySet<String>()
++    /** last screen-wide auto alpha per mode (feeds [MinesLook.glassScale] for the palette glass tokens) */
++    @Volatile var lastLight = MinesLook.NOMINAL_LIGHT
++    @Volatile var lastDark = MinesLook.NOMINAL_DARK
++
++    fun fog(dark: Boolean, fogK: Float, dens: Float): GlassAuto.Stats {
++        val k = "$dark:${"%.2f".format(fogK)}:${"%.2f".format(dens)}"
++        return fogCache.getOrPut(k) { GlassAuto.fogStats(dark, fogK, dens) }
++    }
++
++    suspend fun loadPhoto(c: android.content.Context, key: String, alpha: Float, page: Int) {
++        if (photo.containsKey(key) || !loading.add(key)) return
++        try {
++            val st = withContext(Dispatchers.IO) {
++                runCatching {
++                    val f = wallpaperFile(c)
++                    if (!f.exists()) return@runCatching null
++                    val o = BitmapFactory.Options().apply { inSampleSize = 16 }
++                    val b = BitmapFactory.decodeFile(f.absolutePath, o) ?: return@runCatching null
++                    val s = Bitmap.createScaledBitmap(b, 12, 24, true)   // heavy averaging = the blur under the glass
++                    val px = IntArray(12 * 24); s.getPixels(px, 0, 12, 0, 0, 12, 24)
++                    GlassAuto.photoStats(px, 12, 24, alpha, page)
++                }.getOrNull()
++            }
++            if (st != null) photo[key] = st
++        } finally { loading.remove(key) }
++    }
++}
++
++/** Auto alphas for the current backdrop: (per band, screen-wide). */
++@Composable
++fun glassAutoAlphas(dark: Boolean, tint: Color, ink: Color): Pair<List<Float>, Float> {
++    val ctx = LocalContext.current
++    PlusPrefs.init(ctx)
++    val st by PlusPrefs.state.collectAsState()
++    val photoOn = st.wallpaper.isNotEmpty() && st.wallpaperOnHome && st.wallpaper.startsWith("file:")
++    val stats: GlassAuto.Stats = if (photoOn) {
++        val f = wallpaperFile(ctx)
++        val page = (if (dark) Color(0xFF161114) else Color(0xFFF4EAE4)).toArgb()
++        val key = "${f.lastModified()}:${"%.2f".format(st.wallpaperAlpha)}:$dark"
++        LaunchedEffect(key) { GlassAutoState.loadPhoto(ctx, key, st.wallpaperAlpha, page) }
++        GlassAutoState.photo[key] ?: GlassAutoState.fog(dark, MinesLook.fog(dark), FogWind.density(FogWind.sample.code))
++    } else GlassAutoState.fog(dark, MinesLook.fog(dark), FogWind.density(FogWind.sample.code))
++    val r = GlassAuto.solve(dark, GlassAuto.lum(tint.toArgb()), GlassAuto.lum(ink.toArgb()), stats)
++    if (dark) GlassAutoState.lastDark = r.second else GlassAutoState.lastLight = r.second
++    return r
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassDialogs.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassDialogs.kt
 index 8a17234..124663c 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassDialogs.kt
@@ -12669,10 +12897,10 @@ index f69ee42..44c3194 100644
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/LookScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/LookScreen.kt
 new file mode 100644
-index 0000000..f8d778f
+index 0000000..948fb54
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/LookScreen.kt
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,228 @@
 +package com.openminis.app.ui.plus
 +
 +import android.content.Context
@@ -12732,13 +12960,16 @@ index 0000000..f8d778f
 +    )
 +
 +    data class Look(
-+        val glassLight: Float = 0.58f, val glassDark: Float = 0.50f,   // [Mines-38.9.4] frosted defaults (mock-27)
++        /** [Mines-38.9.4] −1 = 自动 (default: the tint follows the background, GlassAuto); else the manual alpha 0.25…0.92 */
++        val glassLight: Float = -1f, val glassDark: Float = -1f,
 +        val fogLight: Float = 1.25f, val fogDark: Float = 1.2f,   // [Mines-38.9.1] user: 「雾气还要明显点」 (was 1.0)
 +        val accentLight: String = "claude", val accentDark: String = "claude",
 +        /** 流动速度: −1 = 自动（跟着风）, else 0…2 */
 +        val flow: Float = -1f,
 +    )
 +    val DEFAULT = Look()
++    /** the frosted alphas of the approved mock-27 (what the palette glass tokens are drawn at) */
++    const val NOMINAL_LIGHT = 0.58f; const val NOMINAL_DARK = 0.50f
 +
 +    /** Snapshot state: every composable (and [minesColors] inside MinisTheme) that reads it recomposes on change. */
 +    var look by mutableStateOf(DEFAULT)
@@ -12749,7 +12980,8 @@ index 0000000..f8d778f
 +        if (loaded) return
 +        loaded = true
 +        val p = c.getSharedPreferences("mines_look", Context.MODE_PRIVATE)
-+        look = Look(p.getFloat("gl2", DEFAULT.glassLight), p.getFloat("gd2", DEFAULT.glassDark), p.getFloat("fl", DEFAULT.fogLight),
++        // [Mines-38.9.4] new keys: the glass starts on 自动 for everyone (user 16:59 「不用户自己调节」); a manual value set after this is kept
++        look = Look(p.getFloat("gl3", DEFAULT.glassLight), p.getFloat("gd3", DEFAULT.glassDark), p.getFloat("fl", DEFAULT.fogLight),
 +            p.getFloat("fd", DEFAULT.fogDark), p.getString("al", null) ?: DEFAULT.accentLight, p.getString("ad", null) ?: DEFAULT.accentDark, p.getFloat("flow", DEFAULT.flow))
 +        // a fog strength the user never moved follows the new, stronger default
 +        if (!p.contains("fl")) look = look.copy(fogLight = DEFAULT.fogLight)
@@ -12758,16 +12990,19 @@ index 0000000..f8d778f
 +
 +    fun set(c: Context, l: Look) {
 +        look = l
-+        c.getSharedPreferences("mines_look", Context.MODE_PRIVATE).edit().putFloat("gl2", l.glassLight).putFloat("gd2", l.glassDark)
++        c.getSharedPreferences("mines_look", Context.MODE_PRIVATE).edit().putFloat("gl3", l.glassLight).putFloat("gd3", l.glassDark)
 +            .putFloat("fl", l.fogLight).putFloat("fd", l.fogDark).putString("al", l.accentLight).putString("ad", l.accentDark).putFloat("flow", l.flow).apply()
 +    }
 +
 +    fun accent(dark: Boolean): Accent = accents.firstOrNull { it.id == (if (dark) look.accentDark else look.accentLight) } ?: accents[0]
 +    fun glass(dark: Boolean) = if (dark) look.glassDark else look.glassLight
++    fun glassAuto(dark: Boolean) = glass(dark) < 0f
++    /** what the glass is at right now (auto → the last measured screen-wide alpha) */
++    fun glassNow(dark: Boolean): Float = if (glassAuto(dark)) (if (dark) GlassAutoState.lastDark else GlassAutoState.lastLight) else glass(dark)
 +    fun fog(dark: Boolean) = if (dark) look.fogDark else look.fogLight
 +    fun flow(): Float = look.flow
 +    /** chosen glass alpha ÷ the default one (1 = unchanged); every glass alpha in the app is multiplied by it */
-+    fun glassScale(dark: Boolean): Float = if (dark) look.glassDark / DEFAULT.glassDark else look.glassLight / DEFAULT.glassLight
++    fun glassScale(dark: Boolean): Float = glassNow(dark) / (if (dark) NOMINAL_DARK else NOMINAL_LIGHT)
 +
 +    /** Applies the chosen accent + glass to the computed palette (no-op at the defaults). */
 +    fun apply(m: MinesColors): MinesColors {
@@ -12823,7 +13058,20 @@ index 0000000..f8d778f
 +        }
 +        PlusSection(if (dark) "深色" else "浅色") {
 +            val g = MinesLook.glass(dark); val f = MinesLook.fog(dark)
-+            LookSlider("玻璃透明度", "越往右越不透明", g, if (dark) 0.25f..0.92f else 0.25f..0.92f) { v ->
++            // [Mines-38.9.4] user 16:59 「不用户自己调节」: 自动 by default — the glass measures what is behind it (fog or photo)
++            // and picks the most transparent tint that keeps text ≥ 4.5:1; the slider is only an optional override
++            val gAuto = g < 0f
++            val now = (MinesLook.glassNow(dark) * 100).toInt()
++            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
++                Text("玻璃透明度", fontSize = MT.Body, fontWeight = FontWeight.Medium, color = mines().ink, modifier = Modifier.weight(1f))
++                Text(if (gAuto) "自动（按背景算，现在 $now%）" else "手动", fontSize = MT.Meta, color = mines().ink2)
++                Spacer(Modifier.width(8.dp))
++                androidx.compose.material3.Switch(gAuto, { on ->
++                    val v = if (on) -1f else MinesLook.glassNow(dark).coerceIn(0.25f, 0.92f)
++                    MinesLook.set(ctx, if (dark) cur.copy(glassDark = v) else cur.copy(glassLight = v))
++                }, modifier = Modifier.semantics { contentDescription = "玻璃透明度自动" })
++            }
++            if (!gAuto) LookSlider("玻璃透明度（手动）", "越往右越不透明", g, 0.25f..0.92f) { v ->
 +                MinesLook.set(ctx, if (dark) cur.copy(glassDark = v) else cur.copy(glassLight = v))
 +            }
 +            LookSlider("雾气浓淡", "0 = 不要雾，只留底色", f, 0f..2f) { v ->
@@ -13916,7 +14164,7 @@ index 92e996b..216510e 100644
      val Button = 15.sp         // all buttons
      val BodyLH = 22.sp; val SubLH = 18.sp; val CaptionLH = 18.sp
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
-index afd2104..0c1995c 100644
+index afd2104..6f7132b 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
 @@ -1,5 +1,9 @@
@@ -13929,7 +14177,16 @@ index afd2104..0c1995c 100644
  import com.openminis.app.ui.brand.MinesIcon
  
  import android.graphics.BitmapFactory
-@@ -87,8 +91,13 @@ object PlusNav {
+@@ -45,6 +49,8 @@ import androidx.compose.material3.Scaffold
+ import androidx.compose.material3.Text
+ import com.openminis.app.ui.theme.TopAppBar
+ import androidx.compose.runtime.Composable
++import androidx.compose.ui.layout.onGloballyPositioned
++import androidx.compose.ui.layout.boundsInRoot
+ import androidx.compose.runtime.collectAsState
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.produceState
+@@ -87,8 +93,13 @@ object PlusNav {
      @Volatile var autoClaim: Boolean = false
      /** [Mines-38.7] with route plus_connections: open this account's in-app sign-in page right away */
      @Volatile var openLogin: String? = null
@@ -13943,7 +14200,7 @@ index afd2104..0c1995c 100644
      fun go(route: String) { navigate?.invoke(route) ?: run { pending = route } }
  }
  
-@@ -110,6 +119,13 @@ object PlusRoutes {
+@@ -110,6 +121,13 @@ object PlusRoutes {
      const val DIGEST = "plus_digest"
      const val CARDS = "plus_cards"
      const val VOICE_SETTINGS = "plus_voice_settings"
@@ -13957,7 +14214,7 @@ index afd2104..0c1995c 100644
      const val SERVER = "plus_server/{id}"
      fun server(id: String) = "plus_server/$id"
  }
-@@ -183,8 +199,9 @@ fun ChatWallpaperLayer(modifier: Modifier = Modifier, home: Boolean = false) {
+@@ -183,8 +201,9 @@ fun ChatWallpaperLayer(modifier: Modifier = Modifier, home: Boolean = false) {
          }
          val veil = if (dark) Color(0xFF14110F) else Color(0xFFF6F2EC)
          val userDim = st.wallpaperDim.coerceIn(0f, 0.95f)
@@ -13969,7 +14226,7 @@ index afd2104..0c1995c 100644
          Box(Modifier.fillMaxSize().background(Brush.verticalGradient(
              0f to veil.copy(alpha = top), 0.16f to veil.copy(alpha = top), 0.30f to veil.copy(alpha = body), 1f to veil.copy(alpha = body))))
      }
-@@ -196,8 +213,7 @@ fun ChatWallpaperLayer(modifier: Modifier = Modifier, home: Boolean = false) {
+@@ -196,8 +215,7 @@ fun ChatWallpaperLayer(modifier: Modifier = Modifier, home: Boolean = false) {
   * unchanged otherwise.
   */
  @Composable
@@ -13979,7 +14236,7 @@ index afd2104..0c1995c 100644
  
  /** True when a wallpaper is drawn on this screen (bars then go translucent). */
  @Composable
-@@ -266,6 +282,8 @@ fun MinesBackdrop(modifier: Modifier = Modifier) {
+@@ -266,6 +284,8 @@ fun MinesBackdrop(modifier: Modifier = Modifier) {
          Box(modifier) {
              PorcelainBackdrop(Modifier.fillMaxSize())
              ChatWallpaperLayer(Modifier.fillMaxSize(), home = true)
@@ -13988,7 +14245,7 @@ index afd2104..0c1995c 100644
          }
      } else PorcelainBackdrop(modifier)
  }
-@@ -273,11 +291,13 @@ fun MinesBackdrop(modifier: Modifier = Modifier) {
+@@ -273,11 +293,13 @@ fun MinesBackdrop(modifier: Modifier = Modifier) {
  @OptIn(ExperimentalMaterial3Api::class)
  @Composable
  fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, actions: (@Composable () -> Unit)? = null,
@@ -14003,7 +14260,7 @@ index afd2104..0c1995c 100644
          Scaffold(
              containerColor = Color.Transparent,
              topBar = {
-@@ -293,40 +313,58 @@ fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, action
+@@ -293,40 +315,66 @@ fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, action
                      colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent, scrolledContainerColor = Color.Transparent),
                  )
              },
@@ -14051,12 +14308,21 @@ index afd2104..0c1995c 100644
 +
  /** Glass section card fill: translucent porcelain, opaque enough that ink stays ≥ 4.5:1 over any backdrop. */
  @Composable
- fun minesGlassFill(strong: Boolean = false): Color {
+-fun minesGlassFill(strong: Boolean = false): Color {
++fun minesGlassFill(strong: Boolean = false, bands: IntRange? = null): Color {
      val m = mines()
      val photo = wallpaperOn(home = true)
 -    val a = when { strong -> 0.95f; else -> 0.94f }  // [Mines-38.1] solid porcelain cards 94–95 % (user: text must never sit on a clear wallpaper)
 -    @Suppress("UNUSED_EXPRESSION") photo
 -    return (if (m.dark) Color(0xFF221D1A) else Color(0xFFFFFDFA)).copy(alpha = a)
++    val tint = if (m.dark) Color(0xFF221B1E) else LightGlassTint
++    // [Mines-38.9.4] 自动 (default): the most transparent tint that keeps ink2 ≥ 4.5:1 over what is behind THIS card
++    // ([bands] = the screen bands the card covers; null = the worst band on screen). See GlassAuto.
++    if (MinesLook.glassAuto(m.dark)) {
++        val (per, all) = glassAutoAlphas(m.dark, tint, m.ink2)
++        val a = bands?.let { r -> r.mapNotNull { per.getOrNull(it) }.maxOrNull() } ?: all
++        return tint.copy(alpha = (a + (if (strong) 0.06f else 0f)).coerceIn(0.05f, 0.94f))
++    }
 +    // [Mines-38.9.4] user 2026-10-17 「要磨砂底，不要白底」 (approved mock-27): ONE frosted-glass token for cards, lists, bars,
 +    // menus — warm white ~58 % light / dark tint ~50 % over the (already blurred) fog or photo wallpaper, 1 dp white
 +    // hairline. Over a photo it was 94 % white (the 「白底」); the photo is blurred + veiled underneath, so it is frosted
@@ -14065,21 +14331,31 @@ index afd2104..0c1995c 100644
 +        m.dark -> if (strong) 0.56f else 0.50f
 +        else -> if (strong) 0.64f else 0.58f
 +    } + (if (photo) 0.08f else 0f)
-+    val k = MinesLook.glassScale(m.dark)   // [Mines-38.9] 外观调节 › 玻璃透明度
-+    return (if (m.dark) Color(0xFF221B1E) else LightGlassTint).copy(alpha = (a * k).coerceIn(0.05f, 0.98f))
++    val k = MinesLook.glassScale(m.dark)   // [Mines-38.9] 外观调节 › 玻璃透明度 (手动)
++    return tint.copy(alpha = (a * k).coerceIn(0.05f, 0.98f))
  }
  
  /** A frosted 22 dp card (no blur pass: translucent fill + 1 dp highlight + soft warm shadow). */
-@@ -335,7 +373,7 @@ fun MinesCard(modifier: Modifier = Modifier, strong: Boolean = false, onClick: (
+@@ -334,9 +382,16 @@ fun minesGlassFill(strong: Boolean = false): Color {
+ fun MinesCard(modifier: Modifier = Modifier, strong: Boolean = false, onClick: (() -> Unit)? = null, content: @Composable ColumnScope.() -> Unit) {
      val m = mines()
      val shape = RoundedCornerShape(MS.CardRadius)
++    // [Mines-38.9.4] glass 自动: which screen bands this card covers (updated only when that changes, not every scroll frame)
++    var bands by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf<IntRange?>(null) }
++    val screenH = with(androidx.compose.ui.platform.LocalDensity.current) { androidx.compose.ui.platform.LocalConfiguration.current.screenHeightDp.dp.toPx() }.coerceAtLeast(1f)
      Column(
 -        modifier.shadow(if (m.dark) 0.dp else 3.dp, shape, clip = false, ambientColor = Color(0xFF3C2814).copy(alpha = 0.10f), spotColor = Color(0xFF3C2814).copy(alpha = 0.12f))
-+        modifier.shadow(0.dp /* [Mines-38.8] glass: an elevation shadow would show through as a grey core */, shape, clip = false, ambientColor = Color(0xFF3C2814).copy(alpha = 0.10f), spotColor = Color(0xFF3C2814).copy(alpha = 0.12f))
-             .clip(shape).background(minesGlassFill(strong)).border(1.dp, m.glassBorder, shape)
+-            .clip(shape).background(minesGlassFill(strong)).border(1.dp, m.glassBorder, shape)
++        modifier.onGloballyPositioned { c ->
++            val r = c.boundsInRoot(); val n = com.openminis.app.plus.GlassAuto.BANDS
++            val b = (r.top / screenH * n).toInt().coerceIn(0, n - 1)..(r.bottom / screenH * n).toInt().coerceIn(0, n - 1)
++            if (b != bands) bands = b
++        }.shadow(0.dp /* [Mines-38.8] glass: an elevation shadow would show through as a grey core */, shape, clip = false, ambientColor = Color(0xFF3C2814).copy(alpha = 0.10f), spotColor = Color(0xFF3C2814).copy(alpha = 0.12f))
++            .clip(shape).background(minesGlassFill(strong, bands)).border(1.dp, m.glassBorder, shape)
              .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier),
          content = content,
-@@ -344,10 +382,13 @@ fun MinesCard(modifier: Modifier = Modifier, strong: Boolean = false, onClick: (
+     )
+@@ -344,10 +399,13 @@ fun MinesCard(modifier: Modifier = Modifier, strong: Boolean = false, onClick: (
  
  @Composable
  fun PlusSection(title: String?, footer: String? = null, action: String? = null, onAction: (() -> Unit)? = null,
@@ -14094,7 +14370,7 @@ index afd2104..0c1995c 100644
              Text(title, fontSize = MT.Section, color = m.ink2, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f), maxLines = 1,
                  overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
              if (action != null && onAction != null) Text(action, fontSize = MT.Sub, color = m.primaryText, fontWeight = FontWeight.Medium,
-@@ -358,9 +399,10 @@ fun PlusSection(title: String?, footer: String? = null, action: String? = null,
+@@ -358,9 +416,10 @@ fun PlusSection(title: String?, footer: String? = null, action: String? = null,
          }
          if (footer != null) Text(
              footer,
@@ -14108,7 +14384,7 @@ index afd2104..0c1995c 100644
              lineHeight = MT.CaptionLH,
          )
      }
-@@ -448,6 +490,36 @@ fun PillButton(text: String, modifier: Modifier = Modifier, primary: Boolean = t
+@@ -448,6 +507,36 @@ fun PillButton(text: String, modifier: Modifier = Modifier, primary: Boolean = t
      ) { Text(text, fontSize = MT.Button, fontWeight = FontWeight.SemiBold, color = fg, maxLines = 1, softWrap = false) }
  }
  
@@ -16252,6 +16528,84 @@ index 0000000..e9baf52
 +        assertEquals("GitHub 令牌失效", FeedRefresh.netFail("GitHub", RuntimeException("wrap", FeedRefresh.SourceFail("GitHub 令牌失效"))))
 +        assertEquals("GitHub 加密连接失败", FeedRefresh.netFail("GitHub", javax.net.ssl.SSLHandshakeException("bad cert")))
 +        assertEquals("GitHub 暂时读不到", FeedRefresh.netFail("GitHub", IllegalStateException()))
++    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/GlassAutoTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/GlassAutoTest.kt
+new file mode 100644
+index 0000000..a3c2d8c
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/GlassAutoTest.kt
+@@ -0,0 +1,72 @@
++package com.openminis.app.plus
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class GlassAutoTest {
++    private val lightTint = GlassAuto.lum(0xFFFFF5EF.toInt())
++    private val darkTint = GlassAuto.lum(0xFF221B1E.toInt())
++    private val lightInk2 = GlassAuto.lum(0xFF6B5A50.toInt())
++    private val darkInk2 = GlassAuto.lum(0xFFCDC0B8.toInt())
++
++    private fun check(dark: Boolean, tint: Float, ink: Float, s: GlassAuto.Stats, a: Float) {
++        for (b in s.bands) {
++            val worst = if (dark) b.hi else b.lo
++            assertTrue("contrast ${GlassAuto.contrast(ink, GlassAuto.over(tint, a, worst))} at a=$a", GlassAuto.contrast(ink, GlassAuto.over(tint, a, worst)) >= 4.5f || a >= GlassAuto.HARD_MAX)
++        }
++    }
++
++    @Test fun fogLightStaysInRangeAndReadable() {
++        val s = GlassAuto.fogStats(false, 1.25f, 1.05f)
++        val (per, a) = GlassAuto.solve(false, lightTint, lightInk2, s)
++        println("fog light a=$a per band=$per")
++        // default fog (雾气浓淡 1.25): ink2 #6B5A50 needs a little more than 62 % over the darkest blob; readability wins
++        assertTrue("a=$a", a in GlassAuto.LIGHT_MIN..0.72f)
++        check(false, lightTint, lightInk2, s, a)
++    }
++
++    @Test fun fogDarkStaysInRangeAndReadable() {
++        val s = GlassAuto.fogStats(true, 1.2f, 1.05f)
++        val (per, a) = GlassAuto.solve(true, darkTint, darkInk2, s)
++        println("fog dark a=$a per band=$per")
++        assertTrue("a=$a", a in GlassAuto.DARK_MIN..GlassAuto.DARK_MAX + 0.001f)
++        check(true, darkTint, darkInk2, s, a)
++    }
++
++    @Test fun thinFogIsMoreTransparentThanDenseFog() {
++        val thin = GlassAuto.solve(false, lightTint, lightInk2, GlassAuto.fogStats(false, 0.6f, 0.85f)).second
++        val dense = GlassAuto.solve(false, lightTint, lightInk2, GlassAuto.fogStats(false, 1.6f, 1.3f)).second
++        println("thin=$thin dense=$dense")
++        assertTrue(thin <= dense)
++    }
++
++    @Test fun lightPlainBackgroundUsesTheMostTransparentGlass() {
++        val px = IntArray(12 * 24) { 0xFFF4EAE4.toInt() }
++        val (_, a) = GlassAuto.solve(false, lightTint, lightInk2, GlassAuto.statsOf(px, 12, 24))
++        assertEquals(GlassAuto.LIGHT_MIN, a, 0.001f)
++    }
++
++    @Test fun darkPhotoUnderLightGlassGoesDenserButStaysReadable() {
++        val px = IntArray(12 * 24) { i -> if (i % 3 == 0) 0xFF101010.toInt() else 0xFF404040.toInt() }
++        val s = GlassAuto.photoStats(px, 12, 24, 1f, 0xFFF4EAE4.toInt())
++        val (per, a) = GlassAuto.solve(false, lightTint, lightInk2, s)
++        assertTrue("a=$a", a > GlassAuto.LIGHT_MAX)
++        assertEquals(GlassAuto.BANDS, per.size)
++        check(false, lightTint, lightInk2, s, a)
++    }
++
++    @Test fun brightPhotoUnderDarkGlassGoesDenser() {
++        val px = IntArray(12 * 24) { 0xFFF8F8F8.toInt() }
++        val s = GlassAuto.statsOf(px, 12, 24)
++        val (_, a) = GlassAuto.solve(true, darkTint, darkInk2, s)
++        assertTrue("a=$a", a > GlassAuto.DARK_MAX)
++        check(true, darkTint, darkInk2, s, a)
++    }
++
++    @Test fun busyBandNeedsMoreThanCalmBand() {
++        val calm = GlassAuto.Band(0.45f, 0.45f, 0.45f, 0f)
++        val busy = GlassAuto.statsOf(IntArray(12 * 24) { i -> if (i % 2 == 0) 0xFF505050.toInt() else 0xFFE0E0E0.toInt() }, 12, 24).bands[0]
++        assertTrue(GlassAuto.solveBand(false, lightTint, lightInk2, busy) >= GlassAuto.solveBand(false, lightTint, lightInk2, calm))
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/IdentityCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/IdentityCoreTest.kt
