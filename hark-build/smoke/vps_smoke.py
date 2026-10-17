@@ -87,8 +87,9 @@ except Exception:
     H3894 = False
 try:
     I395 = "i395" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
+    I395B = "i395b" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
 except Exception:
-    I395 = False
+    I395 = False; I395B = False
 FONT_SCALE = "1.18"
 step_no = 0
 crashed = []
@@ -3216,7 +3217,7 @@ def main():
         elif B388: fns = (b387_linkall, b387_noblack, b388_weblogin, b388_mailbox, b388_presets)
         else: fns = (b387_linkall, b387_noblack, b387_persist, b387_platforms)
         if HUB: fns = tuple(fns) + (b3891_hub,)   # [38.9.1 c] hub runs after the UI passes
-        if I395: fns = (b395_i,)   # [38.9.5 i] build-i gate only: 一键关联 / 一键重新登录, gateway, new screens light + dark
+        if I395: fns = (b395_i2, b395_i) if I395B else (b395_i,)   # [38.9.5 i] build-i gate only: 一键关联 / 一键重新登录, gateway, new screens light + dark
         elif H3894: fns = (b3894_h,) + tuple(fns)   # [38.9.4 h] SkillHub market, Memoh, a11y wording, 账号 entries, glass / opaque reading, g2 defects first
         for fn in fns:
             try:
@@ -4636,8 +4637,139 @@ def b395_i(res):
         if t.count("已安装") > 1: selftest_fail.append("i395: more than one same-slug row says 已安装 on the market page")
         back(1)
     step("skillshot", skillshot)
+    # [i6] user 22:02–22:04: ☰ 「AI 服务」 + glass menu, Notion truthful web sign-in, 脑图 sci-fi
+    def menu_ai(sfx):
+        r = b381_home(); time.sleep(2)
+        menu = node_bounds(r, lambda n: (n.get("content-desc") or "") == "更多")
+        if menu: sh(f"input tap {menu[0]} {menu[1]}")
+        else: tap_text("更多", wait=2)
+        time.sleep(2); r = shot388(f"i395-menu-{sfx}"); t = _txt(r); o["menu_home_" + sfx] = t[:300]
+        if "AI 服务" not in t: selftest_fail.append(f"i395 {sfx}: ☰ menu has no 「AI 服务」: {t[:120]}")
+        if tap_text("AI 服务", exact=True, wait=3):
+            time.sleep(4); r = shot388(f"i395-aiservices-{sfx}"); t = _txt(r); o["aisvc_" + sfx] = t[:300]
+            if "登录" in t and "服务" in t and "AI 服务" not in t: selftest_fail.append(f"i395 {sfx}: AI 服务 opened the 账号 page with tabs")
+            back(1); time.sleep(1)
+        else: back(1)
+    step("menu-light", lambda: menu_ai("light"))
+    def notion():
+        o["notion_seed"] = selftest("group", "connfake notion", timeout=30)[-120:]
+        selftest("openkind", "notion", timeout=20); time.sleep(10)
+        r = shot388("i395-notion"); t = _txt(r); o["notion"] = t[:500]
+        if "已连接 · 断开" in t: selftest_fail.append("i395: Notion button still 「已连接 · 断开」")
+        if "未登录" not in t and "已登录" not in t and "检查" not in t: selftest_fail.append(f"i395: Notion hero has no truthful login state: {t[:160]}")
+        if "已登录" in t and "未登录" not in t: selftest_fail.append("i395: Notion says 已登录 with a fake cookie (getSpaces must refuse it)")
+        back(1); time.sleep(1)
+        selftest("group", "connfake notion|off", timeout=30)
+    step("notion", notion)
+    def kbmap(sfx):
+        B = "http://10.0.2.2:8088"
+        result_json("group", "kbep "); result_json("group", f"base web:doubao|{B}/webchat")
+        result_json("group", "kbseed "); result_json("group", "kbrun", timeout=120)
+        sh(f"dumpsys gfxinfo {PKG} reset")
+        route("plus_knowledge", 7); r = shot388(f"i395-kbmap-{sfx}")
+        topics = [d for d in all_desc(r, "脑图节点：") if " · " in d[2]]
+        o["kb_topics_" + sfx] = len(topics)
+        if not topics: selftest_fail.append(f"i395 {sfx}: 脑图 has no topic nodes")
+        else:
+            sh(f"input tap {topics[0][0]} {topics[0][1]}"); time.sleep(2.5); shot388(f"i395-kbbranch-{sfx}")
+            sh("input swipe 500 1300 200 1100 120"); time.sleep(2); shot388(f"i395-kbfling-{sfx}")
+        g = sh(f"dumpsys gfxinfo {PKG}", timeout=30)
+        o["kb_gfx_" + sfx] = " | ".join(l.strip() for l in g.splitlines() if re.search(r"Total frames|Janky frames|50th percentile|90th percentile", l))[:300]
+        print("I395 KB GFX", sfx, o["kb_gfx_" + sfx], flush=True)
+        back(2); time.sleep(1)
+    step("kb-light", lambda: kbmap("light"))
+    theme388(2)
+    step("menu-dark", lambda: menu_ai("dark"))
+    step("kb-dark", lambda: kbmap("dark"))
+    theme388(1)
     r8["i395"] = o
     print("I395 RESULT " + json.dumps(o, ensure_ascii=False)[:6000], flush=True)
+
+def b395_i2(res):
+    """[38.9.5 i 22:23–22:43] new shots first (the emulator tends to die late): home greeting + weather light/dark, varied
+    greeting never repeats on consecutive opens, 引用回复 + copy chips in a chat, the secure login card light/dark."""
+    r8 = R8(res); o = {}
+    def step(name, f):
+        try: f()
+        except Exception as e:
+            import traceback; traceback.print_exc(); page_missing.append(f"i395b {name} error {e}")
+        if not alive(): crashed.append(f"i395b {name}"); relaunch()
+    result_json("group", "i395 seed", timeout=90)
+    # varied greeting: 6 opens, never the same phrase twice in a row
+    gs = [selftest("group", "greetvar", timeout=20).strip()[-40:] for _ in range(6)]
+    o["greetings"] = gs
+    if any(a == b for a, b in zip(gs, gs[1:])): selftest_fail.append(f"i395b: greeting repeated on consecutive opens: {gs}")
+    if any("主人" in g for g in gs): selftest_fail.append(f"i395b: greeting still says 主人: {gs}")
+    def home(sfx):
+        result_json("group", 'greet {"hour":22,"weather":"cloudy","soon":"1 小时后有雨"}')
+        r = b381_home(); time.sleep(4); r = shot388(f"i395b-home-{sfx}"); t = _txt(r); o["home_" + sfx] = t[:400]
+        w = all_desc(r, "天气：")
+        if not w: selftest_fail.append(f"i395b {sfx}: no weather on home")
+        else:
+            sh(f"input tap {w[0][0]} {w[0][1]}"); time.sleep(2); r = shot388(f"i395b-weather-{sfx}"); o["wx_" + sfx] = _txt(r)[:300]
+            back(1); time.sleep(1)
+        route("settings", 5); r = shot388(f"i395b-settings-{sfx}"); o["settings_" + sfx] = _txt(r)[:300]; back(1); time.sleep(1)
+    def chat(sfx):
+        r = b381_home(); time.sleep(2)
+        rows = all_desc(r, "进度：")
+        if rows:
+            sh(f"input tap {rows[0][0]} {rows[0][1]}"); time.sleep(3); tap_text("进入对话", wait=4); time.sleep(3)
+        else:
+            tap_text("开个新对话", wait=4); time.sleep(3)
+        r = dump(); e = edits(r)
+        if not e: page_missing.append(f"i395b {sfx}: no chat input"); return
+        if sfx == "light":
+            sh(f"input tap {e[-1][0]} {e[-1][1]}"); time.sleep(0.6)
+            type_text("srv 38.76.209.77:8090 code 482913 mail smoke@example.com api http://8.217.89.133:8787/v1 path /workspace/work/apk/a.apk key sk-ws-AbCdEf0123456789xyzQW")
+            sh("input keyevent KEYCODE_BACK"); time.sleep(0.6)
+            tap_any(["Send", "发送"], wait=6) or sh("input keyevent KEYCODE_ENTER")
+            time.sleep(8)
+        r = shot388(f"i395b-chips-{sfx}"); t = _txt(r); o["chips_" + sfx] = t[-500:]
+        if "482913" in t and "验证码" not in t and "code" in t: pass
+        if "sk-ws-AbCd" in t and "sk-ws-••••••" not in t: pass  # the bubble shows the raw text the user typed; the chip must be masked
+        chips = all_desc(r, "IP 38.76.209.77:8090")
+        if not chips: selftest_fail.append(f"i395b {sfx}: no IP chip under the message")
+        else:
+            sh(f"input tap {chips[0][0]} {chips[0][1]}"); time.sleep(1.5)
+            clip = sh("cmd clipboard get-primary-clip 2>/dev/null || true")
+            o["clip_" + sfx] = clip[-80:]
+        if not all_desc(r, "密钥已隐藏"): selftest_fail.append(f"i395b {sfx}: the sk-ws key is not a masked chip")
+        # 引用回复 from the user bubble's long-press menu
+        b = node_bounds(r, lambda n: "482913" in (n.get("text") or ""))
+        if b:
+            sh(f"input swipe {b[0]} {b[1]} {b[0]} {b[1]} 900"); time.sleep(2)
+            if tap_text("引用回复", wait=3):
+                time.sleep(2); sh("input keyevent KEYCODE_BACK"); time.sleep(1)
+                r = shot388(f"i395b-quote-{sfx}"); o["quote_" + sfx] = _txt(r)[-300:]
+                if not all_desc(r, "引用："): selftest_fail.append(f"i395b {sfx}: quote block not above the input")
+                q = all_desc(r, "取消引用")
+                if q: sh(f"input tap {q[0][0]} {q[0][1]}"); time.sleep(1)
+            else: page_missing.append(f"i395b {sfx}: 引用回复 not in the bubble menu"); back(1)
+        else: page_missing.append(f"i395b {sfx}: user bubble not found")
+        back(1); time.sleep(1)
+    def card(sfx):
+        selftest("group", "i395 card", timeout=20); time.sleep(3)
+        r = shot388(f"i395b-card-{sfx}"); t = _txt(r); o["card_" + sfx] = t[:300]
+        for want in ("Notion", "保存到保险箱", "登录"):
+            if want not in t: selftest_fail.append(f"i395b {sfx}: login card lacks {want}")
+        if "smoke@example.com" not in t: page_missing.append(f"i395b {sfx}: account not prefilled on the card")
+        selftest("group", "i395 cardoff", timeout=20); time.sleep(1)
+        selftest("group", "i395 card refused", timeout=20); time.sleep(3)
+        r = shot388(f"i395b-cardrefused-{sfx}"); t = _txt(r)
+        if "密码不对" not in t: selftest_fail.append(f"i395b {sfx}: refused card title missing")
+        selftest("group", "i395 cardoff", timeout=20); time.sleep(1)
+    theme388(1)
+    step("home-light", lambda: home("light"))
+    step("chat-light", lambda: chat("light"))
+    step("card-light", lambda: card("light"))
+    theme388(2)
+    step("home-dark", lambda: home("dark"))
+    step("chat-dark", lambda: chat("dark"))
+    step("card-dark", lambda: card("dark"))
+    theme388(1)
+    result_json("group", "greet off")
+    r8["i395b"] = o
+    print("I395B RESULT " + json.dumps(o, ensure_ascii=False)[:4000], flush=True)
 
 def finish(lc):
     lc.terminate()
