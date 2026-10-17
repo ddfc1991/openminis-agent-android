@@ -77,6 +77,10 @@ try:
     MSG3892 = "msg3892" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
 except Exception:
     MSG3892 = False
+try:
+    ACCT3893 = "acct3893" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
+except Exception:
+    ACCT3893 = False
 FONT_SCALE = "1.18"
 step_no = 0
 crashed = []
@@ -3195,6 +3199,7 @@ def main():
             print("fast prep error", e, flush=True)
         if UI388: fns = (b388_ui, b389_ui, b3891_fb, b3891_ui) if UI3891 else (b388_ui, b389_ui) if UI389 else (b388_ui,)
         elif FIX3891: fns = ((b3892_msg,) if MSG3892 else ()) + (b3891_fix,)   # [38.9.1 e] states smoke d missed; [38.9.2 f] 消息 pull first
+        if ACCT3893 and not UI388: fns = (b3893_acct, b3893_hostkey) + tuple(fns)   # [38.9.3 g] merged 账号 page + host key first
         elif UI3891: fns = (b3891_fb, b3891_ui)   # [38.9.1 d] feedback round first, then the 38.9.1 pages
         elif HUB: fns = ()
         elif B388: fns = (b387_linkall, b387_noblack, b388_weblogin, b388_mailbox, b388_presets)
@@ -3938,6 +3943,115 @@ def b3892_msg(res):
     o["off"] = result_json("msgfeed", "off", timeout=30)
     r8["msg3892"] = o
     print("MSG3892 RESULT " + json.dumps(o, ensure_ascii=False)[:4000], flush=True)
+
+
+def b3893_acct(res):
+    """[38.9.3 g] user 2026-10-17 「动不动就账号失效登录，而且ui都不一样，没对齐」: ONE 「账号」 page with 服务 / 登录 tabs, the same row +
+    pill everywhere. Seeded like the user's phone: OpenRouter = API key only (patrol OK) that 38.9.2 listed under 账号关联 as
+    登录失效, a stale 豆包 过期了 never confirmed, a mail-sender-named row 「Matt from WarpStati.」. Expect: OpenRouter 正常 in 服务 and
+    NOT in 登录; no 登录失效 / 要重新登录 anywhere; 豆包 = 未检查 (grey) with 一键重新登录 in its detail; the sender name gone. Light + dark."""
+    r8 = R8(res); o = {}
+    def step(name, f):
+        try: f()
+        except Exception as e:
+            import traceback; traceback.print_exc(); page_missing.append(f"acct3893 {name} error {e}")
+        if not alive(): crashed.append(f"acct3893 {name}"); relaunch()
+    theme388(1)
+    o["seed"] = result_json("group", "acct393 seed", timeout=60)
+    st = o["seed"] if isinstance(o["seed"], dict) else {}
+    if st.get("openrouterInLogin"): selftest_fail.append(f"acct3893: OpenRouter (API key only) still listed as a web login {st.get('login')}")
+    if st.get("badNames"): selftest_fail.append(f"acct3893: mail sender name still a site name {st.get('badNames')}")
+    if st.get("expired"): selftest_fail.append(f"acct3893: {st.get('expired')} rows still 要重新登录 without a confirmed sign-out {st.get('login')}")
+    if st.get("orPill") != "OK": selftest_fail.append(f"acct3893: OpenRouter service pill {st.get('orPill')} (want OK)")
+    def pages(sfx):
+        route("plus_connections", 8); time.sleep(3)
+        r = shot388("acct-svc-" + sfx); t = _txt(r); o["svc_" + sfx] = t[:600]
+        if "服务" not in t or "登录" not in t: selftest_fail.append(f"acct3893 {sfx}: tabs 服务 / 登录 not shown")
+        if "OpenRouter" not in t:
+            scroll_down(); r = shot388("acct-svc2-" + sfx); t = _txt(r)
+        if "OpenRouter" not in t: page_missing.append(f"acct3893 {sfx}: OpenRouter row not on 服务")
+        for bad in ("登录失效", "要重新登录"):
+            if bad in t: selftest_fail.append(f"acct3893 {sfx}: 「{bad}」 on 服务")
+        # OpenRouter row: its description carries the pill
+        rows = [d for d in all_desc(r, "OpenRouter")]
+        o["or_row_" + sfx] = [x[2] for x in rows][:2]
+        if rows and "正常" not in rows[0][2]: selftest_fail.append(f"acct3893 {sfx}: OpenRouter row not 正常: {rows[0][2]}")
+        # 登录 tab
+        if not tap_text("登录 标签", wait=4): tap_text("登录", exact=True, wait=4)
+        time.sleep(3); r = shot388("acct-login-" + sfx); t = _txt(r); o["login_" + sfx] = t[:700]
+        for bad in ("登录失效", "Matt from", "OpenRouter"):
+            if bad in t: selftest_fail.append(f"acct3893 {sfx}: 「{bad}」 on 登录")
+        if "个登录" not in t: page_missing.append(f"acct3893 {sfx}: 登录 tab summary not shown")
+        # 豆包 detail (stale 过期了 → 未检查 / 正在确认 + 一键重新登录)
+        rows = [d for d in all_desc(r, "豆包")]
+        if not rows:
+            scroll_down(); r = dump(); rows = [d for d in all_desc(r, "豆包")]
+        if rows:
+            o["doubao_row_" + sfx] = rows[0][2]
+            if "未检查" not in rows[0][2] and "正在确认" not in rows[0][2]: selftest_fail.append(f"acct3893 {sfx}: 豆包 row not 未检查: {rows[0][2]}")
+            sh(f"input tap {rows[0][0]} {rows[0][1]}"); time.sleep(4)
+            r = shot388("acct-detail-" + sfx); t = _txt(r); o["detail_" + sfx] = t[:500]
+            if "一键重新登录" not in t: selftest_fail.append(f"acct3893 {sfx}: detail has no 一键重新登录")
+            if "登录失效" in t: selftest_fail.append(f"acct3893 {sfx}: detail says 登录失效")
+            back(1); time.sleep(2)
+        else: page_missing.append(f"acct3893 {sfx}: 豆包 row not found on 登录")
+        back(1); time.sleep(2)
+    step("light", lambda: pages("light"))
+    theme388(2)
+    step("dark", lambda: pages("dark"))
+    theme388(1)
+    o["state"] = result_json("group", "acct393 state", timeout=60)
+    r8["acct3893"] = o
+    print("ACCT3893 RESULT " + json.dumps(o, ensure_ascii=False)[:4000], flush=True)
+
+
+def b3893_hostkey(res):
+    """[38.9.3 g] server reinstalled → host key changed: add the runner's sshd (password → key), regenerate its host keys,
+    cold start, 立即检测 → 「服务器重装过，指纹变了」 + 「信任新指纹」 → tap → connected again (key still there) — never
+    'End of IO stream' / 'Auth fail'."""
+    r8 = R8(res); o = {}
+    try:
+        theme388(1)
+        route("plus_work_location", 6)
+        add_server("hk", SSH_HOST, SSH_PASS)
+        time.sleep(20); r = shot388("hk-added"); o["added"] = _txt(r)[:400]
+        sub = subprocess.run("sudo sh -c 'rm -f /etc/ssh/ssh_host_*; ssh-keygen -A >/dev/null; (systemctl restart ssh || service ssh restart)'; sleep 2; ssh-keyscan -T 5 127.0.0.1 2>/dev/null | head -1",
+                             shell=True, capture_output=True, text=True, timeout=60)
+        o["rekey"] = (sub.stdout or sub.stderr)[-200:]
+        adb("shell", "am", "force-stop", PKG); time.sleep(1)
+        adb("shell", "monkey", "-p", PKG, "-c", "android.intent.category.LAUNCHER", "1"); time.sleep(8)
+        route("plus_work_location", 6)
+        tap_text("立即检测", wait=4)
+        t = ""
+        for _ in range(20):
+            time.sleep(3); t = _txt(dump())
+            if "指纹变了" in t: break
+        r = shot388("hk-changed"); t = _txt(r); o["changed"] = t[:500]
+        if "指纹变了" not in t: selftest_fail.append("hostkey: changed host key not reported (no 「指纹变了」)")
+        for bad in ("End of", "Auth fail"):
+            if bad in t: selftest_fail.append(f"hostkey: raw error 「{bad}」 shown")
+        if tap_text("信任新指纹", wait=3):
+            for _ in range(15):
+                time.sleep(3); t = _txt(dump())
+                if "指纹变了" not in t: break
+            r = shot388("hk-trusted"); t = _txt(r); o["trusted"] = t[:500]
+            if "指纹变了" in t: selftest_fail.append("hostkey: still 指纹变了 after 信任新指纹")
+            if "服务器密码" in t: o["asked_password"] = True   # acceptable when the key had to be re-installed
+        else: selftest_fail.append("hostkey: no 「信任新指纹」 button")
+        # test dialog: one reason per line (no 「X（X）」), 去授权 only when not authorised
+        if tap_text("测试连接", wait=3):
+            for _ in range(12):
+                time.sleep(2.5); t = _txt(dump())
+                if "好" in t or "去授权" in t: break
+            r = shot388("hk-test"); t = _txt(r); o["test"] = t[:500]
+            if re.search(r"(这个端口不是 SSH)（\1）", t): selftest_fail.append("hostkey: duplicated reason in 测试连接")
+            tap_text("好", exact=True, wait=2)
+        back(1)
+    except Exception as e:
+        import traceback; traceback.print_exc(); page_missing.append(f"hostkey error {e}")
+        if not alive(): crashed.append("hostkey"); relaunch()
+    r8["hostkey"] = o
+    print("HOSTKEY RESULT " + json.dumps(o, ensure_ascii=False)[:3000], flush=True)
 
 
 def b3891_fb(res):
