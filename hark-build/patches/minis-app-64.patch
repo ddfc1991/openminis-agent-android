@@ -80,6 +80,17 @@ index dfd05ae..2e398d2 100755
          sleep "$delay"; delay=$((delay * 2)); [ "$delay" -gt 30 ] && delay=30
      done
  }
+diff --git a/src/android/app/src/main/assets/licenses/mihomo.txt b/src/android/app/src/main/assets/licenses/mihomo.txt
+new file mode 100644
+index 0000000..80554eb
+--- /dev/null
++++ b/src/android/app/src/main/assets/licenses/mihomo.txt
+@@ -0,0 +1,5 @@
++mihomo (Clash.Meta core) — https://github.com/MetaCubeX/mihomo
++Version v1.19.32, binary mihomo-android-arm64-v8 (SHA-256 of the release .gz: 42b1f2be8702484d3ae6238daab392622f54bd0d264966700f1f28f52596e326),
++shipped unmodified inside Mines as lib/arm64-v8a/libmihomo.so and run as a separate process.
++Licence: GNU General Public License v3.0 (GPL-3.0). Source code: https://github.com/MetaCubeX/mihomo/tree/v1.19.32
++Mines itself is distributed under GPL-3.0 as well (continued development of OpenMinis).
 diff --git a/src/android/app/src/main/assets/mines/settings_map.tsv b/src/android/app/src/main/assets/mines/settings_map.tsv
 new file mode 100644
 index 0000000..a409c2e
@@ -5945,12 +5956,15 @@ index 7660141..cfbdc61 100644
          // language settings (it did: every launch reset it, so system Settings → Apps → Mines → 语言 never stuck)
          if (code.isEmpty()) return
 diff --git a/src/android/app/src/main/java/com/openminis/app/MinisApp.kt b/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
-index e48d0e0..4253ccd 100644
+index e48d0e0..da0e0ed 100644
 --- a/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
-@@ -244,6 +244,12 @@ class MinisApp : Application(), ImageLoaderFactory {
+@@ -243,7 +243,15 @@ class MinisApp : Application(), ImageLoaderFactory {
+         super.onCreate()
          // [Mines] Split proxy installs its ProxySelector before any HTTP client is built.
          runCatching { com.openminis.app.plus.SplitProxy.init(this) }
++        // [Mines-38.9.6 i14] embedded Clash (mihomo) core, when switched on
++        runCatching { Thread({ runCatching { com.openminis.app.plus.ClashCore.init(this) } }, "mines-clash-init").start() }
          runCatching { com.openminis.app.plus.HumanVerify.init(this) }
 +        // [Mines-38.9.4] endpoints that reject the `thinking` field (remembered across launches)
 +        runCatching {
@@ -5961,7 +5975,7 @@ index e48d0e0..4253ccd 100644
          runCatching { com.openminis.app.plus.ChatOrganizer.init(this) }
          runCatching { com.openminis.app.plus.SmartRouter.init(this) }
          // [T-android-content-capture-off] Opt every Compose window out of
-@@ -783,6 +789,19 @@ class MinisApp : Application(), ImageLoaderFactory {
+@@ -783,6 +791,19 @@ class MinisApp : Application(), ImageLoaderFactory {
              }
          }
  
@@ -8043,6 +8057,284 @@ index 549a879..6ef5bf4 100644
 +    val offer: StateFlow<Offer?> = _offer.asStateFlow()
 +    fun offer(id: String) { _offer.value = Offer(id, System.currentTimeMillis()) }
 +    fun clear(o: Offer) { if (_offer.value == o) _offer.value = null }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ClashConfigCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/ClashConfigCore.kt
+new file mode 100644
+index 0000000..c999f4d
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/ClashConfigCore.kt
+@@ -0,0 +1,73 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-38.9.6 i14] Clash (mihomo) config text, pure (unit-tested in ClashConfigCoreTest). Mines owns the listening keys:
++ * an imported subscription / YAML keeps its proxies, groups and rules, but its ports, LAN access, controller, secret and any
++ * TUN block are replaced so the core only ever listens on 127.0.0.1 (mixed port + REST controller with a secret). No TUN.
++ */
++object ClashConfigCore {
++    const val MIXED_PORT = 7898
++    const val CONTROLLER_PORT = 9097
++
++    /** top-level keys Mines always sets itself (an imported value is dropped together with its indented block) */
++    private val OWNED = setOf("port", "socks-port", "mixed-port", "redir-port", "tproxy-port", "allow-lan", "bind-address",
++        "external-controller", "external-controller-tls", "external-controller-unix", "external-ui", "secret", "tun",
++        "interface-name", "routing-mark", "authentication", "lan-allowed-ips", "lan-disallowed-ips")
++
++    fun header(secret: String): String = """
++        |mixed-port: $MIXED_PORT
++        |allow-lan: false
++        |bind-address: 127.0.0.1
++        |external-controller: 127.0.0.1:$CONTROLLER_PORT
++        |secret: "${esc(secret)}"
++        |""".trimMargin()
++
++    /** Drops [OWNED] top-level keys (and their nested lines) from [yaml] and puts Mines' header first. */
++    fun override(yaml: String, secret: String): String {
++        val out = StringBuilder(header(secret))
++        var skipping = false
++        for (line in yaml.replace("\r\n", "\n").lines()) {
++            val top = line.isNotEmpty() && !line[0].isWhitespace() && !line.startsWith("#") && !line.startsWith("-")
++            if (top) {
++                val key = line.substringBefore(':').trim().trim('"', '\'')
++                skipping = key in OWNED
++            }
++            if (!skipping) out.append(line).append('\n')
++        }
++        return out.toString()
++    }
++
++    /** One upstream proxy as a Clash node (type http / socks5, optional user + password). */
++    data class Node(val name: String, val type: String, val host: String, val port: Int, val user: String = "", val pass: String = "")
++
++    /**
++     * Config generated from 自己填代理 (+ backups): a fallback group (checks every 60 s, lazy) over the nodes, Google /
++     * Gmail forced through it, China sites direct, everything else (only what the split proxy already sends upstream)
++     * through the group.
++     */
++    fun fromNodes(nodes: List<Node>, secret: String): String {
++        val sb = StringBuilder(header(secret))
++        sb.append("mode: rule\nlog-level: warning\nipv6: false\n")
++        sb.append("proxies:\n")
++        for (n in nodes) {
++            sb.append("  - name: \"${esc(n.name)}\"\n    type: ${if (n.type == "socks5") "socks5" else "http"}\n    server: ${n.host}\n    port: ${n.port}\n")
++            if (n.user.isNotEmpty()) sb.append("    username: \"${esc(n.user)}\"\n    password: \"${esc(n.pass)}\"\n")
++        }
++        val names = nodes.joinToString(", ") { "\"${esc(it.name)}\"" }
++        sb.append("proxy-groups:\n")
++        sb.append("  - name: 自动选择\n    type: url-test\n    proxies: [$names]\n    url: https://www.gstatic.com/generate_204\n    interval: 60\n    tolerance: 80\n    lazy: true\n")
++        sb.append("  - name: 代理\n    type: fallback\n    proxies: [自动选择, $names]\n    url: https://www.gstatic.com/generate_204\n    interval: 60\n    lazy: true\n")
++        sb.append("rules:\n")
++        for (d in listOf("google.com", "gmail.com", "googlemail.com", "googleapis.com", "gstatic.com", "googleusercontent.com", "youtube.com", "ggpht.com"))
++            sb.append("  - DOMAIN-SUFFIX,$d,代理\n")
++        for (d in listOf("cn", "baidu.com", "qq.com", "aliyun.com", "taobao.com", "bilibili.com", "163.com", "weixin.qq.com"))
++            sb.append("  - DOMAIN-SUFFIX,$d,DIRECT\n")
++        sb.append("  - MATCH,代理\n")
++        return sb.toString()
++    }
++
++    private fun esc(s: String) = s.replace("\\", "\\\\").replace("\"", "\\\"")
++
++    /** A subscription body is base64 node links (not Clash YAML) when it has no "proxies:" key. */
++    fun looksLikeClashYaml(text: String): Boolean = Regex("(?m)^proxies\\s*:").containsMatchIn(text) || Regex("(?m)^proxy-providers\\s*:").containsMatchIn(text)
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ClashCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/ClashCore.kt
+new file mode 100644
+index 0000000..3ca0494
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/ClashCore.kt
+@@ -0,0 +1,193 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import android.util.Log
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import java.io.File
++
++/**
++ * [Mines-38.9.6 i14] The embedded Clash core — mihomo (Clash.Meta, MetaCubeX/mihomo, GPL-3.0; licence in
++ * assets/licenses/mihomo.txt), shipped as the native library `libmihomo.so` (an arm64 executable; Android only lets an app
++ * run binaries from its nativeLibraryDir) and started in its own process. It listens on 127.0.0.1 only: a mixed HTTP/SOCKS
++ * port that the split proxy uses as its upstream (so the App, the in-app WebView and the sandbox all go through it), and the
++ * REST controller with a secret. No TUN / VPN service.
++ *
++ * Config: an imported subscription URL or YAML (kept encrypted in PlusVault, never logged), or one generated from
++ * 自己填代理 (+ backups). The agent / sandbox get the controller address, secret and file paths through the sandbox env
++ * (MINES_CLASH_*), so Mines can manage nodes when the user asks. The process is restarted if it dies (2 s … 30 s).
++ */
++object ClashCore {
++    private const val TAG = "MinesClash"
++    private const val VAULT = "clash"
++    private val _state = MutableStateFlow("未开启")
++    /** short Chinese status for the 分流代理 page / 自检 */
++    val state: StateFlow<String> = _state.asStateFlow()
++    @Volatile private var proc: Process? = null
++    @Volatile private var watchdog: Thread? = null
++    @Volatile private var app: Context? = null
++    @Volatile var lastExit: String = ""
++    private val tail = ArrayDeque<String>()
++
++    private fun prefs(c: Context) = c.getSharedPreferences("mines_clash", Context.MODE_PRIVATE)
++    fun enabled(c: Context) = prefs(c).getBoolean("on", false).also { enabledNow = it }
++    /** last known switch state (for the split proxy, no Context there) */
++    @Volatile var enabledNow: Boolean = false
++    fun binary(c: Context): File = File(c.applicationInfo.nativeLibraryDir, "libmihomo.so")
++    fun home(c: Context): File = File(c.filesDir, "clash").apply { mkdirs() }
++    fun configFile(c: Context): File = File(home(c), "config.yaml")
++    fun bundled(c: Context) = binary(c).isFile
++    fun running(): Boolean = proc?.isAlive == true
++
++    /** the controller secret (random, made once, encrypted) */
++    fun secret(c: Context): String {
++        PlusVault.init(c)
++        PlusVault.secretExtra(VAULT, "secret")?.let { return it }
++        val s = java.util.UUID.randomUUID().toString().replace("-", "")
++        PlusVault.setSecretExtra(VAULT, "secret", s); return s
++    }
++    fun controller() = "http://127.0.0.1:${ClashConfigCore.CONTROLLER_PORT}"
++    /** the split proxy's upstream while the core runs */
++    fun upstream(): SplitProxy.Upstream? = if (running()) SplitProxy.Upstream("http", "127.0.0.1", ClashConfigCore.MIXED_PORT, "Clash") else null
++
++    /** the sandbox / agent gets where the core is and how to reach its API (no proxy credentials) */
++    fun agentEnv(c: Context): Map<String, String> = if (!enabled(c) || !bundled(c)) emptyMap() else linkedMapOf(
++        "MINES_CLASH_API" to controller(), "MINES_CLASH_SECRET" to secret(c),
++        "MINES_CLASH_CONFIG" to configFile(c).absolutePath, "MINES_CLASH_BIN" to binary(c).absolutePath,
++        "MINES_CLASH_PROXY" to "http://127.0.0.1:${ClashConfigCore.MIXED_PORT}",
++    )
++
++    // ── import ────────────────────────────────────────────────────────
++
++    /** Saves a subscription URL or a pasted YAML (encrypted) and rebuilds the config. Returns a Chinese result line. */
++    fun import(c: Context, input: String): String {
++        PlusVault.init(c)
++        val t = input.trim()
++        if (t.isEmpty()) { PlusVault.setSecretExtra(VAULT, "sub", null); PlusVault.setSecretExtra(VAULT, "yaml", null); writeConfig(c); return "已清除导入，改用自己填代理" }
++        return if (t.startsWith("http://", true) || t.startsWith("https://", true)) {
++            val body = runCatching { fetch(t) }.getOrElse { return "订阅下载失败：${it.message?.take(80) ?: it.javaClass.simpleName}" }
++            if (!ClashConfigCore.looksLikeClashYaml(body)) return "这个订阅不是 Clash 格式（缺少 proxies），换一个 Clash 订阅链接"
++            PlusVault.setSecretExtra(VAULT, "sub", t); PlusVault.setSecretExtra(VAULT, "yaml", body)
++            writeConfig(c); restart(c); "已导入订阅（${Regex("(?m)^\\s*-\\s*name:").findAll(body).count()} 项）"
++        } else {
++            if (!ClashConfigCore.looksLikeClashYaml(t)) return "不是 Clash 配置（缺少 proxies:）"
++            PlusVault.setSecretExtra(VAULT, "sub", null); PlusVault.setSecretExtra(VAULT, "yaml", t)
++            writeConfig(c); restart(c); "已导入配置"
++        }
++    }
++    fun importedKind(c: Context): String { PlusVault.init(c); return when {
++        PlusVault.secretExtra(VAULT, "sub") != null -> "订阅"; PlusVault.secretExtra(VAULT, "yaml") != null -> "导入的配置"; else -> "自己填代理" } }
++
++    private fun fetch(url: String): String {
++        val conn = (java.net.URL(url).openConnection(java.net.Proxy.NO_PROXY) as java.net.HttpURLConnection).apply {
++            connectTimeout = 10_000; readTimeout = 20_000; setRequestProperty("User-Agent", "clash.meta")
++        }
++        return conn.inputStream.bufferedReader().use { it.readText() }.also { conn.disconnect() }
++    }
++
++    /** Writes config.yaml from the import or from 自己填代理; false when there is nothing to use. */
++    fun writeConfig(c: Context): Boolean {
++        PlusVault.init(c)
++        val sec = secret(c)
++        val imported = PlusVault.secretExtra(VAULT, "yaml")
++        val text = if (imported != null) ClashConfigCore.override(imported, sec) else {
++            val st = SplitProxy.settings.value
++            val nodes = st.all.filter { !(it.host == "127.0.0.1" && it.port == ClashConfigCore.MIXED_PORT) }.mapIndexed { i, u ->
++                ClashConfigCore.Node(if (i == 0) "自己填代理" else "备用 $i", u.type, u.host, u.port, u.user, u.pass)
++            }
++            if (nodes.isEmpty()) { _state.value = "没有节点：先在下面填代理服务器或导入订阅"; return false }
++            ClashConfigCore.fromNodes(nodes, sec)
++        }
++        val f = configFile(c)
++        f.writeText(text)
++        runCatching { f.setReadable(false, false); f.setReadable(true, true) }
++        return true
++    }
++
++    // ── process ───────────────────────────────────────────────────────
++
++    fun setEnabled(c: Context, on: Boolean) {
++        prefs(c).edit().putBoolean("on", on).apply()
++        if (on) start(c) else stop()
++        runCatching { kotlinx.coroutines.runBlocking { com.openminis.app.sandbox.ExecutionCoordinator.broadcastProxyChange() } }
++    }
++
++    /** called at app start: brings the core up when it is switched on */
++    fun init(c: Context) { app = c.applicationContext; if (enabled(c)) start(c) }
++
++    @Synchronized
++    fun start(c: Context) {
++        app = c.applicationContext
++        if (running()) return
++        if (!bundled(c)) { _state.value = "这个版本没有带 Clash 内核"; return }
++        if (!writeConfig(c)) return
++        launch(c)
++        if (watchdog?.isAlive != true) watchdog = Thread({
++            var backoff = 2_000L
++            while (enabled(c)) {
++                try { Thread.sleep(3_000) } catch (_: InterruptedException) { break }
++                val p = proc
++                if (p != null && !p.isAlive && enabled(c)) {
++                    lastExit = "退出码 ${runCatching { p.exitValue() }.getOrDefault(-1)}"
++                    _state.value = "内核退出（$lastExit），${backoff / 1000} 秒后重启"
++                    try { Thread.sleep(backoff) } catch (_: InterruptedException) { break }
++                    backoff = (backoff * 2).coerceAtMost(30_000L)
++                    synchronized(this) { if (enabled(c) && proc?.isAlive != true) launch(c) }
++                } else if (p != null && p.isAlive) backoff = 2_000L
++            }
++        }, "mines-clash-watchdog").apply { isDaemon = true; start() }
++    }
++
++    private fun launch(c: Context) {
++        runCatching {
++            val pb = ProcessBuilder(binary(c).absolutePath, "-d", home(c).absolutePath, "-f", configFile(c).absolutePath)
++                .directory(home(c)).redirectErrorStream(true)
++            pb.environment()["HOME"] = home(c).absolutePath
++            val p = pb.start(); proc = p
++            _state.value = "正在启动…"
++            Thread({
++                runCatching {
++                    p.inputStream.bufferedReader().forEachLine { l ->
++                        synchronized(tail) { tail.addLast(l.take(300)); while (tail.size > 40) tail.removeFirst() }
++                        if (l.contains("Mixed(http+socks) proxy listening", true) || l.contains("RESTful API listening", true)) _state.value = "运行中 · 127.0.0.1:${ClashConfigCore.MIXED_PORT}"
++                    }
++                }
++            }, "mines-clash-out").apply { isDaemon = true; start() }
++            Log.i(TAG, "core started")
++        }.onFailure { _state.value = "启动失败：${it.message?.take(100) ?: it.javaClass.simpleName}"; Log.w(TAG, "start failed: ${it.javaClass.simpleName}") }
++    }
++
++    /** reloads the config into the running core (PUT /configs), or restarts it */
++    fun restart(c: Context) {
++        if (!enabled(c)) return
++        stop(keepWatchdog = true); start(c)
++    }
++
++    @Synchronized
++    fun stop(keepWatchdog: Boolean = false) {
++        proc?.let { runCatching { it.destroy() }; runCatching { if (!it.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) it.destroyForcibly() } }
++        proc = null
++        if (!keepWatchdog) { watchdog?.interrupt(); watchdog = null }
++        _state.value = "未开启"
++    }
++
++    /** last lines of the core's own output (for 自检 details; mihomo does not print proxy passwords) */
++    fun outputTail(): String = synchronized(tail) { tail.takeLast(6).joinToString(" | ") }
++
++    /** GET on the controller with the secret (blocking) */
++    fun api(c: Context, path: String, timeoutMs: Int = 4000): Pair<Int, String> = runCatching {
++        val conn = (java.net.URL(controller() + path).openConnection(java.net.Proxy.NO_PROXY) as java.net.HttpURLConnection).apply {
++            connectTimeout = timeoutMs; readTimeout = timeoutMs; setRequestProperty("Authorization", "Bearer " + secret(c))
++        }
++        val code = conn.responseCode
++        code to ((if (code in 200..299) conn.inputStream else conn.errorStream)?.bufferedReader()?.use { it.readText() } ?: "")
++    }.getOrElse { 0 to (it.message ?: it.javaClass.simpleName) }
++
++    /** exit IP seen through the core's mixed port (blocking) */
++    fun exitIp(timeoutMs: Int = 15_000): String? = runCatching {
++        val proxy = java.net.Proxy(java.net.Proxy.Type.HTTP, java.net.InetSocketAddress("127.0.0.1", ClashConfigCore.MIXED_PORT))
++        val conn = (java.net.URL("https://api.ipify.org").openConnection(proxy) as java.net.HttpURLConnection).apply { connectTimeout = timeoutMs; readTimeout = timeoutMs }
++        conn.inputStream.bufferedReader().use { it.readText() }.trim().takeIf { Regex("""^[0-9a-fA-F.:]+$""").matches(it) }
++    }.getOrNull()
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/CodeSourcesCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/CodeSourcesCore.kt
 new file mode 100644
@@ -12268,7 +12560,7 @@ index 0000000..9fbf83f
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MinesSelfCheck.kt b/src/android/app/src/main/java/com/openminis/app/plus/MinesSelfCheck.kt
-index 495166b..97d52dd 100644
+index 495166b..3e2446e 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/MinesSelfCheck.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/MinesSelfCheck.kt
 @@ -73,13 +73,15 @@ object MinesSelfCheck {
@@ -12291,7 +12583,7 @@ index 495166b..97d52dd 100644
          out += timed("Shizuku") {
              val ok = com.openminis.app.sandbox.offload.FastUi.shizukuReady()
              ok to (if (ok) "已授权" else "未运行或未授权")
-@@ -93,15 +95,79 @@ object MinesSelfCheck {
+@@ -93,15 +95,92 @@ object MinesSelfCheck {
              val (code, text) = MinesJobs.runSync(c, "echo mines-ok; uname -m; df -h / | tail -1", 30_000)
              (code == 0 && text.contains("mines-ok")) to text.replace("\n", " ").take(160)
          }
@@ -12309,7 +12601,7 @@ index 495166b..97d52dd 100644
 +            val want = runCatching { java.net.InetAddress.getAllByName(up.host).map { it.hostAddress } }.getOrDefault(listOf(up.host))
 +            (ip in want) to (if (ip in want) "出口 $ip = 代理 ${up.host}（沙箱经 ${via.ifBlank { "直连" }}）"
 +                else "出口 $ip，不是代理 ${up.host}：沙箱流量没走代理（${if (via == "direct" || via.isBlank()) "沙箱没拿到代理变量，检查 分流 › 用于沙箱" else "经 $via"}）")
-+        }.let { ch -> if (!ch.ok && SplitProxy.settings.value.primary == null) ch.copy(warn = true) else ch }
++        }.let { ch -> if (!ch.ok && (SplitProxy.settings.value.primary == null || ch.detail.contains("沙箱还没启动"))) ch.copy(warn = true) else ch }
 +        progress("Gmail 可达")
 +        out += timed("Gmail 可达") {
 +            val (code, text) = MinesJobs.runSync(c, "command -v curl >/dev/null || timeout 90 apk add --no-cache curl >/dev/null 2>&1; curl -sS -m 20 -o /dev/null -w 'http=%{http_code}' https://mail.google.com/mail/ 2>&1 | tail -c 200; echo; curl -sS -m 20 -o /dev/null -w 'acct=%{http_code}' https://accounts.google.com/ServiceLogin 2>&1 | tail -c 200", 140_000)
@@ -12320,6 +12612,19 @@ index 495166b..97d52dd 100644
 +            ok to "沙箱 mail.google.com ${if (gm > 0) "HTTP $gm" else "连不上"} · 登录页 ${if (ac > 0) "HTTP $ac" else "连不上"} · App ${if (app > 0) "HTTP $app" else "连不上"}" +
 +                (if (code != 0 && !ok) "（${text.lines().lastOrNull { it.isNotBlank() && !it.contains("=") }.orEmpty().take(80)}）" else "") +
 +                " · 网页登录${if (WebProxy.applied) "走代理" else "未走代理"}"
++        }
++        // [Mines-38.9.6 i14] embedded Clash (mihomo): process up + controller answers; exit IP through its mixed port
++        progress("Clash 内核")
++        out += timed("Clash 内核运行") {
++            if (!ClashCore.bundled(c)) return@timed false to "这个版本没有带 Clash 内核"
++            if (!ClashCore.enabled(c)) return@timed true to "没开启（分流代理 › 内置 Clash 内核）"
++            val (code, body) = ClashCore.api(c, "/version")
++            (ClashCore.running() && code == 200) to (if (code == 200) "运行中 · ${Regex("\"version\"\\s*:\\s*\"([^\"]+)").find(body)?.groupValues?.get(1) ?: "mihomo"} · 控制接口 127.0.0.1 已加密钥"
++                else "没在运行（${ClashCore.state.value}${ClashCore.lastExit.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""}）")
++        }.let { ch -> if (!ClashCore.enabled(c) && ClashCore.bundled(c)) ch.copy(warn = true) else ch }
++        if (ClashCore.enabled(c)) out += timed("Clash 出口 IP") {
++            val ip = ClashCore.exitIp()
++            (ip != null) to (ip?.let { "出口 $it（经 Clash 127.0.0.1:${ClashConfigCore.MIXED_PORT}）" } ?: "经 Clash 查不到出口 IP：节点都连不上？")
 +        }
          progress("MCP 服务器")
 +        // [Mines-38.9.4] issue #2 Bug 3: 「alive:false」 only means the stdio server is not running right now (they start on
@@ -14230,7 +14535,7 @@ index 2b50977..3f3e165 100644
          val out = ArrayList<Digest.Item>()
          // [Mines-38.7] every signed-in account of a platform is read with ITS OWN session (isolated store / saved set);
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt b/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt
-index 4290a7b..6f36c89 100644
+index 4290a7b..1815947 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt
 @@ -61,16 +61,24 @@ object SplitProxy {
@@ -14269,7 +14574,15 @@ index 4290a7b..6f36c89 100644
          )
      }
  
-@@ -154,10 +164,12 @@ object SplitProxy {
+@@ -148,16 +158,20 @@ object SplitProxy {
+         init(context)
+         val n = block(_settings.value)
+         _settings.value = n
++        // [Mines-38.9.6 i14] the Clash config generated from 自己填代理 follows every change
++        if (ClashCore.enabledNow) Thread({ runCatching { ClashCore.restart(context.applicationContext) } }, "mines-clash-reload").start()
+         val rules = JSONArray().apply { n.rules.forEach { put(JSONObject().put("p", it.pattern).put("m", it.mode.name)) } }
+         prefs?.edit()
+             ?.putBoolean("enabled", n.enabled)?.putString("utype", n.upstreamType)?.putString("uhost", n.upstreamHost.trim())
              ?.putInt("uport", n.upstreamPort)?.putString("default", n.defaultMode.name)?.putString("rules", rules.toString())
              ?.putBoolean("sandbox", n.forSandbox)?.putBoolean("app", n.forApp)
              ?.putString("backups", JSONArray().apply { n.backups.forEach { put(JSONObject().put("t", it.type).put("h", it.host).put("p", it.port).put("l", it.label)) } }.toString())
@@ -14283,7 +14596,7 @@ index 4290a7b..6f36c89 100644
      }
  
      fun addPreset(context: Context, preset: Preset) = update(context) { s ->
-@@ -205,6 +217,8 @@ object SplitProxy {
+@@ -205,6 +219,8 @@ object SplitProxy {
          "github.com", "githubusercontent.com", "githubassets.com", "ghcr.io", "docker.io", "docker.com",
          "crates.io", "golang.org", "go.dev", "rustup.rs", "rust-lang.org", "huggingface.co", "gradle.org", "maven.org",
          "googleapis.com", "google.com", "gstatic.com",
@@ -14292,7 +14605,7 @@ index 4290a7b..6f36c89 100644
      )
      private fun builtinForeign(host: String): Boolean {
          val h = host.lowercase().trimEnd('.')
-@@ -261,6 +275,9 @@ object SplitProxy {
+@@ -261,8 +277,11 @@ object SplitProxy {
          val url = "http://127.0.0.1:$PORT"
          return linkedMapOf(
              "http_proxy" to url, "https_proxy" to url, "HTTP_PROXY" to url, "HTTPS_PROXY" to url,
@@ -14300,9 +14613,12 @@ index 4290a7b..6f36c89 100644
 +            // upstream's Proxy-Authorization itself, so no credential ever reaches the sandbox env
 +            "all_proxy" to url, "ALL_PROXY" to url,
              "no_proxy" to "localhost,127.0.0.1,::1", "NO_PROXY" to "localhost,127.0.0.1,::1",
-         )
+-        )
++        ) + (ctxRef?.let { runCatching { ClashCore.agentEnv(it) }.getOrNull() } ?: emptyMap())   // [Mines-38.9.6 i14] Clash API for the agent
      }
-@@ -284,6 +301,7 @@ object SplitProxy {
+ 
+     // ── the proxy server ───────────────────────────────────────────────
+@@ -284,6 +303,7 @@ object SplitProxy {
                  }
              }, "split-proxy-accept").apply { isDaemon = true }.start()
              Log.i(TAG, "listening on $PORT")
@@ -14310,7 +14626,7 @@ index 4290a7b..6f36c89 100644
          } catch (e: Exception) {
              Log.w(TAG, "start failed: ${e.message}")
              _running.value = false
-@@ -292,6 +310,7 @@ object SplitProxy {
+@@ -292,6 +312,7 @@ object SplitProxy {
  
      @Synchronized
      private fun stop() {
@@ -14318,7 +14634,7 @@ index 4290a7b..6f36c89 100644
          runCatching { server?.close() }
          server = null
          _running.value = false
-@@ -301,19 +320,41 @@ object SplitProxy {
+@@ -301,19 +322,41 @@ object SplitProxy {
      // ── [Mines-proxy-auto] health checks + failover ────────────────────
  
      private const val CHECK_EVERY_MS = 60_000L
@@ -14362,7 +14678,7 @@ index 4290a7b..6f36c89 100644
      /** Checks every configured upstream once (blocking; call off the main thread). */
      /** [Mines-design-33] consecutive failed checks per proxy (memory only). */
      private val fails = java.util.concurrent.ConcurrentHashMap<String, Int>()
-@@ -324,7 +365,8 @@ object SplitProxy {
+@@ -324,7 +367,8 @@ object SplitProxy {
          val m = HashMap<String, Health>()
          for (u in ups) m[u.key] = check(u)
          _health.value = m
@@ -14372,7 +14688,12 @@ index 4290a7b..6f36c89 100644
          pruneDead()
          pickCurrent()
      }
-@@ -382,7 +424,9 @@ object SplitProxy {
+@@ -379,10 +423,14 @@ object SplitProxy {
+      * dead proxy. Unchecked proxies count as usable until the first check.
+      */
+     private fun activeUpstream(s: Settings): Upstream? {
++        // [Mines-38.9.6 i14] the embedded Clash core, when it runs, is the one upstream (it picks / fails over nodes itself)
++        ClashCore.upstream()?.let { return it }
          val ups = s.all
          if (ups.isEmpty()) return null
          val h = _health.value
@@ -14383,7 +14704,7 @@ index 4290a7b..6f36c89 100644
          if (!s.autoSwitch) return ups.first().takeIf { alive(it) }
          val key = _current.value
          return ups.firstOrNull { it.key == key && alive(it) } ?: ups.firstOrNull { alive(it) }
-@@ -390,7 +434,7 @@ object SplitProxy {
+@@ -390,7 +438,7 @@ object SplitProxy {
  
      /** Marks a failed upstream and moves to the next one right away. */
      private fun markFailed(u: Upstream, e: Throwable) {
@@ -14392,7 +14713,7 @@ index 4290a7b..6f36c89 100644
          pickCurrent()
      }
  
-@@ -504,12 +548,18 @@ object SplitProxy {
+@@ -504,12 +552,18 @@ object SplitProxy {
                  val leg = open(host, port, method.equals("CONNECT", true)) ?: run {
                      c.getOutputStream().write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n".toByteArray()); return
                  }
@@ -14412,7 +14733,7 @@ index 4290a7b..6f36c89 100644
                      } else {
                          val u = URI(target)
                          val origin = (u.rawPath?.ifEmpty { "/" } ?: "/") + (u.rawQuery?.let { "?$it" } ?: "")
-@@ -541,6 +591,7 @@ object SplitProxy {
+@@ -541,6 +595,7 @@ object SplitProxy {
  
      private val tags = java.util.Collections.synchronizedMap(java.util.WeakHashMap<Socket, String>())
      private fun Socket.getTag(): String? = tags[this]
@@ -14420,7 +14741,7 @@ index 4290a7b..6f36c89 100644
  
      private const val IDLE_MS = 180_000L
  
-@@ -566,7 +617,12 @@ object SplitProxy {
+@@ -566,7 +621,12 @@ object SplitProxy {
      }
  
      /** Opens the outbound leg according to the rules. */
@@ -14434,15 +14755,15 @@ index 4290a7b..6f36c89 100644
  
      private fun open(host: String, port: Int, tunnel: Boolean): Leg? {
          val s = _settings.value
-@@ -592,6 +648,7 @@ object SplitProxy {
+@@ -592,6 +652,7 @@ object SplitProxy {
              }
          }
          if (mode == Mode.AUTO && !useProxy) autoDirect = alive != null
-+        if (!useProxy && mode != Mode.DIRECT && s.hasUpstream && alive == null && SplitProxyCore.isGoogle(host)) return googleDown(host, "代理连不上")
++        if (!useProxy && mode != Mode.DIRECT && (s.hasUpstream || ClashCore.enabledNow) && alive == null && SplitProxyCore.isGoogle(host)) return googleDown(host, "代理连不上")
          return runCatching {
              if (!useProxy) {
                  record(host, when {
-@@ -610,7 +667,8 @@ object SplitProxy {
+@@ -610,7 +671,8 @@ object SplitProxy {
                      // Fail over to the next healthy proxy, or direct when none is left.
                      markFailed(u, e)
                      val next = activeUpstream(_settings.value)
@@ -14452,7 +14773,7 @@ index 4290a7b..6f36c89 100644
                          record(host, "${mode.label}→代理 ${u.host}:${u.port} 失败，改直连")
                          Leg(direct(host, port, 10_000), false)
                      } else {
-@@ -623,19 +681,20 @@ object SplitProxy {
+@@ -623,19 +685,20 @@ object SplitProxy {
      }
  
      private fun direct(host: String, port: Int, timeout: Int): Socket =
@@ -29558,7 +29879,7 @@ index 0000000..c6649cc
 +    RouteStatusCore.St.UNCHECKED -> Color(0xFF8A8A8A)
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt
-index 926fe48..e1d9df6 100644
+index 926fe48..8c55798 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt
 @@ -18,6 +18,8 @@ import androidx.compose.material.icons.outlined.Layers
@@ -29590,7 +29911,7 @@ index 926fe48..e1d9df6 100644
      var newRule by remember { mutableStateOf("") }
      var newMode by remember { mutableStateOf(SplitProxy.Mode.PROXY) }
      fun applyToSandbox() = scope.launch { runCatching { com.openminis.app.sandbox.ExecutionCoordinator.broadcastProxyChange() } }
-@@ -142,12 +148,38 @@ private fun SplitProxySection() {
+@@ -142,17 +148,44 @@ private fun SplitProxySection() {
                  FilterChip(selected = s.upstreamType == "http", onClick = { SplitProxy.update(ctx) { it.copy(upstreamType = "http") } }, label = { Text("HTTP") })
                  FilterChip(selected = s.upstreamType == "socks5", onClick = { SplitProxy.update(ctx) { it.copy(upstreamType = "socks5") } }, label = { Text("SOCKS5") })
              }
@@ -29632,7 +29953,14 @@ index 926fe48..e1d9df6 100644
              }
          }
      }
-@@ -230,7 +262,7 @@ private fun ProxyAutoSection() {
++    ClashSection()
+     ProxyAutoSection()
+-    InfoLine("自动：国内直连，境外先试直连、不通再走代理；代理坏了一律直连")
++    InfoLine("自动：国内直连，境外先试直连、不通再走代理；代理坏了时 Google 显示「代理不可用」，其它网站直连")
+     PlusSection("没写规则的网站") {
+         Row(Modifier.padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+             SplitProxy.Mode.entries.forEach { m ->
+@@ -230,7 +263,7 @@ private fun ProxyAutoSection() {
      }
      PlusSection("找代理") {
          Column(Modifier.padding(horizontal = 16.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -29641,6 +29969,48 @@ index 926fe48..e1d9df6 100644
              PillButton(if (busy) "正在检测…" else "一键检测本机代理", Modifier.fillMaxWidth(), enabled = !busy) {
                  scope.launch {
                      busy = true
+@@ -308,3 +341,41 @@ internal fun plainProxyReason(e: String?): String {
+         else -> "暂时连不上"
+     }
+ }
++
++
++/**
++ * [Mines-38.9.6 i14] 内置 Clash（mihomo）: switch, status, import a subscription link or a Clash YAML (kept encrypted).
++ * With the core on, the split proxy's upstream is the core (127.0.0.1:7898); it manages nodes itself.
++ */
++@Composable
++private fun ClashSection() {
++    val ctx = androidx.compose.ui.platform.LocalContext.current
++    val scope = androidx.compose.runtime.rememberCoroutineScope()
++    val st by com.openminis.app.plus.ClashCore.state.collectAsState()
++    var on by remember { mutableStateOf(com.openminis.app.plus.ClashCore.enabled(ctx)) }
++    var input by remember { mutableStateOf("") }
++    var note by remember { mutableStateOf("") }
++    val bundled = remember { com.openminis.app.plus.ClashCore.bundled(ctx) }
++    PlusSection("内置 Clash 内核") {
++        SwitchRow("开启 Clash（mihomo）", if (!bundled) "这个版本没有带内核" else if (on) st else "开启后，走代理的流量都交给 Clash 选节点", on) { v ->
++            on = v; scope.launch(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.ClashCore.setEnabled(ctx, v) }
++        }
++        if (on) {
++            PlusDivider()
++            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                Text("节点来源：" + remember(note) { com.openminis.app.plus.ClashCore.importedKind(ctx) }, fontSize = MT.Sub, color = mines().ink2)
++                OutlinedTextField(input, { input = it }, label = { Text("订阅链接或 Clash 配置（YAML）") }, maxLines = 4,
++                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
++                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                    PillButton("导入", Modifier.weight(1f)) {
++                        val t = input; scope.launch(kotlinx.coroutines.Dispatchers.IO) { note = com.openminis.app.plus.ClashCore.import(ctx, t) }; input = ""
++                    }
++                    PillButton("用自己填代理", Modifier.weight(1f), primary = false) {
++                        scope.launch(kotlinx.coroutines.Dispatchers.IO) { note = com.openminis.app.plus.ClashCore.import(ctx, "") }
++                    }
++                }
++                if (note.isNotBlank()) Text(note, fontSize = MT.Sub, color = mines().ink2)
++            }
++        }
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxNetSection.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxNetSection.kt
 index 577611f..fe51725 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/SandboxNetSection.kt
@@ -31246,10 +31616,10 @@ index 0000000..820e5d8
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WeatherSky.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WeatherSky.kt
 new file mode 100644
-index 0000000..37059d6
+index 0000000..c2f1956
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WeatherSky.kt
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,195 @@
 +package com.openminis.app.ui.plus
 +
 +import android.os.Build
@@ -31260,6 +31630,7 @@ index 0000000..37059d6
 +import androidx.compose.runtime.LaunchedEffect
 +import androidx.compose.runtime.collectAsState
 +import androidx.compose.runtime.getValue
++import androidx.compose.runtime.setValue
 +import androidx.compose.runtime.mutableFloatStateOf
 +import androidx.compose.runtime.mutableLongStateOf
 +import androidx.compose.runtime.mutableStateOf
@@ -34385,6 +34756,38 @@ index 0000000..912210d
 +    @Test fun archivesAtTellsWhen() {
 +        assertEquals(now + 3 * DAY_MS, ArchiveCore.archivesAt(Input(lastActivity = now)))
 +        assertNull(ArchiveCore.archivesAt(Input(lastActivity = now, busy = true)))
++    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/ClashConfigCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/ClashConfigCoreTest.kt
+new file mode 100644
+index 0000000..fb51493
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/ClashConfigCoreTest.kt
+@@ -0,0 +1,26 @@
++package com.openminis.app.plus
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/** [Mines-38.9.6 i14] the embedded Clash core only ever listens on 127.0.0.1, with a secret; imported YAML keeps its nodes. */
++class ClashConfigCoreTest {
++    @Test fun overrideDropsOwnedKeysAndTun() {
++        val y = "port: 7890\nsocks-port: 7891\nallow-lan: true\nexternal-controller: 0.0.0.0:9090\nsecret: ''\ntun:\n  enable: true\n  stack: system\nmode: rule\nproxies:\n  - name: a\n    type: ss\n    server: 1.2.3.4\nrules:\n  - MATCH,a\n"
++        val o = ClashConfigCore.override(y, "s3cr3t")
++        assertTrue(o.startsWith("mixed-port: 7898\nallow-lan: false\nbind-address: 127.0.0.1\nexternal-controller: 127.0.0.1:9097\nsecret: \"s3cr3t\""))
++        assertFalse(o.contains("7890")); assertFalse(o.contains("0.0.0.0")); assertFalse(o.contains("enable: true")); assertFalse(o.contains("stack:"))
++        assertTrue(o.contains("proxies:\n  - name: a")); assertTrue(o.contains("MATCH,a")); assertTrue(o.contains("mode: rule"))
++        assertEquals(1, Regex("(?m)^secret:").findAll(o).count())
++    }
++
++    @Test fun fromNodesHasGroupsAndGoogleRules() {
++        val o = ClashConfigCore.fromNodes(listOf(ClashConfigCore.Node("自己填代理", "http", "h.test", 3128, "u", "p\"w")), "k")
++        assertTrue(o.contains("type: url-test")); assertTrue(o.contains("type: fallback")); assertTrue(o.contains("interval: 60")); assertTrue(o.contains("lazy: true"))
++        assertTrue(o.contains("DOMAIN-SUFFIX,gmail.com,代理")); assertTrue(o.contains("DOMAIN-SUFFIX,cn,DIRECT")); assertTrue(o.contains("MATCH,代理"))
++        assertTrue(o.contains("password: \"p\\\"w\""))
++        assertTrue(ClashConfigCore.looksLikeClashYaml(o)); assertFalse(ClashConfigCore.looksLikeClashYaml("c3M6Ly9hYmM="))
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/CodeSourcesCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/CodeSourcesCoreTest.kt
