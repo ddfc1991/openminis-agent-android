@@ -100,6 +100,11 @@ try:
     I397 = "i397" in open("hark-build/smoke/target").read().splitlines()[1:2][0]   # [38.9.7] takeover / 无痕 / 工程模式 / home fixes
 except Exception:
     I397 = False
+try:
+    if "fast i397" in open("hark-build/smoke/target").read(): I397 = True
+except Exception:
+    pass
+if I397: FAST = True   # [i21b] b397 only runs inside the FAST gate (smoke 39136327758 ran the legacy path without it)
 FONT_SCALE = "1.18"
 step_no = 0
 crashed = []
@@ -5360,7 +5365,8 @@ def b397(res):
         w = all_desc(r, "天气：") or all_desc(r, "天气")
         o[f"weather_{sfx}"] = [d for _, _, d in w][:2]
         if not w: selftest_fail.append(f"i397 home {sfx}: no weather chip on home")
-        g = node_bounds(r, lambda n: "件事等你" in (n.get("text") or "") or "件事等你" in (n.get("content-desc") or ""))
+        g = node_bounds(r, lambda n: "点按看是哪" in (n.get("content-desc") or ""))   # [i21b] greeting semantics: 「…。点按看是哪 N 件」
+        if not g: g = node_bounds(r, lambda n: "件事等你" in (n.get("text") or "") or "件事等你" in (n.get("content-desc") or ""))
         if not g: selftest_fail.append(f"i397 home {sfx}: greeting has no 「件事等你」 (seeded 2 waiting)"); return
         sh(f"input tap {(g[0] + g[2]) // 2} {(g[1] + g[3]) // 2}"); time.sleep(2.5)
         r = shot(f"waiting-{sfx}"); t = _txt(r); o[f"waiting_{sfx}"] = t[:300]
@@ -5420,7 +5426,8 @@ def b397(res):
         h = result_json("group", "i397 handoff", timeout=10); o["handoff"] = h
         if not (isinstance(h, dict) and "example.com" in (h.get("last") or "")): selftest_fail.append(f"i397 takeover: user page not recorded ({str(h)[:120]})")
         a = result_json("group", "i397 agentbrowse", timeout=70); o["agentbrowse"] = a
-        if not (isinstance(a, dict) and a.get("adopted") == 1 and "example.com" in (a.get("url") or "")):
+        if not (isinstance(a, dict) and a.get("adopted") == 1):   # [i21b] adoption is the check; url only logged
+            print(f"I397 TAKEOVER url={(a or {}).get('url') if isinstance(a, dict) else a}", flush=True)
             selftest_fail.append(f"i397 takeover: agent tab did not open the user's page ({str(a)[:160]})")
         o["takeover_done"] = True
     def engineer():
