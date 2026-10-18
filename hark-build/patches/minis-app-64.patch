@@ -13721,10 +13721,10 @@ index 928ae75..49404a3 100644
              while (guard++ < 5000) {
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MarketGitCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/MarketGitCore.kt
 new file mode 100644
-index 0000000..3f66b0f
+index 0000000..6534bd7
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/MarketGitCore.kt
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,124 @@
 +package com.openminis.app.plus
 +
 +/**
@@ -13771,23 +13771,202 @@ index 0000000..3f66b0f
 +    }
 +
 +    /** What a SkillHub plugin row says when it is not one-tap verified. */
-+    data class Kind(val pill: String?, val line: String, val canTry: Boolean)
++    data class Kind(val pill: String?, val line: String, val canTry: Boolean,
++                    /** [Mines-38.9.8] only works on a computer (Windows / macOS / desktop control) → 「只能电脑用」 group, install off */
++                    val desktopOnly: Boolean = false,
++                    /** [Mines-38.9.8] its value is prompts / workflow / docs → can be turned into a phone skill */
++                    val convertible: Boolean = false)
++
++    /**
++     * [Mines-38.9.8] user 01:20 (dsh-pilot 「用不了」): a plugin that drives a Windows / macOS desktop can never run in the
++     * phone sandbox. Returns 「Windows」 / 「macOS」 / 「电脑」 for such a plugin, null otherwise.
++     */
++    fun platformOnly(name: String, description: String, topics: List<String>): String? {
++        val d = (description + " " + name).lowercase(); val t = topics.map { it.lowercase() }
++        val ctl = Regex("screen_view|desktop_control|desktop_sequence|desktop automation|real mouse|mouse,? keyboard|mouse and keyboard|鼠标|键盘鼠标|桌面自动化|操控(电脑|桌面)|pyautogui|pywinauto|uiautomation|autohotkey|\\bahk\\b|win32|winapi|windows api|powershell module|applescript|osascript|accessibility api|\\.exe\\b|\\.dll\\b|\\.msi\\b")
++        val win = Regex("windows (machine|desktop|only|pc|电脑)|only (on|for) windows|仅(支持)? ?windows|windows ?专用|windows 桌面|win32|winapi|windows api|\\.exe\\b|\\.msi\\b|autohotkey|pywinauto|powershell module").containsMatchIn(d) || "windows" in t
++        val mac = Regex("macos only|only (on|for) macos|仅(支持)? ?mac|applescript|osascript|\\bmac app\\b").containsMatchIn(d) || "macos" in t
++        return when {
++            win && (ctl.containsMatchIn(d) || "windows" in d) -> "Windows"
++            mac -> "macOS"
++            ctl.containsMatchIn(d) -> "电脑"
++            else -> null
++        }
++    }
++
++    /** [Mines-38.9.8] prompts / workflow / docs plugin with no desktop control: 「转成手机技能」 is offered. */
++    fun convertible(name: String, description: String, topics: List<String>): Boolean {
++        if (platformOnly(name, description, topics) != null) return false
++        val d = (description + " " + name + " " + topics.joinToString(" ")).lowercase()
++        if (Regex("electron|tauri|native binary|二进制|驱动|daemon|gui app|桌面程序").containsMatchIn(d)) return false
++        return Regex("prompt|提示词|workflow|工作流|guide|指南|教程|docs?\\b|文档|skill|技能|template|模板|playbook|cheat ?sheet|checklist|规范|案例|best practice|rules?\\b").containsMatchIn(d)
++    }
++
++    fun desktopLine(platform: String): String =
++        if (platform == "电脑") "这个插件只能在电脑上用（要操控电脑的屏幕、鼠标和键盘），手机上装了也用不了"
++        else "这个插件只能在 $platform 电脑上用，手机上装了也用不了"
 +
 +    fun classify(name: String, description: String, topics: List<String>, category: String, installability: String): Kind {
 +        val t = topics.map { it.lowercase() }
 +        val d = description.lowercase()
 +        val n = name.lowercase()
++        // [Mines-38.9.8] platform first: dsh-pilot was SkillHub-verified yet only drives a Windows desktop
++        platformOnly(name, description, topics)?.let { return Kind("只能电脑用", desktopLine(it), false, desktopOnly = true) }
 +        if (installability == "verified") return Kind(null, "SkillHub 已验证：一键安装（固定版本）", true)
 +        // the harness itself / its desktop shell are hosts, not plugins (Mines is the host here)
 +        if (n == "deepseek-harness" || n == "dsh" || n == "dsh-desktop") return Kind("宿主", "DSH 本体，不是插件；Mines 自己就是插件宿主", false)
 +        val desktop = "electron" in t || "tauri" in t || "desktop" in t || "desktop-app" in t || n.endsWith("-desktop") ||
 +            Regex("桌面端|桌面版|desktop (app|client)|electron").containsMatchIn(d)
-+        if (desktop) return Kind("电脑版", "电脑桌面程序，手机上跑不了；它的插件可以单独在这里装", false)
++        if (desktop) return Kind("电脑版", "电脑桌面程序，手机上跑不了；它的插件可以单独在这里装", false, desktopOnly = true)
 +        val prompts = Regex("提示词|案例库|prompt(s)? (library|collection)|awesome[- ]").containsMatchIn(d) || n.startsWith("awesome-")
-+        if (prompts && "dsh-plugin" !in t) return Kind("资料库", "是提示词 / 案例合集，不是可运行的插件；打开仓库看", false)
++        if (prompts && "dsh-plugin" !in t) return Kind("资料库", "是提示词 / 案例合集，不是可运行的插件；可以转成手机技能", false, convertible = true)
 +        val dsh = "dsh-plugin" in t || "dsh" in t || "cordis" in t || n.startsWith("dsh-")
-+        return if (dsh) Kind("试装", "SkillHub 还没验证，可以试装（从 GitHub 用 HTTPS 拉代码）", true)
++        return if (dsh) Kind("试装", "SkillHub 还没验证，可以试装（从 GitHub 用 HTTPS 拉代码）", true, convertible = convertible(name, description, topics))
 +        else Kind("非 DSH", "不是 DSH 插件（${category.ifBlank { "其他项目" }}），装了也调不起来；打开仓库看", false)
++    }
++
++    /**
++     * [Mines-38.9.8] 「转成手机技能」: a SKILL.md built from the repo's README (+ prompt files). Pure; [docs] = (path, text).
++     * Returns null when there is nothing usable (README empty / too short).
++     */
++    fun skillMd(owner: String, name: String, description: String, repo: String, docs: List<Pair<String, String>>, maxChars: Int = 24_000): String? {
++        val body = docs.filter { it.second.isNotBlank() }
++        if (body.sumOf { it.second.trim().length } < 80) return null
++        val desc = description.replace(Regex("\\s+"), " ").trim().ifBlank { "$name（从 GitHub 仓库转来的技能）" }.take(300)
++        val slug = skillSlug(name)
++        val sb = StringBuilder()
++        sb.append("---\nname: ").append(slug).append("\ndescription: ").append(desc.replace("\n", " ")).append("\nsource: ").append(repo.ifBlank { "https://github.com/$owner/$name" }).append("\n---\n\n")
++        sb.append("# ").append(name).append("\n\n")
++        sb.append("> 由 Mines 从 ").append(repo.ifBlank { "https://github.com/$owner/$name" }).append(" 的说明文件转成的手机技能：只用里面的提示词、流程和说明，不运行仓库里的程序。\n\n")
++        var left = maxChars - sb.length
++        for ((path, text) in body) {
++            if (left <= 200) break
++            val t = text.trim().let { if (it.length > left - 40) it.take(left - 60) + "\n\n…（后面太长，已截断）" else it }
++            sb.append("## ").append(path).append("\n\n").append(t).append("\n\n"); left = maxChars - sb.length
++        }
++        return sb.toString()
++    }
++
++    fun skillSlug(name: String): String = name.lowercase().replace(Regex("[^a-z0-9-]+"), "-").trim('-').take(60).ifBlank { "repo-skill" }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MarketZh.kt b/src/android/app/src/main/java/com/openminis/app/plus/MarketZh.kt
+new file mode 100644
+index 0000000..e6bc1f2
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/MarketZh.kt
+@@ -0,0 +1,114 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
++import kotlinx.coroutines.withContext
++import org.json.JSONObject
++import java.io.File
++
++/**
++ * [Mines-38.9.8] user 01:21: 市场 plugin / skill descriptions show in English → shown in Chinese. One batched call per page
++ * to the user's own model (cheapest configured cloud model first; Memoh when set), cached per item + description hash
++ * (SkillHub's plugin list has no version field, so a changed description = a new version). Original text whenever the
++ * call fails; the detail dialog has a small 「原文」 toggle. Nothing is sent when every description already reads Chinese.
++ */
++object MarketZh {
++    /** bumps when new translations land (rows re-read [zh]) */
++    val tick = MutableStateFlow(0)
++    @Volatile var lastError: String = ""
++    @Volatile var lastModel: String = ""
++    private val mem = HashMap<String, String>()
++    @Volatile private var loaded = false
++    private val lock = Mutex()
++    private val inFlight = HashSet<String>()
++
++    fun key(kind: String, id: String, text: String): String = "$kind:$id#${text.trim().hashCode().toUInt().toString(16)}"
++    /** needs translating: has Latin words and (almost) no CJK */
++    fun needs(text: String): Boolean {
++        val t = text.trim(); if (t.length < 8) return false
++        val cjk = t.count { it.code in 0x4E00..0x9FFF }; val latin = t.count { it in 'a'..'z' || it in 'A'..'Z' }
++        return latin >= 8 && cjk * 4 < latin / 2
++    }
++
++    private fun file(c: Context) = File(c.filesDir, "market_zh.json")
++    private fun load(c: Context) {
++        if (loaded) return
++        synchronized(mem) {
++            if (loaded) return
++            runCatching { val o = JSONObject(file(c).readText()); o.keys().forEach { k -> mem[k] = o.optString(k) } }
++            loaded = true
++        }
++    }
++    private fun save(c: Context) = runCatching {
++        val o = JSONObject(); synchronized(mem) { mem.entries.toList().takeLast(3000).forEach { (k, v) -> o.put(k, v) } }
++        file(c).writeText(o.toString())
++    }
++
++    /** cached Chinese text, or null (not translated yet / failed) */
++    fun zh(c: Context, kind: String, id: String, text: String): String? {
++        if (!needs(text)) return null
++        load(c); return synchronized(mem) { mem[key(kind, id, text)] }?.takeIf { it.isNotBlank() }
++    }
++
++    /** Translates what is missing (≤ 25 per call). Safe to call on every page load; returns how many were added. */
++    suspend fun ensure(c: Context, kind: String, items: List<Pair<String, String>>): Int = withContext(Dispatchers.IO) {
++        load(c)
++        val todo = items.filter { (id, t) -> needs(t) && synchronized(mem) { mem[key(kind, id, t)] } == null }
++            .distinctBy { key(kind, it.first, it.second) }
++            .filter { synchronized(inFlight) { inFlight.add(key(kind, it.first, it.second)) } }
++            .take(25)
++        if (todo.isEmpty()) return@withContext 0
++        try {
++            lock.withLock {
++                val prompt = buildString {
++                    append("把下面每一行软件插件简介翻译成简洁自然的中文（保留产品名、命令名和代码标识符原样）。")
++                    append("只输出译文，每行一条，行首保留原来的编号「N. 」，不要解释。\n\n")
++                    todo.forEachIndexed { i, (_, t) -> append(i + 1).append(". ").append(t.replace('\n', ' ').take(400)).append('\n') }
++                }
++                val reply = ask(c, prompt) ?: return@withLock 0
++                val lines = reply.lines().mapNotNull { l -> Regex("^\\s*(\\d+)[.、)]\\s*(.+)$").find(l)?.let { it.groupValues[1].toInt() to it.groupValues[2].trim() } }.toMap()
++                var n = 0
++                todo.forEachIndexed { i, (id, t) ->
++                    val z = lines[i + 1]?.takeIf { it.isNotBlank() && it.any { ch -> ch.code in 0x4E00..0x9FFF } }
++                    if (z != null) { synchronized(mem) { mem[key(kind, id, t)] = z.take(600) }; n++ }
++                }
++                if (n > 0) { save(c); tick.value++ }
++                n
++            }
++        } finally { synchronized(inFlight) { todo.forEach { inFlight.remove(key(kind, it.first, it.second)) } } }
++    }
++
++    /** The user's own model: cheapest enabled cloud entry with a key (not the local 免登录 gateway), else Memoh. */
++    private suspend fun ask(c: Context, prompt: String): String? {
++        val a = c.applicationContext as? com.openminis.app.MinisApp
++        if (a != null) {
++            val repo = a.providerRepository
++            val cheapRe = Regex("(?i)(flash|mini|lite|haiku|turbo|nano|small|air|8b|7b)")
++            val entries = repo.allVisibleEntries().filter { e ->
++                val inst = repo.instance(e.providerInstanceId)
++                inst != null && inst.isEnabled && !(inst.customBaseURL ?: "").contains("127.0.0.1")
++            }.sortedByDescending { cheapRe.containsMatchIn(it.baseModel.id) }.take(3)
++            for (e in entries) {
++                val inst = repo.instance(e.providerInstanceId) ?: continue
++                val key = repo.usableApiKey(inst) ?: continue
++                val r = runCatching {
++                    kotlinx.coroutines.withTimeout(40_000L) {
++                        com.openminis.app.provider.ProviderFactory.create(inst, key, e.baseModel, c, overrides = e.overrides)
++                            .sendMessage(messages = listOf(com.openminis.app.data.model.LLMMessage(role = com.openminis.app.data.model.LLMMessage.Role.USER, content = prompt)),
++                                systemPrompt = "你是翻译。只输出译文。", maxTokens = 2000).text
++                    }
++                }.onFailure { lastError = "${e.baseModel.id}：${it.message ?: it.javaClass.simpleName}".take(200) }.getOrNull()
++                if (!r.isNullOrBlank()) { lastModel = e.baseModel.id; lastError = ""; return r }
++            }
++        }
++        if (MemohKey.configured()) {
++            val r = runCatching { MemohKey.reply("你是翻译。只输出译文。", prompt) }.onFailure { lastError = "Memoh：${it.message}".take(200) }.getOrNull()
++            if (!r.isNullOrBlank()) { lastModel = "Memoh"; lastError = ""; return r }
++        }
++        if (lastError.isBlank()) lastError = "没有可用的模型（模型组里加一个带 key 的模型，或在 应用代理 里填 Memoh）"
++        return null
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MemohKey.kt b/src/android/app/src/main/java/com/openminis/app/plus/MemohKey.kt
@@ -15905,10 +16084,10 @@ index 0000000..b60d58e
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SkillHubCn.kt b/src/android/app/src/main/java/com/openminis/app/plus/SkillHubCn.kt
 new file mode 100644
-index 0000000..d0ee809
+index 0000000..a7ea78d
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/SkillHubCn.kt
-@@ -0,0 +1,304 @@
+@@ -0,0 +1,344 @@
 +package com.openminis.app.plus
 +
 +import android.content.Context
@@ -15971,7 +16150,8 @@ index 0000000..d0ee809
 +        val categoryLabel: String get() = SKILL_CATEGORIES[category] ?: category
 +    }
 +
-+    data class Page<T>(val items: List<T>, val total: Int, val fromCache: Boolean = false, /** [38.9.7] rows dropped as not runnable on the phone */ val hidden: Int = 0)
++    data class Page<T>(val items: List<T>, val total: Int, val fromCache: Boolean = false, /** [38.9.7] rows dropped as not runnable on the phone */ val hidden: Int = 0,
++        /** [Mines-38.9.8] plugins that only work on a computer (shown under 「只能电脑用」 when 手机能用 is off) */ val desktop: List<T> = emptyList())
 +
 +    // ── parsing (pure, unit-tested with fixtures saved from the live API) ──
 +
@@ -16000,7 +16180,10 @@ index 0000000..d0ee809
 +        }
 +        // [Mines-38.9.7] user 21:27 「做面板那种跑不了的，你不要放进来呀」: only what installs and runs in the phone sandbox
 +        val runnable = out.filter { it.kind.canTry }
-+        return Page(runnable, o.optInt("total", out.size), hidden = out.size - runnable.size)
++        // [Mines-38.9.8] user 01:22: phone-usable first, computer-only ones grouped under 「只能电脑用」 (prompt / doc packs too:
++        // they can be turned into a phone skill there)
++        val desktop = out.filter { !it.kind.canTry && (it.kind.desktopOnly || it.kind.convertible) }
++        return Page(runnable, o.optInt("total", out.size), hidden = out.size - runnable.size, desktop = desktop)
 +    }
 +
 +    fun parseSkills(body: String): Page<Skill> {
@@ -16211,6 +16394,42 @@ index 0000000..d0ee809
 +        skillsDirs(ctx).forEach { File(it, slug).deleteRecursively() }
 +        (ctx.applicationContext as? com.openminis.app.MinisApp)?.skillRepository?.requestReload("skillhub", force = true)
 +        return "已卸载「$slug」"
++    }
++
++    /**
++     * [Mines-38.9.8] 「转成手机技能」: README (+ up to 4 prompt / doc markdown files) of a plugin repo → SKILL.md in both
++     * skills dirs. Refused for plugins that need desktop control. Returns a one-line result.
++     */
++    fun convertToSkill(ctx: Context, p: Plugin): String {
++        MarketGitCore.platformOnly(p.name, p.description, p.topics)?.let { return "转不了：" + MarketGitCore.desktopLine(it).replace("这个插件", "它") + "（要操控电脑，不是提示词或说明）" }
++        if (!OWNER.matches(p.owner) || !NAME.matches(p.name)) throw IllegalStateException("仓库名不合法")
++        val raw = "https://raw.githubusercontent.com/${p.owner}/${p.name}/HEAD/"
++        val docs = ArrayList<Pair<String, String>>()
++        for (f in listOf("README_zh.md", "README.zh-CN.md", "README.md", "readme.md")) {
++            val t = runCatching { get(raw + f, 15_000) }.getOrNull()
++            if (!t.isNullOrBlank() && !t.trimStart().startsWith("404")) { docs += f to t; if (f.startsWith("README.") || f == "readme.md") break }
++        }
++        // prompt / doc files at the top level or in prompts/ docs/ (GitHub contents API, no token: 60 / h is plenty here)
++        for (dir in listOf("", "prompts", "docs", "skills")) runCatching {
++            val arr = JSONArray(get("https://api.github.com/repos/${p.owner}/${p.name}/contents/$dir", 12_000))
++            for (i in 0 until arr.length()) {
++                if (docs.size >= 6) break
++                val o = arr.getJSONObject(i); val n = o.optString("name"); val path = o.optString("path")
++                if (o.optString("type") != "file" || !Regex("(?i).*\\.(md|txt)$").matches(n) || n.lowercase().startsWith("readme") || n.lowercase() in setOf("license.md", "changelog.md", "contributing.md")) continue
++                if (o.optInt("size") > 200_000) continue
++                runCatching { get(raw + path, 12_000) }.getOrNull()?.takeIf { it.isNotBlank() }?.let { docs += path to it }
++            }
++        }
++        val md = MarketGitCore.skillMd(p.owner, p.name, p.description, p.repo, docs) ?: return "转不了：仓库里没有能用的说明 / 提示词文件"
++        val slug = MarketGitCore.skillSlug(p.name)
++        if (installedSkill(ctx, slug) == "local") return "已经有一个同名的本地技能「$slug」，没有覆盖"
++        for (root in skillsDirs(ctx)) runCatching {
++            val d = File(root, slug).apply { deleteRecursively(); mkdirs() }
++            File(d, "SKILL.md").writeText(md)
++            File(d, ".mines-source").writeText("github:${p.owner}/${p.name}#converted\n")
++        }
++        (ctx.applicationContext as? com.openminis.app.MinisApp)?.skillRepository?.requestReload("skillhub", force = true)
++        return "已转成手机技能「$slug」（用了 ${docs.size} 个说明文件）"
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SkillInstallKey.kt b/src/android/app/src/main/java/com/openminis/app/plus/SkillInstallKey.kt
@@ -19251,7 +19470,7 @@ index 1d773a2..5489e65 100644
          coroutineScope {
              val bg = slow.map { id -> async { one(id) } }
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-index af13c1b..0078777 100644
+index af13c1b..6af99b1 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 @@ -2,6 +2,8 @@ package com.openminis.app.plus.group
@@ -19263,7 +19482,7 @@ index af13c1b..0078777 100644
  import kotlinx.coroutines.runBlocking
  import org.json.JSONArray
  import org.json.JSONObject
-@@ -15,12 +17,428 @@ import org.json.JSONObject
+@@ -15,12 +17,454 @@ import org.json.JSONObject
   *   … --arg 'reset'
   */
  object GroupSelfTest {
@@ -19652,6 +19871,7 @@ index af13c1b..0078777 100644
 +                        }
 +                    }
 +                    "picker" -> {
++                        I398Silent.start()
 +                        val repo = app.chatRepository
 +                        val e = app.providerRepository.config.value.modelEntries.firstOrNull { it.baseModel.id == "coze:7696936574432591908" && !it.isHidden }
 +                            ?: app.providerRepository.config.value.modelEntries.firstOrNull { !it.isHidden }
@@ -19663,7 +19883,32 @@ index af13c1b..0078777 100644
 +                        JSONObject().put("route", route).put("quick", arg2).put("silentAccepted", I398Silent.accepted.get()).toString()
 +                    }
 +                    "silent" -> JSONObject().put("port", I398Silent.port).put("accepted", I398Silent.accepted.get()).toString()
-+                    else -> "i398 seedpicker | picker [modelId] | silent"
++                    // 模型详情 of the first visible model (no quick test) — back arrow, bottom inset, backdrop
++                    "modeldetail" -> {
++                        val e = app.providerRepository.config.value.modelEntries.firstOrNull { !it.isHidden && it.baseModel.id == "smoke-model" }
++                            ?: app.providerRepository.config.value.modelEntries.firstOrNull { !it.isHidden }
++                        if (e == null) "no model" else {
++                            val route = com.openminis.app.ui.navigation.Routes.modelEntryDetail(e.providerInstanceId, e.id)
++                            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) { com.openminis.app.ui.plus.PlusNav.navigate?.invoke(route) }
++                            JSONObject().put("route", route).toString()
++                        }
++                    }
++                    "backdrop" -> JSONObject().put("fogScene", com.openminis.app.ui.plus.FogClock.scene).put("skyOn", com.openminis.app.ui.plus.WeatherSky.enabled(context))
++                        .put("skyScene", com.openminis.app.ui.plus.WeatherSky.scene(context).key).put("lastSky", com.openminis.app.ui.plus.WeatherSky.lastScene.key)
++                        .put("hour", java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)).toString()
++                    "zh" -> JSONObject().put("model", com.openminis.app.plus.MarketZh.lastModel).put("error", com.openminis.app.plus.MarketZh.lastError)
++                        .put("tick", com.openminis.app.plus.MarketZh.tick.value).toString()
++                    // a market install that fails the way the phone's did (publickey) → the failure card
++                    "jobfail" -> {
++                        com.openminis.app.plus.MinesJobs.run(context, "安装 DeepSeekBot",
++                            "echo 'npm error command git --no-replace-objects ls-remote ssh://git@github.com/BotHarness/DeepSeekBot.git'; echo 'npm error git@github.com: Permission denied (publickey).'; echo 'npm error fatal: Could not read from remote repository.'; exit 128") { }
++                        "started"
++                    }
++                    "classify" -> {
++                        val k = com.openminis.app.plus.MarketGitCore.classify("dsh-pilot", arg2.ifBlank { "Desktop automation: hands and eyes on the whole Windows machine - screen_view, desktop_control" }, listOf("dsh-plugin"), "", "verified")
++                        JSONObject().put("canTry", k.canTry).put("desktopOnly", k.desktopOnly).put("line", k.line).put("pill", k.pill ?: "").toString()
++                    }
++                    else -> "i398 seedpicker | picker [modelId] | silent | modeldetail | backdrop | zh | jobfail | classify [desc]"
 +                }
 +            }
 +            // [Mines-38.9.1] 应用代理: 'agents' list (mine + enabled), 'agents clear', 'agents add <id>'
@@ -19692,7 +19937,7 @@ index af13c1b..0078777 100644
              "partners" -> {
                  val l = Partners.refresh(context, rescanApps = true)
                  JSONArray(l.map { JSONObject().put("id", it.id).put("name", it.spec.name).put("state", it.state.name).put("model", it.model).put("via", it.via) }).toString()
-@@ -136,6 +554,13 @@ object GroupSelfTest {
+@@ -136,6 +580,13 @@ object GroupSelfTest {
                  GroupStore.add(gid, GroupMsg(GroupStore.newId(), parts.getOrElse(2) { "host" }, "成员A", "", parts.getOrElse(3) { "好的，结论：照这个办。" }))
                  "ok"
              }
@@ -19706,7 +19951,7 @@ index af13c1b..0078777 100644
              "kbrun" -> { val n = com.openminis.app.plus.ChatKnowledge.runNow(context); "organised=$n" }
              "kbstate" -> {
                  val l = com.openminis.app.plus.ChatKnowledge.load(context)
-@@ -151,6 +576,11 @@ object GroupSelfTest {
+@@ -151,6 +602,11 @@ object GroupSelfTest {
                  JSONObject().put("title", g.title).put("care", g.care).put("kind", g.kind)
                      .put("weather", com.openminis.app.plus.HomeGreeting.cachedWeather(context)?.let { "${it.code}/${it.temp}" } ?: "none").toString()
              }
@@ -19718,7 +19963,7 @@ index af13c1b..0078777 100644
              "greetweather" -> {
                  context.getSharedPreferences("mines_greeting", Context.MODE_PRIVATE).edit().remove("w_try").apply()
                  com.openminis.app.plus.HomeGreeting.refreshWeather(context)
-@@ -238,6 +668,112 @@ object GroupSelfTest {
+@@ -238,6 +694,112 @@ object GroupSelfTest {
              "wallpaper" -> { com.openminis.app.plus.PlusPrefs.init(context)
                  if (parts.getOrElse(0) { "" } == "off") com.openminis.app.plus.PlusPrefs.update(context) { it.copy(wallpaper = "") }
                  com.openminis.app.plus.PlusPrefs.state.value.wallpaper.ifBlank { "none" } }
@@ -19831,7 +20076,7 @@ index af13c1b..0078777 100644
              "fogstate" -> JSONObject().put("t", com.openminis.app.ui.plus.FogClock.t.toDouble()).put("draws", com.openminis.app.ui.plus.FogClock.draws)
                  .put("still", com.openminis.app.ui.plus.FogClock.stillSeen)
                  .put("scale", android.provider.Settings.Global.getFloat(context.contentResolver, android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, -1f).toDouble()).toString()
-@@ -288,3 +824,24 @@ object GroupSelfTest {
+@@ -288,3 +850,26 @@ object GroupSelfTest {
          return JSONObject().put("chat", sid).put("group", g.id).put("direct", d.id).put("directName", dn).toString()
      }
  }
@@ -19844,7 +20089,9 @@ index af13c1b..0078777 100644
 +    private val held = java.util.Collections.synchronizedList(mutableListOf<java.net.Socket>())
 +    @Synchronized fun start(): Int {
 +        if (port != 0) return port
-+        val ss = java.net.ServerSocket(0, 50, java.net.InetAddress.getByName("127.0.0.1"))
++        // fixed port first: the provider's base URL must still point here after the app process restarts
++        val lo = java.net.InetAddress.getByName("127.0.0.1")
++        val ss = runCatching { java.net.ServerSocket(18398, 50, lo) }.getOrElse { java.net.ServerSocket(0, 50, lo) }
 +        port = ss.localPort
 +        Thread({
 +            while (true) {
@@ -28534,10 +28781,10 @@ index 8a17234..075da4a 100644
      }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassKit.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassKit.kt
 new file mode 100644
-index 0000000..f02a7a3
+index 0000000..2b674e6
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassKit.kt
-@@ -0,0 +1,276 @@
+@@ -0,0 +1,278 @@
 +package com.openminis.app.ui.plus
 +
 +import android.os.Build
@@ -28756,9 +29003,11 @@ index 0000000..f02a7a3
 + */
 +@Composable
 +fun GlassToast(modifier: Modifier = Modifier, shape: Shape = androidx.compose.foundation.shape.RoundedCornerShape(18.dp),
++               /** [Mines-38.9.8] solid (error card with a log: nothing behind may bleed through, user 01:22) */
++               solid: Boolean = false,
 +               content: @Composable ColumnScope.() -> Unit) {
 +    val m = mines()
-+    GlassSurface(modifier, shape = shape, fill = GlassTint.of(m.dark).copy(alpha = GlassFloor.toast(m.dark)), content = content)
++    GlassSurface(modifier, shape = shape, fill = GlassTint.of(m.dark).copy(alpha = if (solid) 1f else GlassFloor.toast(m.dark)), content = content)
 +}
 +
 +/** Material SnackbarHost's item, drawn as a [GlassToast] (ink text, accent action). */
@@ -31430,20 +31679,21 @@ index 0000000..2b1c784
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/MarketScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/MarketScreen.kt
-index 849e3da..0e1e9b4 100644
+index 849e3da..2d73288 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/MarketScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/MarketScreen.kt
-@@ -2,6 +2,9 @@ package com.openminis.app.ui.plus
+@@ -2,6 +2,10 @@ package com.openminis.app.ui.plus
  
  import android.content.Context
  import androidx.compose.foundation.clickable
++import androidx.compose.runtime.collectAsState
 +import androidx.compose.material3.FilterChip
 +import androidx.compose.foundation.rememberScrollState
 +import androidx.compose.foundation.horizontalScroll
  import androidx.compose.foundation.layout.Arrangement
  import androidx.compose.foundation.layout.Column
  import androidx.compose.foundation.layout.Row
-@@ -47,17 +50,25 @@ import androidx.compose.foundation.shape.RoundedCornerShape
+@@ -47,17 +51,25 @@ import androidx.compose.foundation.shape.RoundedCornerShape
  import androidx.compose.foundation.background
  import androidx.compose.ui.draw.clip
  import androidx.compose.ui.unit.sp
@@ -31471,7 +31721,7 @@ index 849e3da..0e1e9b4 100644
      }
  }
  
-@@ -138,7 +149,7 @@ private fun npmInfo(name: String): NpmInfo {
+@@ -138,7 +150,7 @@ private fun npmInfo(name: String): NpmInfo {
  @Composable
  private fun TypeBadge(text: String) {
      val c = when (text) { "MCP" -> Color(0xFF5B8DEF); "技能" -> Color(0xFFAF52DE); else -> Color(0xFFD97757) }
@@ -31480,11 +31730,19 @@ index 849e3da..0e1e9b4 100644
          modifier = Modifier.clip(RoundedCornerShape(6.dp)).background(c.copy(alpha = 0.14f)).padding(horizontal = 6.dp, vertical = 1.dp))
  }
  
-@@ -147,24 +158,24 @@ private fun IntroDialog(
+@@ -146,28 +158,43 @@ private fun TypeBadge(text: String) {
+ private fun IntroDialog(
      title: String, badge: String, version: String?, desc: String, adds: List<String>, extra: String?,
      installed: Boolean, busy: Boolean, onInstall: () -> Unit, onUninstall: (() -> Unit)?, onDismiss: () -> Unit,
++    /** [Mines-38.9.8] the original (English) text when [desc] is a translation → small 「原文」 toggle */
++    original: String? = null,
++    /** [Mines-38.9.8] plain reason it cannot run on the phone → 一键安装 disabled */
++    blockNote: String? = null,
++    /** [Mines-38.9.8] 「转成手机技能」 for prompt / doc plugins */
++    onConvert: (() -> Unit)? = null,
  ) {
 -    androidx.compose.material3.AlertDialog(
++    var showOrig by remember { mutableStateOf(false) }
 +    com.openminis.app.ui.glass.AlertDialog(
          onDismissRequest = onDismiss,
          title = {
@@ -31500,7 +31758,12 @@ index 849e3da..0e1e9b4 100644
 +                if (!version.isNullOrBlank()) Text("版本 v$version" + if (installed) " · 已安装" else "", fontSize = MT.Caption,
                      color = MaterialTheme.colorScheme.onSurfaceVariant)
 -                Text(desc.ifBlank { "（作者没写简介）" }, fontSize = 15.sp)
-+                Text(desc.ifBlank { "（作者没写简介）" }, fontSize = MT.Body)
++                Text((if (showOrig && original != null) original else desc).ifBlank { "（作者没写简介）" }, fontSize = MT.Body)
++                if (original != null && original != desc) Text(if (showOrig) "看中文" else "原文", fontSize = MT.Caption, color = mines().primaryText,
++                    modifier = Modifier.clip(RoundedCornerShape(6.dp)).clickable { showOrig = !showOrig }.padding(vertical = 2.dp, horizontal = 2.dp)
++                        .semantics { contentDescription = if (showOrig) "看中文简介" else "看英文原文" })
++                if (blockNote != null) Text(blockNote, fontSize = MT.Body, color = if (mines().dark) MinesDesign.WarningDark else MinesDesign.Warning,
++                    modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background((if (mines().dark) MinesDesign.WarningCDark else MinesDesign.WarningC)).padding(10.dp))
                  if (adds.isNotEmpty()) {
 -                    Text("装好后会加：", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
 -                    adds.forEach { Text("• $it", fontSize = 14.sp) }
@@ -31511,8 +31774,15 @@ index 849e3da..0e1e9b4 100644
 +                if (!extra.isNullOrBlank()) Text(extra, fontSize = MT.Caption, color = MaterialTheme.colorScheme.onSurfaceVariant)
              }
          },
-         confirmButton = { Button(enabled = !busy, onClick = onInstall) { Text(if (installed) "更新" else "一键安装") } },
-@@ -178,7 +189,7 @@ private fun IntroDialog(
+-        confirmButton = { Button(enabled = !busy, onClick = onInstall) { Text(if (installed) "更新" else "一键安装") } },
++        confirmButton = {
++            if (onConvert != null && blockNote == null) Button(enabled = !busy, onClick = onConvert) { Text("转成手机技能") }
++            else Button(enabled = !busy && blockNote == null, onClick = onInstall) { Text(if (installed) "更新" else "一键安装") }
++        },
+         dismissButton = {
+             Row {
+                 if (onUninstall != null) TextButton(enabled = !busy, onClick = onUninstall) { Text("卸载", color = Color(0xFFFF3B30)) }
+@@ -178,7 +205,7 @@ private fun IntroDialog(
  }
  
  @Composable
@@ -31521,7 +31791,7 @@ index 849e3da..0e1e9b4 100644
      val ctx = LocalContext.current
      val scope = rememberCoroutineScope()
      var intro by remember { mutableStateOf<NpmPkg?>(null) }
-@@ -230,9 +241,9 @@ private fun PluginMarket(@Suppress("UNUSED_PARAMETER") onOpenTerminal: (String)
+@@ -230,9 +257,9 @@ private fun PluginMarket(@Suppress("UNUSED_PARAMETER") onOpenTerminal: (String)
              .onSuccess { results = it; msg = if (it.isEmpty()) "没找到" else "" }
              .onFailure { msg = "搜索失败：${it.message}" }
      }
@@ -31533,7 +31803,7 @@ index 849e3da..0e1e9b4 100644
          Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
              OutlinedTextField(query, { query = it }, label = { Text("关键词（可空）") }, singleLine = true, modifier = Modifier.fillMaxWidth())
              Button(onClick = { search() }, modifier = Modifier.fillMaxWidth()) { Text("搜索") }
-@@ -252,7 +263,7 @@ private fun PluginMarket(@Suppress("UNUSED_PARAMETER") onOpenTerminal: (String)
+@@ -252,7 +279,7 @@ private fun PluginMarket(@Suppress("UNUSED_PARAMETER") onOpenTerminal: (String)
              if (i < curatedMcp.lastIndex) PlusDivider()
          }
      }
@@ -31542,7 +31812,7 @@ index 849e3da..0e1e9b4 100644
          if (msg.isNotBlank()) Text(msg, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(16.dp))
          results.forEachIndexed { i, p ->
              val inst = installed[p.name]
-@@ -292,10 +303,10 @@ private fun MarketRow(
+@@ -292,10 +319,10 @@ private fun MarketRow(
          Column(Modifier.weight(1f)) {
              Row(verticalAlignment = Alignment.CenterVertically) {
                  if (badge != null) { TypeBadge(badge); Spacer(Modifier.width(6.dp)) }
@@ -31556,7 +31826,7 @@ index 849e3da..0e1e9b4 100644
                  color = if (statusBad) Color(0xFFFF3B30) else Color(0xFF34C759))
          }
          Spacer(Modifier.width(8.dp))
-@@ -452,9 +463,10 @@ private fun SkillMarket() {
+@@ -452,9 +479,10 @@ private fun SkillMarket() {
              MarketRow(
                  title = s.name, badge = "技能",
                  sub = if (expanded == key) desc.ifBlank { "正在读取简介…" } else "${s.dir.ifBlank { "/" }} · ${s.files.size} 个文件 · 点一下看简介",
@@ -31570,7 +31840,7 @@ index 849e3da..0e1e9b4 100644
                  onPrimary = {
                      if (busy == null && src != "local") {
                          busy = key
-@@ -464,7 +476,7 @@ private fun SkillMarket() {
+@@ -464,7 +492,7 @@ private fun SkillMarket() {
                          }
                      }
                  },
@@ -31579,7 +31849,7 @@ index 849e3da..0e1e9b4 100644
                  onSecondary = { scope.launch { msg = withContext(Dispatchers.IO) { SkillMarketData.uninstall(ctx, s.name) }; tick++ } },
                  onClick = {
                      if (expanded == key) expanded = null else {
-@@ -477,3 +489,334 @@ private fun SkillMarket() {
+@@ -477,3 +505,370 @@ private fun SkillMarket() {
          }
      }
  }
@@ -31755,6 +32025,15 @@ index 849e3da..0e1e9b4 100644
 +    var installed by remember { mutableStateOf<Map<String, InstalledPlugin>>(emptyMap()) }
 +    var specs by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
 +    var intro by remember { mutableStateOf<com.openminis.app.plus.SkillHubCn.Plugin?>(null) }
++    // [Mines-38.9.8] user 01:22: 「手机能用」 (default) = only what runs here; off = also 「只能电脑用」 below
++    var phoneOnly by remember { mutableStateOf(true) }
++    var desktopItems by remember { mutableStateOf<List<com.openminis.app.plus.SkillHubCn.Plugin>>(emptyList()) }
++    @Suppress("UNUSED_VARIABLE") val zhTick = com.openminis.app.plus.MarketZh.tick.collectAsState().value   // read now: new translations recompose
++    fun zhOf(p: com.openminis.app.plus.SkillHubCn.Plugin): String = zhTick.let { _ -> com.openminis.app.plus.MarketZh.zh(ctx, "plugin", p.fullName, p.description) ?: p.description }
++    LaunchedEffect(items, desktopItems, phoneOnly) {
++        val list = items + (if (phoneOnly) emptyList() else desktopItems)
++        if (list.isNotEmpty()) runCatching { com.openminis.app.plus.MarketZh.ensure(ctx, "plugin", list.map { it.fullName to it.description }) }
++    }
 +    val owner = LocalLifecycleOwner.current
 +    LaunchedEffect(owner) { owner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) { tick++ } }
 +    LaunchedEffect(tick) { withContext(Dispatchers.IO) { installed = installedPlugins(ctx); specs = installedSpecs(ctx) } }
@@ -31763,7 +32042,7 @@ index 849e3da..0e1e9b4 100644
 +        kotlinx.coroutines.delay(if (query.isBlank()) 0 else 350)
 +        loading = true; page = 1
 +        val r = withContext(Dispatchers.IO) { runCatching { H.plugins(ctx, query, cat, sort, 1, verifiedOnly) } }
-+        r.onSuccess { items = it.items; total = it.total; unreachable = false
++        r.onSuccess { items = it.items; desktopItems = it.desktop; total = it.total; unreachable = false
 +            status = if (it.fromCache) "SkillHub 暂时连不上，先显示缓存的目录" else if (it.items.isEmpty()) "没找到" else "" }
 +         .onFailure { unreachable = items.isEmpty(); status = "SkillHub 连不上，暂用 npm（${it.message ?: it.javaClass.simpleName}）" }
 +        loading = false
@@ -31788,13 +32067,20 @@ index 849e3da..0e1e9b4 100644
 +
 +    intro?.let { p ->
 +        val inst = isInst(p)
++        val zhDesc = zhOf(p)
 +        IntroDialog(
-+            title = p.name, badge = "DSH插件", version = null, desc = p.description,
++            title = p.name, badge = "DSH插件", version = null, desc = zhDesc, original = p.description.takeIf { zhDesc != it },
++            blockNote = p.kind.line.takeIf { p.kind.desktopOnly },
++            onConvert = if (p.kind.convertible && !p.kind.desktopOnly) ({
++                val target = p; intro = null
++                scope.launch { status = "正在把 ${target.name} 转成手机技能…"
++                    status = withContext(Dispatchers.IO) { runCatching { H.convertToSkill(ctx, target) }.getOrElse { "转不了：${it.message}" } } }
++            }) else null,
 +            adds = listOfNotNull(p.categoryLabel.takeIf { it.isNotBlank() }?.let { "分类：$it" }, "★ ${starsText(p.stars)}",
 +                p.kind.line),   // [Mines-38.9.7] plain one-line reason instead of 「需手动」
 +            extra = p.repo.ifBlank { "${com.openminis.app.plus.SkillHubCn.WEB}" },
 +            installed = inst, busy = task.state.running,
-+            onInstall = { if (p.kind.canTry) install(p) else runCatching { if (p.repo.isNotBlank()) com.openminis.app.ui.plus.PlusNav.openBrowser.value = p.repo }; intro = null },
++            onInstall = { if (p.kind.desktopOnly) Unit else if (p.kind.canTry) install(p) else runCatching { if (p.repo.isNotBlank()) com.openminis.app.ui.plus.PlusNav.openBrowser.value = p.repo }; intro = null },
 +            onUninstall = if (inst) ({ uninstall(p); intro = null }) else null,
 +            onDismiss = { intro = null },
 +        )
@@ -31812,6 +32098,7 @@ index 849e3da..0e1e9b4 100644
 +        FilterChip(selected = sort == "stars", onClick = { sort = "stars" }, label = { Text("星标最多", fontSize = MT.Meta) })
 +        FilterChip(selected = sort == "updated", onClick = { sort = "updated" }, label = { Text("最新", fontSize = MT.Meta) })
 +        FilterChip(selected = verifiedOnly, onClick = { verifiedOnly = !verifiedOnly }, label = { Text("只看可一键装", fontSize = MT.Meta) })
++        FilterChip(selected = phoneOnly, onClick = { phoneOnly = !phoneOnly }, label = { Text("手机能用", fontSize = MT.Meta) })
 +    }
 +    if (status.isNotBlank()) Text(status, fontSize = MT.Meta, color = mines().ink2, modifier = Modifier.padding(horizontal = 36.dp, vertical = 6.dp))
 +    AcctHeader(if (loading && items.isEmpty()) "SkillHub 插件 · 正在加载…" else "SkillHub 插件 · ${items.size} 个手机能用", trailing = "skillhub.cn")
@@ -31819,7 +32106,7 @@ index 849e3da..0e1e9b4 100644
 +        items.forEachIndexed { i, p ->
 +            val inst = isInst(p)
 +            AcctRow({ HubLogo(p.avatar, p.name) }, p.name,
-+                p.description.ifBlank { "（作者没写简介）" } + "\n★ ${starsText(p.stars)}" + (p.categoryLabel.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""),
++                zhOf(p).ifBlank { "（作者没写简介）" } + "\n★ ${starsText(p.stars)}" + (p.categoryLabel.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""),
 +                when { inst -> com.openminis.app.plus.SessionStatus.Pill.OK; !p.verified && !p.kind.canTry -> com.openminis.app.plus.SessionStatus.Pill.UNCHECKED; else -> null },
 +                // [Mines-38.9.7] 「需手动」 → what it is (电脑版 / 资料库 / 非 DSH) or 试装 (DSH plugin SkillHub has not verified yet)
 +                pillLabel = when { inst -> "已安装"; !p.verified && !p.kind.canTry -> p.kind.pill; else -> null },
@@ -31831,9 +32118,28 @@ index 849e3da..0e1e9b4 100644
 +        if (items.size < total && items.isNotEmpty()) TextButton(onClick = {
 +            scope.launch {
 +                val r = withContext(Dispatchers.IO) { runCatching { H.plugins(ctx, query, cat, sort, page + 1, verifiedOnly) } }
-+                r.onSuccess { page++; items = (items + it.items).distinctBy { x -> x.fullName } }.onFailure { status = "下一页没读到：${it.message}" }
++                r.onSuccess { page++; items = (items + it.items).distinctBy { x -> x.fullName }; desktopItems = (desktopItems + it.desktop).distinctBy { x -> x.fullName } }.onFailure { status = "下一页没读到：${it.message}" }
 +            }
 +        }, modifier = Modifier.fillMaxWidth().padding(8.dp)) { Text("再显示 ${H.PAGE} 个", fontSize = MT.Button) }
++    }
++    // [Mines-38.9.8] computer-only plugins (and prompt / doc packs that can become a phone skill), never installable here
++    if (desktopItems.isNotEmpty()) {
++        if (phoneOnly) Text("另有 ${desktopItems.size} 个只能电脑用（关掉「手机能用」查看）", fontSize = MT.Meta, color = mines().ink2,
++            modifier = Modifier.padding(horizontal = 36.dp, vertical = 8.dp))
++        else {
++            AcctHeader("只能电脑用 · ${desktopItems.size} 个")
++            MinesCard(Modifier.fillMaxWidth().padding(horizontal = MS.PageH)) {
++                desktopItems.forEachIndexed { i, p ->
++                    AcctRow({ HubLogo(p.avatar, p.name) }, p.name,
++                        zhOf(p).ifBlank { "（作者没写简介）" } + "\n" + p.kind.line,
++                        com.openminis.app.plus.SessionStatus.Pill.UNCHECKED,
++                        pillLabel = if (p.kind.convertible && !p.kind.desktopOnly) "可转技能" else p.kind.pill,
++                        chevron = Chevron.NONE, subtitleLines = 3, onClick = { intro = p },
++                        description = "${p.name}，${zhOf(p).take(60)}，${p.kind.line}")
++                    if (i < desktopItems.lastIndex) AcctDivider()
++                }
++            }
++        }
 +    }
 +    // the curated MCP servers stay as they were
 +    LegacyPluginMarket(onOpenTerminal, mcpOnly = true)
@@ -31928,7 +32234,7 @@ index 9625470..86a0e4d 100644
  import androidx.compose.material3.LinearProgressIndicator
  import androidx.compose.material3.MaterialTheme
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt
-index 92e996b..648724c 100644
+index 92e996b..da4544e 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt
 @@ -13,6 +13,7 @@ import androidx.compose.ui.Modifier
@@ -32000,7 +32306,7 @@ index 92e996b..648724c 100644
  /** Semantic icon-circle colours: (icon tint, circle fill). */
  enum class Tone { DANGER, WARNING, SUCCESS, INFO, VIOLET, TEAL, NEUTRAL, ACCENT }
  
-@@ -175,81 +201,187 @@ fun toneColors(tone: Tone): Pair<Color, Color> {
+@@ -175,81 +201,201 @@ fun toneColors(tone: Tone): Pair<Color, Color> {
   * Drawn behind every Plus page and the home list when no photo wallpaper is set.
   */
  @Composable
@@ -32047,7 +32353,18 @@ index 92e996b..648724c 100644
 -    val blobs = m.blobs
      val dark = m.dark
 -    Box(modifier.background(Brush.linearGradient(base))) {
-+    val cols = if (dark) intArrayOf(0xFF963A42.toInt(), 0xFF563296.toInt(), 0xFFA85C1C.toInt(), 0xFF8C2E60.toInt())
++    // [Mines-38.9.8] real phone 01:17 (模型详情, dark, photo wallpaper → this fog drawn over it): maroon / purple at night. When
++    // the weather sky is on, the fog takes the CURRENT scene's mist colours (night = deep blue), re-read every minute.
++    val skyMin = androidx.compose.runtime.produceState(System.currentTimeMillis() / 60_000L) {
++        while (true) { kotlinx.coroutines.delay(60_000L); value = System.currentTimeMillis() / 60_000L }
++    }.value
++    val sceneCols = androidx.compose.runtime.remember(skyMin, dark) {
++        if (!WeatherSky.enabled(ctx)) null else runCatching {
++            val sc = WeatherSky.scene(ctx); FogClock.scene = sc.key
++            com.openminis.app.plus.WeatherSkyCore.params(sc).cM.map { (it and 0xFFFFFF) or 0xFF000000.toInt() }.toIntArray()
++        }.getOrNull()
++    }
++    val cols = sceneCols ?: if (dark) intArrayOf(0xFF963A42.toInt(), 0xFF563296.toInt(), 0xFFA85C1C.toInt(), 0xFF8C2E60.toInt())
 +        // [Mines-38.8 v5d] user 2026-10-16: light fog read too faint — more saturated peach / lilac / apricot / rose, full opacity
 +        else intArrayOf(0xFFF0844E.toInt(), 0xFFA07CF0.toInt(), 0xFFFF9F45.toInt(), 0xFFEC72A4.toInt())
 +    val fogK = MinesLook.fog(dark)   // [Mines-38.9] 外观调节 › 雾气浓淡
@@ -32113,19 +32430,6 @@ index 92e996b..648724c 100644
 +                paint.shader = sh; paint.alpha = (255 * a).toInt().coerceIn(0, 255)
 +                nc.save(); nc.scale(1f, 1.15f, cx, cy); nc.drawCircle(cx, cy, r, paint); nc.restore()
 +                paint.alpha = 255
-+            }
-+            // drifting fog streaks (soft horizontal bands), faster and longer in wind, more in rain / overcast
-+            val streakA = ((if (dark) 0.16f else 0.22f) * fogK * dens * (0.6f + 0.4f * FogWind.windK(wind))).coerceIn(0f, 0.6f)
-+            val sCol = if (dark) android.graphics.Color.rgb(200, 170, 190) else android.graphics.Color.rgb(255, 236, 222)
-+            for (k in 0 until (if (FogWind.wet(wind.code)) 5 else 3)) {
-+                val yy = h * (0.18f + 0.19f * k) + 30f * sc * kotlin.math.sin(om * 0.5f + k)
-+                val len = w * (0.9f + 0.5f * FogWind.windK(wind))
-+                val xx = ((dx * (1.2f + 0.2f * k) + k * w * 0.37f) % (w + len) + (w + len)) % (w + len) - len
-+                val sh = sprites.streak(sCol)
-+                mtx.reset(); mtx.setScale(len, 1f); mtx.postTranslate(xx, yy); sh.setLocalMatrix(mtx)
-+                paint.shader = sh; paint.alpha = (255 * streakA).toInt().coerceIn(0, 255)
-+                nc.save(); nc.scale(1f, 0.16f, xx + len / 2, yy); nc.drawCircle(xx + len / 2, yy, len / 2, paint); nc.restore()
-+                paint.alpha = 255
              }
 -            // two faint fog bands sliding sideways (wide soft ellipses)
 -            val fog = if (dark) Color(0xFF3A2E28) else Color.White
@@ -32141,6 +32445,20 @@ index 92e996b..648724c 100644
 -                nc.save(); nc.translate(cx, cy); nc.scale(rx, ry)
 -                nc.drawCircle(0f, 0f, 1f, paint)
 -                nc.restore()
++            // drifting fog streaks (soft horizontal bands), faster and longer in wind, more in rain / overcast
++            val streakA = ((if (dark) 0.16f else 0.22f) * fogK * dens * (0.6f + 0.4f * FogWind.windK(wind))).coerceIn(0f, 0.6f)
++            val sCol = if (dark) android.graphics.Color.rgb(200, 170, 190) else android.graphics.Color.rgb(255, 236, 222)
++            // [Mines-38.9.8] real phone: these bands read as bright streaks cutting across cards and inputs → not drawn any more
++            for (k in 0 until 0) {
++                val yy = h * (0.18f + 0.19f * k) + 30f * sc * kotlin.math.sin(om * 0.5f + k)
++                val len = w * (0.9f + 0.5f * FogWind.windK(wind))
++                val xx = ((dx * (1.2f + 0.2f * k) + k * w * 0.37f) % (w + len) + (w + len)) % (w + len) - len
++                val sh = sprites.streak(sCol)
++                mtx.reset(); mtx.setScale(len, 1f); mtx.postTranslate(xx, yy); sh.setLocalMatrix(mtx)
++                paint.shader = sh; paint.alpha = (255 * streakA).toInt().coerceIn(0, 255)
++                nc.save(); nc.scale(1f, 0.16f, xx + len / 2, yy); nc.drawCircle(xx + len / 2, yy, len / 2, paint); nc.restore()
++                paint.alpha = 255
+             }
 +            // a clear day: two soft light shafts from the top
 +            if (FogWind.clear(wind.code) && !dark && !overlay) {
 +                val ra = (0.10f * fogK * (0.85f + 0.15f * kotlin.math.sin(om))).coerceIn(0f, 0.3f)
@@ -32151,7 +32469,7 @@ index 92e996b..648724c 100644
 +                    shaft.reset(); shaft.moveTo(x0, 0f); shaft.lineTo(x0 + w * 0.16f, 0f); shaft.lineTo(x0 + w * 0.5f, h * 0.75f); shaft.lineTo(x0 + w * 0.22f, h * 0.75f); shaft.close()
 +                    nc.drawPath(shaft, paint)
 +                }
-             }
++            }
 +            if (overlay) { paint.shader = null; return@Canvas }
 +            // film grain (static tile, very faint)
 +            paint.shader = android.graphics.BitmapShader(grain, android.graphics.Shader.TileMode.REPEAT, android.graphics.Shader.TileMode.REPEAT)
@@ -32216,6 +32534,8 @@ index 92e996b..648724c 100644
  /** [Mines-38.7] one fog clock for every backdrop, so the fog does not jump when a new page opens. */
  object FogClock {
      @Volatile var t: Float = 0f
++    /** [Mines-38.9.8] smoke / 自检: the sky scene whose colours the fog uses ("" = fixed fog palette) */
++    @Volatile var scene: String = ""
      /** smoke diagnostics: backdrop draws so far and whether the last one was drawn in still mode */
      @Volatile var draws: Long = 0
      @Volatile var stillSeen: Boolean = false
@@ -32225,7 +32545,7 @@ index 92e996b..648724c 100644
      private var lastMs = 0L
      fun tick(nowMs: Long) {
          if (lastMs != 0L) { val d = (nowMs - lastMs).coerceIn(0L, 100L); t += d / 1000f }
-@@ -272,18 +404,27 @@ fun currentCharacter(): String {
+@@ -272,18 +418,27 @@ fun currentCharacter(): String {
   * from here; the system font scale multiplies them (the user's phone runs ≈ 1.18).
   */
  object MT {
@@ -32291,10 +32611,19 @@ index f8e9041..ac38737 100644
          title = { Text("回到 build-${rollback.first}？") },
          text = { Text("会打开系统安装界面，装回上一个版本。") },
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesJobsHost.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesJobsHost.kt
-index 6e3b76d..d2a2c08 100644
+index 6e3b76d..6d29d51 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesJobsHost.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesJobsHost.kt
-@@ -84,29 +84,27 @@ fun MinesJobsHost() {
+@@ -18,6 +18,8 @@ import androidx.compose.foundation.layout.statusBarsPadding
+ import androidx.compose.foundation.layout.navigationBarsPadding
+ import androidx.compose.foundation.layout.width
+ import androidx.compose.foundation.layout.widthIn
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.verticalScroll
+ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.material3.CircularProgressIndicator
+ import androidx.compose.material3.Text
+@@ -84,29 +86,27 @@ fun MinesJobsHost() {
  
      if (running.isNotEmpty()) {
          Popup(alignment = Alignment.TopCenter, properties = PopupProperties(focusable = false)) {
@@ -32332,7 +32661,7 @@ index 6e3b76d..d2a2c08 100644
          }
      }
  
-@@ -114,32 +112,30 @@ fun MinesJobsHost() {
+@@ -114,32 +114,31 @@ fun MinesJobsHost() {
      if (t != null) {
          Popup(alignment = Alignment.BottomCenter, properties = PopupProperties(focusable = false)) {
              AnimatedVisibility(visible = true, enter = fadeIn(), exit = fadeOut()) {
@@ -32344,7 +32673,7 @@ index 6e3b76d..d2a2c08 100644
 -                        .background(if (t.ok) Color(0xFF1F3A2B) else Color(0xFF3A1F1F))
 +                val gm = mines()
 +                GlassToast(Modifier.navigationBarsPadding().padding(horizontal = 16.dp, vertical = 24.dp)
-+                        .widthIn(max = 420.dp).fillMaxWidth()) { Column(
++                        .widthIn(max = 420.dp).fillMaxWidth(), solid = !t.ok) { Column(
 +                    Modifier
                          .padding(horizontal = 16.dp, vertical = 12.dp)
                          .semantics { liveRegion = LiveRegionMode.Assertive },
@@ -32359,7 +32688,8 @@ index 6e3b76d..d2a2c08 100644
 -                    if (details) Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(Color(0x33000000)).padding(8.dp)) {
 -                        Text(t.lines.takeLast(8).joinToString("\n"), color = Color(0xFFE8E2D9), fontSize = 11.sp)
 +                    if (!t.ok) Text(t.reason, color = gm.ink, fontSize = MT.Body)
-+                    if (details) Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(gm.ink.copy(alpha = 0.06f)).padding(8.dp)) {
++                    if (details) Box(Modifier.fillMaxWidth().then(Modifier.heightIn(max = 260.dp)).clip(RoundedCornerShape(8.dp)).background(gm.ink.copy(alpha = 0.06f))
++                            .verticalScroll(androidx.compose.foundation.rememberScrollState()).padding(8.dp)) {
 +                        Text(t.lines.takeLast(8).joinToString("\n"), color = gm.ink2, fontSize = MT.Caption)
                      }
                      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
@@ -37113,10 +37443,18 @@ index 84aa3a6..38ff39b 100644
                  },
              )
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/settings/ModelEntryDetailScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/settings/ModelEntryDetailScreen.kt
-index 948b2a1..f331a57 100644
+index 948b2a1..8609235 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/settings/ModelEntryDetailScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/settings/ModelEntryDetailScreen.kt
-@@ -77,6 +77,8 @@ fun ModelEntryDetailScreen(
+@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.height
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.text.KeyboardOptions
+ import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.automirrored.filled.ArrowBack
+ import androidx.compose.material.icons.outlined.Bolt
+ import androidx.compose.material3.ButtonDefaults
+ import androidx.compose.material3.ExperimentalMaterial3Api
+@@ -77,6 +78,8 @@ fun ModelEntryDetailScreen(
      var thinkingTouched by remember { mutableStateOf(false) }
      var isHidden by remember { mutableStateOf(entry.isHidden) }
      var showQuickTest by remember { mutableStateOf(false) }
@@ -37125,6 +37463,27 @@ index 948b2a1..f331a57 100644
  
      // Modality state — derive from override-or-base so the toggles reflect
      // what the model actually supports today, then let the user flip from
+@@ -123,14 +126,13 @@ fun ModelEntryDetailScreen(
+         // discard + pop.
+         onBack = null,
+         centerTitle = true,
++        // [Mines-38.9.8] real phone 01:17: the theme's top bar puts the navigation slot in a 40 dp round button, so the
++        // 「取消」 text was clipped to a garbled 「耳」 — a back arrow (= cancel: discards and pops) fits the circle
+         navigation = {
+-            MinisTextButton(
+-                onClick = onBack,
+-                modifier = Modifier.padding(start = 8.dp),
+-                colors = ButtonDefaults.textButtonColors(
+-                    contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+-                ),
+-            ) { Text(stringResource(R.string.common_cancel)) }
++            androidx.compose.material3.IconButton(onClick = onBack) {
++                androidx.compose.material3.Icon(androidx.compose.material.icons.Icons.AutoMirrored.Filled.ArrowBack,
++                    contentDescription = stringResource(R.string.common_cancel))
++            }
+         },
+         actions = {
+             MinisButton(
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/settings/ModelGroupDetailScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/settings/ModelGroupDetailScreen.kt
 index faef869..bb9b292 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/settings/ModelGroupDetailScreen.kt
@@ -37345,7 +37704,7 @@ index 6c48dfe..2e88b9c 100644
      }
  
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsComponents.kt b/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsComponents.kt
-index 29b9e76..03d32f2 100644
+index 29b9e76..3d3e76c 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsComponents.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/settings/SettingsComponents.kt
 @@ -1,5 +1,7 @@
@@ -37356,7 +37715,38 @@ index 29b9e76..03d32f2 100644
  import androidx.compose.foundation.background
  import androidx.compose.foundation.clickable
  import androidx.compose.foundation.layout.Arrangement
-@@ -228,7 +230,7 @@ fun SettingsSection(
+@@ -11,6 +13,7 @@ import androidx.compose.foundation.layout.Spacer
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.navigationBarsPadding
+ import androidx.compose.foundation.layout.heightIn
+ import androidx.compose.foundation.layout.imePadding
+ import androidx.compose.foundation.layout.padding
+@@ -134,14 +137,19 @@ fun SettingsScaffold(
+         // keyboard" rect to scroll a focused TextField into. Without it,
+         // adjustResize + edge-to-edge leaves the scrollable column at
+         // full height behind the IME and bringIntoView is a no-op.
++        // [Mines-38.9.8] real phone (模型详情): the last footer line was cut by the gesture bar. A scrolling page now runs
++        // under the navigation bar and ends with nav-bar inset + 24 dp of room, so its last line clears the bar.
++        val edge = scrollable && bottomBar == null
+         val baseMod = Modifier
+             .fillMaxSize()
+-            .padding(padding)
++            .then(if (edge) Modifier.padding(top = padding.calculateTopPadding()) else Modifier.padding(padding))
+             .imePadding()
+         Column(
+             modifier = if (scrollable) baseMod.verticalScroll(rememberScrollState()) else baseMod,
+-            content = content,
+-        )
++        ) {
++            content()
++            if (edge) androidx.compose.foundation.layout.Spacer(Modifier.navigationBarsPadding().height(24.dp))
++        }
+     }
+ }
+ 
+@@ -228,7 +236,7 @@ fun SettingsSection(
                  style = MaterialTheme.typography.labelSmall,
                  color = MaterialTheme.colorScheme.onSurfaceVariant,
                  fontWeight = FontWeight.Medium,
@@ -37365,7 +37755,7 @@ index 29b9e76..03d32f2 100644
                  // [T-android-settings-ui-md3] #5 header→card gap = 8dp (was 6dp,
                  // off-grid). Horizontal stays 32dp to align the header text with
                  // the inset card's content.
-@@ -264,7 +266,7 @@ fun SettingsSection(
+@@ -264,7 +272,7 @@ fun SettingsSection(
                  // already provides separation, so keep the footer's own bottom
                  // tight at 4dp).
                  modifier = Modifier.padding(start = 32.dp, end = 32.dp, top = 8.dp, bottom = 4.dp),
@@ -39880,10 +40270,10 @@ index 0000000..2fe9b67
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/MarketGitCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/MarketGitCoreTest.kt
 new file mode 100644
-index 0000000..f9a4564
+index 0000000..6ae8270
 --- /dev/null
 +++ b/src/android/app/src/test/java/com/openminis/app/plus/MarketGitCoreTest.kt
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,61 @@
 +package com.openminis.app.plus
 +
 +import org.junit.Assert.assertEquals
@@ -39920,6 +40310,29 @@ index 0000000..f9a4564
 +        assertEquals(null, MarketGitCore.classify("x", "", emptyList(), "", "verified").pill)
 +        assertFalse(MarketGitCore.classify("deepseek-harness", "DeepSeek Harness: Everything is a Plugin.", listOf("dsh-plugin"), "", "unsupported").canTry)
 +        assertFalse(MarketGitCore.classify("reactive-resume", "resume builder", emptyList(), "client", "unsupported").canTry)
++    }
++
++    // [Mines-38.9.8] dsh-pilot (SkillHub verified, Windows desktop control) → 只能电脑用, not installable
++    @Test fun desktopOnly() {
++        val pilot = "Desktop automation for DeepSeek Harness: hands and eyes on the whole Windows machine - screen_view returns a live PNG of the screen, desktop_control drives the real mouse, keyboard and windows at the same pixel coordinates"
++        assertEquals("Windows", MarketGitCore.platformOnly("dsh-pilot", pilot, emptyList()))
++        val k = MarketGitCore.classify("dsh-pilot", pilot, listOf("dsh-plugin"), "agent-workflow", "verified")
++        assertFalse(k.canTry); assertTrue(k.desktopOnly); assertEquals("只能电脑用", k.pill)
++        assertEquals("这个插件只能在 Windows 电脑上用，手机上装了也用不了", k.line)
++        assertEquals("macOS", MarketGitCore.platformOnly("x", "Control apps via AppleScript", emptyList()))
++        assertNull(MarketGitCore.platformOnly("rea", "Reverse engineer anything", listOf("dsh-plugin")))
++        assertNull(MarketGitCore.platformOnly("dsh-git-panel", "Web GUI 里的 IDE 风格 Git 面板", emptyList()))
++        assertTrue(MarketGitCore.classify("rea", "Reverse engineer anything", listOf("dsh-plugin"), "", "verified").canTry)
++    }
++    @Test fun convert() {
++        assertTrue(MarketGitCore.convertible("awesome-prompts", "GPT 提示词与案例库", emptyList()))
++        assertFalse(MarketGitCore.convertible("dsh-pilot", "Windows machine screen_view desktop_control prompt", emptyList()))
++        assertFalse(MarketGitCore.convertible("dsh-desktop", "electron desktop app with prompts", emptyList()))
++        val md = MarketGitCore.skillMd("o", "My Prompts", "Prompt pack", "https://github.com/o/My-Prompts", listOf("README.md" to "# Hi\n" + "x".repeat(200)))!!
++        assertTrue(md.startsWith("---\nname: my-prompts\ndescription: Prompt pack\n"))
++        assertTrue(md.contains("## README.md"))
++        assertNull(MarketGitCore.skillMd("o", "n", "", "", listOf("README.md" to "short")))
++        assertTrue(MarketGitCore.skillMd("o", "n", "", "", listOf("README.md" to "y".repeat(50_000)), maxChars = 5000)!!.length <= 5000)
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/MemohKeyCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/MemohKeyCoreTest.kt
