@@ -3192,6 +3192,7 @@ def main():
     sh("settings put global window_animation_scale 0; settings put global transition_animation_scale 0; settings put global animator_duration_scale 0")
     adb("logcat", "-c")
     lc = subprocess.Popen(f"adb logcat -v threadtime > {OUT}/logcat.txt", shell=True)
+    if I396: wait_gms_stable()   # [i17]
     print(sh(f"am start -W -n {PKG}/com.openminis.app.MainActivity", timeout=90), flush=True)
     time.sleep(12)
     snap("launch")
@@ -3208,6 +3209,9 @@ def main():
         relaunch(); snap("relaunch-with-home"); check("cold launch with chats (home list)")
         dump_fatal()
         user_like_state()
+    if I396:   # [i17] onboarding may have been killed by the GMS death: make sure the app is up with a model
+        if not alive(): recover("onboarding")
+        seed_model()
 
     if FAST:   # [38.7 v11d] user-approved targeted gate: linking, white pages, persistence, chosen platform rows
         res = {}
@@ -4822,6 +4826,77 @@ def _sandbox_down(sc):
     return isinstance(sc, list) and any("沙箱还没启动" in (r.get("detail") or "") for r in sc)
 
 
+RECOVERIES = []   # [38.9.6 i17] app restarts after the emulator's GMS / FontsProvider death (smoke P)
+
+
+def wait_gms_stable(limit=150):
+    """[i17] smoke P: com.google.android.gms.persistent died mid-run and took Mines with it ('depends on provider
+    ...FontsProvider in dying proc'). Before the app starts, wait until the GMS persistent pid has not changed for 25 s."""
+    t0 = time.time(); last = None; since = time.time()
+    while time.time() - t0 < limit:
+        pid = sh("pidof com.google.android.gms.persistent").strip()
+        if pid != last: last = pid; since = time.time()
+        elif pid and time.time() - since >= 25: break
+        time.sleep(5)
+    print(f"GMS persistent pid {last!r} stable after {int(time.time() - t0)} s", flush=True)
+
+
+def gms_died_since(mark):
+    """[i17] ActivityManager lines about GMS dying / a provider in a dying process since logcat mark (epoch secs)."""
+    out = sh(f"logcat -d -v epoch -t {int(mark)}.000 ActivityManager:I *:S", timeout=30)
+    return [l for l in out.splitlines() if ("dying proc" in l or "com.google.android.gms.persistent" in l and "died" in l.lower())][:5]
+
+
+def seed_model():
+    """[i17] the fake OpenAI provider + smoke-model, whatever happened to onboarding."""
+    r = result_json("group", "i396 seedmodel", timeout=40)
+    print(f"  seedmodel -> {r}", flush=True)
+    return r
+
+
+def recover(tag):
+    """[i17] app dead or home unreachable → force-stop, relaunch, skip onboarding if it is back, re-seed the model."""
+    RECOVERIES.append(tag); print(f"!!! RECOVER after {tag} (GMS: {gms_died_since(time.time() - 900)})", flush=True)
+    sh(f"am force-stop {PKG}"); time.sleep(2)
+    if not sh("pidof com.google.android.gms.persistent").strip(): wait_gms_stable(90)
+    sh(f"am start -W -n {PKG}/com.openminis.app.MainActivity", timeout=90); time.sleep(10)
+    dismiss_dialogs()
+    seed_model()
+    r = dump()
+    if r is not None and find(r, "Welcome to Mines"):
+        for lab in ("Skip", "跳过", "Skip for now", "以后再说"):
+            if tap_text(lab, exact=True, wait=2): break
+        sh(f"am force-stop {PKG}"); time.sleep(2); sh(f"am start -W -n {PKG}/com.openminis.app.MainActivity", timeout=90); time.sleep(10)
+    set_zh()
+    return b381_home()
+
+
+def healthy_home():
+    """[i17] the app is alive and the home list answers a dump within reason; else recover once."""
+    if not alive(): return recover("dead")
+    t0 = time.time(); r = dump()
+    if r is not None and find(r, "最近对话"): return r
+    r = b381_home()
+    if r is None or not find(r, "最近对话") or time.time() - t0 > 60: return recover("home unreachable")
+    return r
+
+
+def blur_ratio(home_png, menu_png, box=(0.70, 0.36, 0.97, 0.62)):
+    """[i17] sharpness of the page right of the ☰ menu: menu shot vs home shot (gradient energy ratio, 1 = untouched)."""
+    try:
+        from PIL import Image
+        def lum(p):
+            im = Image.open(p).convert("L"); W, H = im.size
+            im = im.crop((int(box[0] * W), int(box[1] * H), int(box[2] * W), int(box[3] * H)))
+            return list(im.getdata()), im.size
+        (a, (w, h)), (b, _) = lum(home_png), lum(menu_png)
+        def e(px):
+            return sum(abs(px[i + 1] - px[i]) + abs(px[i + w] - px[i]) for i in range(0, (h - 1) * w) if (i % w) < w - 1)
+        ea = e(a); return round(e(b) / ea, 3) if ea > 0 else 0.0
+    except Exception as ex:
+        print("blur_ratio error", ex, flush=True); return -1.0
+
+
 def b396x(res):
     """[38.9.6 i15] seed chats first (i396m sheets need a chat), weather scenes (7 × light/dark + static fallback), 快速测试 sheet
     over the busy model page (Chinese errors, glass), 重试 tapped twice (「已重新开始（第 N 次）」), every overlay in both themes
@@ -4831,13 +4906,14 @@ def b396x(res):
         try: f()
         except Exception as e:
             import traceback; traceback.print_exc(); page_missing.append(f"i396x {name} error {e}")
-        if not alive(): crashed.append(f"i396x {name}"); relaunch()
+        if not alive(): crashed.append(f"i396x {name}"); recover(f"i396x {name}")
     def ov(name, sfx):
         r = shot388(f"i396x-ov-{name}-{sfx}"); f = result_json("group", "i396 overlay", timeout=10)
         o["overlay"].append({"name": name, "theme": sfx, "flag": f, "text": _txt(r)[:160]})
         print(f"I396X OVERLAY | {sfx} | {name} | {json.dumps(f, ensure_ascii=False)[:200]}", flush=True)
         return r
     set_zh()
+    o["seedmodel"] = seed_model()
     o["seed"] = result_json("group", "i396 seed", timeout=90)
     # 1 weather scenes
     def sky(sfx):
@@ -4850,7 +4926,10 @@ def b396x(res):
         result_json("group", "i396 sky cloudy static", timeout=20)   # [i15] static for the rest of the run (swiftshader load)
     # 2 快速测试 sheet over the busy model page
     def quick(sfx):
-        q = result_json("group", "i396 quicktest", timeout=30); o["quick_" + sfx] = q
+        healthy_home()
+        q = result_json("group", "i396 quicktest", timeout=30)
+        if q == "no model": seed_model(); q = result_json("group", "i396 quicktest", timeout=30)
+        o["quick_" + sfx] = q
         time.sleep(8); r = ov("quicktest", sfx); t = _txt(r); o["quicktext_" + sfx] = t[:400]
         if "快速测试" not in t: page_missing.append(f"i396x 快速测试 {sfx}: sheet not open ({str(q)[:60]})")
         for en in ("No API key configured", "API key", "provider."):
@@ -4873,7 +4952,7 @@ def b396x(res):
         back(1); time.sleep(1)
     # 4 overlays
     def overlays(sfx):
-        r = b381_home(); time.sleep(3)
+        healthy_home(); r = b381_home(); time.sleep(3)
         mb = node_bounds(r, lambda n: (n.get("content-desc") or "") == "更多")
         if mb: sh(f"input tap {(mb[0] + mb[2]) // 2} {(mb[1] + mb[3]) // 2}"); time.sleep(2.5); ov("menu", sfx); back(1); time.sleep(1)
         r = b381_home(); time.sleep(2); pills = all_desc(r, "进度："); o["pills_" + sfx] = len(pills)
@@ -4964,7 +5043,11 @@ def b396m(res):
         try: f()
         except Exception as e:
             import traceback; traceback.print_exc(); page_missing.append(f"i396m {name} error {e}")
-        if not alive(): crashed.append(f"i396m {name}"); relaunch()
+        if not alive(): crashed.append(f"i396m {name}"); recover(f"i396m {name}")
+    def flag(name, sfx):
+        f = result_json("group", "i396 overlay", timeout=10); o.setdefault("overlay", []).append({"name": name, "theme": sfx, "flag": f})
+        print(f"I396M OVERLAY | {sfx} | {name} | {json.dumps(f, ensure_ascii=False)[:220]}", flush=True)
+        return f
     set_zh()
     # 1 Memoh: bad record from 38.9.5 → cleaned, not 正常
     def memoh_record():
@@ -5048,19 +5131,20 @@ def b396m(res):
     step("proxy", proxy)
     # 6 glass sheets light + dark (☰ / + 附件 / 选择模型 / inputs / slider minimum over a busy photo)
     def sheets(sfx):
+        healthy_home(); seed_model()
         r = b381_home(); time.sleep(2); shot388(f"i396m-home-input-{sfx}")
         mb = node_bounds(r, lambda n: (n.get("content-desc") or "") == "更多")
-        if mb: sh(f"input tap {(mb[0] + mb[2]) // 2} {(mb[1] + mb[3]) // 2}"); time.sleep(2); shot388(f"i396m-menu-{sfx}"); back(1); time.sleep(1)
+        if mb: sh(f"input tap {(mb[0] + mb[2]) // 2} {(mb[1] + mb[3]) // 2}"); time.sleep(2); shot388(f"i396m-menu-{sfx}"); flag("menu", sfx); back(1); time.sleep(1)
         else: page_missing.append(f"i396m {sfx}: ☰ not found")
         if not find(dump(), "今天新加坡天气", False): result_json("group", "i396 seed", timeout=90); b381_home(); time.sleep(3)   # [i15] a chat to open
         if tap_text("今天新加坡天气", wait=4) or tap_text("你好，我是测试模型。", wait=3):
             time.sleep(2); shot388(f"i396m-chat-input-{sfx}")
             r = dump(); ab = node_bounds(r, lambda n: (n.get("content-desc") or "") == "附件")
-            if ab: sh(f"input tap {(ab[0] + ab[2]) // 2} {(ab[1] + ab[3]) // 2}"); time.sleep(2); shot388(f"i396m-attach-{sfx}"); back(1); time.sleep(1)
+            if ab: sh(f"input tap {(ab[0] + ab[2]) // 2} {(ab[1] + ab[3]) // 2}"); time.sleep(2); shot388(f"i396m-attach-{sfx}"); flag("attach", sfx); back(1); time.sleep(1)
             else: page_missing.append(f"i396m {sfx}: + 附件 not found")
             r = dump()
             if tap_text("默认模型", wait=3, root=r) or tap_text("smoke-model", wait=2, root=r) or tap_text("Default Models", wait=2, root=r):
-                time.sleep(2); r = shot388(f"i396m-picker-{sfx}"); t = _txt(r)
+                time.sleep(2); r = shot388(f"i396m-picker-{sfx}"); t = _txt(r); flag("picker", sfx)
                 if "Default Models" in t: selftest_fail.append(f"i396m {sfx}: picker still shows 「Default Models」")
                 back(1); time.sleep(1)
             else: page_missing.append(f"i396m {sfx}: model picker header not found")
@@ -5070,7 +5154,18 @@ def b396m(res):
         selftest_json("uiprep", "杨arling|gen", timeout=20); result_json("group", "lookset 0.0|", timeout=10); time.sleep(2)
         r = b381_home(); time.sleep(2); shot388(f"i396m-worst-home-{sfx}")
         mb = node_bounds(r, lambda n: (n.get("content-desc") or "") == "更多")
-        if mb: sh(f"input tap {(mb[0] + mb[2]) // 2} {(mb[1] + mb[3]) // 2}"); time.sleep(2.5); shot388(f"i396m-worst-menu-{sfx}"); back(1)
+        if mb:
+            sh(f"input tap {(mb[0] + mb[2]) // 2} {(mb[1] + mb[3]) // 2}"); time.sleep(2.5); shot388(f"i396m-worst-menu-{sfx}")
+            f = flag("worst-menu", sfx); back(1)
+            import glob as _g
+            hp = sorted(_g.glob(f"{OUT}/*i396m-worst-home-{sfx}.png")); mp = sorted(_g.glob(f"{OUT}/*i396m-worst-menu-{sfx}.png"))
+            br = blur_ratio(hp[-1], mp[-1]) if hp and mp else -1.0
+            o[f"worst_ratio_{sfx}"] = br
+            print(f"I396M WORST | {sfx} | page-right-of-menu sharpness ratio {br} | flag {json.dumps(f, ensure_ascii=False)[:200]}", flush=True)
+            # the page behind must be blurred (ratio well under 1) or, if the app could not prove the blur, the fill dense
+            if br > 0.6 and not (isinstance(f, dict) and not f.get("ready") and "dense" in str(f.get("result"))):
+                selftest_fail.append(f"i396m {sfx}: ☰ at glass 0 over photo — page behind still sharp (ratio {br}, flag {f})")
+        else: page_missing.append(f"i396m {sfx}: ☰ not found for the worst case")
         result_json("group", "lookset reset", timeout=10); result_json("group", "wallpaper off", timeout=30)
     for mode, sfx in ((1, "light"), (2, "dark")):
         theme388(mode); step("sheets-" + sfx, lambda sfx=sfx: sheets(sfx))
@@ -5089,7 +5184,7 @@ def b396(res):
         try: f()
         except Exception as e:
             import traceback; traceback.print_exc(); page_missing.append(f"i396 {name} error {e}")
-        if not alive(): crashed.append(f"i396 {name}"); relaunch()
+        if not alive(): crashed.append(f"i396 {name}"); recover(f"i396 {name}")
     set_zh()
     if not I396X: o["seed"] = result_json("group", "i396 seed", timeout=90)   # [i15] b396x already seeded (a second seed duplicated every chat)
     result_json("group", "i396 sky cloudy static", timeout=20)   # [i15] static sky for the rest (swiftshader + live AGSL made long-press flaky)
@@ -5235,6 +5330,7 @@ def finish(lc):
     print("selftest failures:", selftest_fail)
     print("pages not confirmed:", page_missing)
     print("untestable here:", UNTESTABLE)
+    print("recoveries (app restarted after GMS / hang):", RECOVERIES)
     # Mines' own crash log (build-28+), readable through the app's files only for debuggable builds; logcat tag MinesCrash
     for l in log:
         if "MinesCrash" in l:
