@@ -134,10 +134,18 @@ index 0000000..a409c2e
 +设置 › 测试与上报 › 隐私政策				
 +设置 › 测试与上报 › 反馈问题				
 diff --git a/src/android/app/src/main/java/com/openminis/app/MainActivity.kt b/src/android/app/src/main/java/com/openminis/app/MainActivity.kt
-index 7660141..1413515 100644
+index 7660141..df5f521 100644
 --- a/src/android/app/src/main/java/com/openminis/app/MainActivity.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/MainActivity.kt
-@@ -161,6 +161,10 @@ class MainActivity : ComponentActivity() {
+@@ -1,5 +1,7 @@
+ package com.openminis.app
+ 
++import androidx.compose.foundation.layout.fillMaxSize
++import com.openminis.app.ui.plus.glassRootBlur
+ import android.app.LocaleManager
+ import android.content.Intent
+ import android.content.SharedPreferences
+@@ -161,6 +163,10 @@ class MainActivity : ComponentActivity() {
      override fun onCreate(savedInstanceState: Bundle?) {
          super.onCreate(savedInstanceState)
          handleMinesRoute(intent)
@@ -148,7 +156,24 @@ index 7660141..1413515 100644
          // [Mines-voiceprint-35.3] a voiceprint recorded while its model was still missing finishes in the background
          runCatching { if (com.openminis.app.plus.Voiceprint.hasPending(this)) com.openminis.app.plus.Voiceprint.finishInBackground(this) }
  
-@@ -628,6 +632,12 @@ class MainActivity : ComponentActivity() {
+@@ -607,6 +613,8 @@ class MainActivity : ComponentActivity() {
+                     onDispose { job.cancel() }
+                 }
+ 
++                // [Mines-38.9.6 i12] the page behind any open popup / menu / sheet / dialog is blurred here, once (RenderEffect, API 31+)
++                androidx.compose.foundation.layout.Box(androidx.compose.ui.Modifier.fillMaxSize().glassRootBlur()) {
+                 AppNavigation(
+                     chatRepository = app.chatRepository,
+                     providerRepository = app.providerRepository,
+@@ -617,6 +625,7 @@ class MainActivity : ComponentActivity() {
+                     navController = navController,
+                     initialDeepLink = launchDeepLink,
+                 )
++                }
+ 
+                 // T-config: root-level minis-config confirm dialog.
+                 // Bound to ConfigConfirmationGate.pending — the gate
+@@ -628,6 +637,12 @@ class MainActivity : ComponentActivity() {
                  com.openminis.app.ui.settings.ConfigConfirmDialogHost()
                  // [Mines-jobs-25] Background install / check progress + result popups.
                  com.openminis.app.ui.plus.MinesJobsHost()
@@ -161,7 +186,7 @@ index 7660141..1413515 100644
                  // [Mines-38.7] blurred copy of the app under glass dialogs / sheets (replaces FLAG_BLUR_BEHIND)
                  com.openminis.app.ui.plus.GlassBackdropLayer()
              }
-@@ -678,10 +688,12 @@ class MainActivity : ComponentActivity() {
+@@ -678,10 +693,12 @@ class MainActivity : ComponentActivity() {
      override fun onPause() {
          super.onPause()
          com.openminis.app.plus.LoginWeb.flush()
@@ -174,7 +199,7 @@ index 7660141..1413515 100644
          // [Mines-38.7] leaving the app ends the conversation: organise what changed into 知识库 now (no idle wait)
          runCatching { com.openminis.app.plus.ChatKnowledge.onAppStop(this) }
          // [Mines-38.7] last time the app was used (home greeting 「好久不见」)
-@@ -750,8 +762,14 @@ class MainActivity : ComponentActivity() {
+@@ -750,8 +767,14 @@ class MainActivity : ComponentActivity() {
  
      private fun applySavedLanguage() {
          if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
@@ -6323,7 +6348,7 @@ index 0000000..9fbf83f
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MinesSelfCheck.kt b/src/android/app/src/main/java/com/openminis/app/plus/MinesSelfCheck.kt
-index 495166b..b6a26db 100644
+index 495166b..97d52dd 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/MinesSelfCheck.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/MinesSelfCheck.kt
 @@ -73,13 +73,15 @@ object MinesSelfCheck {
@@ -6346,9 +6371,36 @@ index 495166b..b6a26db 100644
          out += timed("Shizuku") {
              val ok = com.openminis.app.sandbox.offload.FastUi.shizukuReady()
              ok to (if (ok) "已授权" else "未运行或未授权")
-@@ -94,14 +96,52 @@ object MinesSelfCheck {
+@@ -93,15 +95,79 @@ object MinesSelfCheck {
+             val (code, text) = MinesJobs.runSync(c, "echo mines-ok; uname -m; df -h / | tail -1", 30_000)
              (code == 0 && text.contains("mines-ok")) to text.replace("\n", " ").take(160)
          }
++        // [Mines-38.9.6 i13] 沙箱代理出口 / Gmail 可达: the sandbox inherits the proxy env (local split proxy → upstream with
++        // Proxy-Authorization), so the exit IP seen from inside must be the proxy's. Nothing here prints credentials.
++        progress("沙箱代理出口")
++        out += timed("沙箱代理出口") {
++            val st = SplitProxy.settings.value
++            val up = st.all.firstOrNull { it.key == SplitProxy.current.value } ?: st.primary
++            val (code, text) = MinesJobs.runSync(c, "command -v curl >/dev/null || timeout 90 apk add --no-cache curl >/dev/null 2>&1; echo \"via=\${HTTPS_PROXY:-direct}\"; curl -sS -m 15 https://api.ipify.org 2>&1 | head -c 200", 120_000)
++            val ip = Regex("""\b(\d{1,3}(?:\.\d{1,3}){3})\b""").findAll(text.substringAfter('\n', text)).lastOrNull()?.value
++            val via = text.lineSequence().firstOrNull { it.startsWith("via=") }?.removePrefix("via=").orEmpty()
++            if (ip == null) return@timed false to "沙箱里查不到出口 IP（退出码 $code）：" + text.lines().lastOrNull { it.isNotBlank() }.orEmpty().take(120)
++            if (up == null) return@timed true to "出口 $ip（没设代理服务器，直连）"
++            val want = runCatching { java.net.InetAddress.getAllByName(up.host).map { it.hostAddress } }.getOrDefault(listOf(up.host))
++            (ip in want) to (if (ip in want) "出口 $ip = 代理 ${up.host}（沙箱经 ${via.ifBlank { "直连" }}）"
++                else "出口 $ip，不是代理 ${up.host}：沙箱流量没走代理（${if (via == "direct" || via.isBlank()) "沙箱没拿到代理变量，检查 分流 › 用于沙箱" else "经 $via"}）")
++        }.let { ch -> if (!ch.ok && SplitProxy.settings.value.primary == null) ch.copy(warn = true) else ch }
++        progress("Gmail 可达")
++        out += timed("Gmail 可达") {
++            val (code, text) = MinesJobs.runSync(c, "command -v curl >/dev/null || timeout 90 apk add --no-cache curl >/dev/null 2>&1; curl -sS -m 20 -o /dev/null -w 'http=%{http_code}' https://mail.google.com/mail/ 2>&1 | tail -c 200; echo; curl -sS -m 20 -o /dev/null -w 'acct=%{http_code}' https://accounts.google.com/ServiceLogin 2>&1 | tail -c 200", 140_000)
++            val gm = Regex("http=(\\d{3})").find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 0
++            val ac = Regex("acct=(\\d{3})").find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 0
++            val app = runCatching { http.newCall(Request.Builder().url("https://mail.google.com/mail/").head().build()).execute().use { it.code } }.getOrDefault(0)
++            val ok = gm in 200..399 && ac in 200..399
++            ok to "沙箱 mail.google.com ${if (gm > 0) "HTTP $gm" else "连不上"} · 登录页 ${if (ac > 0) "HTTP $ac" else "连不上"} · App ${if (app > 0) "HTTP $app" else "连不上"}" +
++                (if (code != 0 && !ok) "（${text.lines().lastOrNull { it.isNotBlank() && !it.contains("=") }.orEmpty().take(80)}）" else "") +
++                " · 网页登录${if (WebProxy.applied) "走代理" else "未走代理"}"
++        }
          progress("MCP 服务器")
 +        // [Mines-38.9.4] issue #2 Bug 3: 「alive:false」 only means the stdio server is not running right now (they start on
 +        // demand). The check now really starts each enabled server (ping), makes sure Node.js / npx is in the sandbox first
@@ -7177,6 +7229,18 @@ index 0000000..27ee1f7
 +        else -> null
 +    }
 +}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SandboxNet.kt b/src/android/app/src/main/java/com/openminis/app/plus/SandboxNet.kt
+index d75d0ae..af2bfb4 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/SandboxNet.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/SandboxNet.kt
+@@ -87,6 +87,7 @@ object SandboxNet {
+         val np = if (url.isNotEmpty()) noProxy() else ""
+         return linkedMapOf(
+             "http_proxy" to url, "https_proxy" to url, "HTTP_PROXY" to url, "HTTPS_PROXY" to url,
++            "all_proxy" to url, "ALL_PROXY" to url,   // [Mines-38.9.6 i13] cleared together with the rest
+             "no_proxy" to np, "NO_PROXY" to np, "MINES_PROXY_SOURCE" to proxySource,
+         )
+     }
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SavedLogins.kt b/src/android/app/src/main/java/com/openminis/app/plus/SavedLogins.kt
 index 44c570e..987447d 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/SavedLogins.kt
@@ -8244,6 +8308,180 @@ index 2b50977..3f3e165 100644
          lastRead = System.currentTimeMillis()
          val out = ArrayList<Digest.Item>()
          // [Mines-38.7] every signed-in account of a platform is read with ITS OWN session (isolated store / saved set);
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt b/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt
+index 4290a7b..f2e52a7 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt
+@@ -61,16 +61,24 @@ object SplitProxy {
+         // current one stops working traffic moves to the next healthy one.
+         val backups: List<Upstream> = emptyList(),
+         val autoSwitch: Boolean = true,
++        // [Mines-38.9.6 i12] user 2026-10-18: an authenticated HTTP proxy (HK :24445) never worked — Mines sent CONNECT / the
++        // forwarded request with NO Proxy-Authorization, got 407, marked the proxy dead and went direct. User name in prefs,
++        // password in PlusVault (Keystore AES-GCM), never logged.
++        val upstreamUser: String = "",
++        val upstreamPass: String = "",
+     ) {
+-        val primary: Upstream? get() = Upstream(upstreamType, upstreamHost.trim(), upstreamPort).takeIf { it.valid }
++        val primary: Upstream? get() = Upstream(upstreamType, upstreamHost.trim(), upstreamPort, user = upstreamUser.trim(), pass = upstreamPass).takeIf { it.valid }
+         /** Primary first, then backups, no duplicates. */
+         val all: List<Upstream> get() = (listOfNotNull(primary) + backups.filter { it.valid }).distinctBy { it.key }
+         val hasUpstream: Boolean get() = all.isNotEmpty()
+     }
+ 
+-    data class Upstream(val type: String, val host: String, val port: Int, val label: String = "") {
++    data class Upstream(val type: String, val host: String, val port: Int, val label: String = "", val user: String = "", val pass: String = "") {
+         val valid: Boolean get() = host.isNotBlank() && port in 1..65535
+         val key: String get() = "$type://$host:$port"
++        /** "Proxy-Authorization: Basic …\r\n" or "" (HTTP upstreams with a user) */
++        val authHeader: String get() = SplitProxyCore.authLine(user, pass)
++        override fun toString(): String = "Upstream($type://$host:$port${if (user.isNotEmpty()) " auth" else ""})"   // never the password
+     }
+ 
+     /** Health of one upstream: latency in ms, or null when the check failed. */
+@@ -141,6 +149,8 @@ object SplitProxy {
+                 (0 until a.length()).map { i -> a.getJSONObject(i).let { Upstream(it.optString("t", "http"), it.optString("h"), it.optInt("p"), it.optString("l")) } }
+             }.getOrDefault(emptyList()),
+             autoSwitch = p.getBoolean("autoswitch", true),
++            upstreamUser = p.getString("uuser", "") ?: "",
++            upstreamPass = runCatching { ctxRef?.let { PlusVault.init(it) }; PlusVault.secretExtra("splitproxy", "upass").orEmpty() }.getOrDefault(""),
+         )
+     }
+ 
+@@ -154,10 +164,12 @@ object SplitProxy {
+             ?.putInt("uport", n.upstreamPort)?.putString("default", n.defaultMode.name)?.putString("rules", rules.toString())
+             ?.putBoolean("sandbox", n.forSandbox)?.putBoolean("app", n.forApp)
+             ?.putString("backups", JSONArray().apply { n.backups.forEach { put(JSONObject().put("t", it.type).put("h", it.host).put("p", it.port).put("l", it.label)) } }.toString())
+-            ?.putBoolean("autoswitch", n.autoSwitch)?.apply()
++            ?.putBoolean("autoswitch", n.autoSwitch)?.putString("uuser", n.upstreamUser.trim())?.apply()
++        runCatching { PlusVault.setSecretExtra("splitproxy", "upass", n.upstreamPass.ifEmpty { null }) }
+         _current.value = null
+         autoCache.clear()
+         if (n.enabled) start() else stop()
++        if (n.enabled && _running.value) WebProxy.apply(n.forApp)   // [Mines-38.9.6 i13] 用于 App toggled while running
+     }
+ 
+     fun addPreset(context: Context, preset: Preset) = update(context) { s ->
+@@ -205,6 +217,8 @@ object SplitProxy {
+         "github.com", "githubusercontent.com", "githubassets.com", "ghcr.io", "docker.io", "docker.com",
+         "crates.io", "golang.org", "go.dev", "rustup.rs", "rust-lang.org", "huggingface.co", "gradle.org", "maven.org",
+         "googleapis.com", "google.com", "gstatic.com",
++        // [Mines-38.9.6 i13] Gmail sign-in / 验证码 pages and the 自检 egress probe always use the proxy in 自动
++        "gmail.com", "googlemail.com", "googleusercontent.com", "api.ipify.org",
+     )
+     private fun builtinForeign(host: String): Boolean {
+         val h = host.lowercase().trimEnd('.')
+@@ -261,6 +275,9 @@ object SplitProxy {
+         val url = "http://127.0.0.1:$PORT"
+         return linkedMapOf(
+             "http_proxy" to url, "https_proxy" to url, "HTTP_PROXY" to url, "HTTPS_PROXY" to url,
++            // [Mines-38.9.6 i13] ALL_PROXY too (git/ssh-less tools, some curl builds); the local split proxy adds the
++            // upstream's Proxy-Authorization itself, so no credential ever reaches the sandbox env
++            "all_proxy" to url, "ALL_PROXY" to url,
+             "no_proxy" to "localhost,127.0.0.1,::1", "NO_PROXY" to "localhost,127.0.0.1,::1",
+         )
+     }
+@@ -284,6 +301,7 @@ object SplitProxy {
+                 }
+             }, "split-proxy-accept").apply { isDaemon = true }.start()
+             Log.i(TAG, "listening on $PORT")
++            WebProxy.apply(_settings.value.forApp)
+         } catch (e: Exception) {
+             Log.w(TAG, "start failed: ${e.message}")
+             _running.value = false
+@@ -292,6 +310,7 @@ object SplitProxy {
+ 
+     @Synchronized
+     private fun stop() {
++        WebProxy.apply(false)
+         runCatching { server?.close() }
+         server = null
+         _running.value = false
+@@ -509,7 +528,9 @@ object SplitProxy {
+                     if (method.equals("CONNECT", true)) {
+                         c.getOutputStream().write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray())
+                     } else if (up.getTag() == "http-proxy") {
+-                        uo.write(head)                              // absolute-form to the upstream proxy
++                        // absolute-form to the upstream proxy (+ its Proxy-Authorization, [Mines-38.9.6])
++                        val auth = auths.remove(up)
++                        uo.write(if (auth == null) head else SplitProxyCore.withAuth(text, auth).toByteArray(Charsets.ISO_8859_1))
+                     } else {
+                         val u = URI(target)
+                         val origin = (u.rawPath?.ifEmpty { "/" } ?: "/") + (u.rawQuery?.let { "?$it" } ?: "")
+@@ -541,6 +562,7 @@ object SplitProxy {
+ 
+     private val tags = java.util.Collections.synchronizedMap(java.util.WeakHashMap<Socket, String>())
+     private fun Socket.getTag(): String? = tags[this]
++    private val auths = java.util.Collections.synchronizedMap(java.util.WeakHashMap<Socket, String>())
+ 
+     private const val IDLE_MS = 180_000L
+ 
+@@ -633,9 +655,9 @@ object SplitProxy {
+         }
+         val sock = Socket(Proxy.NO_PROXY).apply { connect(InetSocketAddress(u.host, u.port), timeout) }
+         if (tunnel) sock.soTimeout = timeout
+-        if (!tunnel) { tags[sock] = "http-proxy"; return sock }
++        if (!tunnel) { tags[sock] = "http-proxy"; if (u.user.isNotEmpty()) auths[sock] = u.authHeader; return sock }
+         val o = sock.getOutputStream()
+-        o.write("CONNECT $host:$port HTTP/1.1\r\nHost: $host:$port\r\n\r\n".toByteArray())
++        o.write("CONNECT $host:$port HTTP/1.1\r\nHost: $host:$port\r\n${u.authHeader}\r\n".toByteArray(Charsets.ISO_8859_1))
+         o.flush()
+         val head = readHead(sock.getInputStream()) ?: throw IOException("upstream closed")
+         val status = String(head, Charsets.ISO_8859_1).substringBefore("\r\n")
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SplitProxyCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/SplitProxyCore.kt
+new file mode 100644
+index 0000000..930610b
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/SplitProxyCore.kt
+@@ -0,0 +1,48 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-38.9.6 i12] Pure helpers for the authenticated upstream proxy (unit-tested in SplitProxyCoreTest):
++ * Basic credentials (RFC 7617, UTF-8), the header injected into a forwarded request, and "http://user:pass@host:port"
++ * parsing for the 自己填代理 fields. Nothing here logs; [Parsed.toString] hides the password.
++ */
++object SplitProxyCore {
++    fun basic(user: String, pass: String): String =
++        "Basic " + java.util.Base64.getEncoder().encodeToString("$user:$pass".toByteArray(Charsets.UTF_8))
++
++    /** the whole header line (with CRLF) or "" when there is no user */
++    fun authLine(user: String, pass: String): String = if (user.isEmpty()) "" else "Proxy-Authorization: ${basic(user, pass)}\r\n"
++
++    /** Adds [authLine] to a request head (replacing a client's own Proxy-Authorization); keeps the blank line at the end. */
++    fun withAuth(head: String, authLine: String): String {
++        if (authLine.isEmpty()) return head
++        val i = head.indexOf("\r\n")
++        if (i < 0) return head
++        val rest = head.substring(i + 2).replace(Regex("(?im)^proxy-authorization:.*\\r\\n"), "")
++        return head.substring(0, i + 2) + authLine + rest
++    }
++
++    data class Parsed(val type: String, val host: String, val port: Int, val user: String, val pass: String) {
++        override fun toString() = "Parsed($type://$host:$port${if (user.isNotEmpty()) " auth" else ""})"
++    }
++
++    /** "http://u:p@h:24445", "socks5://h:1080", "u:p@h:3128", "h:8080" → parts (user / pass URL-decoded); null if no host/port. */
++    fun parse(input: String): Parsed? {
++        var s = input.trim()
++        if (s.isEmpty()) return null
++        val type = when {
++            s.startsWith("socks5://", true) || s.startsWith("socks://", true) -> "socks5"
++            else -> "http"
++        }
++        s = s.substringAfter("://", s).trimEnd('/')
++        val at = s.lastIndexOf('@')
++        val cred = if (at >= 0) s.substring(0, at) else ""
++        val hp = if (at >= 0) s.substring(at + 1) else s
++        val host = hp.substringBeforeLast(':').removePrefix("[").removeSuffix("]")
++        val port = hp.substringAfterLast(':', "").toIntOrNull() ?: return null
++        if (host.isBlank() || port !in 1..65535) return null
++        fun dec(x: String) = runCatching { java.net.URLDecoder.decode(x, "UTF-8") }.getOrDefault(x)
++        val user = dec(cred.substringBefore(':', cred)); val pass = if (cred.contains(':')) dec(cred.substringAfter(':')) else ""
++        return Parsed(type, host, port, user, pass)
++    }
++}
++
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/TaskProgress.kt b/src/android/app/src/main/java/com/openminis/app/plus/TaskProgress.kt
 new file mode 100644
 index 0000000..74415b7
@@ -9204,6 +9442,36 @@ index 0000000..3fd3291
 +        if (!shouldBlock(u, ph)) return null
 +        blocked++
 +        return WebResourceResponse("text/plain", "utf-8", 204, "No Content", emptyMap(), java.io.ByteArrayInputStream(ByteArray(0)))
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/WebProxy.kt b/src/android/app/src/main/java/com/openminis/app/plus/WebProxy.kt
+new file mode 100644
+index 0000000..15b2797
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/WebProxy.kt
+@@ -0,0 +1,24 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-38.9.6 i12] WebView traffic through the local split proxy (androidx.webkit ProxyController). The WebView itself
++ * never sees the upstream credentials: 127.0.0.1:[SplitProxy.PORT] adds Proxy-Authorization upstream. Before this the
++ * Gmail / Google sign-in pages in Mines ignored the proxy (WebView does not use the app's ProxySelector).
++ */
++object WebProxy {
++    @Volatile var applied: Boolean = false; private set
++    fun apply(on: Boolean) {
++        runCatching {
++            if (!androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.PROXY_OVERRIDE)) return
++            val pc = androidx.webkit.ProxyController.getInstance()
++            val ex = java.util.concurrent.Executor { it.run() }
++            if (on) {
++                val cfg = androidx.webkit.ProxyConfig.Builder()
++                    .addProxyRule("127.0.0.1:${SplitProxy.PORT}")
++                    .addBypassRule("localhost").addBypassRule("127.0.0.1").addBypassRule("10.0.2.2")
++                    .build()
++                pc.setProxyOverride(cfg, ex) { applied = true }
++            } else if (applied) pc.clearProxyOverride(ex) { applied = false }
++        }
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/WebSession.kt b/src/android/app/src/main/java/com/openminis/app/plus/WebSession.kt
@@ -11580,6 +11848,18 @@ index 0000000..3d850da
 +
 +    fun shouldRetry(code: Int, errorBody: String, body: JSONObject): Boolean = body.has("thinking") && isUnsupported(code, errorBody)
 +}
+diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/PRootKernel.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/PRootKernel.kt
+index e86c029..9fbd96f 100644
+--- a/src/android/app/src/main/java/com/openminis/app/sandbox/PRootKernel.kt
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/PRootKernel.kt
+@@ -621,6 +621,7 @@ object PRootKernel {
+     private val PROXY_KEYS = listOf(
+         "http_proxy", "https_proxy",
+         "HTTP_PROXY", "HTTPS_PROXY",
++        "all_proxy", "ALL_PROXY",
+         "no_proxy", "NO_PROXY",
+     )
+ 
 diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt
 index bf0df66..ac07bce 100644
 --- a/src/android/app/src/main/java/com/openminis/app/sandbox/offload/AccessibilityOffloadHandler.kt
@@ -12658,7 +12938,7 @@ index 2df1574..5a2b193 100644
  import androidx.compose.material3.Icon
  import androidx.compose.material3.IconButton
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatComposerWidgets.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatComposerWidgets.kt
-index c4580f1..7c85006 100644
+index c4580f1..a0d67a9 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatComposerWidgets.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatComposerWidgets.kt
 @@ -136,7 +136,7 @@ import androidx.compose.material.icons.filled.MoreVert
@@ -12679,7 +12959,15 @@ index c4580f1..7c85006 100644
  import androidx.compose.material3.rememberModalBottomSheetState
  import androidx.compose.material3.Icon
  import androidx.compose.material3.IconButton
-@@ -394,7 +394,7 @@ internal fun AttachmentChip(
+@@ -178,6 +178,7 @@ import androidx.compose.runtime.snapshotFlow
+ import androidx.compose.runtime.setValue
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
++import com.openminis.app.ui.plus.glassInput
+ import androidx.compose.ui.draw.alpha
+ import androidx.compose.ui.draw.clip
+ import androidx.compose.ui.draw.drawBehind
+@@ -394,7 +395,7 @@ internal fun AttachmentChip(
          ) {
              Icon(
                  Icons.Default.Close,
@@ -12688,7 +12976,7 @@ index c4580f1..7c85006 100644
                  tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
                  modifier = Modifier.size(13.dp),
              )
-@@ -864,7 +864,7 @@ private fun ToolPreviewThumbnail(
+@@ -864,7 +865,7 @@ private fun ToolPreviewThumbnail(
                  if (bmp != null) {
                      Image(
                          bitmap = bmp.asImageBitmap(),
@@ -12697,7 +12985,7 @@ index c4580f1..7c85006 100644
                          contentScale = ContentScale.Crop,
                          modifier = Modifier.fillMaxSize(),
                      )
-@@ -908,7 +908,7 @@ private fun ToolPreviewThumbnail(
+@@ -908,7 +909,7 @@ private fun ToolPreviewThumbnail(
                  if (bitmap != null) {
                      Image(
                          bitmap = bitmap.asImageBitmap(),
@@ -12706,6 +12994,16 @@ index c4580f1..7c85006 100644
                          contentScale = ContentScale.Crop,
                          modifier = Modifier.fillMaxSize(),
                      )
+@@ -1097,8 +1098,7 @@ internal fun FloatingToolStatusBar(
+                 .fillMaxWidth()
+                 .height(barHeight)
+                 .align(Alignment.BottomCenter)
+-                .shadow(elevation = 8.dp, shape = RoundedCornerShape(10.dp), ambientColor = Color.Black.copy(alpha = 0.06f), spotColor = Color.Black.copy(alpha = 0.12f))
+-                .background(ChatColors.inputBg, RoundedCornerShape(10.dp))
++                .glassInput(RoundedCornerShape(10.dp), com.openminis.app.ui.plus.glassInputFill(field = true), ChatColors.isDark)   // [Mines-38.9.6] shared glass
+                 .border(0.5.dp, ChatColors.toolBorder, RoundedCornerShape(10.dp))
+                 .padding(start = barStartPadding, end = 12.dp),
+             verticalAlignment = Alignment.CenterVertically,
 @@ -1157,7 +1157,7 @@ internal fun FloatingToolStatusBar(
                  ) {
                      Icon(
@@ -12796,7 +13094,7 @@ index 2cfa24b..2d0ad0d 100644
                  )
              }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatModelPickerSheet.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatModelPickerSheet.kt
-index 21417ad..023878b 100644
+index 21417ad..595bdb1 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatModelPickerSheet.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatModelPickerSheet.kt
 @@ -135,7 +135,7 @@ import androidx.compose.material.icons.filled.MoreVert
@@ -12833,6 +13131,24 @@ index 21417ad..023878b 100644
      }
  
      /**
+@@ -503,7 +508,7 @@ internal fun ModelPickerSheet(
+                         enabled = true,
+                         isError = false,
+                         interactionSource = searchInteraction,
+-                        colors = OutlinedTextFieldDefaults.colors(),
++                        colors = com.openminis.app.ui.plus.glassFieldColors(),   // [Mines-38.9.6] filled glass search field
+                         // Zero vertical: the 42dp frame plus the icons already
+                         // give the text room; any inset here re-clips it.
+                         contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+@@ -512,7 +517,7 @@ internal fun ModelPickerSheet(
+                                 enabled = true,
+                                 isError = false,
+                                 interactionSource = searchInteraction,
+-                                colors = OutlinedTextFieldDefaults.colors(),
++                                colors = com.openminis.app.ui.plus.glassFieldColors(),   // [Mines-38.9.6] filled glass search field
+                                 shape = RoundedCornerShape(50),
+                             )
+                         },
 @@ -531,6 +536,32 @@ internal fun ModelPickerSheet(
                      .weight(1f, fill = false)
                      .nestedScroll(pickerScrollGuard),
@@ -12888,7 +13204,7 @@ index 917c7bb..1153000 100644
                  // An all-zero row carries nothing worth a capsule.
                  if (u.inputTokens == 0 && u.outputTokens == 0 &&
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt
-index aadbc71..c2a69ee 100644
+index aadbc71..eada9e3 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt
 @@ -138,7 +138,7 @@ import androidx.compose.material.icons.filled.RadioButtonChecked
@@ -12909,7 +13225,15 @@ index aadbc71..c2a69ee 100644
  import androidx.compose.material3.rememberModalBottomSheetState
  import androidx.compose.material3.Icon
  import androidx.compose.material3.IconButton
-@@ -945,6 +945,7 @@ fun ChatScreen(
+@@ -202,6 +202,7 @@ import androidx.compose.runtime.snapshotFlow
+ import androidx.compose.runtime.setValue
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
++import com.openminis.app.ui.plus.glassInput
+ import androidx.compose.ui.draw.alpha
+ import androidx.compose.ui.draw.clip
+ import androidx.compose.ui.draw.drawBehind
+@@ -945,6 +946,7 @@ fun ChatScreen(
      var showThinkingLevelSheet by remember { mutableStateOf(false) }
      var showAttachMenu by remember { mutableStateOf(false) }
      var showChatMenu by remember { mutableStateOf(false) }
@@ -12917,7 +13241,7 @@ index aadbc71..c2a69ee 100644
      var showSkillsSheet by remember { mutableStateOf(false) }
      // [T-mcp-integration-android] MCPs-in-Session sheet visibility.
      var showMcpsSheet by remember { mutableStateOf(false) }
-@@ -3075,8 +3076,10 @@ fun ChatScreen(
+@@ -3075,8 +3077,10 @@ fun ChatScreen(
                                  // navbar is narrow; the badge has no weight, so it
                                  // keeps its intrinsic width and always renders in
                                  // full — the level label never gets clipped.
@@ -12930,7 +13254,7 @@ index aadbc71..c2a69ee 100644
                                      val thinkingLevelBadgeState by viewModel.thinkingLevel.collectAsState()
                                      Row(
                                          verticalAlignment = Alignment.CenterVertically,
-@@ -3154,7 +3157,7 @@ fun ChatScreen(
+@@ -3154,7 +3158,7 @@ fun ChatScreen(
                      // [T-android-tablet-split] See `isTwoPane`.
                      if (!isTwoPane) {
                          IconButton(onClick = onBack) {
@@ -12939,7 +13263,7 @@ index aadbc71..c2a69ee 100644
                          }
                      } else if (onToggleSidebar != null) {
                          // [T-android-tablet-sidebar-collapse] The slot the back
-@@ -3232,7 +3235,7 @@ fun ChatScreen(
+@@ -3232,7 +3236,7 @@ fun ChatScreen(
                      // iOS: "..." circle button → dropdown menu
                      Box {
                          IconButton(onClick = { showChatMenu = true }) {
@@ -12948,7 +13272,7 @@ index aadbc71..c2a69ee 100644
                          }
                          MinisMenu(
                              expanded = showChatMenu,
-@@ -3267,6 +3270,25 @@ fun ChatScreen(
+@@ -3267,6 +3271,25 @@ fun ChatScreen(
                                      MenuItemIcon(MinisIcons.SquareAndPencil)
                                  },
                              )
@@ -12974,7 +13298,7 @@ index aadbc71..c2a69ee 100644
                              MinisMenuDivider()
                              // Clear Chat (iOS parity, red)
                              DropdownMenuItem(
-@@ -3520,7 +3542,7 @@ fun ChatScreen(
+@@ -3520,7 +3543,7 @@ fun ChatScreen(
                  // [Mines-38.5] avatar (34 dp, fixed) + title + model row (both sp): grow with font scale, so at the user's
                  // 1.18 the model row is no longer clipped by the bar's bottom edge (82 dp fitted only scale 1.0).
                  expandedHeight = androidx.compose.ui.unit.Dp(
@@ -12983,7 +13307,7 @@ index aadbc71..c2a69ee 100644
              )
          },
          snackbarHost = { SnackbarHost(snackbarHostState) },
-@@ -4463,6 +4485,7 @@ fun ChatScreen(
+@@ -4463,6 +4486,7 @@ fun ChatScreen(
                                  // bubble shows its own action menu (Copy /
                                  // Retry / Edit) instead of starting text
                                  // selection, matching iOS UX.
@@ -12991,7 +13315,7 @@ index aadbc71..c2a69ee 100644
                                  UserMessageBubble(
                                  message = item.message,
                                  // [T-android-candidate-bubble-gap] extra top
-@@ -4473,6 +4496,10 @@ fun ChatScreen(
+@@ -4473,6 +4497,10 @@ fun ChatScreen(
                                      val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
                                      clipboard.setPrimaryClip(android.content.ClipData.newPlainText("message", item.message.content))
                                  },
@@ -13002,7 +13326,7 @@ index aadbc71..c2a69ee 100644
                                  // T119: pass null while a turn is in flight so
                                  // the long-press menu hides Retry; once the
                                  // stream stops (cancel or natural end) the
-@@ -4541,6 +4568,8 @@ fun ChatScreen(
+@@ -4541,6 +4569,8 @@ fun ChatScreen(
                                      }
                                  },
                              )
@@ -13011,7 +13335,7 @@ index aadbc71..c2a69ee 100644
                              } // close UserBubble SideEffect + UserMessageBubble block
                              is FlatChatItem.AssistantHeader -> AssistantHeader()
                              is FlatChatItem.AssistantText -> BoundsTrackedBlock(
-@@ -4551,6 +4580,7 @@ fun ChatScreen(
+@@ -4551,6 +4581,7 @@ fun ChatScreen(
                                  // T-android-gc-storm-issue17: collapse oversized frozen
                                  // assistant text before feeding the markdown parser, which
                                  // is the GC-storm hotspot for legacy sessions.
@@ -13019,7 +13343,7 @@ index aadbc71..c2a69ee 100644
                                  LargeContentGuard(
                                      content = item.block.content,
                                      isStreaming = item.isStreaming,
-@@ -4568,12 +4598,16 @@ fun ChatScreen(
+@@ -4568,12 +4599,16 @@ fun ChatScreen(
                                          ),
                                      )
                                  }
@@ -13036,7 +13360,7 @@ index aadbc71..c2a69ee 100644
                                  LargeContentGuard(
                                      content = item.rawText,
                                      isStreaming = item.isStreaming,
-@@ -4591,6 +4625,8 @@ fun ChatScreen(
+@@ -4591,6 +4626,8 @@ fun ChatScreen(
                                          ),
                                      )
                                  }
@@ -13045,7 +13369,7 @@ index aadbc71..c2a69ee 100644
                              } }
                              is FlatChatItem.AssistantThinking -> {
                                  // T300: hide Deep Thinking block when the user
-@@ -4810,6 +4846,18 @@ fun ChatScreen(
+@@ -4810,6 +4847,18 @@ fun ChatScreen(
                                      ) {
                                          UsageCapsule(usage = item.usage, completedAt = item.completedAt)
                                      }
@@ -13064,7 +13388,7 @@ index aadbc71..c2a69ee 100644
                                  }
                              }
                              is FlatChatItem.AssistantError -> InlineErrorBanner(
-@@ -4929,6 +4977,11 @@ fun ChatScreen(
+@@ -4929,6 +4978,11 @@ fun ChatScreen(
                              try { inputFocusRequester.requestFocus() } catch (_: IllegalStateException) {}
                              keyboardController?.show()
                          },
@@ -13076,7 +13400,7 @@ index aadbc71..c2a69ee 100644
                          // [T-android-selection-readaloud] Speak the selection
                          // through the same screen-scoped lazy player the
                          // Compose-SelectionContainer toolbar uses.
-@@ -5192,7 +5245,7 @@ fun ChatScreen(
+@@ -5192,7 +5246,7 @@ fun ChatScreen(
                              // anchor" for the turn-walk, and keeps this button visually
                              // distinct from the down button's plain chevron.
                              imageVector = Icons.Default.VerticalAlignTop,
@@ -13085,7 +13409,7 @@ index aadbc71..c2a69ee 100644
                              modifier = Modifier.size(20.dp),
                          )
                      }
-@@ -5240,7 +5293,7 @@ fun ChatScreen(
+@@ -5240,7 +5294,7 @@ fun ChatScreen(
                      ) {
                          Icon(
                              imageVector = Icons.Default.KeyboardArrowDown,
@@ -13094,7 +13418,61 @@ index aadbc71..c2a69ee 100644
                              modifier = Modifier.size(20.dp),
                          )
                      }
-@@ -6176,6 +6229,17 @@ fun ChatScreen(
+@@ -5397,8 +5451,7 @@ fun ChatScreen(
+                                 .padding(horizontal = 12.dp)
+                                 // T240: keep a thin visible border instead of the
+                                 // diffuse 8dp halo that bled out past the panel edge.
+-                                .shadow(elevation = 3.dp, shape = RoundedCornerShape(10.dp))
+-                                .background(ChatColors.inputBg, RoundedCornerShape(10.dp))
++                                .glassInput(RoundedCornerShape(10.dp), com.openminis.app.ui.plus.glassInputFill(field = true), ChatColors.isDark)   // [Mines-38.9.6] slash / @ panel = shared glass
+                                 .border(0.5.dp, ChatColors.toolBorder, RoundedCornerShape(10.dp)),
+                         ) {
+                             androidx.compose.foundation.lazy.LazyColumn(
+@@ -5588,8 +5641,7 @@ fun ChatScreen(
+                                     },
+                                 )
+                                 .padding(horizontal = 12.dp)
+-                                .shadow(elevation = 8.dp, shape = RoundedCornerShape(10.dp))
+-                                .background(ChatColors.inputBg, RoundedCornerShape(10.dp))
++                                .glassInput(RoundedCornerShape(10.dp), com.openminis.app.ui.plus.glassInputFill(field = true), ChatColors.isDark)   // [Mines-38.9.6] @ panel = shared glass
+                                 .border(0.5.dp, ChatColors.toolBorder, RoundedCornerShape(10.dp)),
+                         ) {
+                             if (mentionEntries.isEmpty()) {
+@@ -5844,30 +5896,9 @@ fun ChatScreen(
+                 Column(
+                     modifier = Modifier
+                         .fillMaxWidth()
+-                        .drawBehind {
+-                            val radiusPx = 20.dp.toPx()
+-                            val canvas = drawContext.canvas.nativeCanvas
+-                            // Pass 1: symmetric ambient halo — small blur, low alpha.
+-                            shadowPaint.setShadowLayer(
+-                                6.dp.toPx(), 0f, 0f,
+-                                android.graphics.Color.argb(22, 0, 0, 0),
+-                            )
+-                            canvas.drawRoundRect(
+-                                0f, 0f, size.width, size.height,
+-                                radiusPx, radiusPx,
+-                                shadowPaint,
+-                            )
+-                            // Pass 2: soft downward shadow (spot light).
+-                            shadowPaint.setShadowLayer(
+-                                10.dp.toPx(), 0f, 3.dp.toPx(),
+-                                android.graphics.Color.argb(24, 0, 0, 0),
+-                            )
+-                            canvas.drawRoundRect(
+-                                0f, 0f, size.width, size.height,
+-                                radiusPx, radiusPx,
+-                                shadowPaint,
+-                            )
+-                        }
++                        // [Mines-38.9.6 i12] the composer is the shared input glass (was an opaque card with no rim: 「看不清」):
++                        // dense tint (≥ 90 %, it sits over sharp chat text with no blur), soft visible rim, halo outside only
++                        .glassInput(RoundedCornerShape(20.dp), com.openminis.app.ui.plus.glassInputFill(field = true), ChatColors.isDark)
+                         // [T-android-context-usage-hint] Ambient inner glow
+                         // along the card's inside edge once the context window
+                         // is under pressure. Applied to the composer CARD (not
+@@ -6176,6 +6207,17 @@ fun ChatScreen(
                      // text is already delta-appended into `inputText` by the
                      // mic button's callback, so when recording ends the field
                      // shows the full recognized string automatically.
@@ -13112,7 +13490,7 @@ index aadbc71..c2a69ee 100644
                      val recSttState by com.openminis.app.speech.SpeechRecognitionManager
                          .state.collectAsState()
                      val recIsRecording = recSttState == com.openminis.app.speech.RecognitionState.RECORDING ||
-@@ -6807,7 +6871,7 @@ fun ChatScreen(
+@@ -6807,7 +6849,7 @@ fun ChatScreen(
                              ) {
                                  Icon(
                                      Icons.Default.Add,
@@ -13121,7 +13499,7 @@ index aadbc71..c2a69ee 100644
                                      tint = MaterialTheme.colorScheme.onSurfaceVariant,
                                      modifier = Modifier.size(20.dp),
                                  )
-@@ -7368,7 +7432,7 @@ fun ChatScreen(
+@@ -7368,7 +7410,7 @@ fun ChatScreen(
                              ) {
                                  Icon(
                                      Icons.Default.Stop,
@@ -13130,7 +13508,7 @@ index aadbc71..c2a69ee 100644
                                      tint = Color.White,
                                      modifier = Modifier.size(20.dp),
                                  )
-@@ -7590,7 +7654,7 @@ fun ChatScreen(
+@@ -7590,7 +7632,7 @@ fun ChatScreen(
      var minesVerifyShownFor by remember { mutableStateOf(0L) }
      minesVerify?.let { pv ->
          if (minesVerifyShownFor != pv.since && !showBrowserSheet) {
@@ -13722,6 +14100,51 @@ index 8b92488..962b716 100644
  import androidx.compose.material3.Text
  import androidx.compose.material3.TextButton
  import androidx.compose.material3.rememberModalBottomSheetState
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/SendReturnModeMenu.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/SendReturnModeMenu.kt
+index 0541d2d..cd86468 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/chat/SendReturnModeMenu.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/SendReturnModeMenu.kt
+@@ -330,16 +330,9 @@ private fun SendReturnModeMenu(
+         properties = PopupProperties(focusable = false, dismissOnClickOutside = true),
+     ) {
+         val shape = RoundedCornerShape(20.dp)
+-        // Same surface language as MinisMenu (elevated container in dark,
+-        // white in light, launcher-style soft halo, hairline border), with a
+-        // touch of translucency so the composer reads through the edges.
+-        val container = if (ChatColors.isDark) MaterialTheme.colorScheme.surfaceContainerHigh else Color.White
+-        val border = if (ChatColors.isDark) {
+-            BorderStroke(0.5.dp, MaterialTheme.colorScheme.outlineVariant)
+-        } else {
+-            BorderStroke(0.5.dp, Color.Black.copy(alpha = 0.05f))
+-        }
+-        Surface(
++        // [Mines-38.9.6 i12] the shared glass (GlassSurface): no elevation shadow under a translucent fill
++        com.openminis.app.ui.plus.GlassWindowEffect()
++        com.openminis.app.ui.plus.GlassSurface(
+             modifier = Modifier
+                 .graphicsLayer {
+                     val p = progress.value
+@@ -350,18 +343,9 @@ private fun SendReturnModeMenu(
+                     transformOrigin = origin.value
+                 }
+                 .width(IntrinsicSize.Max)
+-                .widthIn(min = 200.dp, max = 280.dp)
+-                .shadow(
+-                    elevation = 24.dp,
+-                    shape = shape,
+-                    clip = false,
+-                    ambientColor = Color.Black.copy(alpha = 0.35f),
+-                    spotColor = Color.Black.copy(alpha = 0.35f),
+-                ),
++                .widthIn(min = 200.dp, max = 280.dp),
+             shape = shape,
+-            color = container.copy(alpha = 0.97f),
+-            tonalElevation = 3.dp,
+-            border = border,
++            halo = false,
+         ) {
+             Column(modifier = Modifier.padding(vertical = 6.dp).selectableGroup()) {
+                 val header = stringResource(R.string.appearance_section_return_key)
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/SessionSkillsSheet.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/SessionSkillsSheet.kt
 index 0baa44f..124c152 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/SessionSkillsSheet.kt
@@ -17626,7 +18049,7 @@ index 0000000..6bc0f8d
 +    return bands?.let { r -> r.mapNotNull { h.getOrNull(it) }.maxOrNull() } ?: h.max()
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassDialogs.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassDialogs.kt
-index 8a17234..0098ff9 100644
+index 8a17234..77d555e 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassDialogs.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassDialogs.kt
 @@ -8,6 +8,7 @@ import androidx.compose.foundation.BorderStroke
@@ -17649,7 +18072,41 @@ index 8a17234..0098ff9 100644
  import androidx.compose.material3.Text
  import androidx.compose.material3.rememberModalBottomSheetState
  import androidx.compose.runtime.Composable
-@@ -138,7 +139,8 @@ object GlassBackdrop {
+@@ -112,9 +113,19 @@ object GlassBackdrop {
+         return null
+     }
+ 
++    /** [Mines-38.9.6 i12] a glass popup / sheet / dialog is open (drives the root blur + scrim) */
++    val active = kotlinx.coroutines.flow.MutableStateFlow(false)
++    /** the page behind is blurred now (RenderEffect on 31+, or the copy has arrived) */
++    val ready = kotlinx.coroutines.flow.MutableStateFlow(false)
++    /** RenderEffect path (API 31+); the smoke / old phones use the copied, software-blurred page */
++    val live: Boolean get() = Build.VERSION.SDK_INT >= 31
++
+     fun show(ctx: android.content.Context) {
+         count++
+         if (count != 1) return
++        active.value = true
++        FogClock.holdUntil = Long.MAX_VALUE   // the page stays still while blurred → the blurred layer is cached
++        if (live) { ready.value = true; lastResult = "renderEffect"; return }
+         val a = activityOf(ctx) ?: run { lastResult = "no activity"; return }
+         val w = a.window; val v = w.decorView
+         if (v.width <= 0 || v.height <= 0) { lastResult = "no size"; return }
+@@ -124,6 +135,7 @@ object GlassBackdrop {
+                 if (res == android.view.PixelCopy.SUCCESS && count > 0) {
+                     val small = blurSmall(full)
+                     bitmap.value = small.asImageBitmap()
++                    ready.value = true
+                     lastResult = "ok ${small.width}x${small.height}"
+                 } else lastResult = "pixelcopy $res"
+                 full.recycle()
+@@ -133,12 +145,13 @@ object GlassBackdrop {
+ 
+     fun hide() {
+         count = (count - 1).coerceAtLeast(0)
+-        if (count == 0) bitmap.value = null
++        if (count == 0) { bitmap.value = null; ready.value = false; active.value = false; FogClock.holdUntil = 0L }
+     }
  
      /** ~90 px wide copy, three box-blur passes each way (≈ gaussian), ready to be drawn back up with bilinear filtering. */
      fun blurSmall(src: android.graphics.Bitmap): android.graphics.Bitmap {
@@ -17659,7 +18116,7 @@ index 8a17234..0098ff9 100644
          // two filtered halvings before the final size: a plain one-step shrink aliases fine text into moiré
          var cur = src
          while (cur.width / 2 >= tw * 2) {
-@@ -165,7 +167,7 @@ object GlassBackdrop {
+@@ -165,23 +178,32 @@ object GlassBackdrop {
                  }
              }
          }
@@ -17668,18 +18125,38 @@ index 8a17234..0098ff9 100644
          small.setPixels(px, 0, tw, 0, 0, tw, th)
          return small
      }
-@@ -182,6 +184,10 @@ fun GlassBackdropLayer() {
-     if (fade <= 0.01f && b == null) return
-     androidx.compose.foundation.Image(img, null, androidx.compose.ui.Modifier.fillMaxSize().graphicsLayer { alpha = fade },
-         contentScale = androidx.compose.ui.layout.ContentScale.FillBounds, filterQuality = androidx.compose.ui.graphics.FilterQuality.High)
-+    // [Mines-38.9.4] slight dim + warm tint over the blurred copy
+ }
+ 
+-/** Drawn once at the activity root: the blurred copy of the app while a glass dialog / sheet is open. */
++/** Drawn once at the activity root: the scrim over the blurred page (and, below API 31, the blurred copy itself). */
+ @Composable
+ fun GlassBackdropLayer() {
++    val on by GlassBackdrop.active.collectAsState()
+     val b by GlassBackdrop.bitmap.collectAsState()
+-    val fade by androidx.compose.animation.core.animateFloatAsState(if (b != null) 1f else 0f, androidx.compose.animation.core.tween(160), label = "glass")
++    val fade by androidx.compose.animation.core.animateFloatAsState(if (on) 1f else 0f, androidx.compose.animation.core.tween(180), label = "glass")
+     var last by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+     if (b != null) last = b
+-    val img = last ?: return
+-    if (fade <= 0.01f && b == null) return
+-    androidx.compose.foundation.Image(img, null, androidx.compose.ui.Modifier.fillMaxSize().graphicsLayer { alpha = fade },
+-        contentScale = androidx.compose.ui.layout.ContentScale.FillBounds, filterQuality = androidx.compose.ui.graphics.FilterQuality.High)
++    if (fade <= 0.01f && !on) return
++    if (!GlassBackdrop.live) last?.let { img ->
++        androidx.compose.foundation.Image(img, null, androidx.compose.ui.Modifier.fillMaxSize().graphicsLayer { alpha = fade },
++            contentScale = androidx.compose.ui.layout.ContentScale.FillBounds, filterQuality = androidx.compose.ui.graphics.FilterQuality.High)
++    }
++    // [Mines-38.9.6] light neutral warm-grey scrim over the blurred page (was a pink veil); stronger without RenderEffect
 +    val dk = mines().dark
-+    androidx.compose.foundation.layout.Box(androidx.compose.ui.Modifier.fillMaxSize().graphicsLayer { alpha = fade }
-+        .background(if (dk) Color(0x33100D0B) else Color(0x1FE9E3DA)))   // [Mines-38.9.6] neutral warm grey veil (was pink 0x24F3D9CB)
++    val scrim = when {
++        GlassBackdrop.live -> if (dk) Color(0x3A0E0C0B) else Color(0x29E2DCD3)
++        else -> if (dk) Color(0x570E0C0B) else Color(0x40DCD5CB)
++    }
++    androidx.compose.foundation.layout.Box(androidx.compose.ui.Modifier.fillMaxSize().graphicsLayer { alpha = fade }.background(scrim))
  }
  
  /** Call inside any Dialog / ModalBottomSheet content: turns its window into frosted glass (no-op elsewhere). */
-@@ -203,10 +209,21 @@ fun glassVeil(): Color {
+@@ -203,10 +225,21 @@ fun glassVeil(): Color {
      val ctx = LocalContext.current
      // [Mines-38.7] the backdrop is our own blurred copy on every phone (Android 8+), so the veil no longer depends on the
      // system's cross-window blur switch
@@ -17698,12 +18175,12 @@ index 8a17234..0098ff9 100644
 + *  手动: the slider (half strength, as before). */
 +fun popupGlassAlpha(dark: Boolean, k: Float = 1f): Float =
 +    if (MinesLook.glassAuto(dark)) com.openminis.app.plus.GlassAuto.cap(dark)
-+    else ((if (dark) 0.56f else 0.52f) * k).coerceIn(0.25f, 0.97f)   // [Mines-38.9.6] card alpha + a little (one slider)
++    else ((if (dark) 0.56f else 0.52f) * k).coerceIn(GlassFloor.popup(dark), 0.97f)   // [Mines-38.9.6] card alpha + a little (one slider), floor
 +
  /**
   * The one Mines dialog: title, scrollable content (never a big empty block), primary = solid
   * terracotta pill, cancel = text button. Frosted glass window.
-@@ -226,13 +243,9 @@ fun MinesDialog(
+@@ -226,13 +259,9 @@ fun MinesDialog(
      val m = mines()
      AlertDialog(
          onDismissRequest = onDismiss,
@@ -17718,7 +18195,7 @@ index 8a17234..0098ff9 100644
              Column(Modifier.fillMaxWidth().heightIn(max = 460.dp).verticalScroll(rememberScrollState()),
                  verticalArrangement = Arrangement.spacedBy(MS.S), content = content)
          },
-@@ -250,10 +263,15 @@ fun MinesDialog(
+@@ -250,10 +279,15 @@ fun MinesDialog(
  fun GlassPill(text: String, enabled: Boolean = true, danger: Boolean = false, modifier: Modifier = Modifier, onClick: () -> Unit) {
      val m = mines()
      val bg = if (danger) MinesDesign.DangerFill else m.primary
@@ -17737,7 +18214,7 @@ index 8a17234..0098ff9 100644
      }
  }
  
-@@ -285,10 +303,8 @@ fun MinesSheet(onDismiss: () -> Unit, content: @Composable ColumnScope.() -> Uni
+@@ -285,10 +319,8 @@ fun MinesSheet(onDismiss: () -> Unit, content: @Composable ColumnScope.() -> Uni
      val state = rememberModalBottomSheetState(skipPartiallyExpanded = true)
      ModalBottomSheet(
          onDismissRequest = onDismiss, sheetState = state,
@@ -17750,10 +18227,10 @@ index 8a17234..0098ff9 100644
      }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassKit.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassKit.kt
 new file mode 100644
-index 0000000..9e0547e
+index 0000000..1a769aa
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassKit.kt
-@@ -0,0 +1,128 @@
+@@ -0,0 +1,200 @@
 +package com.openminis.app.ui.plus
 +
 +import android.os.Build
@@ -17767,6 +18244,8 @@ index 0000000..9e0547e
 +import androidx.compose.runtime.collectAsState
 +import androidx.compose.runtime.getValue
 +import androidx.compose.ui.Modifier
++import androidx.compose.ui.composed
++import androidx.compose.ui.graphics.graphicsLayer
 +import androidx.compose.ui.draw.clip
 +import androidx.compose.ui.draw.drawWithCache
 +import androidx.compose.ui.graphics.Brush
@@ -17813,10 +18292,10 @@ index 0000000..9e0547e
 +@Composable
 +fun glassPopupFill(): Color {
 +    val m = mines()
-+    val a = popupGlassAlpha(m.dark, MinesLook.glassScale(m.dark))
-+    // graceful fallback: until (or unless) the blurred page copy is there, sharp text would sit right under a 45 % tint —
-+    // stay dense (88 %) and thin out together with the backdrop fade-in (same 160 ms)
-+    val blurred = GlassBackdrop.bitmap.collectAsState().value != null
++    val a = popupGlassAlpha(m.dark, MinesLook.glassScale(m.dark)).coerceAtLeast(GlassFloor.popup(m.dark))
++    // graceful fallback: until (or unless) the page behind is blurred (RenderEffect on API 31+, the cached copy below),
++    // sharp text would sit right under the tint — stay dense (88 %) and thin out with the blur fade-in (same 160 ms)
++    val blurred = GlassBackdrop.ready.collectAsState().value
 +    val shown by animateFloatAsState(if (blurred) a else maxOf(a, 0.88f), tween(160), label = "glassFill")
 +    return GlassTint.of(m.dark).copy(alpha = shown)
 +}
@@ -17881,6 +18360,76 @@ index 0000000..9e0547e
 +        is Outline.Rounded -> addRoundRect(o.roundRect)
 +        is Outline.Generic -> addPath(o.path)
 +    }
++}
++
++
++/**
++ * [Mines-38.9.6 i12] minimum tint per surface (user: 「直接透穿」 — nothing behind may be legible, even at the lowest
++ * 外观调节 setting). Popups sit on the blurred page, so their floor is lower; input bars and the chat composer sit over
++ * sharp, scrolling text with NO blur, so theirs is a dense tint (the fallback 「higher solid tint」).
++ */
++object GlassFloor {
++    fun popup(dark: Boolean) = if (dark) 0.50f else 0.45f
++    fun card(dark: Boolean) = if (dark) 0.38f else 0.32f
++    /** home 开个新对话 bar (over the blurred fog, rows scroll away under the dock fade) */
++    fun bar(dark: Boolean) = if (dark) 0.80f else 0.80f
++    /** chat composer + text fields over sharp chat text */
++    fun field(dark: Boolean) = if (dark) 0.90f else 0.90f
++    /** lowest manual value the 外观调节 slider can set */
++    const val SLIDER_MIN = 0.35f
++}
++
++/**
++ * Visible soft rim for input bars and text fields (user: the input box 「看不清」): warm grey with ≥ 3:1 against the
++ * glass tint (light #8C8278 on #F3EFE9 ≈ 3.4:1, dark #8E857D on #252220 ≈ 4.5:1; GlassWrapperScanTest checks it).
++ */
++object GlassRim {
++    val Light = Color(0xFF8C8278)
++    val Dark = Color(0xFF8E857D)
++    fun of(dark: Boolean): Color = if (dark) Dark else Light
++}
++
++/** Input bar / composer tint: the global glass alpha, never below [GlassFloor.bar] / [GlassFloor.field]. */
++@Composable
++fun glassInputFill(field: Boolean = false): Color {
++    val m = mines()
++    val a = popupGlassAlpha(m.dark, MinesLook.glassScale(m.dark))
++    return GlassTint.of(m.dark).copy(alpha = a.coerceAtLeast(if (field) GlassFloor.field(m.dark) else GlassFloor.bar(m.dark)).coerceAtMost(0.97f))
++}
++
++/** One input surface: halo outside only, glass fill, soft visible rim, top sheen. */
++fun Modifier.glassInput(shape: Shape, fill: Color, dark: Boolean): Modifier =
++    this.glassOuterShadow(shape, radius = 10.dp, dy = 2.dp, dark = dark).clip(shape).background(fill).glassSheen(shape, dark)
++        .border(1.dp, GlassRim.of(dark).copy(alpha = 0.85f), shape)
++
++/**
++ * The page behind an open popup / menu / sheet / dialog, blurred ONCE in the shared host (user 2026-10-18: blur the whole
++ * screen behind every popup). API 31+: a RenderEffect blur on the app's content root, animated in (180 ms) and out, the
++ * fog held still meanwhile so the blurred layer stays cached (no per-frame work while open). Below 31: the cached
++ * software-blurred copy ([GlassBackdropLayer]) + a stronger scrim.
++ */
++fun Modifier.glassRootBlur(): Modifier = this.composed {
++    if (Build.VERSION.SDK_INT < 31) return@composed this
++    val on = GlassBackdrop.active.collectAsState().value
++    val r by animateFloatAsState(if (on) 20f else 0f, tween(180), label = "rootBlur")
++    this.graphicsLayer {
++        val px = r.dp.toPx()
++        renderEffect = if (px > 0.5f) androidx.compose.ui.graphics.BlurEffect(px, px, androidx.compose.ui.graphics.TileMode.Clamp) else null
++    }
++}
++
++/** Filled glass text field (search fields in sheets): input tint + soft rim, accent rim while focused. */
++@Composable
++fun glassFieldColors(): androidx.compose.material3.TextFieldColors {
++    val m = mines()
++    val fill = glassInputFill(field = true)
++    return androidx.compose.material3.OutlinedTextFieldDefaults.colors(
++        focusedContainerColor = fill, unfocusedContainerColor = fill, disabledContainerColor = fill,
++        focusedBorderColor = m.primary, unfocusedBorderColor = GlassRim.of(m.dark),
++        focusedTextColor = m.ink, unfocusedTextColor = m.ink,
++        focusedPlaceholderColor = m.ink2, unfocusedPlaceholderColor = m.ink2,
++        focusedLeadingIconColor = m.ink2, unfocusedLeadingIconColor = m.ink2,
++    )
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/KeyAgentScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/KeyAgentScreen.kt
 index 725fc33..0d0475b 100644
@@ -19891,10 +20440,10 @@ index 0000000..0087874
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/LookScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/LookScreen.kt
 new file mode 100644
-index 0000000..b30a65b
+index 0000000..385b4bb
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/LookScreen.kt
-@@ -0,0 +1,237 @@
+@@ -0,0 +1,239 @@
 +package com.openminis.app.ui.plus
 +
 +import android.content.Context
@@ -19976,7 +20525,9 @@ index 0000000..b30a65b
 +        loaded = true
 +        val p = c.getSharedPreferences("mines_look", Context.MODE_PRIVATE)
 +        // [Mines-38.9.4] new keys: the glass starts on 自动 for everyone (user 16:59 「不用户自己调节」); a manual value set after this is kept
-+        look = Look(p.getFloat("gl3", DEFAULT.glassLight), p.getFloat("gd3", DEFAULT.glassDark), p.getFloat("fl", DEFAULT.fogLight),
++        // [Mines-38.9.6] a manual glass below the new floor (0.35) is raised to it
++        fun cl(v: Float) = if (v < 0f) v else v.coerceIn(GlassFloor.SLIDER_MIN, 0.92f)
++        look = Look(cl(p.getFloat("gl3", DEFAULT.glassLight)), cl(p.getFloat("gd3", DEFAULT.glassDark)), p.getFloat("fl", DEFAULT.fogLight),
 +            p.getFloat("fd", DEFAULT.fogDark), p.getString("al", null) ?: DEFAULT.accentLight, p.getString("ad", null) ?: DEFAULT.accentDark, p.getFloat("flow", DEFAULT.flow))
 +        // a fog strength the user never moved follows the new, stronger default
 +        if (!p.contains("fl")) look = look.copy(fogLight = DEFAULT.fogLight)
@@ -20011,8 +20562,8 @@ index 0000000..b30a65b
 +            if (i2 == null || t <= 0f) m else m.copy(ink2 = Color(i2),
 +                ink3 = Color(com.openminis.app.plus.GlassAuto.mixInk(m.ink3.toArgb(), m.ink.toArgb(), t)))
 +        } else m
-+        val withGlass = if (k == 1f) m else m.copy(glass = m.glass.copy(alpha = (m.glass.alpha * k).coerceIn(0.05f, 0.98f)),
-+            glassStrong = m.glassStrong.copy(alpha = (m.glassStrong.alpha * k).coerceIn(0.05f, 0.98f)))
++        val withGlass = if (k == 1f) m else m.copy(glass = m.glass.copy(alpha = (m.glass.alpha * k).coerceIn(GlassFloor.card(m.dark), 0.98f)),
++            glassStrong = m.glassStrong.copy(alpha = (m.glassStrong.alpha * k).coerceIn(GlassFloor.card(m.dark) + 0.06f, 0.98f)))
 +        if (a.id == "claude") return withGlass
 +        val cont = androidx.compose.ui.graphics.lerp(m.bg, a.primary, if (m.dark) 0.32f else 0.13f)
 +        return withGlass.copy(primary = a.primary, primaryText = if (m.dark) a.darkText else a.text, icon = if (m.dark) a.darkText else a.primary,
@@ -20070,11 +20621,11 @@ index 0000000..b30a65b
 +                Text(if (gAuto) "自动（按背景算，现在 $now%）" else "手动", fontSize = MT.Meta, color = mines().ink2)
 +                Spacer(Modifier.width(8.dp))
 +                androidx.compose.material3.Switch(gAuto, { on ->
-+                    val v = if (on) -1f else MinesLook.glassNow(dark).coerceIn(0.25f, 0.92f)
++                    val v = if (on) -1f else MinesLook.glassNow(dark).coerceIn(GlassFloor.SLIDER_MIN, 0.92f)
 +                    MinesLook.set(ctx, if (dark) cur.copy(glassDark = v) else cur.copy(glassLight = v))
 +                }, modifier = Modifier.semantics { contentDescription = "玻璃透明度自动" })
 +            }
-+            if (!gAuto) LookSlider("玻璃透明度（手动）", "越往右越不透明", g, 0.25f..0.92f) { v ->
++            if (!gAuto) LookSlider("玻璃透明度（手动）", "越往右越不透明", g.coerceIn(GlassFloor.SLIDER_MIN, 0.92f), GlassFloor.SLIDER_MIN..0.92f) { v ->
 +                MinesLook.set(ctx, if (dark) cur.copy(glassDark = v) else cur.copy(glassLight = v))
 +            }
 +            LookSlider("雾气浓淡", "0 = 不要雾，只留底色", f, 0f..2f) { v ->
@@ -21542,7 +22093,7 @@ index 7fa3cd5..4e6b73b 100644
          title = { Text("粘贴 WorkBuddy 登录") },
          text = {
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
-index afd2104..5409294 100644
+index afd2104..b7fc11f 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/PlusComponents.kt
 @@ -1,5 +1,9 @@
@@ -21762,7 +22313,7 @@ index afd2104..5409294 100644
 +        val (per, all) = glassAutoAlphas(m.dark, tint, m.ink2)
 +        val a = bands?.let { r -> r.mapNotNull { per.getOrNull(it) }.maxOrNull() } ?: all
 +        // [Mines-38.9.5 i] never denser than the cap (light 45 % / dark 50 %), strong variant included
-+        return tint.copy(alpha = (a + (if (strong) 0.05f else 0f)).coerceIn(0.05f, com.openminis.app.plus.GlassAuto.cap(m.dark)))
++        return tint.copy(alpha = (a + (if (strong) 0.05f else 0f)).coerceIn(GlassFloor.card(m.dark), com.openminis.app.plus.GlassAuto.cap(m.dark)))   // [Mines-38.9.6] floor
 +    }
 +    // [Mines-38.9.4] user 2026-10-17 「要磨砂底，不要白底」 (approved mock-27): ONE frosted-glass token for cards, lists, bars,
 +    // menus — warm white ~58 % light / dark tint ~50 % over the (already blurred) fog or photo wallpaper, 1 dp white
@@ -21773,7 +22324,7 @@ index afd2104..5409294 100644
 +        else -> if (strong) 0.64f else 0.58f
 +    } + (if (photo) 0.08f else 0f)
 +    val k = MinesLook.glassScale(m.dark)   // [Mines-38.9] 外观调节 › 玻璃透明度 (手动)
-+    return tint.copy(alpha = (a * k).coerceIn(0.05f, 0.98f))
++    return tint.copy(alpha = (a * k).coerceIn(GlassFloor.card(m.dark), 0.98f))   // [Mines-38.9.6] floor: never 「透穿」
  }
  
  /** A frosted 22 dp card (no blur pass: translucent fill + 1 dp highlight + soft warm shadow). */
@@ -22122,7 +22673,7 @@ index 0000000..c6649cc
 +    RouteStatusCore.St.UNCHECKED -> Color(0xFF8A8A8A)
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt
-index 926fe48..11cf467 100644
+index 926fe48..2645493 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt
 @@ -90,7 +90,7 @@ fun RoutingScreen(onBack: () -> Unit) {
@@ -22134,7 +22685,60 @@ index 926fe48..11cf467 100644
              }
          }
          val insts = config?.instances?.filter { it.isEnabled }.orEmpty()
-@@ -230,7 +230,7 @@ private fun ProxyAutoSection() {
+@@ -119,6 +119,10 @@ private fun SplitProxySection() {
+     val recent by SplitProxy.recent.collectAsState()
+     var host by remember(s.upstreamHost) { mutableStateOf(s.upstreamHost) }
+     var port by remember(s.upstreamPort) { mutableStateOf(if (s.upstreamPort > 0) s.upstreamPort.toString() else "") }
++    // [Mines-38.9.6 i13] proxy user / password (password in PlusVault, masked, never logged)
++    var puser by remember(s.upstreamUser) { mutableStateOf(s.upstreamUser) }
++    var ppass by remember(s.upstreamPass) { mutableStateOf(s.upstreamPass) }
++    var showPass by remember { mutableStateOf(false) }
+     var newRule by remember { mutableStateOf("") }
+     var newMode by remember { mutableStateOf(SplitProxy.Mode.PROXY) }
+     fun applyToSandbox() = scope.launch { runCatching { com.openminis.app.sandbox.ExecutionCoordinator.broadcastProxyChange() } }
+@@ -142,12 +146,38 @@ private fun SplitProxySection() {
+                 FilterChip(selected = s.upstreamType == "http", onClick = { SplitProxy.update(ctx) { it.copy(upstreamType = "http") } }, label = { Text("HTTP") })
+                 FilterChip(selected = s.upstreamType == "socks5", onClick = { SplitProxy.update(ctx) { it.copy(upstreamType = "socks5") } }, label = { Text("SOCKS5") })
+             }
+-            OutlinedTextField(host, { host = it.trim() }, label = { Text("地址（IP 或域名）") }, singleLine = true, modifier = Modifier.fillMaxWidth())
++            OutlinedTextField(host, { v ->
++                // pasting "http://user:pass@host:port" fills every field
++                val parsed = if (v.contains("@") || v.contains("://")) com.openminis.app.plus.SplitProxyCore.parse(v) else null
++                if (parsed != null) {
++                    host = parsed.host; port = parsed.port.toString()
++                    if (parsed.user.isNotEmpty()) { puser = parsed.user; ppass = parsed.pass }
++                    if (parsed.type != s.upstreamType) SplitProxy.update(ctx) { it.copy(upstreamType = parsed.type) }
++                } else host = v.trim()
++            }, label = { Text("地址（IP 或域名）") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+             OutlinedTextField(port, { port = it.filter(Char::isDigit).take(5) }, label = { Text("端口") }, singleLine = true,
+                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.fillMaxWidth())
++            OutlinedTextField(puser, { puser = it.trim() }, label = { Text("用户名（没有就空着）") }, singleLine = true, modifier = Modifier.fillMaxWidth())
++            OutlinedTextField(ppass, { ppass = it }, label = { Text("密码") }, singleLine = true,
++                visualTransformation = if (showPass) androidx.compose.ui.text.input.VisualTransformation.None else androidx.compose.ui.text.input.PasswordVisualTransformation(),
++                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, autoCorrectEnabled = false),
++                trailingIcon = {
++                    androidx.compose.material3.IconButton(onClick = { showPass = !showPass }) {
++                        androidx.compose.material3.Icon(
++                            if (showPass) androidx.compose.material.icons.Icons.Outlined.VisibilityOff else androidx.compose.material.icons.Icons.Outlined.Visibility,
++                            contentDescription = if (showPass) "隐藏密码" else "显示密码")
++                    }
++                },
++                enabled = puser.isNotEmpty() || ppass.isNotEmpty(), modifier = Modifier.fillMaxWidth())
+             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+-                PillButton("保存", Modifier.weight(1f)) { SplitProxy.update(ctx) { it.copy(upstreamHost = host, upstreamPort = port.toIntOrNull() ?: 0) }; com.openminis.app.plus.PlusVaultLess.setAutoPrimary(ctx, false) }
+-                PillButton("清空", Modifier.weight(1f), primary = false) { host = ""; port = ""; SplitProxy.update(ctx) { it.copy(upstreamHost = "", upstreamPort = 0) } }
++                PillButton("保存", Modifier.weight(1f)) {
++                    SplitProxy.update(ctx) { it.copy(upstreamHost = host, upstreamPort = port.toIntOrNull() ?: 0, upstreamUser = puser, upstreamPass = if (puser.isEmpty()) "" else ppass) }
++                    com.openminis.app.plus.PlusVaultLess.setAutoPrimary(ctx, false); applyToSandbox()
++                }
++                PillButton("清空", Modifier.weight(1f), primary = false) {
++                    host = ""; port = ""; puser = ""; ppass = ""
++                    SplitProxy.update(ctx) { it.copy(upstreamHost = "", upstreamPort = 0, upstreamUser = "", upstreamPass = "") }; applyToSandbox()
++                }
+             }
+         }
+     }
+@@ -230,7 +260,7 @@ private fun ProxyAutoSection() {
      }
      PlusSection("找代理") {
          Column(Modifier.padding(horizontal = 16.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -23298,7 +23902,7 @@ index 31a075b..6f216ef 100644
                  if (!done) PillButton(
                      when {
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WarmComponents.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WarmComponents.kt
-index 4f72cc4..5733ebf 100644
+index 4f72cc4..8c86b00 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/WarmComponents.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WarmComponents.kt
 @@ -3,6 +3,7 @@ package com.openminis.app.ui.plus
@@ -23518,8 +24122,8 @@ index 4f72cc4..5733ebf 100644
 -            .shadow(if (m.dark) 0.dp else 4.dp, shape, clip = false, ambientColor = Color(0x223C2814), spotColor = Color(0x223C2814))
 -            .clip(shape).background(dockFill()).border(1.dp, m.glassBorder, shape)
 +            .shadow(0.dp, shape, clip = false, ambientColor = Color(0x223C2814), spotColor = Color(0x223C2814))
-+            .clip(shape).background(inputGlass()).border(1.dp, m.glassBorder, shape)
-+            .background(androidx.compose.ui.graphics.Brush.verticalGradient(listOf(Color.White.copy(alpha = if (m.dark) 0.06f else 0.20f), Color.Transparent)))
++            // [Mines-38.9.6 i12] the shared input glass: tint ≥ 80 %, soft visible rim (≥ 3:1), sheen, outside-only halo
++            .glassInput(shape, glassInputFill(), m.dark)
              .pressClickable(onNewChat)
              .heightIn(min = 51.dp).padding(start = 14.dp, end = 5.dp),  // [Mines-38.2] board 58 px x 0.874
          verticalAlignment = Alignment.CenterVertically,
@@ -23532,7 +24136,7 @@ index 4f72cc4..5733ebf 100644
  
  /**
   * [Mines-38.5] Solid porcelain band behind the input bar + bottom bar, with a 28 dp fade on top, so
-@@ -451,6 +472,20 @@ fun dockFill(): Color = if (mines().dark) Color(0xFF241F1C) else Color(0xFFFFFDF
+@@ -451,6 +472,21 @@ fun dockFill(): Color = if (mines().dark) Color(0xFF241F1C) else Color(0xFFFFFDF
  fun WarmBottomDock(modifier: Modifier = Modifier, height: Dp = 168.dp) {
      val m = mines()
      val c = if (m.dark) MinesDesign.BgDark else Color(0xFFF6F0E9)
@@ -23549,6 +24153,7 @@ index 4f72cc4..5733ebf 100644
 + */
 +@Composable
 +fun inputGlass(): Color {
++    if (true) return glassInputFill()   // [Mines-38.9.6 i12] one input glass (floor + global slider)
 +    val m = mines()
 +    if (wallpaperOn(home = true)) return minesGlassFill(strong = true)   // over a photo: stay readable
 +    val a = (if (m.dark) 0.40f else 0.26f) * MinesLook.glassScale(m.dark)
@@ -27734,6 +28339,44 @@ index 0000000..96ec4df
 +        assertEquals(Triple("", "weather", "1.0.1"), K.parse("skillhub:weather@1.0.1"))
 +        assertNull(K.parse("local"))
 +        assertEquals("bob/weather", K.rowKey("bob", "weather")); assertEquals("weather", K.rowKey("", "weather"))
++    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/SplitProxyCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/SplitProxyCoreTest.kt
+new file mode 100644
+index 0000000..9aac843
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/SplitProxyCoreTest.kt
+@@ -0,0 +1,32 @@
++package com.openminis.app.plus
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/** [Mines-38.9.6 i12] authenticated upstream proxy: Basic header, injection into a forwarded head, url parsing. */
++class SplitProxyCoreTest {
++    @Test fun basicIsRfc7617() {
++        assertEquals("Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==", SplitProxyCore.basic("Aladdin", "open sesame"))
++        assertEquals("", SplitProxyCore.authLine("", "x"))
++        assertTrue(SplitProxyCore.authLine("u", "p").startsWith("Proxy-Authorization: Basic ") && SplitProxyCore.authLine("u", "p").endsWith("\r\n"))
++    }
++    @Test fun injectsAndReplacesClientHeader() {
++        val head = "GET http://a.test/ HTTP/1.1\r\nHost: a.test\r\nProxy-Authorization: Basic old\r\n\r\n"
++        val out = SplitProxyCore.withAuth(head, SplitProxyCore.authLine("u", "p"))
++        assertTrue(out.startsWith("GET http://a.test/ HTTP/1.1\r\nProxy-Authorization: Basic dTpw\r\n"))
++        assertFalse(out.contains("Basic old")); assertTrue(out.endsWith("\r\n\r\n"))
++        assertEquals(head, SplitProxyCore.withAuth(head, ""))
++    }
++    @Test fun parsesProxyUrls() {
++        val p = SplitProxyCore.parse("http://us%40er:p%3Ass@203.0.113.7:24445")!!
++        assertEquals("http", p.type); assertEquals("203.0.113.7", p.host); assertEquals(24445, p.port)
++        assertEquals("us@er", p.user); assertEquals("p:ss", p.pass)
++        assertFalse(p.toString().contains("p:ss"))
++        assertEquals("socks5", SplitProxyCore.parse("socks5://h.test:1080")!!.type)
++        assertEquals("", SplitProxyCore.parse("h.test:8080")!!.user)
++        assertNull(SplitProxyCore.parse("h.test")); assertNull(SplitProxyCore.parse(""))
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/TaskProgressAutoTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/TaskProgressAutoTest.kt
