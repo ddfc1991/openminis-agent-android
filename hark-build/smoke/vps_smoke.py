@@ -93,8 +93,9 @@ except Exception:
 try:
     I396 = "i396" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
     I396M = "i396m" in open("hark-build/smoke/target").read().splitlines()[1:2][0]   # [38.9.6 i13] Memoh / proxy auth / sheets
+    I396X = "i396x" in open("hark-build/smoke/target").read().splitlines()[1:2][0]   # [38.9.6 i15] weather / 快速测试 / 重试 / overlays / Clash
 except Exception:
-    I396 = False; I396M = False
+    I396 = False; I396M = False; I396X = False
 FONT_SCALE = "1.18"
 step_no = 0
 crashed = []
@@ -3223,7 +3224,7 @@ def main():
         else: fns = (b387_linkall, b387_noblack, b387_persist, b387_platforms)
         if HUB: fns = tuple(fns) + (b3891_hub,)   # [38.9.1 c] hub runs after the UI passes
         if I395: fns = (b395_i2, b395_i) if I395B else (b395_i,)   # [38.9.5 i] build-i gate only: 一键关联 / 一键重新登录, gateway, new screens light + dark
-        if I396: fns = ((b396m,) if I396M else ()) + (b396,) + (tuple(fns) if I395 else ())   # [38.9.6 i12] glass / auto progress / archive shots first, then the full i395 pass + 自检
+        if I396: fns = ((b396x,) if I396X else ()) + ((b396m,) if I396M else ()) + (b396,) + (tuple(fns) if I395 else ())   # [38.9.6 i12] glass / auto progress / archive shots first, then the full i395 pass + 自检
         elif H3894: fns = (b3894_h,) + tuple(fns)   # [38.9.4 h] SkillHub market, Memoh, a11y wording, 账号 entries, glass / opaque reading, g2 defects first
         for fn in fns:
             try:
@@ -4814,6 +4815,145 @@ def b395_i2(res):
     print("I395B RESULT " + json.dumps(o, ensure_ascii=False)[:4000], flush=True)
 
 
+UNTESTABLE = []   # [38.9.6 i15] checks the x86_64 emulator cannot run (proot sandbox never starts there)
+
+
+def _sandbox_down(sc):
+    return isinstance(sc, list) and any("沙箱还没启动" in (r.get("detail") or "") for r in sc)
+
+
+def b396x(res):
+    """[38.9.6 i15] seed chats first (i396m sheets need a chat), weather scenes (7 × light/dark + static fallback), 快速测试 sheet
+    over the busy model page (Chinese errors, glass), 重试 tapped twice (「已重新开始（第 N 次）」), every overlay in both themes
+    with the GlassBackdrop blur flag, embedded Clash against the runner's auth-only proxy."""
+    r8 = R8(res); o = {"overlay": []}
+    def step(name, f):
+        try: f()
+        except Exception as e:
+            import traceback; traceback.print_exc(); page_missing.append(f"i396x {name} error {e}")
+        if not alive(): crashed.append(f"i396x {name}"); relaunch()
+    def ov(name, sfx):
+        r = shot388(f"i396x-ov-{name}-{sfx}"); f = result_json("group", "i396 overlay", timeout=10)
+        o["overlay"].append({"name": name, "theme": sfx, "flag": f, "text": _txt(r)[:160]})
+        print(f"I396X OVERLAY | {sfx} | {name} | {json.dumps(f, ensure_ascii=False)[:200]}", flush=True)
+        return r
+    set_zh()
+    o["seed"] = result_json("group", "i396 seed", timeout=90)
+    # 1 weather scenes
+    def sky(sfx):
+        for k in ("sunny", "cloudy", "rain", "snow", "fog", "night", "sunset"):
+            st = result_json("group", f"i396 sky {k}", timeout=20); b381_home(); time.sleep(3)
+            shot388(f"i396x-sky-{k}-{sfx}"); o[f"sky_{k}_{sfx}"] = st
+            if not (isinstance(st, dict) and st.get("scene") == k): selftest_fail.append(f"i396x sky {sfx}: forced {k} but scene={st}")
+        for k in ("rain", "night"):
+            result_json("group", f"i396 sky {k} static", timeout=20); b381_home(); time.sleep(3); shot388(f"i396x-sky-{k}-static-{sfx}")
+        result_json("group", "i396 sky auto", timeout=20)
+    # 2 快速测试 sheet over the busy model page
+    def quick(sfx):
+        q = result_json("group", "i396 quicktest", timeout=30); o["quick_" + sfx] = q
+        time.sleep(8); r = ov("quicktest", sfx); t = _txt(r); o["quicktext_" + sfx] = t[:400]
+        if "快速测试" not in t: page_missing.append(f"i396x 快速测试 {sfx}: sheet not open ({str(q)[:60]})")
+        for en in ("No API key configured", "API key", "provider."):
+            if en in t: selftest_fail.append(f"i396x 快速测试 {sfx}: English error still shown 「{en}」")
+        back(1); time.sleep(1); back(1); time.sleep(1)
+    # 3 重试 tapped twice on the 「帮我领取免费云浏览器」 card
+    def retry(sfx):
+        rg = result_json("group", "i396 retryreg", timeout=20); o["retryreg_" + sfx] = rg
+        r = b381_home(); time.sleep(3)
+        tb = node_bounds(r, lambda n: (n.get("text") or "").startswith("帮我领取免费云浏览器"))
+        pills = [p for p in all_desc(r, "进度：") if tb and tb[1] - 20 <= p[1] <= tb[3] + 160]
+        if not pills: page_missing.append(f"i396x 重试 {sfx}: no ⋯ pill on 帮我领取免费云浏览器"); return
+        sh(f"input tap {pills[0][0]} {pills[0][1]}"); time.sleep(3)
+        for n in (1, 2):
+            if not tap_text("重试", exact=True, wait=2.5): selftest_fail.append(f"i396x 重试 {sfx}: 重试 #{n} not found"); return
+            r = shot388(f"i396x-retry{n}-{sfx}"); t = _txt(r); o[f"retry{n}_{sfx}"] = t[:300]
+            if "重新开始" not in t: selftest_fail.append(f"i396x 重试 {sfx}: tap #{n} shows no 「重新开始」 line")
+            if n == 2 and "第 2 次" not in t and "第 3 次" not in t and "第 4 次" not in t: selftest_fail.append(f"i396x 重试 {sfx}: second tap has no 「第 N 次」")
+        c = result_json("group", "i396 retrycount", timeout=10); o["retrycount_" + sfx] = c
+        back(1); time.sleep(1)
+    # 4 overlays
+    def overlays(sfx):
+        r = b381_home(); time.sleep(3)
+        mb = node_bounds(r, lambda n: (n.get("content-desc") or "") == "更多")
+        if mb: sh(f"input tap {(mb[0] + mb[2]) // 2} {(mb[1] + mb[3]) // 2}"); time.sleep(2.5); ov("menu", sfx); back(1); time.sleep(1)
+        r = b381_home(); time.sleep(2); pills = all_desc(r, "进度："); o["pills_" + sfx] = len(pills)
+        if len(pills) < 3: selftest_fail.append(f"i396x {sfx}: only {len(pills)} ⋯ progress pills on home")
+        if pills: sh(f"input tap {pills[0][0]} {pills[0][1]}"); time.sleep(3); ov("progress", sfx); back(1); time.sleep(1)
+        r = b381_home(); time.sleep(2)
+        tb = node_bounds(r, lambda n: (n.get("text") or "").startswith("今天新加坡天气"))
+        if tb:
+            cx, cy = (tb[0] + tb[2]) // 2, (tb[1] + tb[3]) // 2
+            sh(f"input swipe {cx} {cy} {cx} {cy} 900"); time.sleep(2); ov("rowmenu", sfx); back(1); time.sleep(1)
+        result_json("group", 'greet {"hour":15,"weather":"cloudy"}'); r = b381_home(); time.sleep(3); w = all_desc(r, "天气：")
+        if w: sh(f"input tap {w[0][0]} {w[0][1]}"); time.sleep(2.5); ov("dialog", sfx); back(1); time.sleep(1)
+        route("plus_keychain", 6); r = dump(); a = all_desc(r, "添加：关联账号或添加身份")
+        if a: sh(f"input tap {a[0][0]} {a[0][1]}"); time.sleep(2.5); ov("bsheet", sfx); back(1); time.sleep(1)
+        back(1); time.sleep(1)
+        r = b381_home(); time.sleep(2)
+        if tap_text("今天新加坡天气", wait=4):
+            time.sleep(1); shot388(f"i396x-chat-{sfx}")
+            r = dump(); mb = node_bounds(r, lambda n: (n.get("content-desc") or "") == "更多")
+            if mb: sh(f"input tap {(mb[0] + mb[2]) // 2} {(mb[1] + mb[3]) // 2}"); time.sleep(2); ov("chatmenu", sfx); back(1); time.sleep(1)
+            r = dump(); ab = node_bounds(r, lambda n: (n.get("content-desc") or "") == "附件")
+            if ab: sh(f"input tap {(ab[0] + ab[2]) // 2} {(ab[1] + ab[3]) // 2}"); time.sleep(2); ov("attach", sfx); back(1); time.sleep(1)
+            else: page_missing.append(f"i396x {sfx}: + 附件 not found in chat")
+            r = dump()
+            if tap_text("默认模型", wait=3, root=r) or tap_text("smoke-model", wait=2, root=r): ov("picker", sfx); back(1); time.sleep(1)
+            else: page_missing.append(f"i396x {sfx}: model picker header not found")
+            back(1); time.sleep(1)
+        else: page_missing.append(f"i396x {sfx}: no chat to open")
+    for mode, sfx in ((1, "light"), (2, "dark")):
+        theme388(mode)
+        step("sky-" + sfx, lambda sfx=sfx: sky(sfx))
+        step("quick-" + sfx, lambda sfx=sfx: quick(sfx))
+        step("retry-" + sfx, lambda sfx=sfx: retry(sfx))
+        step("overlays-" + sfx, lambda sfx=sfx: overlays(sfx))
+    theme388(1)
+    # 5 embedded Clash (mihomo arm64) through the runner's auth-only proxy
+    def clash():
+        p0 = result_json("group", "i396 proxyset", timeout=30); o["clash_proxy"] = p0
+        try: n0 = len(open("fake-proxy.log").read().splitlines())
+        except Exception: n0 = 0
+        route("plus_routing", 5)
+        found = False
+        for _ in range(8):
+            r = dump()
+            if find(r, "开启 Clash（mihomo）", False): found = True; break
+            sh("input swipe 540 1700 540 900 400"); time.sleep(0.8)
+        if not found: page_missing.append("i396x clash: 「开启 Clash（mihomo）」 row not found"); return
+        r = shot388("i396x-clash-off"); o["clash_off"] = _txt(r)[:300]
+        tap_text("开启 Clash（mihomo）", wait=10)
+        r = shot388("i396x-clash-on"); t = _txt(r); o["clash_on"] = t[:400]
+        if "没有带内核" in t: selftest_fail.append("i396x clash: APK says it has no Clash core")
+        sc = result_json("group", "i396 selfcheck", timeout=220); o["clash_selfcheck"] = sc
+        if isinstance(sc, list):
+            for row in sc:
+                if "Clash" in (row.get("name") or ""):
+                    print(f"I396X CLASH | {row.get('name')} | ok={row.get('ok')} | {row.get('detail')}", flush=True)
+        try: log = open("fake-proxy.log").read().splitlines()[n0:]
+        except Exception: log = []
+        o["clash_proxy_log"] = log[-30:]
+        print(f"I396X CLASHLOG {log[-12:]}", flush=True)
+        rows = {r_.get("name"): r_ for r_ in sc} if isinstance(sc, list) else {}
+        run = rows.get("Clash 内核运行"); ip = rows.get("Clash 出口 IP")
+        if not run or not run.get("ok"):
+            UNTESTABLE.append(f"Clash 内核运行 on x86_64 emulator (arm64 binary via translation): {run}")
+        elif not ip or not ip.get("ok"): selftest_fail.append(f"i396x clash: core runs but no exit IP through it: {ip}")
+        if run and run.get("ok") and not any(l.startswith("AUTH_OK") for l in log):
+            selftest_fail.append("i396x clash: core runs but nothing reached the auth proxy with Proxy-Authorization")
+        if any(l.startswith("AUTH_BAD") for l in log): print("I396X CLASH AUTH_BAD lines present", flush=True)
+        route("plus_routing", 4)
+        for _ in range(8):
+            r = dump()
+            if find(r, "开启 Clash（mihomo）", False): tap_text("开启 Clash（mihomo）", wait=3); break
+            sh("input swipe 540 1700 540 900 400"); time.sleep(0.8)
+        result_json("group", "i396 proxyoff", timeout=20)
+    step("clash", clash)
+    r8["i396x"] = o
+    print("I396X UNTESTABLE " + json.dumps(UNTESTABLE, ensure_ascii=False), flush=True)
+    print("I396X RESULT " + json.dumps(o, ensure_ascii=False)[:12000], flush=True)
+
+
 def b396m(res):
     """[38.9.6 i13] Memoh (account 「\\u0001\\u0001」 + 正常 bug: cleaned record, 要重新登录 without a session, __Host- cookie kept
     across restart, self-hosted refused password → secure login card once, right password → token), the login card light/dark,
@@ -4900,7 +5040,8 @@ def b396m(res):
         o["proxy_log"] = log[-40:]
         okl = [l for l in log if l.startswith("AUTH_OK")]; bad = [l for l in log if l.startswith("AUTH_BAD")]
         print(f"I396M PROXYLOG ok={len(okl)} bad={len(bad)} sample={okl[:6]}", flush=True)
-        if not any("api.ipify.org" in l for l in okl): selftest_fail.append(f"i396m proxy: sandbox exit check never went through the auth proxy (ok={len(okl)}, bad={len(bad)})")
+        if _sandbox_down(sc) and not any("api.ipify.org" in l for l in okl): UNTESTABLE.append("沙箱代理出口: 沙箱还没启动 on the x86_64 emulator")
+        elif not any("api.ipify.org" in l for l in okl): selftest_fail.append(f"i396m proxy: sandbox exit check never went through the auth proxy (ok={len(okl)}, bad={len(bad)})")
         if not any("google.com" in l for l in okl): selftest_fail.append("i396m proxy: Gmail check never went through the auth proxy")
         if bad and not okl: selftest_fail.append("i396m proxy: every request reached the proxy WITHOUT Proxy-Authorization")
         result_json("group", "i396 proxyoff", timeout=20)
@@ -4911,6 +5052,7 @@ def b396m(res):
         mb = node_bounds(r, lambda n: (n.get("content-desc") or "") == "更多")
         if mb: sh(f"input tap {(mb[0] + mb[2]) // 2} {(mb[1] + mb[3]) // 2}"); time.sleep(2); shot388(f"i396m-menu-{sfx}"); back(1); time.sleep(1)
         else: page_missing.append(f"i396m {sfx}: ☰ not found")
+        if not find(dump(), "今天新加坡天气", False): result_json("group", "i396 seed", timeout=90); b381_home(); time.sleep(3)   # [i15] a chat to open
         if tap_text("今天新加坡天气", wait=4) or tap_text("你好，我是测试模型。", wait=3):
             time.sleep(2); shot388(f"i396m-chat-input-{sfx}")
             r = dump(); ab = node_bounds(r, lambda n: (n.get("content-desc") or "") == "附件")
@@ -5088,6 +5230,7 @@ def finish(lc):
     print("crashed steps:", crashed)
     print("selftest failures:", selftest_fail)
     print("pages not confirmed:", page_missing)
+    print("untestable here:", UNTESTABLE)
     # Mines' own crash log (build-28+), readable through the app's files only for debuggable builds; logcat tag MinesCrash
     for l in log:
         if "MinesCrash" in l:
