@@ -6346,6 +6346,27 @@ index e661a6e..3eb7e36 100644
          if (n >= limit) {
              lastTool = tool; lastSignature = sig
              return "「${toolLabel(tool)}」已经连续 $n 次因为同样的问题失败（${sig.take(60)}），我先停下了。"
+diff --git a/src/android/app/src/main/java/com/openminis/app/agent/SkillFirst.kt b/src/android/app/src/main/java/com/openminis/app/agent/SkillFirst.kt
+new file mode 100644
+index 0000000..d6e39fb
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/agent/SkillFirst.kt
+@@ -0,0 +1,15 @@
++package com.openminis.app.agent
++
++/**
++ * [Mines-38.9.6 i17] 技能优先 (user 2026-10-18): the agent looks for a matching installed skill before any multi-step task
++ * and follows it; after a new multi-step task with no skill it saves one (no question, one line to the user). Never for
++ * bulk / batch account registration. Toggle: Settings › Agent Tools › 技能优先 (AgentToolSwitch.SKILL_FIRST, default on).
++ * Fixed text so the system-prompt prefix stays cache-stable.
++ */
++object SkillFirst {
++    const val PROMPT = """Skill-first (技能优先, ON):
++- Before starting any multi-step task, look for an installed skill that matches it: check the skills listed above, and if none is listed by name, search /var/minis/skills/*/SKILL.md (e.g. `grep -ril <keyword> /var/minis/skills --include=SKILL.md`). If one matches, file_read its SKILL.md first and follow it.
++- If no skill matches, the task was new, and it took several steps, then AFTER it succeeds write a new skill at /var/minis/skills/<short-kebab-id>/SKILL.md: YAML front matter with `name` and `description` (one line: when to use it), then the steps that actually worked, the commands/paths, and pitfalls you hit. Do not ask first; just save it and tell the user in one line: 「已存成技能：<name>」.
++- Never put passwords, API keys, tokens, cookies, verification codes or personal data into a skill. Do not write skills for bulk / batch account registration or anything that mass-creates accounts.
++- A single-step request (one question, one command) needs no skill lookup."""
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/agent/SoulStore.kt b/src/android/app/src/main/java/com/openminis/app/agent/SoulStore.kt
 index 35abdac..0f96bdf 100644
 --- a/src/android/app/src/main/java/com/openminis/app/agent/SoulStore.kt
@@ -6407,6 +6428,86 @@ index 35abdac..0f96bdf 100644
                      file.writeText(DEFAULT_CONTENT)
                      AppLogger.info(TAG, "upgraded untouched SOUL.md to the Mines default")
                  }
+diff --git a/src/android/app/src/main/java/com/openminis/app/agent/ToolArgsCore.kt b/src/android/app/src/main/java/com/openminis/app/agent/ToolArgsCore.kt
+new file mode 100644
+index 0000000..eba6b3d
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/agent/ToolArgsCore.kt
+@@ -0,0 +1,74 @@
++package com.openminis.app.agent
++
++import org.json.JSONObject
++
++/**
++ * [Mines-38.9.6 i17] Tolerant tool-call arguments (user 2026-10-18: several models on the phone send
++ * {"arguments": {"command": …}} — sometimes with a JSON string inside — the executor found no `command`, refused, and the
++ * agent looped 6+ turns). Before dispatch: a JSON-string payload is decoded; an object whose ONLY key is
++ * arguments / args / parameters / input (object or JSON-string value) is unwrapped, up to 2 levels. When a required
++ * field is still missing the model gets one precise error naming it and showing the expected top-level shape.
++ * Pure (JVM-testable).
++ */
++object ToolArgsCore {
++    private val WRAPPERS = setOf("arguments", "args", "parameters", "input")
++
++    /** fields that must be there for the call to run (tool_title is cosmetic and never enforced) */
++    val REQUIRED: Map<String, List<String>> = mapOf(
++        "shell_execute" to listOf("command"),
++        "file_read" to listOf("path"),
++        "file_write" to listOf("path", "content"),
++        "file_edit" to listOf("path", "old_string", "new_string"),
++        "read_image" to listOf("path"),
++        "browser_use" to listOf("action"),
++        "memory_write" to listOf("content"),
++    )
++
++    private val EXAMPLE: Map<String, String> = mapOf(
++        "shell_execute" to """{"tool_title":"列出文件","command":"ls -la"}""",
++        "file_read" to """{"tool_title":"读文件","path":"/var/minis/workspace/a.txt"}""",
++        "file_write" to """{"tool_title":"写文件","path":"/var/minis/workspace/a.txt","content":"…"}""",
++        "file_edit" to """{"tool_title":"改文件","path":"/var/minis/workspace/a.txt","old_string":"…","new_string":"…"}""",
++        "read_image" to """{"tool_title":"看图","path":"/var/minis/attachments/uploads/a.jpg"}""",
++        "browser_use" to """{"tool_title":"打开网页","action":"navigate","url":"https://example.com"}""",
++        "memory_write" to """{"tool_title":"记下","content":"…"}""",
++    )
++
++    private fun asObject(v: Any?): JSONObject? = when (v) {
++        is JSONObject -> v
++        is String -> v.trim().takeIf { it.startsWith("{") }?.let { runCatching { JSONObject(it) }.getOrNull() }
++        else -> null
++    }
++
++    /** Returns (normalized JSON text, how many wrapper levels were removed or -1 when nothing parsed). */
++    fun normalize(raw: String?): Pair<String, Int> {
++        val text = raw?.trim().orEmpty()
++        if (text.isEmpty()) return "{}" to 0
++        var o: JSONObject = asObject(text) ?: run {
++            // a JSON string literal holding the object: "{\"command\":\"ls\"}"
++            val s = runCatching { org.json.JSONTokener(text).nextValue() }.getOrNull()
++            asObject(s) ?: return text to -1
++        }
++        var levels = if (text.startsWith("\"")) 1 else 0
++        repeat(2) {
++            if (o.length() != 1) return@repeat
++            val k = o.keys().next()
++            if (k !in WRAPPERS) return@repeat
++            val inner = asObject(o.opt(k)) ?: return@repeat
++            o = inner; levels++
++        }
++        return (if (levels == 0) text else o.toString()) to levels
++    }
++
++    fun missing(tool: String, argsJson: String): List<String> {
++        val req = REQUIRED[tool] ?: return emptyList()
++        val o = runCatching { JSONObject(argsJson) }.getOrNull() ?: return req
++        return req.filter { !o.has(it) || o.isNull(it) }
++    }
++
++    fun error(tool: String, missing: List<String>, argsJson: String): String {
++        val keys = runCatching { JSONObject(argsJson).keys().asSequence().toList() }.getOrDefault(emptyList())
++        return "工具 $tool 的参数缺少 ${missing.joinToString("、") { "`$it`" }}（收到的顶层字段：${if (keys.isEmpty()) "无" else keys.joinToString(", ")}）。" +
++            "参数必须是一个顶层 JSON 对象，字段直接放在最外层，不要包在 arguments/args/input 里，例如：${EXAMPLE[tool] ?: "{…}"}"
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt b/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt
 index 9033a1b..1852002 100644
 --- a/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt
@@ -12746,7 +12847,7 @@ index 0000000..9fbf83f
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MinesSelfCheck.kt b/src/android/app/src/main/java/com/openminis/app/plus/MinesSelfCheck.kt
-index 495166b..75c967e 100644
+index 495166b..721f2a0 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/MinesSelfCheck.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/MinesSelfCheck.kt
 @@ -73,13 +73,15 @@ object MinesSelfCheck {
@@ -12769,7 +12870,7 @@ index 495166b..75c967e 100644
          out += timed("Shizuku") {
              val ok = com.openminis.app.sandbox.offload.FastUi.shizukuReady()
              ok to (if (ok) "已授权" else "未运行或未授权")
-@@ -93,15 +95,101 @@ object MinesSelfCheck {
+@@ -93,15 +95,108 @@ object MinesSelfCheck {
              val (code, text) = MinesJobs.runSync(c, "echo mines-ok; uname -m; df -h / | tail -1", 30_000)
              (code == 0 && text.contains("mines-ok")) to text.replace("\n", " ").take(160)
          }
@@ -12798,6 +12899,13 @@ index 495166b..75c967e 100644
 +            ok to "沙箱 mail.google.com ${if (gm > 0) "HTTP $gm" else "连不上"} · 登录页 ${if (ac > 0) "HTTP $ac" else "连不上"} · App ${if (app > 0) "HTTP $app" else "连不上"}" +
 +                (if (code != 0 && !ok) "（${text.lines().lastOrNull { it.isNotBlank() && !it.contains("=") }.orEmpty().take(80)}）" else "") +
 +                " · 网页登录${if (WebProxy.applied) "走代理" else "未走代理"}"
++        }
++        // [Mines-38.9.6 i17] tool-call arguments wrapped as {"arguments":{…}} / JSON strings are unwrapped before dispatch
++        out += timed("工具参数解包") {
++            val T = com.openminis.app.agent.ToolArgsCore
++            val cases = listOf("""{"arguments":{"command":"ls"}}""", """{"args":"{\"command\":\"ls\"}"}""", """{"input":{"parameters":{"command":"ls"}}}""", "\"{\\\"command\\\":\\\"ls\\\"}\"")
++            val ok = cases.count { T.missing("shell_execute", T.normalize(it).first).isEmpty() }
++            (ok == cases.size) to "$ok/${cases.size} 种包法能解开（arguments / args 字符串 / 两层 / 整段字符串）"
 +        }
 +        // [Mines-38.9.6 i17] each server: direct / through the proxy / outside nodes — only all three failing is 「服务器挂了」
 +        progress("服务器连通")
@@ -19687,6 +19795,21 @@ index 057f0f4..b116e94 100644
                  .setTitle(getString(com.openminis.app.R.string.share_provider_json_title))
                  .setMessage(getString(com.openminis.app.R.string.share_provider_json_message))
                  .setPositiveButton(getString(com.openminis.app.R.string.share_provider_json_import)) { _, _ ->
+diff --git a/src/android/app/src/main/java/com/openminis/app/tools/AgentToolSwitch.kt b/src/android/app/src/main/java/com/openminis/app/tools/AgentToolSwitch.kt
+index 99c01d3..23430c9 100644
+--- a/src/android/app/src/main/java/com/openminis/app/tools/AgentToolSwitch.kt
++++ b/src/android/app/src/main/java/com/openminis/app/tools/AgentToolSwitch.kt
+@@ -24,6 +24,10 @@ enum class AgentToolSwitch(val key: String, val defaultValue: Boolean) {
+      *  (see [migrateLegacyIfNeeded]); flipping the default would silently
+      *  disable a feature existing users have. */
+     AGENTS("agent.tools.agents.enabled", true),
++
++    /** [Mines-38.9.6 i17] 技能优先: read a matching SKILL.md before a multi-step task, save a new skill after a new one.
++     *  Prompt-only (no tool is governed by it). */
++    SKILL_FIRST("mines.agent.skillfirst.enabled", true),
+     ;
+ 
+     fun isEnabled(context: Context): Boolean =
 diff --git a/src/android/app/src/main/java/com/openminis/app/tools/AgentTools.kt b/src/android/app/src/main/java/com/openminis/app/tools/AgentTools.kt
 index bd04e31..10fc328 100644
 --- a/src/android/app/src/main/java/com/openminis/app/tools/AgentTools.kt
@@ -20798,7 +20921,7 @@ index d99b975..93fc38a 100644
                  )
              }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
-index e0d0cae..95ae09d 100644
+index e0d0cae..6799385 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
 @@ -89,6 +89,7 @@ import kotlinx.coroutines.flow.combine
@@ -21058,7 +21181,28 @@ index e0d0cae..95ae09d 100644
              // [Mines-loop-34] weak / flash model on a long tool run → one gentle hint to switch in 模型路由
              if (!weakModelHinted && helperConfig == null && runGuard.toolCalls >= 15 &&
                  com.openminis.app.plus.ModelHealth.isWeak(currentProvider.model.id, currentProvider.model.displayName)) {
-@@ -13355,6 +13480,17 @@ class ChatViewModel(
+@@ -13244,12 +13369,19 @@ class ChatViewModel(
+ 
+     private suspend fun executeTool(
+         name: String,
+-        argsJson: String,
++        argsJsonRaw: String,
+         toolId: String,
+         toolBlocks: MutableList<AssistantBlock>,
+         assistantId: String,
+         currentText: String,
+     ): ToolExecutionResult {
++        // [Mines-38.9.6 i17] {"arguments":{…}} / JSON-string arguments are unwrapped before dispatch; a call still missing
++        // a required field gets one precise error (field + expected top-level shape) instead of a generic refusal
++        val (argsJson, unwrapped) = com.openminis.app.agent.ToolArgsCore.normalize(argsJsonRaw)
++        if (unwrapped > 0) AppLogger.info(TAG, "[ToolArgs] $name: unwrapped $unwrapped wrapper level(s)")
++        com.openminis.app.agent.ToolArgsCore.missing(name, argsJson).takeIf { it.isNotEmpty() }?.let { miss ->
++            return ToolExecutionResult(com.openminis.app.agent.ToolArgsCore.error(name, miss, argsJson), success = false, toolTitle = name)
++        }
+         // T330: tri-state permission gating moved into the offload IPC
+         // handler (OffloadGate). The CLIs land there whether the LLM
+         // emitted a named tool call or a raw shell command, so the gate
+@@ -13355,6 +13487,17 @@ class ChatViewModel(
                  kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.MinesSelfCheckTool.run(context, argsJson) }
              com.openminis.app.plus.KnowledgeBase.TOOL_NAME ->
                  kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.KnowledgeBase.runTool(context, argsJson) }
@@ -21076,7 +21220,7 @@ index e0d0cae..95ae09d 100644
              else -> ToolExecutionResult("Unknown tool: $name", false)
          }
      }
-@@ -15429,7 +15565,7 @@ CLI tools at /usr/local/bin with the `android-` prefix give you access to Androi
+@@ -15429,7 +15572,7 @@ CLI tools at /usr/local/bin with the `android-` prefix give you access to Androi
  - android-speech — microphone transcription (`listen [--language BCP47] [--max N] [--timeout SEC]`; `status`). Requires RECORD_AUDIO.
  - android-weather <latitude> <longitude> — Open-Meteo forecast (current + hourly + daily). No API key needed.
  - android-shizuku-cli — invoke privileged Android system APIs (package management, settings, system commands) via Shizuku when granted. Curated subcommands return structured JSON; for anything not covered, fall back to `android-shizuku-cli exec <any shell command>` which runs the command via `sh -c` with Shizuku privilege (same surface as `adb shell`). Run with no args (or --help) for the subcommand list.
@@ -21085,7 +21229,19 @@ index e0d0cae..95ae09d 100644
  - minis-open <url-or-path>: Opens a resource inside Minis without leaving the chat. Accepts http/https URLs (→ built-in WebKit preview) and chat-resource file paths under /var/minis/** (→ built-in file preview, routed by extension: images to the image viewer, .md to markdown preview, .html to HTML preview, .pdf/office docs to QuickLook, audio/video to the media player, else share sheet). Examples: minis-open https://example.com, minis-open /var/minis/workspace/report.md, minis-open /var/minis/attachments/chart.png. Prefer this over android-open for anything that can be previewed in-app so the user doesn't lose conversation context. Run android-open via shell_execute for non-web schemes (tel:, mailto:, geo:, intent:, etc.) or when the user explicitly wants the system handler.
  - minis-sessions-cli: Read chat history. `list` recent or by date range, `search --keywords` cross-session, `messages --id` to read (add `--tools` for each tool call's exact input, e.g. the shell command, and its output). Run --help for full options.
  - minis-model-use: Invoke other LLM models pre-configured by the user. Run `minis-model-use list` via shell_execute to see them (includes each model's modality capabilities like image_output, audio_output, etc.), `minis-model-use search <query>` to filter by name/provider. `minis-model-use run --model <id_or_name>` sends an OpenAI-compatible messages request; pass input via --input <json_file> or stdin, output goes to stdout or --output <path>. The OpenAI shape is the PRIMARY input for every model and modality; standard params are auto-converted to the underlying provider, so do not hand-write provider-native bodies as the primary input. For provider-specific extras the standard schema doesn't model (web-search plugins, image-to-image fields, TTS/video or other custom endpoints), escape hatches exist for OpenAI-compatible providers (they error or are ignored on Anthropic/Gemini models): `extra_body` (object merged verbatim into the request body), a custom `endpoint` path, and a top-level `passthrough` envelope for fully verbatim requests with RAW (unparsed) responses. Results may carry `warnings` (fields that were ignored/downgraded and why) and `applied_extras` (which extras actually took effect) — read them to self-correct. Run --help for the full contract before using these. Models may support multimodal output (image generation, TTS/audio, video) — check the modalities field in list output. For image_output models, pass generation params in the input JSON: top-level `n`/`size`/`quality`/`prompt` (OpenAI /images/generations style) or `generation_config.{aspect_ratio,image_size,number_of_images,person_generation}` (Gemini). Run with --help for full usage.${modelUseDelegateNote}
-@@ -15503,6 +15639,18 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15491,6 +15634,11 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+                 append("\n\n")
+                 append(skillFragment)
+             }
++            // [Mines-38.9.6 i17] 技能优先 (Settings › Agent Tools, default on); byte-stable text → prompt cache unaffected
++            if (!isHelper && com.openminis.app.tools.AgentToolSwitch.SKILL_FIRST.isEnabled(context)) {
++                append("\n\n")
++                append(com.openminis.app.agent.SkillFirst.PROMPT)
++            }
+             if (mcpFragment != null) {
+                 append("\n\n")
+                 append(mcpFragment)
+@@ -15503,6 +15651,18 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                  append("\n\n")
                  append(dailyMemoryFragment)
              }
@@ -21104,7 +21260,7 @@ index e0d0cae..95ae09d 100644
              // Runtime context goes last so the prefix above stays byte-stable
              // across requests within the same day. Keep ordering deterministic
              // (date → tz → lang → model count) — any reorder defeats the cache.
-@@ -15854,11 +16002,59 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15854,11 +16014,59 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
              }
          }
  
@@ -21165,7 +21321,7 @@ index e0d0cae..95ae09d 100644
              append("<user-attached-files>\n")
              for (m in metas) {
                  val urlPath = m.linuxPath.removePrefix("/var/minis/")
-@@ -15874,6 +16070,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15874,6 +16082,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
              }
              append("</user-attached-files>")
          }
@@ -21173,7 +21329,7 @@ index e0d0cae..95ae09d 100644
  
          // Order matches UserAttachmentList convention: images first, then files.
          return PreparedAttachments(
-@@ -17072,6 +17269,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -17072,6 +17281,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
      }
  
      override fun onCleared() {
@@ -21182,7 +21338,7 @@ index e0d0cae..95ae09d 100644
          // [T-sub-agents-queue] Nothing can re-enter a queued delegation once
          // this view model is gone; leaving the starter installed would let the
          // registry call into a cleared VM.
-@@ -17602,6 +17801,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -17602,6 +17813,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                              continue
                          }
                          if (!mime.startsWith("image/")) continue
@@ -21191,7 +21347,7 @@ index e0d0cae..95ae09d 100644
                          val file = java.io.File(mediaStore.mediaBaseDir, rel)
                          if (!file.exists()) continue
                          val original = try { file.readBytes() } catch (_: Exception) { continue }
-@@ -17756,3 +17957,28 @@ internal fun warmUpBudget(window: Int?, compactThreshold: Int?, ratio: Double, f
+@@ -17756,3 +17969,28 @@ internal fun warmUpBudget(window: Int?, compactThreshold: Int?, ratio: Double, f
      val line = if (threshold > 0) threshold else w
      return (line / ratio).toInt() - fixedTokens
  }
@@ -33827,6 +33983,30 @@ index 4e1f21b..e7e0a70 100644
                      }
                  }
              }
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/settings/AgentToolsSettingsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/settings/AgentToolsSettingsScreen.kt
+index 8b8d293..a35cb9a 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/settings/AgentToolsSettingsScreen.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/settings/AgentToolsSettingsScreen.kt
+@@ -42,6 +42,19 @@ fun AgentToolsSettingsScreen(onBack: () -> Unit) {
+                 showDivider = false,
+             )
+         }
++        // [Mines-38.9.6 i17] 技能优先 (default on)
++        var skillFirst by remember { mutableStateOf(AgentToolSwitch.SKILL_FIRST.isEnabled(context)) }
++        SettingsSection(footer = null) {
++            SettingsSwitchRow(
++                title = "技能优先",
++                checked = skillFirst,
++                onCheckedChange = {
++                    skillFirst = it
++                    AgentToolSwitch.SKILL_FIRST.setEnabled(context, it)
++                },
++                showDivider = false,
++            )
++        }
+         // [T-android-subagent-settings-parity] The agents switch is NOT here.
+         //
+         // It lives on Settings > Agents > Sub Agents, which is also where the
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/settings/AppearanceScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/settings/AppearanceScreen.kt
 index d3947d0..b682297 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/settings/AppearanceScreen.kt
@@ -36780,6 +36960,34 @@ index 0000000..8625dd7
 +        assertEquals("未检查", SessionStatus.keyPillLabel(null, null))
 +    }
 +}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/SkillFirstTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/SkillFirstTest.kt
+new file mode 100644
+index 0000000..f82ce24
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/SkillFirstTest.kt
+@@ -0,0 +1,22 @@
++package com.openminis.app.plus
++
++import com.openminis.app.agent.SkillFirst
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import java.io.File
++
++/** [Mines-38.9.6 i17] rule text present; no bundled skill for bulk / batch account registration ships in the APK. */
++class SkillFirstTest {
++    @Test fun promptSaysWhatItMust() {
++        val p = SkillFirst.PROMPT
++        assertTrue(p.contains("SKILL.md")); assertTrue(p.contains("已存成技能")); assertTrue(p.contains("bulk / batch account registration"))
++        assertTrue(p.contains("Never put passwords"))
++    }
++
++    @Test fun noBundledBatchRegistrationSkills() {
++        val roots = listOf(File("src/main/assets"), File("app/src/main/assets")).filter { it.isDirectory }
++        val bad = Regex("(批量注册|批量开号|bulk[ -]?regist|batch[ -]?regist|mass[ -]?regist)", RegexOption.IGNORE_CASE)
++        val hits = roots.flatMap { r -> r.walkTopDown().filter { it.isFile && it.name.equals("SKILL.md", true) && bad.containsMatchIn(it.readText()) }.map { it.path }.toList() }
++        assertTrue("bundled batch-registration skills: $hits", hits.isEmpty())
++    }
++}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/SkillHubCnTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/SkillHubCnTest.kt
 new file mode 100644
 index 0000000..53d4b5f
@@ -37148,6 +37356,40 @@ index 0000000..9b9fd04
 +        val back = C.fromJson(C.toJson(t)); assertNotNull(back); assertEquals(t, back)
 +        assertTrue(C.spoken(t).startsWith("进行中，1/2 步"))
 +    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/ToolArgsCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/ToolArgsCoreTest.kt
+new file mode 100644
+index 0000000..e29d442
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/ToolArgsCoreTest.kt
+@@ -0,0 +1,28 @@
++package com.openminis.app.plus
++
++import com.openminis.app.agent.ToolArgsCore
++import org.json.JSONObject
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class ToolArgsCoreTest {
++    private fun cmd(raw: String) = JSONObject(ToolArgsCore.normalize(raw).first).optString("command")
++
++    @Test fun plainUntouched() { val r = ToolArgsCore.normalize("""{"command":"ls","tool_title":"x"}"""); assertEquals(0, r.second); assertEquals("ls", cmd(r.first)) }
++    @Test fun wrappedObject() = assertEquals("ls", cmd("""{"arguments":{"command":"ls"}}"""))
++    @Test fun wrappedString() = assertEquals("ls", cmd("""{"arguments":"{\"command\":\"ls\"}"}"""))
++    @Test fun otherWrappers() { for (k in listOf("args", "parameters", "input")) assertEquals("ls", cmd("""{"$k":{"command":"ls"}}""")) }
++    @Test fun twoLevels() { val r = ToolArgsCore.normalize("""{"input":{"arguments":{"command":"ls"}}}"""); assertEquals(2, r.second); assertEquals("ls", cmd(r.first)) }
++    @Test fun jsonStringPayload() = assertEquals("ls", cmd("\"{\\\"command\\\":\\\"ls\\\"}\""))
++    @Test fun notAWrapperWhenMoreKeys() { val r = ToolArgsCore.normalize("""{"input":{"command":"ls"},"tool_title":"t"}"""); assertEquals(0, r.second) }
++    @Test fun missingAndError() {
++        val m = ToolArgsCore.missing("shell_execute", """{"cmd":"ls"}""")
++        assertEquals(listOf("command"), m)
++        val e = ToolArgsCore.error("shell_execute", m, """{"cmd":"ls"}""")
++        assertTrue(e.contains("`command`")); assertTrue(e.contains("cmd")); assertTrue(e.contains("\"command\":\"ls -la\""))
++        assertTrue(ToolArgsCore.missing("shell_execute", ToolArgsCore.normalize("""{"arguments":{"command":"ls"}}""").first).isEmpty())
++        assertTrue(ToolArgsCore.missing("unknown_tool", "{}").isEmpty())
++    }
++    @Test fun garbage() { assertEquals(-1, ToolArgsCore.normalize("not json").second); assertEquals("{}", ToolArgsCore.normalize("").first) }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/ValueChipsTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/ValueChipsTest.kt
 new file mode 100644
