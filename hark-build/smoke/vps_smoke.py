@@ -108,6 +108,10 @@ try:
     I398 = "i398" in open("hark-build/smoke/target").read().splitlines()[1:2][0]   # [38.9.8] picker / stacked quick test / timeout / workflows
 except Exception:
     I398 = False
+try:
+    I398B = "i398b" in open("hark-build/smoke/target").read().splitlines()[1:2][0]   # [38.9.8 b] model detail / market / error card
+except Exception:
+    I398B = False
 if I398: I397 = True
 if I397: FAST = True   # [i21b] b397 only runs inside the FAST gate (smoke 39136327758 ran the legacy path without it)
 FONT_SCALE = "1.18"
@@ -3242,7 +3246,8 @@ def main():
         else: fns = (b387_linkall, b387_noblack, b387_persist, b387_platforms)
         if HUB: fns = tuple(fns) + (b3891_hub,)   # [38.9.1 c] hub runs after the UI passes
         if I395: fns = (b395_i2, b395_i) if I395B else (b395_i,)   # [38.9.5 i] build-i gate only: 一键关联 / 一键重新登录, gateway, new screens light + dark
-        if I398: fns = (b398,)
+        if I398B: fns = (b398b,)
+        elif I398: fns = (b398,)
         elif I397: fns = (b397,)   # [38.9.7] its own short gate (1080x2412 / 480 dpi, custom avatar)
         elif I396: fns = ((b396x,) if I396X else ()) + ((b396m,) if I396M else ()) + (b396,) + (tuple(fns) if I395 else ())   # [38.9.6 i12] glass / auto progress / archive shots first, then the full i395 pass + 自检
         elif H3894: fns = (b3894_h,) + tuple(fns)   # [38.9.4 h] SkillHub market, Memoh, a11y wording, 账号 entries, glass / opaque reading, g2 defects first
@@ -5596,6 +5601,100 @@ def b398(res):
     try: b397(res, sub=True)
     except Exception as e:
         import traceback; traceback.print_exc(); page_missing.append(f"i398 b397 sub error {e}")
+
+
+def b398b(res):
+    """[38.9.8 b] user 01:17–01:22 phone shots: 模型详情 (back arrow not 「耳」, no bright bands, last footer line above the
+    gesture bar, backdrop = current sky scene) dark + light; 市场 (Chinese descriptions, 「手机能用」 chip, 「只能电脑用」 group,
+    dsh-pilot note + 一键安装 off); failed install card solid with the Chinese reason first; quick test timeout re-check."""
+    o = res.setdefault("i398b", {})
+    def step(name, f):
+        try: f()
+        except Exception as e:
+            import traceback; traceback.print_exc(); page_missing.append(f"i398b {name} error {e}")
+        if not alive(): crashed.append(f"i398b {name}"); recover(f"i398b {name}")
+    def shot(name):
+        r = snap("i398-" + name)
+        subprocess.run(f"cp {OUT}/{step_no:02d}-i398-{name}.png {OUT}/i398-{name}.png", shell=True)
+        return r
+    set_zh()
+    o["seedmodel"] = seed_model()
+    o["seed"] = result_json("group", "i398 seedpicker", timeout=30)
+    o["classify"] = result_json("group", "i398 classify", timeout=10)
+    print("I398B CLASSIFY", o["classify"], flush=True)
+    if not (isinstance(o["classify"], dict) and o["classify"].get("desktopOnly") and not o["classify"].get("canTry")): selftest_fail.append(f"i398b dsh-pilot not desktop-only {o['classify']}")
+    def detail(sfx):
+        o[f"detail_{sfx}"] = result_json("group", "i398 modeldetail", timeout=15); time.sleep(5)
+        r = shot(f"detail-{sfx}"); t = _txt(r); o[f"detail_top_{sfx}"] = t[:200]
+        o[f"backdrop_{sfx}"] = result_json("group", "i398 backdrop", timeout=10)
+        print(f"I398B DETAIL {sfx} backdrop={o[f'backdrop_{sfx}']} text={t[:160]}", flush=True)
+        for _ in range(6): scroll_down(); time.sleep(0.6)
+        time.sleep(1.5); r = shot(f"detail-end-{sfx}"); o[f"detail_end_{sfx}"] = _txt(r)[-200:]
+        back(1); time.sleep(1.5)
+    def market():
+        route("plus_market", 12); r = dump(); t = _txt(r)
+        for _ in range(4):
+            if "手机能用" in t: break
+            time.sleep(6); r = dump(); t = _txt(r)
+        time.sleep(25)   # translations land (one batched call to the configured model)
+        r = shot("market"); t = _txt(r); o["market"] = t[:500]
+        o["zh"] = result_json("group", "i398 zh", timeout=10); print("I398B ZH", o["zh"], flush=True)
+        if tap_text("手机能用", exact=True, wait=3):
+            for _ in range(10):
+                r = dump()
+                if find(r, "只能电脑用"): break
+                scroll_down(); time.sleep(1)
+            r = shot("market-desktop"); t = _txt(r); o["market_desktop"] = t[:500]
+            if "只能电脑用" not in t: page_missing.append("i398b market: 「只能电脑用」 group not seen")
+            hit = False
+            for _ in range(10):
+                if tap_text("dsh-pilot", wait=3): hit = True; break
+                scroll_down(); time.sleep(1)
+            if hit:
+                r = shot("pilot"); t = _txt(r); o["pilot"] = t[:400]
+                btn = next((n for tt, d, x, y, n in nodes(r) if (tt or d) == "一键安装"), None)
+                o["pilot_btn_enabled"] = (btn or {}).get("enabled")
+                print(f"I398B PILOT enabled={o['pilot_btn_enabled']} text={t[:240]}", flush=True)
+                if "手机上装了也用不了" not in t: selftest_fail.append("i398b dsh-pilot dialog lacks the 只能电脑用 note")
+                back(1); time.sleep(1)
+            else: page_missing.append("i398b market: dsh-pilot not listed (SkillHub list may have changed)")
+        else: page_missing.append("i398b market: 手机能用 chip not found")
+        back(1); time.sleep(1)
+    def jobfail():
+        r = b381_home(); time.sleep(2)
+        o["jobfail"] = result_json("group", "i398 jobfail", timeout=10); time.sleep(12)
+        r = shot("jobfail"); t = _txt(r); o["jobfail_text"] = t[:300]
+        if tap_text("详情", exact=True, wait=2): time.sleep(1.5); shot("jobfail-details")
+        print(f"I398B JOBFAIL {t[:240]}", flush=True)
+        if "没成功" not in t: page_missing.append("i398b failure card not seen")
+        tap_text("好", exact=True, wait=2)
+    def quick():
+        o["quick_open"] = result_json("group", "i398 picker coze:7696936574432591908", timeout=20)
+        time.sleep(7); shot("quick-3s-b")
+        t0 = time.time(); t = ""
+        while time.time() - t0 < 100:
+            time.sleep(10); t = _txt(dump())
+            if "测试中" not in t and "快速测试" in t: break
+        r = shot("quick-end-b"); t = _txt(r); o["quick_end"] = t[:300]; o["quick_secs"] = int(time.time() - t0) + 7
+        o["silent"] = result_json("group", "i398 silent", timeout=10)
+        print(f"I398B QUICK secs={o['quick_secs']} silent={o['silent']} text={t[:240]}", flush=True)
+        if "测试中" in t: selftest_fail.append(f"i398b quick test still 测试中… after {o['quick_secs']} s")
+        back(1); time.sleep(1.5); back(1); time.sleep(1); back(1)
+    for mode, sfx in ((2, "dark"), (1, "light")):
+        theme388(mode); healthy_home(); step("detail-" + sfx, lambda sfx=sfx: detail(sfx))
+    theme388(2); healthy_home()
+    def clash():
+        route("plus_routing", 5)
+        for _ in range(10):
+            r = dump()
+            if find(r, "内置 Clash 内核"): break
+            scroll_down(); time.sleep(0.8)
+        scroll_down(); time.sleep(1); r = shot("clash-b"); o["clash"] = _txt(r)[:400]; back(1)
+    step("market", market)
+    step("clash", clash)
+    step("jobfail", jobfail)
+    step("quick", quick)
+    print("I398B RESULT " + json.dumps(o, ensure_ascii=False)[:6000], flush=True)
 
 
 def finish(lc):
