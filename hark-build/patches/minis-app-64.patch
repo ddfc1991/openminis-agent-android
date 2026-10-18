@@ -10110,7 +10110,7 @@ index 1d773a2..5489e65 100644
          coroutineScope {
              val bg = slow.map { id -> async { one(id) } }
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-index af13c1b..48c702d 100644
+index af13c1b..6665be5 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 @@ -2,6 +2,7 @@ package com.openminis.app.plus.group
@@ -10121,7 +10121,7 @@ index af13c1b..48c702d 100644
  import kotlinx.coroutines.runBlocking
  import org.json.JSONArray
  import org.json.JSONObject
-@@ -21,6 +22,123 @@ object GroupSelfTest {
+@@ -21,6 +22,207 @@ object GroupSelfTest {
          val rest = arg.substringAfter(' ', "")
          val parts = rest.split('|')
          when (cmd) {
@@ -10219,6 +10219,90 @@ index af13c1b..48c702d 100644
 +                    else -> "i395 seed | accounts | login <site> | gw | bailian <key>"
 +                }
 +            }
++            // [Mines-38.9.6 i12] smoke: 'i396 seed' = four chats for the progress / archive shots (a new chat with automatic
++            // steps still running, a plain Q&A, a chat idle for 1 day with no table yet = rebuilt from history at home, one idle
++            // 5 days = auto-archived); 'i396 state' = every listed chat's table + archive flag; 'i396 archive|restore <sid>';
++            // 'i396 selfcheck' = the in-app 自检 (MinesSelfCheck.runAll) as JSON rows (name / ok / warn / detail).
++            "i396" -> {
++                val sub = rest.substringBefore(' ').trim(); val arg2 = rest.substringAfter(' ', "").trim()
++                val app = context.applicationContext as com.openminis.app.MinisApp
++                val TP = com.openminis.app.plus.TaskProgress; TP.init(context)
++                val CO = com.openminis.app.plus.ChatOrganizer; CO.init(context)
++                fun text(t: String) = JSONArray().put(JSONObject().put("type", "text").put("value", t)).toString()
++                fun toolText(tool: String, t: String) = JSONArray().put(JSONObject().put("type", "toolUse").put("value", JSONObject().put("name", "shell_execute")
++                    .put("input", JSONObject().put("tool_title", tool).put("command", "true").toString()))).put(JSONObject().put("type", "text").put("value", t)).toString()
++                when (sub) {
++                    "seed" -> {
++                        val repo = app.chatRepository
++                        val model = repo.observeSessions().first().firstOrNull { it.modelId.isNotEmpty() }?.modelId ?: "smoke"
++                        val now = System.currentTimeMillis()
++                        val out = JSONObject()
++                        // 1) new chat, automatic steps, still running
++                        val a = repo.createSession(model, title = "帮我领取免费云浏览器")
++                        repo.appendMessage(a.id, "user", text("帮我领取免费云浏览器，注册完告诉我额度"))
++                        TP.onTurnStart(a.id, "帮我领取免费云浏览器，注册完告诉我额度")
++                        TP.onToolStart(a.id, "打开注册页"); TP.onToolEnd(a.id, "打开注册页", true)
++                        TP.onToolStart(a.id, "填写邮箱"); TP.onToolEnd(a.id, "填写邮箱", true)
++                        TP.onToolStart(a.id, "等邮件验证码")
++                        out.put("auto", a.id)
++                        // 2) plain Q&A
++                        val b = repo.createSession(model, title = "今天新加坡天气怎么样？")
++                        repo.appendMessage(b.id, "user", text("今天新加坡天气怎么样？"))
++                        repo.appendMessage(b.id, "assistant", text("多云，31 °C，傍晚可能有阵雨，出门带把伞。"))
++                        TP.onTurnStart(b.id, "今天新加坡天气怎么样？"); TP.onTurnEnd(b.id, false, "多云，31 °C，傍晚可能有阵雨，出门带把伞。")
++                        out.put("qa", b.id)
++                        // 3) idle 1 day, no table yet (built from history on home)
++                        val c = repo.createSession(model, title = "整理服务器日志")
++                        repo.appendMessage(c.id, "user", text("帮我看看服务器日志有没有报错"))
++                        repo.appendMessage(c.id, "assistant", toolText("查看日志", "日志里没有报错，服务正常。"))
++                        repo.appendMessage(c.id, "user", text("那再重启一下"))
++                        repo.appendMessage(c.id, "assistant", text("已重启，状态 active。"))
++                        app.database.chatDao().touchSession(c.id, now - 26 * 3_600_000L)
++                        TP.forget(c.id)
++                        out.put("idle", c.id)
++                        // 4) idle 5 days → auto-archived (3-day rule)
++                        val d = repo.createSession(model, title = "上周的旧对话：查快递")
++                        repo.appendMessage(d.id, "user", text("帮我查一下快递到哪了"))
++                        repo.appendMessage(d.id, "assistant", text("已到新加坡分拣中心，预计周三送达。"))
++                        app.database.chatDao().touchSession(d.id, now - 5 * 86_400_000L)
++                        TP.forget(d.id)
++                        out.put("old", d.id)
++                        out.toString()
++                    }
++                    "state" -> {
++                        val all = app.chatRepository.observeSessions().first().filter { it.parentSessionId == null }
++                        JSONArray(all.map { s ->
++                            val t = TP.get(s.id)
++                            JSONObject().put("sid", s.id).put("title", s.title ?: "").put("archived", CO.isArchived(s)).put("manual", CO.isManual(s.id))
++                                .put("has", t != null).put("st", t?.st?.label ?: "").put("origin", t?.origin ?: "").put("auto", t?.auto ?: false)
++                                .put("steps", JSONArray(t?.steps.orEmpty().map { it.title + "|" + it.st.id })).put("line", t?.let { com.openminis.app.plus.TaskProgressCore.oneLine(it) } ?: "")
++                        }).toString()
++                    }
++                    // after a theme switch (the smoke force-stops the app, which turns 进行中 into 已停止): run the new chat's turn again
++                    "relive" -> {
++                        val a = app.chatRepository.observeSessions().first().firstOrNull { it.title == "帮我领取免费云浏览器" } ?: return@runBlocking "no chat"
++                        TP.forget(a.id)
++                        TP.onTurnStart(a.id, "帮我领取免费云浏览器，注册完告诉我额度")
++                        TP.onToolStart(a.id, "打开注册页"); TP.onToolEnd(a.id, "打开注册页", true)
++                        TP.onToolStart(a.id, "填写邮箱"); TP.onToolEnd(a.id, "填写邮箱", true)
++                        TP.onToolStart(a.id, "等邮件验证码")
++                        "relived ${a.id}"
++                    }
++                    "archive" -> { CO.archive(context, arg2); "archived $arg2" }
++                    "restore" -> { CO.restore(context, arg2); "restored $arg2" }
++                    "backfill" -> {
++                        val all = app.chatRepository.observeSessions().first().filter { it.parentSessionId == null }
++                        TP.backfill(context, all.map { it.id to it.title }); "ok ${all.size}"
++                    }
++                    "selfcheck" -> {
++                        val rows = kotlinx.coroutines.withTimeoutOrNull(150_000) { com.openminis.app.plus.MinesSelfCheck.runAll(context) }
++                        if (rows == null) "timeout" else JSONArray(rows.map {
++                            JSONObject().put("name", it.name).put("ok", it.ok).put("warn", it.warn).put("detail", com.openminis.app.plus.AccountLabel.maskText(it.detail).take(140)).put("ms", it.ms)
++                        }).toString()
++                    }
++                    else -> "i396 seed | state | archive <sid> | restore <sid> | backfill | selfcheck"
++                }
++            }
 +            // [Mines-38.9.1] 应用代理: 'agents' list (mine + enabled), 'agents clear', 'agents add <id>'
 +            "agents" -> {
 +                val A = com.openminis.app.plus.AppAgents; A.init(context)
@@ -10245,7 +10329,7 @@ index af13c1b..48c702d 100644
              "partners" -> {
                  val l = Partners.refresh(context, rescanApps = true)
                  JSONArray(l.map { JSONObject().put("id", it.id).put("name", it.spec.name).put("state", it.state.name).put("model", it.model).put("via", it.via) }).toString()
-@@ -136,6 +254,13 @@ object GroupSelfTest {
+@@ -136,6 +338,13 @@ object GroupSelfTest {
                  GroupStore.add(gid, GroupMsg(GroupStore.newId(), parts.getOrElse(2) { "host" }, "成员A", "", parts.getOrElse(3) { "好的，结论：照这个办。" }))
                  "ok"
              }
@@ -10259,7 +10343,7 @@ index af13c1b..48c702d 100644
              "kbrun" -> { val n = com.openminis.app.plus.ChatKnowledge.runNow(context); "organised=$n" }
              "kbstate" -> {
                  val l = com.openminis.app.plus.ChatKnowledge.load(context)
-@@ -151,6 +276,11 @@ object GroupSelfTest {
+@@ -151,6 +360,11 @@ object GroupSelfTest {
                  JSONObject().put("title", g.title).put("care", g.care).put("kind", g.kind)
                      .put("weather", com.openminis.app.plus.HomeGreeting.cachedWeather(context)?.let { "${it.code}/${it.temp}" } ?: "none").toString()
              }
@@ -10271,7 +10355,7 @@ index af13c1b..48c702d 100644
              "greetweather" -> {
                  context.getSharedPreferences("mines_greeting", Context.MODE_PRIVATE).edit().remove("w_try").apply()
                  com.openminis.app.plus.HomeGreeting.refreshWeather(context)
-@@ -238,6 +368,112 @@ object GroupSelfTest {
+@@ -238,6 +452,112 @@ object GroupSelfTest {
              "wallpaper" -> { com.openminis.app.plus.PlusPrefs.init(context)
                  if (parts.getOrElse(0) { "" } == "off") com.openminis.app.plus.PlusPrefs.update(context) { it.copy(wallpaper = "") }
                  com.openminis.app.plus.PlusPrefs.state.value.wallpaper.ifBlank { "none" } }
