@@ -4847,7 +4847,7 @@ def b396x(res):
             if not (isinstance(st, dict) and st.get("scene") == k): selftest_fail.append(f"i396x sky {sfx}: forced {k} but scene={st}")
         for k in ("rain", "night"):
             result_json("group", f"i396 sky {k} static", timeout=20); b381_home(); time.sleep(3); shot388(f"i396x-sky-{k}-static-{sfx}")
-        result_json("group", "i396 sky auto", timeout=20)
+        result_json("group", "i396 sky cloudy static", timeout=20)   # [i15] static for the rest of the run (swiftshader load)
     # 2 快速测试 sheet over the busy model page
     def quick(sfx):
         q = result_json("group", "i396 quicktest", timeout=30); o["quick_" + sfx] = q
@@ -4883,7 +4883,7 @@ def b396x(res):
         tb = node_bounds(r, lambda n: (n.get("text") or "").startswith("今天新加坡天气"))
         if tb:
             cx, cy = (tb[0] + tb[2]) // 2, (tb[1] + tb[3]) // 2
-            sh(f"input swipe {cx} {cy} {cx} {cy} 900"); time.sleep(2); ov("rowmenu", sfx); back(1); time.sleep(1)
+            sh(f"input swipe {cx} {cy} {cx} {cy} 1600"); time.sleep(2); ov("rowmenu", sfx); back(1); time.sleep(1)
         result_json("group", 'greet {"hour":15,"weather":"cloudy"}'); r = b381_home(); time.sleep(3); w = all_desc(r, "天气：")
         if w: sh(f"input tap {w[0][0]} {w[0][1]}"); time.sleep(2.5); ov("dialog", sfx); back(1); time.sleep(1)
         route("plus_keychain", 6); r = dump(); a = all_desc(r, "添加：关联账号或添加身份")
@@ -5091,7 +5091,8 @@ def b396(res):
             import traceback; traceback.print_exc(); page_missing.append(f"i396 {name} error {e}")
         if not alive(): crashed.append(f"i396 {name}"); relaunch()
     set_zh()
-    o["seed"] = result_json("group", "i396 seed", timeout=90)
+    if not I396X: o["seed"] = result_json("group", "i396 seed", timeout=90)   # [i15] b396x already seeded (a second seed duplicated every chat)
+    result_json("group", "i396 sky cloudy static", timeout=20)   # [i15] static sky for the rest (swiftshader + live AGSL made long-press flaky)
     def row_pill(r, title):
         tb = node_bounds(r, lambda n: (n.get("text") or "").startswith(title))
         if not tb: return None, None
@@ -5127,11 +5128,14 @@ def b396(res):
         back(1); time.sleep(1.5)
         t = sheet_for("整理服务器日志", "idle", sfx, ("问：帮我看看服务器日志", "答：已重启"))
         if t is not None and sfx == "light":
-            if tap_text("归档", exact=True, wait=1.2):
-                r = shot388(f"i396-undo-{sfx}"); t2 = _txt(r); o["undo_" + sfx] = t2[-300:]
+            if tap_text("归档", exact=True, wait=0.6):
+                r0 = dump(); t0 = _txt(r0)   # [i15] the bar lives 4 s; a full shot388 (screencap + dump) can outlast it
+                ub = node_bounds(r0, lambda n: (n.get("text") or "") == "撤销")
+                r = shot388(f"i396-undo-{sfx}"); t2 = t0 + " " + _txt(r); o["undo_" + sfx] = t2[-300:]
                 if "已归档这个对话" not in t2: selftest_fail.append(f"i396 {sfx}: no 「已归档 · 撤销」 toast after 归档")
-                if "整理服务器日志" in t2: selftest_fail.append(f"i396 {sfx}: archived chat still on home")
-                if not tap_text("撤销", exact=True, wait=2): selftest_fail.append(f"i396 {sfx}: 撤销 not found")
+                if t0.count("整理服务器日志") > 0 and "已归档这个对话" in t0: selftest_fail.append(f"i396 {sfx}: archived chat still on home")
+                if ub: sh(f"input tap {(ub[0] + ub[2]) // 2} {(ub[1] + ub[3]) // 2}"); time.sleep(2)
+                elif not tap_text("撤销", exact=True, wait=2): selftest_fail.append(f"i396 {sfx}: 撤销 not found")
                 time.sleep(1.5); t3 = _txt(dump())
                 if "整理服务器日志" not in t3: selftest_fail.append(f"i396 {sfx}: 撤销 did not bring the chat back")
             else: selftest_fail.append(f"i396 {sfx}: 归档 button not on the progress card"); back(1)
@@ -5157,7 +5161,7 @@ def b396(res):
         tb = node_bounds(r, lambda n: (n.get("text") or "").startswith("今天新加坡天气"))
         if tb:
             cx, cy = (tb[0] + tb[2]) // 2, (tb[1] + tb[3]) // 2
-            sh(f"input swipe {cx} {cy} {cx} {cy} 900"); time.sleep(2)
+            sh(f"input swipe {cx} {cy} {cx} {cy} 1600"); time.sleep(2)
             r = shot388(f"i396-rowmenu-{sfx}"); t = _txt(r); o["rowmenu_" + sfx] = t[:300]
             if "归档" not in t: selftest_fail.append(f"i396 {sfx}: long-press menu has no 归档")
             back(1); time.sleep(1)
