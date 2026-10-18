@@ -58,10 +58,19 @@ index fd4c2be..2141a5f 100644
      ConnectTimeout 12
      ConnectionAttempts 2
 diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-vps b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-vps
-index dfd05ae..2e398d2 100755
+index dfd05ae..bae5f08 100755
 --- a/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-vps
 +++ b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-vps
-@@ -77,7 +77,7 @@ load() {
+@@ -15,6 +15,8 @@
+ #   minis-vps shell                    interactive login
+ #   minis-vps status                   uptime, memory, disk, public IP
+ #   minis-vps servers                  servers in the order they are tried
++#   minis-vps probe [host[:port]…]     is it the server or the phone's network? direct + via proxy + outside nodes
++#                                      (default: every server). Only 「服务器挂了」 here means the server is down.
+ #   minis-vps setup user@host [port]   make a key in the sandbox and install it (asks the password once)
+ #   minis-vps relay-setup [port]       on the server: install a WebSocket→sshd bridge (default port 8022)
+ #
+@@ -77,7 +79,7 @@ load() {
      set_target "${SERVERS%% *}"
  }
  
@@ -70,7 +79,70 @@ index dfd05ae..2e398d2 100755
  # One shared connection per server (ControlMaster): later commands skip the
  # TCP + key exchange round trips entirely, which is most of the latency on a
  # mobile link and far fewer handshakes for middleboxes to interfere with.
-@@ -189,7 +189,8 @@ run_job() {
+@@ -139,7 +141,8 @@ pick() {
+         echo "minis-vps: 所有服务器暂时连不上，${delay} 秒后重试（第 $round 轮）…" >&2
+         sleep "$delay"; delay=$((delay * 2)); [ "$delay" -gt 20 ] && delay=20
+     done
+-    echo "minis-vps: 所有服务器都连不上。检查网络，或在 设置 → 工作位置 给服务器加一个中转。" >&2
++    echo "minis-vps: 手机这边连不上任何服务器（这不等于服务器挂了）。三条路的检测：" >&2
++    set_target "${SERVERS%% *}"; probe1 "${VPS_TARGET#*@}" "$VPS_PORT" >&2 || true
+     return 255
+ }
+ 
+@@ -151,6 +154,52 @@ script() {
+     if [ $# -eq 1 ]; then printf '%s' "$1"; return; fi
+     for w; do printf "'%s' " "$(printf '%s' "$w" | sed "s/'/'\\\\''/g")"; done
+ }
++# [Mines-38.9.6 i17] remote jobs: rg falls back to grep where ripgrep is missing (a job printed 'rg: not found')
++RG_SHIM='command -v rg >/dev/null 2>&1 || rg() { [ $# -le 1 ] && set -- "$@" .; grep -rnE --color=never --exclude-dir=.git --exclude-dir=node_modules "$@"; }
++'
++rscript() { printf '%s' "$RG_SHIM"; script "$@"; }
++
++# [Mines-38.9.6 i17] probe <host> <port>: one line per path + a verdict. Never calls a server down from one path.
++probe1() {
++    h="$1"; p="${2:-22}"; d=0; x=""; dw=""; xw=""
++    # curl telnet:// = raw TCP; time_connect > 0 = the TCP connect worked; SSH ports must also send the "SSH-" banner
++    # (a TUN / fake-ip VPN on the phone answers the connect itself)
++    o=$(timeout 10 curl -sS --noproxy '*' --max-time 6 -w '\n__C=%{time_connect}' "telnet://$h:$p" </dev/null 2>&1)
++    c=$(printf '%s' "$o" | sed -n 's/^__C=//p' | tail -n 1); b=$(printf '%s' "$o" | grep -m1 '^SSH-')
++    if [ -n "$b" ]; then d=1
++    elif [ "$p" != 22 ] && [ -n "$c" ] && [ "$c" != 0 ] && [ "$c" != 0.000000 ]; then d=1
++    else dw=$(printf '%s' "$o" | grep -v '^__C=' | grep -m1 'curl:' | sed 's/^curl: ([0-9]*) //' | head -c 60); [ -n "$c" ] && [ "$c" != 0.000000 ] && [ -z "$dw" -o "$p" = 22 ] && dw="端口通了但没有 SSH 回应"; fi
++    px="${HTTPS_PROXY:-${https_proxy:-${ALL_PROXY:-${all_proxy:-}}}}"
++    if [ "$d" = 0 ] && [ -n "$px" ]; then
++        o=$(timeout 14 curl -sS --max-time 10 -p -x "$px" -w '\n__H=%{http_connect}' "telnet://$h:$p" </dev/null 2>&1)
++        if printf '%s' "$o" | grep -q '^SSH-'; then x=1
++        elif [ "$p" != 22 ] && printf '%s' "$o" | grep -q '^__H=200'; then x=1
++        else x=0; xw=$(printf '%s' "$o" | grep -m1 'curl:' | sed 's/^curl: ([0-9]*) //' | head -c 60); fi
++    fi
++    ok=0; tot=0
++    if [ "$d" = 0 ] && [ "$x" != 1 ]; then
++        id=$(curl -sS --max-time 10 -H 'Accept: application/json' "https://check-host.net/check-tcp?host=$h:$p&max_nodes=3" 2>/dev/null | sed -n 's/.*"request_id" *: *"\([^"]*\)".*/\1/p')
++        if [ -n "$id" ]; then
++            i=0; while [ $i -lt 6 ]; do sleep 2; i=$((i + 1))
++                r=$(curl -sS --max-time 8 -H 'Accept: application/json' "https://check-host.net/check-result/$id" 2>/dev/null)
++                pend=$(printf '%s' "$r" | grep -o ': *null' | wc -l)
++                tot=$(printf '%s' "$r" | grep -o '"[a-z0-9.-]*\.node\.check-host\.net": *\[' | wc -l)
++                ok=$(printf '%s' "$r" | grep -o '"time"' | wc -l)
++                [ "$tot" -gt 0 ] && [ "$pend" -eq 0 ] && break
++            done
++        fi
++    fi
++    echo "$h:$p"
++    [ "$d" = 1 ] && echo "  直连：通" || echo "  直连：不通（${dw:-连不上}）"
++    if [ -z "$px" ]; then echo "  走代理：没设代理"; elif [ "$d" = 1 ]; then echo "  走代理：不用测"; elif [ "$x" = 1 ]; then echo "  走代理：通（$px）"; else echo "  走代理：不通（${xw:-没有回应}）"; fi
++    [ "$d" = 0 ] && [ "$x" != 1 ] && { [ "$tot" -gt 0 ] && echo "  外部节点：$ok/$tot 个连得上" || echo "  外部节点：没结果（check-host.net 连不上）"; }
++    if [ "$d" = 1 ]; then echo "结论：在线（直连通）"
++    elif [ "$x" = 1 ]; then echo "结论：在线（直连不通，走代理通）——是手机网络的问题，服务器没挂"
++    elif [ "$ok" -gt 0 ]; then echo "结论：手机网络到不了，服务器本身在线（外部 $ok/$tot 个节点连得上）——不要说服务器挂了"
++    elif [ "$tot" -ge 2 ]; then echo "结论：服务器挂了或端口关了（直连、代理、外部节点都连不上）"
++    else echo "结论：暂时没法判断（只有手机这边的路不通），不能说服务器挂了"; fi
++}
++
+ valid_name() { case "$1" in ''|*[!A-Za-z0-9._-]*) echo "minis-vps: job name must be letters, digits, . _ -" >&2; exit 2;; esac; }
+ 
+ # Remote snippets. start_job is idempotent (a retry after a drop never starts
+@@ -189,7 +238,8 @@ run_job() {
              echo "minis-vps: 连接断了 ${budget} 秒还没恢复。任务还在 $VPS_TARGET 上继续跑；网络好了运行  minis-vps attach $name  接着看结果。" >&2
              return 75
          fi
@@ -80,6 +152,52 @@ index dfd05ae..2e398d2 100755
          sleep "$delay"; delay=$((delay * 2)); [ "$delay" -gt 30 ] && delay=30
      done
  }
+@@ -215,8 +265,8 @@ case "$cmd" in
+ run|bg|attach|jobs|logs|status)
+     if [ "$1" != "--direct" ] && link_ok; then
+         case "$cmd" in
+-        run)    name="run-$(date +%s)-$$"; script "$@" | link_stream "$LP/run?name=$name"; exit $? ;;
+-        bg)     name="$1"; shift; valid_name "$name"; script "$@" | lcurl -X POST --data-binary @- "$LP/start?name=$name"; exit 0 ;;
++        run)    name="run-$(date +%s)-$$"; rscript "$@" | link_stream "$LP/run?name=$name"; exit $? ;;
++        bg)     name="$1"; shift; valid_name "$name"; rscript "$@" | lcurl -X POST --data-binary @- "$LP/start?name=$name"; exit 0 ;;
+         attach) valid_name "$1"; printf '' | lcurl "$LP/attach?name=$1&since=${2:-0}" | awk '/^__MINES_RC=/{rc=substr($0,12)+0; next} {print; fflush()} END{exit rc}'; exit $? ;;
+         jobs)   lcurl "$LP/jobs"; exit 0 ;;
+         logs)   valid_name "$1"; printf 'tail -n %s ~/.mines-link/jobs/%s/out 2>/dev/null || tail -n %s ~/minis-jobs/%s.log' "${2:-100}" "$1" "${2:-100}" "$1" | link_stream "$LP/exec?t=30"; exit $? ;;
+@@ -240,10 +290,10 @@ setup)
+     ;;
+ run)
+     need_ssh; load
+-    if [ "$1" = "--direct" ]; then shift; s "sh -c \"\$(echo $(b64 "$(script "$@")") | base64 -d)\""; exit $?; fi
++    if [ "$1" = "--direct" ]; then shift; s "sh -c \"\$(echo $(b64 "$(rscript "$@")") | base64 -d)\""; exit $?; fi
+     name="run-$(date +%s)-$$"
+     pick || exit 255; remember_job "$name"
+-    run_job "$name" "$(start_job "$name" "$(b64 "$(script "$@")")")"; rc=$?
++    run_job "$name" "$(start_job "$name" "$(b64 "$(rscript "$@")")")"; rc=$?
+     [ "$rc" -ne 75 ] && rm -f "$JOBS/$name"
+     exit "$rc"
+     ;;
+@@ -251,7 +301,7 @@ bg)
+     need_ssh; load
+     name="$1"; shift; valid_name "$name"
+     pick || exit 255; remember_job "$name"
+-    s1 "$(start_job "$name" "$(b64 "$(script "$@")")") echo started $name pid \$(cat ~/minis-jobs/$name.pid) on \$(hostname)"
++    s1 "$(start_job "$name" "$(b64 "$(rscript "$@")")") echo started $name pid \$(cat ~/minis-jobs/$name.pid) on \$(hostname)"
+     ;;
+ attach)
+     need_ssh; load; valid_name "$1"; job_server "$1"
+@@ -264,6 +314,12 @@ shell)  need_ssh; load; pick; eval "ssh -t $BASE_OPTS -o BatchMode=no $MUX_OPTS
+ status) need_ssh; load; MINIS_VPS_CONNECT_SECS=${MINIS_VPS_CONNECT_SECS:-20} s 'uptime; free -m | sed -n 2p; df -h / | tail -1; curl -s --max-time 5 https://ipinfo.io/ip; echo' ;;
+ jobs)   need_ssh; load; MINIS_VPS_CONNECT_SECS=${MINIS_VPS_CONNECT_SECS:-20} s 'cd ~/minis-jobs 2>/dev/null || exit 0; for p in *.pid; do [ -f "$p" ] || continue; n=${p%.pid}; if [ -f "$n.rc" ]; then st="done($(cat $n.rc))"; elif kill -0 $(cat "$p") 2>/dev/null; then st=running; else st=done; fi; echo "$n $st"; done' ;;
+ servers) load; for srv in $SERVERS; do echo "$srv"; done ;;
++probe)
++    command -v curl >/dev/null 2>&1 || apk add --no-cache curl >/dev/null 2>&1 || true
++    if [ $# -gt 0 ]; then for a; do a="${a#*@}"; case "$a" in *:*) probe1 "${a%:*}" "${a##*:}" ;; *) probe1 "$a" 22 ;; esac; done
++    else load; seen=""; for srv in $SERVERS; do set_target "$srv"; [ -n "$RELAY_ONLY" ] && continue; hp="${VPS_TARGET#*@}:$VPS_PORT"
++        case " $seen " in *" $hp "*) continue ;; esac; seen="$seen $hp"; probe1 "${VPS_TARGET#*@}" "$VPS_PORT"; done; fi
++    ;;
+ relay-setup)
+     need_ssh; load; port="${1:-8022}"
+     s "set -e; a=\$(uname -m); command -v websocat >/dev/null || { curl -fsSL -o /usr/local/bin/websocat https://github.com/vi/websocat/releases/download/v1.14.1/websocat.\$a-unknown-linux-musl; chmod +x /usr/local/bin/websocat; }; \
 diff --git a/src/android/app/src/main/assets/licenses/mihomo.txt b/src/android/app/src/main/assets/licenses/mihomo.txt
 new file mode 100644
 index 0000000..80554eb
@@ -91,6 +209,21 @@ index 0000000..80554eb
 +shipped unmodified inside Mines as lib/arm64-v8a/libmihomo.so and run as a separate process.
 +Licence: GNU General Public License v3.0 (GPL-3.0). Source code: https://github.com/MetaCubeX/mihomo/tree/v1.19.32
 +Mines itself is distributed under GPL-3.0 as well (continued development of OpenMinis).
+diff --git a/src/android/app/src/main/assets/mines-link/install-bundle.sh b/src/android/app/src/main/assets/mines-link/install-bundle.sh
+index 3e55cde..de70bb8 100644
+--- a/src/android/app/src/main/assets/mines-link/install-bundle.sh
++++ b/src/android/app/src/main/assets/mines-link/install-bundle.sh
+@@ -17,6 +17,10 @@ done
+ [ "$(id -u)" = 0 ] || { echo "请用 root 运行"; exit 1; }
+ command -v python3 >/dev/null || { (apt-get update -qq && apt-get install -y -qq python3) || yum install -y -q python3 || dnf install -y -q python3; }
+ command -v openssl >/dev/null || { (apt-get install -y -qq openssl) || yum install -y -q openssl || dnf install -y -q openssl; }
++# [Mines-38.9.6 i17] agents search with rg (a job printed 'rg: not found'): install ripgrep, else a grep stand-in
++command -v rg >/dev/null || { (apt-get install -y -qq ripgrep) || yum install -y -q ripgrep || dnf install -y -q ripgrep || apk add --no-cache ripgrep; } >/dev/null 2>&1 || true
++command -v rg >/dev/null || { printf '%s\n' '#!/bin/sh' '# Mines: ripgrep is not installable here; plain grep stand-in (rg PATTERN [PATH...])' \
++  '[ $# -le 1 ] && set -- "$@" .' 'exec grep -rnE --color=never --exclude-dir=.git --exclude-dir=node_modules "$@"' > /usr/local/bin/rg; chmod +x /usr/local/bin/rg; }
+ SRC="${MINES_LINK_SRC:-https://cdn.jsdelivr.net/gh/ddfc1991/openminis-agent-android@hark-minis-build/hark-build/vps-worker/mines-link.py}"
+ mkdir -p /etc/mines-link /opt/mines-link
+ if true; then cat > /opt/mines-link/mines-link.py <<'__MINES_EOF__'
 diff --git a/src/android/app/src/main/assets/mines/settings_map.tsv b/src/android/app/src/main/assets/mines/settings_map.tsv
 new file mode 100644
 index 0000000..a409c2e
@@ -10372,6 +10505,59 @@ index 0000000..7f2c27c
 +        }
 +    }
 +}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ImageOnDemandCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/ImageOnDemandCore.kt
+new file mode 100644
+index 0000000..d16cdd1
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/ImageOnDemandCore.kt
+@@ -0,0 +1,47 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-38.9.6 i17] Images sent to the agent work like Hark (user 2026-10-18): the picture is saved as a file in the
++ * sandbox (original + a model copy, long edge ≤ 1568 px, JPEG q85) and the message carries only a short marker with the
++ * path, type and size. A vision model looks at it with read_image when it needs to; a text-only model is told plainly
++ * where the image is. No base64 rides along in every later turn. Pure (JVM-testable).
++ */
++object ImageOnDemandCore {
++    const val MAX_EDGE = 1568
++    const val QUALITY = 85
++
++    /** target size for the model copy, or null when the original already fits */
++    fun fit(w: Int, h: Int, max: Int = MAX_EDGE): Pair<Int, Int>? {
++        if (w <= 0 || h <= 0) return null
++        val long = maxOf(w, h)
++        if (long <= max) return null
++        val s = max.toDouble() / long
++        return maxOf(1, Math.round(w * s).toInt()) to maxOf(1, Math.round(h * s).toInt())
++    }
++
++    /** model copy name next to the original: photo.png → photo.1568.jpg */
++    fun viewName(original: String): String {
++        val dot = original.lastIndexOf('.')
++        val base = if (dot > 0) original.substring(0, dot) else original
++        return "$base.$MAX_EDGE.jpg"
++    }
++
++    fun sizeText(bytes: Long): String = when {
++        bytes >= 1024L * 1024 -> String.format(java.util.Locale.US, "%.1f MB", bytes / 1048576.0)
++        bytes >= 1024 -> "${(bytes + 512) / 1024} KB"
++        else -> "$bytes B"
++    }
++
++    /**
++     * One marker line per image. [viewPath] = the copy to read (the original when it already fits).
++     * [readable] = the current model can look at images (native vision, or read_image routed to a Vision Group).
++     */
++    fun marker(name: String, path: String, viewPath: String, mime: String, bytes: Long, w: Int, h: Int, readable: Boolean): String {
++        val dims = if (w > 0 && h > 0) "，${w}×${h}" else ""
++        val orig = if (viewPath != path) "（原图 $path）" else ""
++        return if (readable)
++            "[图片 $name：$viewPath$orig，$mime，${sizeText(bytes)}$dims。需要看内容时用 read_image $viewPath 读取]"
++        else
++            "[图片 $name 已存到 $viewPath$orig，$mime，${sizeText(bytes)}$dims。当前模型不能看图片；要处理就告诉用户图片在这个路径，或用命令行工具处理这个文件]"
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/KeyAgent.kt b/src/android/app/src/main/java/com/openminis/app/plus/KeyAgent.kt
 index cf4e560..a2cea36 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/KeyAgent.kt
@@ -12560,7 +12746,7 @@ index 0000000..9fbf83f
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MinesSelfCheck.kt b/src/android/app/src/main/java/com/openminis/app/plus/MinesSelfCheck.kt
-index 495166b..3e2446e 100644
+index 495166b..75c967e 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/MinesSelfCheck.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/MinesSelfCheck.kt
 @@ -73,13 +73,15 @@ object MinesSelfCheck {
@@ -12583,7 +12769,7 @@ index 495166b..3e2446e 100644
          out += timed("Shizuku") {
              val ok = com.openminis.app.sandbox.offload.FastUi.shizukuReady()
              ok to (if (ok) "已授权" else "未运行或未授权")
-@@ -93,15 +95,92 @@ object MinesSelfCheck {
+@@ -93,15 +95,101 @@ object MinesSelfCheck {
              val (code, text) = MinesJobs.runSync(c, "echo mines-ok; uname -m; df -h / | tail -1", 30_000)
              (code == 0 && text.contains("mines-ok")) to text.replace("\n", " ").take(160)
          }
@@ -12613,6 +12799,15 @@ index 495166b..3e2446e 100644
 +                (if (code != 0 && !ok) "（${text.lines().lastOrNull { it.isNotBlank() && !it.contains("=") }.orEmpty().take(80)}）" else "") +
 +                " · 网页登录${if (WebProxy.applied) "走代理" else "未走代理"}"
 +        }
++        // [Mines-38.9.6 i17] each server: direct / through the proxy / outside nodes — only all three failing is 「服务器挂了」
++        progress("服务器连通")
++        out += timed("服务器连通（直连/代理/外部）") {
++            PlusPrefs.init(c)
++            val servers = PlusPrefs.state.value.servers.filter { it.enabled }.take(3)
++            if (servers.isEmpty()) return@timed true to "没有添加服务器"
++            val rs = servers.map { sv -> sv to PlusVps.reachFor(sv, maxAgeMs = 0L) }
++            rs.all { it.second.verdict.reachable } to rs.joinToString("；") { (sv, r) -> "${sv.name.ifBlank { sv.host }} ${sv.port}：${r.verdict.text}" }.take(400)
++        }.let { ch -> if (!ch.ok && !ch.detail.contains("服务器挂了")) ch.copy(warn = true) else ch }
 +        // [Mines-38.9.6 i14] embedded Clash (mihomo): process up + controller answers; exit IP through its mixed port
 +        progress("Clash 内核")
 +        out += timed("Clash 内核运行") {
@@ -13098,7 +13293,7 @@ index f3b6d5c..54ac8eb 100644
          val arr = JSONArray()
          _entries.value.values.forEach { e ->
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt
-index 18b343c..cbb5506 100644
+index 18b343c..bd63311 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt
 @@ -84,10 +84,12 @@ object PlusVps {
@@ -13115,7 +13310,32 @@ index 18b343c..cbb5506 100644
                  when {
                      n == -3 -> ProbeResult(-2, "端口通了但没有 SSH 回应（可能被网络干扰）")
                      n > 0 && String(buf, 0, n).startsWith("SSH-") -> ProbeResult(connectMs.coerceAtLeast(1))
-@@ -128,6 +130,7 @@ object PlusVps {
+@@ -115,6 +117,24 @@ object PlusVps {
+      * is blocked but whose relay works counts as online (via relay).
+      */
+     private suspend fun check(context: Context, s: VpsServer): Check = withContext(Dispatchers.IO) {
++        val c = checkRaw(context, s)
++        if (c.latency >= 0) { reachCache.remove(s.id); return@withContext c }
++        // [Mines-38.9.6 i17] the phone could not log in: say WHICH path failed (direct / proxy / outside) instead of 「连不上」,
++        // so neither the row nor the agent calls a live server dead (user 2026-10-18: 8.217 「全端口失联」 while it answered)
++        val r = reachFor(s)
++        c.copy(error = r.verdict.text + (c.error.takeIf { it.isNotBlank() && !r.verdict.text.contains(it) }?.let { "；登录：" + it.take(80) } ?: ""))
++    }
++
++    /** [Mines-38.9.6 i17] three-path verdict per server, cached 10 min (the outside check costs up to 15 s) */
++    private val reachCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, ReachProbe.Report>>()
++    fun reachFor(s: VpsServer, maxAgeMs: Long = 10 * 60_000L): ReachProbe.Report {
++        reachCache[s.id]?.let { (t, r) -> if (System.currentTimeMillis() - t < maxAgeMs) return r }
++        val r = ReachProbe.check(s.host, s.port, ssh = true)
++        reachCache[s.id] = System.currentTimeMillis() to r
++        return r
++    }
++
++    private suspend fun checkRaw(context: Context, s: VpsServer): Check = withContext(Dispatchers.IO) {
+         val direct = probeDetailed(s, context = context)
+         if (!VpsSsh.hasKey(context) && MinesLink.parse(s.linkUrl) == null) {
+             if (direct.latencyMs >= 0 || s.relay.isBlank()) {
+@@ -128,6 +148,7 @@ object PlusVps {
              val lines = r.output.lines().map { it.trim() }.filter { it.isNotEmpty() }
              val os = lines.firstOrNull()?.take(48)
              val ip = lines.lastOrNull { it.matches(Regex("^[0-9a-fA-F.:]{7,45}$")) }?.take(45)
@@ -13123,7 +13343,7 @@ index 18b343c..cbb5506 100644
              Check(if (direct.latencyMs >= 0 && !relay) direct.latencyMs else ms.coerceAtLeast(1), "", true, relay, os, ip)
          }.getOrElse { e ->
              when (e) {
-@@ -168,6 +171,7 @@ object PlusVps {
+@@ -168,6 +189,7 @@ object PlusVps {
              })
          }
          syncToSandbox(context)
@@ -13131,7 +13351,7 @@ index 18b343c..cbb5506 100644
      }
  
      /** Kept for callers of the old API: OS + egress of a reachable server. */
-@@ -186,7 +190,7 @@ object PlusVps {
+@@ -186,7 +208,7 @@ object PlusVps {
          val enabled = st.servers.filter { it.enabled }
          val online = enabled.filter { it.lastLatencyMs >= 0 }.sortedBy { it.lastLatencyMs }
          val unknown = enabled.filter { it.lastLatencyMs == -1 }
@@ -13140,16 +13360,16 @@ index 18b343c..cbb5506 100644
      }
  
      fun effectiveMode(st: PlusState): String {
-@@ -225,7 +229,7 @@ object PlusVps {
+@@ -225,7 +247,7 @@ object PlusVps {
                  else if (repo.getValue(key) != value) repo.update(existing.id, key, value, note)
              }
              put("MINIS_WORK_MODE", mode,
 -                "Mines 工作位置: local=手机沙箱, vps=把重任务交给服务器（minis-vps run/bg 执行；断线自动重连并从断点续上输出，任务在服务器上不会中断；若提示超时，用 minis-vps attach <名字> 接着看，不要重跑）")
-+                "Mines 工作位置: local=手机沙箱, vps=把重任务交给服务器（minis-vps run/bg 执行；断线自动重连并从断点续上输出，任务在服务器上不会中断；若提示超时，用 minis-vps attach <名字> 接着看，不要重跑。超过 1 分钟的远程任务一律用 minis-vps bg，或在服务器上 tmux/nohup 里跑；ssh 偶尔断一下先自己静默重连重试（最多 3 次，间隔 2/5/10 秒），重连成功就接着做，不要跟用户说「SSH 断了」；只有重连都失败时才告诉用户，并说明原因）")
++                "Mines 工作位置: local=手机沙箱, vps=把重任务交给服务器（minis-vps run/bg 执行；断线自动重连并从断点续上输出，任务在服务器上不会中断；若提示超时，用 minis-vps attach <名字> 接着看，不要重跑。超过 1 分钟的远程任务一律用 minis-vps bg，或在服务器上 tmux/nohup 里跑；ssh 偶尔断一下先自己静默重连重试（最多 3 次，间隔 2/5/10 秒），重连成功就接着做，不要跟用户说「SSH 断了」；只有重连都失败时才告诉用户，并说明原因。判断服务器在不在线一律用 minis-vps probe <host[:port]>（直连 + 走代理 + 外部节点三条路）：只有它说「服务器挂了」才能这么说；单一路径连不上（沙箱代理、mines-link、自己写的 python/nc 探测）只能说「手机这边网络到不了」）")
              // [Mines-link-31] the app's HTTPS link to the servers, for minis-vps (preferred over ssh when up)
              put("MINIS_LINK_PORT", LinkBridge.PORT.toString(), "Mines 快速线路本机桥接端口（minis-vps 自动使用）")
              put("MINIS_LINK_TOKEN", LinkBridge.token, "Mines 快速线路本机桥接口令（每次启动更换）")
-@@ -253,19 +257,8 @@ object PlusVps {
+@@ -253,19 +275,8 @@ object PlusVps {
          appContext = context.applicationContext
          LinkBridge.start(context)
          AccountPatrol.load(context); AccountPatrol.schedule(context)
@@ -13171,7 +13391,7 @@ index 18b343c..cbb5506 100644
          val appCtx = context.applicationContext
          PlusPrefs.init(appCtx)
          registerNetworkCallback(appCtx)
-@@ -303,7 +296,10 @@ object PlusVps {
+@@ -303,7 +314,10 @@ object PlusVps {
      // ── [Mines-vps-28] 测试连接: try every route, keep the one that works ──
  
      /** One route tried by [testRoutes]. [relay] is what to store as the server's relay to use it. */
@@ -13183,7 +13403,7 @@ index 18b343c..cbb5506 100644
  
      /**
       * [Mines-vps-32] Plain verdict when nothing works. If the routes through the
-@@ -347,13 +343,11 @@ object PlusVps {
+@@ -347,13 +361,11 @@ object PlusVps {
              when (proxyType) {
                  null -> java.net.Socket(java.net.Proxy.NO_PROXY).use { s ->
                      s.connect(java.net.InetSocketAddress(VpsSsh.preferIpv4(host), port), timeoutMs)
@@ -13199,7 +13419,7 @@ index 18b343c..cbb5506 100644
                  }
                  else -> java.net.Socket(java.net.Proxy.NO_PROXY).use { s ->
                      s.connect(java.net.InetSocketAddress(ph, pp), timeoutMs); s.soTimeout = timeoutMs
-@@ -363,8 +357,7 @@ object PlusVps {
+@@ -363,8 +375,7 @@ object PlusVps {
                      while (!hdr.endsWith("\r\n\r\n") && hdr.length < 4096) { val c = inp.read(); if (c < 0) break; hdr.append(c.toChar()) }
                      val code = hdr.toString().split(' ').getOrNull(1)?.toIntOrNull() ?: 0
                      if (code != 200) return -2 to "代理不让连（HTTP $code）"
@@ -13209,7 +13429,7 @@ index 18b343c..cbb5506 100644
                  }
              }
          } catch (e: Throwable) {
-@@ -381,7 +374,7 @@ object PlusVps {
+@@ -381,7 +392,7 @@ object PlusVps {
          val out = ArrayList<RouteTry>()
          runCatching {
              val (ms, why) = bannerProbe(s.host, s.port, null, null, 0)
@@ -13218,7 +13438,7 @@ index 18b343c..cbb5506 100644
          }.onFailure { out += RouteTry("直连", "", false, -2, VpsSsh.reason(it)) }
          // [Mines-vps-31] backup port and Tailscale name, direct
          VpsSsh.endpoints(s).drop(1).forEach { ep ->
-@@ -434,7 +427,8 @@ object PlusVps {
+@@ -434,7 +445,8 @@ object PlusVps {
          }
          VpsSsh.drop(s.id)
          runCatching { syncToSandbox(context) }
@@ -13263,6 +13483,147 @@ index 7888eab..a353293 100644
                  } else {
                      val d = get("https://openrouter.ai/api/v1/key", key).second?.optJSONObject("data")
                      when {
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ReachCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/ReachCore.kt
+new file mode 100644
+index 0000000..f1a3324
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/ReachCore.kt
+@@ -0,0 +1,57 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-38.9.6 i17] Is a server down, or is only the phone's path to it broken? (user 2026-10-18 17:15: the agent said
++ * 8.217.89.133 「全端口失联」 and 梦云 「SSH 断」 while both answered from outside.) A verdict needs three paths: direct from
++ * the phone, through the user's proxy, and from outside (check-host.net nodes). One failed path never means 「服务器挂了」.
++ * Pure (JVM-testable): the probing itself is in [ReachProbe].
++ */
++object ReachCore {
++    enum class Kind { OK_DIRECT, OK_PROXY, PHONE_PATH, DOWN, UNKNOWN }
++
++    /** null = path not tried / no answer (e.g. no proxy configured, outside check unavailable) */
++    data class Paths(val direct: Boolean?, val proxy: Boolean?, val outsideOk: Int = 0, val outsideTotal: Int = 0,
++                     val directWhy: String = "", val proxyWhy: String = "")
++
++    data class Verdict(val kind: Kind, val text: String) {
++        /** only this verdict lets anyone say the server itself is down */
++        val serverDown: Boolean get() = kind == Kind.DOWN
++        val reachable: Boolean get() = kind == Kind.OK_DIRECT || kind == Kind.OK_PROXY
++    }
++
++    fun verdict(p: Paths): Verdict {
++        val outside = if (p.outsideTotal > 0) "外部检测 ${p.outsideOk}/${p.outsideTotal} 个节点连得上" else "外部检测没结果"
++        fun d() = "直连" + when (p.direct) { true -> "通"; false -> "不通" + why(p.directWhy); null -> "没测" }
++        fun x() = "走代理" + when (p.proxy) { true -> "通"; false -> "不通" + why(p.proxyWhy); null -> "（没设代理）" }
++        return when {
++            p.direct == true -> Verdict(Kind.OK_DIRECT, "在线（直连通）")
++            p.proxy == true -> Verdict(Kind.OK_PROXY, "在线（${d()}，走代理通）")
++            p.outsideTotal > 0 && p.outsideOk > 0 -> Verdict(Kind.PHONE_PATH, "手机网络到不了，服务器本身在线（${d()}，${x()}，$outside）")
++            p.outsideTotal >= 2 && p.outsideOk == 0 && p.direct == false ->
++                Verdict(Kind.DOWN, "服务器挂了或端口关了（${d()}，${x()}，$outside）")
++            else -> Verdict(Kind.UNKNOWN, "暂时没法判断（${d()}，${x()}，$outside），不能说服务器挂了")
++        }
++    }
++
++    private fun why(s: String) = if (s.isBlank()) "" else "：" + s.take(40)
++
++    /**
++     * check-host.net /check-result/<id> JSON → (ok, answered, pending). Each node: null = still running,
++     * [[{"time":…,"address":…}]] / [{"time":…}] = connected, [{"error":"…"}] = failed.
++     */
++    fun parseCheckHost(json: String): Triple<Int, Int, Int> {
++        val o = runCatching { org.json.JSONObject(json) }.getOrNull() ?: return Triple(0, 0, 0)
++        var ok = 0; var answered = 0; var pending = 0
++        for (k in o.keys()) {
++            val v = o.opt(k)
++            if (v == null || v == org.json.JSONObject.NULL) { pending++; continue }
++            val arr = v as? org.json.JSONArray ?: continue
++            var first: Any? = if (arr.length() > 0) arr.opt(0) else null
++            if (first is org.json.JSONArray) first = if (first.length() > 0) first.opt(0) else null
++            val e = first as? org.json.JSONObject
++            answered++
++            if (e != null && e.has("time") && !e.has("error")) ok++
++        }
++        return Triple(ok, answered, pending)
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ReachProbe.kt b/src/android/app/src/main/java/com/openminis/app/plus/ReachProbe.kt
+new file mode 100644
+index 0000000..3819e0f
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/ReachProbe.kt
+@@ -0,0 +1,72 @@
++package com.openminis.app.plus
++
++import java.net.InetSocketAddress
++import java.net.Proxy
++import java.net.Socket
++import java.util.concurrent.TimeUnit
++
++/**
++ * [Mines-38.9.6 i17] Three-path reachability for one server port (see [ReachCore]): direct from the phone (SSH ports need
++ * the "SSH-" banner — a TUN / fake-ip VPN answers the TCP connect itself), through the active proxy, and from outside via
++ * check-host.net TCP nodes. Blocking; call off the main thread. ~6 s direct + 8 s proxy + ≤ 15 s outside.
++ */
++object ReachProbe {
++    data class Report(val host: String, val port: Int, val paths: ReachCore.Paths, val verdict: ReachCore.Verdict)
++
++    private val http = okhttp3.OkHttpClient.Builder().connectTimeout(8, TimeUnit.SECONDS).readTimeout(10, TimeUnit.SECONDS)
++        .callTimeout(15, TimeUnit.SECONDS).build()
++
++    /** banner = the port speaks first (SSH); otherwise a connect that is not reset within 1.2 s counts */
++    private fun answer(sock: Socket, ssh: Boolean, timeoutMs: Int): Pair<Boolean, String> {
++        sock.soTimeout = if (ssh) timeoutMs else 1200
++        val buf = ByteArray(64)
++        return try {
++            val n = sock.getInputStream().read(buf)
++            when {
++                n > 0 && String(buf, 0, n).startsWith("SSH-") -> true to ""
++                ssh -> false to (if (n < 0) "连上就被断开" else "不是 SSH")
++                else -> (n >= 0) to (if (n < 0) "连上就被断开" else "")
++            }
++        } catch (e: java.net.SocketTimeoutException) {
++            if (ssh) false to "端口通了但没有 SSH 回应" else true to ""
++        }
++    }
++
++    fun direct(host: String, port: Int, ssh: Boolean, timeoutMs: Int = 6000): Pair<Boolean, String> = runCatching {
++        Socket(Proxy.NO_PROXY).use { s ->
++            s.connect(InetSocketAddress(VpsSsh.preferIpv4(host), port), timeoutMs)
++            answer(s, ssh, timeoutMs)
++        }
++    }.getOrElse { false to VpsSsh.reason(it) }
++
++    /** null = no proxy configured / running */
++    fun viaProxy(host: String, port: Int, ssh: Boolean, timeoutMs: Int = 8000): Pair<Boolean, String>? {
++        val u = runCatching { SplitProxy.activeUpstreamNow() }.getOrNull() ?: return null
++        return runCatching { SplitProxy.tunnelVia(u, host, port, timeoutMs).use { answer(it, ssh, timeoutMs) } }
++            .getOrElse { false to ("代理 ${u.host}:${u.port} " + VpsSsh.reason(it)) }
++    }
++
++    /** (ok, answered) from up to 3 check-host.net nodes, or (0, 0) when the service cannot be reached */
++    fun outside(host: String, port: Int, budgetMs: Long = 15_000): Pair<Int, Int> = runCatching {
++        val start = http.newCall(okhttp3.Request.Builder().url("https://check-host.net/check-tcp?host=$host:$port&max_nodes=3")
++            .header("Accept", "application/json").build()).execute().use { it.body?.string().orEmpty() }
++        val id = org.json.JSONObject(start).optString("request_id").ifBlank { return@runCatching 0 to 0 }
++        val t0 = System.currentTimeMillis(); var last = Triple(0, 0, 0)
++        while (System.currentTimeMillis() - t0 < budgetMs) {
++            Thread.sleep(2000)
++            val body = http.newCall(okhttp3.Request.Builder().url("https://check-host.net/check-result/$id")
++                .header("Accept", "application/json").build()).execute().use { it.body?.string().orEmpty() }
++            last = ReachCore.parseCheckHost(body)
++            if (last.second > 0 && last.third == 0) break
++        }
++        last.first to last.second
++    }.getOrDefault(0 to 0)
++
++    fun check(host: String, port: Int, ssh: Boolean = true): Report {
++        val d = direct(host, port, ssh)
++        val x = if (d.first) null else viaProxy(host, port, ssh)
++        val o = if (d.first || x?.first == true) 0 to 0 else outside(host, port)
++        val paths = ReachCore.Paths(d.first, x?.first, o.first, o.second, d.second, x?.second.orEmpty())
++        return Report(host, port, paths, ReachCore.verdict(paths))
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Relogin.kt b/src/android/app/src/main/java/com/openminis/app/plus/Relogin.kt
 new file mode 100644
 index 0000000..f008441
@@ -14535,7 +14896,7 @@ index 2b50977..3f3e165 100644
          val out = ArrayList<Digest.Item>()
          // [Mines-38.7] every signed-in account of a platform is read with ITS OWN session (isolated store / saved set);
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt b/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt
-index 4290a7b..1815947 100644
+index 4290a7b..7ae205d 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt
 @@ -61,16 +61,24 @@ object SplitProxy {
@@ -14773,9 +15134,16 @@ index 4290a7b..1815947 100644
                          record(host, "${mode.label}→代理 ${u.host}:${u.port} 失败，改直连")
                          Leg(direct(host, port, 10_000), false)
                      } else {
-@@ -623,19 +685,20 @@ object SplitProxy {
+@@ -622,20 +684,27 @@ object SplitProxy {
+         }.getOrNull()
      }
  
++    /** [Mines-38.9.6 i17] the proxy in use now (Clash core / user's upstream), null when none is set or all are down */
++    fun activeUpstreamNow(): Upstream? = activeUpstream(_settings.value)
++
++    /** [Mines-38.9.6 i17] a raw tunnel to host:port through [u] (ReachProbe: "走代理" path of the server check) */
++    fun tunnelVia(u: Upstream, host: String, port: Int, timeout: Int = 6_000): Socket = viaUpstream(u, host, port, tunnel = true, timeout = timeout)
++
      private fun direct(host: String, port: Int, timeout: Int): Socket =
 -        Socket(Proxy.NO_PROXY).apply { connect(InetSocketAddress(host, port), timeout) }
 +        Socket(Proxy.NO_PROXY).apply { tcpNoDelay = true; keepAlive = true; connect(InetSocketAddress(host, port), timeout) }
@@ -16900,7 +17268,7 @@ index 1d773a2..5489e65 100644
          coroutineScope {
              val bg = slow.map { id -> async { one(id) } }
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-index af13c1b..9794dca 100644
+index af13c1b..2c066ff 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 @@ -2,6 +2,8 @@ package com.openminis.app.plus.group
@@ -16912,7 +17280,7 @@ index af13c1b..9794dca 100644
  import kotlinx.coroutines.runBlocking
  import org.json.JSONArray
  import org.json.JSONObject
-@@ -15,12 +17,329 @@ import org.json.JSONObject
+@@ -15,12 +17,336 @@ import org.json.JSONObject
   *   … --arg 'reset'
   */
  object GroupSelfTest {
@@ -17187,6 +17555,13 @@ index af13c1b..9794dca 100644
 +                    "overlay" -> JSONObject().put("opened", com.openminis.app.ui.plus.GlassBackdrop.opened).put("blurred", com.openminis.app.ui.plus.GlassBackdrop.lastBlurred)
 +                        .put("depth", com.openminis.app.ui.plus.GlassBackdrop.depth.value).put("result", com.openminis.app.ui.plus.GlassBackdrop.lastResult)
 +                        .put("ready", com.openminis.app.ui.plus.GlassBackdrop.ready.value).put("ratio", com.openminis.app.ui.plus.GlassBackdrop.lastRatio.toDouble()).toString()
++                    // [Mines-38.9.6 i17] three-path server check: 'i396 reach <host> <port>' → verdict JSON
++                    "reach" -> {
++                        val hp = arg2.split(' ').filter { it.isNotBlank() }
++                        val r = com.openminis.app.plus.ReachProbe.check(hp.getOrElse(0) { "10.0.2.2" }, hp.getOrNull(1)?.toIntOrNull() ?: 22)
++                        JSONObject().put("kind", r.verdict.kind.name).put("text", r.verdict.text).put("direct", r.paths.direct).put("proxy", r.paths.proxy ?: JSONObject.NULL)
++                            .put("outside", "${r.paths.outsideOk}/${r.paths.outsideTotal}").put("down", r.verdict.serverDown).toString()
++                    }
 +                    // [Mines-38.9.6 i17] a fake OpenAI-compatible provider + smoke-model when onboarding never finished (emulator
 +                    // GMS / FontsProvider death killed the app mid-onboarding in smoke P → 快速测试 / 选择模型 had no model)
 +                    "seedmodel" -> {
@@ -17213,7 +17588,7 @@ index af13c1b..9794dca 100644
 +                            JSONObject().put("route", route).toString()
 +                        }
 +                    }
-+                    else -> "i396 seed | state | archive <sid> | restore <sid> | backfill | selfcheck | memohbad | memohcheck | memohcookie set|drop|get | memohexpire | memohtok | proxyset | proxyoff | logincard [refused] | sky <scene|auto> [static] | skystate | retryreg | retrycount | overlay | quicktest | seedmodel"
++                    else -> "i396 seed | state | archive <sid> | restore <sid> | backfill | selfcheck | memohbad | memohcheck | memohcookie set|drop|get | memohexpire | memohtok | proxyset | proxyoff | logincard [refused] | sky <scene|auto> [static] | skystate | retryreg | retrycount | overlay | quicktest | seedmodel | reach <host> <port>"
 +                }
 +            }
 +            // [Mines-38.9.1] 应用代理: 'agents' list (mine + enabled), 'agents clear', 'agents add <id>'
@@ -17242,7 +17617,7 @@ index af13c1b..9794dca 100644
              "partners" -> {
                  val l = Partners.refresh(context, rescanApps = true)
                  JSONArray(l.map { JSONObject().put("id", it.id).put("name", it.spec.name).put("state", it.state.name).put("model", it.model).put("via", it.via) }).toString()
-@@ -136,6 +455,13 @@ object GroupSelfTest {
+@@ -136,6 +462,13 @@ object GroupSelfTest {
                  GroupStore.add(gid, GroupMsg(GroupStore.newId(), parts.getOrElse(2) { "host" }, "成员A", "", parts.getOrElse(3) { "好的，结论：照这个办。" }))
                  "ok"
              }
@@ -17256,7 +17631,7 @@ index af13c1b..9794dca 100644
              "kbrun" -> { val n = com.openminis.app.plus.ChatKnowledge.runNow(context); "organised=$n" }
              "kbstate" -> {
                  val l = com.openminis.app.plus.ChatKnowledge.load(context)
-@@ -151,6 +477,11 @@ object GroupSelfTest {
+@@ -151,6 +484,11 @@ object GroupSelfTest {
                  JSONObject().put("title", g.title).put("care", g.care).put("kind", g.kind)
                      .put("weather", com.openminis.app.plus.HomeGreeting.cachedWeather(context)?.let { "${it.code}/${it.temp}" } ?: "none").toString()
              }
@@ -17268,7 +17643,7 @@ index af13c1b..9794dca 100644
              "greetweather" -> {
                  context.getSharedPreferences("mines_greeting", Context.MODE_PRIVATE).edit().remove("w_try").apply()
                  com.openminis.app.plus.HomeGreeting.refreshWeather(context)
-@@ -238,6 +569,112 @@ object GroupSelfTest {
+@@ -238,6 +576,112 @@ object GroupSelfTest {
              "wallpaper" -> { com.openminis.app.plus.PlusPrefs.init(context)
                  if (parts.getOrElse(0) { "" } == "off") com.openminis.app.plus.PlusPrefs.update(context) { it.copy(wallpaper = "") }
                  com.openminis.app.plus.PlusPrefs.state.value.wallpaper.ifBlank { "none" } }
@@ -20423,7 +20798,7 @@ index d99b975..93fc38a 100644
                  )
              }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
-index e0d0cae..252f149 100644
+index e0d0cae..4fdf31e 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
 @@ -89,6 +89,7 @@ import kotlinx.coroutines.flow.combine
@@ -20729,7 +21104,77 @@ index e0d0cae..252f149 100644
              // Runtime context goes last so the prefix above stays byte-stable
              // across requests within the same day. Keep ordering deterministic
              // (date → tz → lang → model count) — any reorder defeats the cache.
-@@ -17072,6 +17220,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15854,11 +16002,60 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+             }
+         }
+ 
++        // [Mines-38.9.6 i17] images like Hark: an image that landed in the uploads dir is NOT inlined (no base64 in this
++        // or any later turn). A model copy (long edge ≤ 1568, JPEG q85) is written next to the original and the message
++        // carries one short marker line; the model reads it with read_image when it needs to. Images whose upload failed
++        // stay inline as before.
++        val onDemandMarkers = mutableListOf<String>()
++        if (imageParts.isNotEmpty()) {
++            val readable = currentModelHasNativeVision || runCatching {
++                com.openminis.app.tools.VisionGroupResolver.isConfigured(providerRepository, context)
++            }.getOrDefault(false)
++            val keep = mutableListOf<Int>()
++            imageParts.forEachIndexed { idx, part ->
++                val path = part.linuxPath
++                if (path == null) { keep.add(idx); return@forEachIndexed }
++                val name = path.substringAfterLast('/')
++                val orig = java.io.File(uploadsHostDir, name)
++                var viewPath = path; var w = 0; var h = 0
++                runCatching {
++                    val o = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
++                    android.graphics.BitmapFactory.decodeFile(orig.path, o); w = o.outWidth; h = o.outHeight
++                    val t = com.openminis.app.plus.ImageOnDemandCore.fit(w, h)
++                    if (t != null) {
++                        var sample = 1
++                        while (maxOf(w, h) / (sample * 2) >= com.openminis.app.plus.ImageOnDemandCore.MAX_EDGE) sample *= 2
++                        val bm = android.graphics.BitmapFactory.decodeFile(orig.path, android.graphics.BitmapFactory.Options().apply { inSampleSize = sample })
++                        if (bm != null) {
++                            val sc = android.graphics.Bitmap.createScaledBitmap(bm, t.first, t.second, true)
++                            val vf = java.io.File(uploadsHostDir, com.openminis.app.plus.ImageOnDemandCore.viewName(name))
++                            vf.outputStream().use { sc.compress(android.graphics.Bitmap.CompressFormat.JPEG, com.openminis.app.plus.ImageOnDemandCore.QUALITY, it) }
++                            if (sc !== bm) sc.recycle(); bm.recycle()
++                            viewPath = "/var/minis/attachments/uploads/" + vf.name
++                        }
++                    }
++                }.onFailure { Log.w(TAG, "model copy failed for $name: ${it.message}") }
++                val mime = ImageBudget.sniffFormat(runCatching { ByteArray(64).also { b -> orig.inputStream().use { it.read(b) } } }.getOrDefault(ByteArray(0))).mimeType ?: part.mimeType
++                onDemandMarkers.add(com.openminis.app.plus.ImageOnDemandCore.marker(name, path, viewPath, mime, orig.length(), w, h, readable))
++            }
++            val kept = keep.map { imageParts[it] }; val keptNotes = keep.map { imageModelNotes.getOrNull(it) }
++            val keptPaths = kept.mapNotNull { it.linuxPath }
++            imageParts.clear(); imageParts.addAll(kept)
++            imageModelNotes.clear(); imageModelNotes.addAll(keptNotes)
++            imageUploadPaths.retainAll(keptPaths.toSet())
++            // the bubble keeps every picture; restore must not re-inline the on-demand ones
++            for (i in imageMediaRefPartsJson.indices) runCatching {
++                val o = JSONObject(imageMediaRefPartsJson[i]); val v = o.getJSONObject("value")
++                val lp = v.optString("linuxPath", "")
++                if (lp.isNotEmpty() && lp !in keptPaths) { v.put("onDemand", true); imageMediaRefPartsJson[i] = o.toString() }
++            }
++        }
++
+         // Build the <user-attached-files> XML block (iOS parity). One <file>
+         // per attachment (image and non-image) that successfully landed in
+         // the iSH uploads dir — gives the model a metadata-only inventory
+         // it can resolve via shell tools when content is needed.
+-        val xml = if (metas.isEmpty()) null else buildString {
++        val xml0 = if (metas.isEmpty()) null else buildString {
+             append("<user-attached-files>\n")
+             for (m in metas) {
+                 val urlPath = m.linuxPath.removePrefix("/var/minis/")
+@@ -15874,6 +16071,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+             }
+             append("</user-attached-files>")
+         }
++        val xml = if (onDemandMarkers.isEmpty()) xml0 else listOfNotNull(onDemandMarkers.joinToString("\n"), xml0).joinToString("\n")
+ 
+         // Order matches UserAttachmentList convention: images first, then files.
+         return PreparedAttachments(
+@@ -17072,6 +17270,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
      }
  
      override fun onCleared() {
@@ -20738,7 +21183,16 @@ index e0d0cae..252f149 100644
          // [T-sub-agents-queue] Nothing can re-enter a queued delegation once
          // this view model is gone; leaving the starter installed would let the
          // registry call into a cleared VM.
-@@ -17756,3 +17906,28 @@ internal fun warmUpBudget(window: Int?, compactThreshold: Int?, ratio: Double, f
+@@ -17602,6 +17802,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+                             continue
+                         }
+                         if (!mime.startsWith("image/")) continue
++                        // [Mines-38.9.6 i17] on-demand image: its marker line is in the persisted text, no pixels replayed
++                        if (v.optBoolean("onDemand", false)) continue
+                         val file = java.io.File(mediaStore.mediaBaseDir, rel)
+                         if (!file.exists()) continue
+                         val original = try { file.readBytes() } catch (_: Exception) { continue }
+@@ -17756,3 +17958,28 @@ internal fun warmUpBudget(window: Int?, compactThreshold: Int?, ratio: Double, f
      val line = if (threshold > 0) threshold else w
      return (line / ratio).toInt() - fixedTokens
  }
@@ -30188,10 +30642,10 @@ index 4e3e64b..8905eaf 100644
      }
  }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt
-index 4ee1029..f85c4f7 100644
+index 4ee1029..0bca501 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ServerDetailScreen.kt
-@@ -147,6 +147,24 @@ fun ServerDetailScreen(serverId: String, onBack: () -> Unit, onOpenTerminal: (St
+@@ -147,6 +147,31 @@ fun ServerDetailScreen(serverId: String, onBack: () -> Unit, onOpenTerminal: (St
              }
          }
          LinkSection(server)
@@ -30206,7 +30660,14 @@ index 4ee1029..f85c4f7 100644
 +                val lines = meta?.let { com.openminis.app.plus.WorkspaceCore.cardLines(it, now) }.orEmpty()
 +                lines.forEach { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(horizontal = 16.dp, vertical = 3.dp)) }
 +                val items = meta?.running.orEmpty()
-+                if (items.isEmpty()) Text(if (meta?.runningAt ?: 0L > 0L) "没有发现在跑的服务" else "检测中…", style = MaterialTheme.typography.bodySmall,
++                // [Mines-38.9.6 i17] never stuck on 「检测中…」: after 45 s say why nothing came back
++                var waited by androidx.compose.runtime.remember(server.id) { androidx.compose.runtime.mutableStateOf(false) }
++                androidx.compose.runtime.LaunchedEffect(server.id) { kotlinx.coroutines.delay(45_000); waited = true }
++                if (items.isEmpty()) Text(when {
++                    meta?.runningAt ?: 0L > 0L -> "没有发现在跑的服务"
++                    !waited -> "检测中…"
++                    else -> "没查到：" + server.lastError.ifBlank { "45 秒内服务器没回应（手机网络到不了或服务器没开）" }.take(120)
++                }, style = MaterialTheme.typography.bodySmall,
 +                    color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
 +                items.forEach { Text("• $it", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp)) }
 +                meta?.notes?.forEach { Text("备注：$it", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp)) }
@@ -30216,7 +30677,7 @@ index 4ee1029..f85c4f7 100644
          PlusSection("操作") {
              Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                  val entry = "${server.user}@${server.host}:${server.port}" +
-@@ -285,14 +303,14 @@ private fun LinkSection(server: VpsServer) {
+@@ -285,14 +310,14 @@ private fun LinkSection(server: VpsServer) {
                  st == null -> "正在连接…"
                  else -> st.second
              },
@@ -32151,7 +32612,7 @@ index c17bd02..195b3c7 100644
 +/** [Mines-38.8] porcelain glass base for the sign-in page chrome (same as the light glass veil). */
 +private val PORCELAIN = androidx.compose.ui.graphics.Color(0xFFFBF7F2)
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt
-index 5f57c45..888dcaf 100644
+index 5f57c45..8eb8813 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WorkLocationScreen.kt
 @@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Row
@@ -32180,7 +32641,19 @@ index 5f57c45..888dcaf 100644
  import com.openminis.app.plus.PlusState
  import com.openminis.app.plus.PlusVps
  import com.openminis.app.plus.VpsServer
-@@ -137,7 +140,7 @@ fun WorkLocationScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onO
+@@ -121,8 +124,9 @@ fun WorkLocationScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onO
+                 facts = buildList {
+                     if (effective != PlusState.MODE_LOCAL) {
+                         best?.let { b ->
+-                            add("系统：${b.osLabel.ifBlank { "检测中" }}")
+-                            add("出口：${b.egressIp.ifBlank { "检测中" }}")
++                            // [Mines-38.9.6 i17] 「检测中」 only until the first check finished, then the real outcome
++                            add("系统：${b.osLabel.ifBlank { if (b.lastCheckedAt > 0L) "没读到" else "检测中" }}")
++                            add("出口：${b.egressIp.ifBlank { if (b.lastCheckedAt > 0L) "没读到" else "检测中" }}")
+                         }
+                     }
+                 },
+@@ -137,7 +141,7 @@ fun WorkLocationScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onO
              when {
                  !st.isVps -> "现在：在本机运行"
                  effective == PlusState.MODE_LOCAL -> "现在：服务器都连不上，已自动回到本机"
@@ -32189,7 +32662,7 @@ index 5f57c45..888dcaf 100644
                  else -> "现在：VPS 模式，正在检测服务器"
              },
              style = MaterialTheme.typography.bodyMedium,
-@@ -148,6 +151,7 @@ fun WorkLocationScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onO
+@@ -148,6 +152,7 @@ fun WorkLocationScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onO
          PlusSection(
              "服务器",
              footer = "可以加多台，自动用延迟最低的那台；断了会自动重连，连不上就换下一台，任务在服务器上继续跑不会丢。新服务器添加时输一次密码，Mines 自动装好钥匙，以后免密。直连不通时可以填“中转”。",
@@ -32197,7 +32670,7 @@ index 5f57c45..888dcaf 100644
          ) {
              if (st.servers.isEmpty()) {
                  Text(
-@@ -171,20 +175,17 @@ fun WorkLocationScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onO
+@@ -171,20 +176,17 @@ fun WorkLocationScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onO
                      },
                      onAuthorize = { authorizing = s },
                      onTest = { testing = s },
@@ -32224,7 +32697,7 @@ index 5f57c45..888dcaf 100644
              if (st.servers.size > 1) {
                  PlusDivider()
                  // [Mines-keys-32] Termix-style one tap: put the phone's key on every server
-@@ -192,7 +193,10 @@ fun WorkLocationScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onO
+@@ -192,7 +194,10 @@ fun WorkLocationScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onO
              }
          }
  
@@ -32236,7 +32709,7 @@ index 5f57c45..888dcaf 100644
              Row(
                  Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
                  verticalAlignment = Alignment.CenterVertically,
-@@ -211,7 +215,7 @@ fun WorkLocationScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onO
+@@ -211,7 +216,7 @@ fun WorkLocationScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onO
      authorizing?.let { srv ->
          AuthorizeDialog(srv, onDismiss = { authorizing = null; check() })
      }
@@ -32245,7 +32718,7 @@ index 5f57c45..888dcaf 100644
  
      if (adding || editing != null) {
          ServerDialog(
-@@ -295,50 +299,96 @@ private fun ModeCard(
+@@ -295,50 +300,96 @@ private fun ModeCard(
  }
  
  @Composable
@@ -32370,7 +32843,7 @@ index 5f57c45..888dcaf 100644
      }
  }
  
-@@ -486,7 +536,7 @@ internal fun safeToast(context: android.content.Context, text: String) {
+@@ -486,7 +537,7 @@ internal fun safeToast(context: android.content.Context, text: String) {
   * fastest route that works (a proxy route is saved as the server's relay).
   */
  @Composable
@@ -32379,7 +32852,7 @@ index 5f57c45..888dcaf 100644
      val context = LocalContext.current
      var tries by remember { mutableStateOf<List<PlusVps.RouteTry>?>(null) }
      var summary by remember { mutableStateOf<String?>(null) }
-@@ -513,8 +563,9 @@ internal fun TestRoutesDialog(server: VpsServer, onDismiss: () -> Unit) {
+@@ -513,8 +564,9 @@ internal fun TestRoutesDialog(server: VpsServer, onDismiss: () -> Unit) {
                  } else {
                      t.forEach { r ->
                          Text(
@@ -32391,7 +32864,7 @@ index 5f57c45..888dcaf 100644
                              color = if (r.ok) Green else Red, style = MaterialTheme.typography.bodyMedium,
                          )
                      }
-@@ -522,10 +573,42 @@ internal fun TestRoutesDialog(server: VpsServer, onDismiss: () -> Unit) {
+@@ -522,10 +574,42 @@ internal fun TestRoutesDialog(server: VpsServer, onDismiss: () -> Unit) {
                  }
              }
          },
@@ -32435,7 +32908,7 @@ index 5f57c45..888dcaf 100644
  
  /**
   * [Mines-keys-32] 一键给所有服务器装钥匙: tries each server with the phone's key;
-@@ -540,7 +623,10 @@ private fun BatchKeyRow(servers: List<com.openminis.app.plus.VpsServer>) {
+@@ -540,7 +624,10 @@ private fun BatchKeyRow(servers: List<com.openminis.app.plus.VpsServer>) {
      var msg by remember { mutableStateOf<String?>(null) }
      var need by remember { mutableStateOf<List<com.openminis.app.plus.VpsServer>>(emptyList()) }
      var pw by remember { mutableStateOf("") }
@@ -32447,7 +32920,7 @@ index 5f57c45..888dcaf 100644
          busy = true; msg = "正在逐台检查钥匙…"
          scope.launch {
              val res = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-@@ -553,16 +639,13 @@ private fun BatchKeyRow(servers: List<com.openminis.app.plus.VpsServer>) {
+@@ -553,16 +640,13 @@ private fun BatchKeyRow(servers: List<com.openminis.app.plus.VpsServer>) {
              busy = false
              msg = if (need.isEmpty()) "全部 $ok 台都已经装好钥匙" else "$ok 台已装好，${need.size} 台还需要输一次密码"
          }
@@ -32466,7 +32939,7 @@ index 5f57c45..888dcaf 100644
                  OutlinedTextField(pw, { pw = it }, singleLine = true, label = { Text("密码") },
                      visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation())
              }
-@@ -585,3 +668,56 @@ private fun BatchKeyRow(servers: List<com.openminis.app.plus.VpsServer>) {
+@@ -585,3 +669,56 @@ private fun BatchKeyRow(servers: List<com.openminis.app.plus.VpsServer>) {
          dismissButton = { TextButton(onClick = { need = emptyList() }) { Text("取消") } },
      )
  }
@@ -35742,6 +36215,41 @@ index 0000000..8aa98d7
 +        assertEquals("通过 Google 登录", IdentityCore.methodText(recs[0]))
 +    }
 +}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/ImageOnDemandCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/ImageOnDemandCoreTest.kt
+new file mode 100644
+index 0000000..ed1e51e
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/ImageOnDemandCoreTest.kt
+@@ -0,0 +1,29 @@
++package com.openminis.app.plus
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class ImageOnDemandCoreTest {
++    @Test fun fit() {
++        assertNull(ImageOnDemandCore.fit(1200, 800))
++        assertEquals(1568 to 1176, ImageOnDemandCore.fit(4000, 3000))
++        assertEquals(87 to 1568, ImageOnDemandCore.fit(1264, 22781))
++        assertNull(ImageOnDemandCore.fit(0, 10))
++    }
++    @Test fun names() {
++        assertEquals("IMG_1.1568.jpg", ImageOnDemandCore.viewName("IMG_1.png"))
++        assertEquals("photo.1568.jpg", ImageOnDemandCore.viewName("photo"))
++        assertEquals("2.4 MB", ImageOnDemandCore.sizeText(2_500_000))
++        assertEquals("98 KB", ImageOnDemandCore.sizeText(100_000))
++    }
++    @Test fun markers() {
++        val v = ImageOnDemandCore.marker("a.png", "/var/minis/attachments/uploads/a.png", "/var/minis/attachments/uploads/a.1568.jpg", "image/png", 3_000_000, 4000, 3000, true)
++        assertTrue(v.contains("read_image /var/minis/attachments/uploads/a.1568.jpg")); assertTrue(v.contains("原图 /var/minis/attachments/uploads/a.png"))
++        assertTrue(v.length < 200)
++        val t = ImageOnDemandCore.marker("a.png", "/p/a.png", "/p/a.png", "image/png", 1000, 0, 0, false)
++        assertFalse(t.contains("read_image")); assertTrue(t.contains("不能看图片")); assertFalse(t.contains("原图"))
++    }
++}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/KeychainCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/KeychainCoreTest.kt
 new file mode 100644
 index 0000000..e0b8644
@@ -36060,6 +36568,45 @@ index 0000000..2fe9b67
 +        assertEquals("imap.gmail.com", MailImap.hostFor("alex.demo@gmail.com"))
 +        assertEquals("imap.qq.com", MailImap.hostFor("a@qq.com"))
 +        assertEquals(null, MailImap.hostFor("a@unknown-domain.xyz"))
++    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/ReachCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/ReachCoreTest.kt
+new file mode 100644
+index 0000000..cd2afa7
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/ReachCoreTest.kt
+@@ -0,0 +1,33 @@
++package com.openminis.app.plus
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/** [Mines-38.9.6 i17] one failed path never says 「服务器挂了」. */
++class ReachCoreTest {
++    private fun v(d: Boolean?, p: Boolean?, ok: Int = 0, tot: Int = 0) = ReachCore.verdict(ReachCore.Paths(d, p, ok, tot, "连接超时", "代理拒绝"))
++
++    @Test fun directOk() = assertEquals(ReachCore.Kind.OK_DIRECT, v(true, null).kind)
++    @Test fun proxyOk() { val x = v(false, true); assertEquals(ReachCore.Kind.OK_PROXY, x.kind); assertTrue(x.reachable) }
++    @Test fun phonePath() {
++        val x = v(false, false, 3, 3)
++        assertEquals(ReachCore.Kind.PHONE_PATH, x.kind); assertFalse(x.serverDown); assertTrue(x.text.startsWith("手机网络到不了"))
++    }
++    @Test fun downOnlyWhenOutsideAgrees() {
++        assertTrue(v(false, false, 0, 3).serverDown)
++        assertTrue(v(false, null, 0, 3).serverDown)
++    }
++    @Test fun singlePathNeverDown() {
++        assertFalse(v(false, null).serverDown)               // no outside result
++        assertFalse(v(false, false, 0, 1).serverDown)        // one node is not enough
++        assertEquals(ReachCore.Kind.UNKNOWN, v(false, false).kind)
++        assertTrue(v(false, false).text.contains("不能说服务器挂了"))
++    }
++    @Test fun parse() {
++        val j = """{"us1.node.check-host.net":[{"time":0.12,"address":"1.2.3.4"}],"de1.node.check-host.net":[{"error":"Connection timed out"}],"jp1.node.check-host.net":null}"""
++        assertEquals(Triple(1, 2, 1), ReachCore.parseCheckHost(j))
++        assertEquals(Triple(0, 0, 0), ReachCore.parseCheckHost("nope"))
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/RouteStatusCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/RouteStatusCoreTest.kt
