@@ -688,7 +688,7 @@ index 0000000..e21c8c7
 +    fun check(c: Context): Result = verdict(enabledInSettings(c), running(), restricted(c))
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/AccountJar.kt b/src/android/app/src/main/java/com/openminis/app/plus/AccountJar.kt
-index 01a71ee..728dddf 100644
+index 01a71ee..b309a89 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/AccountJar.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/AccountJar.kt
 @@ -84,7 +84,8 @@ object AccountJar {
@@ -701,6 +701,28 @@ index 01a71ee..728dddf 100644
      }
  
      /** Snapshot of the shared store for [urls] (cookies per url). */
+@@ -103,10 +104,7 @@ object AccountJar {
+         for (u in urlsOf(urls)) {
+             val names = pairs(runCatching { cm.getCookie(u) }.getOrNull()).keys
+             val h = hostOf(u); val r = root(h)
+-            for (n in names) {
+-                cm.setCookie(u, "$n=; Max-Age=0; Path=/")
+-                if (!isIp(h)) { cm.setCookie(u, "$n=; Max-Age=0; Path=/; Domain=.$r"); cm.setCookie(u, "$n=; Max-Age=0; Path=/; Domain=$r") }
+-            }
++            for (n in names) LoginValueCore.deleteLines(n, r, isIp(h)).forEach { cm.setCookie(u, it) }   // [Mines-38.9.6 i13] __Host- aware
+         }
+     }
+ 
+@@ -114,7 +112,8 @@ object AccountJar {
+         val cm = CookieManager.getInstance()
+         for (u in o.keys()) {
+             val m = o.optJSONObject(u) ?: continue
+-            for (n in m.keys()) cm.setCookie(u, "$n=${m.optString(n)}" + attrs(u))
++            // [Mines-38.9.6 i13] __Host- cookies were written with Domain= → rejected → swapped-back session gone
++            for (n in m.keys()) { val h = hostOf(u); cm.setCookie(u, LoginValueCore.cookieLine(n, m.optString(n), if (isIp(h)) "" else root(h), u.startsWith("https"), SessionStatus.KEEP_MS / 1000, sameSiteNone = true)) }
+         }
+     }
+ 
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/AccountLabel.kt b/src/android/app/src/main/java/com/openminis/app/plus/AccountLabel.kt
 index 51a9182..9bced0a 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/AccountLabel.kt
@@ -4040,10 +4062,10 @@ index 0000000..f00f354
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/IdentityStore.kt b/src/android/app/src/main/java/com/openminis/app/plus/IdentityStore.kt
 new file mode 100644
-index 0000000..93f1486
+index 0000000..b5358b5
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/IdentityStore.kt
-@@ -0,0 +1,220 @@
+@@ -0,0 +1,225 @@
 +package com.openminis.app.plus
 +
 +import android.content.Context
@@ -4110,6 +4132,8 @@ index 0000000..93f1486
 +
 +    /** Add / upgrade one account record; its identity (and provider identity) are registered too. */
 +    @Synchronized fun addRec(c: Context, r: Rec) {
++        // [Mines-38.9.6 i13] never store control-char / escape-text account names
++        if (LoginValueCore.badAccount(r.identity)) return addRec(c, r.copy(identity = LoginValueCore.cleanAccount(r.identity), identType = null))
 +        init(c)
 +        if (r.site.isBlank()) return
 +        var ids = _idents.value
@@ -4182,6 +4206,8 @@ index 0000000..93f1486
 +        val after = before.mapNotNull { r ->
 +            if (r.method == Method.KEY && r.sources.isNotEmpty() && r.sources.all { it == "账号连接" }) return@mapNotNull null
 +            var x = r
++            // [Mines-38.9.6 i13] 「\u0001\u0001」 accounts saved by the evaluateJavascript decode bug → no account (re-filled on next sign-in)
++            if (LoginValueCore.badAccount(x.identity)) x = x.copy(identity = LoginValueCore.cleanAccount(x.identity), identType = null)
 +            if (r.sources.any { it.contains("邮件") } && IdentityCore.looksLikeSenderName(r.name) && r.site.contains('.'))
 +                x = x.copy(name = Keychain.siteName(r.site))
 +            if (x.status == IdentityCore.EXPIRED) {
@@ -4191,7 +4217,8 @@ index 0000000..93f1486
 +            }
 +            x
 +        }
-+        if (after != before) { _recs.value = after; save() }
++        val dedup = after.distinctBy { it.key }
++        if (dedup != before) { _recs.value = dedup; save() }
 +    }
 +
 +    /** [Mines-38.9.3] the record is confirmed signed out right now (its platform's probe / key test says so). */
@@ -4358,10 +4385,10 @@ index 0000000..b04d35e
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Keychain.kt b/src/android/app/src/main/java/com/openminis/app/plus/Keychain.kt
 new file mode 100644
-index 0000000..07833ac
+index 0000000..e4ebf69
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/Keychain.kt
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,236 @@
 +package com.openminis.app.plus
 +
 +import android.content.Context
@@ -4446,6 +4473,15 @@ index 0000000..07833ac
 +        return AutoAccounts.siteOf(r)
 +    }
 +
++    /** [Mines-38.9.6 i13] does the WebView store hold any non-noise cookie for [site] (root, www., app./my./web. and remembered login pages)? */
++    fun hasSessionCookie(site: String): Boolean = runCatching {
++        if (site.isBlank() || !site.contains('.')) return@runCatching true   // not a web site: nothing to check
++        val cm = android.webkit.CookieManager.getInstance()
++        val hosts = linkedSetOf(site, "www.$site", "app.$site", "my.$site", "web.$site", "accounts.$site")
++        runCatching { com.openminis.app.plus.group.PresetAuth.memohOrigin()?.let { o -> hostOf(o).takeIf { root(it) == root(site) }?.let { hosts += it } } }
++        hosts.any { h -> SessionStatus.cookiePairs(runCatching { cm.getCookie("https://$h/") }.getOrNull()).keys.any { SessionStatus.keepCookie(it) } }
++    }.getOrDefault(true)
++
 +    fun hostOf(url: String?): String = runCatching { android.net.Uri.parse(url ?: "").host.orEmpty().removePrefix("www.") }.getOrDefault("")
 +
 +    // ---------------- the list ----------------
@@ -4467,10 +4503,13 @@ index 0000000..07833ac
 +                (al.account.isBlank() || r.identity.isBlank() || al.account.equals(r.identity, true)) }
 +            // [Mines-38.9.3] 「登录失效」 only for a CONFIRMED sign-out (its platform's probe saw the login wall / cookie gone after
 +            // a real check); recorded-but-unverified, never-probed, network blips → 未检查 (grey), not a warning
-+            val st = when (SessionStatus.loginPill(r.status, bad, r.status == IdentityCore.EXPIRED && IdentityStore.confirmedOut(r.site))) {
++            val st0 = when (SessionStatus.loginPill(r.status, bad, r.status == IdentityCore.EXPIRED && IdentityStore.confirmedOut(r.site))) {
 +                SessionStatus.Pill.BAD -> Status.ABNORMAL; SessionStatus.Pill.OK -> Status.OK
 +                SessionStatus.Pill.WARN -> Status.EXPIRED; SessionStatus.Pill.UNCHECKED -> Status.UNCHECKED
 +            }
++            // [Mines-38.9.6 i13] user 2026-10-18 (Memoh 账号详情 正常 with no password and no session): a web sign-in with no saved
++            // password counts as 正常 only while the site still holds a session cookie
++            val st = if (st0 == Status.OK && !pw && r.method == IdentityCore.Method.WEB && !hasSessionCookie(r.site)) Status.EXPIRED else st0
 +            Acct(r.key, r.name.ifBlank { AutoAccounts.siteOf(r.site) }, r.site, r.identity, st, pw, totp(r.key) != null || totp(legacy) != null,
 +                r.sources.joinToString(" · ").ifBlank { "账号关联" }, last, method = r.method, provider = r.provider, via = r.via,
 +                identType = r.identType, legacyId = legacy)
@@ -5053,10 +5092,10 @@ index 2069931..20fa494 100644
              if (scan.otpField && scan.otpEmpty && System.currentTimeMillis() - codeFilledAt > 20_000L) {
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/LoginMemory.kt b/src/android/app/src/main/java/com/openminis/app/plus/LoginMemory.kt
 new file mode 100644
-index 0000000..c1fc11f
+index 0000000..1e8a1f6
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/LoginMemory.kt
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,160 @@
 +package com.openminis.app.plus
 +
 +import android.content.Context
@@ -5195,6 +5234,7 @@ index 0000000..c1fc11f
 +
 +    /** Shows the card and waits for the user (null = closed). One card at a time. */
 +    suspend fun ask(r: Req): Answer? {
++        demoShown = false
 +        waiter?.complete(null)
 +        val d = CompletableDeferred<Answer?>()
 +        waiter = d
@@ -5202,10 +5242,14 @@ index 0000000..c1fc11f
 +        return try { d.await() } finally { if (_pending.value?.id == r.id) _pending.value = null }
 +    }
 +
-+    fun answer(a: Answer?) { val w = waiter; waiter = null; _pending.value = null; w?.complete(a) }
++    fun answer(a: Answer?) { val w = waiter; waiter = null; _pending.value = null; demoShown = false; w?.complete(a) }
++
++    /** smoke demo card: not FLAG_SECURE so the screenshot driver can capture it (fake values only). */
++    @Volatile var demoShown: Boolean = false; private set
 +
 +    /** smoke: show the card with fake values (no page behind it). */
 +    fun demo(refused: Boolean) {
++        demoShown = true
 +        val ask = if (refused) LoginMemoryCore.Ask(listOf(LoginMemoryCore.Field.EMAIL, LoginMemoryCore.Field.PASSWORD), "密码不对，重新输入", true)
 +            else LoginMemoryCore.Ask(listOf(LoginMemoryCore.Field.EMAIL, LoginMemoryCore.Field.PASSWORD), "登录 Notion", false)
 +        waiter?.complete(null); waiter = CompletableDeferred()
@@ -5337,6 +5381,93 @@ index 0000000..6272b6c
 +        if (page.code && codeWaitMs >= CODE_WAIT_MS) f += Field.CODE
 +        if (f.isEmpty()) return null
 +        return Ask(f.distinct(), if (f == listOf(Field.CODE)) "输入验证码" else "登录 $siteName", false)
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/LoginValueCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/LoginValueCore.kt
+new file mode 100644
+index 0000000..6642a27
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/LoginValueCore.kt
+@@ -0,0 +1,81 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-38.9.6 i13] Pure helpers for values read from a sign-in page and for re-written cookies (unit-tested in
++ * LoginValueCoreTest). Bug (user 2026-10-18, Memoh 账号详情 showed 账号 「\u0001\u0001」 + 正常): WebView.evaluateJavascript
++ * returns a JSON-encoded string; WebLoginScreen only trimmed the quotes, so the "\u0001" separators stayed as 6-char
++ * escape text, the split never happened and the whole escaped blob was saved as the account name.
++ * Nothing here logs; passwords pass through untouched except for the separator split.
++ */
++object LoginValueCore {
++    /** evaluateJavascript result → the JS string: decodes "\"…\"" with \uXXXX / \n / \" escapes; null / undefined → "". */
++    fun decodeJs(r: String?): String {
++        val s = r?.trim() ?: return ""
++        if (s == "null" || s == "undefined" || s.isEmpty()) return ""
++        if (!(s.length >= 2 && s.startsWith("\"") && s.endsWith("\""))) return s
++        val b = StringBuilder(s.length)
++        var i = 1
++        val end = s.length - 1
++        while (i < end) {
++            val ch = s[i]
++            if (ch != '\\' || i + 1 >= end) { b.append(ch); i++; continue }
++            when (val n = s[i + 1]) {
++                'n' -> b.append('\n'); 'r' -> b.append('\r'); 't' -> b.append('\t'); 'b' -> b.append('\b'); 'f' -> b.append('\u000C')
++                '/' -> b.append('/'); '\\' -> b.append('\\'); '"' -> b.append('"'); '\'' -> b.append('\'')
++                'u' -> {
++                    val hex = if (i + 6 <= end) s.substring(i + 2, i + 6) else ""
++                    val code = hex.toIntOrNull(16)
++                    if (code != null && hex.length == 4) { b.append(code.toChar()); i += 6; continue } else b.append("\\u")
++                }
++                else -> { b.append('\\'); b.append(n) }
++            }
++            i += 2
++        }
++        return b.toString()
++    }
++
++    private val ESC = Regex("""\\u[0-9a-fA-F]{4}|\\x[0-9a-fA-F]{2}""")
++
++    /** A saved / shown account value: no control chars, no left-over escape text; "" when nothing real is left. */
++    fun cleanAccount(v: String?): String {
++        val s = (v ?: "").replace(ESC, "").filterNot { it.isISOControl() || it == '\uFFFD' }.trim()
++        return if (s.isEmpty() || s.all { it == '\\' || it.isWhitespace() }) "" else s
++    }
++
++    /** True for a stored account name that came from the separator bug (or is otherwise junk). */
++    fun badAccount(v: String?): Boolean = !v.isNullOrEmpty() && cleanAccount(v) != v.trim()
++
++    data class Parts(val user: String, val token: String, val pass: String) {
++        override fun toString() = "Parts(user=$user, token=${if (token.isEmpty()) "-" else "…"}, pass=${if (pass.isEmpty()) "-" else "***"})"
++    }
++
++    /** "user \u0001 token \u0001 password" (real separators, or escape text from an older build) → parts. */
++    fun parseAccount(raw: String?): Parts {
++        val s = raw ?: ""
++        val parts = if (s.contains('\u0001')) s.split('\u0001') else s.split("\\u0001")
++        val user = cleanAccount(parts.getOrNull(0))
++        val token = parts.getOrNull(1).orEmpty().trim().takeIf { t -> t.isNotEmpty() && t.none { it.isISOControl() } }.orEmpty()
++        val pass = parts.getOrNull(2).orEmpty().takeIf { p -> p.none { it.isISOControl() } }.orEmpty()
++        return Parts(user, token, pass)
++    }
++
++    /**
++     * Set-Cookie line for putting a cookie back. Cookie prefixes (RFC 6265bis): `__Host-` must be host-only (NO Domain),
++     * Path=/ and Secure — the old writer added "Domain=.root", Chromium rejected it and the hosted Memoh session vanished
++     * after every restart / swap; `__Secure-` needs Secure. [root] blank or an IP → host-only.
++     */
++    fun cookieLine(name: String, value: String, root: String, https: Boolean, maxAgeS: Long, sameSiteNone: Boolean = false): String {
++        val host = name.startsWith("__Host-")
++        val secure = https || host || name.startsWith("__Secure-")
++        val domain = if (!host && root.isNotBlank() && !root.all { it.isDigit() || it == '.' } && !root.contains(':') && root != "localhost") "; Domain=.$root" else ""
++        return "$name=$value; Path=/; Max-Age=$maxAgeS$domain" + (if (secure) "; Secure" else "") + (if (secure && sameSiteNone) "; SameSite=None" else "")
++    }
++
++    /** Lines that delete [name] in every scope it may have been written with (a __Host- delete must be Secure, host-only). */
++    fun deleteLines(name: String, root: String, isIp: Boolean): List<String> {
++        val sec = if (name.startsWith("__Host-") || name.startsWith("__Secure-")) "; Secure" else ""
++        val out = mutableListOf("$name=; Max-Age=0; Path=/$sec")
++        if (!isIp && !name.startsWith("__Host-") && root.isNotBlank()) { out += "$name=; Max-Age=0; Path=/; Domain=.$root$sec"; out += "$name=; Max-Age=0; Path=/; Domain=$root$sec" }
++        return out
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/LoginWeb.kt b/src/android/app/src/main/java/com/openminis/app/plus/LoginWeb.kt
@@ -7525,10 +7656,10 @@ index 0000000..b0b8121
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SessionStatus.kt b/src/android/app/src/main/java/com/openminis/app/plus/SessionStatus.kt
 new file mode 100644
-index 0000000..1c382da
+index 0000000..b60d58e
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/SessionStatus.kt
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,131 @@
 +package com.openminis.app.plus
 +
 +/**
@@ -7614,8 +7745,9 @@ index 0000000..1c382da
 +        if (now - snapshotAt > maxAgeMs) emptyMap() else snapshot.filter { (n, v) -> keepCookie(n) && v.isNotEmpty() && n !in live }
 +
 +    /** Set-Cookie value that makes a restored cookie PERSISTENT (30 days) on the site's registrable domain. */
++    // [Mines-38.9.6 i13] __Host- cookies host-only + Secure (a Domain= made Chromium drop the hosted Memoh session)
 +    fun persistentCookie(name: String, value: String, root: String, secure: Boolean, maxAgeS: Long = KEEP_MS / 1000): String =
-+        "$name=$value; Path=/; Max-Age=$maxAgeS" + (if (root.isNotBlank() && !root.all { it.isDigit() || it == '.' }) "; Domain=.$root" else "") + (if (secure) "; Secure" else "")
++        LoginValueCore.cookieLine(name, value, root, secure, maxAgeS)
 +
 +    const val KEEP_MS = 30L * 24 * 3_600_000L
 +
@@ -11072,10 +11204,10 @@ index 0000000..4e081f8
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/PresetAuth.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/PresetAuth.kt
 new file mode 100644
-index 0000000..d7e1edf
+index 0000000..24d1f73
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/PresetAuth.kt
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,265 @@
 +package com.openminis.app.plus.group
 +
 +import com.openminis.app.plus.PlusVault
@@ -11220,7 +11352,10 @@ index 0000000..d7e1edf
 +    // ── Memoh ─────────────────────────────────────────────────────────────
 +
 +    fun memohBase(): String? = GroupPrefs.get("memoh_base")?.trimEnd('/')
-+    fun memohUser(): String? = GroupPrefs.get("memoh_user")
++    fun memohUser(): String? = GroupPrefs.get("memoh_user")?.let { u ->
++        // [Mines-38.9.6 i13] drop 「\u0001\u0001」 saved by the old page-value decode
++        if (com.openminis.app.plus.LoginValueCore.badAccount(u)) { GroupPrefs.put("memoh_user", null); null } else u.takeIf { it.isNotBlank() }
++    }
 +
 +    // [Mines-38.9.4] user 2026-10-17: signed in on app.memoh.net inside Mines, 我已登录好了 → still 需要登录. Hosted Memoh
 +    // (app.memoh.net) has no JWT in localStorage: the session is an HttpOnly cookie and the web UI calls /api/memoh/* and
@@ -11281,14 +11416,55 @@ index 0000000..d7e1edf
 +        }
 +    }
 +
-+    /** Current JWT; [force] logs in again with the saved password (after a 401). */
++    /**
++     * Current JWT; [force] logs in again with the saved password (after a 401).
++     * [Mines-38.9.6 i13] the saved account + password are used silently; only when there is none, or the server refused it,
++     * the secure login card (LoginCardHost: shared glass sheet, masked + 显示 toggle, FLAG_SECURE) asks — once per process
++     * unless the saved password was just refused. Self-hosted only (hosted app.memoh.net signs in on its own web page).
++     */
 +    suspend fun memohToken(force: Boolean = false): String? {
 +        if (!force) key(PresetRegistry.MEMOH)?.let { return it }
 +        val base = memohBase() ?: return null
-+        val user = memohUser() ?: return null
-+        val pass = PlusVault.secretExtra(V, "memoh_pass") ?: return null
-+        return memohLogin(base, user, pass).map { key(PresetRegistry.MEMOH) }.getOrNull()
++        val user = memohUser()
++        val pass = PlusVault.secretExtra(V, "memoh_pass")
++        if (user != null && pass != null) {
++            val r = memohLogin(base, user, pass)
++            if (r.isSuccess) return key(PresetRegistry.MEMOH)
++            val refused = (r.exceptionOrNull()?.message ?: "").contains("密码不对")
++            return if (refused) memohAskAndLogin(base, refused = true) else null   // network: keep the saved login, no card
++        }
++        return memohAskAndLogin(base, refused = false)
 +    }
++
++    @Volatile private var memohAsked = false
++
++    private suspend fun memohAskAndLogin(base: String, refused: Boolean): String? {
++        if (memohHosted() || isMemohHosted(base)) return null
++        if (memohAsked && !refused) return null
++        memohAsked = true
++        val host = runCatching { java.net.URI(base).host }.getOrNull().orEmpty()
++        var wrong = refused
++        repeat(2) {
++            val ask = com.openminis.app.plus.LoginMemoryCore.Ask(
++                listOf(com.openminis.app.plus.LoginMemoryCore.Field.ACCOUNT, com.openminis.app.plus.LoginMemoryCore.Field.PASSWORD),
++                if (wrong) "密码不对，重新输入" else "登录 Memoh", wrong)
++            val a = kotlinx.coroutines.withTimeoutOrNull(180_000L) {
++                com.openminis.app.plus.LoginCard.ask(com.openminis.app.plus.LoginCard.Req(host, "Memoh", ask, memohUser().orEmpty(), null))
++            } ?: return null
++            if (a.account.isBlank() || a.password.isEmpty()) return null
++            val r = memohLogin(base, a.account, a.password)
++            if (r.isSuccess) {
++                if (!a.save) PlusVault.setSecretExtra(V, "memoh_pass", null)
++                return key(PresetRegistry.MEMOH)
++            }
++            if (!(r.exceptionOrNull()?.message ?: "").contains("密码不对")) return null
++            wrong = true
++        }
++        return null
++    }
++
++    /** 去登录 tapped: the user asked, so the card may show again this process. */
++    fun memohAllowAsk() { memohAsked = false }
 +
 +    fun memohSignOut() {
 +        setKey(PresetRegistry.MEMOH, null); PlusVault.setSecretExtra(V, "memoh_pass", null)
@@ -12916,7 +13092,7 @@ index 315ebf0..297149a 100644
      )
  }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatAssistantMessageUI.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatAssistantMessageUI.kt
-index 2df1574..5a2b193 100644
+index 2df1574..32d9b1c 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatAssistantMessageUI.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatAssistantMessageUI.kt
 @@ -132,7 +132,7 @@ import androidx.compose.material.icons.filled.MoreVert
@@ -12937,8 +13113,27 @@ index 2df1574..5a2b193 100644
  import androidx.compose.material3.rememberModalBottomSheetState
  import androidx.compose.material3.Icon
  import androidx.compose.material3.IconButton
+@@ -1338,7 +1338,8 @@ private fun ThinkingFullContentDialog(content: String, onDismiss: () -> Unit) {
+         onDismissRequest = onDismiss,
+         properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false),
+     ) {
+-        Surface(modifier = Modifier.fillMaxSize()) {
++        // [Mines-38.9.6 i13] full-screen reader: opaque (the theme surface is transparent → chat showed through the text)
++        Surface(modifier = Modifier.fillMaxSize(), color = com.openminis.app.ui.plus.mines().bg) {
+             Column(modifier = Modifier.fillMaxSize()) {
+                 Row(
+                     verticalAlignment = Alignment.CenterVertically,
+@@ -1347,7 +1348,7 @@ private fun ThinkingFullContentDialog(content: String, onDismiss: () -> Unit) {
+                         .padding(horizontal = 12.dp, vertical = 8.dp),
+                 ) {
+                     Text(
+-                        text = "Deep Thinking",
++                        text = "深度思考",
+                         fontSize = 15.sp,
+                         fontWeight = FontWeight.SemiBold,
+                         color = Color(0xFF007AFF),
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatComposerWidgets.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatComposerWidgets.kt
-index c4580f1..a0d67a9 100644
+index c4580f1..7ebdc83 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatComposerWidgets.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatComposerWidgets.kt
 @@ -136,7 +136,7 @@ import androidx.compose.material.icons.filled.MoreVert
@@ -12976,6 +13171,17 @@ index c4580f1..a0d67a9 100644
                  tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
                  modifier = Modifier.size(13.dp),
              )
+@@ -459,8 +460,8 @@ internal fun MicButton(
+     ) {
+         Icon(
+             if (isVoiceActive) Icons.Default.Keyboard else Icons.Default.Mic,
+-            contentDescription = if (isVoiceActive) "Switch to keyboard"
+-            else if (isRecording) "Stop recording" else "Voice input",
++            contentDescription = if (isVoiceActive) "切换到键盘"
++            else if (isRecording) "停止录音" else "语音输入",   // [Mines-38.9.6 i13] no English a11y labels
+             tint = tint,
+             modifier = Modifier.size(20.dp),
+         )
 @@ -864,7 +865,7 @@ private fun ToolPreviewThumbnail(
                  if (bmp != null) {
                      Image(
@@ -13094,7 +13300,7 @@ index 2cfa24b..2d0ad0d 100644
                  )
              }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatModelPickerSheet.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatModelPickerSheet.kt
-index 21417ad..595bdb1 100644
+index 21417ad..a8943a0 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatModelPickerSheet.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatModelPickerSheet.kt
 @@ -135,7 +135,7 @@ import androidx.compose.material.icons.filled.MoreVert
@@ -13182,6 +13388,15 @@ index 21417ad..595bdb1 100644
                  // ── Model Groups (grouped section card with embedded header) ──
                  if (filteredGroups.isNotEmpty()) {
                      // Section card: header + rows live in the same surface so
+@@ -649,7 +680,7 @@ internal fun ModelPickerSheet(
+                                     Column(modifier = Modifier.weight(1f)) {
+                                         Row(verticalAlignment = Alignment.CenterVertically) {
+                                             Text(
+-                                                group.name,
++                                                com.openminis.app.ui.chat.groupLabel(group.name),
+                                                 style = MaterialTheme.typography.bodyMedium,
+                                                 fontWeight = FontWeight.SemiBold,
+                                             )
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatModels.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatModels.kt
 index 917c7bb..1153000 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatModels.kt
@@ -14068,6 +14283,25 @@ index 247da98..6bfc469 100644
  import androidx.compose.material3.ButtonDefaults
  import androidx.compose.material3.MaterialTheme
  import androidx.compose.material3.Text
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/PastedTextBuffer.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/PastedTextBuffer.kt
+index 17920b9..89bad56 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/chat/PastedTextBuffer.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/PastedTextBuffer.kt
+@@ -464,11 +464,9 @@ private fun PastedTextPreviewDialog(
+     onDismiss: () -> Unit,
+ ) {
+     Dialog(onDismissRequest = onDismiss) {
+-        Surface(
+-            shape = RoundedCornerShape(16.dp),
+-            color = MaterialTheme.colorScheme.surfaceContainerLow,
+-            tonalElevation = 6.dp,
+-        ) {
++        // [Mines-38.9.6 i13] shared glass (was a solid surfaceContainerLow card with tonal elevation)
++        com.openminis.app.ui.plus.GlassWindowEffect()
++        com.openminis.app.ui.plus.GlassSurface(shape = RoundedCornerShape(16.dp)) {
+             Column(modifier = Modifier.padding(20.dp)) {
+                 Text(
+                     text = "${pasted.placeholder}  ·  ${pasted.text.length}",
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ScheduledTaskCard.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ScheduledTaskCard.kt
 index 6597b10..54635f6 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ScheduledTaskCard.kt
@@ -14101,9 +14335,18 @@ index 8b92488..962b716 100644
  import androidx.compose.material3.TextButton
  import androidx.compose.material3.rememberModalBottomSheetState
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/SendReturnModeMenu.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/SendReturnModeMenu.kt
-index 0541d2d..cd86468 100644
+index 0541d2d..557094e 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/SendReturnModeMenu.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/SendReturnModeMenu.kt
+@@ -243,7 +243,7 @@ fun ComposerSendButton(
+     ) {
+         Icon(
+             Icons.Default.ArrowUpward,
+-            contentDescription = "Send",
++            contentDescription = "发送",   // [Mines-38.9.6 i13] (smoke driver taps 「Send」 or 「发送」)
+             tint = if (canActivate) ChatColors.background
+             else ChatColors.primaryText.copy(alpha = 0.5f),
+             modifier = Modifier.size(20.dp),
 @@ -330,16 +330,9 @@ private fun SendReturnModeMenu(
          properties = PopupProperties(focusable = false, dismissOnClickOutside = true),
      ) {
@@ -14145,6 +14388,13 @@ index 0541d2d..cd86468 100644
          ) {
              Column(modifier = Modifier.padding(vertical = 6.dp).selectableGroup()) {
                  val header = stringResource(R.string.appearance_section_return_key)
+@@ -430,3 +414,6 @@ private fun ReturnModeRow(
+         }
+     }
+ }
++
++/** [Mines-38.9.6 i13] groups made by older onboarding were named "Default Models": shown as 默认模型. */
++fun groupLabel(name: String): String = if (name.trim().equals("Default Models", ignoreCase = true)) "默认模型" else name
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/SessionSkillsSheet.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/SessionSkillsSheet.kt
 index 0baa44f..124c152 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/SessionSkillsSheet.kt
@@ -14462,10 +14712,10 @@ index ffd0a53..4759123 100644
  import androidx.compose.material3.rememberModalBottomSheetState
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/glass/GlassM3.kt b/src/android/app/src/main/java/com/openminis/app/ui/glass/GlassM3.kt
 new file mode 100644
-index 0000000..3f782bd
+index 0000000..34623f7
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/glass/GlassM3.kt
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,143 @@
 +@file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 +
 +package com.openminis.app.ui.glass
@@ -14565,6 +14815,7 @@ index 0000000..3f782bd
 +    scrimColor: Color = Color(0x2614100C),
 +    dragHandle: @Composable (() -> Unit)? = { GlassDragHandle() },
 +    contentWindowInsets: @Composable () -> WindowInsets = { BottomSheetDefaults.windowInsets },
++    properties: androidx.compose.material3.ModalBottomSheetProperties = androidx.compose.material3.ModalBottomSheetDefaults.properties,
 +    content: @Composable ColumnScope.() -> Unit,
 +) {
 +    val m = mines()
@@ -14580,6 +14831,7 @@ index 0000000..3f782bd
 +        scrimColor = scrimColor,
 +        dragHandle = dragHandle,
 +        contentWindowInsets = contentWindowInsets,
++        properties = properties,
 +    ) {
 +        GlassWindowEffect()
 +        content()
@@ -14984,10 +15236,10 @@ index 0000000..622e5f5
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/group/SiteLogin.kt b/src/android/app/src/main/java/com/openminis/app/ui/group/SiteLogin.kt
 new file mode 100644
-index 0000000..71ab22c
+index 0000000..af72587
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/group/SiteLogin.kt
-@@ -0,0 +1,158 @@
+@@ -0,0 +1,159 @@
 +package com.openminis.app.ui.group
 +
 +import androidx.activity.compose.BackHandler
@@ -15110,8 +15362,9 @@ index 0000000..71ab22c
 +    val pending = save
 +    if (pending == null) WebLoginScreen(kind = kind, url = u, title = "登录 $name", detect = true,
 +        onDone = { raw, _ ->
-+            val parts = raw.split('\u0001')
-+            val user = parts.getOrNull(0).orEmpty().trim(); val token = parts.getOrNull(1).orEmpty(); val pass = parts.getOrNull(2).orEmpty()
++            // [Mines-38.9.6 i13] real separators (or escape text from an older build); empty / control-char values rejected
++            val parts = com.openminis.app.plus.LoginValueCore.parseAccount(raw)
++            val user = parts.user; val token = parts.token; val pass = parts.pass
 +            SiteLogin.remember(svc, u)
 +            val host = Keychain.hostOf(u).ifBlank { u.removePrefix("https://").removePrefix("http://").substringBefore('/') }
 +            IdentityStore.addRec(ctx, IdentityCore.Rec(Keychain.root(host).ifBlank { host }, name, user, null,
@@ -15223,7 +15476,7 @@ index fff9cbd..371a867 100644
          composable(com.openminis.app.ui.plus.PlusRoutes.VOICE) {
              com.openminis.app.ui.plus.VoiceLiveScreen(
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/onboarding/OnboardingModelSelectionScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/onboarding/OnboardingModelSelectionScreen.kt
-index 908675c..bd997ee 100644
+index 908675c..c4143e1 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/onboarding/OnboardingModelSelectionScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/onboarding/OnboardingModelSelectionScreen.kt
 @@ -1,5 +1,7 @@
@@ -15252,8 +15505,17 @@ index 908675c..bd997ee 100644
                                              fontWeight = FontWeight.SemiBold,
                                          )
                                      }
+@@ -297,7 +299,7 @@ fun OnboardingModelSelectionScreen(
+             MinisButton(
+                 onClick = {
+                     if (selected.isNotEmpty()) {
+-                        val group = ModelGroup(name = "Default Models")
++                        val group = ModelGroup(name = "默认模型")
+                         group.memberEntryIds.addAll(selected)
+                         providerRepository.addGroup(group)
+                         if (config.defaultPrimaryGroupId == null) {
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/onboarding/OnboardingScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/onboarding/OnboardingScreen.kt
-index e3644ed..78ab5e3 100644
+index e3644ed..fafb9e1 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/onboarding/OnboardingScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/onboarding/OnboardingScreen.kt
 @@ -1,5 +1,7 @@
@@ -15282,6 +15544,15 @@ index e3644ed..78ab5e3 100644
                                          fontWeight = FontWeight.Bold,
                                      )
                                  }
+@@ -342,7 +344,7 @@ private fun ModelSelectionStep(
+                     onClick = {
+                         // Create default model group from selections
+                         if (selected.isNotEmpty()) {
+-                            val group = ModelGroup(name = "Default Models")
++                            val group = ModelGroup(name = "默认模型")
+                             group.memberEntryIds.addAll(selected)
+                             providerRepository.addGroup(group)
+                             if (config.defaultPrimaryGroupId == null) {
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/AccountsUi.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/AccountsUi.kt
 new file mode 100644
 index 0000000..03c056f
@@ -15533,7 +15804,7 @@ index 0000000..03c056f
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/AppAgentsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/AppAgentsScreen.kt
 new file mode 100644
-index 0000000..a096f12
+index 0000000..9133bed
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/AppAgentsScreen.kt
 @@ -0,0 +1,252 @@
@@ -15765,7 +16036,7 @@ index 0000000..a096f12
 +    when {
 +        d.id.startsWith("web:") -> go(com.openminis.app.ui.group.GroupRoutes.webLogin(d.id))
 +        d.id == "coze" -> { PlusNav.openKind = "coze"; PlusNav.autoClaim = true; go(PlusRoutes.CONNECTIONS) }
-+        d.id == "memoh" -> go(com.openminis.app.ui.group.SiteLogin.route("memoh"))
++        d.id == "memoh" -> { com.openminis.app.plus.group.PresetAuth.memohAllowAsk(); go(com.openminis.app.ui.group.SiteLogin.route("memoh")) }
 +        else -> { com.openminis.app.ui.group.PartnersNav.open = d.id; go(com.openminis.app.ui.group.GroupRoutes.PARTNERS) }
 +    }
 +}
@@ -15790,7 +16061,7 @@ index 0000000..a096f12
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/AvatarPicker.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/AvatarPicker.kt
-index d8e007f..3fb49b5 100644
+index d8e007f..2463cb3 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/AvatarPicker.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/AvatarPicker.kt
 @@ -34,7 +34,7 @@ import androidx.compose.material3.Button
@@ -15811,7 +16082,17 @@ index d8e007f..3fb49b5 100644
      }
  }
  
-@@ -213,10 +213,10 @@ fun CustomAvatarEditor(onDone: (saved: Boolean) -> Unit) {
+@@ -163,7 +163,8 @@ fun CustomAvatarEditor(onDone: (saved: Boolean) -> Unit) {
+     }
+ 
+     Dialog(onDismissRequest = { onDone(false) }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+-        Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.surfaceContainerLow) {
++        // [Mines-38.9.6 i13] full-screen editor: opaque page colour (surfaceContainerLow is glass now → page showed through)
++        Surface(Modifier.fillMaxSize(), color = mines().bg) {
+             Column(Modifier.fillMaxSize().navigationBarsPadding().padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                 Text("调整头像", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+                 Text("拖动移动，双指缩放", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+@@ -213,10 +214,10 @@ fun CustomAvatarEditor(onDone: (saved: Boolean) -> Unit) {
                      },
                      modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp),
                      shape = RoundedCornerShape(14.dp),
@@ -16239,7 +16520,7 @@ index 0000000..fbf18e4
 +    return when { s < 60 -> "刚刚"; s < 3600 -> "${s / 60} 分钟前"; else -> "${s / 3600} 小时前" }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
-index 6a136a6..00177b5 100644
+index 6a136a6..7f07f8b 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ConnectionsScreen.kt
 @@ -1,7 +1,10 @@
@@ -16675,7 +16956,7 @@ index 6a136a6..00177b5 100644
              Text(
                  // [Mines-accounts-31] full identity only here (rows show it masked)
                  if (entry != null) "已连接 · " + com.openminis.app.plus.AccountLabel.method(kind, entry) +
-@@ -666,22 +718,18 @@ private fun ConnectionDetailScreen(
+@@ -666,22 +718,28 @@ private fun ConnectionDetailScreen(
                      (if (PlusVault.hasSecret(kind.id) && (entry.via == "key" || entry.via == "token" || entry.via == "model")) "\n" + kind.keyLabel + "：" + com.openminis.app.plus.AccountLabel.maskSecret(PlusVault.secret(kind.id) ?: "") else "") +
                      (com.openminis.app.plus.KeyBalance.text(kind.id)?.let { "\n$it" } ?: "")
                  else kind.desc + (com.openminis.app.plus.KeyBalance.text(kind.id)?.let { "\n$it" } ?: ""), // [Mines-sources-33] balance read via a console session
@@ -16685,8 +16966,7 @@ index 6a136a6..00177b5 100644
              )
              Spacer(Modifier.height(14.dp))
              if (entry != null) {
-+                var askDel by remember { mutableStateOf(false) }
-                 OutlinedButton(
+-                OutlinedButton(
 -                    onClick = {
 -                        if (kind.method == ConnMethod.WEB && PlusVault.defaultAccount(PlusVault.baseId(kind.id)) == kind.id) PlusConnect.clearCookies(kind)
 -                        PlusConnect.setKeepAlive(context, kind.id, false)
@@ -16694,6 +16974,18 @@ index 6a136a6..00177b5 100644
 -                        PlusVault.remove(context, kind)
 -                        Toast.makeText(context, "已断开 ${kind.name}", Toast.LENGTH_SHORT).show()
 -                    },
++                var askDel by remember { mutableStateOf(false) }
++                // [Mines-38.9.6 i13] user: Notion 未登录 still showed a red 断开 — a web-only account that a real check did not
++                // see signed in gets 登录 (primary) + a quiet 移除; red 断开 only for a live session / a saved key
++                if (webOnly && ws != com.openminis.app.plus.WebSessionCore.St.SIGNED_IN) {
++                    Button(
++                        onClick = { PlusConnect.restoreCookies(kind); onWeb(kind.loginUrl ?: "", true, "登录 ${kind.name}") },
++                        shape = RoundedCornerShape(26.dp),
++                        colors = ButtonDefaults.buttonColors(containerColor = mines().primary, contentColor = mines().onPrimary),
++                        modifier = Modifier.heightIn(min = 52.dp).widthIn(min = 160.dp),
++                    ) { Text("登录", fontSize = MT.Body, fontWeight = FontWeight.SemiBold) }
++                    TextButton(onClick = { askDel = true }) { Text("移除这个账号", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = MT.Sub) }
++                } else OutlinedButton(
 +                    onClick = { askDel = true },
                      shape = RoundedCornerShape(26.dp), border = BorderStroke(1.dp, Red),
                      modifier = Modifier.heightIn(min = 48.dp),
@@ -16703,7 +16995,7 @@ index 6a136a6..00177b5 100644
              } else if (isMcpOnly || kind.method in setOf(ConnMethod.WEB, ConnMethod.KEY, ConnMethod.GOOGLE)) {
                  Button(
                      onClick = {
-@@ -699,30 +747,66 @@ private fun ConnectionDetailScreen(
+@@ -699,30 +757,66 @@ private fun ConnectionDetailScreen(
                      colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color(0xFF1A1A1A)),
                      border = BorderStroke(1.dp, Color(0x33000000)),
                      modifier = Modifier.heightIn(min = 52.dp).widthIn(min = 160.dp),
@@ -16777,7 +17069,7 @@ index 6a136a6..00177b5 100644
                      }
                  }
              }
-@@ -742,16 +826,22 @@ private fun ConnectionDetailScreen(
+@@ -742,16 +836,22 @@ private fun ConnectionDetailScreen(
                  MinesIcon(if (isDef) Icons.Filled.Star else Icons.Outlined.StarBorder, null,
                      tint = if (isDef) Color(0xFFFFB300) else MaterialTheme.colorScheme.onSurfaceVariant)
                  Spacer(Modifier.width(8.dp))
@@ -16804,7 +17096,7 @@ index 6a136a6..00177b5 100644
                      if (entry != null && PlusVault.defaultAccount(PlusVault.baseId(kind.id)) != kind.id) PlusVault.setDefault(context, kind.id)
                      PlusConnect.restoreCookies(kind)
                      onWeb(kind.loginUrl ?: "", true, "登录 ${kind.name}")
-@@ -793,8 +883,8 @@ private fun ConnectionDetailScreen(
+@@ -793,8 +893,8 @@ private fun ConnectionDetailScreen(
              PlusSection(null) {
                  Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
                      Column(Modifier.weight(1f)) {
@@ -16815,7 +17107,7 @@ index 6a136a6..00177b5 100644
                              color = MaterialTheme.colorScheme.onSurfaceVariant)
                      }
                      Switch(entry.shareWithAi, onCheckedChange = { PlusVault.setShare(context, kind, it) })
-@@ -811,12 +901,12 @@ private fun ConnectionDetailScreen(
+@@ -811,12 +911,12 @@ private fun ConnectionDetailScreen(
                      var on by remember { mutableStateOf(PlusConnect.keepAliveOn(context, kind.id)) }
                      Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
                          Column(Modifier.weight(1f)) {
@@ -16830,7 +17122,7 @@ index 6a136a6..00177b5 100644
                              )
                          }
                          Switch(on, onCheckedChange = {
-@@ -842,7 +932,7 @@ private fun ConnectionDetailScreen(
+@@ -842,7 +942,7 @@ private fun ConnectionDetailScreen(
                      // segmented control on the right — one row per permission.
                      Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
                          verticalAlignment = Alignment.CenterVertically) {
@@ -16839,7 +17131,7 @@ index 6a136a6..00177b5 100644
                              maxLines = 2)
                          Spacer(Modifier.width(8.dp))
                          Row(
-@@ -859,7 +949,7 @@ private fun ConnectionDetailScreen(
+@@ -859,7 +959,7 @@ private fun ConnectionDetailScreen(
                                          .clickable(enabled = !cap.locked) { PlusVault.setLevel(kind, cap, lv) },
                                      contentAlignment = Alignment.Center,
                                  ) {
@@ -16848,7 +17140,7 @@ index 6a136a6..00177b5 100644
                                          color = if (sel) color else if (cap.locked) MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
                                          else MaterialTheme.colorScheme.onSurface)
                                  }
-@@ -880,7 +970,7 @@ private fun ConnectionDetailScreen(
+@@ -880,7 +980,7 @@ private fun ConnectionDetailScreen(
                      listOf(30, 90, 180).forEach { d ->
                          FilledTonalButton(onClick = {
                              date = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date(System.currentTimeMillis() + d * 86_400_000L))
@@ -16857,7 +17149,7 @@ index 6a136a6..00177b5 100644
                      }
                  }
                  OutlinedTextField(date, { date = it }, label = { Text("日期（年-月-日）") }, singleLine = true,
-@@ -891,9 +981,9 @@ private fun ConnectionDetailScreen(
+@@ -891,9 +991,9 @@ private fun ConnectionDetailScreen(
                      Button(enabled = date.matches(Regex("""\d{4}-\d{2}-\d{2}""")), onClick = {
                          com.openminis.app.plus.Expiry.set(kind.id, date, note)
                          Toast.makeText(context, "已设好：$date 提醒你", Toast.LENGTH_SHORT).show()
@@ -16869,7 +17161,7 @@ index 6a136a6..00177b5 100644
                  }
              }
          }
-@@ -932,9 +1022,9 @@ private fun DetailRow(label: String, value: String, url: String?) {
+@@ -932,9 +1032,9 @@ private fun DetailRow(label: String, value: String, url: String?) {
              .padding(horizontal = 16.dp, vertical = 12.dp),
          verticalAlignment = Alignment.CenterVertically,
      ) {
@@ -16882,7 +17174,7 @@ index 6a136a6..00177b5 100644
      }
  }
  
-@@ -944,7 +1034,7 @@ private fun BigAction(text: String, onClick: () -> Unit) {
+@@ -944,7 +1044,7 @@ private fun BigAction(text: String, onClick: () -> Unit) {
          onClick = onClick,
          modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp).heightIn(min = 48.dp),
          shape = RoundedCornerShape(14.dp),
@@ -16891,7 +17183,7 @@ index 6a136a6..00177b5 100644
  }
  
  @Composable
-@@ -953,7 +1043,7 @@ private fun SecondaryAction(text: String, onClick: () -> Unit) {
+@@ -953,7 +1053,7 @@ private fun SecondaryAction(text: String, onClick: () -> Unit) {
          onClick = onClick,
          modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp).padding(bottom = 10.dp).heightIn(min = 40.dp),
          shape = RoundedCornerShape(14.dp),
@@ -16900,7 +17192,7 @@ index 6a136a6..00177b5 100644
  }
  
  /** GitHub / Microsoft: OAuth device flow with the code shown big, copied, and the official page opened. */
-@@ -1007,17 +1097,17 @@ private fun DeviceFlowBlock(kind: ConnectionKind, autoStart: Boolean, onWeb: (St
+@@ -1007,17 +1107,17 @@ private fun DeviceFlowBlock(kind: ConnectionKind, autoStart: Boolean, onWeb: (St
          val c = code
          if (c != null) {
              Column(Modifier.fillMaxWidth().padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -16922,7 +17214,7 @@ index 6a136a6..00177b5 100644
                  modifier = Modifier.padding(horizontal = 16.dp).padding(bottom = 10.dp))
          }
          if (kind.loginUrl != null) SecondaryAction(if (kind.method == ConnMethod.GITHUB) "也在 Mines 浏览器里登录 GitHub 网页" else "网页登录 Outlook") {
-@@ -1037,7 +1127,8 @@ private fun KeyBlock(kind: ConnectionKind, resumes: Int, autoStart: Boolean) {
+@@ -1037,7 +1137,8 @@ private fun KeyBlock(kind: ConnectionKind, resumes: Int, autoStart: Boolean) {
  @Composable
  private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean) {
      val context = LocalContext.current
@@ -16932,7 +17224,7 @@ index 6a136a6..00177b5 100644
      var found by remember { mutableStateOf<String?>(null) }
      var manual by remember { mutableStateOf("") }
      var account by remember { mutableStateOf(existing?.account ?: "") }
-@@ -1045,7 +1136,21 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
+@@ -1045,7 +1146,21 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
      var voice by remember { mutableStateOf(PlusVault.extra(kind.id, "voice") ?: com.openminis.app.plus.GeminiLive.DEFAULT_VOICE) }
      val needsAccount = kind.id in setOf("gmail", "mail163", "qqmail")
  
@@ -16954,7 +17246,7 @@ index 6a136a6..00177b5 100644
          if (kind.id == "gemini") { PlusVault.setExtra(kind.id, "model", model); PlusVault.setExtra(kind.id, "voice", voice) }
          PlusVault.save(context, kind, account.ifBlank { existing?.account ?: "" }, secret,
              share = existing?.shareWithAi ?: (kind.envKey != null), via = "key")
-@@ -1062,6 +1167,7 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
+@@ -1062,6 +1177,7 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
      fun autoSave(k: String, from: String) {
          if (autoBusy) return
          if (needsAccount && account.isBlank()) { manual = k; manualOpen = true; autoStatus = "先填上你的邮箱地址，再点「保存并连接」"; return }
@@ -16962,7 +17254,7 @@ index 6a136a6..00177b5 100644
          autoBusy = true; autoStatus = "$from 里有 ${kind.name} 的${kind.keyLabel}，正在测试…"
          kscope.launch {
              val r = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.KeyTester.test(PlusVault.baseId(kind.id), k) }
-@@ -1096,11 +1202,53 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
+@@ -1096,11 +1212,53 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
              if (k != null && k != PlusVault.secret(kind.id)) { manual = k; autoSave(k, "页面") }
              else if (autoStatus == null) autoStatus = "没能自动拿到${kind.keyLabel}。在官网复制它，回到这里会自动填入；也可以粘贴到下面"
          }
@@ -17018,7 +17310,7 @@ index 6a136a6..00177b5 100644
          if (needsAccount) OutlinedTextField(account, { account = it }, label = { Text(if (kind.id == "gmail") "Gmail 地址" else "邮箱地址") }, singleLine = true,
              textStyle = MaterialTheme.typography.bodyMedium,
              modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp))
-@@ -1111,7 +1259,7 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
+@@ -1111,7 +1269,7 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
              textStyle = MaterialTheme.typography.bodyMedium,
              modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp),
          ) else TextButton(onClick = { manualOpen = true; PlusConnect.keyOnClipboard(context, kind)?.let { manual = it } },
@@ -17027,7 +17319,7 @@ index 6a136a6..00177b5 100644
          if (kind.id == "gemini") {
              OutlinedTextField(model, { model = it }, label = { Text("实时语音模型") }, singleLine = true,
                  modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp))
-@@ -1130,7 +1278,7 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
+@@ -1130,7 +1288,7 @@ private fun KeyBlockBody(kind: ConnectionKind, resumes: Int, autoStart: Boolean)
              onClick = { if (!needsAccount || account.isNotBlank()) autoSave(manual.trim(), "你填的内容") else Toast.makeText(context, "先填上你的 Gmail 地址", Toast.LENGTH_SHORT).show() },
              enabled = !autoBusy,
              modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp).heightIn(min = 40.dp),
@@ -17036,7 +17328,7 @@ index 6a136a6..00177b5 100644
          Spacer(Modifier.height(6.dp))
      }
  }
-@@ -1210,7 +1358,7 @@ private fun KeyAgentButton(kind: ConnectionKind, onFallback: ((String?) -> Unit)
+@@ -1210,7 +1368,7 @@ private fun KeyAgentButton(kind: ConnectionKind, onFallback: ((String?) -> Unit)
      BigAction(if (PlusVault.hasSecret(kind.id)) "已接入 · 再生成一个新密钥" else "一键接入") { start() }
      // [Mines-keys-35.3] 「去官网获取」 = the same automatic flow (Mines' own browser), not Chrome + typing
      if (secondary != null) SecondaryAction(secondary) { start() }
@@ -17045,7 +17337,7 @@ index 6a136a6..00177b5 100644
      if (open) KeyAgentDialog(kind, onFallback = onFallback) { saved ->
          open = false
          if (saved) { Toast.makeText(context, "已接入 ${kind.name} ✓", Toast.LENGTH_SHORT).show(); chromeStatus = "已接入 ✓ " + PlusVault.preview(kind.id) }
-@@ -1232,3 +1380,79 @@ fun SecureWindow() {
+@@ -1232,3 +1390,79 @@ fun SecureWindow() {
          onDispose { }
      }
  }
@@ -18049,7 +18341,7 @@ index 0000000..6bc0f8d
 +    return bands?.let { r -> r.mapNotNull { h.getOrNull(it) }.maxOrNull() } ?: h.max()
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassDialogs.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassDialogs.kt
-index 8a17234..77d555e 100644
+index 8a17234..5d6a3db 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassDialogs.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/GlassDialogs.kt
 @@ -8,6 +8,7 @@ import androidx.compose.foundation.BorderStroke
@@ -18214,12 +18506,21 @@ index 8a17234..77d555e 100644
      }
  }
  
-@@ -285,10 +319,8 @@ fun MinesSheet(onDismiss: () -> Unit, content: @Composable ColumnScope.() -> Uni
+@@ -280,15 +314,16 @@ fun GlassSecondaryPill(text: String, modifier: Modifier = Modifier, onClick: ()
+ /** Frosted bottom sheet: content scrolls, bottom gets navigation-bar padding (nothing hides under the gesture bar). */
+ @OptIn(ExperimentalMaterial3Api::class)
+ @Composable
+-fun MinesSheet(onDismiss: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
++fun MinesSheet(onDismiss: () -> Unit, secure: Boolean = false, content: @Composable ColumnScope.() -> Unit) {
+     val m = mines()
      val state = rememberModalBottomSheetState(skipPartiallyExpanded = true)
      ModalBottomSheet(
          onDismissRequest = onDismiss, sheetState = state,
 -        containerColor = glassVeil(), tonalElevation = 0.dp,
          shape = RoundedCornerShape(topStart = 26.dp, topEnd = 26.dp),
++        // [Mines-38.9.6 i13] credential sheets: FLAG_SECURE on the sheet's own window (no screenshots / recents preview)
++        properties = androidx.compose.material3.ModalBottomSheetProperties(
++            securePolicy = if (secure) androidx.compose.ui.window.SecureFlagPolicy.SecureOn else androidx.compose.ui.window.SecureFlagPolicy.Inherit),
      ) {
 -        GlassWindowEffect()
          Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())
@@ -20311,7 +20612,7 @@ index f69ee42..5be64a6 100644
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/LoginCardUi.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/LoginCardUi.kt
 new file mode 100644
-index 0000000..0087874
+index 0000000..81946b8
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/LoginCardUi.kt
 @@ -0,0 +1,123 @@
@@ -20380,7 +20681,7 @@ index 0000000..0087874
 +    var save by remember(r.id) { mutableStateOf(true) }
 +    var show by remember(r.id) { mutableStateOf(false) }
 +    val danger = if (m.dark) MinesDesign.DangerDark else MinesDesign.Danger
-+    MinesSheet(onDismiss = { LoginCard.answer(null) }) {
++    MinesSheet(onDismiss = { LoginCard.answer(null) }, secure = !LoginCard.demoShown) {
 +        Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
 +            AcctLogo(r.host, r.name)
 +            Spacer(Modifier.width(12.dp))
@@ -22673,10 +22974,19 @@ index 0000000..c6649cc
 +    RouteStatusCore.St.UNCHECKED -> Color(0xFF8A8A8A)
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt
-index 926fe48..2645493 100644
+index 926fe48..e1d9df6 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/RoutingScreen.kt
-@@ -90,7 +90,7 @@ fun RoutingScreen(onBack: () -> Unit) {
+@@ -18,6 +18,8 @@ import androidx.compose.material.icons.outlined.Layers
+ import androidx.compose.material.icons.outlined.Info
+ import androidx.compose.material.icons.outlined.Memory
+ import androidx.compose.material.icons.outlined.Shield
++import androidx.compose.material.icons.outlined.Visibility
++import androidx.compose.material.icons.outlined.VisibilityOff
+ import androidx.compose.ui.unit.sp
+ import androidx.compose.material3.Button
+ import androidx.compose.material3.FilterChip
+@@ -90,7 +92,7 @@ fun RoutingScreen(onBack: () -> Unit) {
              unstable.forEach { mk ->
                  PlusDivider()
                  PlusRow(Icons.Outlined.Info, mk.name + " · 不稳定", mk.why, tint = MinesDesign.Warning, chevron = false,
@@ -22685,7 +22995,7 @@ index 926fe48..2645493 100644
              }
          }
          val insts = config?.instances?.filter { it.isEnabled }.orEmpty()
-@@ -119,6 +119,10 @@ private fun SplitProxySection() {
+@@ -119,6 +121,10 @@ private fun SplitProxySection() {
      val recent by SplitProxy.recent.collectAsState()
      var host by remember(s.upstreamHost) { mutableStateOf(s.upstreamHost) }
      var port by remember(s.upstreamPort) { mutableStateOf(if (s.upstreamPort > 0) s.upstreamPort.toString() else "") }
@@ -22696,7 +23006,7 @@ index 926fe48..2645493 100644
      var newRule by remember { mutableStateOf("") }
      var newMode by remember { mutableStateOf(SplitProxy.Mode.PROXY) }
      fun applyToSandbox() = scope.launch { runCatching { com.openminis.app.sandbox.ExecutionCoordinator.broadcastProxyChange() } }
-@@ -142,12 +146,38 @@ private fun SplitProxySection() {
+@@ -142,12 +148,38 @@ private fun SplitProxySection() {
                  FilterChip(selected = s.upstreamType == "http", onClick = { SplitProxy.update(ctx) { it.copy(upstreamType = "http") } }, label = { Text("HTTP") })
                  FilterChip(selected = s.upstreamType == "socks5", onClick = { SplitProxy.update(ctx) { it.copy(upstreamType = "socks5") } }, label = { Text("SOCKS5") })
              }
@@ -22738,7 +23048,7 @@ index 926fe48..2645493 100644
              }
          }
      }
-@@ -230,7 +260,7 @@ private fun ProxyAutoSection() {
+@@ -230,7 +262,7 @@ private fun ProxyAutoSection() {
      }
      PlusSection("找代理") {
          Column(Modifier.padding(horizontal = 16.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -24331,7 +24641,7 @@ index 555a1ed..3ea84e1 100644
                  PillButton("重试", Modifier.weight(1f), primary = true) { state.error = null; state.blank = false; onRetry() }
                  PillButton("用外部浏览器打开", Modifier.weight(1.4f), primary = false) { onExternal() }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
-index c17bd02..76f0b89 100644
+index c17bd02..195b3c7 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WebLoginScreen.kt
 @@ -9,6 +9,13 @@ import android.webkit.WebChromeClient
@@ -24348,7 +24658,16 @@ index c17bd02..76f0b89 100644
  import androidx.compose.foundation.layout.Box
  import androidx.compose.foundation.layout.Column
  import androidx.compose.foundation.layout.fillMaxSize
-@@ -107,13 +114,26 @@ fun WebLoginScreen(
+@@ -100,20 +107,34 @@ fun WebLoginScreen(
+         return suspendCancellableCoroutine { cont ->
+             runCatching {
+                 wv.evaluateJavascript("(function(){try{return String($js)}catch(e){return ''}})()") { r ->
+-                    val v = r?.trim('"')?.takeUnless { it == "null" || it == "undefined" }.orEmpty()
++                    // [Mines-38.9.6 i13] a real JSON decode: trim('"') left "\u0001" escape text (Memoh 账号 「\u0001\u0001」)
++                    val v = com.openminis.app.plus.LoginValueCore.decodeJs(r)
+                     if (cont.isActive) cont.resume(v)
+                 }
+             }.onFailure { if (cont.isActive) cont.resume("") }
          }
      }
  
@@ -24377,7 +24696,7 @@ index c17bd02..76f0b89 100644
      }
  
      // [Mines-login-32] Already signed in (session cookie kept from last time)? Skip the page.
-@@ -148,8 +168,16 @@ fun WebLoginScreen(
+@@ -148,8 +169,16 @@ fun WebLoginScreen(
              val waitNote = if (progress < 100) "页面还在加载（网站慢或需要代理），请稍等…" else "页面还没显示出来，正在重新加载…"
              status = waitNote
              if (progress >= 100) runCatching { webView?.reload() }
@@ -24396,7 +24715,7 @@ index c17bd02..76f0b89 100644
                  status = "页面还是没显示出来：网站慢或需要代理。可以再等一会儿，或检查网络 / 代理后关掉重新打开（登录一直在 Mines 里做）"
              else if (status == waitNote) status = null
          }
-@@ -172,7 +200,7 @@ fun WebLoginScreen(
+@@ -172,7 +201,7 @@ fun WebLoginScreen(
      // [Mines-38.7] + the phone number typed in for you, SMS codes (receiver / inbox / Google consent), 「已自动填好验证码」 read aloud
      LaunchedEffect(webView) {
          if (webView == null) return@LaunchedEffect
@@ -24405,7 +24724,7 @@ index c17bd02..76f0b89 100644
      }
      // [Mines-38.7] can this phone reach the site at all? (X behind a proxy that does not cover Mines → white page)
      LaunchedEffect(url) {
-@@ -211,7 +239,7 @@ fun WebLoginScreen(
+@@ -211,7 +240,7 @@ fun WebLoginScreen(
                  val urlHit = kind.doneUrl?.matches(u) == true
                  val jsHit = kind.doneJs?.let { eval(it).isNotBlank() } == true
                  hits = if (cookieHit || urlHit || jsHit) hits + 1 else 0
@@ -24414,7 +24733,7 @@ index c17bd02..76f0b89 100644
                  delay(1500)
              }
          }
-@@ -237,37 +265,43 @@ fun WebLoginScreen(
+@@ -237,37 +266,43 @@ fun WebLoginScreen(
              )
          },
          bottomBar = {
@@ -24481,7 +24800,7 @@ index c17bd02..76f0b89 100644
                }
            }
            Box(Modifier.fillMaxWidth().weight(1f)) {
-@@ -296,6 +330,7 @@ fun WebLoginScreen(
+@@ -296,6 +331,7 @@ fun WebLoginScreen(
                                      // browser — a browser sign-in never reaches Mines' own cookies). Google / Apple block
                                      // their buttons inside apps, so say so and stay on the site's own sign-in page.
                                      status = "「用 Google / Apple 登录」在 App 里会被拦。请用这个网站自己的账号、手机号或扫码登录"
@@ -24489,7 +24808,7 @@ index c17bd02..76f0b89 100644
                                      return true
                                  }
                                  if (!u.startsWith("http")) return true // app deep links (weixin://, etc.)
-@@ -304,11 +339,14 @@ fun WebLoginScreen(
+@@ -304,11 +340,14 @@ fun WebLoginScreen(
                              override fun onPageStarted(view: WebView, u: String, favicon: Bitmap?) {
                                  current = u; visited.add(u); load.started(view, u)
                              }
@@ -24504,7 +24823,7 @@ index c17bd02..76f0b89 100644
                                  LoginWeb.flush()
                              }
                              // [Mines-38.7] X (heavy page) could kill the page process, and an unhandled loss took the
-@@ -338,3 +376,5 @@ fun WebLoginScreen(
+@@ -338,3 +377,5 @@ fun WebLoginScreen(
      }
  }
  
@@ -27449,6 +27768,91 @@ index 0000000..e83c35b
 +        assertTrue(GlassAuto.solveBand(false, lightTint, lightInk2, busy) >= GlassAuto.solveBand(false, lightTint, lightInk2, calm))
 +    }
 +}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/GlassSurfaceScanTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/GlassSurfaceScanTest.kt
+new file mode 100644
+index 0000000..b8b5284
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/GlassSurfaceScanTest.kt
+@@ -0,0 +1,79 @@
++package com.openminis.app.plus
++
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import java.io.File
++
++/**
++ * [Mines-38.9.6 i13] Extends GlassWrapperScanTest: (1) a raw Compose Dialog / Popup may only appear in the files listed here,
++ * each with its reason; a new one must use the shared glass (ui.glass.* / MinesDialog / MinesSheet / GlassSurface) or be added
++ * here on purpose. (2) The input bars (home + chat composer + slash/@ panel) draw the shared input glass with its rim and floor.
++ */
++class GlassSurfaceScanTest {
++    private fun root(): File = listOf("src/main/java/com/openminis/app", "app/src/main/java/com/openminis/app").map { File(it) }.first { it.isDirectory }
++    private fun code(f: File): String = f.readLines().filterNot { it.trimStart().startsWith("*") || it.trimStart().startsWith("//") || it.trimStart().startsWith("/*") }
++        .joinToString("\n")
++
++    /** file → why a raw window is right there */
++    private val allowed = mapOf(
++        "ui/components/MinisAlertDialog.kt" to "the shared glass dialog itself (GlassSurface inside)",
++        "ui/components/MinisMenu.kt" to "the shared glass menu itself (GlassSurface inside)",
++        "ui/chat/SendReturnModeMenu.kt" to "GlassSurface inside",
++        "ui/chat/ChatScreen.kt" to "slash / @ panels (glassInput) + attachment pill",
++        "ui/chat/MinisMarkdownTextToolbar.kt" to "text-selection toolbar",
++        "ui/chat/MinisTextKitGesture.kt" to "selection handles / magnifier",
++        "ui/chat/PastedTextBuffer.kt" to "GlassSurface inside",
++        "ui/chat/ChatAssistantMessageUI.kt" to "full-screen 深度思考 reader, opaque page colour",
++        "ui/chat/ChatUserMessageUI.kt" to "full-screen image viewer, black",
++        "ui/components/FullscreenImageViewer.kt" to "full-screen image viewer, black",
++        "ui/components/ImageGalleryViewer.kt" to "full-screen gallery, black",
++        "ui/media/InlineMediaPlayer.kt" to "full-screen video",
++        "ui/preview/WebPreviewFullscreenScreen.kt" to "full-screen web preview",
++        "ui/plus/AvatarPicker.kt" to "full-screen editor, opaque page colour",
++        "ui/plus/KeyAgentScreen.kt" to "full-screen web page, opaque porcelain",
++        "ui/plus/VoiceprintSection.kt" to "full-screen recorder, opaque page colour",
++        "ui/plus/KeychainScreen.kt" to "toast",
++        "ui/plus/MinesJobsHost.kt" to "job banners / toast",
++        "ui/plus/TaskProgressUi.kt" to "undo toast (GlassSurface)",
++    )
++
++    @Test fun rawDialogsAndPopupsOnlyWhereAllowed() {
++        val r = root()
++        val bad = mutableListOf<String>()
++        val raw = Regex("""(?<![A-Za-z_.])(Dialog|Popup)\s*\(|androidx\.compose\.ui\.window\.(Dialog|Popup)\s*\(""")
++        val imp = Regex("""^import androidx\.compose\.ui\.window\.(Dialog|Popup)$""", RegexOption.MULTILINE)
++        r.walkTopDown().filter { it.isFile && it.name.endsWith(".kt") }.forEach { f ->
++            val rel = f.relativeTo(r).path.replace('\\', '/')
++            if (rel.startsWith("ui/glass/")) return@forEach
++            val c = code(f)
++            val usesWindow = c.contains("androidx.compose.ui.window.Dialog(") || c.contains("androidx.compose.ui.window.Popup(") ||
++                (imp.containsMatchIn(c) && raw.containsMatchIn(c))
++            if (usesWindow && rel !in allowed) bad += rel
++        }
++        assertTrue("raw Dialog / Popup outside the shared glass (use MinesDialog / MinesSheet / GlassSurface, or add to the list with a reason):\n" +
++            bad.joinToString("\n"), bad.isEmpty())
++    }
++
++    @Test fun pastedTextAndSheetsAreGlass() {
++        val r = root()
++        val p = code(File(r, "ui/chat/PastedTextBuffer.kt"))
++        assertTrue("pasted-text dialog draws GlassSurface", p.contains("GlassSurface("))
++        val d = code(File(r, "ui/plus/GlassDialogs.kt"))
++        assertTrue("MinesSheet can be FLAG_SECURE", d.contains("SecureFlagPolicy.SecureOn"))
++        val card = code(File(r, "ui/plus/LoginCardUi.kt"))
++        assertTrue("login / credential card is secure", card.contains("secure = "))
++        assertTrue("credential card masks the password with a toggle", card.contains("PasswordVisualTransformation()") && card.contains("显示密码"))
++    }
++
++    @Test fun inputBarsUseSharedInputGlass() {
++        val r = root()
++        val kit = code(File(r, "ui/plus/GlassKit.kt"))
++        assertTrue("glassInputFill has a floor", kit.contains("fun glassInputFill(") && kit.contains("GlassFloor."))
++        assertTrue("glassInput draws sheen + halo", kit.contains("fun Modifier.glassInput("))
++        val home = code(File(r, "ui/plus/WarmComponents.kt"))
++        assertTrue("home input bar = shared input glass", home.contains("glassInputFill()"))
++        val chat = code(File(r, "ui/chat/ChatComposerWidgets.kt")) + code(File(r, "ui/chat/ChatScreen.kt"))
++        assertTrue("chat composer = shared input glass", chat.contains("glassInputFill("))
++        assertTrue("no English a11y labels on the composer", !chat.contains("\"Voice input\"") && !chat.contains("\"Stop recording\""))
++    }
++}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/GlassWrapperScanTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/GlassWrapperScanTest.kt
 new file mode 100644
 index 0000000..f9bc346
@@ -27890,6 +28294,57 @@ index 0000000..09bb83f
 +        val r = LoginMemoryCore.cardFields(pw, true, true, -1, true, "Notion")!!
 +        assertEquals("密码不对，重新输入", r.title); assertTrue(r.refused)
 +        assertEquals(listOf(Field.EMAIL, Field.PASSWORD), r.fields)
++    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/LoginValueCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/LoginValueCoreTest.kt
+new file mode 100644
+index 0000000..101dced
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/LoginValueCoreTest.kt
+@@ -0,0 +1,45 @@
++package com.openminis.app.plus
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class LoginValueCoreTest {
++    @Test fun decodesEvaluateJavascriptString() {
++        assertEquals("a\u0001b\u0001c", LoginValueCore.decodeJs("\"a\\u0001b\\u0001c\""))
++        assertEquals("", LoginValueCore.decodeJs("null"))
++        assertEquals("he said \"hi\"\n", LoginValueCore.decodeJs("\"he said \\\"hi\\\"\\n\""))
++        assertEquals("blank", LoginValueCore.decodeJs("\"blank\""))
++    }
++
++    @Test fun separatorBugValuesAreRejected() {
++        // what 38.9.5 saved for a Memoh web sign-in with nothing typed
++        assertEquals("", LoginValueCore.cleanAccount("\\u0001\\u0001"))
++        assertEquals("", LoginValueCore.cleanAccount("\u0001\u0001"))
++        assertTrue(LoginValueCore.badAccount("\\u0001\\u0001"))
++        assertFalse(LoginValueCore.badAccount("me@163.com"))
++        assertEquals("me@163.com", LoginValueCore.cleanAccount(" me@163.com "))
++    }
++
++    @Test fun parsesRealAndEscapedSeparators() {
++        val a = LoginValueCore.parseAccount("u@x.com\u0001\u0001p@ss")
++        assertEquals("u@x.com", a.user); assertEquals("", a.token); assertEquals("p@ss", a.pass)
++        val b = LoginValueCore.parseAccount("\\u0001eyJa.b.c\\u0001")
++        assertEquals("", b.user); assertEquals("eyJa.b.c", b.token); assertEquals("", b.pass)
++        assertEquals("", LoginValueCore.parseAccount("").user)
++        assertFalse(a.toString().contains("p@ss"))
++    }
++
++    @Test fun hostPrefixedCookiesStayHostOnly() {
++        val l = LoginValueCore.cookieLine("__Host-session", "v", "memoh.net", true, 100)
++        assertFalse(l.contains("Domain"))
++        assertTrue(l.contains("Secure")); assertTrue(l.contains("Path=/"))
++        assertTrue(LoginValueCore.cookieLine("sid", "v", "memoh.net", true, 100).contains("Domain=.memoh.net"))
++        assertTrue(LoginValueCore.cookieLine("__Secure-x", "v", "memoh.net", false, 100).contains("Secure"))
++        assertFalse(LoginValueCore.cookieLine("sid", "v", "10.0.0.2", false, 100).contains("Domain"))
++        assertEquals(1, LoginValueCore.deleteLines("__Host-s", "memoh.net", false).size)
++        assertTrue(LoginValueCore.deleteLines("__Host-s", "memoh.net", false).first().contains("Secure"))
++        assertEquals(3, LoginValueCore.deleteLines("sid", "memoh.net", false).size)
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/MailConfigTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/MailConfigTest.kt
