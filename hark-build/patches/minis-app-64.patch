@@ -1,5 +1,5 @@
 diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
-index e0c88bb..951ad08 100644
+index e0c88bb..79e0665 100644
 --- a/src/android/app/build.gradle.kts
 +++ b/src/android/app/build.gradle.kts
 @@ -38,8 +38,8 @@ android {
@@ -8,8 +8,8 @@ index e0c88bb..951ad08 100644
          targetSdk = 35
 -        versionCode = 35
 -        versionName = "1.21"
-+        versionCode = 43
-+        versionName = "1.23.6"
++        versionCode = 44
++        versionName = "1.23.7"
  
          testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
  
@@ -41,6 +41,19 @@ index 3855cc1..f8a5abe 100644
          <service
              android:name=".plus.WakeWordService"
              android:exported="false"
+diff --git a/src/android/app/src/main/assets/default_mount/etc/profile.d/minis.sh b/src/android/app/src/main/assets/default_mount/etc/profile.d/minis.sh
+index 4bcb90a..7892964 100644
+--- a/src/android/app/src/main/assets/default_mount/etc/profile.d/minis.sh
++++ b/src/android/app/src/main/assets/default_mount/etc/profile.d/minis.sh
+@@ -44,3 +44,8 @@ export UV_LINK_MODE=symlink
+ #
+ # Only affects NEW operations -- it cannot repair already-stuck files.
+ git config --system core.createObject copy 2>/dev/null || true
++
++# [Mines-38.9.7] no GitHub SSH key in the sandbox: GitHub ssh urls → https, git never prompts (mirrors PRootKernel env)
++export GIT_TERMINAL_PROMPT=0
++git config --system url."https://github.com/".insteadOf "ssh://git@github.com/" 2>/dev/null || true
++git config --system --add url."https://github.com/".insteadOf "git@github.com:" 2>/dev/null || true
 diff --git a/src/android/app/src/main/assets/default_mount/etc/ssh/ssh_config.d/minis.conf b/src/android/app/src/main/assets/default_mount/etc/ssh/ssh_config.d/minis.conf
 index fd4c2be..2141a5f 100644
 --- a/src/android/app/src/main/assets/default_mount/etc/ssh/ssh_config.d/minis.conf
@@ -57,6 +70,101 @@ index fd4c2be..2141a5f 100644
      TCPKeepAlive yes
      ConnectTimeout 12
      ConnectionAttempts 2
+diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-dsh b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-dsh
+index 0f916dc..a3de3da 100644
+--- a/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-dsh
++++ b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-dsh
+@@ -27,11 +27,25 @@ mkdir -p "$H"
+ [ -f "$H/plugins.json" ] || printf '{"plugins":[]}\n' > "$H/plugins.json"
+ 
+ need_node() {
++    git_https
+     command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && return
+     echo "第一次使用，正在安装 Node.js（只装一次）…" >&2
+     apk add --no-cache nodejs npm >/dev/null
+ }
+ 
++# [Mines-38.9.7] the phone sandbox has no GitHub SSH key: npm's git deps (github:, git+ssh://) go over HTTPS, never prompt
++git_https() {
++    export GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=2 \
++        GIT_CONFIG_KEY_0=url.https://github.com/.insteadOf GIT_CONFIG_VALUE_0=ssh://git@github.com/ \
++        GIT_CONFIG_KEY_1=url.https://github.com/.insteadOf GIT_CONFIG_VALUE_1=git@github.com:
++    command -v git >/dev/null 2>&1 || { command -v apk >/dev/null 2>&1 && apk add --no-cache git >/dev/null 2>&1; } || true
++}
++
++# npm spec -> HTTPS spec for GitHub (github:o/r, git+ssh://git@github.com/o/r.git, git@github.com:o/r.git)
++https_spec() {
++    printf '%s' "$1" | sed -E 's#^github:([^/]+)/([^#]+)#git+https://github.com/\1/\2.git#; s#^(git\+)?ssh://git@github\.com[:/]#git+https://github.com/#; s#^git@github\.com:#git+https://github.com/#; s#\.git\.git#.git#'
++}
++
+ # [Mines-dsh-25] The plugin check, as Mines runs it: bounded in time, stdin
+ # closed, output through a file so a process a plugin leaves behind can't keep
+ # the caller's pipe open. socket.mjs also kills its children on exit.
+@@ -129,6 +143,30 @@ pkg_name() {
+     esac
+ }
+ 
++# [Mines-38.9.7] the agent's path to a DSH tool: plugin → socket.mjs (stdio MCP server "dsh") → tools/call.
++# Plants a tiny tool plugin, runs initialize + tools/list + tools/call exactly as Mines' MCP client does, removes it.
++call_test() {
++    E="$H/node_modules/mines-selftest-echo"; mkdir -p "$E"
++    printf '{"name":"mines-selftest-echo","version":"1.0.0","type":"module","main":"index.js"}\n' > "$E/package.json"
++    printf 'export default { name: "mines-selftest-echo", apply(ctx) { ctx.tools.register({ name: "mines_echo", description: "echo", parameters: { type: "object", properties: { text: { type: "string" } } }, execute: async (a) => "echo:" + a.text }) } }\n' > "$E/index.js"
++    H="$H" node --input-type=module -e '
++      import fs from "node:fs"; const f = process.env.H + "/plugins.json"
++      const j = JSON.parse(fs.readFileSync(f, "utf8")); j.plugins = j.plugins.filter(p => p.package !== "mines-selftest-echo"); j.plugins.push({ package: "mines-selftest-echo", enabled: true })
++      fs.writeFileSync(f, JSON.stringify(j, null, 2))'
++    out=$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
++        '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
++        '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"mines_echo","arguments":{"text":"hi"}}}' \
++        | (cat; sleep 8) | MINIS_DSH_HOME="$H" timeout 60 node "$SOCK" 2>/dev/null)
++    H="$H" node --input-type=module -e '
++      import fs from "node:fs"; const f = process.env.H + "/plugins.json"
++      const j = JSON.parse(fs.readFileSync(f, "utf8")); j.plugins = j.plugins.filter(p => p.package !== "mines-selftest-echo")
++      fs.writeFileSync(f, JSON.stringify(j, null, 2))'
++    rm -rf "$E"
++    n=$(printf '%s\n' "$out" | grep -c '"name":"[^"]*"' || true)
++    if printf '%s' "$out" | grep -q 'echo:hi'; then echo "✓ DSH 工具调用：tools/call mines_echo → echo:hi（共列出工具 $n 行）"; return 0; fi
++    echo "✗ DSH 工具调用没成功"; printf '%s\n' "$out" | head -5; return 1
++}
++
+ cmd="${1:-help}"; [ $# -gt 0 ] && shift
+ case "$cmd" in
+ add)
+@@ -142,7 +180,15 @@ add)
+     [ -d "$H/node_modules/@deepseek-ai/dsh-tools" ] || (cd "$H" && $NPMI @deepseek-ai/dsh-tools@next @deepseek-ai/cordis@next \
+         @deepseek-ai/dsh-scope@next @deepseek-ai/dsh-llm@next @deepseek-ai/dsh-sandbox@next \
+         @deepseek-ai/dsh-llm-pi-ai@next @deepseek-ai/schemastery @deepseek-ai/dsh-home-paths@next >&2) || true
+-    (cd "$H" && $NPMI "$1" >&2)
++    _l=$(mktemp)
++    if ! (cd "$H" && $NPMI "$1" >"$_l" 2>&1); then
++        cat "$_l" >&2
++        if grep -qiE 'publickey|ssh://git@github|Host key verification' "$_l"; then
++            echo "这个插件要从 GitHub 拉代码，已改用 HTTPS 重试 RETRIED_HTTPS" >&2
++            (cd "$H" && $NPMI "$(https_spec "$1")" >&2) || { rm -f "$_l"; exit 1; }
++        else rm -f "$_l"; exit 1; fi
++    else cat "$_l" >&2; fi
++    rm -f "$_l"
+     name=$(pkg_name "$1"); [ -n "$name" ] || name="$1"
+     set_state add "$name"
+     # Fill in any other dsh library the plugin imports (only @deepseek-ai/*).
+@@ -180,6 +226,8 @@ list|ls)
+     need_node
+     check
+     ;;
++calltest)
++    need_node; call_test ;;
+ gateway)
+     need_node
+     exec env MINIS_DSH_HOME="$H" node "$SOCK" --gateway ;;
+@@ -229,6 +277,7 @@ selftest)
+       const j = JSON.parse(fs.readFileSync(f, "utf8")); j.plugins = j.plugins.filter(p => p.package !== "mines-selftest-linger")
+       fs.writeFileSync(f, JSON.stringify(j, null, 2))'
+     rm -rf "$L"
++    call_test || rc=1
+     for p in $PLUGS; do printf '%s\n' "$out" | grep -q "^✓ $p" || { echo "✗ $p 没加载"; rc=1; }; done
+     # What the app reads.
+     H="$MINIS_DSH_HOME" PLUGS="$PLUGS" node --input-type=module -e '
 diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-vps b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-vps
 index dfd05ae..bae5f08 100755
 --- a/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-vps
@@ -6154,6 +6262,32 @@ index def9c81..47e673d 100644
      fun windowInfos(): List<Map<String, Any?>> {
          val out = ArrayList<Map<String, Any?>>()
          try {
+diff --git a/src/android/app/src/main/java/com/openminis/app/agent/EngineerMode.kt b/src/android/app/src/main/java/com/openminis/app/agent/EngineerMode.kt
+new file mode 100644
+index 0000000..c32f1ad
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/agent/EngineerMode.kt
+@@ -0,0 +1,20 @@
++package com.openminis.app.agent
++
++/**
++ * [Mines-38.9.7] 高级工程模式 (user approved 2026-10-18): a senior-engineer working rule appended to the system prompt like
++ * [SkillFirst]. Toggle: Settings › Agent Tools › 高级工程模式 (AgentToolSwitch.ENGINEER, default on). Fixed text so the
++ * system-prompt prefix stays cache-stable.
++ */
++object EngineerMode {
++    const val PROMPT = """Senior-engineer mode (高级工程模式, ON):
++- Multi-step task: write a short plan (numbered steps) before the first action, then follow it; update it when facts change.
++- Read before you edit: open the file, the error message, the log or the page first. Never edit from memory or a guess.
++- Verify after every change: run it, test it, or read the output back. Never say 「已完成 / 成功」 for something you did not check.
++- When a tool call fails, read the error and fix the arguments or the approach; do not resend the same call unchanged.
++- Never loop: the same failure more than 2 times → stop, say what you tried, what failed (exact error) and what you need.
++- Prefer an installed skill that matches the task (技能优先) and existing tools / scripts over writing new ones.
++- Minimal, precise diffs: change only what the task needs; keep the user's style and structure.
++- End with what was verified (and how) and what was NOT verified, separately.
++- Ask the user only when truly blocked (missing permission, money, a choice only they can make); otherwise keep going.
++- 用中文回复用户；代码、命令、路径保持原文。"""
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/agent/ExperienceCore.kt b/src/android/app/src/main/java/com/openminis/app/agent/ExperienceCore.kt
 new file mode 100644
 index 0000000..2deb686
@@ -6508,19 +6642,230 @@ index 0000000..eba6b3d
 +            "参数必须是一个顶层 JSON 对象，字段直接放在最外层，不要包在 arguments/args/input 里，例如：${EXAMPLE[tool] ?: "{…}"}"
 +    }
 +}
+diff --git a/src/android/app/src/main/java/com/openminis/app/browser/BrowserHandoff.kt b/src/android/app/src/main/java/com/openminis/app/browser/BrowserHandoff.kt
+new file mode 100644
+index 0000000..946ffed
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/browser/BrowserHandoff.kt
+@@ -0,0 +1,44 @@
++package com.openminis.app.browser
++
++import android.webkit.WebView
++import androidx.webkit.WebViewCompat
++import androidx.webkit.WebViewFeature
++
++/** [Mines-38.9.7] Android side of [BrowserHandoffCore]: remembers the user's page, prepares an agent tab with it. */
++object BrowserHandoff {
++    @Volatile var last: BrowserHandoffCore.UserPage? = null; private set
++    @Volatile var adopted: Int = 0; private set
++
++    /** The user is looking at [wv] in [pool] (sheet shown / page changed / sheet closed). Main thread. */
++    fun noteUser(pool: Any, wv: WebView, url: String, desktop: Boolean, incognito: Boolean = false) {
++        if (incognito) return   // 无痕: never handed over, never remembered
++        if (!url.startsWith("http")) return
++        runCatching { com.openminis.app.plus.LoginWeb.flush() }   // CookieManager.flush (+ profiles) before any handoff
++        val key = System.identityHashCode(pool)
++        last = BrowserHandoffCore.UserPage(url, desktop, System.currentTimeMillis(), last?.takeIf { it.url == url }?.sessionJson, key)
++        runCatching {
++            wv.evaluateJavascript(BrowserHandoffCore.DUMP_SESSION_JS) { r ->
++                val dump = BrowserHandoffCore.usableDump(runCatching { org.json.JSONTokener(r ?: "\"\"").nextValue() as? String }.getOrNull())
++                val cur = last
++                if (cur != null && cur.url == url) last = cur.copy(sessionJson = dump)
++            }
++        }
++    }
++
++    /** The page to open in [pool]'s first agent tab, or null. */
++    fun adoptFor(pool: Any, poolHasTabs: Boolean): BrowserHandoffCore.UserPage? {
++        val p = last
++        return if (BrowserHandoffCore.adopt(p, System.currentTimeMillis(), poolHasTabs, System.identityHashCode(pool))) p else null
++    }
++
++    /** Before the first load: the page's sessionStorage comes back on its origin. */
++    fun prepare(wv: WebView, page: BrowserHandoffCore.UserPage) {
++        adopted++
++        val js = page.sessionJson ?: return
++        if (page.origin.isBlank()) return
++        runCatching {
++            if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT))
++                WebViewCompat.addDocumentStartJavaScript(wv, BrowserHandoffCore.restoreSessionJs(page.origin, js), setOf(page.origin))
++        }
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/browser/BrowserHandoffCore.kt b/src/android/app/src/main/java/com/openminis/app/browser/BrowserHandoffCore.kt
+new file mode 100644
+index 0000000..f62e1aa
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/browser/BrowserHandoffCore.kt
+@@ -0,0 +1,56 @@
++package com.openminis.app.browser
++
++/**
++ * [Mines-38.9.7] 浏览器接管保持登录 (user approved 2026-10-18). Root cause of 「我在 Mines 浏览器里登录了，AI 接手却是没登录」:
++ *  1. the browser on the home screen (☰ › 打开浏览器) had its OWN private tab pool, separate from every chat's pool, so an
++ *     agent in a chat never saw the user's tab: it opened a blank tab of its own;
++ *  2. even in the same chat the agent took the first free tab (often tab 0), not the tab the user was looking at;
++ *  3. a new tab starts with an empty sessionStorage (per tab) and the pool's default UA — sites that keep the sign-in in
++ *     sessionStorage (many consoles / SPAs) or bind it to the UA (Cloudflare cf_clearance, 阿里云 risk checks, the per-site
++ *     电脑版 chip) look signed-out there, although the cookies are shared;
++ *  4. Google / Apple sign-in goes to a Chrome Custom Tab (Google blocks WebView sign-in), so THAT session lives in Chrome
++ *     and can never be handed to a WebView — the agent is told so instead of guessing.
++ * Fix: the home browser uses the process-wide shared pool; the agent prefers the user's selected tab; when the agent's
++ * pool has no tab yet it opens the user's last page (≤ 20 min old) with the same UA and that origin's sessionStorage
++ * (document-start script), after cookies were flushed. Pure parts here (unit-tested).
++ */
++object BrowserHandoffCore {
++    const val MAX_AGE_MS = 20 * 60_000L
++
++    data class TabLite(val id: Int, val inUse: Boolean, val mayUse: Boolean)
++    data class UserPage(val url: String, val desktop: Boolean, val at: Long, val sessionJson: String?, val poolKey: Int, val incognito: Boolean = false) {
++        val origin: String get() = originOf(url)
++    }
++
++    fun originOf(url: String): String = runCatching {
++        val u = java.net.URI(url); if (u.scheme == null || u.host == null) "" else u.scheme + "://" + u.host + (if (u.port > 0) ":" + u.port else "")
++    }.getOrDefault("")
++
++    /** The tab an agent (no tab id given) drives: the user's selected tab when it is free, else the first free one. */
++    fun pickAgentTab(selected: Int?, tabs: List<TabLite>): Int? =
++        tabs.firstOrNull { it.id == selected && !it.inUse && it.mayUse }?.id ?: tabs.firstOrNull { !it.inUse && it.mayUse }?.id
++
++    /** Adopt the user's last page into an agent pool that has no tab yet. Never an incognito page. */
++    fun adopt(page: UserPage?, now: Long, poolHasTabs: Boolean, poolKey: Int): Boolean =
++        page != null && !page.incognito && !poolHasTabs && page.poolKey != poolKey && now - page.at in 0..MAX_AGE_MS &&
++            (page.url.startsWith("https://") || page.url.startsWith("http://"))
++
++    const val DUMP_SESSION_JS = "(function(){try{var o={};for(var i=0;i<sessionStorage.length;i++){var k=sessionStorage.key(i);if(k.indexOf('__m')!==0)o[k]=sessionStorage.getItem(k);}return JSON.stringify(o);}catch(e){return '';}})()"
++
++    /** Document-start script putting [json] (a sessionStorage dump) back once, only on [origin]. */
++    fun restoreSessionJs(origin: String, json: String): String {
++        val o = org.json.JSONObject.quote(origin)
++        return "(function(){try{if(location.origin!==$o||sessionStorage.getItem('__mh_ho'))return;var d=$json;" +
++            "for(var k in d){if(sessionStorage.getItem(k)===null)sessionStorage.setItem(k,d[k]);}sessionStorage.setItem('__mh_ho','1');}catch(e){}})();"
++    }
++
++    /** True when a dump is a JSON object worth restoring. */
++    fun usableDump(raw: String?): String? {
++        val s = raw?.trim().orEmpty()
++        if (s.length < 3 || !s.startsWith("{")) return null
++        return runCatching { val o = org.json.JSONObject(s); if (o.length() == 0) null else o.toString() }.getOrNull()
++    }
++
++    /** One line for the agent when the user signed in with Google / Apple (Custom Tab, Chrome's jar). */
++    const val CUSTOM_TAB_NOTE = "This site's Google / Apple sign-in ran in Chrome (Custom Tab), not in the app's WebView, so that session cannot be used here; ask the user to sign in on the site's own form (email / phone / QR) inside the Mines browser."
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/browser/BrowserTabPool.kt b/src/android/app/src/main/java/com/openminis/app/browser/BrowserTabPool.kt
+index 3e55128..71bb166 100644
+--- a/src/android/app/src/main/java/com/openminis/app/browser/BrowserTabPool.kt
++++ b/src/android/app/src/main/java/com/openminis/app/browser/BrowserTabPool.kt
+@@ -27,7 +27,11 @@ import java.util.concurrent.ConcurrentHashMap
+  * Manages up to 3 browser tabs for the agent, mirroring iOS BrowserTabPool.
+  * All tabs share the same cookie store by default on Android.
+  */
+-class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.RegistryPool {
++class BrowserTabPool(
++    private val context: Context,
++    /** [Mines-38.9.7] 无痕标签: own WebView profile, never saved / handed over / fed to account memory. */
++    val incognito: Boolean = false,
++) : BrowserTabPoolRegistry.RegistryPool {
+ 
+     companion object {
+         private const val TAG = "BrowserTabPool"
+@@ -1036,7 +1040,12 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
+             // [T-android-browser-tab-ownership] "Free" means free AND mine (or
+             // unowned when privileged): grabbing a sibling's idle tab is the
+             // trampling this exists to stop.
+-            var picked = currentTabs.firstOrNull { !it.inUse && mayUse(it.id, owner) }
++            // [Mines-38.9.7] takeover keeps the login: the user's selected tab first (BrowserHandoffCore.pickAgentTab);
++            // an empty agent pool opens the user's last page (other pool, ≤ 20 min) with its UA + sessionStorage
++            val lite = currentTabs.map { BrowserHandoffCore.TabLite(it.id, it.inUse, mayUse(it.id, owner)) }
++            val pref = if (isPrivileged(owner)) BrowserHandoffCore.pickAgentTab(_selectedTabId.value, lite) else BrowserHandoffCore.pickAgentTab(null, lite)
++            var picked = currentTabs.firstOrNull { it.id == pref }
++                ?: adoptUserPage(currentTabs, owner)
+                 ?: createTab(currentTabs, owner = owner)
+             if (picked == null) {
+                 val waitDeadline = IMPLICIT_TAB_WAIT_MS
+@@ -1158,6 +1167,19 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
+         return replacementForRequested
+     }
+ 
++    /** [Mines-38.9.7] First agent tab of an empty pool = the page the user was just on (BrowserHandoff). Main thread. */
++    private fun adoptUserPage(tabs: MutableList<Tab>, owner: String?): Tab? {
++        val page = BrowserHandoff.adoptFor(this, tabs.isNotEmpty()) ?: return null
++        val wantUa = if (page.desktop) UserAgentProfile.DESKTOP_CHROME else UserAgentProfile.MOBILE_CHROME
++        val t = createTab(tabs, owner = owner) ?: return null
++        if (userAgentProfile != UserAgentProfile.CUSTOM && userAgentProfile != wantUa) t.manager.setUserAgent(wantUa, null)
++        BrowserHandoff.prepare(t.manager.webView, page)
++        t.needsInitialBlankPage = false
++        t.manager.loadURL(page.url)
++        Log.i(TAG, "adopted the user's page into a new agent tab ${t.id}")
++        return t
++    }
++
+     private fun createTab(
+         tabs: MutableList<Tab>,
+         url: String? = null,
+@@ -1184,6 +1206,12 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
+ 
+         val id = nextTabId++
+         val webView = WebView(context)
++        if (incognito && !Incognito.attach(webView)) {
++            // never fall back to the shared jar for an incognito tab
++            runCatching { webView.destroy() }
++            Log.w(TAG, "incognito tab refused: no WebView profile support")
++            return null
++        }
+         com.openminis.app.plus.PayCards.install(webView)  // [Mines-cards-35.1] 填卡 into payment iframes
+         // [T-android-minis-url-session-scope] Hand the manager a LIVE reader of
+         // this pool's session id (set later via setSession) plus a context, so
+@@ -1207,6 +1235,7 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
+         manager.onCloseWindow = { handleCloseWindow(manager) }
+         wireDownloadHandlers(manager)
+ 
++        manager.incognito = incognito
+         val tab = Tab(id = id, manager = manager)
+         tabs.add(tab)
+         _tabs.value = tabs.toList()
+@@ -1852,6 +1881,7 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
+     // -- Disk Persistence --
+ 
+     private fun saveState() {
++        if (!IncognitoCore.persistsTabs(incognito)) return
+         val sid = sessionId ?: return
+         try {
+             val dir = File(context.filesDir, "browser_tabs")
 diff --git a/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt b/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt
-index 9033a1b..1852002 100644
+index 9033a1b..29ef2fd 100644
 --- a/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt
-@@ -460,6 +460,7 @@ class BrowserUseManager(
+@@ -48,6 +48,9 @@ class BrowserUseManager(
+     /** App context for the session-scoped path resolver. Null disables it. */
+     private val appContext: android.content.Context? = null,
+ ) {
++    /** [Mines-38.9.7] 无痕标签: no history, no account recording. Set by the pool right after construction. */
++    @Volatile var incognito: Boolean = false
++
+     companion object {
+         private const val TAG = "BrowserUseManager"
+         private const val NAVIGATION_TIMEOUT_MS = 30_000L
+@@ -460,6 +463,7 @@ class BrowserUseManager(
  
              override fun onPageFinished(view: WebView, url: String?) {
                  _isLoading.value = false
-+                runCatching { com.openminis.app.plus.AutoAccounts.onPage(view, url) }   // [Mines-38.8] auto-record sign-ups / sign-ins
++                if (IncognitoCore.feedsAccounts(incognito)) runCatching { com.openminis.app.plus.AutoAccounts.onPage(view, url) }   // [Mines-38.8] auto-record sign-ups / sign-ins
                  _currentURL.value = url ?: ""
                  _pageTitle.value = view.title ?: ""
                  _canGoBack.value = view.canGoBack()
-@@ -878,6 +879,8 @@ class BrowserUseManager(
+@@ -479,7 +483,7 @@ class BrowserUseManager(
+                 // Record in browser history
+                 val histUrl = url ?: ""
+                 val histTitle = view.title ?: ""
+-                if (histUrl.isNotEmpty() && histUrl != "about:blank") {
++                if (histUrl.isNotEmpty() && histUrl != "about:blank" && IncognitoCore.recordsHistory(incognito)) {
+                     BrowserHistoryStore.getInstance(view.context).record(histUrl, histTitle)
+                 }
+                 // T-webview-popup-d3c6e10f (Issue 1): after the pool WebView's
+@@ -878,6 +882,8 @@ class BrowserUseManager(
          if (!com.openminis.app.offload.MinisNotificationListenerService.isConnected() && !mailOk) {
              return BrowserActionResult.error("Mines 没有通知使用权，也没有已登录的邮箱，收不到验证码。请让用户在 设置 → 浏览器验证 里打开通知使用权，或把验证码直接告诉你")
          }
@@ -6529,6 +6874,105 @@ index 9033a1b..1852002 100644
          val code = hv.awaitCode(com.openminis.app.plus.HumanVerify.WAIT_SLICE_MS)
              ?: return BrowserActionResult(text = "约 50 秒内没收到验证码短信/邮件通知。确认已经点了发送验证码后，可以再调用一次 wait_for_otp。", success = true)
          val r = runCatching { evaluateJavascript(hv.fillJs(code, selector)) }.getOrNull()
+diff --git a/src/android/app/src/main/java/com/openminis/app/browser/Incognito.kt b/src/android/app/src/main/java/com/openminis/app/browser/Incognito.kt
+new file mode 100644
+index 0000000..023d8f6
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/browser/Incognito.kt
+@@ -0,0 +1,54 @@
++package com.openminis.app.browser
++
++import android.webkit.WebView
++import androidx.webkit.ProfileStore
++import androidx.webkit.WebViewCompat
++import androidx.webkit.WebViewFeature
++
++/** [Mines-38.9.7] Android side of [IncognitoCore]: separate WebView profile, wiped on close. Main thread. */
++object Incognito {
++    @Volatile var lastClose: String? = null; private set
++
++    fun supported(): Boolean = runCatching { WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE) }.getOrDefault(false)
++
++    /** Must run right after `WebView(context)`, before anything else touches [wv]. */
++    fun attach(wv: WebView): Boolean {
++        if (!supported()) return false
++        return runCatching {
++            ProfileStore.getInstance().getOrCreateProfile(IncognitoCore.PROFILE)
++            WebViewCompat.setProfile(wv, IncognitoCore.PROFILE)
++            true
++        }.getOrElse { android.util.Log.w("Incognito", "setProfile failed", it); false }
++    }
++
++    /** Before the tabs' WebViews are destroyed. */
++    fun wipeViews(views: List<WebView>) {
++        for (v in views) runCatching { v.clearHistory(); v.clearCache(true); v.clearFormData() }
++    }
++
++    /** After the tabs are destroyed: cookies + storage gone, profile deleted. */
++    fun wipeProfile() {
++        if (!supported()) return
++        val r = runCatching {
++            val store = ProfileStore.getInstance()
++            val p = store.getProfile(IncognitoCore.PROFILE)
++            if (p != null) {
++                p.cookieManager.removeAllCookies(null)
++                p.cookieManager.flush()
++                p.webStorage.deleteAllData()
++            }
++            // deleteProfile throws while a WebView still uses it; the next open re-creates it either way
++            runCatching { store.deleteProfile(IncognitoCore.PROFILE) }
++            "已清除"
++        }.getOrElse { "清除失败：" + (it.message ?: it.javaClass.simpleName) }
++        lastClose = java.text.SimpleDateFormat("HH:mm", java.util.Locale.CHINA).format(java.util.Date()) + " " + r
++    }
++
++    /** Close an incognito pool: wipe its views, destroy the tabs, wipe the profile. */
++    fun close(pool: BrowserTabPool) {
++        if (!pool.incognito) return
++        wipeViews(pool.tabs.value.map { it.manager.webView })
++        pool.destroyAllTabs()
++        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({ wipeProfile() }, 300)
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/browser/IncognitoCore.kt b/src/android/app/src/main/java/com/openminis/app/browser/IncognitoCore.kt
+new file mode 100644
+index 0000000..473d013
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/browser/IncognitoCore.kt
+@@ -0,0 +1,33 @@
++package com.openminis.app.browser
++
++/**
++ * [Mines-38.9.7] 无痕标签 (user 2026-10-18). Pure rules, unit-tested:
++ *  - an incognito tab lives in its own WebView profile (androidx.webkit MULTI_PROFILE), so its cookies / storage never
++ *    touch the default jar that LoginMemory, SessionKeeper, AutoSources and the agent read;
++ *  - closing the incognito sheet wipes that profile (cookies, storage, cache, history) and deletes it;
++ *  - when the phone's WebView has no profile support the tab is NOT opened (sharing the normal jar would be a lie) —
++ *    the user gets one clear line instead.
++ */
++object IncognitoCore {
++    const val PROFILE = "mines-incognito"
++    const val TITLE_PREFIX = "无痕 · "
++    const val NO_PROFILE_MSG = "这台手机的系统 WebView 太旧，不支持无痕标签。请在应用商店更新「Android System WebView」后再试。"
++    const val CLOSED_MSG = "无痕标签已关闭，Cookie 和浏览记录已清除"
++
++    sealed class Plan { object Open : Plan(); data class Refuse(val why: String) : Plan() }
++
++    fun plan(profileSupported: Boolean): Plan = if (profileSupported) Plan.Open else Plan.Refuse(NO_PROFILE_MSG)
++
++    /** What an incognito tab may feed: nothing that outlives it. */
++    fun recordsHistory(incognito: Boolean) = !incognito
++    fun feedsAccounts(incognito: Boolean) = !incognito      // AutoAccounts / LoginMemory / SessionKeeper / AutoSources
++    fun handsOver(incognito: Boolean) = !incognito          // BrowserHandoff (agent takeover)
++    fun persistsTabs(incognito: Boolean) = !incognito       // browser_tabs/<sid>.json
++
++    fun title(base: String, incognito: Boolean) = if (incognito) TITLE_PREFIX + base else base
++
++    /** 自检 line. */
++    fun selfCheck(supported: Boolean, lastClose: String?): Pair<Boolean, String> =
++        if (!supported) false to "系统 WebView 不支持独立配置（需要更新 Android System WebView）"
++        else true to ("独立配置可用" + (lastClose?.let { " · 上次关闭：$it" } ?: ""))
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/browser/WebPrewarm.kt b/src/android/app/src/main/java/com/openminis/app/browser/WebPrewarm.kt
 new file mode 100644
 index 0000000..db33444
@@ -7513,10 +7957,10 @@ index 0000000..16ed069
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/AppAgents.kt b/src/android/app/src/main/java/com/openminis/app/plus/AppAgents.kt
 new file mode 100644
-index 0000000..6686aad
+index 0000000..ea74f70
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/AppAgents.kt
-@@ -0,0 +1,256 @@
+@@ -0,0 +1,274 @@
 +package com.openminis.app.plus
 +
 +import android.content.Context
@@ -7612,6 +8056,15 @@ index 0000000..6686aad
 +    suspend fun test(c: Context, d: Def): Test {
 +        init(c)
 +        if (Partners.list.value.isEmpty()) runCatching { Partners.refresh(c) }
++        // [Mines-38.9.7] Memoh = OpenAI-compatible endpoint with a key
++        if (d.id == "memoh" && MemohKey.configured()) {
++            val t0 = System.currentTimeMillis()
++            val r = runCatching { kotlinx.coroutines.withTimeout(45_000L) { MemohKey.reply("你在帮 Mines 做连通测试。", "只回复 OK 两个字母，不要别的。", 20) } }
++            val ms = System.currentTimeMillis() - t0
++            val res = r.fold({ Test(false, it.isNotBlank(), it.take(200).ifBlank { "（回复是空的）" }, ms, if (it.isBlank()) "回复是空的" else "") }, { e -> Test(false, false, "", ms, reasonOf(e)) })
++            addLog(c, LogEntry(d.name, "连通测试", System.currentTimeMillis(), ms, res.ok, res.text.length))
++            return res
++        }
 +        val p = partnerFor(d)
 +        if (p == null || !p.ready) return Test(false, false, "", 0, "${d.name} 还没登录，点这里去登录")
 +        val t0 = System.currentTimeMillis()
@@ -7649,12 +8102,13 @@ index 0000000..6686aad
 +
 +    enum class Login(val label: String) { OK("已登录"), NEED("需要登录"), US("需要美国网络"), OFF("连不上") }
 +    fun loginOf(d: Def): Login {
++        if (d.id == "memoh") return if (MemohKey.configured()) Login.OK else Login.NEED   // [Mines-38.9.7] key, not web login
 +        if (d.id == "web:muse" && !com.openminis.app.plus.group.PresetRegistry.museOn()) return Login.US
 +        val p = partnerFor(d) ?: return Login.NEED
 +        return when (p.state) { Partner.State.READY -> Login.OK; Partner.State.UNREACHABLE -> Login.OFF; else -> Login.NEED }
 +    }
 +    fun quotaOf(d: Def): String = partnerFor(d)?.balance?.let { "余额：$it" }
-+        ?: (if (d.id == "memoh") runCatching { com.openminis.app.plus.group.PresetAuth.memohWhere() }.getOrNull() else null) ?: d.quota
++        ?: (if (d.id == "memoh") MemohKeyCore.where(MemohKey.base()) ?: "填你服务器上的地址和 key" else null) ?: d.quota
 +
 +    // ---------------- routing ----------------
 +
@@ -7718,6 +8172,14 @@ index 0000000..6686aad
 +        if (d == null) return Result(false, "", if (agentId == "auto" || agentId.isBlank()) "不交出去（$how）：Mines 自己做" else "没有这个代理：$agentId", 0, how)
 +        if (!enabled(d.id)) return Result(false, d.name, "${d.name} 没启用（设置 › 应用代理 里点启用）", 0, how)
 +        if (never.containsMatchIn(task)) return Result(false, d.name, "付款、替用户发消息、删除数据的事不交给别的服务", 0, how)
++        if (d.id == "memoh" && MemohKey.configured()) {
++            val t0 = System.currentTimeMillis()
++            val r = runCatching { MemohKey.reply("你在帮 Mines 完成一件事。直接把结果写出来，中文，简洁；做不到就说做不到和原因。", task.take(6000)) }
++            val ms = System.currentTimeMillis() - t0
++            val res = r.fold({ Result(it.isNotBlank(), d.name, it.ifBlank { "（没有回复）" }, ms, how) }, { Result(false, d.name, "没成功：${it.message}", ms, how) })
++            addLog(c, LogEntry(d.name, task.take(60), System.currentTimeMillis(), ms, res.ok, res.text.length))
++            return res
++        }
 +        val p = partnerFor(d)?.takeIf { it.ready } ?: return Result(false, d.name, "${d.name} 还没登录（设置 › 应用代理 › ${d.name}）", 0, how)
 +        val t0 = System.currentTimeMillis()
 +        val r = runCatching {
@@ -8898,6 +9360,19 @@ index 2bfd012..de873da 100644
      }
  }
  
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/DshWidgets.kt b/src/android/app/src/main/java/com/openminis/app/plus/DshWidgets.kt
+index cde53b3..a21d1b2 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/DshWidgets.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/DshWidgets.kt
+@@ -54,7 +54,7 @@ object DshWebHost {
+     @Volatile private var process: Process? = null
+     private val lock = Mutex()
+ 
+-    private fun home(context: Context) = File(RootfsManager.getInstance(context).rootfsDir, "root/.minis-dsh")
++    fun home(context: Context) = File(RootfsManager.getInstance(context).rootfsDir, "root/.minis-dsh")
+ 
+     /** Installed, enabled plugins that inject a Web UI widget (from status.json). */
+     fun widgetPlugins(context: Context): List<String> = runCatching {
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Experience.kt b/src/android/app/src/main/java/com/openminis/app/plus/Experience.kt
 new file mode 100644
 index 0000000..e0e3e5b
@@ -9472,8 +9947,77 @@ index 0000000..d5b6d9a
 +        return Stats(perBand.map { band(it) })
 +    }
 +}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/HomeFixCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/HomeFixCore.kt
+new file mode 100644
+index 0000000..6145d0e
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/HomeFixCore.kt
+@@ -0,0 +1,63 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-38.9.7] user 2026-10-18 21:15/21:16 real-phone feedback on 38.9.6 (realme 1080×2412, dark):
++ *  (a) 「晚上好，2 件事等你」 said nothing about WHICH two things and could not be tapped → [waiting] is the one list both the
++ *      greeting count and the tap-through sheet use (same filter: on the home list, touched in the last 24 h, state 等你);
++ *  (b) the home weather was gone: the cache is 1 h and was only refreshed on resume / first composition, so after an hour
++ *      in the app (or with no location) HomeWeatherMini drew nothing → it always shows something now ([weatherChip]) and
++ *      自检 says why ([weatherWhy]);
++ *  (c) the 天气皮肤 looked like a maroon tint: the sky scene was picked once (remember on ticks only) — at 18:xx that is
++ *      SUNSET, whose dark variant is maroon, and it never changed again → re-picked every minute, 自检 says which and why
++ *      ([skyWhy]); and the type was larger than the design: the design was drawn at 405 dpi (the emulator), the phone runs
++ *      480 dpi, so everything was ~18 % bigger → [density] keeps at least 400 dp across the screen.
++ * Pure (unit-tested).
++ */
++object HomeFixCore {
++    data class Waiting(val sid: String, val title: String, val why: String, val at: Long)
++
++    /** The 「N 件事等你」 list: newest first; [visible] = chats on the home list (null = all). */
++    fun waiting(tasks: Collection<TaskProgressCore.Task>, visible: Set<String>?, now: Long, titles: Map<String, String> = emptyMap(),
++                windowMs: Long = 24 * 3_600_000L): List<Waiting> =
++        tasks.filter { (visible?.contains(it.sid) ?: true) && now - it.updatedAt <= windowMs && it.st == TaskProgressCore.St.WAITING }
++            .sortedByDescending { it.updatedAt }
++            .map { Waiting(it.sid, titles[it.sid]?.takeIf { t -> t.isNotBlank() } ?: it.goal.ifBlank { "对话" }, it.reason.ifBlank { "等你回复" }, it.updatedAt) }
++
++    enum class WxWhy(val line: String) {
++        OK("天气正常"), STALE("显示的是 1 小时前的天气，正在刷新"), NO_PERMISSION("没有定位权限，也没设城市"),
++        NO_FIX("手机还没给出位置"), FETCH_FAILED("天气接口连不上"), NEVER("还没取过天气")
++    }
++
++    fun weatherWhy(hasWeather: Boolean, ageMs: Long?, permission: Boolean, hasCity: Boolean, lastError: String?): WxWhy = when {
++        hasWeather && ageMs != null && ageMs <= 3_600_000L -> WxWhy.OK
++        hasWeather -> WxWhy.STALE
++        !permission && !hasCity -> WxWhy.NO_PERMISSION
++        lastError == "nofix" -> WxWhy.NO_FIX
++        lastError == "fetch" -> WxWhy.FETCH_FAILED
++        else -> WxWhy.NEVER
++    }
++
++    /** The small home chip when there is no weather to show (never nothing). */
++    fun weatherChip(why: WxWhy): String = when (why) {
++        WxWhy.NO_PERMISSION, WxWhy.NO_FIX -> "设置城市"
++        WxWhy.FETCH_FAILED -> "天气没取到 · 点我"
++        else -> "天气获取中…"
++    }
++
++    /** 自检: 「天气皮肤：夜晚 · 动画 · 按天气（多云）+ 时间 21:13」. */
++    fun skyWhy(sceneZh: String, mode: String, enabled: Boolean, photoWallpaper: Boolean, weatherCode: Int?, hour: Int, minute: Int): String = when {
++        !enabled -> "天气皮肤关着（外观调节）"
++        photoWallpaper -> "首页用了照片壁纸，天气皮肤在照片下面不显示"
++        else -> "天气皮肤：$sceneZh · " + (if (mode.startsWith("static")) "静态（${mode.removePrefix("static: ")}）" else "动画") +
++            " · " + (if (weatherCode != null) "按天气（代码 $weatherCode）+ 时间" else "没有天气，按时间") + " %02d:%02d".format(hour, minute)
++    }
++
++    const val MIN_WIDTH_DP = 400f
++
++    /** Compose density that keeps ≥ [MIN_WIDTH_DP] dp across the short edge (never larger than the system's). */
++    fun density(systemDensity: Float, shortEdgePx: Int): Float {
++        if (shortEdgePx <= 0 || systemDensity <= 0f) return systemDensity
++        val cap = shortEdgePx / MIN_WIDTH_DP
++        return if (systemDensity > cap) cap else systemDensity
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/HomeGreeting.kt b/src/android/app/src/main/java/com/openminis/app/plus/HomeGreeting.kt
-index 44e47ed..d67a3f5 100644
+index 44e47ed..6380b95 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/HomeGreeting.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/HomeGreeting.kt
 @@ -22,11 +22,16 @@ import java.util.concurrent.TimeUnit
@@ -9511,7 +10055,25 @@ index 44e47ed..d67a3f5 100644
          }
          return Ctx(hour, cal.get(Calendar.MINUTE), dow, month, day, w, bat, charging && o?.has("battery") != true, awayDays)
      }
-@@ -138,7 +148,7 @@ object HomeGreeting {
+@@ -116,7 +126,16 @@ object HomeGreeting {
+     fun weatherNow(c: Context): Weather? {
+         val o = override
+         if (o != null && o.has("weather")) return context(c, 80, false).weather
+-        return cachedWeather(c)
++        // [Mines-38.9.7] the phone lost its weather after 1 h in the app: show the last reading up to 6 h old while refreshing
++        return cachedWeather(c) ?: cachedWeather(c, 6 * 3600_000L)
++    }
++
++    /** [Mines-38.9.7] age of the cached reading (null = none) and why there is none / it is old (自检, home chip). */
++    fun weatherAgeMs(c: Context): Long? = prefs(c).getLong("w_at", 0L).takeIf { it > 0 && prefs(c).contains("w") }?.let { System.currentTimeMillis() - it }
++    fun weatherWhy(c: Context): HomeFixCore.WxWhy {
++        val ok = androidx.core.content.ContextCompat.checkSelfPermission(c, android.Manifest.permission.ACCESS_COARSE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED
++        val age = weatherAgeMs(c)
++        return HomeFixCore.weatherWhy(age != null && age <= 6 * 3600_000L, age, ok, prefs(c).contains("city_name"), prefs(c).getString("w_why", null))
+     }
+ 
+     /** (line-icon name, short words) for an open-meteo WMO code; night swaps the sun for a moon. */
+@@ -138,7 +157,7 @@ object HomeGreeting {
      }
  
      /** The app came to the front (for 「好久不见」). The away gap is read before this. */
@@ -9520,7 +10082,7 @@ index 44e47ed..d67a3f5 100644
  
      private fun slotOf(h: Int) = slots.firstOrNull { h in it.first } ?: slots.last()
  
-@@ -211,63 +221,239 @@ object HomeGreeting {
+@@ -211,63 +230,241 @@ object HomeGreeting {
  
      private val http = OkHttpClient.Builder().connectTimeout(6, TimeUnit.SECONDS).readTimeout(8, TimeUnit.SECONDS).callTimeout(15, TimeUnit.SECONDS).build()
  
@@ -9541,9 +10103,9 @@ index 44e47ed..d67a3f5 100644
 +        Triple(o.optDouble("wind", 1.5), o.optDouble("windDir", 270.0), o.optInt("code", 0))
 +    }.getOrNull()
 +
-+    fun cachedWeather(c: Context): Weather? = runCatching {
++    fun cachedWeather(c: Context, maxAgeMs: Long = 3600_000L): Weather? = runCatching {
 +        val p = prefs(c)
-+        if (System.currentTimeMillis() - p.getLong("w_at", 0L) > 3600_000L) return null   // [Mines-38.8] max 1 h
++        if (System.currentTimeMillis() - p.getLong("w_at", 0L) > maxAgeMs) return null   // [Mines-38.8] max 1 h (display: 6 h)
 +        val o = JSONObject(p.getString("w", null) ?: return null)
          Weather(o.getInt("code"), o.getDouble("temp"), o.getDouble("max"), o.getDouble("min"),
 -            if (o.has("maxY")) o.getDouble("maxY") else null, o.optInt("rain"), o.optString("place"))
@@ -9575,7 +10137,9 @@ index 44e47ed..d67a3f5 100644
 +            "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code,sunrise,sunset" +
 +            "&past_days=1&forecast_days=2&timezone=auto"
          val o = runCatching { http.newCall(Request.Builder().url(url).build()).execute().use { r -> if (r.isSuccessful) JSONObject(r.body?.string().orEmpty()) else null } }.getOrNull()
-             ?: return@withContext
+-            ?: return@withContext
++            ?: run { p.edit().putString("w_why", "fetch").apply(); _tick.value++; return@withContext }
++        p.edit().remove("w_why").apply()
          runCatching {
              val cur = o.getJSONObject("current"); val d = o.getJSONObject("daily")
              val maxA = d.getJSONArray("temperature_2m_max"); val minA = d.getJSONArray("temperature_2m_min")
@@ -9754,6 +10318,7 @@ index 44e47ed..d67a3f5 100644
 +            }
          }
 +        if (!ok && !p.getBoolean("loc_asked", false)) _askLocation.value = true
++        p.edit().putString("w_why", if (ok) "nofix" else "noperm").apply()   // [Mines-38.9.7] 自检 / home chip
          return null
      }
 +
@@ -12671,6 +13236,174 @@ index 928ae75..49404a3 100644
              val out = ArrayList<Any>()
              var guard = 0
              while (guard++ < 5000) {
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MarketGitCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/MarketGitCore.kt
+new file mode 100644
+index 0000000..3f66b0f
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/MarketGitCore.kt
+@@ -0,0 +1,65 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-38.9.7] user 2026-10-18 21:22 (phone): 市场 「安装 rea 没成功 / 没有权限」 — npm ran
++ * `git ls-remote ssh://git@github.com/morluto/rea.git` → 「Permission denied (publickey)」: the phone sandbox has no GitHub
++ * SSH key, so every github: / git+ssh dependency failed. Every sandbox process now gets git config (GIT_CONFIG_COUNT env,
++ * no file needed) that rewrites GitHub SSH urls to HTTPS, and GIT_TERMINAL_PROMPT=0 (never hangs on a password prompt).
++ * The installer retries once with an HTTPS spec when a publickey error still shows up. Pure (unit-tested).
++ */
++object MarketGitCore {
++    /** Environment for every sandbox process (PRootKernel) and minis-dsh. Order matters for GIT_CONFIG_KEY_n. */
++    val GIT_ENV: Map<String, String> = linkedMapOf(
++        "GIT_TERMINAL_PROMPT" to "0",
++        "GIT_CONFIG_COUNT" to "2",
++        "GIT_CONFIG_KEY_0" to "url.https://github.com/.insteadOf", "GIT_CONFIG_VALUE_0" to "ssh://git@github.com/",
++        "GIT_CONFIG_KEY_1" to "url.https://github.com/.insteadOf", "GIT_CONFIG_VALUE_1" to "git@github.com:",
++    )
++
++    private val GH_SHORT = Regex("^github:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(\\.git)?(#.*)?$")
++    private val GH_SSH = Regex("^(?:git\\+)?ssh://git@github\\.com[:/]([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(\\.git)?(#.*)?$")
++    private val GH_SCP = Regex("^git@github\\.com:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(\\.git)?(#.*)?$")
++
++    /** github:o/r, git+ssh://git@github.com/o/r.git, git@github.com:o/r.git → git+https://github.com/o/r.git (#ref kept); others unchanged. */
++    fun httpsSpec(spec: String): String {
++        val s = spec.trim()
++        for (re in listOf(GH_SHORT, GH_SSH, GH_SCP)) re.matchEntire(s)?.let { m ->
++            return "git+https://github.com/${m.groupValues[1]}/${m.groupValues[2]}.git" + m.groupValues[4]
++        }
++        return s
++    }
++
++    fun isPublickey(text: String): Boolean =
++        Regex("Permission denied \\(publickey\\)|Host key verification failed|ssh://git@github\\.com|git@github\\.com: Permission", RegexOption.IGNORE_CASE).containsMatchIn(text)
++
++    /** Plain Chinese reason for a failed install (null = no git/GitHub problem in the output). */
++    fun reason(text: String): String? = when {
++        Regex("RETRIED_HTTPS", RegexOption.IGNORE_CASE).containsMatchIn(text) && isPublickey(text) ->
++            "这个插件要从 GitHub 拉代码，已改用 HTTPS 重试，还是没拉下来（检查网络或代理）"
++        isPublickey(text) -> "这个插件要从 GitHub 拉代码，手机里没有 GitHub 密钥（已改用 HTTPS 重试）"
++        Regex("could not read Username|terminal prompts disabled|Authentication failed for 'https://github", RegexOption.IGNORE_CASE).containsMatchIn(text) ->
++            "GitHub 上这个仓库是私有的或不存在，拉不下来"
++        Regex("Repository not found|remote: Not Found", RegexOption.IGNORE_CASE).containsMatchIn(text) -> "GitHub 上找不到这个仓库"
++        else -> null
++    }
++
++    /** What a SkillHub plugin row says when it is not one-tap verified. */
++    data class Kind(val pill: String?, val line: String, val canTry: Boolean)
++
++    fun classify(name: String, description: String, topics: List<String>, category: String, installability: String): Kind {
++        val t = topics.map { it.lowercase() }
++        val d = description.lowercase()
++        val n = name.lowercase()
++        if (installability == "verified") return Kind(null, "SkillHub 已验证：一键安装（固定版本）", true)
++        // the harness itself / its desktop shell are hosts, not plugins (Mines is the host here)
++        if (n == "deepseek-harness" || n == "dsh" || n == "dsh-desktop") return Kind("宿主", "DSH 本体，不是插件；Mines 自己就是插件宿主", false)
++        val desktop = "electron" in t || "tauri" in t || "desktop" in t || "desktop-app" in t || n.endsWith("-desktop") ||
++            Regex("桌面端|桌面版|desktop (app|client)|electron").containsMatchIn(d)
++        if (desktop) return Kind("电脑版", "电脑桌面程序，手机上跑不了；它的插件可以单独在这里装", false)
++        val prompts = Regex("提示词|案例库|prompt(s)? (library|collection)|awesome[- ]").containsMatchIn(d) || n.startsWith("awesome-")
++        if (prompts && "dsh-plugin" !in t) return Kind("资料库", "是提示词 / 案例合集，不是可运行的插件；打开仓库看", false)
++        val dsh = "dsh-plugin" in t || "dsh" in t || "cordis" in t || n.startsWith("dsh-")
++        return if (dsh) Kind("试装", "SkillHub 还没验证，可以试装（从 GitHub 用 HTTPS 拉代码）", true)
++        else Kind("非 DSH", "不是 DSH 插件（${category.ifBlank { "其他项目" }}），装了也调不起来；打开仓库看", false)
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MemohKey.kt b/src/android/app/src/main/java/com/openminis/app/plus/MemohKey.kt
+new file mode 100644
+index 0000000..2773c9d
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/MemohKey.kt
+@@ -0,0 +1,43 @@
++package com.openminis.app.plus
++
++import com.openminis.app.plus.group.PresetHttp
++import org.json.JSONArray
++import org.json.JSONObject
++
++/** [Mines-38.9.7] Memoh as an OpenAI-compatible endpoint (address + key, encrypted in PlusVault). See [MemohKeyCore]. */
++object MemohKey {
++    private const val V = "memoh_key"
++    fun base(): String? = PlusVault.secretExtra(V, "base")?.takeIf { it.isNotBlank() }
++    fun key(): String? = PlusVault.secretExtra(V, "key")?.takeIf { it.isNotBlank() }
++    fun model(): String? = PlusVault.secretExtra(V, "model")?.takeIf { it.isNotBlank() }
++    fun configured(): Boolean = base() != null && key() != null
++    fun save(base: String, key: String, model: String?) {
++        PlusVault.setSecretExtra(V, "base", base); PlusVault.setSecretExtra(V, "key", key.trim()); PlusVault.setSecretExtra(V, "model", model)
++    }
++    fun clear() { PlusVault.setSecretExtra(V, "base", null); PlusVault.setSecretExtra(V, "key", null); PlusVault.setSecretExtra(V, "model", null) }
++
++    fun suggestion(c: android.content.Context): String? = runCatching {
++        PlusPrefs.init(c); MemohKeyCore.suggestFrom(PlusPrefs.state.value.servers.map { it.host })
++    }.getOrNull()
++
++    data class Check(val ok: Boolean, val line: String, val model: String?)
++
++    /** GET <v1>/models with the key. */
++    suspend fun check(v1: String, key: String?): Check = runCatching {
++        val r = PresetHttp.call("$v1/models", token = key?.trim()?.takeIf { it.isNotBlank() }, method = "GET", readSec = 15)
++        val (ok, line) = MemohKeyCore.verdict(r.code, !key.isNullOrBlank())
++        val m = if (ok) MemohKeyCore.firstModel(r.body) else null
++        Check(ok, if (ok) "$line · ${m ?: "没列出模型"}" else line, m)
++    }.getOrElse { Check(false, it.message ?: "连不上", null) }
++
++    /** One chat turn (OpenAI chat/completions). */
++    suspend fun reply(system: String, user: String, maxTokens: Int = 2000): String {
++        val v1 = base() ?: throw IllegalStateException("Memoh 还没填地址和 key")
++        val m = model() ?: check(v1, key()).model ?: throw IllegalStateException("Memoh 没列出可用的模型")
++        val body = JSONObject().put("model", m).put("max_tokens", maxTokens)
++            .put("messages", JSONArray().put(JSONObject().put("role", "system").put("content", system)).put(JSONObject().put("role", "user").put("content", user)))
++        val r = PresetHttp.call("$v1/chat/completions", token = key(), body = body, readSec = 60)
++        if (!r.ok) throw IllegalStateException(MemohKeyCore.verdict(r.code, true).second)
++        return r.json()?.optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("message")?.optString("content").orEmpty()
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MemohKeyCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/MemohKeyCore.kt
+new file mode 100644
+index 0000000..0b4d211
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/MemohKeyCore.kt
+@@ -0,0 +1,42 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-38.9.7] user 2026-10-18 21:30: Memoh 「去登录」 crashed the app on the phone, and the card said 「自建：memoh.net」.
++ * The user's Memoh is an OpenAI-compatible endpoint on their own server (port 8794, /v1/models answers 401 without a key),
++ * so it is set up with an address + key and checked against /v1/models — no web sign-in. Pure (unit-tested). The address
++ * is never written into the code (public repo): it is suggested from the user's own 工作位置 servers.
++ */
++object MemohKeyCore {
++    const val PORT = 8794
++
++    /** "8.8.8.8:8794", "http://h:8794/", "http://h:8794/v1" → "http://h:8794/v1"; blank → null. */
++    fun v1Base(input: String): String? {
++        var u = input.trim().trimEnd('/')
++        if (u.isEmpty()) return null
++        if (!u.startsWith("http://") && !u.startsWith("https://")) u = "http://$u"
++        val host = runCatching { java.net.URI(u).host }.getOrNull() ?: return null
++        if (host.isBlank()) return null
++        return if (u.endsWith("/v1")) u else "$u/v1"
++    }
++
++    /** Suggested address from a server host the user already has under 工作位置. */
++    fun suggestFrom(serverHosts: List<String>): String? = serverHosts.firstOrNull { it.isNotBlank() }?.let { "http://$it:$PORT" }
++
++    /** What a GET /v1/models answer means, in one plain line. */
++    fun verdict(code: Int, hasKey: Boolean): Pair<Boolean, String> = when (code) {
++        in 200..299 -> true to "通了"
++        401, 403 -> false to (if (hasKey) "key 不对（服务器拒绝了这个 key）" else "服务器在线，要填 key")
++        404 -> false to "这个地址没有 /v1/models（不像 OpenAI 兼容接口）"
++        in 500..599 -> false to "服务器出错（HTTP $code）"
++        else -> false to "没通（HTTP $code）"
++    }
++
++    /** First model id of a /v1/models body (OpenAI shape: {"data":[{"id":…}]}). */
++    fun firstModel(body: String): String? = runCatching {
++        val a = org.json.JSONObject(body).optJSONArray("data") ?: return null
++        (0 until a.length()).mapNotNull { a.optJSONObject(it)?.optString("id")?.takeIf { s -> s.isNotBlank() } }.firstOrNull()
++    }.getOrNull()
++
++    /** 应用代理 subtitle: 「自建：host:port」. */
++    fun where(v1: String?): String? = v1?.let { runCatching { java.net.URI(it) }.getOrNull() }?.let { "自建：" + it.host + (if (it.port > 0) ":${it.port}" else "") }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MinesAutofillService.kt b/src/android/app/src/main/java/com/openminis/app/plus/MinesAutofillService.kt
 new file mode 100644
 index 0000000..9fbf83f
@@ -12846,8 +13579,20 @@ index 0000000..9fbf83f
 +        }
 +    }
 +}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MinesJobs.kt b/src/android/app/src/main/java/com/openminis/app/plus/MinesJobs.kt
+index 1278d0e..ee297cd 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/MinesJobs.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/MinesJobs.kt
+@@ -195,6 +195,7 @@ object MinesJobs {
+         val text = job.lines.joinToString("\n")
+         return when {
+             code == 124 -> "超时了"
++            MarketGitCore.reason(text) != null -> MarketGitCore.reason(text)!!   // [Mines-38.9.7] GitHub ssh → https
+             text.contains("MINES_DEVKIT_FAIL") || text.contains("mines-guard") ->
+                 job.lines.lastOrNull { it.startsWith("✗") }?.take(90) ?: "下载卡住或连不上（已自动换源重试过），运行「网络体检」看原因"
+             Regex("ETIMEDOUT|ECONNRESET|EAI_AGAIN|ENOTFOUND|network|socket hang up", RegexOption.IGNORE_CASE).containsMatchIn(text) ->
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MinesSelfCheck.kt b/src/android/app/src/main/java/com/openminis/app/plus/MinesSelfCheck.kt
-index 495166b..721f2a0 100644
+index 495166b..b6fa711 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/MinesSelfCheck.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/MinesSelfCheck.kt
 @@ -73,13 +73,15 @@ object MinesSelfCheck {
@@ -12870,7 +13615,7 @@ index 495166b..721f2a0 100644
          out += timed("Shizuku") {
              val ok = com.openminis.app.sandbox.offload.FastUi.shizukuReady()
              ok to (if (ok) "已授权" else "未运行或未授权")
-@@ -93,15 +95,108 @@ object MinesSelfCheck {
+@@ -93,15 +95,161 @@ object MinesSelfCheck {
              val (code, text) = MinesJobs.runSync(c, "echo mines-ok; uname -m; df -h / | tail -1", 30_000)
              (code == 0 && text.contains("mines-ok")) to text.replace("\n", " ").take(160)
          }
@@ -12899,6 +13644,59 @@ index 495166b..721f2a0 100644
 +            ok to "沙箱 mail.google.com ${if (gm > 0) "HTTP $gm" else "连不上"} · 登录页 ${if (ac > 0) "HTTP $ac" else "连不上"} · App ${if (app > 0) "HTTP $app" else "连不上"}" +
 +                (if (code != 0 && !ok) "（${text.lines().lastOrNull { it.isNotBlank() && !it.contains("=") }.orEmpty().take(80)}）" else "") +
 +                " · 网页登录${if (WebProxy.applied) "走代理" else "未走代理"}"
++        }
++        // [Mines-38.9.7] 天气皮肤 / 首页天气 / 网页登录 / DSH 工具 — what is active and why (phone 21:15–21:30)
++        out += timed("天气皮肤") {
++            val cal = java.util.Calendar.getInstance()
++            com.openminis.app.plus.PlusPrefs.init(context)
++            val st = com.openminis.app.plus.PlusPrefs.state.value
++            val on = com.openminis.app.ui.plus.WeatherSky.enabled(context)
++            val photo = st.wallpaper.isNotEmpty() && st.wallpaperOnHome
++            val code = runCatching { HomeGreeting.weatherNow(context)?.code }.getOrNull()
++            val sc = runCatching { com.openminis.app.ui.plus.WeatherSky.scene(context) }.getOrDefault(com.openminis.app.ui.plus.WeatherSky.lastScene)
++            (on && !photo) to HomeFixCore.skyWhy(sc.zh, com.openminis.app.ui.plus.WeatherSky.lastMode.ifBlank { "shader" }, on, photo, code,
++                cal.get(java.util.Calendar.HOUR_OF_DAY), cal.get(java.util.Calendar.MINUTE))
++        }
++        out += timed("首页天气") {
++            val why = HomeGreeting.weatherWhy(context)
++            (why == HomeFixCore.WxWhy.OK || why == HomeFixCore.WxWhy.STALE) to (why.line + (if (why == HomeFixCore.WxWhy.OK || why == HomeFixCore.WxWhy.STALE) "" else " → 首页显示「${HomeFixCore.weatherChip(why)}」"))
++        }
++        out += timed("网页登录诊断") { true to WebLoginDiag.lines() }
++        out += timed("字号与缩放") {
++            val sys = com.openminis.app.ui.theme.MinesDensity.system; val ap = com.openminis.app.ui.theme.MinesDensity.applied
++            val fs = context.resources.configuration.fontScale
++            true to "系统 ${"%.2f".format(sys)}x → 用 ${"%.2f".format(ap)}x（屏宽至少 ${HomeFixCore.MIN_WIDTH_DP.toInt()} dp）· 系统字体 ${"%.2f".format(fs)} → 用 ${"%.2f".format(minOf(fs, 1f))}"
++        }
++        out += timed("DSH 插件调用") {
++            val f = java.io.File(DshWidgets.home(context), "status.json")
++            if (!f.exists()) true to "还没装 DSH 插件（装了以后工具经 MCP「dsh」给对话调用）"
++            else {
++                val o = org.json.JSONObject(f.readText())
++                val names = o.keys().asSequence().toList()
++                val tools = names.sumOf { o.optJSONObject(it)?.optJSONArray("tools")?.length() ?: 0 }
++                val okN = names.count { o.optJSONObject(it)?.optBoolean("ok") == true }
++                (okN == names.size) to "$okN/${names.size} 个插件加载成功 · $tools 个工具可被对话调用（MCP: dsh）"
++            }
++        }
++        // [Mines-38.9.7] 浏览器接管 / 无痕标签 / 高级工程模式
++        out += timed("浏览器接管") {
++            val shared = runCatching { (context.applicationContext as com.openminis.app.MinisApp).sharedBrowserTabPool }.getOrNull()
++            val sel = shared?.selectedTabId?.value
++            val lite = shared?.tabs?.value.orEmpty().map { com.openminis.app.browser.BrowserHandoffCore.TabLite(it.id, it.inUse, true) }
++            val pick = com.openminis.app.browser.BrowserHandoffCore.pickAgentTab(sel, lite)
++            val last = com.openminis.app.browser.BrowserHandoff.last
++            val age = last?.let { (System.currentTimeMillis() - it.at) / 60_000 }
++            val lastLine = if (last == null) "还没记下你打开的网页"
++                else "记下了 ${last.origin}（${age} 分钟前${if (last.sessionJson != null) "，含会话存储" else ""}${if (last.desktop) "，电脑版" else ""}）"
++            val pickLine = if (lite.isEmpty()) "首页浏览器还没开标签" else if (pick == sel) "AI 接手会用你正在看的标签 $sel" else "AI 接手用标签 $pick（你看的 $sel 正忙）"
++            true to "首页浏览器 = 共享标签池 · $pickLine · $lastLine · 已接手 ${com.openminis.app.browser.BrowserHandoff.adopted} 次"
++        }
++        out += timed("无痕标签") {
++            com.openminis.app.browser.IncognitoCore.selfCheck(com.openminis.app.browser.Incognito.supported(), com.openminis.app.browser.Incognito.lastClose)
++        }
++        out += timed("高级工程模式") {
++            val on = com.openminis.app.tools.AgentToolSwitch.ENGINEER.isEnabled(context)
++            true to (if (on) "已开（计划 → 先读再改 → 验证 → 不盲目重试），${com.openminis.app.agent.EngineerMode.PROMPT.length} 字规则加在系统提示末尾" else "已关（设置 › Agent 工具 › 高级工程模式）")
 +        }
 +        // [Mines-38.9.6 i17] tool-call arguments wrapped as {"arguments":{…}} / JSON strings are unwrapped before dispatch
 +        out += timed("工具参数解包") {
@@ -14356,10 +15154,10 @@ index 0000000..b60d58e
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SkillHubCn.kt b/src/android/app/src/main/java/com/openminis/app/plus/SkillHubCn.kt
 new file mode 100644
-index 0000000..1ff8021
+index 0000000..d0ee809
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/SkillHubCn.kt
-@@ -0,0 +1,297 @@
+@@ -0,0 +1,304 @@
 +package com.openminis.app.plus
 +
 +import android.content.Context
@@ -14405,7 +15203,10 @@ index 0000000..1ff8021
 +    data class Plugin(
 +        val owner: String, val name: String, val fullName: String, val description: String, val stars: Int,
 +        val category: String, val verified: Boolean, val repo: String, val avatar: String,
++        /** [Mines-38.9.7] GitHub topics + SkillHub installability (verified / unsupported …) for the row's reason line */
++        val topics: List<String> = emptyList(), val installability: String = "",
 +    ) {
++        val kind: MarketGitCore.Kind get() = MarketGitCore.classify(name, description, topics, category, if (verified) "verified" else installability)
 +        val categoryLabel: String get() = PLUGIN_CATEGORIES[category] ?: ""
 +    }
 +
@@ -14419,7 +15220,7 @@ index 0000000..1ff8021
 +        val categoryLabel: String get() = SKILL_CATEGORIES[category] ?: category
 +    }
 +
-+    data class Page<T>(val items: List<T>, val total: Int, val fromCache: Boolean = false)
++    data class Page<T>(val items: List<T>, val total: Int, val fromCache: Boolean = false, /** [38.9.7] rows dropped as not runnable on the phone */ val hidden: Int = 0)
 +
 +    // ── parsing (pure, unit-tested with fixtures saved from the live API) ──
 +
@@ -14442,9 +15243,13 @@ index 0000000..1ff8021
 +            val repo = r.optString("repositoryUrl").takeIf { it.startsWith("https://github.com/", true) }.orEmpty()
 +            out += Plugin(owner, name, r.optString("fullName", "$owner/$name").take(200), r.optString("description").take(500).trim(),
 +                r.optInt("stars"), r.optString("categoryKey").takeIf { it in PLUGIN_CATEGORIES }.orEmpty(),
-+                r.optString("installability") == "verified", repo, safeHttps(r.optString("avatarUrl")))
++                r.optString("installability") == "verified", repo, safeHttps(r.optString("avatarUrl")),
++                r.optJSONArray("topics")?.let { t -> (0 until t.length()).map { t.optString(it) }.filter { it.isNotBlank() }.take(30) } ?: emptyList(),
++                r.optString("installability"))
 +        }
-+        return Page(out, o.optInt("total", out.size))
++        // [Mines-38.9.7] user 21:27 「做面板那种跑不了的，你不要放进来呀」: only what installs and runs in the phone sandbox
++        val runnable = out.filter { it.kind.canTry }
++        return Page(runnable, o.optInt("total", out.size), hidden = out.size - runnable.size)
 +    }
 +
 +    fun parseSkills(body: String): Page<Skill> {
@@ -16441,6 +17246,37 @@ index 0000000..3fd3291
 +        blocked++
 +        return WebResourceResponse("text/plain", "utf-8", 204, "No Content", emptyMap(), java.io.ByteArrayInputStream(ByteArray(0)))
 +    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/WebLoginDiag.kt b/src/android/app/src/main/java/com/openminis/app/plus/WebLoginDiag.kt
+new file mode 100644
+index 0000000..e576b7e
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/WebLoginDiag.kt
+@@ -0,0 +1,25 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-38.9.7] user 2026-10-18 21:30 (phone): 应用代理 › Manus 「去登录」 → pure white screen. Every sign-in WebView now
++ * records its main-frame errors, HTTP errors and console errors here (last 20, no values typed on the page), and the
++ * screen shows 「页面没打开」 + 重新加载 / 用浏览器打开 when nothing visible loaded after [BLANK_AFTER_MS]. 自检 lists them.
++ */
++object WebLoginDiag {
++    const val BLANK_AFTER_MS = 12_000L
++    data class Entry(val at: Long, val where: String, val what: String)
++    private val ring = ArrayDeque<Entry>()
++
++    fun note(where: String, what: String) = synchronized(ring) {
++        ring.addLast(Entry(System.currentTimeMillis(), where.take(40), what.replace(Regex("[\\r\\n]+"), " ").take(200)))
++        while (ring.size > 20) ring.removeFirst()
++    }
++
++    fun recent(): List<Entry> = synchronized(ring) { ring.toList().asReversed() }
++
++    /** One line per entry for 自检 / smoke. */
++    fun lines(max: Int = 5): String = recent().take(max).joinToString("；") { "${it.where}: ${it.what}" }.ifBlank { "没有记录到错误" }
++
++    /** Plain reason for the 「页面没打开」 card from the last main-frame error of [where] (null = just blank). */
++    fun reasonFor(where: String): String? = recent().firstOrNull { it.where == where && it.what.startsWith("main:") }?.what?.removePrefix("main:")?.trim()
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/WebProxy.kt b/src/android/app/src/main/java/com/openminis/app/plus/WebProxy.kt
 new file mode 100644
@@ -19021,10 +19857,19 @@ index 0000000..3d850da
 +    fun shouldRetry(code: Int, errorBody: String, body: JSONObject): Boolean = body.has("thinking") && isUnsupported(code, errorBody)
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/PRootKernel.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/PRootKernel.kt
-index e86c029..9fbd96f 100644
+index e86c029..eed13e4 100644
 --- a/src/android/app/src/main/java/com/openminis/app/sandbox/PRootKernel.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/sandbox/PRootKernel.kt
-@@ -621,6 +621,7 @@ object PRootKernel {
+@@ -194,6 +194,8 @@ object PRootKernel {
+         // sources. Reported as openminis/openminis#7.
+         // Mirrored in default_mount/etc/profile.d/minis.sh for login shells.
+         customEnvironment.putIfAbsent("UV_LINK_MODE", "symlink")
++        // [Mines-38.9.7] no GitHub SSH key in the sandbox: GitHub ssh urls → https for every git (npm / pip / agent), never prompt
++        com.openminis.app.plus.MarketGitCore.GIT_ENV.forEach { (k, v) -> customEnvironment.putIfAbsent(k, v) }
+ 
+         // Inject device timezone so Alpine userspace sees local time.
+         // Mirrors iOS ISHShellExecutor.m:335-353 — uses POSIX TZ format with a
+@@ -621,6 +623,7 @@ object PRootKernel {
      private val PROXY_KEYS = listOf(
          "http_proxy", "https_proxy",
          "HTTP_PROXY", "HTTPS_PROXY",
@@ -19796,10 +20641,10 @@ index 057f0f4..b116e94 100644
                  .setMessage(getString(com.openminis.app.R.string.share_provider_json_message))
                  .setPositiveButton(getString(com.openminis.app.R.string.share_provider_json_import)) { _, _ ->
 diff --git a/src/android/app/src/main/java/com/openminis/app/tools/AgentToolSwitch.kt b/src/android/app/src/main/java/com/openminis/app/tools/AgentToolSwitch.kt
-index 99c01d3..23430c9 100644
+index 99c01d3..2500906 100644
 --- a/src/android/app/src/main/java/com/openminis/app/tools/AgentToolSwitch.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/tools/AgentToolSwitch.kt
-@@ -24,6 +24,10 @@ enum class AgentToolSwitch(val key: String, val defaultValue: Boolean) {
+@@ -24,6 +24,13 @@ enum class AgentToolSwitch(val key: String, val defaultValue: Boolean) {
       *  (see [migrateLegacyIfNeeded]); flipping the default would silently
       *  disable a feature existing users have. */
      AGENTS("agent.tools.agents.enabled", true),
@@ -19807,6 +20652,9 @@ index 99c01d3..23430c9 100644
 +    /** [Mines-38.9.6 i17] 技能优先: read a matching SKILL.md before a multi-step task, save a new skill after a new one.
 +     *  Prompt-only (no tool is governed by it). */
 +    SKILL_FIRST("mines.agent.skillfirst.enabled", true),
++
++    /** [Mines-38.9.7] 高级工程模式: plan → read → minimal change → verify; no blind retries. Prompt-only. */
++    ENGINEER("mines.agent.engineer.enabled", true),
      ;
  
      fun isEnabled(context: Context): Boolean =
@@ -19949,7 +20797,7 @@ index 5e4771c..1598122 100644
  import androidx.compose.material3.RadioButton
  import androidx.compose.material3.Surface
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserSheet.kt b/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserSheet.kt
-index 3c1504e..06e8fae 100644
+index 3c1504e..2e638fc 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserSheet.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/browser/BrowserSheet.kt
 @@ -1,5 +1,7 @@
@@ -19960,7 +20808,7 @@ index 3c1504e..06e8fae 100644
  import com.openminis.app.R
  import androidx.compose.ui.res.stringResource
  import androidx.compose.animation.AnimatedVisibility
-@@ -147,12 +149,12 @@ fun BrowserSheet(
+@@ -147,18 +149,33 @@ fun BrowserSheet(
              }
          }
      }
@@ -19975,7 +20823,37 @@ index 3c1504e..06e8fae 100644
                  }
              }
          } },
-@@ -249,7 +251,7 @@ fun BrowserSheet(
+         confirmButton = { androidx.compose.material3.TextButton(onClick = { cardPick = false }) { androidx.compose.material3.Text("取消") } })
+     val hinted = remember { mutableSetOf<String>() }
+     val downloadEntries by tabPool.downloads.collectAsState()
++    // [Mines-38.9.7] remember the page the user is on (and its sessionStorage) so an agent taking over keeps the login.
++    // 无痕 pools are never recorded (BrowserHandoff.noteUser ignores them).
++    androidx.compose.runtime.LaunchedEffect(selectedTabId, currentURL, isLoading) {
++        val wv = curTabState.value?.manager?.webView ?: return@LaunchedEffect
++        if (!isLoading && currentURL.startsWith("http"))
++            com.openminis.app.browser.BrowserHandoff.noteUser(tabPool, wv, currentURL, userAgentProfile == UserAgentProfile.DESKTOP_CHROME, tabPool.incognito)
++    }
++    androidx.compose.runtime.DisposableEffect(Unit) {
++        onDispose {
++            val t = curTabState.value
++            val u = t?.manager?.currentURL?.value.orEmpty()
++            if (t != null && u.startsWith("http"))
++                runCatching { com.openminis.app.browser.BrowserHandoff.noteUser(tabPool, t.manager.webView, u, tabPool.currentUserAgentProfile.value == UserAgentProfile.DESKTOP_CHROME, tabPool.incognito) }
++        }
++    }
+ 
+     val accent = MaterialTheme.colorScheme.primary
+     val secondaryBg = MaterialTheme.colorScheme.surfaceContainer
+@@ -183,7 +200,7 @@ fun BrowserSheet(
+     }
+ 
+     StandardChatSheet(
+-        title = pageTitle.ifEmpty { stringResource(R.string.browser_title) },
++        title = com.openminis.app.browser.IncognitoCore.title(pageTitle.ifEmpty { stringResource(R.string.browser_title) }, tabPool.incognito),
+         onDismiss = onDismiss,
+         sheetMaxWidth = androidx.compose.ui.unit.Dp.Unspecified,  // [Mines-webfit-38.3] full width in landscape
+         singleLineTitle = true,  // [Mines-webpaint-38.4] long titles: one line + …, close X always visible
+@@ -249,7 +266,7 @@ fun BrowserSheet(
                      item {
                          Text(
                              "${tabs.size}/3",
@@ -19984,7 +20862,7 @@ index 3c1504e..06e8fae 100644
                              fontWeight = FontWeight.Medium,
                              fontFamily = FontFamily.Monospace,
                              color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
-@@ -298,7 +300,7 @@ fun BrowserSheet(
+@@ -298,7 +315,7 @@ fun BrowserSheet(
                              singleLine = true,
                              enabled = !isAgentBusy,
                              textStyle = LocalTextStyle.current.copy(
@@ -19993,7 +20871,7 @@ index 3c1504e..06e8fae 100644
                                  fontFamily = FontFamily.Monospace,
                                  color = MaterialTheme.colorScheme.onSurface,
                              ),
-@@ -319,7 +321,7 @@ fun BrowserSheet(
+@@ -319,7 +336,7 @@ fun BrowserSheet(
                          if (urlInput.isEmpty()) {
                              Text(
                                  stringResource(R.string.browser_search_placeholder),
@@ -20002,7 +20880,7 @@ index 3c1504e..06e8fae 100644
                                  fontFamily = FontFamily.Monospace,
                                  color = MaterialTheme.colorScheme.onSurfaceVariant,
                              )
-@@ -349,6 +351,34 @@ fun BrowserSheet(
+@@ -349,6 +366,34 @@ fun BrowserSheet(
                  )
              }
  
@@ -20037,7 +20915,7 @@ index 3c1504e..06e8fae 100644
              // ── WebView + overlays ──
              Box(
                  modifier = Modifier
-@@ -619,7 +649,7 @@ private fun TabChip(
+@@ -619,7 +664,7 @@ private fun TabChip(
      ) {
          Text(
              text = title,
@@ -20046,7 +20924,7 @@ index 3c1504e..06e8fae 100644
              fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
              color = textColor,
              maxLines = 1,
-@@ -728,7 +758,7 @@ private fun AgentBrowsingOverlay(accent: Color, onTakeover: () -> Unit) {
+@@ -728,7 +773,7 @@ private fun AgentBrowsingOverlay(accent: Color, onTakeover: () -> Unit) {
              Text(
                  stringResource(R.string.browser_minis_browsing),
                  color = Color.White.copy(alpha = 0.9f),
@@ -20055,7 +20933,7 @@ index 3c1504e..06e8fae 100644
                  fontWeight = FontWeight.Medium,
              )
              Spacer(Modifier.width(12.dp))
-@@ -742,7 +772,7 @@ private fun AgentBrowsingOverlay(accent: Color, onTakeover: () -> Unit) {
+@@ -742,7 +787,7 @@ private fun AgentBrowsingOverlay(accent: Color, onTakeover: () -> Unit) {
              Text(
                  stringResource(R.string.browser_takeover),
                  color = accent,
@@ -20921,7 +21799,7 @@ index d99b975..93fc38a 100644
                  )
              }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
-index e0d0cae..6799385 100644
+index e0d0cae..dbe4dd9 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
 @@ -89,6 +89,7 @@ import kotlinx.coroutines.flow.combine
@@ -21229,7 +22107,7 @@ index e0d0cae..6799385 100644
  - minis-open <url-or-path>: Opens a resource inside Minis without leaving the chat. Accepts http/https URLs (→ built-in WebKit preview) and chat-resource file paths under /var/minis/** (→ built-in file preview, routed by extension: images to the image viewer, .md to markdown preview, .html to HTML preview, .pdf/office docs to QuickLook, audio/video to the media player, else share sheet). Examples: minis-open https://example.com, minis-open /var/minis/workspace/report.md, minis-open /var/minis/attachments/chart.png. Prefer this over android-open for anything that can be previewed in-app so the user doesn't lose conversation context. Run android-open via shell_execute for non-web schemes (tel:, mailto:, geo:, intent:, etc.) or when the user explicitly wants the system handler.
  - minis-sessions-cli: Read chat history. `list` recent or by date range, `search --keywords` cross-session, `messages --id` to read (add `--tools` for each tool call's exact input, e.g. the shell command, and its output). Run --help for full options.
  - minis-model-use: Invoke other LLM models pre-configured by the user. Run `minis-model-use list` via shell_execute to see them (includes each model's modality capabilities like image_output, audio_output, etc.), `minis-model-use search <query>` to filter by name/provider. `minis-model-use run --model <id_or_name>` sends an OpenAI-compatible messages request; pass input via --input <json_file> or stdin, output goes to stdout or --output <path>. The OpenAI shape is the PRIMARY input for every model and modality; standard params are auto-converted to the underlying provider, so do not hand-write provider-native bodies as the primary input. For provider-specific extras the standard schema doesn't model (web-search plugins, image-to-image fields, TTS/video or other custom endpoints), escape hatches exist for OpenAI-compatible providers (they error or are ignored on Anthropic/Gemini models): `extra_body` (object merged verbatim into the request body), a custom `endpoint` path, and a top-level `passthrough` envelope for fully verbatim requests with RAW (unparsed) responses. Results may carry `warnings` (fields that were ignored/downgraded and why) and `applied_extras` (which extras actually took effect) — read them to self-correct. Run --help for the full contract before using these. Models may support multimodal output (image generation, TTS/audio, video) — check the modalities field in list output. For image_output models, pass generation params in the input JSON: top-level `n`/`size`/`quality`/`prompt` (OpenAI /images/generations style) or `generation_config.{aspect_ratio,image_size,number_of_images,person_generation}` (Gemini). Run with --help for full usage.${modelUseDelegateNote}
-@@ -15491,6 +15634,11 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15491,6 +15634,16 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                  append("\n\n")
                  append(skillFragment)
              }
@@ -21238,10 +22116,15 @@ index e0d0cae..6799385 100644
 +                append("\n\n")
 +                append(com.openminis.app.agent.SkillFirst.PROMPT)
 +            }
++            // [Mines-38.9.7] 高级工程模式 (Settings › Agent Tools, default on); fixed text
++            if (!isHelper && com.openminis.app.tools.AgentToolSwitch.ENGINEER.isEnabled(context)) {
++                append("\n\n")
++                append(com.openminis.app.agent.EngineerMode.PROMPT)
++            }
              if (mcpFragment != null) {
                  append("\n\n")
                  append(mcpFragment)
-@@ -15503,6 +15651,18 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15503,6 +15656,18 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                  append("\n\n")
                  append(dailyMemoryFragment)
              }
@@ -21260,7 +22143,7 @@ index e0d0cae..6799385 100644
              // Runtime context goes last so the prefix above stays byte-stable
              // across requests within the same day. Keep ordering deterministic
              // (date → tz → lang → model count) — any reorder defeats the cache.
-@@ -15854,11 +16014,59 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15854,11 +16019,59 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
              }
          }
  
@@ -21321,7 +22204,7 @@ index e0d0cae..6799385 100644
              append("<user-attached-files>\n")
              for (m in metas) {
                  val urlPath = m.linuxPath.removePrefix("/var/minis/")
-@@ -15874,6 +16082,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15874,6 +16087,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
              }
              append("</user-attached-files>")
          }
@@ -21329,7 +22212,7 @@ index e0d0cae..6799385 100644
  
          // Order matches UserAttachmentList convention: images first, then files.
          return PreparedAttachments(
-@@ -17072,6 +17281,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -17072,6 +17286,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
      }
  
      override fun onCleared() {
@@ -21338,7 +22221,7 @@ index e0d0cae..6799385 100644
          // [T-sub-agents-queue] Nothing can re-enter a queued delegation once
          // this view model is gone; leaving the starter installed would let the
          // registry call into a cleared VM.
-@@ -17602,6 +17813,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -17602,6 +17818,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                              continue
                          }
                          if (!mime.startsWith("image/")) continue
@@ -21347,7 +22230,7 @@ index e0d0cae..6799385 100644
                          val file = java.io.File(mediaStore.mediaBaseDir, rel)
                          if (!file.exists()) continue
                          val original = try { file.readBytes() } catch (_: Exception) { continue }
-@@ -17756,3 +17969,28 @@ internal fun warmUpBudget(window: Int?, compactThreshold: Int?, ratio: Double, f
+@@ -17756,3 +17974,28 @@ internal fun warmUpBudget(window: Int?, compactThreshold: Int?, ratio: Double, f
      val line = if (threshold > 0) threshold else w
      return (line / ratio).toInt() - fixedTokens
  }
@@ -22232,7 +23115,7 @@ index 0000000..bac8e80
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/group/GroupScreens.kt b/src/android/app/src/main/java/com/openminis/app/ui/group/GroupScreens.kt
-index 9e32ad4..78bfae2 100644
+index 9e32ad4..7c0196c 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/group/GroupScreens.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/group/GroupScreens.kt
 @@ -27,7 +27,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
@@ -22350,7 +23233,60 @@ index 9e32ad4..78bfae2 100644
                  .semantics { contentDescription = note })
              // [Mines-38.7 v11d] smoke 38758822905: the sign-in screen still caught blank. The page is shown at its first frame or
              // 1.2 s at the latest, and a spinner sits on the backdrop until then: never an empty area.
-@@ -639,11 +651,8 @@ fun WebAppLoginScreen(id: String, onBack: () -> Unit) {
+@@ -607,6 +619,12 @@ fun WebAppLoginScreen(id: String, onBack: () -> Unit) {
+                     w.webViewClient = object : android.webkit.WebViewClient() {
+                         override fun onPageCommitVisible(view: android.webkit.WebView, u: String) { view.visibility = android.view.View.VISIBLE; shown = true }
+                         override fun onPageFinished(view: android.webkit.WebView, u: String) { view.visibility = android.view.View.VISIBLE; shown = true; com.openminis.app.plus.LoginWeb.flush() }
++                        override fun onReceivedError(view: android.webkit.WebView, req: android.webkit.WebResourceRequest, err: android.webkit.WebResourceError) {
++                            if (req.isForMainFrame) com.openminis.app.plus.WebLoginDiag.note(id, "main: ${err.errorCode} ${err.description}")
++                        }
++                        override fun onReceivedHttpError(view: android.webkit.WebView, req: android.webkit.WebResourceRequest, r: android.webkit.WebResourceResponse) {
++                            if (req.isForMainFrame) com.openminis.app.plus.WebLoginDiag.note(id, "main: HTTP ${r.statusCode} ${r.reasonPhrase.orEmpty()}")
++                        }
+                         // [Mines-38.7] a crashed page never takes the app down: drop it and open a fresh one
+                         override fun onRenderProcessGone(view: android.webkit.WebView, detail: android.webkit.RenderProcessGoneDetail?): Boolean {
+                             com.openminis.app.ui.webview.WebViewRenderProcess.handle("webapp-login", detail)
+@@ -626,10 +644,39 @@ fun WebAppLoginScreen(id: String, onBack: () -> Unit) {
+                             return !u.startsWith("http")
+                         }
+                     }
++                    // [Mines-38.9.7] white-screen diagnosis: main-frame / HTTP / console errors → WebLoginDiag (自检)
++                    w.webChromeClient = object : android.webkit.WebChromeClient() {
++                        override fun onConsoleMessage(cm: android.webkit.ConsoleMessage): Boolean {
++                            if (cm.messageLevel() == android.webkit.ConsoleMessage.MessageLevel.ERROR) com.openminis.app.plus.WebLoginDiag.note(id, "console: " + cm.message())
++                            return false
++                        }
++                    }
+                     w.loadUrl(url); web = w
+                 }
+             }, modifier = Modifier.fillMaxSize()) }
+                 if (!shown) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator(Modifier.size(28.dp), strokeWidth = 2.dp, color = m.primary) }
++                // [Mines-38.9.7] nothing visible after 12 s (or the main frame failed) → say so, never a bare white page
++                var blank by remember(reloadKey) { mutableStateOf<String?>(null) }
++                LaunchedEffect(reloadKey, web) {
++                    val w = web ?: return@LaunchedEffect
++                    kotlinx.coroutines.delay(com.openminis.app.plus.WebLoginDiag.BLANK_AFTER_MS)
++                    w.evaluateJavascript(com.openminis.app.plus.LoginWeb.BLANK_JS) { r ->
++                        val isBlank = (r ?: "").contains("blank")
++                        val why = com.openminis.app.plus.WebLoginDiag.reasonFor(id)
++                        if (isBlank || why != null) { blank = why ?: "页面一直是空白（网站没响应，或被网络拦了）"; com.openminis.app.plus.WebLoginDiag.note(id, "blank after 12s: " + (why ?: "no content")) }
++                    }
++                }
++                blank?.let { why ->
++                    Column(Modifier.align(Alignment.Center).padding(24.dp).clip(RoundedCornerShape(20.dp)).background(com.openminis.app.ui.plus.glassVeil())
++                        .border(1.dp, m.glassBorder, RoundedCornerShape(20.dp)).padding(18.dp)) {
++                        Text("页面没打开", fontSize = MT.Body, fontWeight = FontWeight.SemiBold, color = m.ink)
++                        Text(why, fontSize = MT.Sub, lineHeight = MT.SubLH, color = m.ink2, modifier = Modifier.padding(top = 4.dp, bottom = 10.dp))
++                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                            ActionPill("重新加载") { blank = null; web = null; shown = false; reloadKey++ }
++                            ActionPill("用浏览器打开") { runCatching { com.openminis.app.browser.GoogleAuthRouter.openInCustomTab(ctx, url) } }
++                        }
++                    }
++                }
+             }
+             else Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) { CircularProgressIndicator(Modifier.size(28.dp), strokeWidth = 2.dp, color = m.primary) }
+         }
+@@ -639,11 +686,8 @@ fun WebAppLoginScreen(id: String, onBack: () -> Unit) {
  /** Uniform trailing action in the partner lists: 96 dp min, 40 dp tall terracotta pill, never wraps. */
  @Composable
  private fun ActionPill(text: String, onClick: () -> Unit) {
@@ -22364,7 +23300,7 @@ index 9e32ad4..78bfae2 100644
  }
  
  /**
-@@ -666,7 +675,7 @@ private fun PartnerEditDialog(p: Partner, onDismiss: () -> Unit, onSaved: () ->
+@@ -666,7 +710,7 @@ private fun PartnerEditDialog(p: Partner, onDismiss: () -> Unit, onSaved: () ->
          }
      }
      val explain = when {
@@ -22373,7 +23309,7 @@ index 9e32ad4..78bfae2 100644
          p.spec.id == "workbuddy" -> "打开手机上的 WorkBuddy，回到这里会自动接上。"
          else -> null
      }
-@@ -793,7 +802,7 @@ fun GroupChatScreen(gid: String, onBack: () -> Unit, onPartners: () -> Unit) {
+@@ -793,7 +837,7 @@ fun GroupChatScreen(gid: String, onBack: () -> Unit, onPartners: () -> Unit) {
                      MinesIcon(icon("arrow-left"), null, tint = m.ink)
                  }
                  Column(Modifier.weight(1f)) {
@@ -22382,7 +23318,7 @@ index 9e32ad4..78bfae2 100644
                      val tok = GroupRunner.tokens(msgs)
                      Text((if (direct) (members.firstOrNull()?.let { statusLine(it) } ?: "单聊") else "${members.size + if (g.host) 1 else 0} 位成员") +
                          (if (tok > 0) " · ${fmtTok(tok)} tokens" else "") + if (busy) " · 正在回复" else "",
-@@ -893,7 +902,7 @@ private fun MemberChip(p: Partner?, who: String, name: String, badge: String?, o
+@@ -893,7 +937,7 @@ private fun MemberChip(p: Partner?, who: String, name: String, badge: String?, o
          .semantics { contentDescription = "@$name" }, verticalAlignment = Alignment.CenterVertically) {
          PartnerAvatar(p, who, name, 30.dp)
          Spacer(Modifier.width(6.dp))
@@ -22391,7 +23327,7 @@ index 9e32ad4..78bfae2 100644
          if (badge != null) {
              Spacer(Modifier.width(4.dp))
              Text(badge, fontSize = MT.Meta, color = if (badge == "不可用" || badge == "余额低") MinesDesign.Warning else m.ink3, maxLines = 1)
-@@ -933,7 +942,7 @@ private fun Bubble(msg: GroupMsg, p: Partner?, onRetry: () -> Unit, onFix: () ->
+@@ -933,7 +977,7 @@ private fun Bubble(msg: GroupMsg, p: Partner?, onRetry: () -> Unit, onFix: () ->
          Column(if (wide) Modifier.weight(1f) else Modifier.weight(1f, fill = false).widthIn(max = 320.dp)) {
              // name (14 sp SemiBold ink) + model (12 sp ink3, one line) — same hierarchy as the member chips
              Row(verticalAlignment = Alignment.CenterVertically) {
@@ -22400,7 +23336,7 @@ index 9e32ad4..78bfae2 100644
                  if (msg.model.isNotBlank()) {
                      Spacer(Modifier.width(6.dp))
                      Text(msg.model, fontSize = MT.Meta, color = m.ink3, maxLines = 1, overflow = TextOverflow.Ellipsis, softWrap = false)
-@@ -970,7 +979,7 @@ private fun Bubble(msg: GroupMsg, p: Partner?, onRetry: () -> Unit, onFix: () ->
+@@ -970,7 +1014,7 @@ private fun Bubble(msg: GroupMsg, p: Partner?, onRetry: () -> Unit, onFix: () ->
                              if (msg.detail.isNotBlank()) SmallLink(if (open) "收起" else "详情") { open = !open }
                          }
                          if (open) {
@@ -23176,10 +24112,10 @@ index 0000000..03c056f
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/AppAgentsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/AppAgentsScreen.kt
 new file mode 100644
-index 0000000..9133bed
+index 0000000..ab9014e
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/AppAgentsScreen.kt
-@@ -0,0 +1,252 @@
+@@ -0,0 +1,289 @@
 +package com.openminis.app.ui.plus
 +
 +import androidx.compose.animation.core.animateDpAsState
@@ -23273,6 +24209,7 @@ index 0000000..9133bed
 +    var catalog by remember { mutableStateOf(false) }
 +    var custom by remember { mutableStateOf(false) }
 +    val mine = remember(rev, partners) { AppAgents.mine() }
++    MemohKeyDialog(onSaved = { rev++ })
 +    PlusPage("应用代理", onBack, actions = {
 +        androidx.compose.material3.IconButton(onClick = { catalog = true }) { MinesIcon(MinesIcons.named("plus")!!, "添加 AI 服务", tint = m.ink) }
 +    }) {
@@ -23337,9 +24274,11 @@ index 0000000..9133bed
 +                        if (login == AppAgents.Login.OK) ActionPill2(if (t?.running == true) "测试中…" else "测试一下", primary = true, enabled = t?.running != true) {
 +                            tests[d.id] = AppAgents.Test(true)
 +                            scope.launch { tests[d.id] = AppAgents.test(ctx, d) }
-+                        } else ActionPill2("去登录", primary = false) { openLogin(d, go) }
++                        } else ActionPill2(if (d.id == "memoh") "填 key" else "去登录", primary = false) { openLogin(d, go) }
 +                    }
 +                    if (t != null) TestCard(t, onClose = { tests.remove(d.id) }, onLogin = { openLogin(d, go) })
++                    if (d.id == "memoh" && login == AppAgents.Login.OK) Text("改地址 / key", fontSize = MT.Caption, color = m.ink3,
++                        modifier = Modifier.padding(start = 16.dp).clickable { MemohKeyUi.open = true }.padding(vertical = 4.dp))
 +                    Text("移除", fontSize = MT.Caption, color = m.ink3, modifier = Modifier.align(Alignment.End).clickable { AppAgents.remove(d.id); rev++ }
 +                        .padding(horizontal = 16.dp, vertical = 6.dp).semantics { contentDescription = "从我的服务里移除 ${d.name}" })
 +                }
@@ -23408,7 +24347,7 @@ index 0000000..9133bed
 +    when {
 +        d.id.startsWith("web:") -> go(com.openminis.app.ui.group.GroupRoutes.webLogin(d.id))
 +        d.id == "coze" -> { PlusNav.openKind = "coze"; PlusNav.autoClaim = true; go(PlusRoutes.CONNECTIONS) }
-+        d.id == "memoh" -> { com.openminis.app.plus.group.PresetAuth.memohAllowAsk(); go(com.openminis.app.ui.group.SiteLogin.route("memoh")) }
++        d.id == "memoh" -> MemohKeyUi.open = true   // [Mines-38.9.7] address + key (OpenAI-compatible), no web sign-in
 +        else -> { com.openminis.app.ui.group.PartnersNav.open = d.id; go(com.openminis.app.ui.group.GroupRoutes.PARTNERS) }
 +    }
 +}
@@ -23430,6 +24369,40 @@ index 0000000..9133bed
 +        if (!t.running && !t.ok && (t.reason.contains("登录"))) WarmPrimaryPill("去登录", onClick = onLogin, height = 34.dp, fontSize = 13,
 +            modifier = Modifier.padding(start = 6.dp))
 +        if (!t.running) Text("关闭", fontSize = MT.Caption, color = m.ink2, modifier = Modifier.clickable(onClick = onClose).padding(6.dp))
++    }
++}
++
++/** [Mines-38.9.7] Memoh address + key sheet (测试一下 = GET /v1/models). */
++object MemohKeyUi { var open by androidx.compose.runtime.mutableStateOf(false) }
++
++@Composable
++fun MemohKeyDialog(onSaved: () -> Unit) {
++    if (!MemohKeyUi.open) return
++    val ctx = androidx.compose.ui.platform.LocalContext.current
++    val m = mines()
++    val scope = androidx.compose.runtime.rememberCoroutineScope()
++    var addr by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(com.openminis.app.plus.MemohKey.base()?.removeSuffix("/v1") ?: com.openminis.app.plus.MemohKey.suggestion(ctx).orEmpty()) }
++    var key by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(com.openminis.app.plus.MemohKey.key().orEmpty()) }
++    var line by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf<String?>(null) }
++    var busy by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
++    MinesDialog("Memoh", onDismiss = { MemohKeyUi.open = false }, confirm = if (busy) "测试中…" else "测试并保存", onConfirm = {
++        val v1 = com.openminis.app.plus.MemohKeyCore.v1Base(addr)
++        if (v1 == null) { line = "地址不对"; return@MinesDialog }
++        if (busy) return@MinesDialog
++        busy = true; line = "正在连 $v1/models …"
++        scope.launch {
++            val r = com.openminis.app.plus.MemohKey.check(v1, key)
++            busy = false; line = r.line
++            if (r.ok) { com.openminis.app.plus.MemohKey.save(v1, key, r.model); MemohKeyUi.open = false; onSaved() }
++        }
++    }, dismiss = "取消") {
++        androidx.compose.material3.OutlinedTextField(addr, { addr = it.trim(); line = null }, singleLine = true, modifier = Modifier.fillMaxWidth(),
++            label = { Text("地址", fontSize = MT.Caption) }, placeholder = { Text("http://你的服务器:8794", fontSize = MT.Sub) },
++            textStyle = androidx.compose.ui.text.TextStyle(fontSize = MT.Body, color = m.ink))
++        androidx.compose.material3.OutlinedTextField(key, { key = it.trim(); line = null }, singleLine = true, modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
++            label = { Text("key", fontSize = MT.Caption) }, visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
++            textStyle = androidx.compose.ui.text.TextStyle(fontSize = MT.Body, color = m.ink))
++        line?.let { Text(it, fontSize = MT.Sub, color = m.ink2, modifier = Modifier.padding(top = 6.dp)) }
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/AvatarPicker.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/AvatarPicker.kt
@@ -28935,7 +29908,7 @@ index 0000000..2b1c784
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/MarketScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/MarketScreen.kt
-index 849e3da..57a6628 100644
+index 849e3da..0e1e9b4 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/MarketScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/MarketScreen.kt
 @@ -2,6 +2,9 @@ package com.openminis.app.ui.plus
@@ -29084,7 +30057,7 @@ index 849e3da..57a6628 100644
                  onSecondary = { scope.launch { msg = withContext(Dispatchers.IO) { SkillMarketData.uninstall(ctx, s.name) }; tick++ } },
                  onClick = {
                      if (expanded == key) expanded = null else {
-@@ -477,3 +489,333 @@ private fun SkillMarket() {
+@@ -477,3 +489,334 @@ private fun SkillMarket() {
          }
      }
  }
@@ -29296,10 +30269,10 @@ index 849e3da..57a6628 100644
 +        IntroDialog(
 +            title = p.name, badge = "DSH插件", version = null, desc = p.description,
 +            adds = listOfNotNull(p.categoryLabel.takeIf { it.isNotBlank() }?.let { "分类：$it" }, "★ ${starsText(p.stars)}",
-+                if (p.verified) "SkillHub 已验证：一键安装（固定版本）" else "需手动：SkillHub 没验证这个插件能直接装"),
++                p.kind.line),   // [Mines-38.9.7] plain one-line reason instead of 「需手动」
 +            extra = p.repo.ifBlank { "${com.openminis.app.plus.SkillHubCn.WEB}" },
 +            installed = inst, busy = task.state.running,
-+            onInstall = { install(p); intro = null },
++            onInstall = { if (p.kind.canTry) install(p) else runCatching { if (p.repo.isNotBlank()) com.openminis.app.ui.plus.PlusNav.openBrowser.value = p.repo }; intro = null },
 +            onUninstall = if (inst) ({ uninstall(p); intro = null }) else null,
 +            onDismiss = { intro = null },
 +        )
@@ -29319,17 +30292,18 @@ index 849e3da..57a6628 100644
 +        FilterChip(selected = verifiedOnly, onClick = { verifiedOnly = !verifiedOnly }, label = { Text("只看可一键装", fontSize = MT.Meta) })
 +    }
 +    if (status.isNotBlank()) Text(status, fontSize = MT.Meta, color = mines().ink2, modifier = Modifier.padding(horizontal = 36.dp, vertical = 6.dp))
-+    AcctHeader(if (loading && items.isEmpty()) "SkillHub 插件 · 正在加载…" else "SkillHub 插件 · 共 $total 个", trailing = "skillhub.cn")
++    AcctHeader(if (loading && items.isEmpty()) "SkillHub 插件 · 正在加载…" else "SkillHub 插件 · ${items.size} 个手机能用", trailing = "skillhub.cn")
 +    MinesCard(Modifier.fillMaxWidth().padding(horizontal = MS.PageH)) {
 +        items.forEachIndexed { i, p ->
 +            val inst = isInst(p)
 +            AcctRow({ HubLogo(p.avatar, p.name) }, p.name,
 +                p.description.ifBlank { "（作者没写简介）" } + "\n★ ${starsText(p.stars)}" + (p.categoryLabel.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""),
-+                when { inst -> com.openminis.app.plus.SessionStatus.Pill.OK; !p.verified -> com.openminis.app.plus.SessionStatus.Pill.UNCHECKED; else -> null },
-+                pillLabel = when { inst -> "已安装"; !p.verified -> "需手动"; else -> null },
++                when { inst -> com.openminis.app.plus.SessionStatus.Pill.OK; !p.verified && !p.kind.canTry -> com.openminis.app.plus.SessionStatus.Pill.UNCHECKED; else -> null },
++                // [Mines-38.9.7] 「需手动」 → what it is (电脑版 / 资料库 / 非 DSH) or 试装 (DSH plugin SkillHub has not verified yet)
++                pillLabel = when { inst -> "已安装"; !p.verified && !p.kind.canTry -> p.kind.pill; else -> null },
 +                chevron = Chevron.NONE, subtitleLines = 3, onClick = { intro = p },
-+                description = "${p.name}，${p.description.take(60)}，" + (if (inst) "已安装" else if (p.verified) "可一键安装" else "需手动"),
-+                extra = { if (p.verified) HubAction(if (inst) "更新" else "安装", enabled = !task.state.running) { install(p) } })
++                description = "${p.name}，${p.description.take(60)}，" + (if (inst) "已安装" else p.kind.line),
++                extra = { if (p.kind.canTry) HubAction(if (inst) "更新" else if (p.verified) "安装" else "试装", enabled = !task.state.running) { install(p) } })
 +            if (i < items.lastIndex) AcctDivider()
 +        }
 +        if (items.size < total && items.isNotEmpty()) TextButton(onClick = {
@@ -31191,7 +32165,7 @@ index 0000000..b7d45758
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
-index 95d1b6b..402a2d4 100644
+index 95d1b6b..fb412f4 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
 @@ -1,6 +1,7 @@
@@ -31253,7 +32227,7 @@ index 95d1b6b..402a2d4 100644
      val greeting = androidx.compose.runtime.remember(gTick, hour) {
          val snap = DeviceSnap.read(context)
          val charging = runCatching { context.getSystemService(android.os.BatteryManager::class.java)?.isCharging == true }.getOrDefault(false)
-@@ -143,21 +166,90 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier, onSearch:
+@@ -143,21 +166,100 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier, onSearch:
                  .clickable { switcher = true }.semantics { contentDescription = "换角色：$name" },
                  contentAlignment = Alignment.Center) { PetAvatar(size = 100.dp) }
          }
@@ -31293,11 +32267,19 @@ index 95d1b6b..402a2d4 100644
 +        // [Mines-38.9.5 i] user 22:34 「晚上好主人太单调了」: varied greeting — time of day · weather (rain soon → 带伞) ·
 +        // weekday / holiday · task status, from a pool, never the same phrase on two opens in a row; name optional
 +        val tasksAll by com.openminis.app.plus.TaskProgress.tasks.collectAsState()
-+        val tSum = androidx.compose.runtime.remember(tasksAll) { com.openminis.app.plus.TaskProgressCore.summary(tasksAll.values, System.currentTimeMillis()) }
-+        val hello = androidx.compose.runtime.remember(gTick, hour, tSum.running, tSum.waiting, tSum.error) {
++        // [Mines-38.9.7] user 21:15 「2 件事等你」 — which two? Same filter as the summary line (chats on the list), and the
++        // greeting's number is the size of the list the tap opens
++        val visHome by com.openminis.app.plus.TaskProgress.visible.collectAsState()
++        val tSum = androidx.compose.runtime.remember(tasksAll, visHome) { com.openminis.app.plus.TaskProgressCore.summary(tasksAll.values.filter { t -> visHome?.contains(t.sid) ?: true }, System.currentTimeMillis()) }
++        val waitList = androidx.compose.runtime.remember(tasksAll, visHome, all) {
++            com.openminis.app.plus.HomeFixCore.waiting(tasksAll.values, visHome, System.currentTimeMillis(), all.associate { it.id to (it.title ?: "") })
++        }
++        var waitOpen by androidx.compose.runtime.saveable.rememberSaveable { androidx.compose.runtime.mutableStateOf(false) }
++        if (waitOpen) WaitingSheet(waitList, onOpen = { sid -> waitOpen = false; onOpen(com.openminis.app.ui.navigation.Routes.chat(sid)) }, onDismiss = { waitOpen = false })
++        val hello = androidx.compose.runtime.remember(gTick, hour, tSum.running, waitList.size, tSum.error) {
 +            runCatching {
 +                com.openminis.app.plus.HomeGreeting.variedGreeting(context, com.openminis.app.plus.HomeGreeting.context(context, 80, true),
-+                    tSum.running, tSum.waiting, tSum.error, who)
++                    tSum.running, waitList.size, tSum.error, who)
 +            }.getOrDefault(greet)
 +        }
 +        // [Mines-38.9.1] user: 「晚上好这里高一点」 — the greeting moves up into the space the plate's status line left
@@ -31305,7 +32287,9 @@ index 95d1b6b..402a2d4 100644
 +            if (!searching) {
 +                Text(hello, fontSize = MT.PageTitle, lineHeight = 24.sp, fontWeight = FontWeight.Medium, color = m.ink, maxLines = 1, style = fogGlow(),
 +                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-+                    modifier = Modifier.weight(1f).semantics { contentDescription = "$hello。$lineText" })
++                    modifier = Modifier.weight(1f)
++                        .then(if (waitList.isNotEmpty()) Modifier.clip(RoundedCornerShape(12.dp)).clickable { waitOpen = true } else Modifier)
++                        .semantics { contentDescription = "$hello。$lineText" + if (waitList.isNotEmpty()) "。点按看是哪 ${waitList.size} 件" else "" })
 +                Spacer(Modifier.width(8.dp))
 +                WarmRoundButton(com.openminis.app.ui.brand.MinesIcons.named("search")!!, "搜索对话", size = 42.dp, onClick = onSearch)
 +            } else {
@@ -31358,7 +32342,7 @@ index 95d1b6b..402a2d4 100644
          }
      }
  }
-@@ -203,6 +295,65 @@ fun HomeAvatar(modifier: Modifier = Modifier) {
+@@ -203,6 +305,65 @@ fun HomeAvatar(modifier: Modifier = Modifier) {
      }
  }
  
@@ -31424,7 +32408,7 @@ index 95d1b6b..402a2d4 100644
  /** [Mines-38.7] the home weather as the sprite / big picture / pill need it; null = no weather (nothing shown). */
  class HomeWx(val icon: String, val words: String, val temp: Int, val extra: String, val night: Boolean) {
      val spoken get() = "$words $temp 度"
-@@ -219,7 +370,8 @@ fun homeWeather(): HomeWx? {
+@@ -219,7 +380,8 @@ fun homeWeather(): HomeWx? {
      val forced = com.openminis.app.plus.HomeGreeting.override?.optInt("hour", -1)?.takeIf { it >= 0 }
      val night = if (forced != null) forced >= 19 || forced < 6 else sunNight
      val (icon, words) = com.openminis.app.plus.HomeGreeting.describe(w.code, if (night) 23 else 12)
@@ -31434,7 +32418,7 @@ index 95d1b6b..402a2d4 100644
      return HomeWx(icon, words, Math.round(w.temp).toInt(), extra, night)
  }
  
-@@ -234,7 +386,7 @@ fun HomeWeatherPill() {
+@@ -234,7 +396,7 @@ fun HomeWeatherPill() {
      androidx.compose.animation.AnimatedVisibility(HomeOrbit.open,
          enter = androidx.compose.animation.fadeIn() + androidx.compose.animation.expandVertically(),
          exit = androidx.compose.animation.fadeOut() + androidx.compose.animation.shrinkVertically()) {
@@ -31443,7 +32427,7 @@ index 95d1b6b..402a2d4 100644
          Row(Modifier.padding(top = 10.dp, bottom = 2.dp).heightIn(min = 36.dp)
              .clip(RoundedCornerShape(50)).background(fill).border(1.dp, m.hairline.copy(alpha = 0.18f), RoundedCornerShape(50))
              .padding(horizontal = 14.dp, vertical = 4.dp)
-@@ -242,7 +394,7 @@ fun HomeWeatherPill() {
+@@ -242,7 +404,7 @@ fun HomeWeatherPill() {
              verticalAlignment = Alignment.CenterVertically) {
              Text("${wx.temp}°", fontSize = 18.sp, lineHeight = 22.sp, fontWeight = FontWeight.Bold, color = m.ink, maxLines = 1, softWrap = false)
              Spacer(Modifier.width(6.dp))
@@ -31452,7 +32436,7 @@ index 95d1b6b..402a2d4 100644
          }
      }
  }
-@@ -287,7 +439,8 @@ class WeatherOrbitState {
+@@ -287,7 +449,8 @@ class WeatherOrbitState {
   * face's upper right, a tap shows the pill.
   */
  @Composable
@@ -31462,7 +32446,7 @@ index 95d1b6b..402a2d4 100644
      val ctx = LocalContext.current
      val m = mines()
      val still = remember { AnimeWeather.still(ctx) }
-@@ -315,9 +468,9 @@ private fun WeatherOrbit(st: WeatherOrbitState, wx: HomeWx, front: Boolean, onTa
+@@ -315,9 +478,9 @@ private fun WeatherOrbit(st: WeatherOrbitState, wx: HomeWx, front: Boolean, onTa
      }
      val a = st.angle
      val f = st.fly.value
@@ -31475,7 +32459,7 @@ index 95d1b6b..402a2d4 100644
      // faint dashed orbit line (back layer, while circling)
      if (!front && !still && f < 0.02f) {
          androidx.compose.foundation.Canvas(Modifier.size(1.dp)) {
-@@ -338,7 +491,7 @@ private fun WeatherOrbit(st: WeatherOrbitState, wx: HomeWx, front: Boolean, onTa
+@@ -338,7 +501,7 @@ private fun WeatherOrbit(st: WeatherOrbitState, wx: HomeWx, front: Boolean, onTa
      val tx = 0f; val ty = -82f
      val x = ox + (tx - ox) * f
      val y = oy + (ty - oy) * f - kotlin.math.sin(Math.PI.toFloat() * f) * 22f
@@ -31484,7 +32468,7 @@ index 95d1b6b..402a2d4 100644
      val scale = sc0 + (1f - sc0) * f
      val alpha = al0 + (1f - al0) * f
      // faint trail of light dots behind the sprite while it circles
-@@ -407,7 +560,7 @@ private fun StatusTile(modifier: Modifier, icon: String, value: String, label: S
+@@ -407,7 +570,7 @@ private fun StatusTile(modifier: Modifier, icon: String, value: String, label: S
              Text(label, fontSize = MT.Meta, color = m.ink2, maxLines = 1, softWrap = false, modifier = Modifier.weight(1f))
              Box(Modifier.size(6.dp).clip(CircleShape).background(dot))
          }
@@ -31493,7 +32477,7 @@ index 95d1b6b..402a2d4 100644
              overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, modifier = Modifier.padding(top = 2.dp))
      }
  }
-@@ -473,7 +626,7 @@ private fun FeedRow(item: com.openminis.app.plus.Digest.Item) {
+@@ -473,7 +636,7 @@ private fun FeedRow(item: com.openminis.app.plus.Digest.Item) {
          ToneBubble(com.openminis.app.ui.brand.MinesIcons.named(icon)!!, tone)
          Spacer(Modifier.width(14.dp))
          Column(Modifier.weight(1f)) {
@@ -31502,7 +32486,7 @@ index 95d1b6b..402a2d4 100644
                  maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
              val sub = it.summary.takeIf { s -> s.isNotBlank() && s != it.headline } ?: it.source
              Text(sub, fontSize = 15.sp, lineHeight = 20.sp, color = m.ink2, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
-@@ -514,7 +667,7 @@ private fun MessagesBar(count: Int, onClick: () -> Unit) {
+@@ -514,7 +677,7 @@ private fun MessagesBar(count: Int, onClick: () -> Unit) {
      ) {
          MinesIcon(com.openminis.app.ui.brand.MinesIcons.named("mail")!!, null, tint = m.ink2, modifier = Modifier.size(20.dp))
          Spacer(Modifier.width(10.dp))
@@ -31511,7 +32495,7 @@ index 95d1b6b..402a2d4 100644
          if (count > 0) {
              Box(Modifier.heightIn(min = 22.dp).clip(RoundedCornerShape(50)).background(MinesDesign.DangerFill).padding(horizontal = 7.dp),
                  contentAlignment = Alignment.Center) {
-@@ -542,10 +695,10 @@ fun HomeWeatherChip(modifier: Modifier = Modifier) {
+@@ -542,10 +705,10 @@ fun HomeWeatherChip(modifier: Modifier = Modifier) {
      val hour = (com.openminis.app.plus.HomeGreeting.override?.optInt("hour", -1)?.takeIf { it >= 0 }) ?: Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
      val (icon, words) = com.openminis.app.plus.HomeGreeting.describe(w.code, hour)
      val night = hour >= 19 || hour < 6
@@ -31524,7 +32508,7 @@ index 95d1b6b..402a2d4 100644
      Row(modifier.padding(top = 4.dp, bottom = 6.dp).clip(RoundedCornerShape(50)).background(fill)
          .border(1.dp, m.hairline.copy(alpha = 0.18f), RoundedCornerShape(50))
          .padding(start = 8.dp, end = 16.dp, top = 3.dp, bottom = 3.dp)
-@@ -556,6 +709,107 @@ fun HomeWeatherChip(modifier: Modifier = Modifier) {
+@@ -556,6 +719,142 @@ fun HomeWeatherChip(modifier: Modifier = Modifier) {
          Spacer(Modifier.width(6.dp))
          Text("$t°", fontSize = 18.sp, lineHeight = 22.sp, fontWeight = FontWeight.Bold, color = m.ink, maxLines = 1)
          Spacer(Modifier.width(8.dp))
@@ -31574,9 +32558,22 @@ index 95d1b6b..402a2d4 100644
 +    val context = LocalContext.current
 +    val m = mines()
 +    val tick by com.openminis.app.plus.HomeGreeting.tick.collectAsState()
-+    LaunchedEffect(Unit) { runCatching { com.openminis.app.plus.HomeGreeting.refreshWeather(context) } }
-+    val w = androidx.compose.runtime.remember(tick) { com.openminis.app.plus.HomeGreeting.weatherNow(context) } ?: return
++    // [Mines-38.9.7] re-checked every 10 min while home is shown (was once: after 1 h the weather vanished)
++    LaunchedEffect(Unit) { while (true) { runCatching { com.openminis.app.plus.HomeGreeting.refreshWeather(context) }; kotlinx.coroutines.delay(10 * 60_000L) } }
 +    var open by androidx.compose.runtime.saveable.rememberSaveable { androidx.compose.runtime.mutableStateOf(false) }
++    val w = androidx.compose.runtime.remember(tick) { com.openminis.app.plus.HomeGreeting.weatherNow(context) }
++    if (w == null) {
++        // [Mines-38.9.7] never nothing: 「设置城市」 / 「天气获取中…」, tap → city
++        val why = androidx.compose.runtime.remember(tick) { com.openminis.app.plus.HomeGreeting.weatherWhy(context) }
++        val label = com.openminis.app.plus.HomeFixCore.weatherChip(why)
++        Row(Modifier.clip(RoundedCornerShape(50)).clickable { open = true }.padding(horizontal = 6.dp, vertical = 2.dp)
++            .semantics(mergeDescendants = true) { contentDescription = "天气：" + why.line + "。点按设置城市" }, verticalAlignment = Alignment.CenterVertically) {
++            AnimeWeatherIcon("cloud", 18.dp); Spacer(Modifier.width(4.dp))
++            Text(label, fontSize = MT.Meta, lineHeight = MT.SubLH, color = m.ink2, maxLines = 1, softWrap = false, style = fogGlow())
++        }
++        if (open) HomeWeatherSheet(null, why.line, onDismiss = { open = false })
++        return
++    }
 +    val hour = (com.openminis.app.plus.HomeGreeting.override?.optInt("hour", -1)?.takeIf { it >= 0 }) ?: Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
 +    val (icon0, words) = com.openminis.app.plus.HomeGreeting.describe(w.code, hour)
 +    val t = Math.round(w.temp).toInt()
@@ -31600,15 +32597,15 @@ index 95d1b6b..402a2d4 100644
 +}
 +
 +@Composable
-+private fun HomeWeatherSheet(w: com.openminis.app.plus.HomeGreeting.Weather, words: String, onDismiss: () -> Unit) {
++private fun HomeWeatherSheet(w: com.openminis.app.plus.HomeGreeting.Weather?, words: String, onDismiss: () -> Unit) {
 +    val context = LocalContext.current
 +    val m = mines()
 +    val scope = androidx.compose.runtime.rememberCoroutineScope()
-+    var editing by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
++    var editing by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(w == null) }
 +    var city by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(com.openminis.app.plus.HomeGreeting.manualCity(context)?.third.orEmpty()) }
 +    var err by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf<String?>(null) }
 +    val src = com.openminis.app.plus.HomeGreeting.placeSource(context)
-+    MinesDialog(w.place.ifBlank { "天气" }, onDismiss = onDismiss,
++    MinesDialog(w?.place?.ifBlank { null } ?: "天气", onDismiss = onDismiss,
 +        confirm = if (editing) "保存" else null,
 +        onConfirm = if (editing) ({
 +            scope.launch {
@@ -31619,9 +32616,10 @@ index 95d1b6b..402a2d4 100644
 +        @Composable fun line(k: String, v: String, c: Color = m.ink) = Row(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
 +            Text(k, fontSize = MT.Body, color = m.ink2, modifier = Modifier.width(72.dp)); Text(v, fontSize = MT.Body, color = c)
 +        }
-+        line("现在", "${Math.round(w.temp)}° $words")
-+        line("今天", "${Math.round(w.min)}° ~ ${Math.round(w.max)}° · 降水 ${w.rainProb}%")
-+        val rainLine = w.soon.ifBlank { w.later }
++        if (w == null) line("现在", words)
++        if (w != null) line("现在", "${Math.round(w.temp)}° $words")
++        if (w != null) line("今天", "${Math.round(w.min)}° ~ ${Math.round(w.max)}° · 降水 ${w.rainProb}%")
++        val rainLine = if (w == null) "" else w.soon.ifBlank { w.later }
 +        if (rainLine.isNotBlank()) line("下雨", rainLine, if (m.dark) MinesDesign.WarningDark else MinesDesign.Warning)
 +        if (src.isNotBlank()) line("位置", src)
 +        if (!editing) Text("设置城市", fontSize = MT.Body, color = m.primaryText, fontWeight = FontWeight.Medium,
@@ -31630,6 +32628,27 @@ index 95d1b6b..402a2d4 100644
 +            androidx.compose.material3.OutlinedTextField(city, { city = it; err = null }, singleLine = true, modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
 +                textStyle = androidx.compose.ui.text.TextStyle(fontSize = MT.Body, color = m.ink), placeholder = { Text("城市（留空 = 用手机定位）", fontSize = MT.Body, color = m.ink3) })
 +            err?.let { Text(it, fontSize = MT.Caption, color = if (m.dark) MinesDesign.DangerDark else MinesDesign.Danger, modifier = Modifier.padding(top = 4.dp)) }
++        }
++    }
++}
++
++/** [Mines-38.9.7] 「N 件事等你」 → exactly those N chats, each opens its chat. */
++@Composable
++private fun WaitingSheet(items: List<com.openminis.app.plus.HomeFixCore.Waiting>, onOpen: (String) -> Unit, onDismiss: () -> Unit) {
++    val m = mines()
++    MinesDialog("${items.size} 件事等你", onDismiss = onDismiss, dismiss = "关闭") {
++        if (items.isEmpty()) Text("现在没有等你的事", fontSize = MT.Body, color = m.ink2)
++        items.forEach { w ->
++            Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).clickable { onOpen(w.sid) }.padding(horizontal = 6.dp, vertical = 10.dp)
++                .semantics(mergeDescendants = true) { contentDescription = "${w.title}，${w.why}。点按打开" }, verticalAlignment = Alignment.CenterVertically) {
++                Box(Modifier.size(8.dp).clip(CircleShape).background(ProgressColors.of(com.openminis.app.plus.TaskProgressCore.St.WAITING, m.dark)))
++                Spacer(Modifier.width(10.dp))
++                Column(Modifier.weight(1f)) {
++                    Text(w.title, fontSize = MT.Body, fontWeight = FontWeight.Medium, color = m.ink, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
++                    Text(w.why, fontSize = MT.Caption, lineHeight = MT.CaptionLH, color = m.ink2, maxLines = 2, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
++                }
++                MinesIcon(com.openminis.app.ui.brand.MinesIcons.named("chevron-right")!!, null, tint = m.ink3, modifier = Modifier.size(16.dp))
++            }
 +        }
      }
  }
@@ -32363,10 +33382,10 @@ index 0000000..820e5d8
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WeatherSky.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WeatherSky.kt
 new file mode 100644
-index 0000000..c2f1956
+index 0000000..cc5579d
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WeatherSky.kt
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,198 @@
 +package com.openminis.app.ui.plus
 +
 +import android.os.Build
@@ -32466,7 +33485,10 @@ index 0000000..c2f1956
 +    val m = mines()
 +    val gTick by com.openminis.app.plus.HomeGreeting.tick.collectAsState()
 +    val sTick by WeatherSky.tick.collectAsState()
-+    val scene = remember(gTick, sTick) { WeatherSky.scene(ctx) }
++    // [Mines-38.9.7] re-picked every minute: the scene was picked once, so a home opened at 18:xx stayed SUNSET (maroon in
++    // dark) all evening on the phone
++    val minuteTick by androidx.compose.runtime.produceState(0) { while (true) { kotlinx.coroutines.delay(60_000L); value++ } }
++    val scene = remember(gTick, sTick, minuteTick) { WeatherSky.scene(ctx) }
 +    // crossfade from the previous scene over 1.5 s
 +    var prev by remember { mutableStateOf<Scene?>(null) }
 +    var cur by remember { mutableStateOf(scene) }
@@ -33491,7 +34513,7 @@ index e255c97..3b5c20d 100644
  import androidx.compose.material3.rememberModalBottomSheetState
  import androidx.compose.runtime.Composable
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
-index 4e1f21b..e7e0a70 100644
+index 4e1f21b..3c88af5 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/sessions/SessionListScreen.kt
 @@ -29,6 +29,8 @@ import androidx.compose.foundation.layout.Column
@@ -33558,7 +34580,23 @@ index 4e1f21b..e7e0a70 100644
      val isSelecting by viewModel.isSelecting.collectAsState()
      val selectedIds by viewModel.selectedIds.collectAsState()
      val regeneratingIds by viewModel.regeneratingIds.collectAsState()
-@@ -860,8 +876,8 @@ fun SessionListScreen(
+@@ -675,7 +691,14 @@ fun SessionListScreen(
+     var editSession by remember { mutableStateOf<ChatSessionEntity?>(null) }
+     var showBrowserSheet by remember { mutableStateOf(false) }
+     var showBrowserSettings by remember { mutableStateOf(false) }
+-    val browserTabPool = remember { com.openminis.app.browser.BrowserTabPool(context) }
++    // [Mines-38.9.7] the home browser IS the process-wide shared pool (was a private remember{} pool no agent could see),
++    // so an agent taking over drives the tab the user signed in on
++    val browserTabPool = remember { (context.applicationContext as com.openminis.app.MinisApp).sharedBrowserTabPool }
++    // [Mines-38.9.7] 无痕标签: separate profile pool, wiped when its sheet closes
++    var incognitoPool by remember { mutableStateOf<com.openminis.app.browser.BrowserTabPool?>(null) }
++    androidx.compose.runtime.DisposableEffect(Unit) {
++        onDispose { incognitoPool?.let { com.openminis.app.browser.Incognito.close(it) }; incognitoPool = null }
++    }
+     // [Mines-webfit-38.3] open the browser on a URL handed over from elsewhere (self-test / deep link)
+     val openBrowserUrl by com.openminis.app.ui.plus.PlusNav.openBrowser.collectAsState()
+     LaunchedEffect(openBrowserUrl) {
+@@ -860,8 +883,8 @@ fun SessionListScreen(
      val minesNavIcon: @Composable () -> Unit = {
          Box {
              // [Mines-38.7] ☰ uses the same round porcelain button as ⚙ (38.6 had a bare icon on the left, a round one on the right)
@@ -33569,7 +34607,7 @@ index 4e1f21b..e7e0a70 100644
              fun ic(n: String) = com.openminis.app.ui.brand.MinesIcons.named(n)
              com.openminis.app.ui.plus.WarmMenu(showOverflowMenu, onDismiss = { showOverflowMenu = false }) {
                  if (sessions.isNotEmpty()) com.openminis.app.ui.plus.WarmMenuItem("选择对话", ic("list-select")) {
-@@ -873,6 +889,12 @@ fun SessionListScreen(
+@@ -873,6 +896,12 @@ fun SessionListScreen(
                  com.openminis.app.ui.plus.WarmMenuItem(if (scheduledTaskCount > 0) "定时任务  $scheduledTaskCount" else "定时任务", ic("clock")) {
                      showOverflowMenu = false; onScheduledTasksClick()
                  }
@@ -33582,7 +34620,26 @@ index 4e1f21b..e7e0a70 100644
                  com.openminis.app.ui.plus.WarmMenuDivider()
                  com.openminis.app.ui.plus.WarmMenuItem(stringResource(R.string.sessionlist_shell_terminal), ic("terminal")) {
                      showOverflowMenu = false; onTerminalClick()
-@@ -893,32 +915,32 @@ fun SessionListScreen(
+@@ -884,6 +913,18 @@ fun SessionListScreen(
+                 com.openminis.app.ui.plus.WarmMenuItem(stringResource(R.string.sessionlist_open_browser), ic("globe")) {
+                     showOverflowMenu = false; browserTabPool.ensureTabForUI(); showBrowserSheet = true
+                 }
++                com.openminis.app.ui.plus.WarmMenuItem("无痕标签", ic("eye-off") ?: ic("globe")) {
++                    showOverflowMenu = false
++                    when (val plan = com.openminis.app.browser.IncognitoCore.plan(com.openminis.app.browser.Incognito.supported())) {
++                        is com.openminis.app.browser.IncognitoCore.Plan.Refuse ->
++                            android.widget.Toast.makeText(context, plan.why, android.widget.Toast.LENGTH_LONG).show()
++                        else -> {
++                            val pool = com.openminis.app.browser.BrowserTabPool(context, incognito = true)
++                            if (runCatching { pool.ensureTabForUI() }.isSuccess) incognitoPool = pool
++                            else android.widget.Toast.makeText(context, com.openminis.app.browser.IncognitoCore.NO_PROFILE_MSG, android.widget.Toast.LENGTH_LONG).show()
++                        }
++                    }
++                }
+                 com.openminis.app.ui.plus.WarmMenuItem(stringResource(R.string.sessionlist_browser_settings), ic("settings")) {
+                     showOverflowMenu = false; showBrowserSettings = true
+                 }
+@@ -893,32 +934,32 @@ fun SessionListScreen(
      Box(Modifier.fillMaxSize()) {
      if (minesPhotoWall) com.openminis.app.ui.plus.ChatWallpaperLayer(Modifier.fillMaxSize(), home = true)
      else com.openminis.app.ui.plus.PorcelainBackdrop(Modifier.fillMaxSize())
@@ -33631,7 +34688,7 @@ index 4e1f21b..e7e0a70 100644
                  com.openminis.app.ui.plus.HomeWeatherPill() // [Mines-38.7] 「26° 晴」 under the face while the big picture is up
                  }
              } else TopAppBar(
-@@ -929,8 +951,8 @@ fun SessionListScreen(
+@@ -929,8 +970,8 @@ fun SessionListScreen(
                                  stringResource(R.string.sessionlist_select_title)
                              else
                                  stringResource(R.string.sessionlist_n_selected, selectedIds.size),
@@ -33642,7 +34699,7 @@ index 4e1f21b..e7e0a70 100644
                          )
                      } else {
                          // [Mines-warm-36] the character's face + name plate below is the title now
-@@ -944,8 +966,10 @@ fun SessionListScreen(
+@@ -944,8 +985,10 @@ fun SessionListScreen(
                  },
                  navigationIcon = {
                      if (isSelecting) {
@@ -33655,7 +34712,7 @@ index 4e1f21b..e7e0a70 100644
                          }
                      } else {
                          // [Mines-38.1] board 01: ☰ (left) holds the developer tools in a warm menu; ⚙ (right) opens settings.
-@@ -988,7 +1012,7 @@ fun SessionListScreen(
+@@ -988,7 +1031,7 @@ fun SessionListScreen(
              // iOS `didInitialLoad` on ContentView. The transition is usually
              // sub-200ms, so no spinner.
              if (isInitialLoadComplete) Column(modifier = Modifier.fillMaxSize()) {
@@ -33664,7 +34721,7 @@ index 4e1f21b..e7e0a70 100644
                      if (isSearchActive && searchQuery.isNotBlank()) {
                          Box(
                              modifier = Modifier.fillMaxSize(),
-@@ -1049,6 +1073,14 @@ fun SessionListScreen(
+@@ -1049,6 +1092,14 @@ fun SessionListScreen(
                              onOpen = { route -> com.openminis.app.ui.plus.PlusNav.go(route) },
                              onSearch = { viewModel.isSearchActive.value = true },
                              all = minesAllSessions,
@@ -33679,7 +34736,7 @@ index 4e1f21b..e7e0a70 100644
                          )
                          com.openminis.app.ui.plus.UpdateHomeCard(onOpen = { com.openminis.app.ui.plus.PlusNav.go(com.openminis.app.ui.plus.PlusRoutes.UPDATE) })
                          com.openminis.app.ui.plus.LocalGatewayCards()
-@@ -1059,10 +1091,17 @@ fun SessionListScreen(
+@@ -1059,10 +1110,17 @@ fun SessionListScreen(
                          // [T-android-newchat-list-autoscroll] Hoisted state so
                          // the new-session autoscroll effect above can drive it.
                          state = listState,
@@ -33699,7 +34756,7 @@ index 4e1f21b..e7e0a70 100644
                          // T25: search-active path used to flatten the list and skip
                          // section headers entirely. Now reuses the same grouped
                          // rendering — `displayedSessions` is already filtered by
-@@ -1132,10 +1171,10 @@ fun SessionListScreen(
+@@ -1132,10 +1190,10 @@ fun SessionListScreen(
                                      val mc = com.openminis.app.ui.plus.mines()
                                      Modifier
                                          .padding(start = 16.dp, end = 16.dp, bottom = if (last) 8.dp else 0.dp)
@@ -33712,7 +34769,7 @@ index 4e1f21b..e7e0a70 100644
                                          .then(if (!first) Modifier.drawBehind {
                                              drawLine(mc.hairline, Offset(64.dp.toPx(), 0f), Offset(size.width - 16.dp.toPx(), 0f), 1.dp.toPx())
                                          } else Modifier)
-@@ -1319,7 +1358,7 @@ fun SessionListScreen(
+@@ -1319,7 +1377,7 @@ fun SessionListScreen(
                                  // Folder names are user data — verbatim.
                                  Text(
                                      bar.folder.name,
@@ -33721,7 +34778,7 @@ index 4e1f21b..e7e0a70 100644
                                      fontWeight = FontWeight.SemiBold,
                                      color = MaterialTheme.colorScheme.onSurface,
                                      maxLines = 1,
-@@ -1403,7 +1442,7 @@ fun SessionListScreen(
+@@ -1403,7 +1461,7 @@ fun SessionListScreen(
                      onVoice = { com.openminis.app.ui.plus.PlusNav.go(com.openminis.app.ui.plus.PlusRoutes.VOICE) },
                      modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 80.dp),  // [Mines-38.5] nav bar 74 dp
                  )
@@ -33730,7 +34787,7 @@ index 4e1f21b..e7e0a70 100644
                  // Dual FAB row (matching iOS: New Chat left + Search right, or vice versa).
                  // Hidden while the onboarding landing is showing — Step 3 provides the CTA.
                  // T46: stay visible while search is active even when the result
-@@ -1447,7 +1486,7 @@ fun SessionListScreen(
+@@ -1447,7 +1505,7 @@ fun SessionListScreen(
                  )
              }
              // [Mines-warm-36] bottom bar (对话 · 消息 · 灵感 · 任务 · 应用); 消息 shows the red count of things to handle
@@ -33739,7 +34796,7 @@ index 4e1f21b..e7e0a70 100644
                  modifier = Modifier.align(Alignment.BottomCenter),
                  onTasks = onScheduledTasksClick,
                  onTop = { scope.launch { listState.animateScrollToItem(0) } },
-@@ -1558,7 +1597,7 @@ fun SessionListScreen(
+@@ -1558,7 +1616,7 @@ fun SessionListScreen(
          // text fields, and MinisAlertDialog is a title/text/buttons component.
          // Widening it for a single caller would push layout complexity into
          // every other dialog in the app.
@@ -33748,7 +34805,24 @@ index 4e1f21b..e7e0a70 100644
              onDismissRequest = { folderToRename = null },
              title = { Text(stringResource(R.string.group_rename)) },
              text = {
-@@ -1928,10 +1967,16 @@ private fun SelectionToolbar(
+@@ -1661,6 +1719,16 @@ fun SessionListScreen(
+         )
+     }
+ 
++    incognitoPool?.let { ip ->
++        com.openminis.app.ui.browser.BrowserSheet(
++            tabPool = ip,
++            onDismiss = {
++                com.openminis.app.browser.Incognito.close(ip); incognitoPool = null
++                android.widget.Toast.makeText(context, com.openminis.app.browser.IncognitoCore.CLOSED_MSG, android.widget.Toast.LENGTH_SHORT).show()
++            },
++        )
++    }
++
+     // Browser Settings sheet
+     if (showBrowserSettings) {
+         com.openminis.app.ui.browser.BrowserSettingsSheet(
+@@ -1928,10 +1996,16 @@ private fun SelectionToolbar(
      onDelete: () -> Unit,
      modifier: Modifier = Modifier,
  ) {
@@ -33766,7 +34840,7 @@ index 4e1f21b..e7e0a70 100644
              .padding(vertical = 10.dp),
          horizontalArrangement = Arrangement.SpaceEvenly,
      ) {
-@@ -1941,6 +1986,7 @@ private fun SelectionToolbar(
+@@ -1941,6 +2015,7 @@ private fun SelectionToolbar(
              MinisTextButton(
                  onClick = { showExportMenu = true },
                  enabled = selectedCount > 0,
@@ -33774,7 +34848,7 @@ index 4e1f21b..e7e0a70 100644
              ) {
                  Column(horizontalAlignment = Alignment.CenterHorizontally) {
                      MinesIcon(
-@@ -1949,7 +1995,7 @@ private fun SelectionToolbar(
+@@ -1949,7 +2024,7 @@ private fun SelectionToolbar(
                          modifier = Modifier.size(20.dp),
                      )
                      Spacer(Modifier.height(4.dp))
@@ -33783,7 +34857,7 @@ index 4e1f21b..e7e0a70 100644
                  }
              }
              DropdownMenu(expanded = showExportMenu, onDismissRequest = { showExportMenu = false }) {
-@@ -1974,6 +2020,7 @@ private fun SelectionToolbar(
+@@ -1974,6 +2049,7 @@ private fun SelectionToolbar(
          MinisTextButton(
              onClick = onMove,
              enabled = selectedCount > 0,
@@ -33791,7 +34865,7 @@ index 4e1f21b..e7e0a70 100644
          ) {
              Column(horizontalAlignment = Alignment.CenterHorizontally) {
                  MinesIcon(
-@@ -1982,7 +2029,7 @@ private fun SelectionToolbar(
+@@ -1982,7 +2058,7 @@ private fun SelectionToolbar(
                      modifier = Modifier.size(20.dp),
                  )
                  Spacer(Modifier.height(4.dp))
@@ -33800,7 +34874,7 @@ index 4e1f21b..e7e0a70 100644
              }
          }
  
-@@ -1990,23 +2037,32 @@ private fun SelectionToolbar(
+@@ -1990,23 +2066,32 @@ private fun SelectionToolbar(
          MinisTextButton(
              onClick = onDelete,
              enabled = selectedCount > 0,
@@ -33836,7 +34910,7 @@ index 4e1f21b..e7e0a70 100644
  }
  
  // ─── Section Header (matching iOS .subheadline.weight(.semibold)) ───────────
-@@ -2036,7 +2092,7 @@ private fun SectionHeader(title: String) {
+@@ -2036,7 +2121,7 @@ private fun SectionHeader(title: String) {
          }
          Text(
              text = title,
@@ -33845,7 +34919,7 @@ index 4e1f21b..e7e0a70 100644
              fontWeight = FontWeight.SemiBold,
              color = MaterialTheme.colorScheme.onSurfaceVariant,
          )
-@@ -2196,6 +2252,20 @@ private fun SessionItemContent(
+@@ -2196,6 +2281,20 @@ private fun SessionItemContent(
                          )
                      },
                  )
@@ -33866,7 +34940,7 @@ index 4e1f21b..e7e0a70 100644
                  // Export submenu (JSON / Plain Text)
                  var showExportSub by remember { mutableStateOf(false) }
                  DropdownMenuItem(
-@@ -2636,7 +2706,7 @@ private fun FolderCard(
+@@ -2636,7 +2735,7 @@ private fun FolderCard(
                  // User data — rendered verbatim, never a string lookup.
                  Text(
                      block.folder.name,
@@ -33875,7 +34949,7 @@ index 4e1f21b..e7e0a70 100644
                      fontWeight = FontWeight.SemiBold,
                      color = MaterialTheme.colorScheme.onSurface,
                      maxLines = 1,
-@@ -2654,7 +2724,7 @@ private fun FolderCard(
+@@ -2654,7 +2753,7 @@ private fun FolderCard(
                              stringResource(R.string.group_n_chats, block.totalCount)
                          else -> stringResource(R.string.group_empty)
                      },
@@ -33884,7 +34958,7 @@ index 4e1f21b..e7e0a70 100644
                      color = MaterialTheme.colorScheme.onSurfaceVariant,
                      maxLines = 1,
                      overflow = TextOverflow.Ellipsis,
-@@ -2667,7 +2737,7 @@ private fun FolderCard(
+@@ -2667,7 +2766,7 @@ private fun FolderCard(
              ) {
                  Text(
                      dateText,
@@ -33893,7 +34967,7 @@ index 4e1f21b..e7e0a70 100644
                      // [Mines-a11y-26] was colorScheme.outline (too dark to read)
                      color = com.openminis.app.ui.plus.readableSecondary(),
                  )
-@@ -3058,6 +3128,8 @@ private fun SessionRow(
+@@ -3058,6 +3157,8 @@ private fun SessionRow(
                      )
                  }
              }
@@ -33902,7 +34976,7 @@ index 4e1f21b..e7e0a70 100644
              if (badgeHead != null) {
                  SessionBadgeOverlay(
                      state = badgeHead,
-@@ -3114,15 +3186,24 @@ private fun SessionRow(
+@@ -3114,15 +3215,24 @@ private fun SessionRow(
          }
  
          // Relative timestamp
@@ -33935,7 +35009,7 @@ index 4e1f21b..e7e0a70 100644
      }
  }
  
-@@ -3505,7 +3586,7 @@ internal fun SessionEditSheet(
+@@ -3505,7 +3615,7 @@ internal fun SessionEditSheet(
                  modifier = Modifier.fillMaxWidth(),
                  verticalAlignment = Alignment.CenterVertically,
              ) {
@@ -33944,7 +35018,7 @@ index 4e1f21b..e7e0a70 100644
                  Spacer(Modifier.weight(1f))
                  Text(
                      "Edit Session",
-@@ -3515,7 +3596,7 @@ internal fun SessionEditSheet(
+@@ -3515,7 +3625,7 @@ internal fun SessionEditSheet(
                  Spacer(Modifier.weight(1f))
                  MinisTextButton(
                      onClick = { onSave(title.ifBlank { "New Chat" }, selectedCategory) },
@@ -33953,7 +35027,7 @@ index 4e1f21b..e7e0a70 100644
              }
  
              Spacer(Modifier.height(16.dp))
-@@ -3524,7 +3605,7 @@ internal fun SessionEditSheet(
+@@ -3524,7 +3634,7 @@ internal fun SessionEditSheet(
              OutlinedTextField(
                  value = title,
                  onValueChange = { title = it },
@@ -33962,7 +35036,7 @@ index 4e1f21b..e7e0a70 100644
                  modifier = Modifier.fillMaxWidth(),
                  singleLine = true,
              )
-@@ -3570,7 +3651,7 @@ internal fun SessionEditSheet(
+@@ -3570,7 +3680,7 @@ internal fun SessionEditSheet(
                              Spacer(Modifier.height(4.dp))
                              Text(
                                  cat,
@@ -33971,7 +35045,7 @@ index 4e1f21b..e7e0a70 100644
                                  color = if (isSelected) style.color
                                  else MaterialTheme.colorScheme.onSurfaceVariant,
                                  fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
-@@ -3682,9 +3763,9 @@ private fun SessionExportSummaryDialog(
+@@ -3682,9 +3792,9 @@ private fun SessionExportSummaryDialog(
              Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                  for ((label, value) in rows) {
                      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -33984,10 +35058,10 @@ index 4e1f21b..e7e0a70 100644
                  }
              }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/settings/AgentToolsSettingsScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/settings/AgentToolsSettingsScreen.kt
-index 8b8d293..a35cb9a 100644
+index 8b8d293..1f511ed 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/settings/AgentToolsSettingsScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/settings/AgentToolsSettingsScreen.kt
-@@ -42,6 +42,19 @@ fun AgentToolsSettingsScreen(onBack: () -> Unit) {
+@@ -42,6 +42,32 @@ fun AgentToolsSettingsScreen(onBack: () -> Unit) {
                  showDivider = false,
              )
          }
@@ -34000,6 +35074,19 @@ index 8b8d293..a35cb9a 100644
 +                onCheckedChange = {
 +                    skillFirst = it
 +                    AgentToolSwitch.SKILL_FIRST.setEnabled(context, it)
++                },
++                showDivider = false,
++            )
++        }
++        // [Mines-38.9.7] 高级工程模式 (default on)
++        var engineer by remember { mutableStateOf(AgentToolSwitch.ENGINEER.isEnabled(context)) }
++        SettingsSection(footer = null) {
++            SettingsSwitchRow(
++                title = "高级工程模式",
++                checked = engineer,
++                onCheckedChange = {
++                    engineer = it
++                    AgentToolSwitch.ENGINEER.setEnabled(context, it)
 +                },
 +                showDivider = false,
 +            )
@@ -35094,7 +36181,7 @@ index 0ab0828..51fecc0 100644
  import androidx.compose.material3.Text
  import androidx.compose.material3.rememberModalBottomSheetState
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/theme/Theme.kt b/src/android/app/src/main/java/com/openminis/app/ui/theme/Theme.kt
-index df61d03..37f6efd 100644
+index df61d03..47b451e 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/theme/Theme.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/theme/Theme.kt
 @@ -11,6 +11,7 @@ import androidx.compose.runtime.Composable
@@ -35105,7 +36192,7 @@ index df61d03..37f6efd 100644
  import androidx.compose.ui.text.TextStyle
  import androidx.compose.ui.unit.dp
  import androidx.compose.ui.unit.sp
-@@ -165,19 +166,35 @@ fun MinisTheme(
+@@ -165,19 +166,41 @@ fun MinisTheme(
      val plusSt = com.openminis.app.plus.PlusPrefs.state.collectAsState().value
      // [Mines-38.1] single accent: terracotta #B5532F everywhere, whatever character is chosen (user 16:03)
      @Suppress("UNUSED_VARIABLE") val style = plusSt.petStyle
@@ -35137,12 +36224,18 @@ index df61d03..37f6efd 100644
          typography = typography,
      ) {
 +        val dens = androidx.compose.ui.platform.LocalDensity.current
++        // [Mines-38.9.7] user 21:15 「不要大字」 (realme 480 dpi): the design is drawn at ~427 dp across (405 dpi); a phone at
++        // 480 dpi made every row ~18 % bigger. Keep ≥ 400 dp across the short edge (HomeFixCore.density); never enlarge.
++        val conf = androidx.compose.ui.platform.LocalConfiguration.current
++        val shortPx = (minOf(conf.screenWidthDp, conf.screenHeightDp) * dens.density).toInt()
++        val d2 = com.openminis.app.plus.HomeFixCore.density(dens.density, shortPx)
++        MinesDensity.applied = d2; MinesDensity.system = dens.density
          CompositionLocalProvider(
-+            androidx.compose.ui.platform.LocalDensity provides androidx.compose.ui.unit.Density(dens.density, dens.fontScale.coerceAtMost(1f)),
++            androidx.compose.ui.platform.LocalDensity provides androidx.compose.ui.unit.Density(d2, dens.fontScale.coerceAtMost(1f)),
              LocalChatPalette provides chatPalette,
              com.openminis.app.ui.plus.LocalMinesColors provides mc,
              content = content,
-@@ -207,23 +224,27 @@ private fun porcelainScheme(base: androidx.compose.material3.ColorScheme, m: com
+@@ -207,23 +230,27 @@ private fun porcelainScheme(base: androidx.compose.material3.ColorScheme, m: com
      surfaceVariant = m.surface2,
      onSurfaceVariant = m.ink2,
      surfaceContainerLowest = m.bg,
@@ -35176,6 +36269,13 @@ index df61d03..37f6efd 100644
  
  private fun scaledTypography(factor: Float): Typography {
      // [Mines-38.1] one size smaller, per the approved board (user 16:03 「字体是不是太大了」): page title 20,
+@@ -260,3 +287,6 @@ private fun scaledTypography(factor: Float): Typography {
+         labelSmall = base.labelSmall.scale(factor),
+     )
+ }
++
++/** [Mines-38.9.7] what MinisTheme applied (自检). */
++object MinesDensity { @Volatile var applied = 0f; @Volatile var system = 0f }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/theme/WarmBars.kt b/src/android/app/src/main/java/com/openminis/app/ui/theme/WarmBars.kt
 index 9c18509..512f8a2 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/theme/WarmBars.kt
@@ -35541,6 +36641,51 @@ index 0000000..912210d
 +        assertNull(ArchiveCore.archivesAt(Input(lastActivity = now, busy = true)))
 +    }
 +}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/BrowserHandoffCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/BrowserHandoffCoreTest.kt
+new file mode 100644
+index 0000000..86968ca
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/BrowserHandoffCoreTest.kt
+@@ -0,0 +1,39 @@
++package com.openminis.app.plus
++
++import com.openminis.app.browser.BrowserHandoffCore
++import com.openminis.app.browser.BrowserHandoffCore.TabLite
++import com.openminis.app.browser.BrowserHandoffCore.UserPage
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/** [Mines-38.9.7] agent takeover drives the user's tab / page with the same session. */
++class BrowserHandoffCoreTest {
++    @Test fun agentTakesTheUsersTab() {
++        val tabs = listOf(TabLite(0, false, true), TabLite(3, false, true))
++        assertEquals(3, BrowserHandoffCore.pickAgentTab(3, tabs))          // was: tab 0
++        assertEquals(0, BrowserHandoffCore.pickAgentTab(3, listOf(TabLite(0, false, true), TabLite(3, true, true))))
++        assertEquals(0, BrowserHandoffCore.pickAgentTab(null, tabs))
++        assertNull(BrowserHandoffCore.pickAgentTab(3, listOf(TabLite(3, false, false))))
++    }
++
++    @Test fun adoptOnlyFreshForeignNonIncognito() {
++        val now = 10_000_000L
++        val p = UserPage("https://console.example.com/home", false, now - 60_000, "{\"tok\":\"x\"}", poolKey = 1)
++        assertTrue(BrowserHandoffCore.adopt(p, now, poolHasTabs = false, poolKey = 2))
++        assertFalse(BrowserHandoffCore.adopt(p, now, poolHasTabs = true, poolKey = 2))
++        assertFalse(BrowserHandoffCore.adopt(p, now, false, 1))   // same pool: its own tab is used
++        assertFalse(BrowserHandoffCore.adopt(p.copy(at = now - 21 * 60_000L), now, false, 2))
++        assertFalse(BrowserHandoffCore.adopt(p.copy(incognito = true), now, false, 2))
++        assertEquals("https://console.example.com", p.origin)
++    }
++
++    @Test fun sessionStorageRestore() {
++        assertNull(BrowserHandoffCore.usableDump("{}")); assertNull(BrowserHandoffCore.usableDump("")); assertNull(BrowserHandoffCore.usableDump("nope"))
++        val d = BrowserHandoffCore.usableDump("{\"tok\":\"abc\"}")!!
++        val js = BrowserHandoffCore.restoreSessionJs("https://a.example", d)
++        assertTrue(js.contains("location.origin!==\"https://a.example\"")); assertTrue(js.contains("\"tok\":\"abc\"")); assertTrue(js.contains("__mh_ho"))
++    }
++}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/ClashConfigCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/ClashConfigCoreTest.kt
 new file mode 100644
 index 0000000..fb51493
@@ -35664,6 +36809,43 @@ index 0000000..66253bf
 +    @Test fun namedIdentityCarriedOver() {
 +        val p = ConnDedupe.plan(listOf(E("cloudflare", "chrome", "Chrome 已登录"), E("cloudflare#2", "key", "me@example.com", "t"))) { "cloudflare" }
 +        assertEquals("me@example.com", p[0].account)
++    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/EngineerModeTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/EngineerModeTest.kt
+new file mode 100644
+index 0000000..8f3718b
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/EngineerModeTest.kt
+@@ -0,0 +1,31 @@
++package com.openminis.app.plus
++
++import com.openminis.app.agent.EngineerMode
++import com.openminis.app.tools.AgentToolSwitch
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import java.io.File
++
++/** [Mines-38.9.7] 高级工程模式: rule text, default on, and the system prompt appends it like 技能优先. */
++class EngineerModeTest {
++    @Test fun promptSaysWhatItMust() {
++        val p = EngineerMode.PROMPT
++        listOf("plan", "Read before you edit", "Verify after every change", "read the error", "more than 2 times", "skill", "Minimal", "NOT verified", "truly blocked")
++            .forEach { assertTrue("missing: $it", p.contains(it)) }
++    }
++
++    @Test fun defaultOn() {
++        assertEquals("mines.agent.engineer.enabled", AgentToolSwitch.ENGINEER.key)
++        assertTrue(AgentToolSwitch.ENGINEER.defaultValue)
++    }
++
++    @Test fun includedInSystemPrompt() {
++        val f = listOf(File("src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt"), File("app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt")).first { it.exists() }
++        val t = f.readText()
++        val i = t.indexOf("AgentToolSwitch.ENGINEER.isEnabled(context)")
++        assertTrue("ENGINEER gate missing in buildSystemPrompt", i > 0)
++        assertTrue(t.indexOf("append(com.openminis.app.agent.EngineerMode.PROMPT)", i) in i..(i + 300))
++        assertTrue("must come after 技能优先", t.indexOf("SkillFirst.PROMPT") in 1 until i)
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/FeedRefreshTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/FeedRefreshTest.kt
@@ -36158,6 +37340,53 @@ index 0000000..f9bc346
 +        assertTrue("dark tint saturation ${sat(dark)}", sat(dark) < 0.15f)
 +    }
 +}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/HomeFixCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/HomeFixCoreTest.kt
+new file mode 100644
+index 0000000..37aef96
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/HomeFixCoreTest.kt
+@@ -0,0 +1,41 @@
++package com.openminis.app.plus
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/** [Mines-38.9.7] greeting list = count, weather never blank, sky reason, density cap (phone 21:15/21:16). */
++class HomeFixCoreTest {
++    private fun t(sid: String, st: TaskProgressCore.St, at: Long, goal: String = "g$sid") = TaskProgressCore.Task(sid = sid, goal = goal, st = st, updatedAt = at, reason = "要你选")
++
++    @Test fun waitingMatchesCount() {
++        val now = 100_000_000L
++        val all = listOf(t("a", TaskProgressCore.St.WAITING, now - 10), t("b", TaskProgressCore.St.WAITING, now - 5), t("c", TaskProgressCore.St.RUNNING, now),
++            t("d", TaskProgressCore.St.WAITING, now - 25 * 3_600_000L), t("gone", TaskProgressCore.St.WAITING, now))
++        val w = HomeFixCore.waiting(all, setOf("a", "b", "c", "d"), now, mapOf("b" to "项目地址"))
++        assertEquals(listOf("b", "a"), w.map { it.sid })
++        assertEquals("项目地址", w[0].title); assertEquals("ga", w[1].title)
++        // the greeting's number is this list's size
++        val s = TaskProgressCore.summary(all.filter { it.sid in setOf("a", "b", "c", "d") }, now)
++        assertEquals(s.waiting, w.size)
++    }
++
++    @Test fun weatherAlwaysSaysSomething() {
++        assertEquals(HomeFixCore.WxWhy.NO_PERMISSION, HomeFixCore.weatherWhy(false, null, false, false, null))
++        assertEquals("设置城市", HomeFixCore.weatherChip(HomeFixCore.WxWhy.NO_PERMISSION))
++        assertEquals(HomeFixCore.WxWhy.STALE, HomeFixCore.weatherWhy(true, 2 * 3_600_000L, true, false, null))
++        assertEquals(HomeFixCore.WxWhy.OK, HomeFixCore.weatherWhy(true, 60_000L, true, false, null))
++        HomeFixCore.WxWhy.values().forEach { assertTrue(HomeFixCore.weatherChip(it).isNotBlank()) }
++    }
++
++    @Test fun skyReason() {
++        assertTrue(HomeFixCore.skyWhy("夜晚", "shader", true, false, null, 21, 13).contains("没有天气，按时间 21:13"))
++        assertTrue(HomeFixCore.skyWhy("夜晚", "shader", true, true, 3, 21, 13).contains("照片壁纸"))
++    }
++
++    @Test fun densityCap() {
++        assertEquals(2.7f, HomeFixCore.density(3.0f, 1080), 0.001f)     // phone 480 dpi → ~400 dp wide
++        assertEquals(2.53f, HomeFixCore.density(2.53f, 1080), 0.001f)   // design emulator (405 dpi) unchanged
++        assertEquals(2.0f, HomeFixCore.density(2.0f, 0), 0.001f)
++    }
++}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/HomeWeatherCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/HomeWeatherCoreTest.kt
 new file mode 100644
 index 0000000..f3440f2
@@ -36427,6 +37656,60 @@ index 0000000..ed1e51e
 +        assertTrue(v.length < 200)
 +        val t = ImageOnDemandCore.marker("a.png", "/p/a.png", "/p/a.png", "image/png", 1000, 0, 0, false)
 +        assertFalse(t.contains("read_image")); assertTrue(t.contains("不能看图片")); assertFalse(t.contains("原图"))
++    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/IncognitoCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/IncognitoCoreTest.kt
+new file mode 100644
+index 0000000..6769144
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/IncognitoCoreTest.kt
+@@ -0,0 +1,48 @@
++package com.openminis.app.plus
++
++import com.openminis.app.browser.IncognitoCore
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import java.io.File
++
++/** [Mines-38.9.7] 无痕标签 rules + wiring (separate profile, wiped on close, never handed over / recorded). */
++class IncognitoCoreTest {
++    private fun src(rel: String): String =
++        listOf(File("src/main/java/com/openminis/app/$rel"), File("app/src/main/java/com/openminis/app/$rel")).first { it.exists() }.readText()
++
++    @Test fun planRefusesWithoutProfiles() {
++        assertEquals(IncognitoCore.Plan.Open, IncognitoCore.plan(true))
++        val r = IncognitoCore.plan(false)
++        assertTrue(r is IncognitoCore.Plan.Refuse && r.why.contains("WebView"))
++        assertFalse(IncognitoCore.selfCheck(false, null).first)
++        assertTrue(IncognitoCore.selfCheck(true, "21:00 已清除").second.contains("已清除"))
++    }
++
++    @Test fun incognitoFeedsNothing() {
++        assertFalse(IncognitoCore.recordsHistory(true)); assertFalse(IncognitoCore.feedsAccounts(true))
++        assertFalse(IncognitoCore.handsOver(true)); assertFalse(IncognitoCore.persistsTabs(true))
++        assertTrue(IncognitoCore.recordsHistory(false) && IncognitoCore.feedsAccounts(false) && IncognitoCore.persistsTabs(false))
++        assertEquals("无痕 · 百度", IncognitoCore.title("百度", true)); assertEquals("百度", IncognitoCore.title("百度", false))
++    }
++
++    @Test fun wiring() {
++        val pool = src("browser/BrowserTabPool.kt")
++        assertTrue(pool.contains("if (incognito && !Incognito.attach(webView))"))
++        assertTrue("profile must be set before PayCards touches the WebView",
++            pool.indexOf("Incognito.attach(webView)") < pool.indexOf("PayCards.install(webView)"))
++        assertTrue(pool.contains("IncognitoCore.persistsTabs(incognito)"))
++        val mgr = src("browser/BrowserUseManager.kt")
++        assertTrue(mgr.contains("IncognitoCore.feedsAccounts(incognito)") && mgr.contains("IncognitoCore.recordsHistory(incognito)"))
++        val inc = src("browser/Incognito.kt")
++        assertTrue(inc.contains("removeAllCookies") && inc.contains("deleteAllData") && inc.contains("clearHistory") && inc.contains("deleteProfile"))
++        val home = src("ui/sessions/SessionListScreen.kt")
++        assertTrue("home browser must be the shared pool", home.contains("sharedBrowserTabPool"))
++        assertFalse(home.contains("remember { com.openminis.app.browser.BrowserTabPool(context) }"))
++        assertTrue(home.contains("BrowserTabPool(context, incognito = true)") && home.contains("Incognito.close("))
++        val sheet = src("ui/browser/BrowserSheet.kt")
++        assertTrue(sheet.contains("BrowserHandoff.noteUser(") && sheet.contains("tabPool.incognito"))
++        assertTrue(src("browser/BrowserHandoff.kt").contains("if (incognito) return"))
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/KeychainCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/KeychainCoreTest.kt
@@ -36749,6 +38032,81 @@ index 0000000..2fe9b67
 +        assertEquals(null, MailImap.hostFor("a@unknown-domain.xyz"))
 +    }
 +}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/MarketGitCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/MarketGitCoreTest.kt
+new file mode 100644
+index 0000000..f9a4564
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/MarketGitCoreTest.kt
+@@ -0,0 +1,38 @@
++package com.openminis.app.plus
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/** [Mines-38.9.7] GitHub SSH → HTTPS for market installs (phone 21:22 「安装 rea 没成功 / 没有权限」). */
++class MarketGitCoreTest {
++    @Test fun specs() {
++        assertEquals("git+https://github.com/morluto/rea.git", MarketGitCore.httpsSpec("github:morluto/rea"))
++        assertEquals("git+https://github.com/morluto/rea.git", MarketGitCore.httpsSpec("git+ssh://git@github.com/morluto/rea.git"))
++        assertEquals("git+https://github.com/a/b.git#v1", MarketGitCore.httpsSpec("git@github.com:a/b.git#v1"))
++        assertEquals("dsh-whale-widget@latest", MarketGitCore.httpsSpec("dsh-whale-widget@latest"))
++    }
++    @Test fun env() {
++        val e = MarketGitCore.GIT_ENV
++        assertEquals("0", e["GIT_TERMINAL_PROMPT"]); assertEquals("2", e["GIT_CONFIG_COUNT"])
++        assertEquals("ssh://git@github.com/", e["GIT_CONFIG_VALUE_0"]); assertEquals("git@github.com:", e["GIT_CONFIG_VALUE_1"])
++        assertTrue(e["GIT_CONFIG_KEY_0"]!!.endsWith(".insteadOf"))
++    }
++    @Test fun reasons() {
++        val log = "npm error command git --no-replace-objects ls-remote ssh://git@github.com/morluto/rea.git\nnpm error git@github.com: Permission denied (publickey)."
++        assertTrue(MarketGitCore.isPublickey(log))
++        assertTrue(MarketGitCore.reason(log)!!.contains("已改用 HTTPS 重试"))
++        assertFalse(MarketGitCore.reason(log)!!.contains("没有权限"))
++        assertNull(MarketGitCore.reason("npm error 404 Not Found"))
++    }
++    @Test fun kinds() {
++        assertFalse(MarketGitCore.classify("dsh-desktop", "为 DeepSeek Harness (DSH) 插件生态打造的现代化桌面端", emptyList(), "client", "unsupported").canTry)
++        assertEquals("资料库", MarketGitCore.classify("awesome-gpt-image-2", "GPT Image 2 提示词与案例库", emptyList(), "model-inference", "unsupported").pill)
++        assertTrue(MarketGitCore.classify("rea", "Reverse engineer anything", listOf("dsh-plugin", "cordis"), "agent-workflow", "unsupported").canTry)
++        assertEquals(null, MarketGitCore.classify("x", "", emptyList(), "", "verified").pill)
++        assertFalse(MarketGitCore.classify("deepseek-harness", "DeepSeek Harness: Everything is a Plugin.", listOf("dsh-plugin"), "", "unsupported").canTry)
++        assertFalse(MarketGitCore.classify("reactive-resume", "resume builder", emptyList(), "client", "unsupported").canTry)
++    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/MemohKeyCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/MemohKeyCoreTest.kt
+new file mode 100644
+index 0000000..c1339fc
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/MemohKeyCoreTest.kt
+@@ -0,0 +1,25 @@
++package com.openminis.app.plus
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/** [Mines-38.9.7] Memoh = OpenAI-compatible endpoint with a key (no web sign-in). Demo addresses only. */
++class MemohKeyCoreTest {
++    @Test fun bases() {
++        assertEquals("http://192.0.2.10:8794/v1", MemohKeyCore.v1Base("192.0.2.10:8794"))
++        assertEquals("http://192.0.2.10:8794/v1", MemohKeyCore.v1Base("http://192.0.2.10:8794/v1/"))
++        assertEquals("https://m.example.com/v1", MemohKeyCore.v1Base("https://m.example.com"))
++        assertNull(MemohKeyCore.v1Base("  "))
++    }
++    @Test fun verdicts() {
++        assertTrue(MemohKeyCore.verdict(200, true).first)
++        assertEquals("服务器在线，要填 key", MemohKeyCore.verdict(401, false).second)
++        assertFalse(MemohKeyCore.verdict(401, true).first)
++        assertEquals("gpt-x", MemohKeyCore.firstModel("""{"data":[{"id":"gpt-x"},{"id":"y"}]}"""))
++        assertEquals("自建：192.0.2.10:8794", MemohKeyCore.where("http://192.0.2.10:8794/v1"))
++        assertEquals("http://192.0.2.10:8794", MemohKeyCore.suggestFrom(listOf("192.0.2.10")))
++    }
++}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/ReachCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/ReachCoreTest.kt
 new file mode 100644
 index 0000000..cd2afa7
@@ -36990,10 +38348,10 @@ index 0000000..f82ce24
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/SkillHubCnTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/SkillHubCnTest.kt
 new file mode 100644
-index 0000000..53d4b5f
+index 0000000..d9a1334
 --- /dev/null
 +++ b/src/android/app/src/test/java/com/openminis/app/plus/SkillHubCnTest.kt
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,95 @@
 +package com.openminis.app.plus
 +
 +import org.junit.Assert.assertEquals
@@ -37009,7 +38367,8 @@ index 0000000..53d4b5f
 +
 +    @Test fun pluginsParse() {
 +        val p = SkillHubCn.parsePlugins(fx("plugins.json"))
-+        assertEquals(4, p.items.size)
++        assertEquals(3, p.items.size)   // [38.9.7] deepseek-harness (the host itself) is not listed
++        assertEquals(1, p.hidden)
 +        assertTrue(p.total > 1000)
 +        val first = p.items[0]
 +        assertTrue(first.owner.isNotBlank() && first.name.isNotBlank())
