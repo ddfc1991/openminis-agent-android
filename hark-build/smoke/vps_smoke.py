@@ -5028,6 +5028,16 @@ def b396x(res):
             sh("input swipe 540 1700 540 900 400"); time.sleep(0.8)
         result_json("group", "i396 proxyoff", timeout=20)
     step("clash", clash)
+    # 6 [i17] three-path server check: the runner's sshd (10.0.2.2:22) is up; a blackhole address must never be called
+    #   「在线」, and a phone-side-only failure must never be 「服务器挂了」
+    def reach():
+        up = result_json("group", "i396 reach 10.0.2.2 22", timeout=60); o["reach_up"] = up
+        dead = result_json("group", "i396 reach 10.255.255.1 22", timeout=90); o["reach_dead"] = dead
+        print(f"I396X REACH | up {json.dumps(up, ensure_ascii=False)} | dead {json.dumps(dead, ensure_ascii=False)}", flush=True)
+        if not (isinstance(up, dict) and up.get("kind") == "OK_DIRECT"): selftest_fail.append(f"i396x reach: runner sshd not 在线: {up}")
+        if not (isinstance(dead, dict) and dead.get("kind") in ("DOWN", "UNKNOWN")): selftest_fail.append(f"i396x reach: blackhole verdict wrong: {dead}")
+        if isinstance(dead, dict) and dead.get("kind") == "UNKNOWN" and dead.get("down"): selftest_fail.append("i396x reach: UNKNOWN flagged as down")
+    step("reach", reach)
     r8["i396x"] = o
     print("I396X UNTESTABLE " + json.dumps(UNTESTABLE, ensure_ascii=False), flush=True)
     print("I396X RESULT " + json.dumps(o, ensure_ascii=False)[:12000], flush=True)
