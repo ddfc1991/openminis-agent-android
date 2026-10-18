@@ -8,7 +8,7 @@ shipped): launch -> home Today card -> 工作位置 -> add a reachable SSH serve
 工作位置. After every step it checks the app process is still alive and at the
 end prints every FATAL EXCEPTION from logcat. Exit 1 when the app crashed.
 """
-import json, os, re, struct, subprocess, sys, time, xml.etree.ElementTree as ET
+import json, os, re, struct, subprocess, sys, time, urllib.request, xml.etree.ElementTree as ET
 
 PKG = os.environ.get("PKG", "com.openminis.mines.plus")
 OUT = os.environ.get("OUT", "smoke-out")
@@ -90,6 +90,11 @@ try:
     I395B = "i395b" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
 except Exception:
     I395 = False; I395B = False
+try:
+    I396 = "i396" in open("hark-build/smoke/target").read().splitlines()[1:2][0]
+    I396M = "i396m" in open("hark-build/smoke/target").read().splitlines()[1:2][0]   # [38.9.6 i13] Memoh / proxy auth / sheets
+except Exception:
+    I396 = False; I396M = False
 FONT_SCALE = "1.18"
 step_no = 0
 crashed = []
@@ -3218,6 +3223,7 @@ def main():
         else: fns = (b387_linkall, b387_noblack, b387_persist, b387_platforms)
         if HUB: fns = tuple(fns) + (b3891_hub,)   # [38.9.1 c] hub runs after the UI passes
         if I395: fns = (b395_i2, b395_i) if I395B else (b395_i,)   # [38.9.5 i] build-i gate only: 一键关联 / 一键重新登录, gateway, new screens light + dark
+        if I396: fns = ((b396m,) if I396M else ()) + (b396,) + (tuple(fns) if I395 else ())   # [38.9.6 i12] glass / auto progress / archive shots first, then the full i395 pass + 自检
         elif H3894: fns = (b3894_h,) + tuple(fns)   # [38.9.4 h] SkillHub market, Memoh, a11y wording, 账号 entries, glass / opaque reading, g2 defects first
         for fn in fns:
             try:
@@ -4806,6 +4812,267 @@ def b395_i2(res):
     result_json("group", "greet off")
     r8["i395b"] = o
     print("I395B RESULT " + json.dumps(o, ensure_ascii=False)[:4000], flush=True)
+
+
+def b396m(res):
+    """[38.9.6 i13] Memoh (account 「\\u0001\\u0001」 + 正常 bug: cleaned record, 要重新登录 without a session, __Host- cookie kept
+    across restart, self-hosted refused password → secure login card once, right password → token), the login card light/dark,
+    proxy with auth (自己填代理 user/password → local split proxy adds Proxy-Authorization, sandbox + Gmail through it),
+    and the glass sheets: ☰, + 附件, 选择模型, chat + home input, slider at minimum over a busy photo, light + dark."""
+    r8 = R8(res); o = {}
+    def step(name, f):
+        try: f()
+        except Exception as e:
+            import traceback; traceback.print_exc(); page_missing.append(f"i396m {name} error {e}")
+        if not alive(): crashed.append(f"i396m {name}"); relaunch()
+    set_zh()
+    # 1 Memoh: bad record from 38.9.5 → cleaned, not 正常
+    def memoh_record():
+        o["bad"] = result_json("group", "i396 memohbad", timeout=20)
+        c = result_json("group", "i396 memohcheck", timeout=40); o["check1"] = c
+        if isinstance(c, dict):
+            if any("\\u0001" in x or "\u0001" in x for x in c.get("ids", [])): selftest_fail.append(f"i396m memoh: account still 「\\u0001」: {c}")
+            if c.get("user"): selftest_fail.append(f"i396m memoh: memoh_user not cleaned: {c.get('user')!r}")
+            if "正常" in c.get("status", []): selftest_fail.append(f"i396m memoh: 正常 with no password and no session: {c}")
+        else: page_missing.append(f"i396m memohcheck: no result {str(c)[:80]}")
+        for mode, sfx in ((1, "light"), (2, "dark")):
+            theme388(mode); route("plus_keychain", 7)
+            if tap_text("Memoh", wait=5):
+                time.sleep(3); r = shot388(f"i396m-memoh-acct-{sfx}"); t = _txt(r); o["acct_" + sfx] = t[:400]
+                if "\\u0001" in t: selftest_fail.append(f"i396m memoh {sfx}: 账号 still shows \\u0001")
+                if "正常" in t: selftest_fail.append(f"i396m memoh {sfx}: 账号详情 shows 正常 without password / session")
+                back(1)
+            else: page_missing.append(f"i396m memoh {sfx}: Memoh row not on 账号 page")
+        theme388(1)
+    step("memoh-record", memoh_record)
+    # 2 __Host- session cookie survives losing it + a restart (SessionKeeper restore without Domain=)
+    def memoh_cookie():
+        a = result_json("group", "i396 memohcookie set", timeout=20); o["ck_set"] = a
+        b = result_json("group", "i396 memohcookie drop", timeout=20); o["ck_drop"] = b
+        sh(f"am force-stop {PKG}"); time.sleep(1); relaunch(); time.sleep(6)
+        c = result_json("group", "i396 memohcookie get", timeout=20); o["ck_after_restart"] = c
+        if not (isinstance(a, dict) and a.get("cookie")): page_missing.append(f"i396m cookie: not set {a}")
+        if not (isinstance(c, dict) and c.get("cookie")): selftest_fail.append(f"i396m cookie: __Host- Memoh session lost after restart {c}")
+        d = result_json("group", "i396 memohcheck", timeout=40); o["check2"] = d
+        if isinstance(d, dict) and "要重新登录" in d.get("status", []): selftest_fail.append(f"i396m memoh: 要重新登录 while the session cookie is there {d}")
+    step("memoh-cookie", memoh_cookie)
+    # 3 self-hosted: saved password refused → card asks once; right password → token
+    def memoh_card():
+        o["exp"] = result_json("group", "i396 memohexpire", timeout=20); time.sleep(5)
+        t1 = result_json("group", "i396 memohtok", timeout=10); o["tok1"] = t1
+        if not (isinstance(t1, dict) and t1.get("card")): selftest_fail.append(f"i396m memoh: no login card after the saved password was refused {t1}"); return
+        r = dump(); o["card_text"] = _txt(r)[:200]
+        if "密码不对" not in _txt(r): page_missing.append("i396m memoh card: 「密码不对，重新输入」 not shown")
+        pb = node_bounds(r, lambda n: (n.get("content-desc") or "") == "密码")
+        if pb:
+            sh(f"input tap {(pb[0] + pb[2]) // 2} {(pb[1] + pb[3]) // 2}"); time.sleep(1); type_text("good396"); time.sleep(1)
+            sh("input keyevent 111"); time.sleep(1)
+            if not tap_text("登录", exact=True, wait=3): page_missing.append("i396m memoh card: 登录 not found")
+            time.sleep(5); t2 = result_json("group", "i396 memohtok", timeout=10); o["tok2"] = t2
+            if not (isinstance(t2, dict) and t2.get("tok") == "ok"): selftest_fail.append(f"i396m memoh: right password did not give a token {t2}")
+        else: page_missing.append("i396m memoh card: 密码 field not found")
+        try: o["fake_logins"] = json.load(urllib.request.urlopen("http://127.0.0.1:8088/stats", timeout=5)).get("memoh_logins")
+        except Exception as e: o["fake_logins"] = f"err {e}"
+    step("memoh-card", memoh_card)
+    # 4 the login card (demo values; not FLAG_SECURE so it can be photographed) light + dark
+    for mode, sfx in ((1, "light"), (2, "dark")):
+        def card(sfx=sfx, mode=mode):
+            theme388(mode); b381_home(); time.sleep(2)
+            result_json("group", "i396 logincard refused", timeout=10); time.sleep(2.5)
+            r = shot388(f"i396m-cred-{sfx}"); o["cred_" + sfx] = _txt(r)[:200]; back(1); time.sleep(1)
+        step("cred-" + sfx, card)
+    theme388(1)
+    # 5 proxy with auth: 自己填代理 fields + the 自检 rows through the runner's auth-only proxy
+    def proxy():
+        p0 = result_json("group", "i396 proxyset", timeout=30); o["proxy"] = p0
+        route("plus_routing", 5)
+        for _ in range(3): sh("input swipe 540 1700 540 700 400"); time.sleep(0.8)
+        r = shot388("i396m-routing"); t = _txt(r); o["routing"] = t[:400]
+        for w in ("用户名", "密码"):
+            if w not in t: page_missing.append(f"i396m routing: 自己填代理 lacks 「{w}」")
+        if "proxy396" in t: selftest_fail.append("i396m routing: proxy password shown in clear text")
+        sc = result_json("group", "i396 selfcheck", timeout=220); o["selfcheck_proxy"] = sc
+        if isinstance(sc, list):
+            for row in sc:
+                if row.get("name") in ("沙箱代理出口", "Gmail 可达"): print(f"I396M PROXY | {row.get('name')} | ok={row.get('ok')} | {row.get('detail')}", flush=True)
+        try: log = open("fake-proxy.log").read().splitlines()
+        except Exception: log = []
+        o["proxy_log"] = log[-40:]
+        okl = [l for l in log if l.startswith("AUTH_OK")]; bad = [l for l in log if l.startswith("AUTH_BAD")]
+        print(f"I396M PROXYLOG ok={len(okl)} bad={len(bad)} sample={okl[:6]}", flush=True)
+        if not any("api.ipify.org" in l for l in okl): selftest_fail.append(f"i396m proxy: sandbox exit check never went through the auth proxy (ok={len(okl)}, bad={len(bad)})")
+        if not any("google.com" in l for l in okl): selftest_fail.append("i396m proxy: Gmail check never went through the auth proxy")
+        if bad and not okl: selftest_fail.append("i396m proxy: every request reached the proxy WITHOUT Proxy-Authorization")
+        result_json("group", "i396 proxyoff", timeout=20)
+    step("proxy", proxy)
+    # 6 glass sheets light + dark (☰ / + 附件 / 选择模型 / inputs / slider minimum over a busy photo)
+    def sheets(sfx):
+        r = b381_home(); time.sleep(2); shot388(f"i396m-home-input-{sfx}")
+        mb = node_bounds(r, lambda n: (n.get("content-desc") or "") == "更多")
+        if mb: sh(f"input tap {(mb[0] + mb[2]) // 2} {(mb[1] + mb[3]) // 2}"); time.sleep(2); shot388(f"i396m-menu-{sfx}"); back(1); time.sleep(1)
+        else: page_missing.append(f"i396m {sfx}: ☰ not found")
+        if tap_text("今天新加坡天气", wait=4) or tap_text("你好，我是测试模型。", wait=3):
+            time.sleep(2); shot388(f"i396m-chat-input-{sfx}")
+            r = dump(); ab = node_bounds(r, lambda n: (n.get("content-desc") or "") == "附件")
+            if ab: sh(f"input tap {(ab[0] + ab[2]) // 2} {(ab[1] + ab[3]) // 2}"); time.sleep(2); shot388(f"i396m-attach-{sfx}"); back(1); time.sleep(1)
+            else: page_missing.append(f"i396m {sfx}: + 附件 not found")
+            r = dump()
+            if tap_text("默认模型", wait=3, root=r) or tap_text("smoke-model", wait=2, root=r) or tap_text("Default Models", wait=2, root=r):
+                time.sleep(2); r = shot388(f"i396m-picker-{sfx}"); t = _txt(r)
+                if "Default Models" in t: selftest_fail.append(f"i396m {sfx}: picker still shows 「Default Models」")
+                back(1); time.sleep(1)
+            else: page_missing.append(f"i396m {sfx}: model picker header not found")
+            back(1); time.sleep(1)
+        else: page_missing.append(f"i396m {sfx}: no chat to open")
+        # worst case: busy photo wallpaper + glass slider at its minimum, ☰ over it
+        selftest_json("uiprep", "杨arling|gen", timeout=20); result_json("group", "lookset 0.0|", timeout=10); time.sleep(2)
+        r = b381_home(); time.sleep(2); shot388(f"i396m-worst-home-{sfx}")
+        mb = node_bounds(r, lambda n: (n.get("content-desc") or "") == "更多")
+        if mb: sh(f"input tap {(mb[0] + mb[2]) // 2} {(mb[1] + mb[3]) // 2}"); time.sleep(2.5); shot388(f"i396m-worst-menu-{sfx}"); back(1)
+        result_json("group", "lookset reset", timeout=10); result_json("group", "wallpaper off", timeout=30)
+    for mode, sfx in ((1, "light"), (2, "dark")):
+        theme388(mode); step("sheets-" + sfx, lambda sfx=sfx: sheets(sfx))
+    theme388(1)
+    r8["i396m"] = o
+    print("I396M RESULT " + json.dumps(o, ensure_ascii=False)[:8000], flush=True)
+
+
+def b396(res):
+    """[38.9.6 i12] user 2026-10-18: ☰ menu + progress card = one real glass surface (no inner white block, no solid card),
+    暖瓷 tint, every chat has goal / steps / summary (new chat with automatic steps, plain Q&A, chat idle 1 day rebuilt from
+    history), archive (one tap + 撤销, 3-day auto, 已归档 list, chat ⋯ menu), a dialog + another bottom sheet, light + dark;
+    then the in-app 自检 (MinesSelfCheck) in both themes as a per-item table."""
+    r8 = R8(res); o = {}
+    def step(name, f):
+        try: f()
+        except Exception as e:
+            import traceback; traceback.print_exc(); page_missing.append(f"i396 {name} error {e}")
+        if not alive(): crashed.append(f"i396 {name}"); relaunch()
+    set_zh()
+    o["seed"] = result_json("group", "i396 seed", timeout=90)
+    def row_pill(r, title):
+        tb = node_bounds(r, lambda n: (n.get("text") or "").startswith(title))
+        if not tb: return None, None
+        ty = (tb[1] + tb[3]) // 2
+        pills = [p for p in all_desc(r, "进度：") if p[1] >= tb[1] - 20 and p[1] <= tb[3] + 160]
+        return (min(pills, key=lambda p: abs(p[1] - ty)) if pills else None), tb
+    def sheet_for(title, tag, sfx, wants):
+        r = b381_home(); time.sleep(3)
+        p, tb = row_pill(r, title)
+        if not p:
+            page_missing.append(f"i396 {sfx}: no ⋯ pill on the row 「{title}」 (title {tb})"); return None
+        sh(f"input tap {p[0]} {p[1]}"); time.sleep(3.5)
+        r = shot388(f"i396-sheet-{tag}-{sfx}"); t = _txt(r); o[f"sheet_{tag}_{sfx}"] = t[:500]
+        if "还没有步骤表" in t: selftest_fail.append(f"i396 {sfx}: 「还没有步骤表」 still on the {tag} card")
+        for w in wants:
+            if w not in t: selftest_fail.append(f"i396 {sfx}: {tag} card lacks 「{w}」: {t[:160]}")
+        return t
+    def pages(sfx):
+        o["relive_" + sfx] = selftest("group", "i396 relive", timeout=30)[-80:]
+        r = b381_home(); time.sleep(4); r = shot388(f"i396-home-{sfx}"); t = _txt(r); o["home_" + sfx] = t[:500]
+        pills = all_desc(r, "进度："); o["pills_" + sfx] = len(pills)
+        if len(pills) < 3: selftest_fail.append(f"i396 {sfx}: only {len(pills)} ⋯ progress pills on home (want one on every row)")
+        if "上周的旧对话" in t: selftest_fail.append(f"i396 {sfx}: chat idle 5 days still on home (3-day auto archive)")
+        # ☰ menu (centre tap)
+        menu = node_bounds(r, lambda n: (n.get("content-desc") or "") == "更多")
+        if menu: sh(f"input tap {(menu[0] + menu[2]) // 2} {(menu[1] + menu[3]) // 2}")
+        time.sleep(2.5); r = shot388(f"i396-menu-{sfx}"); t = _txt(r); o["menu_" + sfx] = t[:300]
+        if "AI 群聊" not in t: selftest_fail.append(f"i396 {sfx}: ☰ menu did not open: {t[:100]}")
+        back(1); time.sleep(1)
+        sheet_for("帮我领取免费云浏览器", "auto", sfx, ("问：帮我领取免费云浏览器", "打开注册页", "填写邮箱", "等邮件验证码"))
+        back(1); time.sleep(1.5)
+        sheet_for("今天新加坡天气", "qa", sfx, ("已回答", "答：多云"))
+        back(1); time.sleep(1.5)
+        t = sheet_for("整理服务器日志", "idle", sfx, ("问：帮我看看服务器日志", "答：已重启"))
+        if t is not None and sfx == "light":
+            if tap_text("归档", exact=True, wait=1.2):
+                r = shot388(f"i396-undo-{sfx}"); t2 = _txt(r); o["undo_" + sfx] = t2[-300:]
+                if "已归档这个对话" not in t2: selftest_fail.append(f"i396 {sfx}: no 「已归档 · 撤销」 toast after 归档")
+                if "整理服务器日志" in t2: selftest_fail.append(f"i396 {sfx}: archived chat still on home")
+                if not tap_text("撤销", exact=True, wait=2): selftest_fail.append(f"i396 {sfx}: 撤销 not found")
+                time.sleep(1.5); t3 = _txt(dump())
+                if "整理服务器日志" not in t3: selftest_fail.append(f"i396 {sfx}: 撤销 did not bring the chat back")
+            else: selftest_fail.append(f"i396 {sfx}: 归档 button not on the progress card"); back(1)
+        elif t is not None: back(1)
+        time.sleep(1.5)
+        # 已归档 list via 全部 ›
+        r = b381_home(); time.sleep(2)
+        if tap_text("筛选对话", wait=2) or tap_text("全部", exact=True, wait=2):
+            r = shot388(f"i396-filter-{sfx}"); t = _txt(r)
+            if tap_text("已归档", wait=2.5):
+                r = shot388(f"i396-archived-{sfx}"); t = _txt(r); o["archived_" + sfx] = t[:400]
+                if "上周的旧对话" not in t: selftest_fail.append(f"i396 {sfx}: 已归档 list lacks the 5-day-old chat")
+                p, _ = row_pill(r, "上周的旧对话")
+                if p:
+                    sh(f"input tap {p[0]} {p[1]}"); time.sleep(3.5); r = shot388(f"i396-sheet-old-{sfx}"); t = _txt(r); o["sheet_old_" + sfx] = t[:300]
+                    if "取消归档" not in t: selftest_fail.append(f"i396 {sfx}: archived chat's card has no 取消归档")
+                    back(1); time.sleep(1)
+                tap_text("筛选对话", wait=2) and tap_text("全部", exact=True, wait=2)
+            else: page_missing.append(f"i396 {sfx}: 已归档 not in the 全部 menu: {t[:120]}"); back(1)
+        else: page_missing.append(f"i396 {sfx}: 全部 › filter not found")
+        # long-press row → glass row menu (归档 item)
+        r = b381_home(); time.sleep(2)
+        tb = node_bounds(r, lambda n: (n.get("text") or "").startswith("今天新加坡天气"))
+        if tb:
+            cx, cy = (tb[0] + tb[2]) // 2, (tb[1] + tb[3]) // 2
+            sh(f"input swipe {cx} {cy} {cx} {cy} 900"); time.sleep(2)
+            r = shot388(f"i396-rowmenu-{sfx}"); t = _txt(r); o["rowmenu_" + sfx] = t[:300]
+            if "归档" not in t: selftest_fail.append(f"i396 {sfx}: long-press menu has no 归档")
+            back(1); time.sleep(1)
+        # dialog: home weather (MinesDialog through the glass AlertDialog)
+        result_json("group", 'greet {"hour":15,"weather":"cloudy"}')
+        r = b381_home(); time.sleep(3); w = all_desc(r, "天气：")
+        if w:
+            sh(f"input tap {w[0][0]} {w[0][1]}"); time.sleep(2.5); r = shot388(f"i396-dialog-{sfx}"); o["dialog_" + sfx] = _txt(r)[:200]
+            back(1); time.sleep(1)
+        else: page_missing.append(f"i396 {sfx}: no weather item for the dialog shot")
+        # another bottom sheet: 账号 › ＋
+        route("plus_keychain", 6); r = dump()
+        a = all_desc(r, "添加：关联账号或添加身份")
+        if a:
+            sh(f"input tap {a[0][0]} {a[0][1]}"); time.sleep(2.5); r = shot388(f"i396-bsheet-{sfx}"); o["bsheet_" + sfx] = _txt(r)[:200]
+            back(1); time.sleep(1)
+        else: page_missing.append(f"i396 {sfx}: 账号 ＋ not found for the bottom-sheet shot")
+        back(1); time.sleep(1)
+        # chat ⋯ menu: 进度与步骤 + 归档 in every chat
+        r = b381_home(); time.sleep(2)
+        if tap_text("今天新加坡天气", wait=4):
+            r = dump(); mb = node_bounds(r, lambda n: (n.get("content-desc") or "") == "更多")
+            if mb: sh(f"input tap {(mb[0] + mb[2]) // 2} {(mb[1] + mb[3]) // 2}")
+            time.sleep(2); r = shot388(f"i396-chatmenu-{sfx}"); t = _txt(r); o["chatmenu_" + sfx] = t[:300]
+            for w_ in ("进度与步骤", "归档"):
+                if w_ not in t: selftest_fail.append(f"i396 {sfx}: chat ⋯ menu lacks {w_}")
+            if tap_text("进度与步骤", wait=3):
+                r = shot388(f"i396-chatsheet-{sfx}"); t = _txt(r); o["chatsheet_" + sfx] = t[:300]
+                if "已回答" not in t: selftest_fail.append(f"i396 {sfx}: chat 进度与步骤 card lacks the summary")
+                back(1); time.sleep(1)
+            else: back(1)
+            back(1); time.sleep(1)
+        else: page_missing.append(f"i396 {sfx}: Q&A chat row not found")
+    theme388(1)
+    step("light", lambda: pages("light"))
+    theme388(2)
+    step("dark", lambda: pages("dark"))
+    theme388(1)
+    # every listed chat has a table after the background pass (old / idle chats included)
+    selftest("group", "i396 backfill", timeout=60)
+    st = result_json("group", "i396 state", timeout=30); o["state"] = st
+    if isinstance(st, list):
+        no = [x.get("title") for x in st if not x.get("has") or not x.get("line")]
+        if no: selftest_fail.append(f"i396: chats without a progress table/summary after backfill: {no[:6]}")
+        old = [x for x in st if x.get("title", "").startswith("上周的旧对话")]
+        if old and not old[0].get("archived"): selftest_fail.append("i396: 5-day-old chat not auto-archived")
+    # in-app 自检, both themes
+    for mode, sfx in ((1, "light"), (2, "dark")):
+        theme388(mode)
+        sc = result_json("group", "i396 selfcheck", timeout=200); o["selfcheck_" + sfx] = sc
+        if isinstance(sc, list):
+            for row in sc: print(f"I396 SELFCHECK {sfx} | {'PASS' if row.get('ok') else ('WARN' if row.get('warn') else 'FAIL')} | {row.get('name')} | {row.get('detail')}", flush=True)
+        else: page_missing.append(f"i396 自检 {sfx}: no result ({str(sc)[:80]})")
+    theme388(1)
+    r8["i396"] = o
+    print("I396 RESULT " + json.dumps(o, ensure_ascii=False)[:8000], flush=True)
+
 
 def finish(lc):
     lc.terminate()

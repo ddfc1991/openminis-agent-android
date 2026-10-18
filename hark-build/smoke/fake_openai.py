@@ -240,6 +240,16 @@ fetch('/linkfake/send?'+k+'='+encodeURIComponent(v));document.getElementById('fc
             return self._json({"object": "list", "data": [{"id": "smoke-model", "object": "model", "owned_by": "smoke"}]})
         self._json({"ok": True})
     def do_POST(self):
+        # [Mines-38.9.6 i13] fake self-hosted Memoh: POST /memoh396/api/auth/login {username,password}; good396 → JWT, else 401
+        if self.path.startswith("/memoh396/"):
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(n) or b"{}")
+            STATS.setdefault("memoh_logins", []).append(body.get("password") == "good396")
+            if self.path.endswith("/auth/login"):
+                if body.get("password") == "good396":
+                    return self._json({"access_token": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzbW9rZSJ9.c21va2U", "token_type": "bearer"})
+                return self._json({"detail": "invalid credentials"}, 401)
+            return self._json({"detail": "not found"}, 404)
         if self.path.startswith("/v1/bot/publish") or self.path.startswith("/v3/chat") or "/manus/v2/task.create" in self.path:
             n = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(n) or b"{}")
