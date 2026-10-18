@@ -104,6 +104,11 @@ try:
     if "fast i397" in open("hark-build/smoke/target").read(): I397 = True
 except Exception:
     pass
+try:
+    I398 = "i398" in open("hark-build/smoke/target").read().splitlines()[1:2][0]   # [38.9.8] picker / stacked quick test / timeout / workflows
+except Exception:
+    I398 = False
+if I398: I397 = True
 if I397: FAST = True   # [i21b] b397 only runs inside the FAST gate (smoke 39136327758 ran the legacy path without it)
 FONT_SCALE = "1.18"
 step_no = 0
@@ -3237,7 +3242,8 @@ def main():
         else: fns = (b387_linkall, b387_noblack, b387_persist, b387_platforms)
         if HUB: fns = tuple(fns) + (b3891_hub,)   # [38.9.1 c] hub runs after the UI passes
         if I395: fns = (b395_i2, b395_i) if I395B else (b395_i,)   # [38.9.5 i] build-i gate only: 一键关联 / 一键重新登录, gateway, new screens light + dark
-        if I397: fns = (b397,)   # [38.9.7] its own short gate (1080x2412 / 480 dpi, custom avatar)
+        if I398: fns = (b398,)
+        elif I397: fns = (b397,)   # [38.9.7] its own short gate (1080x2412 / 480 dpi, custom avatar)
         elif I396: fns = ((b396x,) if I396X else ()) + ((b396m,) if I396M else ()) + (b396,) + (tuple(fns) if I395 else ())   # [38.9.6 i12] glass / auto progress / archive shots first, then the full i395 pass + 自检
         elif H3894: fns = (b3894_h,) + tuple(fns)   # [38.9.4 h] SkillHub market, Memoh, a11y wording, 账号 entries, glass / opaque reading, g2 defects first
         for fn in fns:
@@ -5335,7 +5341,7 @@ def b396(res):
     print("I396 RESULT " + json.dumps(o, ensure_ascii=False)[:8000], flush=True)
 
 
-def b397(res):
+def b397(res, sub=False):
     """[38.9.7] user's phone 1080x2412 / 480 dpi, custom avatar. Home weather skin + greeting 「N 件事等你」 tap (light + dark),
     应用代理 Manus 去登录 (no FATAL, never a bare white page) + Memoh 填 key, 无痕标签 open/close, browser takeover (home browser
     page → an empty chat pool's agent tab), 高级工程模式 switch, SkillHub market without desktop / panel rows, one DSH call, 自检."""
@@ -5378,7 +5384,7 @@ def b397(res):
         o["agents_add"] = [result_json("group", "agents add web:manus", timeout=10), result_json("group", "agents add memoh", timeout=10)]
         route("plus_app_agents", 6); r = shot(f"agents-{sfx}")
         mb = node_bounds(r, lambda n: (n.get("text") or "") == "Manus")
-        pills = [(x, y) for t, d, x, y, n in nodes(r) if (t or d) == "去登录" and mb and abs(y - (mb[1] + mb[3]) // 2) < 160]
+        pills = [(x, y) for t, d, x, y, n in nodes(r) if (t or d) == "去登录" and mb and -40 < y - (mb[1] + mb[3]) // 2 < 280]
         if not pills: page_missing.append(f"i397 agents {sfx}: Manus 去登录 not found"); 
         else:
             sh(f"input tap {pills[0][0]} {pills[0][1]}"); time.sleep(6); shot(f"manus-6s-{sfx}")
@@ -5391,7 +5397,7 @@ def b397(res):
             r = dump()
             if r is not None and not find(r, "Memoh"): route("plus_app_agents", 5); r = dump()
         mb = node_bounds(r, lambda n: (n.get("text") or "") == "Memoh")
-        pills = [(x, y) for t, d, x, y, n in nodes(r) if (t or d) in ("填 key", "去登录") and mb and abs(y - (mb[1] + mb[3]) // 2) < 160]
+        pills = [(x, y) for t, d, x, y, n in nodes(r) if (t or d) in ("填 key", "去登录") and mb and -40 < y - (mb[1] + mb[3]) // 2 < 280]
         if not pills: page_missing.append(f"i397 agents {sfx}: Memoh 填 key not found"); return
         sh(f"input tap {pills[0][0]} {pills[0][1]}"); time.sleep(3); r = shot(f"memoh-{sfx}"); t = _txt(r)
         o[f"memoh_{sfx}"] = t[:200]
@@ -5402,7 +5408,8 @@ def b397(res):
         r = b381_home(); time.sleep(2)
         mb = node_bounds(r, lambda n: (n.get("content-desc") or "") == "更多")
         if mb: sh(f"input tap {(mb[0] + mb[2]) // 2} {(mb[1] + mb[3]) // 2}"); time.sleep(2.5)
-        if not tap_text("无痕标签", wait=1.5): selftest_fail.append("i397 无痕标签 not in ☰ menu"); back(1); return
+        if not tap_text("无痕标签", wait=1.5):   # [i22] no back(): it sent Mines to the background in smoke 39140538050
+            shot("incog-menu"); selftest_fail.append("i397 无痕标签 not in ☰ menu"); b381_home(); return
         r = dump(); time.sleep(4); r = shot("incog-open"); t = _txt(r)
         st = result_json("group", "i397 incog", timeout=10); o["incog_state"] = st
         sup = isinstance(st, dict) and st.get("supported")
@@ -5479,6 +5486,12 @@ def b397(res):
             miss = [n for n in names if n not in got]
             if miss: selftest_fail.append(f"i397 自检 rows missing: {miss}")
         else: selftest_fail.append(f"i397 自检 did not answer ({str(rows)[:80]})")
+    if sub:   # [38.9.8] only the 38.9.7 gaps: Manus 去登录 / Memoh 填 key (both themes) + 无痕标签 entry
+        for mode, sfx in ((1, "light"), (2, "dark")):
+            theme388(mode); healthy_home(); step("agents-" + sfx, lambda sfx=sfx: agents(sfx))
+        theme388(1); healthy_home(); step("incog", incog)
+        print("I397 RESULT " + json.dumps(o, ensure_ascii=False)[:4000], flush=True)
+        return
     for mode, sfx in ((1, "light"), (2, "dark")):
         theme388(mode); healthy_home()
         step("home-" + sfx, lambda sfx=sfx: home(sfx))
@@ -5491,6 +5504,98 @@ def b397(res):
     step("dsh", dsh)
     step("selfcheck", selfcheck)
     print("I397 RESULT " + json.dumps(o, ensure_ascii=False)[:6000], flush=True)
+
+
+def b398(res):
+    """[38.9.8] 选择模型 with a 10-model 「免登录 AI（Mines）」 card (two 「Mines-Test」 bots) light + dark; 快速测试 stacked over it
+    (solid, page below dimmed) against a server that never answers → must stop with a real reason (≤ 60 s + margin);
+    home 未完成 marker, 工作流记录 page, 自检 rows; then the 38.9.7 gaps (Manus / Memoh pills, 无痕 entry)."""
+    o = res.setdefault("i398", {})
+    def step(name, f):
+        try: f()
+        except Exception as e:
+            import traceback; traceback.print_exc(); page_missing.append(f"i398 {name} error {e}")
+        if not alive(): crashed.append(f"i398 {name}"); recover(f"i398 {name}")
+    def shot(name):
+        r = snap("i398-" + name)
+        subprocess.run(f"cp {OUT}/{step_no:02d}-i398-{name}.png {OUT}/i398-{name}.png", shell=True)
+        return r
+    print("I398 screen", sh("wm size").strip(), sh("wm density").strip(), flush=True)
+    set_zh()
+    o["seedmodel"] = seed_model()
+    try: result_json("group", "wallpaper off")
+    except Exception: pass
+    o["seed"] = result_json("group", "i398 seedpicker", timeout=30)
+    print("I398 SEED", o["seed"], flush=True)
+    def picker(sfx):
+        o[f"open_{sfx}"] = result_json("group", "i398 picker", timeout=20); time.sleep(5)
+        r = shot(f"picker-{sfx}"); t = _txt(r)
+        for _ in range(4):
+            if "免登录" in t: break
+            scroll_down(); time.sleep(1); r = shot(f"picker-{sfx}"); t = _txt(r)
+        o[f"picker_{sfx}"] = t[:600]
+        if "免登录" not in t: selftest_fail.append(f"i398 picker {sfx}: 免登录 AI（Mines） card not seen")
+        names = [x for x in ((tt or d) for tt, d, _, _, _ in nodes(r)) if x and "Mines-Test" in x]
+        o[f"minestest_{sfx}"] = names
+        print(f"I398 MINES-TEST {sfx} {names}", flush=True)
+        if len(set(names)) < 2 and len(names) >= 2: selftest_fail.append(f"i398 picker {sfx}: two Mines-Test rows look the same {names}")
+        scroll_down(); time.sleep(1); r = shot(f"picker-end-{sfx}"); o[f"picker_end_{sfx}"] = _txt(r)[:300]
+        back(1); time.sleep(1.5); back(1); time.sleep(1)
+    def quick():
+        o["quick_open"] = result_json("group", "i398 picker coze:7696936574432591908", timeout=20)
+        time.sleep(7); r = shot("quick-3s"); t = _txt(r); o["quick_3s"] = t[:400]
+        if "快速测试" not in t: selftest_fail.append(f"i398 quick test sheet did not open over 选择模型 ({t[:120]})")
+        ov = result_json("group", "i396 overlay", timeout=10); o["quick_overlay"] = ov
+        t0 = time.time(); done = False
+        while time.time() - t0 < 100:
+            time.sleep(10); r = dump(); t = _txt(r)
+            if "测试中" not in t and "快速测试" in t: done = True; break
+        r = shot("quick-end"); t = _txt(r); o["quick_end"] = t[:500]; o["quick_secs"] = int(time.time() - t0) + 7
+        o["silent"] = result_json("group", "i398 silent", timeout=10)
+        print(f"I398 QUICK done={done} secs={o['quick_secs']} silent={o['silent']} text={t[:300]}", flush=True)
+        if not done: selftest_fail.append(f"i398 quick test still 测试中… after {o['quick_secs']} s")
+        elif not any(w in t for w in ("超时", "没有回应", "没回", "秒", "失败")): selftest_fail.append(f"i398 quick test ended without a reason ({t[:160]})")
+        back(1); time.sleep(1.5); back(1); time.sleep(1); back(1)
+    def marker():
+        r = b381_home(); time.sleep(3); r = shot("home"); 
+        b = node_bounds(r, lambda n: "未完成的事" in (n.get("content-desc") or ""))
+        o["marker"] = [d for _, _, d in all_desc(r, "未完成的事")][:1]
+        if not b: page_missing.append("i398 home: 未完成 marker not seen (seeded 2 waiting chats)"); return
+        sh(f"input tap {(b[0] + b[2]) // 2} {(b[1] + b[3]) // 2}"); time.sleep(2.5); r = shot("unfinished"); o["unfinished"] = _txt(r)[:300]; back(1)
+    def workflows():
+        route("plus_workflows", 5); r = shot("workflows"); t = _txt(r); o["workflows"] = t[:300]
+        if "工作流" not in t: page_missing.append(f"i398 工作流记录 page not seen ({t[:100]})")
+        back(1)
+    def clash():   # 订阅 / 正在启动… state with a real line (emulator: no phone Clash app)
+        route("plus_routing", 5); r = dump()
+        for _ in range(6):
+            if find(r, "Clash"): break
+            scroll_down(); time.sleep(1); r = dump()
+        r = shot("clash"); o["clash"] = _txt(r)[:400]
+        if "正在启动" in _txt(r): time.sleep(20); r = shot("clash-20s"); o["clash_20s"] = _txt(r)[:300]
+        back(1)
+    def selfcheck():
+        rows = result_json("group", "i396 selfcheck", timeout=240); o["selfcheck"] = rows
+        names = ("Clash 订阅", "免登录 AI 实测", "自我地图", "技能匹配", "工作流记录", "浏览器接管", "无痕标签")
+        if isinstance(rows, list):
+            for rw in rows:
+                if rw.get("name") in names: print(f"I398 SELFCHECK | {rw.get('name')} | ok={rw.get('ok')} | {rw.get('detail')}", flush=True)
+            miss = [n for n in names if n not in {rw.get("name") for rw in rows}]
+            if miss: selftest_fail.append(f"i398 自检 rows missing: {miss}")
+        else: selftest_fail.append(f"i398 自检 did not answer ({str(rows)[:80]})")
+    for mode, sfx in ((2, "dark"), (1, "light")):
+        theme388(mode); healthy_home(); step("picker-" + sfx, lambda sfx=sfx: picker(sfx))
+    theme388(2); healthy_home(); step("quick", quick)
+    theme388(1); healthy_home()
+    o["wait"] = result_json("group", "i397 wait", timeout=60)
+    step("marker", marker)
+    step("workflows", workflows)
+    step("clash", clash)
+    step("selfcheck", selfcheck)
+    print("I398 RESULT " + json.dumps(o, ensure_ascii=False)[:6000], flush=True)
+    try: b397(res, sub=True)
+    except Exception as e:
+        import traceback; traceback.print_exc(); page_missing.append(f"i398 b397 sub error {e}")
 
 
 def finish(lc):
