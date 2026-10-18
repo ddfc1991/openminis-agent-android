@@ -4062,10 +4062,10 @@ index 0000000..f00f354
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/IdentityStore.kt b/src/android/app/src/main/java/com/openminis/app/plus/IdentityStore.kt
 new file mode 100644
-index 0000000..b5358b5
+index 0000000..7f2c27c
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/IdentityStore.kt
-@@ -0,0 +1,225 @@
+@@ -0,0 +1,228 @@
 +package com.openminis.app.plus
 +
 +import android.content.Context
@@ -4131,6 +4131,9 @@ index 0000000..b5358b5
 +    @Synchronized fun removeIdent(c: Context, key: String) { init(c); _idents.value = _idents.value.filterNot { it.key == key }; save() }
 +
 +    /** Add / upgrade one account record; its identity (and provider identity) are registered too. */
++    /** smoke only (GroupSelfTest 'i396 memohbad'): store a record exactly as an older build did, bypassing the checks. */
++    @Synchronized fun smokeInject(c: Context, r: Rec) { init(c); _recs.value = _recs.value.filterNot { it.key == r.key } + r; save() }
++
 +    @Synchronized fun addRec(c: Context, r: Rec) {
 +        // [Mines-38.9.6 i13] never store control-char / escape-text account names
 +        if (LoginValueCore.badAccount(r.identity)) return addRec(c, r.copy(identity = LoginValueCore.cleanAccount(r.identity), identType = null))
@@ -10510,18 +10513,19 @@ index 1d773a2..5489e65 100644
          coroutineScope {
              val bg = slow.map { id -> async { one(id) } }
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-index af13c1b..6665be5 100644
+index af13c1b..080e3cb 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-@@ -2,6 +2,7 @@ package com.openminis.app.plus.group
+@@ -2,6 +2,8 @@ package com.openminis.app.plus.group
  
  import android.content.Context
  import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
 +import kotlinx.coroutines.flow.first
  import kotlinx.coroutines.runBlocking
  import org.json.JSONArray
  import org.json.JSONObject
-@@ -21,6 +22,207 @@ object GroupSelfTest {
+@@ -21,6 +23,267 @@ object GroupSelfTest {
          val rest = arg.substringAfter(' ', "")
          val parts = rest.split('|')
          when (cmd) {
@@ -10700,7 +10704,67 @@ index af13c1b..6665be5 100644
 +                            JSONObject().put("name", it.name).put("ok", it.ok).put("warn", it.warn).put("detail", com.openminis.app.plus.AccountLabel.maskText(it.detail).take(140)).put("ms", it.ms)
 +                        }).toString()
 +                    }
-+                    else -> "i396 seed | state | archive <sid> | restore <sid> | backfill | selfcheck"
++                    // [Mines-38.9.6 i13] Memoh + proxy checks (fake values only; nothing real is printed)
++                    "memohbad" -> {   // what 38.9.5 saved: account 「\u0001\u0001」 on memoh.net, no password, no cookie
++                        com.openminis.app.plus.IdentityStore.smokeInject(context, com.openminis.app.plus.IdentityCore.Rec("memoh.net", "Memoh", "\\u0001\\u0001", null,
++                            com.openminis.app.plus.IdentityCore.Method.WEB, sources = setOf("网页登录"), at = System.currentTimeMillis()))
++                        GroupPrefs.put("memoh_user", "\\u0001\\u0001")
++                        "seeded"
++                    }
++                    "memohcheck" -> {
++                        com.openminis.app.plus.IdentityStore.sync(context, force = true)
++                        val recs = com.openminis.app.plus.IdentityStore.recs.value.filter { it.site == "memoh.net" }
++                        val ks = runCatching { com.openminis.app.plus.Keychain.all(context).filter { it.host == "memoh.net" } }.getOrDefault(emptyList())
++                        JSONObject().put("ids", JSONArray(recs.map { it.identity })).put("status", JSONArray(ks.map { it.status.label }))
++                            .put("user", PresetAuth.memohUser() ?: "").put("cookie", PresetAuth.memohWebCookie()?.contains("__Host-memoh396") == true).toString()
++                    }
++                    "memohcookie" -> {
++                        val done = kotlinx.coroutines.CompletableDeferred<Unit>()
++                        val cm = android.webkit.CookieManager.getInstance()
++                        val u = "https://app.memoh.net/"
++                        when (arg2) {
++                            "set" -> {
++                                GroupPrefs.put("memoh_base", PresetAuth.memohApiBaseFor(u)); GroupPrefs.put("memoh_web", "1")
++                                android.os.Handler(android.os.Looper.getMainLooper()).post {
++                                    // a __Host- session cookie the way app.memoh.net sets it (host-only, Secure, no Max-Age)
++                                    runCatching { cm.setCookie(u, "__Host-memoh396=smoke; Path=/; Secure; HttpOnly; SameSite=Lax") { cm.flush(); done.complete(Unit) } }.onFailure { done.complete(Unit) }
++                                }
++                                kotlinx.coroutines.withTimeoutOrNull(5_000) { done.await() }
++                                com.openminis.app.plus.SessionKeeper.snapshot(context, 0L)
++                            }
++                            "drop" -> {   // the store loses it (what Chromium does to session cookies) — the snapshot must bring it back
++                                android.os.Handler(android.os.Looper.getMainLooper()).post {
++                                    runCatching { cm.setCookie(u, com.openminis.app.plus.LoginValueCore.deleteLines("__Host-memoh396", "memoh.net", false).first()) { cm.flush(); done.complete(Unit) } }.onFailure { done.complete(Unit) }
++                                }
++                                kotlinx.coroutines.withTimeoutOrNull(5_000) { done.await() }
++                            }
++                        }
++                        JSONObject().put("cookie", runCatching { cm.getCookie(u) }.getOrNull()?.contains("__Host-memoh396=smoke") == true)
++                            .put("restored", com.openminis.app.plus.SessionKeeper.isRestored()).toString()
++                    }
++                    "memohexpire" -> {   // self-hosted, saved password refused → the secure login card asks (once)
++                        GroupPrefs.put("memoh_base", "http://10.0.2.2:8088/memoh396/api"); GroupPrefs.put("memoh_user", "smoke"); GroupPrefs.put("memoh_web", null)
++                        PresetAuth.setKey(PresetRegistry.MEMOH, null)
++                        com.openminis.app.plus.PlusVault.setSecretExtra("preset_auth", "memoh_pass", "wrong396")
++                        PresetAuth.memohAllowAsk()
++                        kotlinx.coroutines.GlobalScope.launch(kotlinx.coroutines.Dispatchers.IO) { val t = PresetAuth.memohToken(force = true); GroupPrefs.put("smoke_memoh_tok", if (t != null) "ok" else "none") }
++                        "asking"
++                    }
++                    "memohtok" -> JSONObject().put("tok", GroupPrefs.get("smoke_memoh_tok") ?: "").put("card", com.openminis.app.plus.LoginCard.pending.value != null).toString()
++                    "proxyset" -> {   // smoke: the runner's authenticated proxy (fake_proxy.py, smoke/proxy396) as 自己填代理
++                        com.openminis.app.plus.SplitProxy.update(context) { it.copy(enabled = true, forSandbox = true, forApp = true, upstreamType = "http",
++                            upstreamHost = "10.0.2.2", upstreamPort = 3128, upstreamUser = "smoke", upstreamPass = "proxy396") }
++                        runCatching { com.openminis.app.sandbox.ExecutionCoordinator.broadcastProxyChange() }
++                        val st = com.openminis.app.plus.SplitProxy.settings.value
++                        JSONObject().put("primary", st.primary?.toString() ?: "").put("user", st.upstreamUser).put("pass_saved", st.upstreamPass.isNotEmpty())
++                            .put("running", com.openminis.app.plus.SplitProxy.running.value).put("web", com.openminis.app.plus.WebProxy.applied).toString()
++                    }
++                    "proxyoff" -> {
++                        com.openminis.app.plus.SplitProxy.update(context) { it.copy(upstreamHost = "", upstreamPort = 0, upstreamUser = "", upstreamPass = "") }
++                        runCatching { com.openminis.app.sandbox.ExecutionCoordinator.broadcastProxyChange() }; "off"
++                    }
++                    "logincard" -> { com.openminis.app.plus.LoginCard.demo(arg2 == "refused"); "shown" }
++                    else -> "i396 seed | state | archive <sid> | restore <sid> | backfill | selfcheck | memohbad | memohcheck | memohcookie set|drop|get | memohexpire | memohtok | proxyset | proxyoff | logincard [refused]"
 +                }
 +            }
 +            // [Mines-38.9.1] 应用代理: 'agents' list (mine + enabled), 'agents clear', 'agents add <id>'
@@ -10729,7 +10793,7 @@ index af13c1b..6665be5 100644
              "partners" -> {
                  val l = Partners.refresh(context, rescanApps = true)
                  JSONArray(l.map { JSONObject().put("id", it.id).put("name", it.spec.name).put("state", it.state.name).put("model", it.model).put("via", it.via) }).toString()
-@@ -136,6 +338,13 @@ object GroupSelfTest {
+@@ -136,6 +399,13 @@ object GroupSelfTest {
                  GroupStore.add(gid, GroupMsg(GroupStore.newId(), parts.getOrElse(2) { "host" }, "成员A", "", parts.getOrElse(3) { "好的，结论：照这个办。" }))
                  "ok"
              }
@@ -10743,7 +10807,7 @@ index af13c1b..6665be5 100644
              "kbrun" -> { val n = com.openminis.app.plus.ChatKnowledge.runNow(context); "organised=$n" }
              "kbstate" -> {
                  val l = com.openminis.app.plus.ChatKnowledge.load(context)
-@@ -151,6 +360,11 @@ object GroupSelfTest {
+@@ -151,6 +421,11 @@ object GroupSelfTest {
                  JSONObject().put("title", g.title).put("care", g.care).put("kind", g.kind)
                      .put("weather", com.openminis.app.plus.HomeGreeting.cachedWeather(context)?.let { "${it.code}/${it.temp}" } ?: "none").toString()
              }
@@ -10755,7 +10819,7 @@ index af13c1b..6665be5 100644
              "greetweather" -> {
                  context.getSharedPreferences("mines_greeting", Context.MODE_PRIVATE).edit().remove("w_try").apply()
                  com.openminis.app.plus.HomeGreeting.refreshWeather(context)
-@@ -238,6 +452,112 @@ object GroupSelfTest {
+@@ -238,6 +513,112 @@ object GroupSelfTest {
              "wallpaper" -> { com.openminis.app.plus.PlusPrefs.init(context)
                  if (parts.getOrElse(0) { "" } == "off") com.openminis.app.plus.PlusPrefs.update(context) { it.copy(wallpaper = "") }
                  com.openminis.app.plus.PlusPrefs.state.value.wallpaper.ifBlank { "none" } }
