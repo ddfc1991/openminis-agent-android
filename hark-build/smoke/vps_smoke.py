@@ -96,6 +96,10 @@ try:
     I396X = "i396x" in open("hark-build/smoke/target").read().splitlines()[1:2][0]   # [38.9.6 i15] weather / 快速测试 / 重试 / overlays / Clash
 except Exception:
     I396 = False; I396M = False; I396X = False
+try:
+    I397 = "i397" in open("hark-build/smoke/target").read().splitlines()[1:2][0]   # [38.9.7] takeover / 无痕 / 工程模式 / home fixes
+except Exception:
+    I397 = False
 FONT_SCALE = "1.18"
 step_no = 0
 crashed = []
@@ -3192,7 +3196,7 @@ def main():
     sh("settings put global window_animation_scale 0; settings put global transition_animation_scale 0; settings put global animator_duration_scale 0")
     adb("logcat", "-c")
     lc = subprocess.Popen(f"adb logcat -v threadtime > {OUT}/logcat.txt", shell=True)
-    if I396: wait_gms_stable()   # [i17]
+    if I396 or I397: wait_gms_stable()   # [i17]
     print(sh(f"am start -W -n {PKG}/com.openminis.app.MainActivity", timeout=90), flush=True)
     time.sleep(12)
     snap("launch")
@@ -3209,7 +3213,7 @@ def main():
         relaunch(); snap("relaunch-with-home"); check("cold launch with chats (home list)")
         dump_fatal()
         user_like_state()
-    if I396:   # [i17] onboarding may have been killed by the GMS death: make sure the app is up with a model
+    if I396 or I397:   # [i17] onboarding may have been killed by the GMS death: make sure the app is up with a model
         if not alive(): recover("onboarding")
         seed_model()
 
@@ -3228,7 +3232,8 @@ def main():
         else: fns = (b387_linkall, b387_noblack, b387_persist, b387_platforms)
         if HUB: fns = tuple(fns) + (b3891_hub,)   # [38.9.1 c] hub runs after the UI passes
         if I395: fns = (b395_i2, b395_i) if I395B else (b395_i,)   # [38.9.5 i] build-i gate only: 一键关联 / 一键重新登录, gateway, new screens light + dark
-        if I396: fns = ((b396x,) if I396X else ()) + ((b396m,) if I396M else ()) + (b396,) + (tuple(fns) if I395 else ())   # [38.9.6 i12] glass / auto progress / archive shots first, then the full i395 pass + 自检
+        if I397: fns = (b397,)   # [38.9.7] its own short gate (1080x2412 / 480 dpi, custom avatar)
+        elif I396: fns = ((b396x,) if I396X else ()) + ((b396m,) if I396M else ()) + (b396,) + (tuple(fns) if I395 else ())   # [38.9.6 i12] glass / auto progress / archive shots first, then the full i395 pass + 自检
         elif H3894: fns = (b3894_h,) + tuple(fns)   # [38.9.4 h] SkillHub market, Memoh, a11y wording, 账号 entries, glass / opaque reading, g2 defects first
         for fn in fns:
             try:
@@ -5323,6 +5328,162 @@ def b396(res):
     theme388(1)
     r8["i396"] = o
     print("I396 RESULT " + json.dumps(o, ensure_ascii=False)[:8000], flush=True)
+
+
+def b397(res):
+    """[38.9.7] user's phone 1080x2412 / 480 dpi, custom avatar. Home weather skin + greeting 「N 件事等你」 tap (light + dark),
+    应用代理 Manus 去登录 (no FATAL, never a bare white page) + Memoh 填 key, 无痕标签 open/close, browser takeover (home browser
+    page → an empty chat pool's agent tab), 高级工程模式 switch, SkillHub market without desktop / panel rows, one DSH call, 自检."""
+    o = res.setdefault("i397", {})
+    def step(name, f):
+        try: f()
+        except Exception as e:
+            import traceback; traceback.print_exc(); page_missing.append(f"i397 {name} error {e}")
+        if not alive(): crashed.append(f"i397 {name}"); recover(f"i397 {name}")
+    def shot(name):
+        r = snap("i397-" + name)
+        subprocess.run(f"cp {OUT}/{step_no:02d}-i397-{name}.png {OUT}/i397-{name}.png", shell=True)
+        return r
+    def png(name): return f"{OUT}/i397-{name}.png"
+    print("I397 screen", sh("wm size").strip(), sh("wm density").strip(), flush=True)
+    set_zh()
+    o["seedmodel"] = seed_model()
+    o["avatar"] = selftest_json("uiprep", "杨arling|gen", timeout=20)
+    try: result_json("group", "wallpaper off")
+    except Exception: pass
+    o["seed"] = result_json("group", "i396 seed", timeout=90)
+    o["wait"] = result_json("group", "i397 wait", timeout=60)
+    def home(sfx):
+        result_json("group", "i396 sky auto static", timeout=20)
+        r = b381_home(); time.sleep(4); r = shot(f"home-{sfx}")
+        o[f"sky_{sfx}"] = result_json("group", "i396 skystate", timeout=10)
+        w = all_desc(r, "天气：") or all_desc(r, "天气")
+        o[f"weather_{sfx}"] = [d for _, _, d in w][:2]
+        if not w: selftest_fail.append(f"i397 home {sfx}: no weather chip on home")
+        g = node_bounds(r, lambda n: "件事等你" in (n.get("text") or "") or "件事等你" in (n.get("content-desc") or ""))
+        if not g: selftest_fail.append(f"i397 home {sfx}: greeting has no 「件事等你」 (seeded 2 waiting)"); return
+        sh(f"input tap {(g[0] + g[2]) // 2} {(g[1] + g[3]) // 2}"); time.sleep(2.5)
+        r = shot(f"waiting-{sfx}"); t = _txt(r); o[f"waiting_{sfx}"] = t[:300]
+        if "注册免费云服务器" not in t or "绑定 GitHub 账号" not in t: selftest_fail.append(f"i397 greeting tap {sfx}: list lacks the 2 waiting chats")
+        if tap_text("注册免费云服务器", wait=4):
+            r = dump(); o[f"waitopen_{sfx}"] = _txt(r)[:160]; back(1)
+        else: back(1)
+    def agents(sfx):
+        o["agents_add"] = [result_json("group", "agents add web:manus", timeout=10), result_json("group", "agents add memoh", timeout=10)]
+        route("plus_app_agents", 6); r = shot(f"agents-{sfx}")
+        mb = node_bounds(r, lambda n: (n.get("text") or "") == "Manus")
+        pills = [(x, y) for t, d, x, y, n in nodes(r) if (t or d) == "去登录" and mb and abs(y - (mb[1] + mb[3]) // 2) < 160]
+        if not pills: page_missing.append(f"i397 agents {sfx}: Manus 去登录 not found"); 
+        else:
+            sh(f"input tap {pills[0][0]} {pills[0][1]}"); time.sleep(6); shot(f"manus-6s-{sfx}")
+            time.sleep(10); r = shot(f"manus-16s-{sfx}")
+            if not alive(): crashed.append(f"i397 manus {sfx}"); recover("manus"); return
+            fl = _flat(png(f"manus-16s-{sfx}")); lum = _lum(png(f"manus-16s-{sfx}")); t = _txt(r)
+            o[f"manus_{sfx}"] = {"flat": fl, "lum": lum, "card": "页面没打开" in t, "text": t[:200]}
+            if fl is not None: selftest_fail.append(f"i397 Manus 去登录 {sfx}: flat screen (sd {fl}, lum {lum})")
+            back(1); time.sleep(1)
+            r = dump()
+            if r is not None and not find(r, "Memoh"): route("plus_app_agents", 5); r = dump()
+        mb = node_bounds(r, lambda n: (n.get("text") or "") == "Memoh")
+        pills = [(x, y) for t, d, x, y, n in nodes(r) if (t or d) in ("填 key", "去登录") and mb and abs(y - (mb[1] + mb[3]) // 2) < 160]
+        if not pills: page_missing.append(f"i397 agents {sfx}: Memoh 填 key not found"); return
+        sh(f"input tap {pills[0][0]} {pills[0][1]}"); time.sleep(3); r = shot(f"memoh-{sfx}"); t = _txt(r)
+        o[f"memoh_{sfx}"] = t[:200]
+        if not alive(): crashed.append(f"i397 memoh {sfx}"); recover("memoh"); return
+        if "地址" not in t: selftest_fail.append(f"i397 Memoh 填 key {sfx}: address field not shown")
+        back(1); time.sleep(1); back(1)
+    def incog():
+        r = b381_home(); time.sleep(2)
+        mb = node_bounds(r, lambda n: (n.get("content-desc") or "") == "更多")
+        if mb: sh(f"input tap {(mb[0] + mb[2]) // 2} {(mb[1] + mb[3]) // 2}"); time.sleep(2.5)
+        if not tap_text("无痕标签", wait=1.5): selftest_fail.append("i397 无痕标签 not in ☰ menu"); back(1); return
+        r = dump(); time.sleep(4); r = shot("incog-open"); t = _txt(r)
+        st = result_json("group", "i397 incog", timeout=10); o["incog_state"] = st
+        sup = isinstance(st, dict) and st.get("supported")
+        o["incog_text"] = t[:200]
+        if sup and "无痕" not in t: selftest_fail.append("i397 无痕: supported but sheet title lacks 无痕")
+        if not sup: UNTESTABLE.append("无痕标签: emulator WebView has no MULTI_PROFILE → refused with the update message (by design)")
+        if sup:
+            browser_url = "https://example.com"
+            r = dump(); ed_ = next(((x, y) for tt, d, x, y, n in nodes(r) if n.get("class", "").endswith("EditText")), None)
+            if ed_:
+                sh(f"input tap {ed_[0]} {ed_[1]}"); time.sleep(1); sh("input keycombination 113 29"); sh("input keyevent KEYCODE_DEL")
+                sh(f"input text '{browser_url}'"); sh("input keyevent 66"); time.sleep(8); shot("incog-page")
+            back(1); time.sleep(2); shot("incog-closed")
+            o["incog_after"] = result_json("group", "i397 incog", timeout=10)
+            h = result_json("group", "i397 handoff", timeout=10); o["incog_handoff"] = h
+            if isinstance(h, dict) and "example.com" in (h.get("last") or "") and not o.get("takeover_done"):
+                selftest_fail.append("i397 无痕 page was recorded for handoff")
+    def takeover():
+        browser_open("https://example.com/?mines397", "i397")
+        shot("browser-user"); back(1); time.sleep(2)
+        h = result_json("group", "i397 handoff", timeout=10); o["handoff"] = h
+        if not (isinstance(h, dict) and "example.com" in (h.get("last") or "")): selftest_fail.append(f"i397 takeover: user page not recorded ({str(h)[:120]})")
+        a = result_json("group", "i397 agentbrowse", timeout=70); o["agentbrowse"] = a
+        if not (isinstance(a, dict) and a.get("adopted") == 1 and "example.com" in (a.get("url") or "")):
+            selftest_fail.append(f"i397 takeover: agent tab did not open the user's page ({str(a)[:160]})")
+        o["takeover_done"] = True
+    def engineer():
+        route("agent_tools", 5)
+        for _ in range(6):
+            r = dump()
+            if find(r, "高级工程模式"): break
+            scroll_down()
+        r = shot("engineer-on"); e0 = result_json("group", "i397 engineer", timeout=10)
+        if not find(r, "高级工程模式"): selftest_fail.append("i397 高级工程模式 switch not found"); return
+        p = find(r, "高级工程模式"); sh(f"input tap {p[0]} {p[1]}"); time.sleep(2)
+        sw = [(x, y) for t, d, x, y, n in nodes(dump()) if n.get("checkable") == "true" and abs(y - p[1]) < 160]
+        e1 = result_json("group", "i397 engineer", timeout=10)
+        if isinstance(e1, dict) and e1.get("on") == (e0 or {}).get("on") and sw: sh(f"input tap {sw[0][0]} {sw[0][1]}"); time.sleep(2); e1 = result_json("group", "i397 engineer", timeout=10)
+        shot("engineer-off")
+        o["engineer"] = [e0, e1]
+        if not (isinstance(e0, dict) and e0.get("on") is True): selftest_fail.append(f"i397 高级工程模式 not on by default ({e0})")
+        if not (isinstance(e1, dict) and e1.get("on") is False): selftest_fail.append(f"i397 高级工程模式 switch did not turn it off ({e1})")
+        result_json("group", "i397 engineer on", timeout=10); back(1)
+    def market():
+        route("plus_market", 12); r = dump(); t = _txt(r)
+        for _ in range(3):
+            if "手机能用" in t or "共" in t: break
+            time.sleep(6); r = dump(); t = _txt(r)
+        r = shot("market"); t = _txt(r); o["market"] = t[:400]
+        if "手机能用" not in t: page_missing.append("i397 market: header 「N 个手机能用」 not seen")
+        bad = [w for w in ("电脑版", "宿主", "资料库") if w in t]
+        if bad: selftest_fail.append(f"i397 market lists non-runnable rows: {bad}")
+        scroll_down(); scroll_down(); r = shot("market-2"); t2 = _txt(r)
+        bad2 = [w for w in ("电脑版", "宿主", "资料库") if w in t2]
+        if bad2: selftest_fail.append(f"i397 market (scrolled) lists non-runnable rows: {bad2}")
+        btn = next(((x, y, tt or d) for tt, d, x, y, n in nodes(dump()) if (tt or d) in ("试装", "安装")), None)
+        if btn:
+            sh(f"input tap {btn[0]} {btn[1]}"); time.sleep(4); shot("market-install-tap")
+            if tap_text("安装", exact=True, wait=3) or tap_text("试装", exact=True, wait=3): pass
+            time.sleep(60); r = shot("market-install-60s"); o["install"] = {"btn": btn[2], "text": _txt(r)[:300]}
+        else: page_missing.append("i397 market: no 安装 / 试装 button")
+        back(1)
+    def dsh():
+        out = selftest("offload", "minis-dsh calltest", timeout=150); o["dsh_calltest"] = out.strip()[-400:]
+        if "echo:hi" not in out: UNTESTABLE.append("DSH 插件调用 (minis-dsh calltest) in the emulator sandbox: " + out.strip()[-120:])
+    def selfcheck():
+        rows = result_json("group", "i396 selfcheck", timeout=170); o["selfcheck"] = rows
+        names = ("浏览器接管", "无痕标签", "高级工程模式", "DSH 插件调用", "首页天气", "天气皮肤", "字号与缩放", "网页登录诊断")
+        if isinstance(rows, list):
+            for rw in rows:
+                if rw.get("name") in names: print(f"I397 SELFCHECK | {rw.get('name')} | ok={rw.get('ok')} | {rw.get('detail')}", flush=True)
+            got = {rw.get("name") for rw in rows}
+            miss = [n for n in names if n not in got]
+            if miss: selftest_fail.append(f"i397 自检 rows missing: {miss}")
+        else: selftest_fail.append(f"i397 自检 did not answer ({str(rows)[:80]})")
+    for mode, sfx in ((1, "light"), (2, "dark")):
+        theme388(mode); healthy_home()
+        step("home-" + sfx, lambda sfx=sfx: home(sfx))
+        step("agents-" + sfx, lambda sfx=sfx: agents(sfx))
+    theme388(1); healthy_home()
+    step("takeover", takeover)
+    step("incog", incog)
+    step("engineer", engineer)
+    step("market", market)
+    step("dsh", dsh)
+    step("selfcheck", selfcheck)
+    print("I397 RESULT " + json.dumps(o, ensure_ascii=False)[:6000], flush=True)
 
 
 def finish(lc):
