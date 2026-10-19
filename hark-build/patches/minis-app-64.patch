@@ -183,7 +183,7 @@ index 0f916dc..e75bb0b 100644
      H="$MINIS_DSH_HOME" PLUGS="$PLUGS" node --input-type=module -e '
        import fs from "node:fs"; const H = process.env.H
 diff --git a/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-vps b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-vps
-index dfd05ae..bae5f08 100755
+index dfd05ae..89e67a4 100755
 --- a/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-vps
 +++ b/src/android/app/src/main/assets/default_mount/usr/local/bin/minis-vps
 @@ -15,6 +15,8 @@
@@ -277,7 +277,36 @@ index dfd05ae..bae5f08 100755
          sleep "$delay"; delay=$((delay * 2)); [ "$delay" -gt 30 ] && delay=30
      done
  }
-@@ -215,8 +265,8 @@ case "$cmd" in
+@@ -211,12 +261,37 @@ link_stream() {
+ }
+ 
+ cmd="${1:-help}"; [ $# -gt 0 ] && shift
++# [Mines-38.9.9] user-taught rule: plain `minis-vps run` (direct, then the configured ws relay). A command that overrides
++# MINIS_VPS_SERVERS without the relay, or uses --direct on a server that has one, hit datacenter rate limits on the phone.
++# Warn once and fall back to the configured routing unless --force.
++FORCE=""; [ "$1" = "--force" ] && { FORCE=1; shift; }
++relay_guard() {
++    app="$MINIS_VPS_SERVERS_APP"; [ -n "$app" ] && [ "$app" != none ] || return 0
++    case "$app" in *"|"*) ;; *) return 0 ;; esac
++    warn=""
++    if [ -n "$MINIS_VPS_SERVERS" ] && [ "$MINIS_VPS_SERVERS" != "$app" ]; then
++        for e in $(printf '%s' "$MINIS_VPS_SERVERS" | tr ',' ' '); do
++            case "$e" in *"|"*) continue ;; esac
++            h="${e#!}"; h="${h%%:*}"; h="${h#*@}"
++            printf '%s' "$app" | tr ',' '\n' | grep -q "@$h:.*|" && warn=1
++        done
++    fi
++    [ "$1" = "--direct" ] && warn=1
++    [ -n "$warn" ] || return 0
++    echo "minis-vps: 已配置中转，建议直接用 minis-vps run（会先直连，不通再走中转）" >&2
++    [ -n "$FORCE" ] && return 0
++    MINIS_VPS_SERVERS="$app"; export MINIS_VPS_SERVERS
++    return 1
++}
++case "$cmd" in run|bg|status|shell|attach|jobs|logs)
++    if ! relay_guard "$1" && [ "$1" = "--direct" ]; then shift; fi ;;
++esac
+ case "$cmd" in
  run|bg|attach|jobs|logs|status)
      if [ "$1" != "--direct" ] && link_ok; then
          case "$cmd" in
@@ -288,7 +317,7 @@ index dfd05ae..bae5f08 100755
          attach) valid_name "$1"; printf '' | lcurl "$LP/attach?name=$1&since=${2:-0}" | awk '/^__MINES_RC=/{rc=substr($0,12)+0; next} {print; fflush()} END{exit rc}'; exit $? ;;
          jobs)   lcurl "$LP/jobs"; exit 0 ;;
          logs)   valid_name "$1"; printf 'tail -n %s ~/.mines-link/jobs/%s/out 2>/dev/null || tail -n %s ~/minis-jobs/%s.log' "${2:-100}" "$1" "${2:-100}" "$1" | link_stream "$LP/exec?t=30"; exit $? ;;
-@@ -240,10 +290,10 @@ setup)
+@@ -240,10 +315,10 @@ setup)
      ;;
  run)
      need_ssh; load
@@ -301,7 +330,7 @@ index dfd05ae..bae5f08 100755
      [ "$rc" -ne 75 ] && rm -f "$JOBS/$name"
      exit "$rc"
      ;;
-@@ -251,7 +301,7 @@ bg)
+@@ -251,7 +326,7 @@ bg)
      need_ssh; load
      name="$1"; shift; valid_name "$name"
      pick || exit 255; remember_job "$name"
@@ -310,7 +339,7 @@ index dfd05ae..bae5f08 100755
      ;;
  attach)
      need_ssh; load; valid_name "$1"; job_server "$1"
-@@ -264,6 +314,12 @@ shell)  need_ssh; load; pick; eval "ssh -t $BASE_OPTS -o BatchMode=no $MUX_OPTS
+@@ -264,6 +339,12 @@ shell)  need_ssh; load; pick; eval "ssh -t $BASE_OPTS -o BatchMode=no $MUX_OPTS
  status) need_ssh; load; MINIS_VPS_CONNECT_SECS=${MINIS_VPS_CONNECT_SECS:-20} s 'uptime; free -m | sed -n 2p; df -h / | tail -1; curl -s --max-time 5 https://ipinfo.io/ip; echo' ;;
  jobs)   need_ssh; load; MINIS_VPS_CONNECT_SECS=${MINIS_VPS_CONNECT_SECS:-20} s 'cd ~/minis-jobs 2>/dev/null || exit 0; for p in *.pid; do [ -f "$p" ] || continue; n=${p%.pid}; if [ -f "$n.rc" ]; then st="done($(cat $n.rc))"; elif kill -0 $(cat "$p") 2>/dev/null; then st=running; else st=done; fi; echo "$n $st"; done' ;;
  servers) load; for srv in $SERVERS; do echo "$srv"; done ;;
@@ -5744,7 +5773,7 @@ index def9c81..47e673d 100644
          try {
 diff --git a/src/android/app/src/main/java/com/openminis/app/agent/BuiltinPrompts.kt b/src/android/app/src/main/java/com/openminis/app/agent/BuiltinPrompts.kt
 new file mode 100644
-index 0000000..4e96e77
+index 0000000..6738a1f
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/agent/BuiltinPrompts.kt
 @@ -0,0 +1,51 @@
@@ -5767,7 +5796,7 @@ index 0000000..4e96e77
 +4. 同一方向两次没进展就停：退一步重审前提（第 1 条），并换更强的模型来想。
 +5. 结论分清「测到的」（附数字/日志）和「猜的」（标明推测），再写下一步。"""),
 +        Section("archive", "解决后归档", """解决后归档（内置）：问题解决后，用几行总结完整流程（现象 → 根因 → 改了什么 → 怎么验证），并自动存成可复用的工作流/技能（工作流记录），下次遇到类似问题先调用它。"""),
-+        Section("senior", "高级工程师", """工作方式（内置）：像资深工程师一样做事——先看本质再动手；读过再改，改完必验证；最小改动；不确定就查证，不编造；结论简短直接，说明验证了什么、没验证什么。"""),
++        Section("senior", "高级工程师", """工作方式（内置）：像资深工程师一样做事——先看本质再动手；读过再改，改完必验证；最小改动；不确定就查证，不编造；结论简短直接，说明验证了什么、没验证什么。用户教过的方法（记忆里、技能里标为学到的）优先于通用习惯：选方法前先查它们，照着做。"""),
 +        Section("automation", "自动化工作流", """自动化（内置）：把任务拆成可复用的小步骤；每步可重复执行而不产生副作用（幂等），先检查当前状态再操作；每步记录输入、输出和结果；失败时有限次重试（最多 2 次、间隔递增），超过就停下报告原因。"""),
 +        Section("redblue", "红蓝队（仅限授权）", """安全测试（内置，仅限授权与防御）：只在用户拥有或书面授权的系统上做安全测试，开始前先确认范围（目标、时间、方式）；绝不攻击未授权的系统，不帮助入侵、窃取或破坏。红队发现的每个问题都同时给出蓝队视角：如何检测（日志/告警特征）、如何修复与加固、如何验证已修好。"""),
 +    )
@@ -6363,6 +6392,37 @@ index 0000000..eba6b3d
 +        val keys = runCatching { JSONObject(argsJson).keys().asSequence().toList() }.getOrDefault(emptyList())
 +        return "工具 $tool 的参数缺少 ${missing.joinToString("、") { "`$it`" }}（收到的顶层字段：${if (keys.isEmpty()) "无" else keys.joinToString(", ")}）。" +
 +            "参数必须是一个顶层 JSON 对象，字段直接放在最外层，不要包在 arguments/args/input 里，例如：${EXAMPLE[tool] ?: "{…}"}"
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/agent/VpsSshHint.kt b/src/android/app/src/main/java/com/openminis/app/agent/VpsSshHint.kt
+new file mode 100644
+index 0000000..43a09d3
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/agent/VpsSshHint.kt
+@@ -0,0 +1,25 @@
++package com.openminis.app.agent
++
++/**
++ * [Mines-38.9.9] user 2026-10-19 09:56: the agent ignored the taught method (plain `minis-vps run`, direct then the configured
++ * ws relay) and ran bare `ssh` / `scp` to a server from 工作位置, hitting datacenter rate limits. A shell command that does
++ * bare ssh / scp / sftp / rsync to a host in MINIS_VPS_SERVERS gets one hint line appended to its result. Pure, unit-tested.
++ */
++object VpsSshHint {
++    /** hosts from a MINIS_VPS_SERVERS value: user@host:port[|relay],… (leading ! allowed) */
++    fun hosts(servers: String?): Set<String> = servers.orEmpty().split(',').mapNotNull { e ->
++        val ent = e.trim().removePrefix("!").substringBefore('|')
++        if (ent.isEmpty() || ent == "none") null else ent.substringAfter('@').substringBeforeLast(':').lowercase().ifEmpty { null }
++    }.toSet()
++
++    fun hint(command: String, servers: String?): String? {
++        val hs = hosts(servers); if (hs.isEmpty()) return null
++        val c = command.lowercase()
++        if (!Regex("""(^|[\s;&|(`])(ssh|scp|sftp|rsync)\s""").containsMatchIn(c)) return null
++        // only when the ssh word itself is not part of a minis-vps call on the same line
++        val lines = c.lines().filter { Regex("""(^|[\s;&|(`])(ssh|scp|sftp|rsync)\s""").containsMatchIn(it) && !it.contains("minis-vps") }
++        val hit = hs.firstOrNull { h -> lines.any { l -> Regex("""(@|\s)${Regex.escape(h)}(\s|:|$|/)""").containsMatchIn(l) } } ?: return null
++        return "[提示] $hit 在「工作位置」服务器列表里：请用用户教过的方法 `minis-vps run <命令>`（先直连，不通自动走已配置的中转），" +
++            "不要裸 ssh/scp、不要手改 MINIS_VPS_SERVERS 或加 --direct（会触发机房限流）。传文件用 minis-vps 的 put/get 或 run 里 base64。"
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/auth/CopilotOAuthManager.kt b/src/android/app/src/main/java/com/openminis/app/auth/CopilotOAuthManager.kt
@@ -14715,7 +14775,7 @@ index f3b6d5c..54ac8eb 100644
          val arr = JSONArray()
          _entries.value.values.forEach { e ->
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt
-index 18b343c..bd63311 100644
+index 18b343c..f6b549e 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/PlusVps.kt
 @@ -84,10 +84,12 @@ object PlusVps {
@@ -14782,7 +14842,7 @@ index 18b343c..bd63311 100644
      }
  
      fun effectiveMode(st: PlusState): String {
-@@ -225,7 +247,7 @@ object PlusVps {
+@@ -225,12 +247,15 @@ object PlusVps {
                  else if (repo.getValue(key) != value) repo.update(existing.id, key, value, note)
              }
              put("MINIS_WORK_MODE", mode,
@@ -14791,7 +14851,15 @@ index 18b343c..bd63311 100644
              // [Mines-link-31] the app's HTTPS link to the servers, for minis-vps (preferred over ssh when up)
              put("MINIS_LINK_PORT", LinkBridge.PORT.toString(), "Mines 快速线路本机桥接端口（minis-vps 自动使用）")
              put("MINIS_LINK_TOKEN", LinkBridge.token, "Mines 快速线路本机桥接口令（每次启动更换）")
-@@ -253,19 +275,8 @@ object PlusVps {
+             put("MINIS_VPS_SERVERS", list.ifEmpty { "none" },
+                 "Mines Plus 服务器列表，按延迟排序；minis-vps 自动选第一个可用的，断开切下一台")
++            // [Mines-38.9.9] reference copy: minis-vps warns when a command overrides the list and drops a configured relay
++            put("MINIS_VPS_SERVERS_APP", list.ifEmpty { "none" },
++                "Mines 设置里的服务器列表原样副本（minis-vps 用它发现命令里手改 MINIS_VPS_SERVERS / --direct 丢掉了中转）；不要改")
+         }.onFailure { Log.w(TAG, "env sync failed: ${it.message}") }
+     }
+ 
+@@ -253,19 +278,8 @@ object PlusVps {
          appContext = context.applicationContext
          LinkBridge.start(context)
          AccountPatrol.load(context); AccountPatrol.schedule(context)
@@ -14813,7 +14881,7 @@ index 18b343c..bd63311 100644
          val appCtx = context.applicationContext
          PlusPrefs.init(appCtx)
          registerNetworkCallback(appCtx)
-@@ -303,7 +314,10 @@ object PlusVps {
+@@ -303,7 +317,10 @@ object PlusVps {
      // ── [Mines-vps-28] 测试连接: try every route, keep the one that works ──
  
      /** One route tried by [testRoutes]. [relay] is what to store as the server's relay to use it. */
@@ -14825,7 +14893,7 @@ index 18b343c..bd63311 100644
  
      /**
       * [Mines-vps-32] Plain verdict when nothing works. If the routes through the
-@@ -347,13 +361,11 @@ object PlusVps {
+@@ -347,13 +364,11 @@ object PlusVps {
              when (proxyType) {
                  null -> java.net.Socket(java.net.Proxy.NO_PROXY).use { s ->
                      s.connect(java.net.InetSocketAddress(VpsSsh.preferIpv4(host), port), timeoutMs)
@@ -14841,7 +14909,7 @@ index 18b343c..bd63311 100644
                  }
                  else -> java.net.Socket(java.net.Proxy.NO_PROXY).use { s ->
                      s.connect(java.net.InetSocketAddress(ph, pp), timeoutMs); s.soTimeout = timeoutMs
-@@ -363,8 +375,7 @@ object PlusVps {
+@@ -363,8 +378,7 @@ object PlusVps {
                      while (!hdr.endsWith("\r\n\r\n") && hdr.length < 4096) { val c = inp.read(); if (c < 0) break; hdr.append(c.toChar()) }
                      val code = hdr.toString().split(' ').getOrNull(1)?.toIntOrNull() ?: 0
                      if (code != 200) return -2 to "代理不让连（HTTP $code）"
@@ -14851,7 +14919,7 @@ index 18b343c..bd63311 100644
                  }
              }
          } catch (e: Throwable) {
-@@ -381,7 +392,7 @@ object PlusVps {
+@@ -381,7 +395,7 @@ object PlusVps {
          val out = ArrayList<RouteTry>()
          runCatching {
              val (ms, why) = bannerProbe(s.host, s.port, null, null, 0)
@@ -14860,7 +14928,7 @@ index 18b343c..bd63311 100644
          }.onFailure { out += RouteTry("直连", "", false, -2, VpsSsh.reason(it)) }
          // [Mines-vps-31] backup port and Tailscale name, direct
          VpsSsh.endpoints(s).drop(1).forEach { ep ->
-@@ -434,7 +445,8 @@ object PlusVps {
+@@ -434,7 +448,8 @@ object PlusVps {
          }
          VpsSsh.drop(s.id)
          runCatching { syncToSandbox(context) }
@@ -19317,7 +19385,7 @@ index 1d773a2..5489e65 100644
          coroutineScope {
              val bg = slow.map { id -> async { one(id) } }
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-index af13c1b..6af99b1 100644
+index af13c1b..4b35039 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 @@ -2,6 +2,8 @@ package com.openminis.app.plus.group
@@ -19329,7 +19397,7 @@ index af13c1b..6af99b1 100644
  import kotlinx.coroutines.runBlocking
  import org.json.JSONArray
  import org.json.JSONObject
-@@ -15,12 +17,454 @@ import org.json.JSONObject
+@@ -15,12 +17,466 @@ import org.json.JSONObject
   *   … --arg 'reset'
   */
  object GroupSelfTest {
@@ -19730,6 +19798,18 @@ index af13c1b..6af99b1 100644
 +                        JSONObject().put("route", route).put("quick", arg2).put("silentAccepted", I398Silent.accepted.get()).toString()
 +                    }
 +                    "silent" -> JSONObject().put("port", I398Silent.port).put("accepted", I398Silent.accepted.get()).toString()
++                    // [Mines-38.9.9] an OAuth provider (GitHub Copilot, never signed in) with one model → its quick test must say why
++                    "seedoauth" -> {
++                        val repo = app.providerRepository
++                        val old = repo.config.value.instances.firstOrNull { it.providerType == com.openminis.app.data.model.ProviderType.githubCopilot }
++                        val iid = old?.id ?: com.openminis.app.debug.ProviderMutationMethods.instancesCreate(context, JSONObject()
++                            .put("providerType", "githubCopilot").put("credentialType", "oauth").put("label", "GitHub Copilot"))
++                            .optJSONObject("instance")?.optString("id").orEmpty()
++                        if (repo.config.value.modelEntries.none { it.providerInstanceId == iid && it.baseModel.id == "gpt-4.1" })
++                            runCatching { com.openminis.app.debug.ProviderMutationMethods.modelsAdd(context,
++                                JSONObject().put("instanceId", iid).put("modelId", "gpt-4.1").put("displayName", "Copilot GPT-4.1")) }
++                        JSONObject().put("instance", iid).put("seeded", old == null).toString()
++                    }
 +                    // 模型详情 of the first visible model (no quick test) — back arrow, bottom inset, backdrop
 +                    "modeldetail" -> {
 +                        val e = app.providerRepository.config.value.modelEntries.firstOrNull { !it.isHidden && it.baseModel.id == "smoke-model" }
@@ -19755,7 +19835,7 @@ index af13c1b..6af99b1 100644
 +                        val k = com.openminis.app.plus.MarketGitCore.classify("dsh-pilot", arg2.ifBlank { "Desktop automation: hands and eyes on the whole Windows machine - screen_view, desktop_control" }, listOf("dsh-plugin"), "", "verified")
 +                        JSONObject().put("canTry", k.canTry).put("desktopOnly", k.desktopOnly).put("line", k.line).put("pill", k.pill ?: "").toString()
 +                    }
-+                    else -> "i398 seedpicker | picker [modelId] | silent | modeldetail | backdrop | zh | jobfail | classify [desc]"
++                    else -> "i398 seedpicker | picker [modelId] | silent | seedoauth | modeldetail | backdrop | zh | jobfail | classify [desc]"
 +                }
 +            }
 +            // [Mines-38.9.1] 应用代理: 'agents' list (mine + enabled), 'agents clear', 'agents add <id>'
@@ -19784,7 +19864,7 @@ index af13c1b..6af99b1 100644
              "partners" -> {
                  val l = Partners.refresh(context, rescanApps = true)
                  JSONArray(l.map { JSONObject().put("id", it.id).put("name", it.spec.name).put("state", it.state.name).put("model", it.model).put("via", it.via) }).toString()
-@@ -136,6 +580,13 @@ object GroupSelfTest {
+@@ -136,6 +592,13 @@ object GroupSelfTest {
                  GroupStore.add(gid, GroupMsg(GroupStore.newId(), parts.getOrElse(2) { "host" }, "成员A", "", parts.getOrElse(3) { "好的，结论：照这个办。" }))
                  "ok"
              }
@@ -19798,7 +19878,7 @@ index af13c1b..6af99b1 100644
              "kbrun" -> { val n = com.openminis.app.plus.ChatKnowledge.runNow(context); "organised=$n" }
              "kbstate" -> {
                  val l = com.openminis.app.plus.ChatKnowledge.load(context)
-@@ -151,6 +602,11 @@ object GroupSelfTest {
+@@ -151,6 +614,11 @@ object GroupSelfTest {
                  JSONObject().put("title", g.title).put("care", g.care).put("kind", g.kind)
                      .put("weather", com.openminis.app.plus.HomeGreeting.cachedWeather(context)?.let { "${it.code}/${it.temp}" } ?: "none").toString()
              }
@@ -19810,7 +19890,7 @@ index af13c1b..6af99b1 100644
              "greetweather" -> {
                  context.getSharedPreferences("mines_greeting", Context.MODE_PRIVATE).edit().remove("w_try").apply()
                  com.openminis.app.plus.HomeGreeting.refreshWeather(context)
-@@ -238,6 +694,112 @@ object GroupSelfTest {
+@@ -238,6 +706,112 @@ object GroupSelfTest {
              "wallpaper" -> { com.openminis.app.plus.PlusPrefs.init(context)
                  if (parts.getOrElse(0) { "" } == "off") com.openminis.app.plus.PlusPrefs.update(context) { it.copy(wallpaper = "") }
                  com.openminis.app.plus.PlusPrefs.state.value.wallpaper.ifBlank { "none" } }
@@ -19923,7 +20003,7 @@ index af13c1b..6af99b1 100644
              "fogstate" -> JSONObject().put("t", com.openminis.app.ui.plus.FogClock.t.toDouble()).put("draws", com.openminis.app.ui.plus.FogClock.draws)
                  .put("still", com.openminis.app.ui.plus.FogClock.stillSeen)
                  .put("scale", android.provider.Settings.Global.getFloat(context.contentResolver, android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, -1f).toDouble()).toString()
-@@ -288,3 +850,26 @@ object GroupSelfTest {
+@@ -288,3 +862,26 @@ object GroupSelfTest {
          return JSONObject().put("chat", sid).put("group", g.id).put("direct", d.id).put("directName", dn).toString()
      }
  }
@@ -23112,7 +23192,7 @@ index 917c7bb..1153000 100644
                  // An all-zero row carries nothing worth a capsule.
                  if (u.inputTokens == 0 && u.outputTokens == 0 &&
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt
-index aadbc71..af70c4b 100644
+index aadbc71..058e4a9 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt
 @@ -138,7 +138,7 @@ import androidx.compose.material.icons.filled.RadioButtonChecked
@@ -23310,12 +23390,16 @@ index aadbc71..af70c4b 100644
                              } }
                              is FlatChatItem.AssistantThinking -> {
                                  // T300: hide Deep Thinking block when the user
-@@ -4810,6 +4851,18 @@ fun ChatScreen(
+@@ -4810,6 +4851,23 @@ fun ChatScreen(
                                      ) {
                                          UsageCapsule(usage = item.usage, completedAt = item.completedAt)
                                      }
 +                                    // [Mines-38.9.1] small 「model · account」 tag under every finished reply (hidden while the capsule shows)
-+                                    if (!shown && item.usage.servedBy.isNotBlank()) {
++                                    // [Mines-38.9.9] footer row: 「model · account」 + a one-tap 复制 (whole reply, plain text)
++                                    if (!shown) Row(
++                                        modifier = Modifier.fillMaxWidth(),
++                                        verticalAlignment = Alignment.CenterVertically,
++                                    ) {
 +                                        Text(
 +                                            text = item.usage.servedBy,
 +                                            fontSize = 11.sp,
@@ -23323,13 +23407,14 @@ index aadbc71..af70c4b 100644
 +                                            color = ChatColors.tertiaryText,
 +                                            maxLines = 1,
 +                                            overflow = TextOverflow.Ellipsis,
-+                                            modifier = Modifier.padding(start = 16.dp, top = 2.dp, bottom = 2.dp),
++                                            modifier = Modifier.weight(1f).padding(start = 16.dp, top = 2.dp, bottom = 2.dp),
 +                                        )
++                                        ReplyCopyButton(markdown = { ReplyCopy.markdownOf(messages, item.messageId) }, modifier = Modifier.padding(end = 8.dp))
 +                                    }
                                  }
                              }
                              is FlatChatItem.AssistantError -> InlineErrorBanner(
-@@ -4929,6 +4982,11 @@ fun ChatScreen(
+@@ -4929,6 +4987,11 @@ fun ChatScreen(
                              try { inputFocusRequester.requestFocus() } catch (_: IllegalStateException) {}
                              keyboardController?.show()
                          },
@@ -23341,7 +23426,7 @@ index aadbc71..af70c4b 100644
                          // [T-android-selection-readaloud] Speak the selection
                          // through the same screen-scoped lazy player the
                          // Compose-SelectionContainer toolbar uses.
-@@ -5192,7 +5250,7 @@ fun ChatScreen(
+@@ -5192,7 +5255,7 @@ fun ChatScreen(
                              // anchor" for the turn-walk, and keeps this button visually
                              // distinct from the down button's plain chevron.
                              imageVector = Icons.Default.VerticalAlignTop,
@@ -23350,7 +23435,7 @@ index aadbc71..af70c4b 100644
                              modifier = Modifier.size(20.dp),
                          )
                      }
-@@ -5240,7 +5298,7 @@ fun ChatScreen(
+@@ -5240,7 +5303,7 @@ fun ChatScreen(
                      ) {
                          Icon(
                              imageVector = Icons.Default.KeyboardArrowDown,
@@ -23359,7 +23444,7 @@ index aadbc71..af70c4b 100644
                              modifier = Modifier.size(20.dp),
                          )
                      }
-@@ -5397,8 +5455,7 @@ fun ChatScreen(
+@@ -5397,8 +5460,7 @@ fun ChatScreen(
                                  .padding(horizontal = 12.dp)
                                  // T240: keep a thin visible border instead of the
                                  // diffuse 8dp halo that bled out past the panel edge.
@@ -23369,7 +23454,7 @@ index aadbc71..af70c4b 100644
                                  .border(0.5.dp, ChatColors.toolBorder, RoundedCornerShape(10.dp)),
                          ) {
                              androidx.compose.foundation.lazy.LazyColumn(
-@@ -5588,8 +5645,7 @@ fun ChatScreen(
+@@ -5588,8 +5650,7 @@ fun ChatScreen(
                                      },
                                  )
                                  .padding(horizontal = 12.dp)
@@ -23379,7 +23464,7 @@ index aadbc71..af70c4b 100644
                                  .border(0.5.dp, ChatColors.toolBorder, RoundedCornerShape(10.dp)),
                          ) {
                              if (mentionEntries.isEmpty()) {
-@@ -5844,30 +5900,9 @@ fun ChatScreen(
+@@ -5844,30 +5905,9 @@ fun ChatScreen(
                  Column(
                      modifier = Modifier
                          .fillMaxWidth()
@@ -23413,7 +23498,7 @@ index aadbc71..af70c4b 100644
                          // [T-android-context-usage-hint] Ambient inner glow
                          // along the card's inside edge once the context window
                          // is under pressure. Applied to the composer CARD (not
-@@ -6176,6 +6211,17 @@ fun ChatScreen(
+@@ -6176,6 +6216,17 @@ fun ChatScreen(
                      // text is already delta-appended into `inputText` by the
                      // mic button's callback, so when recording ends the field
                      // shows the full recognized string automatically.
@@ -23431,7 +23516,7 @@ index aadbc71..af70c4b 100644
                      val recSttState by com.openminis.app.speech.SpeechRecognitionManager
                          .state.collectAsState()
                      val recIsRecording = recSttState == com.openminis.app.speech.RecognitionState.RECORDING ||
-@@ -6807,7 +6853,7 @@ fun ChatScreen(
+@@ -6807,7 +6858,7 @@ fun ChatScreen(
                              ) {
                                  Icon(
                                      Icons.Default.Add,
@@ -23440,7 +23525,7 @@ index aadbc71..af70c4b 100644
                                      tint = MaterialTheme.colorScheme.onSurfaceVariant,
                                      modifier = Modifier.size(20.dp),
                                  )
-@@ -7368,7 +7414,7 @@ fun ChatScreen(
+@@ -7368,7 +7419,7 @@ fun ChatScreen(
                              ) {
                                  Icon(
                                      Icons.Default.Stop,
@@ -23449,7 +23534,7 @@ index aadbc71..af70c4b 100644
                                      tint = Color.White,
                                      modifier = Modifier.size(20.dp),
                                  )
-@@ -7590,7 +7636,7 @@ fun ChatScreen(
+@@ -7590,7 +7641,7 @@ fun ChatScreen(
      var minesVerifyShownFor by remember { mutableStateOf(0L) }
      minesVerify?.let { pv ->
          if (minesVerifyShownFor != pv.since && !showBrowserSheet) {
@@ -23619,7 +23704,7 @@ index d99b975..93fc38a 100644
                  )
              }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
-index e0d0cae..fdd466e 100644
+index e0d0cae..84a4d93 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
 @@ -89,6 +89,7 @@ import kotlinx.coroutines.flow.combine
@@ -23965,7 +24050,21 @@ index e0d0cae..fdd466e 100644
          // T330: tri-state permission gating moved into the offload IPC
          // handler (OffloadGate). The CLIs land there whether the LLM
          // emitted a named tool call or a raw shell command, so the gate
-@@ -13355,6 +13543,19 @@ class ChatViewModel(
+@@ -13294,6 +13482,13 @@ class ChatViewModel(
+                 // skill. The repository compares a directory signature in the
+                 // background and only reloads when /var/minis/skills changed.
+                 skillRepository?.requestReload("shell_execute")
++            }.let { r ->
++                // [Mines-38.9.9] bare ssh / scp to a 工作位置 server → hint to use the taught `minis-vps run`
++                val h = runCatching {
++                    com.openminis.app.agent.VpsSshHint.hint(JSONObject(argsJson).optString("command"),
++                        (context.applicationContext as? com.openminis.app.MinisApp)?.envVarRepository?.getValue("MINIS_VPS_SERVERS"))
++                }.getOrNull()
++                if (h == null) r else r.copy(output = r.output + "\n\n" + h)
+             }
+             // [T-tools-granular-switches] Refuse a switched-off tool at the
+             // dispatcher too, not only by omitting it from the schema: a model
+@@ -13355,6 +13550,19 @@ class ChatViewModel(
                  kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.MinesSelfCheckTool.run(context, argsJson) }
              com.openminis.app.plus.KnowledgeBase.TOOL_NAME ->
                  kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.KnowledgeBase.runTool(context, argsJson) }
@@ -23985,7 +24084,7 @@ index e0d0cae..fdd466e 100644
              else -> ToolExecutionResult("Unknown tool: $name", false)
          }
      }
-@@ -15429,7 +15630,7 @@ CLI tools at /usr/local/bin with the `android-` prefix give you access to Androi
+@@ -15429,7 +15637,7 @@ CLI tools at /usr/local/bin with the `android-` prefix give you access to Androi
  - android-speech — microphone transcription (`listen [--language BCP47] [--max N] [--timeout SEC]`; `status`). Requires RECORD_AUDIO.
  - android-weather <latitude> <longitude> — Open-Meteo forecast (current + hourly + daily). No API key needed.
  - android-shizuku-cli — invoke privileged Android system APIs (package management, settings, system commands) via Shizuku when granted. Curated subcommands return structured JSON; for anything not covered, fall back to `android-shizuku-cli exec <any shell command>` which runs the command via `sh -c` with Shizuku privilege (same surface as `adb shell`). Run with no args (or --help) for the subcommand list.
@@ -23994,7 +24093,7 @@ index e0d0cae..fdd466e 100644
  - minis-open <url-or-path>: Opens a resource inside Minis without leaving the chat. Accepts http/https URLs (→ built-in WebKit preview) and chat-resource file paths under /var/minis/** (→ built-in file preview, routed by extension: images to the image viewer, .md to markdown preview, .html to HTML preview, .pdf/office docs to QuickLook, audio/video to the media player, else share sheet). Examples: minis-open https://example.com, minis-open /var/minis/workspace/report.md, minis-open /var/minis/attachments/chart.png. Prefer this over android-open for anything that can be previewed in-app so the user doesn't lose conversation context. Run android-open via shell_execute for non-web schemes (tel:, mailto:, geo:, intent:, etc.) or when the user explicitly wants the system handler.
  - minis-sessions-cli: Read chat history. `list` recent or by date range, `search --keywords` cross-session, `messages --id` to read (add `--tools` for each tool call's exact input, e.g. the shell command, and its output). Run --help for full options.
  - minis-model-use: Invoke other LLM models pre-configured by the user. Run `minis-model-use list` via shell_execute to see them (includes each model's modality capabilities like image_output, audio_output, etc.), `minis-model-use search <query>` to filter by name/provider. `minis-model-use run --model <id_or_name>` sends an OpenAI-compatible messages request; pass input via --input <json_file> or stdin, output goes to stdout or --output <path>. The OpenAI shape is the PRIMARY input for every model and modality; standard params are auto-converted to the underlying provider, so do not hand-write provider-native bodies as the primary input. For provider-specific extras the standard schema doesn't model (web-search plugins, image-to-image fields, TTS/video or other custom endpoints), escape hatches exist for OpenAI-compatible providers (they error or are ignored on Anthropic/Gemini models): `extra_body` (object merged verbatim into the request body), a custom `endpoint` path, and a top-level `passthrough` envelope for fully verbatim requests with RAW (unparsed) responses. Results may carry `warnings` (fields that were ignored/downgraded and why) and `applied_extras` (which extras actually took effect) — read them to self-correct. Run --help for the full contract before using these. Models may support multimodal output (image generation, TTS/audio, video) — check the modalities field in list output. For image_output models, pass generation params in the input JSON: top-level `n`/`size`/`quality`/`prompt` (OpenAI /images/generations style) or `generation_config.{aspect_ratio,image_size,number_of_images,person_generation}` (Gemini). Run with --help for full usage.${modelUseDelegateNote}
-@@ -15491,6 +15692,21 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15491,6 +15699,25 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                  append("\n\n")
                  append(skillFragment)
              }
@@ -24013,10 +24112,14 @@ index e0d0cae..fdd466e 100644
 +                append("\n\n")
 +                append(it)
 +            }
++            // [Mines-38.9.9] user 10:02: 深度思考 showed English — think in the UI language
++            if (!isHelper && java.util.Locale.getDefault().language == "zh") {
++                append("\n\n思考过程（reasoning / thinking）也用中文写；代码、命令、报错原文保持原样。")
++            }
              if (mcpFragment != null) {
                  append("\n\n")
                  append(mcpFragment)
-@@ -15503,6 +15719,25 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15503,6 +15730,25 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                  append("\n\n")
                  append(dailyMemoryFragment)
              }
@@ -24042,7 +24145,7 @@ index e0d0cae..fdd466e 100644
              // Runtime context goes last so the prefix above stays byte-stable
              // across requests within the same day. Keep ordering deterministic
              // (date → tz → lang → model count) — any reorder defeats the cache.
-@@ -15854,11 +16089,59 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15854,11 +16100,59 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
              }
          }
  
@@ -24103,7 +24206,7 @@ index e0d0cae..fdd466e 100644
              append("<user-attached-files>\n")
              for (m in metas) {
                  val urlPath = m.linuxPath.removePrefix("/var/minis/")
-@@ -15874,6 +16157,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15874,6 +16168,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
              }
              append("</user-attached-files>")
          }
@@ -24111,7 +24214,7 @@ index e0d0cae..fdd466e 100644
  
          // Order matches UserAttachmentList convention: images first, then files.
          return PreparedAttachments(
-@@ -17072,6 +17356,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -17072,6 +17367,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
      }
  
      override fun onCleared() {
@@ -24120,7 +24223,7 @@ index e0d0cae..fdd466e 100644
          // [T-sub-agents-queue] Nothing can re-enter a queued delegation once
          // this view model is gone; leaving the starter installed would let the
          // registry call into a cleared VM.
-@@ -17602,6 +17888,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -17602,6 +17899,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                              continue
                          }
                          if (!mime.startsWith("image/")) continue
@@ -24129,7 +24232,7 @@ index e0d0cae..fdd466e 100644
                          val file = java.io.File(mediaStore.mediaBaseDir, rel)
                          if (!file.exists()) continue
                          val original = try { file.readBytes() } catch (_: Exception) { continue }
-@@ -17756,3 +18044,28 @@ internal fun warmUpBudget(window: Int?, compactThreshold: Int?, ratio: Double, f
+@@ -17756,3 +18055,28 @@ internal fun warmUpBudget(window: Int?, compactThreshold: Int?, ratio: Double, f
      val line = if (threshold > 0) threshold else w
      return (line / ratio).toInt() - fixedTokens
  }
@@ -24181,7 +24284,7 @@ index 83af099..4b24569 100644
      )
  }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/MinisTextKitGesture.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/MinisTextKitGesture.kt
-index 8c7fdc6..8896800 100644
+index 8c7fdc6..722ec31 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/MinisTextKitGesture.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/MinisTextKitGesture.kt
 @@ -863,6 +863,8 @@ data class SelectionToolbarActions(
@@ -24193,7 +24296,30 @@ index 8c7fdc6..8896800 100644
      /**
       * [T-android-selection-readaloud] Speak the currently-selected plain text
       * through Minis TTS. Null hides the button. Mirrors iOS's "Read Selection".
-@@ -1120,6 +1122,13 @@ fun MinisSelectionToolbarHost(
+@@ -902,6 +904,22 @@ fun MinisSelectionToolbarHost(
+ ) {
+     val sel by controller.selection
+     if (sel == null) return
++    // [Mines-38.9.9] user 10:02: long-press used to select 2 characters and open two stacked floating menus with 复制全文
++    // hidden in a submenu. Now a long-press on one message opens ONE sheet; 「选择文字」 selects the whole message with
++    // handles and only then shows the normal floating bar for the partial copy.
++    val sheetDone = remember { androidx.compose.runtime.mutableStateOf(false) }
++    val sheetMsg = controller.singleMessageId()
++    if (!sheetDone.value && sheetMsg != null && actions != null && controller.dragIntent.value == null) {
++        val md = actions.resolveSelectionMarkdown() ?: controller.selectedPlainText()
++        ReplyActionSheet(
++            markdown = md,
++            onDismiss = { controller.clearSelection() },
++            onSelectText = { controller.selectAllInMessage(sheetMsg); sheetDone.value = true },
++            onQuote = actions.onQuote,
++            onRead = actions.onReadFromStart ?: actions.onReadAloud,
++        )
++        return
++    }
+     // Anchor the toolbar above the VISIBLE portion of the selection — the
+     // union of every shard's drawn rectangle in window coords (computed by
+     // visibleSelectionWindowRect). This way the menu tracks the highlight
+@@ -1120,6 +1138,13 @@ fun MinisSelectionToolbarHost(
                      // read-aloud and so was folded into the "⋯" overflow; the
                      // bar now keeps up to four actions inline when they fit,
                      // so read-aloud stays visible too (see inlineCount below).
@@ -24207,7 +24333,7 @@ index 8c7fdc6..8896800 100644
                      if (actions?.onAddToInput != null) {
                          add(SelectionAction(labelAddToInput) {
                              val text = controller.selectedPlainText()
-@@ -1239,6 +1248,13 @@ fun MinisSelectionToolbarHost(
+@@ -1239,6 +1264,13 @@ fun MinisSelectionToolbarHost(
                              )
                          }
                      }
@@ -24221,6 +24347,28 @@ index 8c7fdc6..8896800 100644
                      if (tableActions != null) {
                          add(SelectionAction(labelCopyTable) {
                              tableActions.copyTableMarkdown()
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/MinisTextKitSelection.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/MinisTextKitSelection.kt
+index f6c0318..c2eccc2 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/chat/MinisTextKitSelection.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/MinisTextKitSelection.kt
+@@ -384,6 +384,17 @@ class SelectionController {
+         return best
+     }
+ 
++    /** [Mines-38.9.9] 选择文字: select every registered shard of [messageId] (start of the first … end of the last). */
++    fun selectAllInMessage(messageId: String): Boolean {
++        val ids = currentShards().filter { it.key.messageId == messageId }.values.toList()
++        if (ids.isEmpty()) return false
++        val sorted = ids.sortedWith { a, b -> compareShards(a.id, b.id) ?: 0 }
++        val first = sorted.first(); val last = sorted.last()
++        retired.clear()
++        selection.value = TextSelection(TextPosition(first.id, 0), TextPosition(last.id, last.plainText.length))
++        return true
++    }
++
+     /** Begin a fresh selection collapsed at [pos] (long-press start). */
+     fun beginSelection(pos: TextPosition) {
+         retired.clear()
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/MoveToSessionSheet.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/MoveToSessionSheet.kt
 index 1f9d184..c2fce7d 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/MoveToSessionSheet.kt
@@ -24266,6 +24414,122 @@ index 17920b9..89bad56 100644
              Column(modifier = Modifier.padding(20.dp)) {
                  Text(
                      text = "${pasted.placeholder}  ·  ${pasted.text.length}",
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ReplyCopy.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ReplyCopy.kt
+new file mode 100644
+index 0000000..c5f9504
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ReplyCopy.kt
+@@ -0,0 +1,110 @@
++package com.openminis.app.ui.chat
++
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.ContentCopy
++import androidx.compose.material.icons.filled.FormatQuote
++import androidx.compose.material.icons.filled.RecordVoiceOver
++import androidx.compose.material.icons.filled.SelectAll
++import androidx.compose.material.icons.filled.Code
++import androidx.compose.material3.ExperimentalMaterial3Api
++import androidx.compose.material3.Icon
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.vector.ImageVector
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import com.openminis.app.ui.theme.ChatColors
++
++/**
++ * [Mines-38.9.9] user 10:02: copying a reply was painful (long-press picked 2 characters, then two stacked floating menus
++ * hid the text and 复制全文 sat in a submenu). Now: a one-tap 复制 in each reply's footer (whole reply, markdown stripped,
++ * toast 「已复制」), and long-press opens ONE bottom sheet — 复制全文 / 复制为 Markdown / 选择文字 / 引用 / 朗读.
++ */
++object ReplyCopy {
++    /** the reply's own markdown: its text blocks in order (legacy messages: content) */
++    fun markdownOf(messages: List<ChatMessage>, itemMessageId: String): String {
++        val base = itemMessageId.substringBefore('#')
++        val ms = messages.filter { it.id == itemMessageId || it.id.substringBefore('#') == base }
++        return ms.joinToString("\n\n") { m ->
++            val t = m.toolBlocks.filter { it.kind == "text" && it.content.isNotBlank() }.joinToString("\n\n") { it.content.trim() }
++            t.ifBlank { m.content.trim() }
++        }.trim()
++    }
++
++    fun copyPlain(context: android.content.Context, markdown: String) {
++        if (markdown.isBlank()) return
++        MarkdownClipboard.copyPlain(context, markdown)
++        android.widget.Toast.makeText(context, "已复制", android.widget.Toast.LENGTH_SHORT).show()
++    }
++
++    fun copyMarkdown(context: android.content.Context, markdown: String) {
++        if (markdown.isBlank()) return
++        MarkdownClipboard.copyMarkdown(context, markdown)
++        android.widget.Toast.makeText(context, "已复制 Markdown", android.widget.Toast.LENGTH_SHORT).show()
++    }
++}
++
++/** The small 「复制」 button in a reply's footer row. */
++@Composable
++internal fun ReplyCopyButton(markdown: () -> String, modifier: Modifier = Modifier) {
++    val ctx = LocalContext.current
++    Row(
++        modifier = modifier
++            .clickable { ReplyCopy.copyPlain(ctx, markdown()) }
++            .heightIn(min = 32.dp)
++            .padding(horizontal = 8.dp),
++        verticalAlignment = Alignment.CenterVertically,
++    ) {
++        Icon(Icons.Default.ContentCopy, contentDescription = "复制整条回复", tint = ChatColors.tertiaryText, modifier = Modifier.size(15.dp))
++        Text("复制", fontSize = 11.sp, color = ChatColors.tertiaryText, modifier = Modifier.padding(start = 3.dp))
++    }
++}
++
++/** One sheet for a long-pressed message (replaces the floating bar + its submenu). */
++@OptIn(ExperimentalMaterial3Api::class)
++@Composable
++internal fun ReplyActionSheet(
++    markdown: String,
++    onDismiss: () -> Unit,
++    onSelectText: () -> Unit,
++    onQuote: ((String) -> Unit)?,
++    onRead: ((String) -> Unit)?,
++) {
++    val ctx = LocalContext.current
++    com.openminis.app.ui.glass.ModalBottomSheet(
++        onDismissRequest = onDismiss,
++        sheetState = androidx.compose.material3.rememberModalBottomSheetState(skipPartiallyExpanded = true),
++    ) {
++        Column(Modifier.fillMaxWidth().padding(bottom = 16.dp)) {
++            @Composable
++            fun row(icon: ImageVector, label: String, action: () -> Unit) {
++                Row(
++                    Modifier.fillMaxWidth().clickable { action() }.heightIn(min = 52.dp).padding(horizontal = 24.dp),
++                    verticalAlignment = Alignment.CenterVertically,
++                ) {
++                    Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.onSurface, modifier = Modifier.size(20.dp))
++                    Text(label, fontSize = 16.sp, color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.padding(start = 16.dp))
++                }
++            }
++            row(Icons.Default.ContentCopy, "复制全文") { ReplyCopy.copyPlain(ctx, markdown); onDismiss() }
++            row(Icons.Default.Code, "复制为 Markdown") { ReplyCopy.copyMarkdown(ctx, markdown); onDismiss() }
++            row(Icons.Default.SelectAll, "选择文字") { onSelectText() }
++            if (onQuote != null) row(Icons.Default.FormatQuote, "引用") { onQuote(markdown); onDismiss() }
++            if (onRead != null) row(Icons.Default.RecordVoiceOver, "朗读") { onRead(markdown); onDismiss() }
++            Spacer(Modifier.height(8.dp))
++        }
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ScheduledTaskCard.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ScheduledTaskCard.kt
 index 6597b10..54635f6 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ScheduledTaskCard.kt
@@ -24399,7 +24663,7 @@ index 7b86dd5..27dd238 100644
  import androidx.compose.material3.rememberModalBottomSheetState
  import androidx.compose.runtime.Composable
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/StreamingMarkdownText.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/StreamingMarkdownText.kt
-index 0c4c7bc..5dc8686 100644
+index 0c4c7bc..3fb118d 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/StreamingMarkdownText.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/StreamingMarkdownText.kt
 @@ -82,6 +82,7 @@ import androidx.compose.foundation.gestures.detectTapGestures
@@ -24443,7 +24707,44 @@ index 0c4c7bc..5dc8686 100644
                      }
                  }
              }
-@@ -3151,7 +3158,7 @@ private fun RenderMdVideo(block: MdBlock.Video) {
+@@ -2390,17 +2397,29 @@ private fun RenderBlock(block: MdBlock) {
+                         color = MdCodeLangColor,
+                         modifier = Modifier.weight(1f),
+                     )
+-                    Icon(
+-                        imageVector = if (copied) Icons.Default.Check else Icons.Default.ContentCopy,
+-                        contentDescription = if (copied) "Copied" else "Copy code",
+-                        tint = if (copied) Color(0xFF34C759) else Color.White.copy(alpha = 0.4f),
++                    // [Mines-38.9.9] user: copying was painful — a visible 「复制」 pill (icon + word, 32 dp target) per code block
++                    val tint = if (copied) Color(0xFF34C759) else Color.White.copy(alpha = 0.78f)
++                    val ctx = androidx.compose.ui.platform.LocalContext.current
++                    Row(
+                         modifier = Modifier
+-                            .size(16.dp)
++                            .clip(RoundedCornerShape(8.dp))
+                             .clickable {
+                                 clipboardManager.setText(androidx.compose.ui.text.AnnotatedString(block.code))
+                                 copied = true
+-                            },
+-                    )
++                                android.widget.Toast.makeText(ctx, "已复制", android.widget.Toast.LENGTH_SHORT).show()
++                            }
++                            .heightIn(min = 32.dp)
++                            .padding(horizontal = 8.dp),
++                        verticalAlignment = Alignment.CenterVertically,
++                    ) {
++                        Icon(
++                            imageVector = if (copied) Icons.Default.Check else Icons.Default.ContentCopy,
++                            contentDescription = "复制代码",
++                            tint = tint,
++                            modifier = Modifier.size(16.dp),
++                        )
++                        Text(if (copied) "已复制" else "复制", fontSize = 12.sp, color = tint, modifier = Modifier.padding(start = 4.dp))
++                    }
+                 }
+                 // iOS parity (SelectableMarkdownView.swift L971): cap visual
+                 // code-block height at ~400 pt and let an internal scroll
+@@ -3151,7 +3170,7 @@ private fun RenderMdVideo(block: MdBlock.Video) {
              }
              Icon(
                  imageVector = Icons.Filled.PlayCircleFilled,
@@ -24452,7 +24753,7 @@ index 0c4c7bc..5dc8686 100644
                  tint = Color.White.copy(alpha = 0.9f),
                  modifier = Modifier.size(56.dp),
              )
-@@ -3427,6 +3434,7 @@ private fun RenderTable(block: MdBlock.Table) {
+@@ -3427,6 +3446,7 @@ private fun RenderTable(block: MdBlock.Table) {
              modifier = Modifier
                  .fillMaxWidth()
                  .clip(RoundedCornerShape(6.dp))
@@ -24460,7 +24761,7 @@ index 0c4c7bc..5dc8686 100644
                  .border(1.dp, colors.tableBorder, RoundedCornerShape(6.dp))
                  // Record this draw pass into the GraphicsLayer so Copy Table
                  // Image can materialise the styled table (cells, borders, header
-@@ -3506,7 +3514,7 @@ private fun RenderTable(block: MdBlock.Table) {
+@@ -3506,7 +3526,7 @@ private fun RenderTable(block: MdBlock.Table) {
                          val columnAlign = block.alignments.getOrElse(colIndex) { MdTableAlign.START }
                          Box(
                              modifier = Modifier
@@ -42063,6 +42364,36 @@ index 0000000..dd20bfd
 +        assertEquals("> 只引用", QuoteReply.compose("只引用", ""))
 +        assertEquals("a b c", QuoteReply.preview("a\n b   c"))
 +        assertTrue(QuoteReply.preview("x".repeat(100)).length == 60)
++    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/VpsSshHintTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/VpsSshHintTest.kt
+new file mode 100644
+index 0000000..6c90d4e
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/VpsSshHintTest.kt
+@@ -0,0 +1,24 @@
++package com.openminis.app.plus
++
++import com.openminis.app.agent.VpsSshHint
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNotNull
++import org.junit.Assert.assertNull
++import org.junit.Test
++
++/** [Mines-38.9.9] bare ssh / scp to a 工作位置 server → hint to use `minis-vps run`. */
++class VpsSshHintTest {
++    private val sv = "root@8.217.89.133:22|ws://8.217.89.133:8022/,!ubuntu@vps2.example.com:2222|wss://t.example/x"
++    @Test fun hosts() = assertEquals(setOf("8.217.89.133", "vps2.example.com"), VpsSshHint.hosts(sv))
++    @Test fun bareSsh() {
++        assertNotNull(VpsSshHint.hint("ssh -p 22 root@8.217.89.133 'uptime'", sv))
++        assertNotNull(VpsSshHint.hint("cd /tmp && scp a.txt root@8.217.89.133:/root/", sv))
++        assertNotNull(VpsSshHint.hint("ssh ubuntu@vps2.example.com -p 2222 ls", sv))
++    }
++    @Test fun fine() {
++        assertNull(VpsSshHint.hint("minis-vps run uptime", sv))
++        assertNull(VpsSshHint.hint("ssh git@github.com", sv))
++        assertNull(VpsSshHint.hint("ssh root@8.217.89.133", "none"))
++        assertNull(VpsSshHint.hint("echo 8.217.89.133", sv))
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/WeatherSkyCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/WeatherSkyCoreTest.kt
