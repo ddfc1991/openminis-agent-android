@@ -5746,8 +5746,20 @@ def b399(res):
         else:
             tap_text("删除", exact=True, wait=2); time.sleep(1.5)
             r = shot(f"{tag}-delete-dialog"); t = _txt(r); o[f"{tag}_dialog"] = t[:300]
-            if "取消" not in t: selftest_fail.append(f"i399 {tag}: 删除 tap showed no confirmation dialog ({t[:100]})")
+            o[f"{tag}_dialog_probe"] = result_json("group", "i398 swipeprobe", timeout=10)
+            if "取消" not in t: selftest_fail.append(f"i399 {tag}: 删除 tap showed no confirmation dialog ({t[:100]} | probe {o[f'{tag}_dialog_probe']})")
             tap_text("取消", exact=True, wait=2); time.sleep(1)
+            # [i27] the other action: swipe again, tap 编辑 → its detail page opens (the list's add button is gone)
+            r = dump(); b2 = node_bounds(r, row_pred) if r is not None else None
+            if b2:
+                y2 = (b2[1] + b2[3]) // 2
+                sh(f"input swipe {x2} {y2} {max(40, x2 - 560)} {y2} 400"); time.sleep(1.5)
+                if tap_text("编辑", exact=True, wait=2):
+                    time.sleep(2); r = shot(f"{tag}-edit-opened"); t = _txt(r); o[f"{tag}_edit"] = t[:300]
+                    o[f"{tag}_edit_probe"] = result_json("group", "i398 swipeprobe", timeout=10)
+                    if any(k in t for k in ("添加 AI 服务商", "新建分组")): selftest_fail.append(f"i399 {tag}: 编辑 tap did not open the detail page ({t[:100]})")
+                    back(1); time.sleep(1.5)
+                else: page_missing.append(f"i399 {tag}: 编辑 not visible on the second swipe")
         back(1); time.sleep(1)
     def providers():
         swipe_page("providers", "providers", lambda n: "免登录 AI" in ((n.get("text") or "") + (n.get("content-desc") or "")))
@@ -5783,6 +5795,9 @@ def b399(res):
                 st = result_json("group", f"i396 sky {k} static", timeout=20); b381_home(); time.sleep(3); shot(f"sky-{k}-{sfx}")
                 o[f"sky_{k}_{sfx}"] = st
                 if not (isinstance(st, dict) and st.get("scene") == k): selftest_fail.append(f"i399 sky {sfx}: forced {k} but {st}")
+                # [i27] 阴 must use the overcast photo, 雾 the fog photo (were identical)
+                exp = {"overcast": "sky_overcast", "fog": "sky_fog"}.get(k)
+                if exp and isinstance(st, dict) and not str(st.get("shot", "")).startswith(exp): selftest_fail.append(f"i399 sky {sfx}: {k} shot {st.get('shot')}")
             o[f"nodata_{sfx}"] = result_json("group", "i396 sky auto static", timeout=20); b381_home(); time.sleep(3); shot(f"sky-nodata-{sfx}")
         for mode, sfx in ((1, "light"), (2, "dark")):
             theme388(mode)
@@ -5824,6 +5839,9 @@ def b399(res):
             time.sleep(2); r = dump()
             if find(r, "最后一行"): break
         r = shot("chat-sky"); t = _txt(r); o["chat"] = t[:400]
+        # [i27] light 夜 chat veil (blue-grey, not flat grey)
+        o["chat_night"] = result_json("group", "i396 sky night static", timeout=20); time.sleep(3); shot("chat-night-light")
+        result_json("group", "i396 sky sunny static", timeout=20); time.sleep(2)
         if "复制" not in t: selftest_fail.append("i399 chat: footer/code 复制 not visible")
         if tap_text("复制", exact=True, wait=2): time.sleep(0.8); shot("chat-copied")
         b = node_bounds(r, lambda n: "这是" in (n.get("text") or "") or "最后一行" in (n.get("text") or ""))
