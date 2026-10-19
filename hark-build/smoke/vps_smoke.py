@@ -116,6 +116,11 @@ try:
     I399 = "i399" in open("hark-build/smoke/target").read().splitlines()[1:2][0]   # [38.9.9] swipe / sheets / sky / 免登录 page / OAuth quick test / copy
 except Exception:
     I399 = False
+try:
+    I3910 = "i3910" in open("hark-build/smoke/target").read().splitlines()[1:2][0]   # [38.9.10 i29] sky v7 / swipe title / Clash restart / real proxy check / soak
+except Exception:
+    I3910 = False
+if I3910: I397 = True
 if I399: I397 = True
 if I398: I397 = True
 if I397: FAST = True   # [i21b] b397 only runs inside the FAST gate (smoke 39136327758 ran the legacy path without it)
@@ -3251,7 +3256,8 @@ def main():
         else: fns = (b387_linkall, b387_noblack, b387_persist, b387_platforms)
         if HUB: fns = tuple(fns) + (b3891_hub,)   # [38.9.1 c] hub runs after the UI passes
         if I395: fns = (b395_i2, b395_i) if I395B else (b395_i,)   # [38.9.5 i] build-i gate only: 一键关联 / 一键重新登录, gateway, new screens light + dark
-        if I399: fns = (b399,)
+        if I3910: fns = (b3910,)
+        elif I399: fns = (b399,)
         elif I398B: fns = (b398b,)
         elif I398: fns = (b398,)
         elif I397: fns = (b397,)   # [38.9.7] its own short gate (1080x2412 / 480 dpi, custom avatar)
@@ -5865,6 +5871,214 @@ def b399(res):
     step("drawer", drawer_free)
     step("chat", chat_copy)
     print("I399 RESULT " + json.dumps(o, ensure_ascii=False)[:8000], flush=True)
+
+
+def b3910(res):
+    """[38.9.10 i29] sky v7 (procedural AGSL): 8 scenes x light/dark on home, 5 scenes x light/dark on the chat page;
+    swipe rows on 服务商 / 模型组 keep the title; Clash service after am crash / kill (status line only: x86_64 can't run
+    mihomo); proxy check against a runner port that accepts then drops (3129) = a real failure; >= 10 min soak with heap +
+    meminfo; ~10 s screenrecords of live 晴 and 雨 on home."""
+    o = res.setdefault("i3910", {})
+    def step(name, f):
+        t0 = time.time()
+        try: f()
+        except Exception as e:
+            import traceback; traceback.print_exc(); page_missing.append(f"i3910 {name} error {e}")
+        print(f"I3910 STEP {name} {int(time.time() - t0)} s", flush=True)
+        if not alive(): crashed.append(f"i3910 {name}"); recover(f"i3910 {name}")
+    def shot(name):
+        r = snap("i3910-" + name)
+        subprocess.run(f"cp {OUT}/{step_no:02d}-i3910-{name}.png {OUT}/i3910-{name}.png", shell=True)
+        return r
+    print("I3910 screen", sh("wm size").strip(), sh("wm density").strip(), flush=True)
+    set_zh()
+    o["seedmodel"] = seed_model()
+    try: result_json("group", "wallpaper off")
+    except Exception: pass
+    o["seed"] = result_json("group", "i398 seedpicker", timeout=30)
+    o["heap0"] = result_json("group", "i3910 heap", timeout=10)
+    o["meminfo0"] = sh(f"dumpsys meminfo {PKG}", timeout=30)[:3000]
+    print("I3910 MEMINFO START\n" + o["meminfo0"][:1600], flush=True)
+    SCENES = ("sunny", "cloudy", "overcast", "fog", "snow", "sunset", "night", "rain")
+    CHAT = ("sunny", "rain", "overcast", "fog", "night")
+
+    def sky_home():
+        for mode, sfx in ((1, "light"), (2, "dark")):
+            theme388(mode); healthy_home()
+            for k in SCENES:
+                st = result_json("group", f"i396 sky {k} static", timeout=20); b381_home(); time.sleep(3)
+                shot(f"sky-{k}-{sfx}"); st2 = result_json("group", "i396 skystate", timeout=10)
+                o[f"sky_{k}_{sfx}"] = st2 or st
+                if not (isinstance(st2, dict) and st2.get("scene") == k): selftest_fail.append(f"i3910 sky {sfx}: forced {k} but {st2}")
+                elif st2.get("error"): page_missing.append(f"i3910 sky {sfx} {k}: shader error {st2.get('error')} (fallback still {st2.get('shot')})")
+        print("I3910 SKY " + json.dumps({k: v for k, v in o.items() if k.startswith("sky_")}, ensure_ascii=False)[:4000], flush=True)
+
+    def sky_chat():
+        for mode, sfx in ((1, "light"), (2, "dark")):
+            theme388(mode); healthy_home()
+            result_json("group", "i396 sky sunny static", timeout=20)
+            o[f"chat_open_{sfx}"] = result_json("group", "i398 picker", timeout=20); time.sleep(5)
+            picked = False
+            for _ in range(4):
+                if tap_text("smoke-model", wait=2): picked = True; break
+                scroll_down(); time.sleep(1)
+            if not picked: back(1); time.sleep(1.5)
+            r = dump(); e = edits(r)
+            if e:
+                sh(f"input tap {e[-1][0]} {e[-1][1]}"); time.sleep(0.6); type_text("COPYTEST"); sh("input keyevent KEYCODE_BACK"); time.sleep(0.6)
+                tap_any(["Send", "发送"], wait=3) or sh("input keyevent KEYCODE_ENTER")
+                for _ in range(12):
+                    time.sleep(2); r = dump()
+                    if find(r, "最后一行"): break
+            else: page_missing.append(f"i3910 chat {sfx}: no input")
+            for k in CHAT:
+                st = result_json("group", f"i396 sky {k} static", timeout=20); time.sleep(2.5)
+                shot(f"chat-{k}-{sfx}"); o[f"chat_{k}_{sfx}"] = st
+            back(1); time.sleep(1)
+
+    def swipe_page(route_name, tag, row_pred):
+        route(route_name, 5); r = shot(f"{tag}-rest")
+        b = node_bounds(r, row_pred)
+        if not b:
+            for _ in range(3):
+                scroll_down(); time.sleep(1); r = dump(); b = node_bounds(r, row_pred)
+                if b: break
+        if not b: page_missing.append(f"i3910 {tag}: no row to swipe"); back(1); return
+        title_nodes = [n.get("text") for n in r.iter("node") if n.get("text") and _in(n, b)] if hasattr(r, "iter") else []
+        y = (b[1] + b[3]) // 2; x2 = (SCREEN[0] - 100) if SCREEN[0] else b[2] - 20
+        sh(f"input swipe {x2} {y} {max(40, x2 - 560)} {y} 400"); time.sleep(1.5)
+        o[f"{tag}_probe"] = result_json("group", "i398 swipeprobe", timeout=10)
+        r = shot(f"{tag}-swiped"); t = _txt(r); o[f"{tag}_swiped"] = t[:400]
+        if "删除" not in t: selftest_fail.append(f"i3910 {tag}: swipe did not reveal 删除")
+        # the row's title must still be on screen (narrowed row, not pushed off / blank)
+        title = next((x for x in title_nodes if len(x) >= 2 and x not in ("编辑", "删除")), None)
+        o[f"{tag}_title"] = title
+        if title and title not in t: selftest_fail.append(f"i3910 {tag}: title 「{title}」 gone after swipe")
+        if not title: page_missing.append(f"i3910 {tag}: could not read the row title before the swipe")
+        sh(f"input tap {SCREEN[0] // 4} {y}"); time.sleep(1); back(1); time.sleep(1)
+
+    def swipes():
+        for mode, sfx in ((1, "light"), (2, "dark")):
+            theme388(mode); healthy_home()
+            swipe_page("providers", f"providers-{sfx}", lambda n: "免登录 AI" in ((n.get("text") or "") + (n.get("content-desc") or "")))
+            swipe_page("model_groups", f"groups-{sfx}", lambda n: "个模型" in ((n.get("text") or "") + (n.get("content-desc") or "")))
+
+    def svc():
+        return sh(f"dumpsys activity services {PKG}/com.openminis.app.plus.ClashService", timeout=20)
+
+    def clash():
+        theme388(1); healthy_home()
+        o["clash_on"] = result_json("group", "i3910 clashon", timeout=30); time.sleep(3)
+        s0 = svc(); o["svc_on"] = ("ServiceRecord" in s0, "isForeground=true" in s0)
+        print(f"I3910 CLASH ON {o['clash_on']} svc={o['svc_on']}", flush=True)
+        if "ServiceRecord" not in s0: selftest_fail.append(f"i3910 clash: ClashService not running after clashon ({o['clash_on']})")
+        pid0 = sh(f"pidof {PKG}").strip()
+        for how in ("crash", "kill"):
+            sh("input keyevent KEYCODE_HOME"); time.sleep(2)
+            if how == "crash": sh(f"am crash {PKG}")
+            else:
+                p = sh(f"pidof {PKG}").strip()
+                sh(f"am kill {PKG}"); time.sleep(1)
+                if p and sh(f"pidof {PKG}").strip() == p: sh(f"kill -9 {p}") ; sh(f"su 0 kill -9 {p}")
+            t0 = time.time(); back_pid = ""; s = ""
+            while time.time() - t0 < 90:
+                time.sleep(3); back_pid = sh(f"pidof {PKG}").strip(); s = svc()
+                if back_pid and back_pid != pid0 and "ServiceRecord" in s: break
+            o[f"after_{how}"] = {"secs": int(time.time() - t0), "pid_before": pid0, "pid_after": back_pid,
+                                 "service": "ServiceRecord" in s, "fg": "isForeground=true" in s}
+            st = result_json("group", "i3910 clash", timeout=20); o[f"after_{how}_state"] = st
+            print(f"I3910 CLASH AFTER {how} {o[f'after_{how}']} state={st}", flush=True)
+            if not (back_pid and back_pid != pid0 and "ServiceRecord" in s):
+                selftest_fail.append(f"i3910 clash: service not restarted within 90 s after {how} ({o[f'after_{how}']})")
+            elif isinstance(st, dict) and not st.get("serviceAlive"): selftest_fail.append(f"i3910 clash after {how}: serviceAlive false ({st})")
+            pid0 = back_pid or pid0
+        relaunch(); time.sleep(4)
+        route("plus_routing", 5)
+        for _ in range(10):
+            r = dump()
+            if find(r, "内置 Clash 内核"): break
+            scroll_down(); time.sleep(0.8)
+        scroll_down(); time.sleep(1); r = shot("clash-status"); o["clash_page"] = _txt(r)[:500]
+        sh("cmd statusbar expand-notifications"); time.sleep(2); shot("clash-notification"); sh("cmd statusbar collapse"); time.sleep(1)
+        back(1)
+        o["clash_off"] = result_json("group", "i3910 clashoff", timeout=20); time.sleep(2)
+        if "ServiceRecord" in svc(): selftest_fail.append("i3910 clash: service still running after clashoff")
+
+    def proxy():
+        theme388(1); healthy_home()
+        j = result_json("group", "i3910 proxies 10.0.2.2:3129,10.0.2.2:3128:smoke:proxy396,10.0.2.2:3128:smoke:proxy396", timeout=120)
+        o["proxies"] = j; print(f"I3910 PROXIES {j}", flush=True)
+        if not isinstance(j, dict): selftest_fail.append(f"i3910 proxies: no json ({j})"); return
+        chk = {c.get("proxy"): c for c in j.get("checks", [])}
+        d = chk.get("10.0.2.2:3129"); g = chk.get("10.0.2.2:3128")
+        if not d: selftest_fail.append(f"i3910 proxies: drop proxy not checked ({j})")
+        elif d.get("ok"): selftest_fail.append(f"i3910 proxies: accept-then-drop proxy shown as working ({d})")
+        if g and not g.get("ok"): UNTESTABLE.append(f"auth proxy 3128 real check failed on runner (no outbound?): {g}")
+        if j.get("listed", 0) > 2: selftest_fail.append(f"i3910 proxies: duplicate host:port listed twice ({j.get('listed')})")
+        route("plus_routing", 5)
+        for _ in range(8):
+            r = dump()
+            if find(r, "10.0.2.2"): break
+            scroll_down(); time.sleep(0.8)
+        r = shot("proxy-list"); o["proxy_page"] = _txt(r)[:500]
+        for lbl in ("测试", "检测", "测一下"):
+            if tap_text(lbl, wait=2): time.sleep(15); r = shot("proxy-tested"); o["proxy_page_tested"] = _txt(r)[:500]; break
+        back(1)
+        result_json("group", "i396 proxyoff", timeout=20)
+
+    def soak():
+        theme388(1); healthy_home()
+        result_json("group", "i396 sky rain", timeout=20); b381_home()
+        o["soak"] = []; t0 = time.time(); i = 0
+        while time.time() - t0 < 620:
+            i += 1
+            if i % 3 == 1:
+                result_json("group", "i398 picker", timeout=20); time.sleep(4); back(1); time.sleep(1); back(1); time.sleep(1)
+            elif i % 3 == 2:
+                for _ in range(3): scroll_down(); time.sleep(0.5)
+                b381_home()
+            else:
+                route("providers", 3); back(1); time.sleep(1)
+            if i % 2 == 0:
+                h = result_json("group", "i3910 heap", timeout=10); o["soak"].append([int(time.time() - t0), h])
+                print(f"I3910 SOAK {int(time.time() - t0)} s heap={h}", flush=True)
+            time.sleep(15)
+        o["gc"] = result_json("group", "i3910 gc", timeout=20)
+        o["heap1"] = result_json("group", "i3910 heap", timeout=10)
+        o["meminfo1"] = sh(f"dumpsys meminfo {PKG}", timeout=30)[:3000]
+        print("I3910 MEMINFO END\n" + o["meminfo1"][:1600], flush=True)
+        print(f"I3910 HEAP start={o['heap0']} end={o['heap1']} gc={o['gc']}", flush=True)
+        o["oom"] = result_json("group", "i3910 oomtest", timeout=20); time.sleep(3)
+        print(f"I3910 OOMTEST {o['oom']} alive={alive()}", flush=True)
+        if not alive(): selftest_fail.append("i3910 oomtest: app died on a background OutOfMemoryError")
+
+    def record():
+        for mode, sfx in ((1, "light"), (2, "dark")):
+            theme388(mode); healthy_home()
+            for k in ("sunny", "rain"):
+                result_json("group", f"i396 sky {k}", timeout=20); b381_home(); time.sleep(3)
+                sh(f"rm -f /sdcard/rec.mp4; screenrecord --time-limit 10 --bit-rate 6000000 /sdcard/rec.mp4", timeout=40); time.sleep(1)
+                adb("pull", "/sdcard/rec.mp4", f"{OUT}/i3910-rec-{k}-{sfx}.mp4", timeout=60)
+                st = result_json("group", "i396 skystate", timeout=10); o[f"rec_{k}_{sfx}"] = st
+                print(f"I3910 REC {k} {sfx} {os.path.getsize(f'{OUT}/i3910-rec-{k}-{sfx}.mp4') if os.path.exists(f'{OUT}/i3910-rec-{k}-{sfx}.mp4') else 0} B state={st}", flush=True)
+        result_json("group", "i396 sky sunny static", timeout=20)
+
+    step("sky_home", sky_home)
+    step("record", record)
+    step("swipes", swipes)
+    step("sky_chat", sky_chat)
+    step("clash", clash)
+    step("proxy", proxy)
+    step("soak", soak)
+    print("I3910 RESULT " + json.dumps({k: v for k, v in o.items() if not k.startswith("meminfo")}, ensure_ascii=False)[:9000], flush=True)
+
+
+def _in(n, b):
+    try:
+        nb = list(map(int, re.findall(r"\d+", n.get("bounds", ""))))
+        return nb[1] >= b[1] - 5 and nb[3] <= b[3] + 5
+    except Exception:
+        return False
 
 
 def finish(lc):
