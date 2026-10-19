@@ -5468,13 +5468,16 @@ index 7660141..f96b661 100644
          // language settings (it did: every launch reset it, so system Settings → Apps → Mines → 语言 never stuck)
          if (code.isEmpty()) return
 diff --git a/src/android/app/src/main/java/com/openminis/app/MinisApp.kt b/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
-index e48d0e0..da0e0ed 100644
+index e48d0e0..0a3bea6 100644
 --- a/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
-@@ -243,7 +243,15 @@ class MinisApp : Application(), ImageLoaderFactory {
+@@ -243,7 +243,18 @@ class MinisApp : Application(), ImageLoaderFactory {
          super.onCreate()
          // [Mines] Split proxy installs its ProxySelector before any HTTP client is built.
          runCatching { com.openminis.app.plus.SplitProxy.init(this) }
++        // [Mines-38.9.10 i29] memory guard (heap watch + trim + OOM summary), wired as i28 designed
++        runCatching { com.openminis.app.plus.MemGuard.install(this) }
++        runCatching { com.openminis.app.plus.MemGuard.register("聊天缓存") { android.os.Handler(android.os.Looper.getMainLooper()).post { runCatching { com.openminis.app.ui.chat.ChatViewModelStore.handleMemoryPressure() } }; "释放不在用的对话" } }
 +        // [Mines-38.9.6 i14] embedded Clash (mihomo) core, when switched on
 +        runCatching { Thread({ runCatching { com.openminis.app.plus.ClashCore.init(this) } }, "mines-clash-init").start() }
          runCatching { com.openminis.app.plus.HumanVerify.init(this) }
@@ -5487,7 +5490,7 @@ index e48d0e0..da0e0ed 100644
          runCatching { com.openminis.app.plus.ChatOrganizer.init(this) }
          runCatching { com.openminis.app.plus.SmartRouter.init(this) }
          // [T-android-content-capture-off] Opt every Compose window out of
-@@ -783,6 +791,19 @@ class MinisApp : Application(), ImageLoaderFactory {
+@@ -783,6 +794,19 @@ class MinisApp : Application(), ImageLoaderFactory {
              }
          }
  
@@ -14225,6 +14228,36 @@ index 0000000..9fbf83f
 +        }
 +    }
 +}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MinesCrash.kt b/src/android/app/src/main/java/com/openminis/app/plus/MinesCrash.kt
+index 2098c05..4a76c90 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/MinesCrash.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/MinesCrash.kt
+@@ -32,7 +32,10 @@ object MinesCrash {
+         val app = context.applicationContext ?: context
+         val prior = Thread.getDefaultUncaughtExceptionHandler()
+         Thread.setDefaultUncaughtExceptionHandler { thread, t ->
+-            runCatching { record(app, thread, t) }
++            // [Mines-38.9.10 i29] OutOfMemoryError: MemGuard records the heap summary; a background one (first in 10 min) is absorbed
++            val absorbed = runCatching { MemGuard.onUncaught(app, thread, t) }.getOrDefault(false)
++            if (absorbed) return@setDefaultUncaughtExceptionHandler
++            if (!MemGuardCore.isOom(t)) runCatching { record(app, thread, t) }
+             prior?.uncaughtException(thread, t)
+         }
+     }
+@@ -58,6 +61,13 @@ object MinesCrash {
+         }
+     }
+ 
++    /** [Mines-38.9.10 i29] an OutOfMemoryError: the normal crash record plus MemGuard's heap summary */
++    fun recordOom(context: Context, thread: Thread, t: Throwable, summary: String) {
++        record(context, thread, t)
++        runCatching { file(context).appendText("\n—— 内存摘要 ——\n" + summary.take(4000) + "\n") }
++        Log.e(TAG, "OOM summary: " + summary.take(2000))
++    }
++
+     fun last(context: Context): String? = runCatching { file(context).takeIf { it.exists() }?.readText() }.getOrNull()
+ 
+     /** A crash not yet shown to the user (one prompt per crash). */
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MinesJobs.kt b/src/android/app/src/main/java/com/openminis/app/plus/MinesJobs.kt
 index 1278d0e..ee297cd 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/MinesJobs.kt
@@ -24622,6 +24655,23 @@ index e0d0cae..ed6674f 100644
 +        }
 +    }
 +}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModelStore.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModelStore.kt
+index cf6a7ce..cf98de6 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModelStore.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModelStore.kt
+@@ -334,6 +334,12 @@ object ChatViewModelStore {
+      *  - the session currently on screen, which would otherwise be torn down
+      *    underneath the composition that is reading it.
+      */
++    /** [Mines-38.9.10 i29] MemGuard summary: live chat view models (normal + sub agent) */
++    @Synchronized
++    fun debugSize(): String = runCatching {
++        "${stores.size} 个（子任务 ${poolSize(PoolKind.CHILD)}）"
++    }.getOrDefault("?")
++
+     /** Number of cached stores currently belonging to [kind]. */
+     private fun poolSize(kind: PoolKind?): Int {
+         if (kind == null) return 0
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/MemoryDetailScreens.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/MemoryDetailScreens.kt
 index 83af099..4b24569 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/MemoryDetailScreens.kt
