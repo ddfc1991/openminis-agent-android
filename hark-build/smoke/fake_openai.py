@@ -281,6 +281,8 @@ fetch('/linkfake/send?'+k+'='+encodeURIComponent(v));document.getElementById('fc
         if "整理成用户以后能查的知识" in last_user_text(msgs):
             STATS["kb_posts"] = STATS.get("kb_posts", 0) + 1
             text = json.dumps(KB_JSON, ensure_ascii=False)
+        if "COPYTEST" in last_user_text(msgs):   # [38.9.9] copy UX: markdown + a code block
+            text = "## 复制测试\n这是**加粗**的一段话，还有 `行内代码`。\n\n```bash\nminis-vps run uptime\n```\n\n最后一行。"
         if "MULTIPART" in last_user_text(msgs):
             STATS["multipart"] = STATS.get("multipart", 0) + 1
             text = MULTIPART

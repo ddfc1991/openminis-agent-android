@@ -112,6 +112,11 @@ try:
     I398B = "i398b" in open("hark-build/smoke/target").read().splitlines()[1:2][0]   # [38.9.8 b] model detail / market / error card
 except Exception:
     I398B = False
+try:
+    I399 = "i399" in open("hark-build/smoke/target").read().splitlines()[1:2][0]   # [38.9.9] swipe / sheets / sky / 免登录 page / OAuth quick test / copy
+except Exception:
+    I399 = False
+if I399: I397 = True
 if I398: I397 = True
 if I397: FAST = True   # [i21b] b397 only runs inside the FAST gate (smoke 39136327758 ran the legacy path without it)
 FONT_SCALE = "1.18"
@@ -3246,7 +3251,8 @@ def main():
         else: fns = (b387_linkall, b387_noblack, b387_persist, b387_platforms)
         if HUB: fns = tuple(fns) + (b3891_hub,)   # [38.9.1 c] hub runs after the UI passes
         if I395: fns = (b395_i2, b395_i) if I395B else (b395_i,)   # [38.9.5 i] build-i gate only: 一键关联 / 一键重新登录, gateway, new screens light + dark
-        if I398B: fns = (b398b,)
+        if I399: fns = (b399,)
+        elif I398B: fns = (b398b,)
         elif I398: fns = (b398,)
         elif I397: fns = (b397,)   # [38.9.7] its own short gate (1080x2412 / 480 dpi, custom avatar)
         elif I396: fns = ((b396x,) if I396X else ()) + ((b396m,) if I396M else ()) + (b396,) + (tuple(fns) if I395 else ())   # [38.9.6 i12] glass / auto progress / archive shots first, then the full i395 pass + 自检
@@ -5695,6 +5701,135 @@ def b398b(res):
     step("jobfail", jobfail)
     step("quick", quick)
     print("I398B RESULT " + json.dumps(o, ensure_ascii=False)[:6000], flush=True)
+
+
+def b399(res):
+    """[38.9.9] 服务商 / 模型组 rows (no bleed-through at rest, swipe reveals, delete dialog), 选择模型 + stacked 快速测试 (no
+    white line, uniform dim), sky 晴 / 多云 / 阴 / no-data on home, chat page sky, 免登录 AI page from the home ☰ drawer,
+    quick test on an OAuth provider (Copilot, never signed in → a real Chinese reason), copy UX (footer 复制, one long-press sheet)."""
+    o = res.setdefault("i399", {})
+    def step(name, f):
+        try: f()
+        except Exception as e:
+            import traceback; traceback.print_exc(); page_missing.append(f"i399 {name} error {e}")
+        if not alive(): crashed.append(f"i399 {name}"); recover(f"i399 {name}")
+    def shot(name):
+        r = snap("i399-" + name)
+        subprocess.run(f"cp {OUT}/{step_no:02d}-i399-{name}.png {OUT}/i399-{name}.png", shell=True)
+        return r
+    print("I399 screen", sh("wm size").strip(), sh("wm density").strip(), flush=True)
+    set_zh()
+    o["seedmodel"] = seed_model()
+    try: result_json("group", "wallpaper off")
+    except Exception: pass
+    o["seed"] = result_json("group", "i398 seedpicker", timeout=30)
+    o["seedoauth"] = result_json("group", "i398 seedoauth", timeout=30)
+    print("I399 SEED", o["seed"], o["seedoauth"], flush=True)
+    result_json("group", "i396 sky sunny static", timeout=20)
+
+    def swipe_page(route_name, tag, row_pred):
+        route(route_name, 5); r = shot(f"{tag}-rest"); t = _txt(r)
+        o[f"{tag}_rest"] = t[:500]
+        if "删除" in t: selftest_fail.append(f"i399 {tag}: 删除 visible at rest (bleed-through)")
+        b = node_bounds(r, row_pred)
+        if not b:
+            for _ in range(3):
+                scroll_down(); time.sleep(1); r = dump(); b = node_bounds(r, row_pred)
+                if b: break
+        if not b: page_missing.append(f"i399 {tag}: no row to swipe"); back(1); return
+        y = (b[1] + b[3]) // 2; x2 = min(SCREEN[0] - 40, b[2] - 20) if SCREEN[0] else b[2] - 20
+        sh(f"input swipe {x2} {y} {max(40, x2 - 520)} {y} 350"); time.sleep(1.5)
+        r = shot(f"{tag}-swiped"); t = _txt(r); o[f"{tag}_swiped"] = t[:300]
+        if "删除" not in t: selftest_fail.append(f"i399 {tag}: swipe did not reveal 删除")
+        else:
+            tap_text("删除", exact=True, wait=2); time.sleep(1.5)
+            r = shot(f"{tag}-delete-dialog"); t = _txt(r); o[f"{tag}_dialog"] = t[:300]
+            if "取消" not in t: selftest_fail.append(f"i399 {tag}: 删除 tap showed no confirmation dialog ({t[:100]})")
+            tap_text("取消", exact=True, wait=2); time.sleep(1)
+        back(1); time.sleep(1)
+    def providers():
+        swipe_page("providers", "providers", lambda n: "免登录 AI" in ((n.get("text") or "") + (n.get("content-desc") or "")))
+    def groups():
+        swipe_page("model_groups", "groups", lambda n: "个模型" in ((n.get("text") or "") + (n.get("content-desc") or "")))
+    def picker():
+        o["open"] = result_json("group", "i398 picker", timeout=20); time.sleep(5)
+        r = shot("picker"); o["picker"] = _txt(r)[:300]
+        back(1); time.sleep(1.5); back(1); time.sleep(1)
+        o["quick_open"] = result_json("group", "i398 picker coze:7696936574432591908", timeout=20); time.sleep(6)
+        r = shot("quick-stacked"); t = _txt(r); o["quick_stacked"] = t[:300]
+        if "快速测试" not in t: selftest_fail.append(f"i399 quick test sheet not over 选择模型 ({t[:100]})")
+        o["overlay"] = result_json("group", "i396 overlay", timeout=10)
+        back(1); time.sleep(1.5); back(1); time.sleep(1); back(1)
+    def oauth_quick():
+        o["oq_open"] = result_json("group", "i398 picker gpt-4.1", timeout=20); time.sleep(5)
+        t0 = time.time(); t = ""
+        while time.time() - t0 < 75:
+            time.sleep(6); t = _txt(dump())
+            if "测试中" not in t and "快速测试" in t: break
+        r = shot("oauth-quick"); t = _txt(r); o["oauth_quick"] = t[:400]
+        print(f"I399 OAUTH QUICK {t[:300]}", flush=True)
+        if "还没配置 API Key" in t: selftest_fail.append("i399 OAuth quick test still says 还没配置 API Key")
+        if not any(w in t for w in ("Copilot", "GitHub", "登录")): page_missing.append(f"i399 OAuth quick test: no Copilot/GitHub reason seen ({t[:120]})")
+        back(1); time.sleep(1.5); back(1); time.sleep(1); back(1)
+    def sky():
+        for mode, sfx in ((1, "light"), (2, "dark")):
+            theme388(mode)
+            for k in ("sunny", "cloudy", "overcast"):
+                result_json("group", f"i396 sky {k} static", timeout=20); b381_home(); time.sleep(3); shot(f"sky-{k}-{sfx}")
+            o[f"nodata_{sfx}"] = result_json("group", "i396 sky auto static", timeout=20); b381_home(); time.sleep(3); shot(f"sky-nodata-{sfx}")
+        theme388(1)
+    def drawer_free():
+        r = b381_home(); time.sleep(2)
+        mb = node_bounds(r, lambda n: (n.get("content-desc") or "") == "更多")
+        if mb: sh(f"input tap {(mb[0] + mb[2]) // 2} {(mb[1] + mb[3]) // 2}"); time.sleep(2.5)
+        shot("drawer")
+        if not tap_text("免登录 AI", wait=2):
+            page_missing.append("i399 免登录 AI not in ☰ drawer"); b381_home(); return
+        time.sleep(3); r = shot("free-ai"); t = _txt(r); o["free_ai"] = t[:400]
+        if "一键检查" not in t: selftest_fail.append(f"i399 免登录 AI page lacks 一键检查 ({t[:100]})")
+        if tap_text("一键检查", exact=True, wait=2): time.sleep(12); r = shot("free-ai-checked"); o["free_ai_checked"] = _txt(r)[:300]
+        back(1); time.sleep(1)
+    def chat_copy():
+        result_json("group", "i396 sky sunny static", timeout=20)
+        o["chat_open"] = result_json("group", "i398 picker", timeout=20); time.sleep(5)
+        # the hook opens a chat with 选择模型 armed: pick the fake smoke-model there (the seeded coze entry never answers)
+        picked = False
+        for _ in range(5):
+            if tap_text("smoke-model", wait=2): picked = True; break
+            scroll_down(); time.sleep(1)
+        if not picked: page_missing.append("i399 chat: smoke-model not found in 选择模型"); back(1); time.sleep(1.5)
+        time.sleep(1.5)
+        r = dump(); e = edits(r)
+        if not e: page_missing.append("i399 chat: no input"); return
+        sh(f"input tap {e[-1][0]} {e[-1][1]}"); time.sleep(0.6); type_text("COPYTEST"); sh("input keyevent KEYCODE_BACK"); time.sleep(0.6)
+        tap_any(["Send", "发送"], wait=3) or sh("input keyevent KEYCODE_ENTER")
+        for _ in range(15):
+            time.sleep(2); r = dump()
+            if find(r, "最后一行"): break
+        r = shot("chat-sky"); t = _txt(r); o["chat"] = t[:400]
+        if "复制" not in t: selftest_fail.append("i399 chat: footer/code 复制 not visible")
+        if tap_text("复制", exact=True, wait=2): time.sleep(0.8); shot("chat-copied")
+        b = node_bounds(r, lambda n: "这是" in (n.get("text") or "") or "最后一行" in (n.get("text") or ""))
+        if b:
+            x, y = (b[0] + b[2]) // 2, (b[1] + b[3]) // 2
+            sh(f"input swipe {x} {y} {x} {y} 900"); time.sleep(2)
+            r = shot("chat-longpress"); t = _txt(r); o["longpress"] = t[:300]
+            if "复制全文" not in t: selftest_fail.append(f"i399 long-press did not open the one sheet ({t[:100]})")
+            if tap_text("选择文字", exact=True, wait=2): time.sleep(1.5); shot("chat-select-all")
+            back(1); time.sleep(1)
+        else: page_missing.append("i399 chat: reply text not found for long-press")
+        back(1); time.sleep(1)
+    theme388(1); healthy_home()
+    step("providers", providers)
+    step("groups", groups)
+    theme388(2); healthy_home()
+    step("picker", picker)
+    step("oauth", oauth_quick)
+    step("sky", sky)
+    healthy_home()
+    step("drawer", drawer_free)
+    step("chat", chat_copy)
+    print("I399 RESULT " + json.dumps(o, ensure_ascii=False)[:8000], flush=True)
 
 
 def finish(lc):
