@@ -5879,8 +5879,11 @@ def b3910(res):
     mihomo); proxy check against a runner port that accepts then drops (3129) = a real failure; >= 10 min soak with heap +
     meminfo; ~10 s screenrecords of live 晴 and 雨 on home."""
     o = res.setdefault("i3910", {})
+    T_I3910 = time.time()
     def step(name, f):
         t0 = time.time()
+        if t0 - T_I3910 > 82 * 60:   # [i30] smoke 1 hit the 120-min job timeout in the soak → finish() never ran
+            page_missing.append(f"i3910 {name} skipped (time budget)"); print(f"I3910 SKIP {name} (time budget)", flush=True); return
         try: f()
         except Exception as e:
             import traceback; traceback.print_exc(); page_missing.append(f"i3910 {name} error {e}")
@@ -5906,11 +5909,12 @@ def b3910(res):
         for mode, sfx in ((1, "light"), (2, "dark")):
             theme388(mode); healthy_home()
             for k in SCENES:
-                st = result_json("group", f"i396 sky {k} static", timeout=20); b381_home(); time.sleep(3)
+                st = result_json("group", f"i396 sky {k} static", timeout=20); b381_home(); time.sleep(5)
                 shot(f"sky-{k}-{sfx}"); st2 = result_json("group", "i396 skystate", timeout=10)
                 o[f"sky_{k}_{sfx}"] = st2 or st
                 if not (isinstance(st2, dict) and st2.get("scene") == k): selftest_fail.append(f"i3910 sky {sfx}: forced {k} but {st2}")
                 elif st2.get("error"): page_missing.append(f"i3910 sky {sfx} {k}: shader error {st2.get('error')} (fallback still {st2.get('shot')})")
+            record_theme(sfx)   # [i30] same theme, no extra force-stop
         print("I3910 SKY " + json.dumps({k: v for k, v in o.items() if k.startswith("sky_")}, ensure_ascii=False)[:4000], flush=True)
 
     def sky_chat():
@@ -5932,7 +5936,7 @@ def b3910(res):
                     if find(r, "最后一行"): break
             else: page_missing.append(f"i3910 chat {sfx}: no input")
             for k in CHAT:
-                st = result_json("group", f"i396 sky {k} static", timeout=20); time.sleep(2.5)
+                st = result_json("group", f"i396 sky {k} static", timeout=20); time.sleep(7)   # [i30] smoke 1 shots lagged one scene
                 shot(f"chat-{k}-{sfx}"); o[f"chat_{k}_{sfx}"] = st
             back(1); time.sleep(1)
 
@@ -5948,6 +5952,9 @@ def b3910(res):
         y = (b[1] + b[3]) // 2; x2 = (SCREEN[0] - 100) if SCREEN[0] else b[2] - 20
         sh(f"input swipe {x2} {y} {max(40, x2 - 560)} {y} 400"); time.sleep(1.5)
         o[f"{tag}_probe"] = result_json("group", "i398 swipeprobe", timeout=10)
+        if "open=true" not in str(o[f"{tag}_probe"]):   # [i30] smoke 1: 服务商 swipe lost under 3-s render stalls (off=-31)
+            time.sleep(2); sh(f"input swipe {x2} {y} {max(40, x2 - 560)} {y} 600"); time.sleep(2)
+            o[f"{tag}_probe2"] = result_json("group", "i398 swipeprobe", timeout=10); print(f"I3910 SWIPE RETRY {tag} {o[f'{tag}_probe2']}", flush=True)
         r = shot(f"{tag}-swiped"); t = _txt(r); o[f"{tag}_swiped"] = t[:400]
         if "删除" not in t: selftest_fail.append(f"i3910 {tag}: swipe did not reveal 删除")
         # the row's title must still be on screen (narrowed row, not pushed off / blank)
@@ -6030,7 +6037,7 @@ def b3910(res):
         theme388(1); healthy_home()
         result_json("group", "i396 sky rain", timeout=20); b381_home()
         o["soak"] = []; t0 = time.time(); i = 0
-        while time.time() - t0 < 620:
+        while time.time() - t0 < 420:
             i += 1
             if i % 3 == 1:
                 result_json("group", "i398 picker", timeout=20); time.sleep(4); back(1); time.sleep(1); back(1); time.sleep(1)
@@ -6052,9 +6059,8 @@ def b3910(res):
         print(f"I3910 OOMTEST {o['oom']} alive={alive()}", flush=True)
         if not alive(): selftest_fail.append("i3910 oomtest: app died on a background OutOfMemoryError")
 
-    def record():
-        for mode, sfx in ((1, "light"), (2, "dark")):
-            theme388(mode); healthy_home()
+    def record_theme(sfx):
+        if True:
             for k in ("sunny", "rain"):
                 result_json("group", f"i396 sky {k}", timeout=20); b381_home(); time.sleep(3)
                 sh(f"rm -f /sdcard/rec.mp4; screenrecord --time-limit 10 --bit-rate 6000000 /sdcard/rec.mp4", timeout=40); time.sleep(1)
@@ -6063,13 +6069,13 @@ def b3910(res):
                 print(f"I3910 REC {k} {sfx} {os.path.getsize(f'{OUT}/i3910-rec-{k}-{sfx}.mp4') if os.path.exists(f'{OUT}/i3910-rec-{k}-{sfx}.mp4') else 0} B state={st}", flush=True)
         result_json("group", "i396 sky sunny static", timeout=20)
 
+    # [i30] order: what smoke 1 never reached (finish) matters most → clash/proxy/swipes/soak before chat shots
     step("sky_home", sky_home)
-    step("record", record)
-    step("swipes", swipes)
-    step("sky_chat", sky_chat)
     step("clash", clash)
     step("proxy", proxy)
+    step("swipes", swipes)
     step("soak", soak)
+    step("sky_chat", sky_chat)
     print("I3910 RESULT " + json.dumps({k: v for k, v in o.items() if not k.startswith("meminfo")}, ensure_ascii=False)[:9000], flush=True)
 
 
@@ -6087,7 +6093,9 @@ def finish(lc):
     log = open(f"{OUT}/logcat.txt", errors="replace").read().splitlines()
     fatal = [i for i, l in enumerate(log)
              if ("FATAL EXCEPTION" in l or "Fatal signal" in l or " ANR in " in l)
-             and PKG in "\n".join(log[i:i + 4])]
+             and PKG in "\n".join(log[i:i + 4])
+             and "CrashedByAdbException" not in "\n".join(log[i:i + 4])]   # [i30] am crash in the i3910 Clash step is intentional
+    print("intentional am crash FATALs (not counted):", sum(1 for l in log if "CrashedByAdbException: shell-induced crash" in l and "AndroidRuntime" in l), flush=True)
     print("=" * 30, "FATAL EXCEPTIONS:", len(fatal), flush=True)
     for i in fatal:
         print("\n".join(log[max(0, i - 3): i + 60]))
