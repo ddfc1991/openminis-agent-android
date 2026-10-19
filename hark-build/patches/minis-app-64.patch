@@ -16960,6 +16960,77 @@ index 0000000..a763f85
 +        return "已卸载「${dirName(s)}」"
 +    }
 +}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SkyPerfCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/SkyPerfCore.kt
+new file mode 100644
+index 0000000..acf7fe3
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/SkyPerfCore.kt
+@@ -0,0 +1,65 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-38.9.10 i30] performance rules of the v7 living sky (user 「优化下」 after the 38.9.10 smoke: 230 main-thread hangs
++ * ≥ 3 s + 4 ANRs on the emulator's software GPU, 38.9.9 photo sky had none). Pure, unit-tested:
++ *  - a software GL renderer (SwiftShader / llvmpipe / softpipe …) never runs the procedural shader → pre-rendered stills;
++ *  - live frame caps: 12 fps (雨 glass 15), battery saver 4, reduce motion / forced still = one frame;
++ *  - auto-degrade from measured frame times (FrameMetrics TOTAL_DURATION): ≥ [SLOW_N] of the last [WINDOW] frames over
++ *    [SLOW_MS] ms → one level down: L1 = half fps + 1/6 resolution, L2 = still frames (shader drawn once per scene),
++ *    L3 = pre-rendered stills (no shader at all). Levels only go down within a process.
++ */
++object SkyPerfCore {
++    const val FPS = 12
++    const val RAIN_FPS = 15
++    const val SLOW_FPS = 4
++    const val SLOW_MS = 20f
++    const val WINDOW = 30
++    const val SLOW_N = 12
++    const val MAX_LEVEL = 3
++    /** level that skips the shader entirely (stills) */
++    const val STILLS = 3
++
++    private val SOFTWARE = listOf("swiftshader", "llvmpipe", "softpipe", "software rasterizer", "software renderer", "lavapipe", "pixelflinger")
++    fun isSoftwareRenderer(renderer: String?): Boolean {
++        val r = renderer?.lowercase() ?: return false
++        return SOFTWARE.any { it in r }
++    }
++
++    /** live fps for a scene at a degrade level (0 = one still frame) */
++    fun fps(rain: Boolean, level: Int, powerSave: Boolean, animOff: Boolean, forcedStatic: Boolean): Int = when {
++        animOff || forcedStatic || level >= 2 -> 0
++        powerSave -> SLOW_FPS
++        level == 1 -> (if (rain) RAIN_FPS else FPS) / 2
++        else -> if (rain) RAIN_FPS else FPS
++    }
++
++    /** pass-1 sky buffer divisor (4 = quarter resolution) */
++    fun skyDiv(level: Int): Float = if (level >= 1) 6f else 4f
++    /** pass-2 (stars / snow / rain glass) buffer divisor */
++    fun pass2Div(level: Int): Float = if (level >= 1) 3f else 2f
++
++    /** Sliding window of frame times → level steps. Not thread-safe by itself; callers feed it from one thread. */
++    class Degrader(private val window: Int = WINDOW, private val slowN: Int = SLOW_N, private val slowMs: Float = SLOW_MS) {
++        private val ring = BooleanArray(window)
++        private var i = 0; private var filled = 0; private var slow = 0
++        /** returns true when the caller should drop one level (the window restarts) */
++        fun feed(frameMs: Float): Boolean {
++            val s = frameMs > slowMs
++            if (filled == window) { if (ring[i]) slow-- } else filled++
++            ring[i] = s; if (s) slow++
++            i = (i + 1) % window
++            if (filled >= window / 2 && slow >= slowN) { reset(); return true }
++            return false
++        }
++        fun reset() { ring.fill(false); i = 0; filled = 0; slow = 0 }
++    }
++
++    fun label(level: Int, software: Boolean): String = when {
++        software -> "stills: software GPU"
++        level >= STILLS -> "stills: too slow"
++        level == 2 -> "still frames: slow"
++        level == 1 -> "reduced: half fps"
++        else -> "full"
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SmsCodes.kt b/src/android/app/src/main/java/com/openminis/app/plus/SmsCodes.kt
 index cc21c33..778a30a 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/SmsCodes.kt
@@ -18367,7 +18438,7 @@ index 9e2ca88..26bdfce 100644
          prefs(context).edit().remove("pin:${s.host}:${s.port}").apply()
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/WeatherSkyCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/WeatherSkyCore.kt
 new file mode 100644
-index 0000000..75371ab
+index 0000000..2fdc448
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/WeatherSkyCore.kt
 @@ -0,0 +1,175 @@
@@ -18394,7 +18465,7 @@ index 0000000..75371ab
 +    }
 +
 +    /** frame cap while live; battery saver drops to [SLOW_FPS]; reduce motion = one still frame */
-+    const val FPS = 20
++    const val FPS = 12   // [i30] was 20 (sky perf pass)
 +    const val SLOW_FPS = 4
 +    /** crossfade when the weather / time changes */
 +    const val FADE_MS = 1500L
@@ -19732,7 +19803,7 @@ index 1d773a2..5489e65 100644
          coroutineScope {
              val bg = slow.map { id -> async { one(id) } }
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-index af13c1b..90082f6 100644
+index af13c1b..15f89ae 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 @@ -2,6 +2,8 @@ package com.openminis.app.plus.group
@@ -19744,7 +19815,7 @@ index af13c1b..90082f6 100644
  import kotlinx.coroutines.runBlocking
  import org.json.JSONArray
  import org.json.JSONObject
-@@ -15,12 +17,512 @@ import org.json.JSONObject
+@@ -15,12 +17,515 @@ import org.json.JSONObject
   *   … --arg 'reset'
   */
  object GroupSelfTest {
@@ -19752,7 +19823,10 @@ index af13c1b..90082f6 100644
 +    private val fakeRetries = java.util.concurrent.ConcurrentHashMap<String, Int>()
 +    private fun skyState(): String = JSONObject().put("scene", com.openminis.app.ui.plus.WeatherSky.lastScene.key)
 +        .put("mode", com.openminis.app.ui.plus.WeatherSky.lastMode).put("error", com.openminis.app.ui.plus.WeatherSky.shaderError ?: "")
-+        .put("frames", com.openminis.app.ui.plus.WeatherSky.frames).put("shot", com.openminis.app.ui.plus.WeatherSky.lastShot).put("api", android.os.Build.VERSION.SDK_INT).toString()
++        .put("frames", com.openminis.app.ui.plus.WeatherSky.frames).put("shot", com.openminis.app.ui.plus.WeatherSky.lastShot).put("api", android.os.Build.VERSION.SDK_INT)
++        .put("perf", com.openminis.app.ui.plus.WeatherSky.perfLabel()).put("level", com.openminis.app.ui.plus.WeatherSky.level)
++        .put("renderer", com.openminis.app.ui.plus.WeatherSky.renderer).put("measured", com.openminis.app.ui.plus.WeatherSky.measuredFrames)
++        .put("slow", com.openminis.app.ui.plus.WeatherSky.slowFrames).put("lastFrameMs", com.openminis.app.ui.plus.WeatherSky.lastFrameMs.toDouble()).toString()
 +
      fun handle(context: Context, arg: String): String = runBlocking {
          GroupStore.init(context)
@@ -20257,7 +20331,7 @@ index af13c1b..90082f6 100644
              "partners" -> {
                  val l = Partners.refresh(context, rescanApps = true)
                  JSONArray(l.map { JSONObject().put("id", it.id).put("name", it.spec.name).put("state", it.state.name).put("model", it.model).put("via", it.via) }).toString()
-@@ -136,6 +638,13 @@ object GroupSelfTest {
+@@ -136,6 +641,13 @@ object GroupSelfTest {
                  GroupStore.add(gid, GroupMsg(GroupStore.newId(), parts.getOrElse(2) { "host" }, "成员A", "", parts.getOrElse(3) { "好的，结论：照这个办。" }))
                  "ok"
              }
@@ -20271,7 +20345,7 @@ index af13c1b..90082f6 100644
              "kbrun" -> { val n = com.openminis.app.plus.ChatKnowledge.runNow(context); "organised=$n" }
              "kbstate" -> {
                  val l = com.openminis.app.plus.ChatKnowledge.load(context)
-@@ -151,6 +660,11 @@ object GroupSelfTest {
+@@ -151,6 +663,11 @@ object GroupSelfTest {
                  JSONObject().put("title", g.title).put("care", g.care).put("kind", g.kind)
                      .put("weather", com.openminis.app.plus.HomeGreeting.cachedWeather(context)?.let { "${it.code}/${it.temp}" } ?: "none").toString()
              }
@@ -20283,7 +20357,7 @@ index af13c1b..90082f6 100644
              "greetweather" -> {
                  context.getSharedPreferences("mines_greeting", Context.MODE_PRIVATE).edit().remove("w_try").apply()
                  com.openminis.app.plus.HomeGreeting.refreshWeather(context)
-@@ -238,6 +752,112 @@ object GroupSelfTest {
+@@ -238,6 +755,112 @@ object GroupSelfTest {
              "wallpaper" -> { com.openminis.app.plus.PlusPrefs.init(context)
                  if (parts.getOrElse(0) { "" } == "off") com.openminis.app.plus.PlusPrefs.update(context) { it.copy(wallpaper = "") }
                  com.openminis.app.plus.PlusPrefs.state.value.wallpaper.ifBlank { "none" } }
@@ -20396,7 +20470,7 @@ index af13c1b..90082f6 100644
              "fogstate" -> JSONObject().put("t", com.openminis.app.ui.plus.FogClock.t.toDouble()).put("draws", com.openminis.app.ui.plus.FogClock.draws)
                  .put("still", com.openminis.app.ui.plus.FogClock.stillSeen)
                  .put("scale", android.provider.Settings.Global.getFloat(context.contentResolver, android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, -1f).toDouble()).toString()
-@@ -288,3 +908,26 @@ object GroupSelfTest {
+@@ -288,3 +911,26 @@ object GroupSelfTest {
          return JSONObject().put("chat", sid).put("group", g.id).put("direct", d.id).put("directName", dn).toString()
      }
  }
@@ -36831,10 +36905,10 @@ index 0000000..6e9e598
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WeatherSky.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WeatherSky.kt
 new file mode 100644
-index 0000000..c542643
+index 0000000..a31c338
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WeatherSky.kt
-@@ -0,0 +1,263 @@
+@@ -0,0 +1,364 @@
 +package com.openminis.app.ui.plus
 +
 +import android.os.Build
@@ -36854,7 +36928,9 @@ index 0000000..c542643
 +import androidx.compose.ui.graphics.nativeCanvas
 +import androidx.compose.ui.platform.LocalContext
 +import androidx.lifecycle.repeatOnLifecycle
++import com.openminis.app.plus.SkyPerfCore
 +import com.openminis.app.plus.WeatherSkyCore
++import kotlinx.coroutines.launch
 +import com.openminis.app.plus.WeatherSkyCore.Scene
 +
 +/**
@@ -36942,11 +37018,92 @@ index 0000000..c542643
 +        }
 +    }
 +    @Volatile private var gpu: Any? = null
-+    fun gpuOrNull(c: android.content.Context): Any? {
-+        if (Build.VERSION.SDK_INT < 33 || shaderError != null) return null
-+        gpu?.let { return it }
-+        return runCatching { Gpu(c) }.onFailure { shaderError = (it.message ?: it.javaClass.simpleName).take(300) }.getOrNull()?.also { gpu = it }
++    // [Mines-38.9.10 i30] perf pass (user 「优化下」): degrade level (SkyPerfCore), software-GPU check, off-main preparation
++    @Volatile var level: Int = 0
++    @Volatile var software: Boolean? = null
++    @Volatile var renderer: String = ""
++    @Volatile private var preparing = false
++    @Volatile var lastFrameMs: Float = 0f
++    @Volatile var slowFrames: Long = 0
++    @Volatile var measuredFrames: Long = 0
++    fun perfLabel(): String = SkyPerfCore.label(level, software == true)
++    fun degrade(why: String) {
++        if (level >= SkyPerfCore.MAX_LEVEL) return
++        level++; android.util.Log.w("MinesSky", "degrade → $level (${SkyPerfCore.label(level, false)}): $why"); bump()
 +    }
++
++    /** Never builds anything on the caller's thread: returns the prepared GPU object, or null (→ stills) and starts [prepare]. */
++    fun gpuOrNull(c: android.content.Context): Any? {
++        if (Build.VERSION.SDK_INT < 33 || shaderError != null || software == true || level >= SkyPerfCore.STILLS) return null
++        gpu?.let { return it }
++        if (!preparing) prepare(c.applicationContext)
++        return null
++    }
++
++    /** off the main thread: GL_RENDERER check (software renderer → stills for good), textures, every scene's shader parsed */
++    fun prepare(c: android.content.Context) {
++        if (preparing || Build.VERSION.SDK_INT < 33) return
++        preparing = true
++        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default).launch {
++            try {
++                if (software == null) {
++                    val r = glRenderer(c); renderer = r ?: ""
++                    software = SkyPerfCore.isSoftwareRenderer(r)
++                    if (software == true) { android.util.Log.w("MinesSky", "software GL renderer '$r' → stills"); bump(); return@launch }
++                }
++                val g = runCatching { Gpu(c).also { it.warm() } }
++                    .onFailure { shaderError = (it.message ?: it.javaClass.simpleName).take(300) }.getOrNull()
++                if (g != null) gpu = g
++                bump()
++            } finally { preparing = false }
++        }
++    }
++
++    /** GLES20.GL_RENDERER from a 1×1 pbuffer context (cached per system build) */
++    private fun glRenderer(c: android.content.Context): String? {
++        val sp = c.getSharedPreferences("mines_sky", 0); val fp = Build.FINGERPRINT
++        if (sp.getString("gl_fp", null) == fp) sp.getString("gl_renderer", null)?.let { return it }
++        val r = runCatching {
++            val d = android.opengl.EGL14.eglGetDisplay(android.opengl.EGL14.EGL_DEFAULT_DISPLAY)
++            val v = IntArray(2); android.opengl.EGL14.eglInitialize(d, v, 0, v, 1)
++            val cfg = arrayOfNulls<android.opengl.EGLConfig>(1); val n = IntArray(1)
++            android.opengl.EGL14.eglChooseConfig(d, intArrayOf(android.opengl.EGL14.EGL_RENDERABLE_TYPE, android.opengl.EGL14.EGL_OPENGL_ES2_BIT,
++                android.opengl.EGL14.EGL_SURFACE_TYPE, android.opengl.EGL14.EGL_PBUFFER_BIT, android.opengl.EGL14.EGL_NONE), 0, cfg, 0, 1, n, 0)
++            val ctx = android.opengl.EGL14.eglCreateContext(d, cfg[0], android.opengl.EGL14.EGL_NO_CONTEXT,
++                intArrayOf(android.opengl.EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, android.opengl.EGL14.EGL_NONE), 0)
++            val surf = android.opengl.EGL14.eglCreatePbufferSurface(d, cfg[0], intArrayOf(android.opengl.EGL14.EGL_WIDTH, 1,
++                android.opengl.EGL14.EGL_HEIGHT, 1, android.opengl.EGL14.EGL_NONE), 0)
++            android.opengl.EGL14.eglMakeCurrent(d, surf, surf, ctx)
++            val s = android.opengl.GLES20.glGetString(android.opengl.GLES20.GL_RENDERER)
++            android.opengl.EGL14.eglMakeCurrent(d, android.opengl.EGL14.EGL_NO_SURFACE, android.opengl.EGL14.EGL_NO_SURFACE, android.opengl.EGL14.EGL_NO_CONTEXT)
++            android.opengl.EGL14.eglDestroySurface(d, surf); android.opengl.EGL14.eglDestroyContext(d, ctx)
++            s
++        }.getOrNull()
++        if (r != null) sp.edit().putString("gl_fp", fp).putString("gl_renderer", r).apply()
++        return r
++    }
++}
++
++/** [i30] FrameMetrics (TOTAL_DURATION incl. RenderThread/GPU) of the window while the sky is live → [SkyPerfCore.Degrader]. */
++private object SkyFrameWatch {
++    private val thread by lazy { android.os.HandlerThread("mines-sky-frames").also { it.start() } }
++    val handler by lazy { android.os.Handler(thread.looper) }
++    val degrader = SkyPerfCore.Degrader()
++    /** frames ignored after (re)registering: launch / page-open frames are slow everywhere */
++    @Volatile var skip = 0
++    fun listener() = android.view.Window.OnFrameMetricsAvailableListener { _, fm, _ ->
++        if (skip > 0) { skip--; return@OnFrameMetricsAvailableListener }
++        val ms = fm.getMetric(android.view.FrameMetrics.TOTAL_DURATION) / 1_000_000f
++        WeatherSky.lastFrameMs = ms; WeatherSky.measuredFrames++
++        if (ms > SkyPerfCore.SLOW_MS) WeatherSky.slowFrames++
++        if (degrader.feed(ms)) WeatherSky.degrade("${SkyPerfCore.SLOW_N}/${SkyPerfCore.WINDOW} frames > ${SkyPerfCore.SLOW_MS.toInt()} ms (last ${ms.toInt()} ms)")
++    }
++}
++
++private fun android.content.Context.findActivity(): android.app.Activity? {
++    var c: android.content.Context? = this
++    while (c is android.content.ContextWrapper) { if (c is android.app.Activity) return c; c = c.baseContext }
++    return null
 +}
 +
 +@Composable
@@ -36966,11 +37123,12 @@ index 0000000..c542643
 +    // [i27] battery saver follows the system live (broadcast), reduce-motion re-read every minute
 +    val powerSave by MotionGate.powerSave(ctx)
 +    val animOff = remember(sTick, minuteTick) { AnimeWeather.still(ctx) }
-+    val fps = WeatherSkyCore.fps(powerSave, animOff, WeatherSky.forceStatic)
 +    val gpu = remember(sTick) { WeatherSky.gpuOrNull(ctx) }
++    val level = remember(sTick) { WeatherSky.level }
++    val fps = SkyPerfCore.fps(cur == Scene.RAIN, level, powerSave, animOff, WeatherSky.forceStatic)
 +    WeatherSky.lastScene = cur
 +    WeatherSky.lastMode = WeatherSkyCore.mode(Build.VERSION.SDK_INT, WeatherSky.shaderError.takeIf { gpu == null } ?: (if (gpu == null) "unavailable" else null),
-+        powerSave, animOff, WeatherSky.forceStatic)
++        powerSave, animOff, WeatherSky.forceStatic) + " · " + WeatherSky.perfLabel()
 +    // virtual clock: the wall clock (every page shows the same sky) minus the time the page was held still
 +    val heldMs = remember { mutableLongStateOf(0L) }
 +    val frameNow = remember { mutableLongStateOf(WeatherSky.now()) }
@@ -36978,6 +37136,15 @@ index 0000000..c542643
 +    // [Mines-38.9.9 i27] the loop runs only while something moves (live sky or a scene cross-fade) and parks while a glass
 +    // overlay is open — the parked time is added to the held clock so the sky resumes where it stopped.
 +    val fading = prev != null
++    // [i30] measure real frame times only while the shader animates
++    val view = androidx.compose.ui.platform.LocalView.current
++    val live = fps > 0 && gpu != null
++    androidx.compose.runtime.DisposableEffect(view, live) {
++        val win = if (live) view.context.findActivity()?.window else null
++        val l = if (win != null) SkyFrameWatch.listener() else null
++        if (win != null && l != null) runCatching { SkyFrameWatch.degrader.reset(); SkyFrameWatch.skip = 60; win.addOnFrameMetricsAvailableListener(l, SkyFrameWatch.handler) }
++        onDispose { if (win != null && l != null) runCatching { win.removeOnFrameMetricsAvailableListener(l) } }
++    }
 +    if ((fps > 0 && gpu != null) || fading) LaunchedEffect(owner, fps, fading, gpu != null) {
 +        owner.lifecycle.repeatOnLifecycle(androidx.lifecycle.Lifecycle.State.RESUMED) {
 +            var last = 0L
@@ -37021,7 +37188,7 @@ index 0000000..c542643
 +                fun layer(s: Scene, alpha: Float, slot: Int) {
 +                    val g = gpu
 +                    if (g != null && Build.VERSION.SDK_INT >= 33 && nc.isHardwareAccelerated) {
-+                        val ok = runCatching { drawSky(nc, g as WeatherSky.Gpu, s, dark, chat, w, h, t, alpha, nodes, slot) }
++                        val ok = runCatching { drawSky(nc, g as WeatherSky.Gpu, s, dark, chat, w, h, t, alpha, nodes, slot, level) }
 +                        ok.exceptionOrNull()?.let { WeatherSky.shaderError = (it.message ?: it.javaClass.simpleName).take(300); WeatherSky.bump() }
 +                        WeatherSky.lastShot = "v7 ${s.key} t=${"%.1f".format(t)}${s.pass2?.let { " +$it" } ?: ""}"
 +                        return
@@ -37050,8 +37217,9 @@ index 0000000..c542643
 +/** one scene: pass 1 (quarter res, blurred) + pass 2 (stars / snow full res, or 雨 glass at half res over the sky) */
 +@androidx.annotation.RequiresApi(33)
 +private fun drawSky(nc: android.graphics.Canvas, g: WeatherSky.Gpu, s: Scene, dark: Boolean, chat: Boolean, w: Float, h: Float, t: Float,
-+                    alpha: Float, nodes: Array<Any?>, slot: Int) {
-+    val qw = kotlin.math.ceil(w / 4f).toInt().coerceAtLeast(1); val qh = kotlin.math.ceil(h / 4f).toInt().coerceAtLeast(1)
++                    alpha: Float, nodes: Array<Any?>, slot: Int, level: Int = 0) {
++    val dv = SkyPerfCore.skyDiv(level); val d2 = SkyPerfCore.pass2Div(level)
++    val qw = kotlin.math.ceil(w / dv).toInt().coerceAtLeast(1); val qh = kotlin.math.ceil(h / dv).toInt().coerceAtLeast(1)
 +    val n1 = (nodes[slot] as? android.graphics.RenderNode) ?: android.graphics.RenderNode("mines-sky-$slot").also {
 +        it.setRenderEffect(android.graphics.RenderEffect.createBlurEffect(1.5f, 1.5f, android.graphics.Shader.TileMode.CLAMP)); nodes[slot] = it
 +    }
@@ -37062,7 +37230,7 @@ index 0000000..c542643
 +    try { rc.drawPaint(android.graphics.Paint().apply { shader = sh }) } finally { n1.endRecording() }
 +    val p2 = g.pass2(s)
 +    if (s == Scene.RAIN && p2 != null) {
-+        val hw = kotlin.math.ceil(w / 2f).toInt().coerceAtLeast(1); val hh = kotlin.math.ceil(h / 2f).toInt().coerceAtLeast(1)
++        val hw = kotlin.math.ceil(w / d2).toInt().coerceAtLeast(1); val hh = kotlin.math.ceil(h / d2).toInt().coerceAtLeast(1)
 +        val n2 = (nodes[2 + slot] as? android.graphics.RenderNode) ?: android.graphics.RenderNode("mines-glass-$slot").also { nodes[2 + slot] = it }
 +        n2.setPosition(0, 0, hw, hh)
 +        g.uniforms(p2, s, dark, chat, hw.toFloat(), hh.toFloat(), t)
@@ -37078,9 +37246,16 @@ index 0000000..c542643
 +    n1.alpha = alpha
 +    nc.save(); nc.scale(w / qw, h / qh); nc.drawRenderNode(n1); nc.restore()
 +    if (p2 != null) {
-+        g.uniforms(p2, s, dark, chat, w, h, t)
-+        val p = android.graphics.Paint().apply { shader = p2; this.alpha = (255 * alpha).toInt() }
-+        nc.drawRect(0f, 0f, w, h, p)
++        // [i30] stars / snow at half resolution (were full res); the shader scales by width, so the look is unchanged
++        val hw = kotlin.math.ceil(w / d2).toInt().coerceAtLeast(1); val hh = kotlin.math.ceil(h / d2).toInt().coerceAtLeast(1)
++        val n3 = (nodes[2 + slot] as? android.graphics.RenderNode) ?: android.graphics.RenderNode("mines-p2-$slot").also { nodes[2 + slot] = it }
++        n3.setRenderEffect(null)
++        n3.setPosition(0, 0, hw, hh)
++        g.uniforms(p2, s, dark, chat, hw.toFloat(), hh.toFloat(), t)
++        val r3 = n3.beginRecording(hw, hh)
++        try { r3.drawPaint(android.graphics.Paint().apply { shader = p2 }) } finally { n3.endRecording() }
++        n3.alpha = alpha
++        nc.save(); nc.scale(w / hw, h / hh); nc.drawRenderNode(n3); nc.restore()
 +    }
 +}
 +
@@ -42827,6 +43002,74 @@ index 0000000..3ecce48
 +    @Test fun frontMatter() {
 +        assertEquals("a-b" to "做某事", SkillMatchCore.frontMatter("---\nname: a-b\ndescription: \"做某事\"\n---\nbody", "dir"))
 +        assertEquals("dir" to "", SkillMatchCore.frontMatter("no fm", "dir"))
++    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/SkyPerfCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/SkyPerfCoreTest.kt
+new file mode 100644
+index 0000000..144e851
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/SkyPerfCoreTest.kt
+@@ -0,0 +1,62 @@
++package com.openminis.app.plus
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import java.io.File
++
++/** [Mines-38.9.10 i30] sky performance rules + a source scan that the sky never builds shaders / decodes on the main path. */
++class SkyPerfCoreTest {
++    @Test fun software() {
++        assertTrue(SkyPerfCore.isSoftwareRenderer("Android Emulator OpenGL ES Translator (Google SwiftShader)"))
++        assertTrue(SkyPerfCore.isSoftwareRenderer("llvmpipe (LLVM 15.0.7, 256 bits)"))
++        assertTrue(SkyPerfCore.isSoftwareRenderer("Gallium 0.4 on softpipe"))
++        assertFalse(SkyPerfCore.isSoftwareRenderer("Mali-G720-Immortalis MC12"))
++        assertFalse(SkyPerfCore.isSoftwareRenderer("Adreno (TM) 750"))
++        assertFalse(SkyPerfCore.isSoftwareRenderer(null))
++    }
++
++    @Test fun fps() {
++        assertEquals(12, SkyPerfCore.fps(false, 0, false, false, false))
++        assertEquals(15, SkyPerfCore.fps(true, 0, false, false, false))
++        assertTrue(SkyPerfCore.FPS <= 12 && SkyPerfCore.RAIN_FPS <= 15)
++        assertEquals(6, SkyPerfCore.fps(false, 1, false, false, false))
++        assertEquals(7, SkyPerfCore.fps(true, 1, false, false, false))
++        assertEquals(0, SkyPerfCore.fps(false, 2, false, false, false))
++        assertEquals(4, SkyPerfCore.fps(false, 0, true, false, false))
++        assertEquals(0, SkyPerfCore.fps(false, 0, false, true, false))
++        assertEquals(0, SkyPerfCore.fps(true, 0, false, false, true))
++        assertTrue(SkyPerfCore.skyDiv(0) >= 4f && SkyPerfCore.skyDiv(1) > SkyPerfCore.skyDiv(0))
++        assertTrue(SkyPerfCore.pass2Div(0) >= 2f)
++        assertEquals(WeatherSkyCore.FPS, SkyPerfCore.FPS)
++    }
++
++    @Test fun degrader() {
++        val d = SkyPerfCore.Degrader()
++        repeat(200) { assertFalse(d.feed(8f)) }          // a smooth device never degrades
++        repeat(200) { i -> assertFalse(d.feed(if (i % 4 == 0) 30f else 9f)) }   // 25 % slow frames: occasional jank is fine
++        var steps = 0; repeat(30) { if (d.feed(3000f)) steps++ }  // emulator-class stalls
++        assertTrue(steps >= 1)
++        val e = SkyPerfCore.Degrader(); var at = -1
++        for (k in 0 until 40) if (e.feed(40f)) { at = k; break }
++        assertTrue("degrades within a window, at $at", at in 11..29)
++    }
++
++    @Test fun labels() {
++        assertEquals("stills: software GPU", SkyPerfCore.label(0, true))
++        assertEquals("full", SkyPerfCore.label(0, false))
++        assertEquals("stills: too slow", SkyPerfCore.label(3, false))
++    }
++
++    /** the composable must not construct the GPU object (texture decode + shader parse) during composition */
++    @Test fun noMainThreadBuild() {
++        val f = listOf("src/main/java/com/openminis/app/ui/plus/WeatherSky.kt", "app/src/main/java/com/openminis/app/ui/plus/WeatherSky.kt")
++            .map { File(it) }.firstOrNull { it.exists() } ?: return
++        val src = f.readText()
++        assertTrue("prepare runs off the main thread", src.contains("Dispatchers.Default") && src.contains("fun prepare("))
++        assertFalse("no Gpu(c) inside remember{}", Regex("remember\\([^)]*\\)\\s*\\{[^}]*Gpu\\(").containsMatchIn(src))
++        assertTrue("frame metrics drive the degrade", src.contains("addOnFrameMetricsAvailableListener"))
++        assertTrue("software renderer check", src.contains("GL_RENDERER") || src.contains("GLES20.GL_RENDERER"))
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/SplitProxyCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/SplitProxyCoreTest.kt
