@@ -5737,8 +5737,10 @@ def b399(res):
                 scroll_down(); time.sleep(1); r = dump(); b = node_bounds(r, row_pred)
                 if b: break
         if not b: page_missing.append(f"i399 {tag}: no row to swipe"); back(1); return
-        y = (b[1] + b[3]) // 2; x2 = min(SCREEN[0] - 40, b[2] - 20) if SCREEN[0] else b[2] - 20
-        sh(f"input swipe {x2} {y} {max(40, x2 - 520)} {y} 350"); time.sleep(1.5)
+        # [i26] start on the row's right side (not the end of a short text node) and pull a full reveal
+        y = (b[1] + b[3]) // 2; x2 = (SCREEN[0] - 100) if SCREEN[0] else b[2] - 20
+        sh(f"input swipe {x2} {y} {max(40, x2 - 560)} {y} 400"); time.sleep(1.5)
+        o[f"{tag}_probe"] = result_json("group", "i398 swipeprobe", timeout=10); print(f"I399 SWIPEPROBE {tag} {o[f'{tag}_probe']}", flush=True)
         r = shot(f"{tag}-swiped"); t = _txt(r); o[f"{tag}_swiped"] = t[:300]
         if "删除" not in t: selftest_fail.append(f"i399 {tag}: swipe did not reveal 删除")
         else:
@@ -5758,6 +5760,7 @@ def b399(res):
         o["quick_open"] = result_json("group", "i398 picker coze:7696936574432591908", timeout=20); time.sleep(6)
         r = shot("quick-stacked"); t = _txt(r); o["quick_stacked"] = t[:300]
         if "快速测试" not in t: selftest_fail.append(f"i399 quick test sheet not over 选择模型 ({t[:100]})")
+        if "· 1908" not in t: selftest_fail.append(f"i399 stacked quick test title lacks 「· 1908」 ({t[:120]})")
         o["overlay"] = result_json("group", "i396 overlay", timeout=10)
         back(1); time.sleep(1.5); back(1); time.sleep(1); back(1)
     def oauth_quick():
@@ -5772,11 +5775,25 @@ def b399(res):
         if not any(w in t for w in ("Copilot", "GitHub", "登录")): page_missing.append(f"i399 OAuth quick test: no Copilot/GitHub reason seen ({t[:120]})")
         back(1); time.sleep(1.5); back(1); time.sleep(1); back(1)
     def sky():
+        # [i26] sky v6 = graded photo per weather: every scene light + dark (still frame), then live frames of 晴 seconds and
+        # minutes apart (skyclock shifts the shot clock: +0 / +6 s / +150 s / +300 s = next shot)
         for mode, sfx in ((1, "light"), (2, "dark")):
             theme388(mode)
-            for k in ("sunny", "cloudy", "overcast"):
-                result_json("group", f"i396 sky {k} static", timeout=20); b381_home(); time.sleep(3); shot(f"sky-{k}-{sfx}")
+            for k in ("sunny", "cloudy", "overcast", "rain", "fog", "sunset", "night", "snow"):
+                st = result_json("group", f"i396 sky {k} static", timeout=20); b381_home(); time.sleep(3); shot(f"sky-{k}-{sfx}")
+                o[f"sky_{k}_{sfx}"] = st
+                if not (isinstance(st, dict) and st.get("scene") == k): selftest_fail.append(f"i399 sky {sfx}: forced {k} but {st}")
             o[f"nodata_{sfx}"] = result_json("group", "i396 sky auto static", timeout=20); b381_home(); time.sleep(3); shot(f"sky-nodata-{sfx}")
+        for mode, sfx in ((1, "light"), (2, "dark")):
+            theme388(mode)
+            result_json("group", "i396 sky sunny", timeout=20); b381_home(); time.sleep(4)
+            for off, tag in ((0, "t0"), (None, "t6"), (150, "t150"), (300, "t300")):
+                if off is not None: o[f"live_{sfx}_{tag}"] = result_json("group", f"i396 skyclock {off}", timeout=20); b381_home(); time.sleep(3)
+                else: time.sleep(6); o[f"live_{sfx}_{tag}"] = result_json("group", "i396 skystate", timeout=10)
+                shot(f"sky-live-{sfx}-{tag}")
+            result_json("group", "i396 skyclock 0", timeout=20)
+        print("I399 SKY " + json.dumps({k: v for k, v in o.items() if k.startswith(("sky_", "live_", "nodata_"))}, ensure_ascii=False)[:3000], flush=True)
+        result_json("group", "i396 sky sunny static", timeout=20)
         theme388(1)
     def drawer_free():
         r = b381_home(); time.sleep(2)
