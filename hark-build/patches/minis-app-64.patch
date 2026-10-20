@@ -7126,14 +7126,14 @@ index 8e689fa..9d8b6ee 100644
          )
          val modelIds = config.modelEntries.filter { it.providerInstanceId == instanceId }.map { it.model.id }
 diff --git a/src/android/app/src/main/java/com/openminis/app/data/session/SessionDeleter.kt b/src/android/app/src/main/java/com/openminis/app/data/session/SessionDeleter.kt
-index b3b898b..681b40c 100644
+index b3b898b..89cb76f 100644
 --- a/src/android/app/src/main/java/com/openminis/app/data/session/SessionDeleter.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/data/session/SessionDeleter.kt
 @@ -74,6 +74,8 @@ object SessionDeleter {
              //    a ViewModelStore.
              withContext(Dispatchers.Main) { ChatViewModelStore.release(id) }
              HeadlessChatRunner.forget(id)
-+            // [Mines-38.9.11 c] an automatic delete (empty-on-exit / orphan-sweep) keeps the chat's files: shared/已归档/
++            // [Mines-38.9.11 c] automatic deletes + chat-list / folder deletes keep the chat's files: shared/已归档/ (SharedFilesCore.keepsFiles)
 +            com.openminis.app.plus.SharedFiles.beforeDelete(context, repo, id, reason)
              // 3. DB rows. deleteSessionOnly is the non-cascading primitive; the
              //    cascade is this loop, which already walked the subtree.
@@ -17173,7 +17173,7 @@ index 0000000..b60d58e
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SharedFiles.kt b/src/android/app/src/main/java/com/openminis/app/plus/SharedFiles.kt
 new file mode 100644
-index 0000000..276855d
+index 0000000..0cfcf90
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/SharedFiles.kt
 @@ -0,0 +1,48 @@
@@ -17196,9 +17196,9 @@ index 0000000..276855d
 +        SharedFilesCore.hasFiles(SharedFilesCore.workspaceDir(fd, sessionId)) || SharedFilesCore.hasFiles(SharedFilesCore.attachmentsDir(fd, sessionId))
 +    }.getOrDefault(true)   // unsure → keep the chat
 +
-+    /** SessionDeleter hook: an automatic delete keeps the files (moved to shared/已归档/); user deletes are unchanged */
++    /** SessionDeleter hook: automatic + chat-list / folder deletes keep the files (moved to shared/已归档/); 存储管理 batch delete still frees them */
 +    suspend fun beforeDelete(c: Context, repo: ChatRepository, sessionId: String, reason: String) {
-+        if (!SharedFilesCore.isAutomatic(reason)) return
++        if (!SharedFilesCore.keepsFiles(reason)) return
 +        runCatching {
 +            val title = runCatching { repo.getSession(sessionId)?.title }.getOrNull()
 +            SharedFilesCore.archive(c.applicationContext.filesDir, sessionId, title)?.let {
@@ -17227,10 +17227,10 @@ index 0000000..276855d
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SharedFilesCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/SharedFilesCore.kt
 new file mode 100644
-index 0000000..cfa29d4
+index 0000000..669ed43
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/SharedFilesCore.kt
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,108 @@
 +package com.openminis.app.plus
 +
 +import java.io.File
@@ -17254,6 +17254,10 @@ index 0000000..cfa29d4
 +    /** delete reasons that the user did not ask for (SessionDeleter callers) */
 +    val AUTOMATIC = setOf("orphan-sweep", "empty-on-exit")
 +    fun isAutomatic(reason: String): Boolean = reason in AUTOMATIC
++    /** [38.9.11 c] deletes whose chat files are moved to shared/已归档/ first: automatic ones + the chat list / folder deletes
++     *  (their dialogs say so). 存储管理's batch delete is for freeing space, so it still deletes the files. */
++    val KEEPS_FILES = AUTOMATIC + setOf("list-single", "list-multi", "folder-delete")
++    fun keepsFiles(reason: String): Boolean = reason in KEEPS_FILES
 +
 +    fun sharedDir(filesDir: File): File = File(filesDir, SHARED)
 +    fun downloadsDir(filesDir: File): File = File(sharedDir(filesDir), DOWNLOADS)
@@ -42059,9 +42063,27 @@ index 0000000..b4b58c2
 +        android:textColor="#6B5A50" />
 +</LinearLayout>
 diff --git a/src/android/app/src/main/res/values-zh-rTW/strings.xml b/src/android/app/src/main/res/values-zh-rTW/strings.xml
-index b3e1d87..3cabe37 100644
+index b3e1d87..b9991a3 100644
 --- a/src/android/app/src/main/res/values-zh-rTW/strings.xml
 +++ b/src/android/app/src/main/res/values-zh-rTW/strings.xml
+@@ -476,7 +476,7 @@
+     <string name="group_dissolve_confirm_message">%1$d 個工作階段將移回主列表，不會刪除任何工作階段。</string>
+     <string name="group_delete_with_sessions">刪除分組和 %1$d 個工作階段</string>
+     <string name="group_delete_confirm_title">刪除分組？</string>
+-    <string name="group_delete_confirm_message">該分組及其中 %1$d 個工作階段將被永久刪除，此操作無法復原。</string>
++    <string name="group_delete_confirm_message">該分組及其中 %1$d 個工作階段將被永久刪除，此操作無法復原。對話裡的檔案會保留在 shared/已归档 裡。</string>
+     <string name="group_duplicate_exists">「%1$s」已存在</string>
+     <string name="group_duplicate_hint">請換一個名稱，或點此使用已存在的分組</string>
+     <string name="group_suggest">AI 建議</string>
+@@ -519,7 +519,7 @@
+     <string name="sessionlist_dismiss">關閉</string>
+     <string name="sessionlist_delete_one_title">刪除此對話？</string>
+     <string name="sessionlist_delete_n_title">刪除 %1$d 個對話？</string>
+-    <string name="sessionlist_delete_message">此操作無法復原。</string>
++    <string name="sessionlist_delete_message">此操作無法復原。對話裡的檔案會保留在 shared/已归档 裡。</string>
+     <string name="browser_title">瀏覽器</string>
+     <string name="browser_settings_title">瀏覽器設定</string>
+     <string name="browser_new_tab">新分頁</string>
 @@ -1141,7 +1141,7 @@
      <string name="model_group_detail_unlimited">無限制</string>
      <string name="model_group_detail_context_limit_unavailable">群組成員未宣告上下文視窗——無法套用限制。請先新增模型或檢查模型中繼資料。</string>
@@ -42072,9 +42094,27 @@ index b3e1d87..3cabe37 100644
      <string name="model_groups_no_model_groups">暫無模型分組</string>
      <string name="model_groups_groups_let_you_combine_models_for_fallba">模型分組可實現回退或負載均衡。</string>
 diff --git a/src/android/app/src/main/res/values-zh/strings.xml b/src/android/app/src/main/res/values-zh/strings.xml
-index 508cf96..45ff2a1 100644
+index 508cf96..95b0caf 100644
 --- a/src/android/app/src/main/res/values-zh/strings.xml
 +++ b/src/android/app/src/main/res/values-zh/strings.xml
+@@ -477,7 +477,7 @@
+     <string name="group_dissolve_confirm_message">%1$d 个会话将移回主列表，不会删除任何会话。</string>
+     <string name="group_delete_with_sessions">删除分组和 %1$d 个会话</string>
+     <string name="group_delete_confirm_title">删除分组？</string>
+-    <string name="group_delete_confirm_message">该分组及其中 %1$d 个会话将被永久删除，此操作无法撤销。</string>
++    <string name="group_delete_confirm_message">该分组及其中 %1$d 个会话将被永久删除，此操作无法撤销。对话里的文件会保留在 shared/已归档 里。</string>
+     <string name="group_duplicate_exists">“%1$s”已存在</string>
+     <string name="group_duplicate_hint">请换一个名称，或点此使用已存在的分组</string>
+     <string name="group_suggest">AI 建议</string>
+@@ -520,7 +520,7 @@
+     <string name="sessionlist_dismiss">关闭</string>
+     <string name="sessionlist_delete_one_title">删除该对话？</string>
+     <string name="sessionlist_delete_n_title">删除 %1$d 个对话？</string>
+-    <string name="sessionlist_delete_message">此操作无法撤销。</string>
++    <string name="sessionlist_delete_message">此操作无法撤销。对话里的文件会保留在 shared/已归档 里。</string>
+     <string name="browser_title">浏览器</string>
+     <string name="browser_settings_title">浏览器设置</string>
+     <string name="browser_new_tab">新标签页</string>
 @@ -1142,7 +1142,7 @@
      <string name="model_group_detail_unlimited">不限</string>
      <string name="model_group_detail_context_limit_unavailable">分组成员未声明上下文窗口，无法启用上限。请先添加模型或检查模型元数据。</string>
@@ -42084,6 +42124,28 @@ index 508cf96..45ff2a1 100644
      <string name="model_groups_new_group">新建分组</string>
      <string name="model_groups_no_model_groups">暂无模型分组</string>
      <string name="model_groups_groups_let_you_combine_models_for_fallba">模型分组可实现回退或负载均衡。</string>
+diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
+index d610b4a..adbca98 100644
+--- a/src/android/app/src/main/res/values/strings.xml
++++ b/src/android/app/src/main/res/values/strings.xml
+@@ -540,7 +540,7 @@
+     <string name="group_dissolve_confirm_message">%1$d sessions will move back to the main list. No session will be deleted.</string>
+     <string name="group_delete_with_sessions">Delete Group &amp; %1$d Sessions</string>
+     <string name="group_delete_confirm_title">Delete Group?</string>
+-    <string name="group_delete_confirm_message">The group and its %1$d sessions will be permanently deleted. This cannot be undone.</string>
++    <string name="group_delete_confirm_message">The group and its %1$d sessions will be permanently deleted. This cannot be undone. Files from these chats are kept in shared/已归档.</string>
+     <string name="group_duplicate_exists">“%1$s” already exists</string>
+     <string name="group_duplicate_hint">Rename to something else, or tap to use it</string>
+     <string name="group_suggest">AI Suggest</string>
+@@ -584,7 +584,7 @@
+     <string name="sessionlist_dismiss">Dismiss</string>
+     <string name="sessionlist_delete_one_title">Delete conversation?</string>
+     <string name="sessionlist_delete_n_title">Delete %1$d conversations?</string>
+-    <string name="sessionlist_delete_message">This cannot be undone.</string>
++    <string name="sessionlist_delete_message">This cannot be undone. Files from the chat are kept in shared/已归档.</string>
+     <string name="browser_title">Browser</string>
+     <string name="browser_settings_title">Browser Settings</string>
+     <string name="browser_new_tab">New Tab</string>
 diff --git a/src/android/app/src/main/res/xml/mines_autofill.xml b/src/android/app/src/main/res/xml/mines_autofill.xml
 new file mode 100644
 index 0000000..f0f85eb
@@ -44698,10 +44760,10 @@ index 0000000..8625dd7
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/SharedFilesCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/SharedFilesCoreTest.kt
 new file mode 100644
-index 0000000..eb7ea61
+index 0000000..23bfa11
 --- /dev/null
 +++ b/src/android/app/src/test/java/com/openminis/app/plus/SharedFilesCoreTest.kt
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,89 @@
 +package com.openminis.app.plus
 +
 +import org.junit.Assert.assertEquals
@@ -44745,6 +44807,8 @@ index 0000000..eb7ea61
 +    @Test fun onlyAutomaticDeletesRescue() {
 +        assertTrue(SharedFilesCore.isAutomatic("empty-on-exit")); assertTrue(SharedFilesCore.isAutomatic("orphan-sweep"))
 +        for (r in listOf("list-single", "list-multi", "folder-delete", "storage-multi")) assertFalse(r, SharedFilesCore.isAutomatic(r))
++        for (r in listOf("empty-on-exit", "orphan-sweep", "list-single", "list-multi", "folder-delete")) assertTrue(r, SharedFilesCore.keepsFiles(r))
++        for (r in listOf("storage-multi", "debug", "")) assertFalse(r, SharedFilesCore.keepsFiles(r))
 +    }
 +
 +    @Test fun hasFilesIgnoresEmptyFolders() {
