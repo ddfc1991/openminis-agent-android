@@ -14,7 +14,7 @@ index e0c88bb..15ccd62 100644
          testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
  
 diff --git a/src/android/app/src/main/AndroidManifest.xml b/src/android/app/src/main/AndroidManifest.xml
-index 3855cc1..cd2c07d 100644
+index 3855cc1..87a19db 100644
 --- a/src/android/app/src/main/AndroidManifest.xml
 +++ b/src/android/app/src/main/AndroidManifest.xml
 @@ -255,6 +255,14 @@
@@ -74,6 +74,25 @@ index 3855cc1..cd2c07d 100644
          <service
              android:name=".plus.WakeWordService"
              android:exported="false"
+@@ -642,6 +685,18 @@
+ 
+         <!-- FileProvider for sharing exported JSON (provider config, etc.)
+              to other apps. Paths exposed are under app-scoped cache. -->
++        <!-- [Mines-38.9.11 c] the system file picker / Files app sees Mines' shared files (minis-global/shared, plus read-only
++             memory + skills): files the agent saves for the user stay reachable outside the app. -->
++        <provider
++            android:name="com.openminis.app.providers.MinisDocumentsProvider"
++            android:authorities="${applicationId}.documents"
++            android:exported="true"
++            android:grantUriPermissions="true"
++            android:permission="android.permission.MANAGE_DOCUMENTS">
++            <intent-filter>
++                <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
++            </intent-filter>
++        </provider>
+         <!-- [Mines-selftest-29] adb-only (uid 2000/0, checked in code) hook for the CI smoke test. -->
+         <provider
+             android:name="com.openminis.app.plus.SelfTestProvider"
 diff --git a/src/android/app/src/main/assets/default_mount/etc/profile.d/minis.sh b/src/android/app/src/main/assets/default_mount/etc/profile.d/minis.sh
 index 4bcb90a..7892964 100644
 --- a/src/android/app/src/main/assets/default_mount/etc/profile.d/minis.sh
@@ -461,6 +480,416 @@ index 0000000..c2ed4c3
 +设置 › 测试与上报 › 关于 Mines	about		Mines · Mines 基于 OpenMinis 继续开发	版本与项目信息
 +设置 › 测试与上报 › 隐私政策				
 +设置 › 测试与上报 › 反馈问题				
+diff --git a/src/android/app/src/main/assets/skybg/rain.agsl b/src/android/app/src/main/assets/skybg/rain.agsl
+new file mode 100644
+index 0000000..675b9a6
+--- /dev/null
++++ b/src/android/app/src/main/assets/skybg/rain.agsl
+@@ -0,0 +1,404 @@
++// [Mines-38.9.11 c] 雨 v5 — AGSL port of the user-approved rain prototypes (2026-10-19 22:34):
++//   light = mock-mood/video2/yu5.py 'sky-yu5-light'  水面光影: looking softly down at wet reflective ground on an overcast day,
++//           no green; silver / blue-grey water, the pale sky's reflection drifting, diagonal sheen bands, soft caustic light
++//           ripples, pale pink / silver light pooling and dissolving, a soft passing shadow; ripple rings and pink petals only as
++//           faint blurred hints, barely-there drizzle.
++//   dark  = mock-mood/video2/yu4.py 'sky-yu4-dark'   misted window at night: fogged glass with a few beading / sliding drops,
++//           quiet drizzle only visible in the lamplight, one warm lamp swaying and now and then faltering, a few far dim lights.
++// GENERATED from r3911c/sky/rain.agsl.in by r3911c/sky/gen.py (H(#rrggbb) → half3). Loaded by RainSky (ui/plus/RainSky.kt) and
++// merged over the bundled sky.agsl by RainSkyCore.merge: this file's //#SKY rain and //#GLASS replace sky.agsl's, and
++// //#RAIN_COMMON is prepended to both. It uses only sky.agsl's //#SHARED helpers + uniforms (dark, gk, gLo, gHi, iTime …).
++//#RAIN_COMMON
++float sq(float x) { return x * x; }
++const float RL = 20.0;                                   // the prototypes' loop length (s); the shader clock never loops
++/** where the light may swing: full in the open stage (between the cards and the input bar), calmer behind text / bars */
++float rzU(float y) { return 0.34 + 0.86 * ss(0.56, 0.62, y) * (1.0 - ss(0.83, 0.87, y)) + 0.14 * ss(0.27, 0.32, y) * (1.0 - ss(0.56, 0.6, y)); }
++/** the open stage only */
++float rzOpen(float y) { return ss(0.55, 0.67, y) * (1.0 - ss(0.82, 0.88, y)); }
++/** dark: quieter behind the cards / bottom bars */
++float rzWz(float y) { return 0.30 + 0.70 * ss(0.44, 0.63, y) * (1.0 - ss(0.78, 0.95, y)); }
++/** the lamp, swaying like a light hanging in the wind (slow, a little irregular); screen fractions */
++float2 rLamp(float t) {
++    float w = TAU * t / 23.0;
++    return float2(0.64 + 0.024 * sin(2.0 * w + 0.3) + 0.009 * sin(5.0 * w + 1.1) + 0.004 * sin(9.0 * w + 2.0),
++                  0.655 + 0.004 * sin(4.0 * w + 0.6) + 0.002 * sin(7.0 * w));
++}
++/** lamp intensity: mostly steady; now and then it falters (a short stutter, later a softer dip) */
++float rFlicker(float t) {
++    float e = 1.0;
++    float a = mod(t, 37.0) - 6.3;
++    e -= 0.55 * exp(-sq(a / 0.06)) + 0.35 * exp(-sq((a - 0.22) / 0.05)) + 0.65 * exp(-sq((a - 0.40) / 0.09));
++    float b = mod(t, 59.0) - 14.9;
++    e -= 0.30 * exp(-sq(b / 0.10)) + 0.20 * exp(-sq((b - 0.35) / 0.12));
++    return max(e, 0.25);
++}
++/** periodic gaussian envelope in time (period RL) */
++float rWrapG(float t, float c, float s) { float d = mod(t - c + RL * 0.5, RL) - RL * 0.5; return exp(-(d / s) * (d / s)); }
++//#SKY rain
++half3 rainLightSky(float2 p, float BH, float t) {
++    float xn = p.x / 270.0, yn = p.y / BH; float ASP = BH / 270.0;
++    float Xa = xn, Ya = yn * ASP;
++    float w = TAU * t / RL;
++    float U = rzU(yn), Uo = rzOpen(yn);
++    float3 top = float3(half3(0.8392, 0.8588, 0.8784)), mid = float3(half3(0.8039, 0.8275, 0.8549)), low = float3(half3(0.7216, 0.7569, 0.7961)), flo = float3(half3(0.8157, 0.8353, 0.8588)), silver = float3(half3(0.9333, 0.9412, 0.9529));
++    float3 slate = float3(half3(0.5608, 0.6039, 0.6549)), deep = float3(half3(0.4902, 0.5333, 0.5882)), pink = float3(half3(0.9176, 0.8275, 0.8510)), warm = float3(half3(0.9373, 0.8902, 0.8392));
++    float3 img = mix(top, mid, ss(0.05, 0.45, yn));
++    img = mix(img, low, ss(0.50, 0.70, yn) * (1.0 - ss(0.80, 0.90, yn)));
++    img = mix(img, flo, ss(0.84, 0.92, yn));
++    // domain warp, slowly turning
++    float wx = W1(float2(Xa * 60.0 + 1.2 * t, Ya * 60.0 + 0.6 * t));
++    float wy = W2(float2(Xa * 60.0 + 200.0 - 0.8 * t, Ya * 60.0 + 90.0 + 0.9 * t));
++    float Xw = Xa + 0.06 * wx + 0.015 * sin(w), Yw = Ya + 0.06 * wy + 0.015 * cos(w);
++    // 1) the pale sky's reflection drifting across the water: big soft light + darker wet-ground masses
++    float Rf = T2r(float2(Xw * 70.0 - 2.4 * t, Yw * 70.0 - 1.6 * t));
++    float G = T2g(float2(Xw * 90.0 + 0.9 * t + 300.0, Yw * 90.0 + 0.5 * t));
++    float dk = ss(0.1, 1.6, -(0.65 * Rf + 0.55 * G));
++    img = mix(img, slate, (0.05 + 0.45 * Uo) * dk);
++    img = mix(img, deep, 0.50 * Uo * dk * dk);
++    img = mix(img, silver, (0.20 + 0.28 * U) * ss(0.0, 1.6, Rf));
++    // 2) sheen bands sliding diagonally, bent by the warp
++    float band = pow(0.5 + 0.5 * cos((Xw * 0.82 + Yw * 0.57) * 2.6 * TAU - 2.0 * w + 0.9 * wx), 6.0);
++    float band2 = pow(0.5 + 0.5 * cos((Xw * 0.95 - Yw * 0.30) * 1.7 * TAU + w + 0.7 * wy + 1.0), 8.0);
++    float sheen = band * ss(-0.6, 1.2, Rf) + 0.6 * band2 * ss(-0.2, 1.4, -G);
++    img = float3(screen(half3(img), half3(silver), (0.15 + 0.28 * U) * sheen));
++    // the one warm accent: a pale warm sheen inside the main band, drifting through the open stage
++    float wc = exp(-sq((xn - 0.58 - 0.12 * sin(w + 0.4)) / 0.30) - sq((yn - 0.70 - 0.04 * sin(2.0 * w)) / 0.14));
++    img = float3(screen(half3(img), half3(warm), 0.30 * band * wc));
++    // 3) caustic-like light ripples: a soft web of bright filaments where the light falls, slowly morphing
++    float h1 = T0g(float2(Xw * 150.0 + 3.0 * t, Yw * 150.0 + 1.2 * t));
++    float h2 = T1b(float2(Xw * 150.0 - 2.0 * t, Yw * 150.0 + 2.6 * t));
++    float c1 = 1.0 - abs(sin(1.7 * h1)), c2 = 1.0 - abs(sin(1.7 * h2));
++    float ca = pow(c1, 7.0) * 0.6 + pow(c1 * c2, 5.0);
++    img = float3(screen(half3(img), half3(silver), (0.08 + 0.20 * U) * ca * (0.35 + 0.65 * clamp(sheen + 0.4 * ss(0.0, 1.5, Rf), 0.0, 1.0))));
++    // 4) pink / silver / warm light pooling and dissolving (x, y, radius, centre time, duration)
++    for (int i = 0; i < 6; i++) {
++        float px = i == 0 ? 0.30 : (i == 1 ? 0.74 : (i == 2 ? 0.62 : (i == 3 ? 0.18 : (i == 4 ? 0.82 : 0.20))));
++        float py = i == 0 ? 0.66 : (i == 1 ? 0.76 : (i == 2 ? 0.62 : (i == 3 ? 0.80 : (i == 4 ? 0.10 : 0.20))));
++        float pr = i == 0 ? 0.30 : (i == 1 ? 0.26 : (i == 2 ? 0.34 : (i == 3 ? 0.22 : (i == 4 ? 0.28 : 0.30))));
++        float tc = i == 0 ? 3.0 : (i == 1 ? 9.5 : (i == 2 ? 15.0 : (i == 3 ? 12.0 : (i == 4 ? 6.5 : 17.5))));
++        float du = i == 0 ? 4.2 : (i == 1 ? 4.6 : (i == 2 ? 4.0 : (i == 3 ? 3.6 : (i == 4 ? 4.5 : 4.2))));
++        float3 col = (i == 1 || i == 5) ? silver : (i == 3 ? warm : pink);
++        float e = rWrapG(t, tc, du * 0.6);
++        if (e < 0.01) continue;
++        float age = (mod(t - tc + RL * 0.5, RL) - RL * 0.5) / du;
++        float d = sqrt(sq(xn - px - 0.04 * age) + sq((yn - py - 0.015 * age) * ASP)) / (pr * (0.8 + 0.25 * age));
++        float m = exp(-d * d) * (0.75 + 0.25 * ss(-1.5, 1.5, Rf));
++        img = float3(screen(half3(img), half3(col), ((i == 1 || i == 5) ? 0.50 : 0.48) * e * m * (0.55 + 0.45 * U)));
++    }
++    // 5) a soft shadow passing (an out-of-focus branch overhead), very blurred
++    float Sh = T0r(float2(Xa * 55.0 + 2.2 * t, Ya * 55.0 - 0.4 * t));
++    float sw = sin(w + 2.0);
++    img *= 1.0 - (0.04 + 0.18 * Uo) * ss(0.4, 1.9, Sh) * (0.55 + 0.45 * sw * sw);
++    return half3(img);
++}
++half3 rainDarkSky(float2 p, float BH, float t) {
++    float xn = p.x / 270.0, yn = p.y / BH; float w = TAU * t / RL;
++    float3 top = float3(half3(0.0471, 0.0784, 0.1255)), mid = float3(half3(0.0588, 0.1020, 0.1569)), low = float3(half3(0.0745, 0.1255, 0.1882)), cloud = float3(half3(0.0863, 0.1294, 0.1843));
++    float3 tree = float3(half3(0.0431, 0.0784, 0.0863)), city = float3(half3(0.1255, 0.1412, 0.1647)), fog = float3(half3(0.1020, 0.1490, 0.2078));
++    float3 img = mix(top, mid, ss(0.0, 0.55, yn));
++    img = mix(img, low, ss(0.5, 1.0, yn));
++    // faint night cloud, drifting very slowly
++    float n = T0r(float2(xn * 110.0 + 2.5 * t, yn * 240.0 + 0.5 * t));
++    img = mix(img, cloud, 0.5 * ss(-0.4, 1.6, n) * (1.0 - ss(0.3, 0.6, yn)));
++    // dim city haze far below
++    img = float3(screen(half3(img), half3(city), 0.6 * ss(0.62, 0.85, yn) * (1.0 - 0.5 * ss(0.9, 1.0, yn))));
++    // the tree around the lamp: a dark, defocused canopy mass, barely separable from the night
++    float2 L = rLamp(t);
++    float dd = sqrt(sq(xn - L.x) + sq((yn - L.y) * BH / 270.0));
++    float lv = T2b(float2(xn * 90.0 + 3.0 * sin(w), yn * 200.0 + 2.0 * sin(2.0 * w + 1.0)));
++    img = mix(img, tree, 0.55 * exp(-(dd / 0.5) * (dd / 0.5)) * ss(-0.8, 1.2, lv));
++    // low mist
++    float mn = T3g(float2(xn * 120.0 - 4.0 * t, yn * 260.0));
++    img = mix(img, fog * 1.25, 0.35 * ss(0.6, 0.85, yn) * ss(-0.6, 1.4, mn));
++    return half3(img);
++}
++half3 skyColor(float2 p, float BH, float t) { return dark > 0.5 ? rainDarkSky(p, BH, t) : rainLightSky(p, BH, t); }
++//#GLASS
++// 雨 pass 2 (half res, input `sky` = pass 1 at this size). light: ripples refracting the water, glints, a few soft petals,
++// barely-there drizzle, gentle vignette. dark: the lamp + far lights + drizzle in the lamplight behind a misted window with
++// sparse beading drops and a few sliding ones. Output = the final colour; the text guard is re-applied (relaxed on home only
++// in the open stage between the cards and the input bar, where the approved prototype keeps the lamp bright).
++uniform shader sky;
++uniform float gk;   // 1 dark set, 0 light set
++half3 rGuard(half3 c, float lo, float hi) {
++    float3 lin = pow(max(float3(c), float3(0.0)), float3(2.2));
++    float Lm = dot(lin, float3(0.2126, 0.7152, 0.0722));
++    if (lo > 0.0) {
++        float knee = min(lo * 1.5, 0.95);
++        if (Lm < knee) {
++            float target = lo + Lm * (knee - lo) / knee;
++            float3 tl = pow(float3(liftTint), float3(2.2)); float Lt = dot(tl, float3(0.2126, 0.7152, 0.0722));
++            lin = mix(lin, tl, clamp((target - Lm) / max(Lt - Lm, 1e-3), 0.0, 1.0));
++        }
++    }
++    if (hi < 1.0) {
++        float knee = hi * 0.6;
++        if (Lm > knee) { float target = knee + (Lm - knee) * (hi - knee) / max(1.0 - knee, 1e-3); lin *= target / Lm; }
++    }
++    return half3(pow(lin, float3(1.0 / 2.2)));
++}
++float3 skyAt(float2 q) { return float3(sky.eval(clamp(q, float2(0.5), iResolution - 0.5)).rgb); }
++/** fine falling drizzle (two layers of short soft streaks), q in glass px (360 wide) */
++float drizzle(float2 q, float t, float shear) {
++    float a = 0.0;
++    for (int k = 0; k < 2; k++) {
++        float cw = k == 0 ? 7.0 : 11.0, ch = k == 0 ? 30.0 : 46.0, spd = k == 0 ? 470.0 : 400.0, len = k == 0 ? 4.5 : 8.0;
++        float2 u = float2(q.x - shear * (k == 0 ? 1.0 : 1.1), q.y - spd * t + float(k) * 333.0);
++        float2 id = floor(u / float2(cw, ch));
++        float2 r = h22(id + float(k) * 9.7);
++        if (r.x > (k == 0 ? 0.62 : 0.45)) continue;
++        float2 c = (id + float2(0.2 + 0.6 * r.y, 0.15 + 0.7 * h12(id + 4.1))) * float2(cw, ch);
++        float2 d = u - c;
++        float tap = clamp(1.0 - sq(d.y / len), 0.0, 1.0);
++        a += (k == 0 ? 0.7 : 0.6) * (0.35 + 0.65 * h12(id + 1.7)) * pow(tap, 0.8) * exp(-0.5 * sq(d.x / (k == 0 ? 0.45 : 0.6)));
++    }
++    return a;
++}
++/** dark: the lamp, far dim lights and lamp-lit mist, in glass px (360 wide, DH tall); litm = how lit (for the drizzle) */
++float3 lampLight(float2 q, float DH, float t, out float litm) {
++    float w = TAU * t / RL;
++    float2 L = rLamp(t);
++    float fl = rFlicker(t) * (0.95 + 0.05 * sin(3.0 * w + 0.4));
++    float2 dlt = q - float2(L.x * 360.0, L.y * DH);
++    float r = length(dlt);
++    float core = exp(-sq(r / 22.0)) * 0.9 + exp(-sq(r / 46.0)) * 0.35;
++    float halo = exp(-pow(r / 100.0, 1.5)) * 0.58 + exp(-pow(r / 190.0, 1.6)) * 0.18;
++    // leaf shadows drifting across the light: two canopy layers moving in the wind
++    float sh1 = T0g(float2(dlt.x * 0.30 + 30.0 * sin(2.0 * w) + 10.0 * sin(5.0 * w + 1.0), q.y * 0.30 + 7.0 * sin(3.0 * w + 0.5)));
++    float sh2 = T2b(float2(q.x * 0.8 - 30.0 * sin(w + 0.7) + 8.0 * sin(4.0 * w), q.y * 0.8 + 6.0 * sin(2.0 * w + 2.0)));
++    float leaf = (0.18 + 0.82 * ss(-0.7, 0.7, sh1)) * (0.65 + 0.35 * ss(-1.0, 1.0, sh2));
++    core *= fl * (0.55 + 0.45 * leaf); halo *= fl * (0.35 + 0.65 * leaf);
++    float3 hal = float3(0.0);
++    // a handful of far, dim lights (mostly cool, two faint warm) — quiet
++    for (int i = 0; i < 7; i++) {
++        float bx = i == 0 ? 0.12 : (i == 1 ? 0.47 : (i == 2 ? 0.78 : (i == 3 ? 0.58 : (i == 4 ? 0.30 : (i == 5 ? 0.90 : 0.05)))));
++        float by = i == 0 ? 0.71 : (i == 1 ? 0.62 : (i == 2 ? 0.77 : (i == 3 ? 0.79 : (i == 4 ? 0.66 : (i == 5 ? 0.69 : 0.61)))));
++        float br = i == 0 ? 9.0 : (i == 1 ? 6.0 : (i == 2 ? 12.0 : (i == 3 ? 7.5 : (i == 4 ? 10.0 : (i == 5 ? 8.0 : 5.5)))));
++        float bi = i == 0 ? 0.16 : (i == 1 ? 0.12 : (i == 2 ? 0.20 : (i == 3 ? 0.14 : (i == 4 ? 0.18 : (i == 5 ? 0.15 : 0.11)))));
++        float3 bc = i == 4 ? float3(half3(0.7882, 0.5725, 0.3686)) : (i == 5 ? float3(half3(0.7255, 0.5176, 0.3412)) : (i == 1 ? float3(half3(0.4980, 0.6275, 0.7098)) : (i == 3 ? float3(half3(0.5412, 0.6510, 0.7216)) : float3(half3(0.4353, 0.5608, 0.6588)))));
++        float ph = float(i) * 1.7;
++        float2 bp = float2((bx + 0.006 * sin(w + ph)) * 360.0, (by + 0.003 * sin(2.0 * w + ph)) * DH);
++        float rr = length(q - bp) / br;
++        hal += (1.0 - ss(0.7, 1.08, rr)) * bi * (0.8 + 0.2 * sin(2.0 * w + ph)) * bc;
++    }
++    hal += float3(half3(0.9059, 0.6471, 0.3843)) * 0.62 * halo + float3(half3(1.0000, 0.8627, 0.6510)) * 0.95 * core;
++    // 细雨蒙蒙: drifting mist only visible where the lamp lights it
++    float fg = T2r(float2(q.x * 0.35 - 9.0 * t, q.y * 0.35 + 5.0 * t));
++    litm = clamp(halo * 1.6 + core * 0.4, 0.0, 1.0);
++    hal += float3(half3(0.4784, 0.3373, 0.2039)) * 0.30 * litm * ss(-0.8, 1.6, fg);
++    // wet ground below: the lamp's reflection, a soft vertical shimmer
++    float yh = q.y / DH, xh = q.x / 360.0, gy0 = 0.765;
++    float rx = exp(-sq((xh - L.x) / (0.045 + 0.05 * ss(gy0, 0.86, yh))));
++    float shim = 0.75 + 0.25 * sin(q.y * 0.35 + 6.0 * w) * sin(q.y * 0.11 - 2.0 * w);
++    hal += float3(half3(0.9059, 0.6471, 0.3843)) * 0.20 * rx * ss(gy0, gy0 + 0.02, yh) * (1.0 - ss(gy0 + 0.03, 0.86, yh)) * shim * fl;
++    litm *= 0.6 + 0.4 * ss(-0.5, 1.0, fg);
++    return hal * rzWz(yh);
++}
++/** one water drop on the glass (yu2 / yu4 maps): height gradient G, refraction mask M, rim, dark edge, speculars, caustic */
++void rDrop(inout float2 G, inout float M, inout float RIM, inout float EDGE, inout float SPEC, inout float CAU,
++           float2 p, float2 ctr, float R, float ax, float av) {
++    float2 d = p - ctr;
++    float r2 = ((d.x / ax) * (d.x / ax) + (d.y * ax) * (d.y * ax)) / (R * R);
++    if (r2 > 1.69 || av <= 0.0) return;
++    float r = sqrt(r2);
++    float dome = max(1.0 - r2, 0.0);
++    if (r2 < 1.0) G += av * -2.0 * float2(d.x / (ax * ax), d.y * ax * ax);
++    M = max(M, av * ss(0.0, 0.3, dome));
++    RIM = max(RIM, av * exp(-sq((r - 0.9) / 0.11)));
++    EDGE = max(EDGE, av * ss(0.55, 0.85, r) * (1.0 - ss(0.88, 1.0, r)) * (0.45 + clamp(0.5 - d.y / R, 0.0, 1.2)));
++    SPEC = max(SPEC, av * exp(-(((d.x + 0.32 * R) * (d.x + 0.32 * R) + (d.y + 0.42 * R) * (d.y + 0.42 * R)) / ((0.2 * R) * (0.2 * R)))));
++    CAU = max(CAU, av * ss(0.35, 0.8, r) * (1.0 - ss(0.8, 1.0, r)) * clamp(d.y / R + 0.1, 0.0, 1.0));
++}
++/** ring profile (yu5 Ripples5): value + d/dr of exp(-((r-R)/w)^2) - 0.7 exp(-((r-R+k w)/w)^2) */
++float2 rRing(float r, float R, float w, float k) {
++    float a = (r - R) / w, b = (r - R + k * w) / w;
++    float ea = exp(-a * a), eb = exp(-b * b);
++    return float2(ea - 0.7 * eb, (-2.0 * a * ea + 1.4 * b * eb) / w);
++}
++half4 rainLightGlass(float2 fragCoord, float sc, float2 q, float DH, float t) {
++    float3 silver = float3(half3(0.9333, 0.9412, 0.9529));
++    // ripples: soft wide double rings seen from above, mostly in the open stage, a few near the top; tiny glint where they land
++    float F = 0.0; float2 Gr = float2(0.0); float Pk = 0.0;
++    float cell = 120.0;
++    float2 id = floor(q / cell);
++    for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
++        float2 g = id + float2(float(i), float(j));
++        float2 cc = (g + 0.5) * cell;
++        float yc = cc.y / DH;
++        float zone = ss(0.50, 0.585, yc) * (1.0 - ss(0.835, 0.90, yc)) + 0.35 * ss(0.0, 0.03, yc) * (1.0 - ss(0.20, 0.26, yc));
++        if (zone < 0.02) continue;
++        float life = 3.6 + 2.0 * h12(g + 2.3);
++        float per = life + 0.8 + 4.5 * h12(g + 7.9);
++        float ph = h12(g + 1.1) * per;
++        float cyc = floor((t + ph) / per); float age = mod(t + ph, per);
++        if (age > life) continue;
++        if (h12(g + cyc * 3.7 + 0.4) > 0.55 * zone + 0.1) continue;
++        float2 rr = h22(g + cyc * 1.37);
++        float2 ctr = (g + 0.1 + 0.8 * rr) * cell;
++        float rmax = 34.0 + 56.0 * h12(g + cyc * 2.1), amp0 = 0.45 + 0.55 * h12(g + cyc * 5.3), asp = 0.86 + 0.10 * h12(g + cyc * 6.1);
++        float a = age / life;
++        float R = rmax * (1.0 - exp(-2.4 * a)) / (1.0 - exp(-2.4)) + 1.0;
++        float wd = 4.5 + 4.0 * a;
++        float amp = amp0 * pow(1.0 - a, 1.7) * min(1.0, a / 0.05);
++        float2 d = float2(q.x - ctr.x, (q.y - ctr.y) / asp);
++        float r = max(length(d), 1e-3);
++        if (r > R + 4.0 * wd) continue;
++        float2 v = rRing(r, R, wd, 2.2);
++        if (a > 0.12) v += 0.5 * rRing(r, 0.58 * R, wd, 2.0);
++        F += amp * v.x;
++        Gr += amp * v.y * float2(d.x / r, d.y / (r * asp));
++        if (age < 0.30) Pk += exp(-age / 0.09) * amp0 * exp(-sq(r / 2.2));
++    }
++    float yo = q.y / DH, xo = q.x / 360.0;
++    float3 refr = skyAt(fragCoord + Gr * 18.0 * 0.5 * sc);
++    float lit = clamp(-(Gr.x * 0.6 + Gr.y) * 3.0, -1.0, 1.0);
++    float kz = 0.35 + 0.65 * rzU(yo);
++    float3 o = refr + (silver - refr) * (clamp(0.35 * lit, 0.0, 0.22) * kz) - (0.06 * clamp(-lit, 0.0, 1.0) * kz) * refr;
++    o = float3(screen(half3(o), half3(silver), 0.45 * clamp(Pk, 0.0, 1.0) * kz));
++    // a few soft pink petals floating (defocused hints)
++    float wv = TAU * t / 26.0;
++    float3 cpink = float3(half3(0.9216, 0.8078, 0.8510)), clight = float3(half3(0.9647, 0.9020, 0.9255)), cdeep = float3(half3(0.8667, 0.7059, 0.7686));
++    for (int i = 0; i < 6; i++) {
++        float px = i == 0 ? 0.16 : (i == 1 ? 0.80 : (i == 2 ? 0.50 : (i == 3 ? 0.30 : (i == 4 ? 0.68 : 0.06))));
++        float py = i == 0 ? 0.645 : (i == 1 ? 0.715 : (i == 2 ? 0.785 : (i == 3 ? 0.815 : (i == 4 ? 0.630 : 0.120))));
++        float sz = 0.5 * (i == 0 ? 34.0 : (i == 1 ? 38.0 : (i == 2 ? 24.0 : (i == 3 ? 40.0 : (i == 4 ? 26.0 : 36.0)))));
++        float df = 0.5 * (i == 0 ? 22.0 : (i == 1 ? 26.0 : (i == 2 ? 7.0 : (i == 3 ? 30.0 : (i == 4 ? 12.0 : 26.0)))));
++        float al = i == 0 ? 0.40 : (i == 1 ? 0.36 : (i == 2 ? 0.55 : (i == 3 ? 0.30 : (i == 4 ? 0.45 : 0.28))));
++        float fi = float(i);
++        float ox = 0.5 * (14.0 + 20.0 * h12(float2(fi, 1.0))), oy = 0.5 * (8.0 + 12.0 * h12(float2(fi, 2.0)));
++        float ph = TAU * h12(float2(fi, 3.0)); float kk = (h12(float2(fi, 4.0)) < 0.5 ? -1.0 : 1.0) * (h12(float2(fi, 5.0)) < 0.5 ? 1.0 : 2.0);
++        float2 c = float2(px * 360.0 + ox * sin(kk * wv + ph) + 0.5 * ox * sin(2.0 * wv + 1.3 * ph), py * DH + oy * cos(kk * wv + ph));
++        float2 dd = q - c;
++        if (abs(dd.x) > sz + 3.0 * df + 4.0 || abs(dd.y) > sz + 3.0 * df + 4.0) continue;
++        float ang = TAU * h12(float2(fi, 6.0)) + (0.35 + 0.55 * h12(float2(fi, 7.0))) * sin(wv + ph) + 0.25 * sin(3.0 * wv + 2.0 * ph);
++        float casp = 0.80 + 0.12 * h12(float2(fi, 8.0)), tone = h12(float2(fi, 9.0));
++        float ca = cos(ang), sa = sin(ang);
++        float u = (dd.x * ca + dd.y * sa) / sz; float vv = (-dd.x * sa + dd.y * ca) / (sz * casp);
++        vv = vv / (0.55 + 0.45 * clamp((u + 1.0) * 0.5, 0.0, 1.0));            // teardrop: narrow at the base
++        float notch = 0.22 * exp(-sq((u - 1.0) / 0.18) - sq(vv / 0.25));
++        float dist = sqrt(u * u + vv * vv) + notch;
++        float soft = df / sz;
++        float m = 1.0 - ss(1.0 - 0.35 * soft - 0.05, 1.0 + soft + 0.05, dist);
++        float3 col = mix(cpink, clight, 0.55 * (1.0 - ss(0.0, 0.9, dist)) + 0.2 * tone);
++        col = mix(col, cdeep, 0.35 * clamp((-0.2 - u) / 0.8, 0.0, 1.0));
++        float aa = min(1.06 * al * m, 0.8);
++        o = o * (1.0 - aa) + col * aa;
++    }
++    // drizzle: barely there, only against the darker water in the open stage
++    float lumU = dot(float3(sky.eval(fragCoord).rgb), float3(0.3333));
++    float vis = clamp((0.82 - lumU) * 4.0, 0.0, 1.0) * rzU(yo);
++    o = float3(screen(half3(o), half3(half3(0.9569, 0.9647, 0.9725)), clamp(drizzle(q, t * 0.45, 0.05 * (q.y - DH * 0.5)) * vis * 0.05, 0.0, 1.0)));
++    // gentle vignette
++    float r2 = sq((xo - 0.5) / 0.62) + sq((yo - 0.52) / 0.75);
++    o = mix(o, float3(half3(0.6627, 0.6980, 0.7373)), clamp(max(r2 - 0.25, 0.0) * 0.09, 0.0, 0.6));
++    return half4(rGuard(half3(clamp(o, 0.0, 1.0)), gLo, gHi), 1.0);
++}
++half4 rainDarkGlass(float2 fragCoord, float sc, float2 p, float DH, float t) {
++    // sparse drops on a misted window (yu4 Glass4): drops bead up slowly and evaporate; a few slide and clear a trail
++    float2 G = float2(0.0); float M = 0.0, RIM = 0.0, EDGE = 0.0, SPEC = 0.0, CAU = 0.0;
++    for (int k = 0; k < 3; k++) {
++        float cell = k == 0 ? 33.0 : (k == 1 ? 55.0 : 115.0);
++        float Rlo = k == 0 ? 0.9 : (k == 1 ? 2.2 : 4.8); float Rhi = k == 0 ? 2.2 : (k == 1 ? 4.8 : 9.0);
++        float2 id = floor(p / cell);
++        for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
++            if (k < 2 && (i != 0 || j != 0)) continue;
++            float2 g = id + float2(float(i), float(j));
++            float ph = h12(g + float(k) * 13.7) * 40.0;
++            float life = 10.0 + 9.0 * h12(g + 5.1 + float(k));
++            float per = life + 1.0 + 6.0 * h12(g + 9.9);
++            float cyc = floor((t + ph) / per); float age = mod(t + ph, per);
++            float2 r = h22(g + cyc * 3.17 + float(k) * 1.3);
++            float R0 = mix(Rlo, Rhi, h12(g + cyc * 1.91));
++            float margin = k < 2 ? R0 * 1.3 / cell : 0.0;
++            float2 ctr = (g + margin + (1.0 - 2.0 * margin) * r) * cell;
++            float shr = 2.5;
++            float av = ss(0.0, 1.2, age) * (1.0 - pow(clamp((age - (life - shr)) / shr, 0.0, 1.0), 1.5)) * step(age, life);
++            rDrop(G, M, RIM, EDGE, SPEC, CAU, p, ctr, R0 * (0.75 + 0.25 * min(av, 1.0)), 0.88 + 0.24 * h12(g + cyc), av);
++        }
++    }
++    // sliders: now and then a drop breaks loose and slides down stick-slip with a wobble, leaving beads and a cleared trail
++    float clr = 0.0;
++    float colW = 90.0; float cx = floor(p.x / colW);
++    for (int i = -1; i <= 1; i++) {
++        float col = cx + float(i);
++        float per = 19.0 + 14.0 * h12(float2(col, 3.0));
++        float o0 = h12(float2(col, 7.0)) * per;
++        float cyc = floor((t + o0) / per); float st = mod(t + o0, per);
++        if (h12(float2(col, cyc)) < 0.45) continue;
++        float Rs = 5.0 + 2.5 * h12(float2(col, cyc + 0.5)); float dur = 4.5 + 2.5 * h12(float2(col, cyc + 1.5));
++        float y0 = (0.40 + 0.15 * h12(float2(col, cyc + 2.5))) * DH; float ln = (0.28 + 0.14 * h12(float2(col, cyc + 3.5))) * DH;
++        float x0 = (col + 0.2 + 0.6 * h12(float2(col, cyc + 4.5))) * colW;
++        float wa = 3.0 + 4.0 * h12(float2(col, cyc + 5.5)), wl = 40.0 + 50.0 * h12(float2(col, cyc + 6.5)), wph = TAU * h12(float2(col, cyc + 7.5));
++        float q = min(st / dur, 1.0);
++        float hy = ln * clamp(q + sin(TAU * q * 4.0) / (TAU * 4.0) * 0.9, 0.0, 1.0);
++        float fadeIn = ss(0.0, 0.8, st); float fadeOut = 1.0 - ss(dur + 7.0, dur + 10.0, st);
++        float yy = p.y - y0;
++        float xPath = x0 + wa * sin(yy / wl + wph) + 2.0 * sin(yy / 22.0);
++        if (st < dur + 0.8) {
++            float aH = fadeIn * (1.0 - ss(dur, dur + 0.8, st));
++            float hx = x0 + wa * sin(hy / wl + wph) + 2.0 * sin(hy / 22.0);
++            rDrop(G, M, RIM, EDGE, SPEC, CAU, p, float2(hx, y0 + hy), Rs, 0.84, aH);
++            rDrop(G, M, RIM, EDGE, SPEC, CAU, p, float2(hx, y0 + hy - Rs * 0.95), Rs * 0.55, 0.9, aH * 0.8);
++        }
++        if (yy > 0.0 && yy < hy) {
++            float since = st - (yy / ln) * dur;
++            float wdt = Rs * (0.75 + 0.2 * sin(yy * 0.23));
++            clr = max(clr, exp(-since / 6.0) * fadeIn * fadeOut * (1.0 - ss(wdt * 0.8, wdt, abs(p.x - xPath))));
++            float sp = 18.0 + 12.0 * h12(float2(col, cyc + 8.5));
++            float kb = floor(yy / sp + 0.5); float by = kb * sp;
++            if (by > 6.0 && by < hy) {
++                float bx = x0 + wa * sin(by / wl + wph) + 2.0 * sin(by / 22.0);
++                float br = (0.18 + 0.22 * h12(float2(col * 3.1 + kb, cyc))) * Rs;
++                float sb = st - (by / ln) * dur;
++                rDrop(G, M, RIM, EDGE, SPEC, CAU, p, float2(bx, y0 + by), br, 0.95, (1.0 - ss(6.0, 9.5, sb)) * fadeOut);
++            }
++        }
++    }
++    M *= 1.0 - 0.8 * clr;
++    // the scene behind the glass: night sky (pass 1) + the lamp + drizzle in its light
++    float litm;
++    float3 hal = lampLight(p, DH, t, litm);
++    float shr = 0.05 * (p.y - DH * 0.5) + 6.0 * sin(TAU * t / RL);
++    float rv = drizzle(p, t, shr);
++    float3 add = clamp(hal + float3(half3(1.0000, 0.8627, 0.6510)) * (0.60 * rv * litm), 0.0, 1.0);
++    float3 base = skyAt(fragCoord);
++    float3 bg = 1.0 - (1.0 - base) * (1.0 - add);
++    // condensation: soft-focus everything and bloom the lamp; slid trails clear it
++    float3 bl = float3(0.0);
++    float rb = 9.0 * sc;
++    for (int k = 0; k < 8; k++) { float a = float(k) * 0.785398 + 0.39; bl += skyAt(fragCoord + float2(cos(a), sin(a)) * rb); }
++    bl = bl / 8.0;
++    float3 bloom = 1.0 - (1.0 - bl) * (1.0 - clamp(hal * 1.15, 0.0, 1.0));
++    float3 fogc = float3(half3(0.1020, 0.1490, 0.2078));
++    float speck = T3b(p * 1.7);
++    float fa = (0.42 + 0.08 * clamp(speck / 1.6, -1.0, 1.0)) * (1.0 - 0.85 * clr) * (1.0 - M);
++    float3 o = mix(bg, bloom * 1.05 + fogc * 0.22, fa);
++    float2 off = G * 10.0 * sc;
++    if (M > 0.004) {                                 // drop = inverted, minified view of the scene behind (lamp included)
++        float litr;
++        float3 hr = lampLight(p + G * 10.0, DH, t, litr);
++        float3 br0 = skyAt(fragCoord + off);
++        float3 refr = (1.0 - (1.0 - br0) * (1.0 - clamp(hr, 0.0, 1.0))) * 1.12 + 0.008;
++        o = mix(o, refr, M);
++    }
++    o = o * (1.0 - 0.45 * EDGE);
++    float lumL = dot(bloom, float3(0.3333));
++    float3 ltint = clamp(bloom / max(lumL, 0.02) * clamp(lumL * 3.0, 0.2, 1.5), 0.0, 1.5) * 0.6;
++    o = o + (min(ltint, float3(1.4)) * 0.40 + float3(half3(0.6863, 0.7529, 0.8118)) * 0.07) * RIM;
++    o = float3(screen(half3(o), half3(half3(1.0000, 0.9412, 0.8549)), 0.28 * SPEC * (0.25 + 0.9 * clamp(lumL * 3.0, 0.0, 1.0))));
++    o = o + min(ltint, float3(1.4)) * 0.55 * CAU;
++    // grade: lifted blacks, gentle cool vignette
++    o = o * 0.94 + float3(half3(0.0549, 0.0863, 0.1333)) * 0.054;
++    float xo = p.x / 360.0, yo = p.y / DH;
++    float r2 = sq((xo - 0.5) / 0.62) + sq((yo - 0.52) / 0.75);
++    o = mix(o, float3(half3(0.0471, 0.0784, 0.1255)) * 0.7, clamp(max(r2 - 0.25, 0.0) * 0.22, 0.0, 0.6));
++    // text guard; home keeps the lamp bright in the open stage (no text there), the chat page stays strict
++    float hi = gHi >= 0.1 && gHi < 1.0 ? mix(gHi, 0.80, rzOpen(yo)) : gHi;
++    return half4(rGuard(half3(clamp(o, 0.0, 1.0)), gLo, hi), 1.0);
++}
++half4 main(float2 fragCoord) {
++    float sc = iResolution.x / 360.0;             // glass maps designed at 360 px wide (yu4 / yu5 half res)
++    float2 p = fragCoord / sc;
++    float DH = iResolution.y / sc;
++    return gk > 0.5 ? rainDarkGlass(fragCoord, sc, p, DH, iTime) : rainLightGlass(fragCoord, sc, p, DH, iTime);
++}
 diff --git a/src/android/app/src/main/assets/skybg/sky.agsl b/src/android/app/src/main/assets/skybg/sky.agsl
 new file mode 100644
 index 0000000..77e00eb
@@ -1702,297 +2131,135 @@ HcmV?d00001
 
 diff --git a/src/android/app/src/main/assets/skybg/still_rain_d.webp b/src/android/app/src/main/assets/skybg/still_rain_d.webp
 new file mode 100644
-index 0000000000000000000000000000000000000000..3f911ca5eef16e4e20198e045d265afcd138a804
+index 0000000000000000000000000000000000000000..743d1d10edd6e45d22b2d0cbe5fe42b661ed2d8d
 GIT binary patch
-literal 5710
-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
-Ap#T5?
+literal 3908
+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
+SEFz)1jK2C^tQcIH0000X#c4?Z
 
 literal 0
 HcmV?d00001
 
 diff --git a/src/android/app/src/main/assets/skybg/still_rain_l.webp b/src/android/app/src/main/assets/skybg/still_rain_l.webp
 new file mode 100644
-index 0000000000000000000000000000000000000000..2db08867994f307dda02715911b2f256735d32c0
+index 0000000000000000000000000000000000000000..6441d43d14e511a9f57c061f6e6ff17014f84c16
 GIT binary patch
-literal 8706
-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
+literal 2106
+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
 
 literal 0
 HcmV?d00001
@@ -2220,45 +2487,49 @@ HcmV?d00001
 
 diff --git a/src/android/app/src/main/assets/skybg/still_sunny_d.webp b/src/android/app/src/main/assets/skybg/still_sunny_d.webp
 new file mode 100644
-index 0000000000000000000000000000000000000000..7a39411cf16dcedd25ff2d4f328896a0ecc3c15d
+index 0000000000000000000000000000000000000000..a855ce8ae46f48a4601e72563444713c744db34d
 GIT binary patch
-literal 1830
-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
-UQ4D<Nr0F+=tyU~}2D=^r0FZKX0RR91
+literal 2062
+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
 
 literal 0
 HcmV?d00001
@@ -5523,7 +5794,7 @@ index 7660141..f96b661 100644
          // language settings (it did: every launch reset it, so system Settings → Apps → Mines → 语言 never stuck)
          if (code.isEmpty()) return
 diff --git a/src/android/app/src/main/java/com/openminis/app/MinisApp.kt b/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
-index e48d0e0..0a3bea6 100644
+index e48d0e0..cb79b30 100644
 --- a/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
 @@ -243,7 +243,18 @@ class MinisApp : Application(), ImageLoaderFactory {
@@ -5545,7 +5816,16 @@ index e48d0e0..0a3bea6 100644
          runCatching { com.openminis.app.plus.ChatOrganizer.init(this) }
          runCatching { com.openminis.app.plus.SmartRouter.init(this) }
          // [T-android-content-capture-off] Opt every Compose window out of
-@@ -783,6 +794,19 @@ class MinisApp : Application(), ImageLoaderFactory {
+@@ -776,6 +787,8 @@ class MinisApp : Application(), ImageLoaderFactory {
+         // repository is up, on IO, and only at cold start: a restore happens
+         // within a single app run, so it can never straddle this.
+         kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
++            // [Mines-38.9.11 c] once: workspaces whose chat row is already gone → shared/已归档/ (before the sweep)
++            runCatching { com.openminis.app.plus.SharedFiles.migrateOrphansOnce(this@MinisApp, chatRepository) }
+             runCatching {
+                 com.openminis.app.data.session.OrphanChildSweeper.sweep(this@MinisApp, chatRepository)
+             }.onFailure {
+@@ -783,6 +796,19 @@ class MinisApp : Application(), ImageLoaderFactory {
              }
          }
  
@@ -6136,10 +6416,10 @@ index 35abdac..0f96bdf 100644
                  }
 diff --git a/src/android/app/src/main/java/com/openminis/app/agent/ToolArgsCore.kt b/src/android/app/src/main/java/com/openminis/app/agent/ToolArgsCore.kt
 new file mode 100644
-index 0000000..eba6b3d
+index 0000000..70f98ac
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/agent/ToolArgsCore.kt
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,75 @@
 +package com.openminis.app.agent
 +
 +import org.json.JSONObject
@@ -6169,7 +6449,8 @@ index 0000000..eba6b3d
 +    private val EXAMPLE: Map<String, String> = mapOf(
 +        "shell_execute" to """{"tool_title":"列出文件","command":"ls -la"}""",
 +        "file_read" to """{"tool_title":"读文件","path":"/var/minis/workspace/a.txt"}""",
-+        "file_write" to """{"tool_title":"写文件","path":"/var/minis/workspace/a.txt","content":"…"}""",
++        // [Mines-38.9.11 c] deliverables go to shared/<主题>/ (the workspace is deleted with the chat)
++        "file_write" to """{"tool_title":"写文件","path":"/var/minis/shared/报告/a.md","content":"…"}""",
 +        "file_edit" to """{"tool_title":"改文件","path":"/var/minis/workspace/a.txt","old_string":"…","new_string":"…"}""",
 +        "read_image" to """{"tool_title":"看图","path":"/var/minis/attachments/uploads/a.jpg"}""",
 +        "browser_use" to """{"tool_title":"打开网页","action":"navigate","url":"https://example.com"}""",
@@ -6423,7 +6704,7 @@ index 0000000..f62e1aa
 +    const val CUSTOM_TAB_NOTE = "This site's Google / Apple sign-in ran in Chrome (Custom Tab), not in the app's WebView, so that session cannot be used here; ask the user to sign in on the site's own form (email / phone / QR) inside the Mines browser."
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/browser/BrowserTabPool.kt b/src/android/app/src/main/java/com/openminis/app/browser/BrowserTabPool.kt
-index 3e55128..71bb166 100644
+index 3e55128..6770d73 100644
 --- a/src/android/app/src/main/java/com/openminis/app/browser/BrowserTabPool.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/browser/BrowserTabPool.kt
 @@ -27,7 +27,11 @@ import java.util.concurrent.ConcurrentHashMap
@@ -6439,6 +6720,19 @@ index 3e55128..71bb166 100644
  
      companion object {
          private const val TAG = "BrowserTabPool"
+@@ -499,9 +503,9 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
+     /** The session's /var/minis/workspace/ host directory — downloads land here
+      *  so the agent can read and operate on them in follow-up turns. */
+     private fun sessionWorkspaceDir(): File? {
+-        val sid = sessionId ?: return null
+-        return File(File(File(context.filesDir, "minis-sessions"), sid), "workspace")
+-            .apply { mkdirs() }
++        // [Mines-38.9.11 c] downloads → /var/minis/shared/下载/ (survives chat deletes, visible in the system file picker;
++        // the per-chat workspace was wiped with the chat). Works for the home browser too (no chat bound).
++        return com.openminis.app.plus.SharedFiles.downloadsDir(context)
+     }
+ 
+     /** name.ext → name-1.ext → name-2.ext … until unused. */
 @@ -1036,7 +1040,12 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
              // [T-android-browser-tab-ownership] "Free" means free AND mine (or
              // unowned when privileged): grabbing a sibling's idle tab is the
@@ -6831,6 +7125,19 @@ index 8e689fa..9d8b6ee 100644
              offEffort = null,
          )
          val modelIds = config.modelEntries.filter { it.providerInstanceId == instanceId }.map { it.model.id }
+diff --git a/src/android/app/src/main/java/com/openminis/app/data/session/SessionDeleter.kt b/src/android/app/src/main/java/com/openminis/app/data/session/SessionDeleter.kt
+index b3b898b..681b40c 100644
+--- a/src/android/app/src/main/java/com/openminis/app/data/session/SessionDeleter.kt
++++ b/src/android/app/src/main/java/com/openminis/app/data/session/SessionDeleter.kt
+@@ -74,6 +74,8 @@ object SessionDeleter {
+             //    a ViewModelStore.
+             withContext(Dispatchers.Main) { ChatViewModelStore.release(id) }
+             HeadlessChatRunner.forget(id)
++            // [Mines-38.9.11 c] an automatic delete (empty-on-exit / orphan-sweep) keeps the chat's files: shared/已归档/
++            com.openminis.app.plus.SharedFiles.beforeDelete(context, repo, id, reason)
+             // 3. DB rows. deleteSessionOnly is the non-cascading primitive; the
+             //    cascade is this loop, which already walked the subtree.
+             repo.deleteSessionOnly(id)
 diff --git a/src/android/app/src/main/java/com/openminis/app/i18n/LocaleWrap.kt b/src/android/app/src/main/java/com/openminis/app/i18n/LocaleWrap.kt
 index 1956659..be4aa22 100644
 --- a/src/android/app/src/main/java/com/openminis/app/i18n/LocaleWrap.kt
@@ -15174,6 +15481,53 @@ index 7888eab..a353293 100644
                  } else {
                      val d = get("https://openrouter.ai/api/v1/key", key).second?.optJSONObject("data")
                      when {
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/RainSkyCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/RainSkyCore.kt
+new file mode 100644
+index 0000000..1dc7ffe
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/RainSkyCore.kt
+@@ -0,0 +1,41 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-38.9.11 c] 雨 v5 — AGSL port of the user-approved rain prototypes (2026-10-19 22:34): light = mock-mood/video2 yu5
++ * 「水面光影」 (silver / blue-grey wet water surface, flowing light and soft reflections, ripples and pink petals only as faint
++ * blurred hints, no green); dark = yu4 (fogged window with beading / sliding drops, quiet drizzle in the lamplight, a warm lamp
++ * slowly swaying and now and then faltering, a few far dim lights).
++ *
++ * The rain lives in its own asset (assets/skybg/rain.agsl) so it never edits the shared sky.agsl: [merge] lays its
++ * `//#SKY rain` and `//#GLASS` segments over the bundled ones and prepends `//#RAIN_COMMON` to both. Pure (unit-tested).
++ * Frame caps are unchanged ([SkyPerfCore.RAIN_FPS] = 15, L1 halves it, stills on a software GPU).
++ */
++object RainSkyCore {
++    const val ASSET = "skybg/rain.agsl"
++    const val VERSION = "雨 v5"
++
++    /** base segments (from sky.agsl) with the rain segments of [rainSrc] laid over them; base unchanged when rainSrc is unusable */
++    fun merge(base: Map<String, String>, rainSrc: String?): Map<String, String> {
++        if (rainSrc.isNullOrBlank()) return base
++        val r = WeatherSkyCore.segments(rainSrc)
++        val common = r["RAIN_COMMON"]?.let { body(it) } ?: return base
++        val sky = r["SKY rain"]?.let { body(it) } ?: return base
++        val glass = r["GLASS"]?.let { body(it) } ?: return base
++        if (!sky.contains("half3 skyColor(") || !glass.contains("half4 main(")) return base
++        val out = LinkedHashMap(base)
++        out["SKY rain"] = "//#SKY rain\n" + common + sky
++        out["GLASS"] = "//#GLASS\n" + common + glass
++        return out
++    }
++    private fun body(seg: String): String = seg.substringAfter('\n', "")
++
++    /**
++     * Mirror of the shader's text guard ceiling for the dark rain glass: on home (gHi ≥ 0.1) the ceiling rises to [OPEN_HI]
++     * inside the open stage between the cards and the input bar (where the approved prototype keeps the lamp bright and no
++     * text sits); a stricter ceiling (< 0.1, a chat page that wants it) is never relaxed.
++     */
++    const val OPEN_HI = 0.80f
++    fun openStage(y: Float): Float = ss(0.55f, 0.67f, y) * (1f - ss(0.82f, 0.88f, y))
++    fun darkCeiling(gHi: Float, y: Float): Float = if (gHi >= 0.1f && gHi < 1f) gHi + (OPEN_HI - gHi) * openStage(y) else gHi
++    private fun ss(a: Float, b: Float, x: Float): Float { val t = ((x - a) / (b - a)).coerceIn(0f, 1f); return t * t * (3f - 2f * t) }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ReachCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/ReachCore.kt
 new file mode 100644
 index 0000000..f1a3324
@@ -16161,6 +16515,170 @@ index 0000000..b60d58e
 +
 +    /** Probing a site more often than this risks its risk-control (≥ 6 h, except right after the user opens it). */
 +    const val MIN_PROBE_MS = 6 * 3_600_000L
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SharedFiles.kt b/src/android/app/src/main/java/com/openminis/app/plus/SharedFiles.kt
+new file mode 100644
+index 0000000..276855d
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/SharedFiles.kt
+@@ -0,0 +1,48 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import com.openminis.app.data.repository.ChatRepository
++import com.openminis.app.logging.AppLogger
++import java.io.File
++
++/** [Mines-38.9.11 c] Android side of [SharedFilesCore]: rescue before automatic deletes + the one-time orphan migration. */
++object SharedFiles {
++    private const val TAG = "SharedFiles"
++    /** 自检 / smoke: what the last rescue / migration did */
++    @Volatile var lastNote: String = ""
++
++    fun downloadsDir(c: Context): File = SharedFilesCore.downloadsDir(c.applicationContext.filesDir).apply { mkdirs() }
++    fun hasWorkspaceFiles(c: Context, sessionId: String): Boolean = runCatching {
++        val fd = c.applicationContext.filesDir
++        SharedFilesCore.hasFiles(SharedFilesCore.workspaceDir(fd, sessionId)) || SharedFilesCore.hasFiles(SharedFilesCore.attachmentsDir(fd, sessionId))
++    }.getOrDefault(true)   // unsure → keep the chat
++
++    /** SessionDeleter hook: an automatic delete keeps the files (moved to shared/已归档/); user deletes are unchanged */
++    suspend fun beforeDelete(c: Context, repo: ChatRepository, sessionId: String, reason: String) {
++        if (!SharedFilesCore.isAutomatic(reason)) return
++        runCatching {
++            val title = runCatching { repo.getSession(sessionId)?.title }.getOrNull()
++            SharedFilesCore.archive(c.applicationContext.filesDir, sessionId, title)?.let {
++                lastNote = "已归档 ${it.name}（$reason）"
++                AppLogger.info(TAG, "rescued workspace of ${sessionId.take(8)} → shared/${SharedFilesCore.ARCHIVE}/${it.name} ($reason)")
++            }
++        }.onFailure { AppLogger.warning(TAG, "rescue failed for ${sessionId.take(8)}: ${it.message}") }
++    }
++
++    /** once per install: workspaces whose chat row is already gone → shared/已归档/ */
++    suspend fun migrateOrphansOnce(c: Context, repo: ChatRepository) {
++        val sp = c.getSharedPreferences("mines_shared_files", 0)
++        if (sp.getBoolean(SharedFilesCore.MIGRATION_KEY, false)) return
++        val fd = c.applicationContext.filesDir
++        val dirs = File(fd, "minis-sessions").list()?.toList().orEmpty()
++        val live = HashSet<String>()
++        for (id in dirs) if (runCatching { repo.getSession(id) != null }.getOrDefault(true)) live += id   // unsure → live (kept)
++        var moved = 0
++        for (id in SharedFilesCore.orphans(dirs) { it in live }) {
++            runCatching { SharedFilesCore.archive(fd, id, null) }.getOrNull()?.let { moved++ }
++        }
++        sp.edit().putBoolean(SharedFilesCore.MIGRATION_KEY, true).apply()
++        lastNote = "迁移：$moved 个没有对话的工作区已移到 shared/${SharedFilesCore.ARCHIVE}/"
++        AppLogger.info(TAG, "orphan workspace migration: $moved archived of ${dirs.size} session dirs")
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SharedFilesCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/SharedFilesCore.kt
+new file mode 100644
+index 0000000..cfa29d4
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/SharedFilesCore.kt
+@@ -0,0 +1,104 @@
++package com.openminis.app.plus
++
++import java.io.File
++
++/**
++ * [Mines-38.9.11 c] files the agent makes for the user must outlive the chat (user 2026-10-19 「worker 里的文件会被自动清理」;
++ * research/mines-worker-files-cleanup.md). /var/minis/workspace is per chat (filesDir/minis-sessions/<id>/workspace) and was
++ * wiped by the empty-chat cleanup, the orphan sweep at start, and every chat delete. Now:
++ *  - deliverables + browser downloads go to /var/minis/shared/<主题>/ and shared/下载/ (filesDir/minis-global/shared);
++ *  - an automatic delete (empty-on-exit, orphan-sweep) never throws files away: a chat with workspace files is not
++ *    auto-deleted, and an orphan's workspace + attachments are moved to shared/已归档/<title>-<id8>/ first;
++ *  - a one-time migration archives workspaces already orphaned (no chat row) the same way.
++ * Pure (java.io only), unit-tested.
++ */
++object SharedFilesCore {
++    const val SHARED = "minis-global/shared"
++    const val DOWNLOADS = "下载"
++    const val ARCHIVE = "已归档"
++    const val ATTACH_SUB = "附件"
++    const val MIGRATION_KEY = "orphan_workspace_migrated_v1"
++    /** delete reasons that the user did not ask for (SessionDeleter callers) */
++    val AUTOMATIC = setOf("orphan-sweep", "empty-on-exit")
++    fun isAutomatic(reason: String): Boolean = reason in AUTOMATIC
++
++    fun sharedDir(filesDir: File): File = File(filesDir, SHARED)
++    fun downloadsDir(filesDir: File): File = File(sharedDir(filesDir), DOWNLOADS)
++    fun archiveRoot(filesDir: File): File = File(sharedDir(filesDir), ARCHIVE)
++    fun workspaceDir(filesDir: File, sessionId: String): File = File(filesDir, "minis-sessions/$sessionId/workspace")
++    fun attachmentsDir(filesDir: File, sessionId: String): File = File(filesDir, "minis-sessions/$sessionId/attachments")
++
++    private val BAD = Regex("""[\\/:*?"<>|\u0000-\u001F\u007F]""")
++    /** a file / folder name that is safe on every file system the picker may copy to; never empty, ".", or ".." */
++    fun safeName(raw: String?, max: Int = 40, fallback: String = "对话"): String {
++        val s = (raw ?: "").replace(BAD, " ").replace(Regex("""\s+"""), " ").trim().trim('.', ' ')
++        val cut = if (s.codePointCount(0, s.length) > max) s.substring(0, s.offsetByCodePoints(0, max)).trim() else s
++        return cut.ifEmpty { fallback }
++    }
++
++    /** shared/<主题>/ for a topic the agent names ("报告", "myproject/data" → only the first level is the topic) */
++    fun topicDir(filesDir: File, topic: String?): File = File(sharedDir(filesDir), safeName(topic?.substringBefore('/'), fallback = "未分类"))
++
++    /** archive folder name for a chat: <title>-<id8> */
++    fun archiveName(title: String?, sessionId: String): String = "${safeName(title)}-${sessionId.filter { it.isLetterOrDigit() }.take(8).ifEmpty { "x" }}"
++
++    /** name → name-1 → name-2 … (keeps the extension) until [taken] says it is free */
++    fun unique(name: String, taken: (String) -> Boolean): String {
++        if (!taken(name)) return name
++        val dot = name.lastIndexOf('.')
++        val (base, ext) = if (dot > 0) name.substring(0, dot) to name.substring(dot) else name to ""
++        var i = 1
++        while (taken("$base-$i$ext")) i++
++        return "$base-$i$ext"
++    }
++
++    /** true when [dir] holds at least one regular file anywhere below it (empty sub-folders do not count) */
++    fun hasFiles(dir: File): Boolean {
++        if (!dir.isDirectory) return false
++        return dir.walkTopDown().maxDepth(32).any { it.isFile }
++    }
++
++    /** session dirs on disk without a chat row → their workspaces are candidates for the one-time migration */
++    fun orphans(sessionDirs: List<String>, isLive: (String) -> Boolean): List<String> = sessionDirs.filter { it.isNotBlank() && !it.startsWith(".") && !isLive(it) }
++
++    /**
++     * Moves [src]'s content into [dst] (created; a free name is the caller's job). rename first, copy + delete when rename
++     * fails (different mount). Returns the number of files that ended up in [dst]; [src] is removed only when everything got
++     * there.
++     */
++    fun moveInto(src: File, dst: File): Int {
++        if (!src.isDirectory) return 0
++        dst.mkdirs()
++        var n = 0; var ok = true
++        for (c in src.listFiles().orEmpty()) {
++            val target = File(dst, unique(c.name) { File(dst, it).exists() })
++            if (c.renameTo(target)) { n += if (target.isFile) 1 else target.walkTopDown().count { it.isFile }; continue }
++            val copied = runCatching { c.copyRecursively(target, overwrite = false) }.getOrDefault(false)
++            if (copied) { n += if (target.isFile) 1 else target.walkTopDown().count { it.isFile }; c.deleteRecursively() } else ok = false
++        }
++        if (ok) src.deleteRecursively()
++        return n
++    }
++
++    /**
++     * Rescues a chat's workspace (+ attachments into 附件/) into shared/已归档/<title>-<id8>/. Null when there was nothing
++     * to keep. Safe to call twice (the second call finds nothing).
++     */
++    fun archive(filesDir: File, sessionId: String, title: String?): File? {
++        val ws = workspaceDir(filesDir, sessionId); val at = attachmentsDir(filesDir, sessionId)
++        val wsHas = hasFiles(ws); val atHas = hasFiles(at)
++        if (!wsHas && !atHas) return null
++        val root = archiveRoot(filesDir).apply { mkdirs() }
++        val dst = File(root, unique(archiveName(title, sessionId)) { File(root, it).exists() })
++        if (wsHas) moveInto(ws, dst)
++        if (atHas) moveInto(at, File(dst, ATTACH_SUB))
++        return dst
++    }
++
++    /** the agent prompt lines about where files go (kept here so the wording is tested) */
++    const val PROMPT_NOTE = "File persistence: /var/minis/workspace/ belongs to THIS chat only and is deleted with the chat — use it for scratch work. " +
++        "Anything the user should keep (documents, reports, images you made for them, downloads, finished code projects) goes to " +
++        "/var/minis/shared/<主题>/ (one folder per topic, e.g. /var/minis/shared/旅行计划/), link it as minis://shared/…; browser " +
++        "downloads land in /var/minis/shared/下载/. shared/ is visible in the phone's file picker (Mines) and survives chat deletes; " +
++        "files of chats that were cleaned up automatically are kept in /var/minis/shared/已归档/."
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SkillHubCn.kt b/src/android/app/src/main/java/com/openminis/app/plus/SkillHubCn.kt
 new file mode 100644
@@ -18519,7 +19037,7 @@ index 9e2ca88..26bdfce 100644
          prefs(context).edit().remove("pin:${s.host}:${s.port}").apply()
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/WeatherSkyCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/WeatherSkyCore.kt
 new file mode 100644
-index 0000000..2fdc448
+index 0000000..6e32af2
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/WeatherSkyCore.kt
 @@ -0,0 +1,175 @@
@@ -18594,7 +19112,7 @@ index 0000000..2fdc448
 +        else -> Grade(0f, 0xF4EAE4, ONE, 0f)
 +    } else when (s) {
 +        // [i29] dark day: lift = contrast exponent 1 + 2·lift before the multiply (was a flat band under the dark guard)
-+        Scene.SUNNY -> Grade(0.8f, 0xF4EAE4, floatArrayOf(0.75f, 0.85f, 1.0f), 0.04f)
++        Scene.SUNNY -> Grade(0.8f, 0xF4EAE4, floatArrayOf(0.50f, 0.58f, 0.72f), 0.04f)   // [3911c] was .75/.85/1: clouds sat above the guard knee → flat
 +        Scene.CLOUDY -> Grade(0.8f, 0xF4EAE4, floatArrayOf(0.70f, 0.76f, 0.88f), 0.04f)
 +        Scene.OVERCAST -> Grade(0.6f, 0xEEF0F2, floatArrayOf(0.60f, 0.63f, 0.70f), 0.04f)
 +        Scene.FOG -> Grade(0f, 0xF4EAE4, floatArrayOf(0.36f, 0.37f, 0.40f), 0.3f)
@@ -18691,7 +19209,7 @@ index 0000000..2fdc448
 +        "sunny" to intArrayOf(0xCBCECF, 0xB8C6D1, 0xBEC8D1, 0xC3C9CF),
 +        "cloudy" to intArrayOf(0xA8B2BB, 0xADB7BF, 0xB4BCC1, 0xABB1B7),
 +        "overcast" to intArrayOf(0xB0B5BA, 0xAEB3B8, 0xA7ACB1, 0xA3A8AE),
-+        "rain" to intArrayOf(0xBCC6D0, 0xB8C3CD, 0xBAC5CF, 0xB6C0CB),
++        "rain" to intArrayOf(0xD2D7DC, 0xCCD2D8, 0xC5CBD2, 0xCFD3D8),   // [3911c] 雨 v5 water surface
 +        "snow" to intArrayOf(0xD4D8DA, 0xD5D9DB, 0xD6D9DB, 0xD8DBDC),
 +        "fog" to intArrayOf(0xCBCCC9, 0xD7D3CA, 0xDBDAD5, 0xDCDDDA),
 +        "night" to intArrayOf(0x161D2C, 0x151C2A, 0x192132, 0x2A3855),
@@ -22030,6 +22548,122 @@ index 0000000..3d850da
 +
 +    fun shouldRetry(code: Int, errorBody: String, body: JSONObject): Boolean = body.has("thinking") && isUnsupported(code, errorBody)
 +}
+diff --git a/src/android/app/src/main/java/com/openminis/app/providers/MinisDocumentsProvider.kt b/src/android/app/src/main/java/com/openminis/app/providers/MinisDocumentsProvider.kt
+index d741810..240f911 100644
+--- a/src/android/app/src/main/java/com/openminis/app/providers/MinisDocumentsProvider.kt
++++ b/src/android/app/src/main/java/com/openminis/app/providers/MinisDocumentsProvider.kt
+@@ -42,9 +42,11 @@ import java.io.FileNotFoundException
+ class MinisDocumentsProvider : DocumentsProvider() {
+ 
+     companion object {
+-        const val AUTHORITY = "com.openminis.minis.documents"
++        // [Mines-38.9.11 c] registered in the manifest as ${applicationId}.documents (the old authority clashed with other
++        // installs); the root document id is "root" (an empty id breaks DocumentsUI tree URIs).
++        const val AUTHORITY = "com.openminis.mines.plus.documents"
+         private const val ROOT_ID = "minis-root"
+-        private const val ROOT_DOC_ID = ""        // empty = providerRoot
++        private const val ROOT_DOC_ID = "root"
+         private val TOP_LEVEL = listOf("memory", "skills", "shared")
+         private val READ_ONLY_TOP = setOf("memory", "skills")
+         /** Never expose internal metadata that happens to sit in filesDir. */
+@@ -62,6 +64,7 @@ class MinisDocumentsProvider : DocumentsProvider() {
+             Root.COLUMN_TITLE,
+             Root.COLUMN_DOCUMENT_ID,
+             Root.COLUMN_MIME_TYPES,
++            Root.COLUMN_SUMMARY,
+         )
+ 
+         private val DOCUMENT_PROJECTION = arrayOf(
+@@ -84,7 +87,7 @@ class MinisDocumentsProvider : DocumentsProvider() {
+     private fun resolveDoc(documentId: String): File {
+         val root = providerRoot()
+         val clean = documentId.trim().trim('/')
+-        if (clean.isEmpty()) return root
++        if (clean.isEmpty() || clean == ROOT_DOC_ID) return root
+         if (clean.contains("..")) throw FileNotFoundException("Invalid path: $documentId")
+         return File(root, clean)
+     }
+@@ -98,7 +101,7 @@ class MinisDocumentsProvider : DocumentsProvider() {
+     }
+ 
+     private fun flagsFor(documentId: String, file: File): Int {
+-        if (documentId.isEmpty()) return 0 // root is immutable through SAF
++        if (documentId.isEmpty() || documentId == ROOT_DOC_ID) return 0 // root is immutable through SAF
+         val topLevel = documentId.substringBefore('/')
+         val isTop = documentId.indexOf('/') < 0
+         if (topLevel in READ_ONLY_TOP) {
+@@ -108,7 +111,8 @@ class MinisDocumentsProvider : DocumentsProvider() {
+         var flags = 0
+         if (file.isDirectory) flags = flags or Document.FLAG_DIR_SUPPORTS_CREATE
+         else flags = flags or Document.FLAG_SUPPORTS_WRITE
+-        flags = flags or Document.FLAG_SUPPORTS_DELETE or Document.FLAG_SUPPORTS_RENAME
++        // [3911c] the top-level shared/ folder itself can be written into but not deleted / renamed
++        if (!isTop) flags = flags or Document.FLAG_SUPPORTS_DELETE or Document.FLAG_SUPPORTS_RENAME
+         return flags
+     }
+ 
+@@ -123,17 +127,18 @@ class MinisDocumentsProvider : DocumentsProvider() {
+         cursor.newRow()
+             .add(Root.COLUMN_ROOT_ID, ROOT_ID)
+             .add(Root.COLUMN_FLAGS, Root.FLAG_LOCAL_ONLY or Root.FLAG_SUPPORTS_IS_CHILD)
++            .add(Root.COLUMN_SUMMARY, "共享文件 · 记忆 · 技能")
+             .add(Root.COLUMN_TITLE, "Mines")
+             .add(Root.COLUMN_DOCUMENT_ID, ROOT_DOC_ID)
+             .add(Root.COLUMN_MIME_TYPES, "*/*")
+-            .add(Root.COLUMN_ICON, 0)
++            .add(Root.COLUMN_ICON, com.openminis.app.R.mipmap.ic_launcher)
+         return cursor
+     }
+ 
+     override fun queryDocument(documentId: String, projection: Array<String>?): Cursor {
+         val cursor = MatrixCursor(projection ?: DOCUMENT_PROJECTION)
+         val file = resolveDoc(documentId)
+-        val displayName = if (documentId.isEmpty()) "Mines" else file.name
++        val displayName = if (documentId.isEmpty() || documentId == ROOT_DOC_ID) "Mines" else file.name
+         cursor.newRow()
+             .add(Document.COLUMN_DOCUMENT_ID, documentId)
+             .add(Document.COLUMN_DISPLAY_NAME, displayName)
+@@ -151,14 +156,14 @@ class MinisDocumentsProvider : DocumentsProvider() {
+     ): Cursor {
+         val cursor = MatrixCursor(projection ?: DOCUMENT_PROJECTION)
+         val parent = resolveDoc(parentDocumentId)
+-        val isRoot = parentDocumentId.isEmpty()
++        val isRoot = parentDocumentId.isEmpty() || parentDocumentId == ROOT_DOC_ID
+         val children = parent.listFiles()?.toList() ?: emptyList()
+         for (child in children) {
+             val name = child.name
+             if (name.startsWith(".")) continue
+             if (name in METADATA_BLACKLIST) continue
+             if (isRoot && name !in TOP_LEVEL) continue
+-            val docId = if (parentDocumentId.isEmpty()) name else "$parentDocumentId/$name"
++            val docId = if (isRoot) name else "$parentDocumentId/$name"
+             cursor.newRow()
+                 .add(Document.COLUMN_DOCUMENT_ID, docId)
+                 .add(Document.COLUMN_DISPLAY_NAME, name)
+@@ -198,6 +203,7 @@ class MinisDocumentsProvider : DocumentsProvider() {
+         val parent = resolveDoc(parentDocumentId)
+         val top = parentDocumentId.substringBefore('/').ifEmpty { parentDocumentId }
+         if (top in READ_ONLY_TOP) throw UnsupportedOperationException("$top is read-only")
++        if (top.isEmpty() || top == ROOT_DOC_ID) throw UnsupportedOperationException("create inside shared/")
+         val safeName = displayName.replace("/", "_").replace("..", "_")
+         val created = File(parent, safeName)
+         val ok = if (mimeType == Document.MIME_TYPE_DIR) created.mkdirs() else created.createNewFile()
+@@ -209,6 +215,7 @@ class MinisDocumentsProvider : DocumentsProvider() {
+         val file = resolveDoc(documentId)
+         val top = documentId.substringBefore('/')
+         if (top in READ_ONLY_TOP) throw UnsupportedOperationException("$top is read-only")
++        if (documentId.indexOf('/') < 0) throw UnsupportedOperationException("top-level folder")
+         if (!file.deleteRecursively()) throw FileNotFoundException("Failed to delete $documentId")
+     }
+ 
+@@ -216,6 +223,7 @@ class MinisDocumentsProvider : DocumentsProvider() {
+         val file = resolveDoc(documentId)
+         val top = documentId.substringBefore('/')
+         if (top in READ_ONLY_TOP) throw UnsupportedOperationException("$top is read-only")
++        if (documentId.indexOf('/') < 0) throw UnsupportedOperationException("top-level folder")
+         val safe = displayName.replace("/", "_").replace("..", "_")
+         val target = File(file.parentFile, safe)
+         if (!file.renameTo(target)) throw FileNotFoundException("Failed to rename $documentId")
 diff --git a/src/android/app/src/main/java/com/openminis/app/sandbox/PRootKernel.kt b/src/android/app/src/main/java/com/openminis/app/sandbox/PRootKernel.kt
 index e86c029..eed13e4 100644
 --- a/src/android/app/src/main/java/com/openminis/app/sandbox/PRootKernel.kt
@@ -22869,6 +23503,19 @@ index bd04e31..f50504d 100644
      }
  
      /**
+diff --git a/src/android/app/src/main/java/com/openminis/app/tools/FileWriteTool.kt b/src/android/app/src/main/java/com/openminis/app/tools/FileWriteTool.kt
+index e75c624..b403b26 100644
+--- a/src/android/app/src/main/java/com/openminis/app/tools/FileWriteTool.kt
++++ b/src/android/app/src/main/java/com/openminis/app/tools/FileWriteTool.kt
+@@ -19,7 +19,7 @@ object FileWriteTool {
+         // both slow and a common way for a request to die mid-flight — and the
+         // model has no way to know that from the schema alone. Ported from iOS
+         // AIChatViewModel+ToolDefinitions.swift.
+-        description = "Write content to a file on the Linux filesystem. Faster than shell_execute for writing files. Creates the file if it doesn't exist. Use append mode to add to existing files.\n\nIMPORTANT for large files (roughly >8KB): do NOT emit it as one call. Every byte of `content` is generated and streamed as tool arguments, so one huge call is slow and frequently dies mid-request. Instead either (a) write the first chunk, then extend it with further calls using append: true, or (b) when the content is repetitive or computable (SVG charts, generated tables, boilerplate), write a short script and run it with shell_execute — generating 2KB of code that emits 100KB beats transcribing 100KB.",
++        description = "Write content to a file on the Linux filesystem. Faster than shell_execute for writing files. Creates the file if it doesn't exist. Use append mode to add to existing files. Files the user should keep go to /var/minis/shared/<主题>/ (/var/minis/workspace/ is deleted with the chat).\n\nIMPORTANT for large files (roughly >8KB): do NOT emit it as one call. Every byte of `content` is generated and streamed as tool arguments, so one huge call is slow and frequently dies mid-request. Instead either (a) write the first chunk, then extend it with further calls using append: true, or (b) when the content is repetitive or computable (SVG charts, generated tables, boilerplate), write a short script and run it with shell_execute — generating 2KB of code that emits 100KB beats transcribing 100KB.",
+         parameters = mapOf(
+             "tool_title" to AgentToolParam("string", "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Create Python statistics script', 'Write configuration file'). Use the same language as the user."),
+             "path" to AgentToolParam("string", "Absolute Linux path to write (e.g. /root/test.txt)"),
 diff --git a/src/android/app/src/main/java/com/openminis/app/tools/VisionGroupResolver.kt b/src/android/app/src/main/java/com/openminis/app/tools/VisionGroupResolver.kt
 index 7004a5c..9a60c5f 100644
 --- a/src/android/app/src/main/java/com/openminis/app/tools/VisionGroupResolver.kt
@@ -24270,7 +24917,7 @@ index d99b975..93fc38a 100644
                  )
              }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
-index e0d0cae..ed6674f 100644
+index e0d0cae..aaaaa98 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
 @@ -89,6 +89,7 @@ import kotlinx.coroutines.flow.combine
@@ -24698,7 +25345,14 @@ index e0d0cae..ed6674f 100644
  - minis-open <url-or-path>: Opens a resource inside Minis without leaving the chat. Accepts http/https URLs (→ built-in WebKit preview) and chat-resource file paths under /var/minis/** (→ built-in file preview, routed by extension: images to the image viewer, .md to markdown preview, .html to HTML preview, .pdf/office docs to QuickLook, audio/video to the media player, else share sheet). Examples: minis-open https://example.com, minis-open /var/minis/workspace/report.md, minis-open /var/minis/attachments/chart.png. Prefer this over android-open for anything that can be previewed in-app so the user doesn't lose conversation context. Run android-open via shell_execute for non-web schemes (tel:, mailto:, geo:, intent:, etc.) or when the user explicitly wants the system handler.
  - minis-sessions-cli: Read chat history. `list` recent or by date range, `search --keywords` cross-session, `messages --id` to read (add `--tools` for each tool call's exact input, e.g. the shell command, and its output). Run --help for full options.
  - minis-model-use: Invoke other LLM models pre-configured by the user. Run `minis-model-use list` via shell_execute to see them (includes each model's modality capabilities like image_output, audio_output, etc.), `minis-model-use search <query>` to filter by name/provider. `minis-model-use run --model <id_or_name>` sends an OpenAI-compatible messages request; pass input via --input <json_file> or stdin, output goes to stdout or --output <path>. The OpenAI shape is the PRIMARY input for every model and modality; standard params are auto-converted to the underlying provider, so do not hand-write provider-native bodies as the primary input. For provider-specific extras the standard schema doesn't model (web-search plugins, image-to-image fields, TTS/video or other custom endpoints), escape hatches exist for OpenAI-compatible providers (they error or are ignored on Anthropic/Gemini models): `extra_body` (object merged verbatim into the request body), a custom `endpoint` path, and a top-level `passthrough` envelope for fully verbatim requests with RAW (unparsed) responses. Results may carry `warnings` (fields that were ignored/downgraded and why) and `applied_extras` (which extras actually took effect) — read them to self-correct. Run --help for the full contract before using these. Models may support multimodal output (image generation, TTS/audio, video) — check the modalities field in list output. For image_output models, pass generation params in the input JSON: top-level `n`/`size`/`quality`/`prompt` (OpenAI /images/generations style) or `generation_config.{aspect_ratio,image_size,number_of_images,person_generation}` (Gemini). Run with --help for full usage.${modelUseDelegateNote}
-@@ -15491,6 +15715,25 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15487,10 +15711,32 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+ 
+         return buildString {
+             append(base)
++            // [Mines-38.9.11 c] where files the user should keep go (shared/<主题>/, downloads shared/下载/); fixed text
++            append("\n\n")
++            append(com.openminis.app.plus.SharedFilesCore.PROMPT_NOTE)
+             if (skillFragment != null) {
                  append("\n\n")
                  append(skillFragment)
              }
@@ -24724,7 +25378,7 @@ index e0d0cae..ed6674f 100644
              if (mcpFragment != null) {
                  append("\n\n")
                  append(mcpFragment)
-@@ -15503,6 +15746,25 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15503,6 +15749,25 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                  append("\n\n")
                  append(dailyMemoryFragment)
              }
@@ -24750,7 +25404,7 @@ index e0d0cae..ed6674f 100644
              // Runtime context goes last so the prefix above stays byte-stable
              // across requests within the same day. Keep ordering deterministic
              // (date → tz → lang → model count) — any reorder defeats the cache.
-@@ -15854,11 +16116,59 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15854,11 +16119,59 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
              }
          }
  
@@ -24811,7 +25465,7 @@ index e0d0cae..ed6674f 100644
              append("<user-attached-files>\n")
              for (m in metas) {
                  val urlPath = m.linuxPath.removePrefix("/var/minis/")
-@@ -15874,6 +16184,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15874,6 +16187,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
              }
              append("</user-attached-files>")
          }
@@ -24819,7 +25473,7 @@ index e0d0cae..ed6674f 100644
  
          // Order matches UserAttachmentList convention: images first, then files.
          return PreparedAttachments(
-@@ -17072,6 +17383,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -17072,6 +17386,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
      }
  
      override fun onCleared() {
@@ -24828,7 +25482,16 @@ index e0d0cae..ed6674f 100644
          // [T-sub-agents-queue] Nothing can re-enter a queued delegation once
          // this view model is gone; leaving the starter installed would let the
          // registry call into a cleared VM.
-@@ -17602,6 +17915,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -17123,6 +17439,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+             try {
+                 val count = chatRepository.messageCount(sid)
+                 if (count > 0) return@launch
++                // [Mines-38.9.11 c] a chat with files (terminal / agent output never persisted as messages) is not "empty"
++                if (com.openminis.app.plus.SharedFiles.hasWorkspaceFiles(context, sid)) return@launch
+                 AppLogger.info(
+                     TAG,
+                     "cleanupIfEmptyOnExit: deleting empty session $sid (no persisted messages)",
+@@ -17602,6 +17920,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                              continue
                          }
                          if (!mime.startsWith("image/")) continue
@@ -24837,7 +25500,7 @@ index e0d0cae..ed6674f 100644
                          val file = java.io.File(mediaStore.mediaBaseDir, rel)
                          if (!file.exists()) continue
                          val original = try { file.readBytes() } catch (_: Exception) { continue }
-@@ -17756,3 +18071,28 @@ internal fun warmUpBudget(window: Int?, compactThreshold: Int?, ratio: Double, f
+@@ -17756,3 +18076,28 @@ internal fun warmUpBudget(window: Int?, compactThreshold: Int?, ratio: Double, f
      val line = if (threshold > 0) threshold else w
      return (line / ratio).toInt() - fixedTokens
  }
@@ -34819,6 +35482,44 @@ index afd2104..3ddbee0 100644
 +    pass(px, tmp, w, h, 1, w)      // rows
 +    pass(tmp, px, h, w, w, 1)      // columns
 +}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/RainSky.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/RainSky.kt
+new file mode 100644
+index 0000000..a5fbca1
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/RainSky.kt
+@@ -0,0 +1,32 @@
++package com.openminis.app.ui.plus
++
++import com.openminis.app.plus.RainSkyCore
++import com.openminis.app.plus.WeatherSkyCore
++
++/**
++ * [Mines-38.9.11 c] loads 雨 v5 (assets/skybg/rain.agsl, [RainSkyCore]) over the bundled sky segments. The two rain shaders are
++ * compiled once here (on the sky's preparation thread); if either fails, the bundled rain is kept and the reason is recorded,
++ * so a rain problem never sends every other scene to the fallback stills.
++ */
++object RainSky {
++    @Volatile var lastError: String? = null
++    @Volatile var active: Boolean = false
++    fun label(): String = if (active) RainSkyCore.VERSION else "雨 v2" + (lastError?.let { "（$it）" } ?: "")
++
++    @androidx.annotation.RequiresApi(33)
++    fun segments(c: android.content.Context, base: Map<String, String>): Map<String, String> {
++        val src = runCatching { c.assets.open(RainSkyCore.ASSET).bufferedReader().use { it.readText() } }
++            .onFailure { lastError = "no asset" }.getOrNull() ?: return base
++        val merged = RainSkyCore.merge(base, src)
++        if (merged === base) { lastError = "bad segments"; active = false; return base }
++        return try {
++            android.graphics.RuntimeShader(WeatherSkyCore.skySource(merged, WeatherSkyCore.Scene.RAIN))
++            WeatherSkyCore.pass2Source(merged, WeatherSkyCore.Scene.RAIN)?.let { android.graphics.RuntimeShader(it) }
++            active = true; lastError = null; merged
++        } catch (e: Throwable) {
++            lastError = (e.message ?: e.javaClass.simpleName).take(200)
++            android.util.Log.w("MinesSky", "rain v5 shader failed, keeping the bundled rain: $lastError")
++            active = false; base
++        }
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ReportScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ReportScreen.kt
 index 996cfde..61d1ab2 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/ReportScreen.kt
@@ -36986,7 +37687,7 @@ index 0000000..6e9e598
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WeatherSky.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WeatherSky.kt
 new file mode 100644
-index 0000000..554305a
+index 0000000..0f9184f
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WeatherSky.kt
 @@ -0,0 +1,397 @@
@@ -37073,7 +37774,7 @@ index 0000000..554305a
 +    /** Compiled shaders (per scene, lazily) + the four noise textures. A compile error is kept (→ stills) and reported. */
 +    @androidx.annotation.RequiresApi(33)
 +    class Gpu(c: android.content.Context) {
-+        private val seg = WeatherSkyCore.segments(source(c))
++        private val seg = RainSky.segments(c, WeatherSkyCore.segments(source(c)))   // [3911c] 雨 v5 (skybg/rain.agsl) over the bundled rain
 +        private val tex: List<android.graphics.BitmapShader> = (0..3).map { i ->
 +            val o = android.graphics.BitmapFactory.Options().apply { inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888; inScaled = false }
 +            val b = c.assets.open("skybg/tex$i.webp").use { android.graphics.BitmapFactory.decodeStream(it, null, o) } ?: error("tex$i")
@@ -42656,6 +43357,88 @@ index 0000000..b47e69d
 +        assertTrue(ModelScoreCore.summary("修 502", listOf(Call("shell", true, "boom")), listOf("curl x")).contains("✗ shell"))
 +    }
 +}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/RainSkyCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/RainSkyCoreTest.kt
+new file mode 100644
+index 0000000..4110d5a
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/RainSkyCoreTest.kt
+@@ -0,0 +1,76 @@
++package com.openminis.app.plus
++
++import com.openminis.app.plus.WeatherSkyCore.Scene
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertSame
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import java.io.File
++
++/** [Mines-38.9.11 c] 雨 v5: rain.agsl merges over sky.agsl, keeps SkSL rules, both looks present, guard relaxed only on home's open stage. */
++class RainSkyCoreTest {
++    private fun assets(): File = File(listOf("src/main/assets", "app/src/main/assets").first { File(it).isDirectory })
++    private fun base() = WeatherSkyCore.segments(File(assets(), "skybg/sky.agsl").readText())
++    private fun rain() = File(assets(), RainSkyCore.ASSET).readText()
++
++    @Test fun mergeReplacesOnlyRain() {
++        val b = base(); val m = RainSkyCore.merge(b, rain())
++        assertEquals(b.keys, m.keys)
++        for (k in b.keys) if (k != "SKY rain" && k != "GLASS") assertSame(b[k], m[k])
++        val sky = WeatherSkyCore.skySource(m, Scene.RAIN)
++        assertTrue("light = water surface", sky.contains("rainLightSky") && sky.contains("caustic"))
++        assertTrue("dark = night behind the window", sky.contains("rainDarkSky"))
++        assertEquals(1, Regex("""half3 skyColor\(""").findAll(sky).count())
++        assertEquals(1, Regex("""half4 main\(""").findAll(sky).count())
++        val g = WeatherSkyCore.pass2Source(m, Scene.RAIN)!!
++        assertTrue(g.contains("uniform shader sky") && g.contains("rainDarkGlass") && g.contains("rainLightGlass"))
++        assertTrue("lamp + drizzle + petals + ripples", g.contains("lampLight") && g.contains("drizzle") && g.contains("petal") && g.contains("ripple"))
++        assertEquals(1, Regex("""half4 main\(""").findAll(g).count())
++        assertTrue("no nested segment marker", !Regex("(?m)^//#RAIN_COMMON").containsMatchIn(sky + g))
++        // other scenes untouched
++        assertEquals(WeatherSkyCore.skySource(b, Scene.SUNNY), WeatherSkyCore.skySource(m, Scene.SUNNY))
++        assertEquals(WeatherSkyCore.pass2Source(b, Scene.NIGHT), WeatherSkyCore.pass2Source(m, Scene.NIGHT))
++    }
++
++    @Test fun unusableSourceKeepsBase() {
++        val b = base()
++        assertSame(b, RainSkyCore.merge(b, null)); assertSame(b, RainSkyCore.merge(b, "")); assertSame(b, RainSkyCore.merge(b, "//#SKY rain\nx"))
++    }
++
++    @Test fun rainFollowsSkSLRules() {
++        val code = rain().lines().map { it.substringBefore("//") }.joinToString("\n")
++        assertTrue(!Regex("""\b(while|do)\b""").containsMatchIn(code))
++        val loops = Regex("""for\s*\(([^)]*)\)""").findAll(code).map { it.groupValues[1] }.toList()
++        assertTrue(loops.size >= 6)
++        loops.forEach { assertTrue("loop form: $it", Regex("""^\s*int (\w+) = -?\d+; \1 (<|<=) \d+; \1\+\+\s*$""").matches(it)) }
++        assertTrue(!code.contains("#define") && !code.contains("H(#"))
++        // pow(x, 2.0) is undefined for x < 0 on GPUs (it broke the lamp flicker in the offline render) → sq()
++        assertTrue("no pow(…, 2.0)", !Regex("""pow\([^;]*,\s*2\.0\)""").containsMatchIn(code))
++        // only sky.agsl's SHARED uniforms + the glass input
++        val uni = Regex("""uniform\s+\w+\s+(\w+)""").findAll(code).map { it.groupValues[1] }.toSet()
++        assertEquals(setOf("sky", "gk"), uni)
++        assertTrue("no green in the light palette", !code.contains("#7FA87F") && !code.contains("green"))
++    }
++
++    @Test fun stillsAndBudget() {
++        for (d in listOf("l", "d")) assertTrue(File(assets(), "skybg/still_rain_$d.webp").length() in 500L..60_000L)
++        assertTrue(File(assets(), RainSkyCore.ASSET).length() in 5_000L..60_000L)
++        assertTrue(File(assets(), "skybg").listFiles()!!.sumOf { it.length() } <= 600_000L)
++    }
++
++    @Test fun guardRelaxedOnlyInOpenStageOnHome() {
++        assertEquals(0.15f, RainSkyCore.darkCeiling(0.15f, 0.20f), 1e-4f)     // behind the greeting / cards
++        assertEquals(0.15f, RainSkyCore.darkCeiling(0.15f, 0.95f), 1e-4f)     // behind the bottom bar
++        assertTrue(RainSkyCore.darkCeiling(0.15f, 0.70f) > 0.7f)              // lamp in the open stage stays bright
++        assertEquals(0.075f, RainSkyCore.darkCeiling(0.075f, 0.70f), 1e-4f)   // a strict (chat) ceiling is never relaxed
++        assertEquals(1f, RainSkyCore.darkCeiling(1f, 0.70f), 1e-4f)
++        // mirror of the shader constants
++        assertTrue(rain().contains("mix(gHi, 0.80, rzOpen(yo))") && rain().contains("ss(0.55, 0.67, y) * (1.0 - ss(0.82, 0.88, y))"))
++    }
++
++    @Test fun capsUnchanged() {
++        assertEquals(15, SkyPerfCore.fps(true, 0, false, false, false))
++        assertEquals(7, SkyPerfCore.fps(true, 1, false, false, false))
++        assertEquals(0, SkyPerfCore.fps(true, 2, false, false, false))
++    }
++}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/ReachCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/ReachCoreTest.kt
 new file mode 100644
 index 0000000..cd2afa7
@@ -42910,6 +43693,99 @@ index 0000000..8625dd7
 +        assertEquals("异常", SessionStatus.keyPillLabel("BAD", "连不上（网络）"))
 +        assertEquals("正常", SessionStatus.keyPillLabel("OK", "401"))
 +        assertEquals("未检查", SessionStatus.keyPillLabel(null, null))
++    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/SharedFilesCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/SharedFilesCoreTest.kt
+new file mode 100644
+index 0000000..eb7ea61
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/SharedFilesCoreTest.kt
+@@ -0,0 +1,87 @@
++package com.openminis.app.plus
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNotNull
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import java.io.File
++import java.nio.file.Files
++
++/** [Mines-38.9.11 c] files the user should keep survive chat deletes: shared/<主题>, 下载, 已归档 rescue + migration rules. */
++class SharedFilesCoreTest {
++    private fun tmp(): File = Files.createTempDirectory("sfc").toFile()
++    private fun write(f: File, s: String = "x") { f.parentFile.mkdirs(); f.writeText(s) }
++
++    @Test fun paths() {
++        val fd = File("/data/x/files")
++        assertEquals(File("/data/x/files/minis-global/shared/下载"), SharedFilesCore.downloadsDir(fd))
++        assertEquals(File("/data/x/files/minis-global/shared/已归档"), SharedFilesCore.archiveRoot(fd))
++        assertEquals(File("/data/x/files/minis-sessions/abc/workspace"), SharedFilesCore.workspaceDir(fd, "abc"))
++        assertEquals(File("/data/x/files/minis-global/shared/旅行计划"), SharedFilesCore.topicDir(fd, "旅行计划/day1"))
++        assertEquals(File("/data/x/files/minis-global/shared/未分类"), SharedFilesCore.topicDir(fd, "  "))
++    }
++
++    @Test fun safeNames() {
++        assertEquals("a b c", SharedFilesCore.safeName("a/b:c"))
++        assertEquals("对话", SharedFilesCore.safeName(null)); assertEquals("对话", SharedFilesCore.safeName("..")); assertEquals("对话", SharedFilesCore.safeName(" / "))
++        assertEquals(40, SharedFilesCore.safeName("长".repeat(80)).length)
++        assertEquals("帮我写周报-1a2b3c4d", SharedFilesCore.archiveName("帮我写周报", "1a2b3c4d-9999"))
++        assertEquals("对话-x", SharedFilesCore.archiveName(null, "--"))
++    }
++
++    @Test fun uniqueKeepsExtension() {
++        val taken = setOf("a.pdf", "a-1.pdf", "dir")
++        assertEquals("a-2.pdf", SharedFilesCore.unique("a.pdf") { it in taken })
++        assertEquals("dir-1", SharedFilesCore.unique("dir") { it in taken })
++        assertEquals("b.pdf", SharedFilesCore.unique("b.pdf") { it in taken })
++    }
++
++    @Test fun onlyAutomaticDeletesRescue() {
++        assertTrue(SharedFilesCore.isAutomatic("empty-on-exit")); assertTrue(SharedFilesCore.isAutomatic("orphan-sweep"))
++        for (r in listOf("list-single", "list-multi", "folder-delete", "storage-multi")) assertFalse(r, SharedFilesCore.isAutomatic(r))
++    }
++
++    @Test fun hasFilesIgnoresEmptyFolders() {
++        val d = tmp(); File(d, "a/b/c").mkdirs()
++        assertFalse(SharedFilesCore.hasFiles(d)); assertFalse(SharedFilesCore.hasFiles(File(d, "missing")))
++        write(File(d, "a/b/c/x.txt")); assertTrue(SharedFilesCore.hasFiles(d))
++    }
++
++    @Test fun archiveMovesWorkspaceAndAttachments() {
++        val fd = tmp()
++        write(File(fd, "minis-sessions/S1/workspace/report.md"), "hello")
++        write(File(fd, "minis-sessions/S1/workspace/proj/main.py"))
++        write(File(fd, "minis-sessions/S1/attachments/chart.png"))
++        write(File(fd, "minis-sessions/S1/offloads/big.txt"))           // temp: not rescued (deleted with the chat as before)
++        val dst = SharedFilesCore.archive(fd, "S1", "周报")
++        assertNotNull(dst)
++        assertEquals(File(fd, "minis-global/shared/已归档/周报-S1"), dst)
++        assertEquals("hello", File(dst, "report.md").readText())
++        assertTrue(File(dst, "proj/main.py").isFile); assertTrue(File(dst, "附件/chart.png").isFile)
++        assertFalse(File(fd, "minis-sessions/S1/workspace").exists())
++        assertNull("second call finds nothing", SharedFilesCore.archive(fd, "S1", "周报"))
++        // same title again → a free name, nothing overwritten
++        write(File(fd, "minis-sessions/S1/workspace/report.md"), "v2")
++        val dst2 = SharedFilesCore.archive(fd, "S1", "周报")!!
++        assertEquals("周报-S1-1", dst2.name); assertEquals("hello", File(dst, "report.md").readText())
++    }
++
++    @Test fun emptyWorkspaceIsNotArchived() {
++        val fd = tmp(); File(fd, "minis-sessions/S2/workspace/sub").mkdirs()
++        assertNull(SharedFilesCore.archive(fd, "S2", null))
++        assertFalse(File(fd, "minis-global/shared/已归档").exists())
++    }
++
++    @Test fun orphanMigrationRule() {
++        val live = setOf("a", "b")
++        assertEquals(listOf("c"), SharedFilesCore.orphans(listOf("a", "b", "c", ".tmp", "")) { it in live })
++    }
++
++    @Test fun promptSteersToShared() {
++        val p = SharedFilesCore.PROMPT_NOTE
++        assertTrue(p.contains("/var/minis/shared/<主题>/") && p.contains("/var/minis/shared/下载/") && p.contains("deleted with the chat"))
++        assertTrue(p.contains("minis://shared/") && p.contains("已归档"))
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/SkillFirstTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/SkillFirstTest.kt
