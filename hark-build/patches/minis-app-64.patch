@@ -12077,10 +12077,10 @@ index 0000000..dcfc972
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/AgentMailbox.kt b/src/android/app/src/main/java/com/openminis/app/plus/AgentMailbox.kt
 new file mode 100644
-index 0000000..16ed069
+index 0000000..faafdea
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/AgentMailbox.kt
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,189 @@
 +package com.openminis.app.plus
 +
 +import android.content.Context
@@ -12147,7 +12147,24 @@ index 0000000..16ed069
 + */
 +object AgentMailbox {
 +    private const val V = "agent_mail"
-+    private val http = OkHttpClient.Builder().connectTimeout(10, TimeUnit.SECONDS).readTimeout(20, TimeUnit.SECONDS).build()
++    // [38.9.11.1] user 「AI 邮箱没一个可以打开」: requests went through the app ProxySelector to a dead 127.0.0.1:7899. Now:
++    // the selector only hands out a local proxy that passed (LocalProxy), and a failed call is retried direct and through
++    // the proxy that passed, with short timeouts; failures come back as one plain Chinese line (AiMailCore).
++    private val http = OkHttpClient.Builder().connectTimeout(8, TimeUnit.SECONDS).readTimeout(15, TimeUnit.SECONDS).callTimeout(25, TimeUnit.SECONDS).build()
++    private fun via(p: java.net.Proxy): OkHttpClient = http.newBuilder().proxy(p).build()
++    /** default route → direct → the local proxy that passed; the first that answers (any HTTP status) wins */
++    private fun exec(req: Request): Pair<Int, String> {
++        var last: Throwable? = null
++        val routes = ArrayList<OkHttpClient>()
++        routes += http
++        routes += via(java.net.Proxy.NO_PROXY)
++        LocalProxy.best?.let { routes += via(java.net.Proxy(java.net.Proxy.Type.HTTP, java.net.InetSocketAddress("127.0.0.1", it))) }
++        for ((i, c) in routes.withIndex()) {
++            try { return c.newCall(req).execute().use { it.code to (it.body?.string().orEmpty()) } }
++            catch (e: java.io.IOException) { last = e; if (i == 0) LocalProxy.reportFailure() }
++        }
++        throw last ?: java.io.IOException("no route")
++    }
 +    private val JSON = "application/json".toMediaType()
 +
 +    fun key(id: String): String? = PlusVault.secretExtra(V, "key_$id")?.takeIf { it.isNotBlank() }
@@ -12171,13 +12188,13 @@ index 0000000..16ed069
 +    private fun get(url: String, bearer: String?): Pair<Int, String> {
 +        val b = Request.Builder().url(url).header("Accept", "application/json")
 +        bearer?.let { b.header("Authorization", "Bearer $it") }
-+        return http.newCall(b.build()).execute().use { it.code to (it.body?.string().orEmpty()) }
++        return exec(b.build())
 +    }
 +
 +    private fun post(url: String, body: JSONObject, bearer: String? = null): Pair<Int, String> {
 +        val b = Request.Builder().url(url).header("Accept", "application/json").post(body.toString().toRequestBody(JSON))
 +        bearer?.let { b.header("Authorization", "Bearer $it") }
-+        return http.newCall(b.build()).execute().use { it.code to (it.body?.string().orEmpty()) }
++        return exec(b.build())
 +    }
 +
 +    /** AgentMail: with the user's key, use the first inbox (or create one). Returns null = ok, else a plain reason. */
@@ -12195,25 +12212,36 @@ index 0000000..16ed069
 +            }
 +            setKey("agentmail", key); setAddress("agentmail", inbox)
 +            null
-+        }.getOrElse { "连不上 AgentMail（${it.javaClass.simpleName}）" }
++        }.getOrElse { AiMailCore.netReason("AgentMail", it.javaClass.simpleName, it.message) }
 +    }
 +
-+    /** Mail.tm: a free temporary box, no key (api.mail.tm, ≤ 8 requests / s). */
++    /** Mail.tm: a free temporary box, no key (api.mail.tm, ≤ 8 requests / s): GET /domains → POST /accounts → POST /token. */
++    @Volatile var lastMailTmStep: String = ""
 +    suspend fun openMailTm(): String? = withContext(Dispatchers.IO) {
 +        runCatching {
++            lastMailTmStep = "domains"
 +            val (c0, d) = get("https://api.mail.tm/domains", null)
-+            if (c0 !in 200..299) return@runCatching "Mail.tm 没有正常回复（HTTP $c0）"
-+            val o = JSONObject(d)
-+            val dom = (o.optJSONArray("hydra:member") ?: o.optJSONArray("member"))?.optJSONObject(0)?.optString("domain")
-+                ?: return@runCatching "Mail.tm 现在没有可用域名"
-+            val user = "mines" + java.lang.Long.toString(System.currentTimeMillis() % 1_000_000_000L, 36) + (100..999).random()
++            AiMailCore.mailTmHttp(AiMailCore.Step.DOMAINS, c0, d)?.let { return@runCatching it }
++            val dom = AiMailCore.mailTmDomain(d) ?: return@runCatching "Mail.tm 现在没有可用域名"
 +            val pass = java.util.UUID.randomUUID().toString()
-+            val addr = "$user@$dom"
-+            val (c1, _) = post("https://api.mail.tm/accounts", JSONObject().put("address", addr).put("password", pass))
-+            if (c1 !in 200..299) return@runCatching "建邮箱没成功（HTTP $c1）"
++            var addr = ""; var why: String? = "建邮箱没成功"
++            for (attempt in 0..1) {   // a taken name (422) → one more try with a new name
++                lastMailTmStep = "accounts"
++                addr = AiMailCore.userName(System.currentTimeMillis(), (0..899).random()) + "@" + dom
++                val (c1, b1) = post("https://api.mail.tm/accounts", JSONObject().put("address", addr).put("password", pass))
++                why = AiMailCore.mailTmHttp(AiMailCore.Step.ACCOUNT, c1, b1)
++                if (why == null || c1 != 422) break
++            }
++            if (why != null) return@runCatching why
++            // the box is only usable when a token can be had
++            lastMailTmStep = "token"
++            val (c2, b2) = post("https://api.mail.tm/token", JSONObject().put("address", addr).put("password", pass))
++            AiMailCore.mailTmHttp(AiMailCore.Step.TOKEN, c2, b2)?.let { return@runCatching it }
++            if (JSONObject(b2).optString("token").isBlank()) return@runCatching "Mail.tm 没给登录令牌"
 +            PlusVault.setSecretExtra(V, "mailtm_pass", pass); setAddress("mailtm", addr)
++            lastMailTmStep = "ok"
 +            null
-+        }.getOrElse { "连不上 Mail.tm（${it.javaClass.simpleName}）" }
++        }.getOrElse { AiMailCore.netReason("Mail.tm", it.javaClass.simpleName, it.message) }
 +    }
 +
 +    private fun mailTmToken(): String? {
@@ -12241,6 +12269,59 @@ index 0000000..16ed069
 +        setKey(id, null); setAddress(id, null)
 +        if (id == "mailtm") PlusVault.setSecretExtra(V, "mailtm_pass", null)
 +    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/AiMailCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/AiMailCore.kt
+new file mode 100644
+index 0000000..119745a
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/AiMailCore.kt
+@@ -0,0 +1,47 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-38.9.11.1 hotfix] user: 「AI 邮箱没一个可以打开，注册都注册不了」. Pure helpers for the AI 邮箱 clients (AgentMailbox):
++ * plain Chinese reasons for network / HTTP failures (was 「连不上 Mail.tm（UnknownHostException）」 or a silent no-op), the
++ * Mail.tm domain pick and account-name rules. Unit-tested (AiMailCoreTest).
++ */
++object AiMailCore {
++    /** a network exception (class simple name + message) → one plain Chinese line */
++    fun netReason(service: String, errClass: String, msg: String? = null): String {
++        val m = msg.orEmpty().lowercase()
++        return when {
++            errClass.contains("UnknownHost") -> "找不到 $service 的服务器（网络或代理问题，DNS 解析失败）"
++            errClass.contains("SocketTimeout") || errClass.contains("InterruptedIOException") || m.contains("timeout") -> "连接 $service 超时（网络慢或代理不通）"
++            errClass.contains("ConnectException") || m.contains("failed to connect") -> "连不上 $service（代理或网络拒绝连接）"
++            errClass.contains("SSL") || errClass.contains("Handshake") || m.contains("ssl") -> "和 $service 的加密连接失败（可能被代理或网络拦截）"
++            errClass.contains("ProtocolException") || m.contains("unexpected end") -> "$service 的连接被中途断开（代理问题）"
++            errClass.contains("JSON") -> "$service 返回的内容看不懂"
++            else -> "连不上 $service（$errClass）"
++        }
++    }
++
++    enum class Step(val zh: String) { DOMAINS("取域名"), ACCOUNT("建邮箱"), TOKEN("登录邮箱") }
++
++    /** Mail.tm HTTP status → reason; null = ok */
++    fun mailTmHttp(step: Step, code: Int, body: String = ""): String? = when {
++        code in 200..299 -> null
++        code == 429 -> "Mail.tm 请求太频繁（${step.zh}），过一会儿再试"
++        code == 422 && step == Step.ACCOUNT -> if (body.contains("already", true) || body.contains("used", true)) "这个地址已被占用" else "Mail.tm 不接受这个地址（422）"
++        code == 401 && step == Step.TOKEN -> "Mail.tm 登录失败（账号或密码不对）"
++        code in 500..599 -> "Mail.tm 服务器出错（${step.zh}，HTTP $code），稍后再试"
++        code == 403 -> "Mail.tm 拒绝了请求（${step.zh}，HTTP 403，可能是网络出口被限制）"
++        else -> "Mail.tm 没有正常回复（${step.zh}，HTTP $code）"
++    }
++
++    /** first active, public domain from GET /domains (hydra:member or member) */
++    fun mailTmDomain(json: String): String? = runCatching {
++        val o = org.json.JSONObject(json)
++        val a = o.optJSONArray("hydra:member") ?: o.optJSONArray("member") ?: return null
++        (0 until a.length()).map { a.getJSONObject(it) }
++            .firstOrNull { it.optBoolean("isActive", true) && !it.optBoolean("isPrivate", false) && it.optString("domain").isNotBlank() }
++            ?.optString("domain")
++    }.getOrNull()
++
++    /** a fresh local part: "mines" + base36 time + 3 digits (lowercase, 3..64 chars) */
++    fun userName(nowMs: Long, rnd: Int): String = "mines" + java.lang.Long.toString(nowMs % 1_000_000_000L, 36) + (100 + Math.floorMod(rnd, 900))
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/AppAgents.kt b/src/android/app/src/main/java/com/openminis/app/plus/AppAgents.kt
 new file mode 100644
@@ -13804,10 +13885,10 @@ index 0000000..d027a85
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/CodeSourcesCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/CodeSourcesCore.kt
 new file mode 100644
-index 0000000..2032008
+index 0000000..d70d014
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/CodeSourcesCore.kt
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,110 @@
 +package com.openminis.app.plus
 +
 +import org.json.JSONObject
@@ -13878,13 +13959,15 @@ index 0000000..2032008
 +    data class Provider(
 +        val id: String, val name: String, val url: String, val limits: String, val needsKey: Boolean,
 +        val note: String = "", val advanced: Boolean = false, val temporary: Boolean = false,
++        /** [38.9.11.1] the service itself is down (agmail.ai: no DNS / no response, 2026-10-20) → 暂不可用, no buttons */
++        val down: Boolean = false,
 +    )
 +
 +    /** user 19:36 — the list and the free limits shown on each row. */
 +    val PROVIDERS = listOf(
 +        Provider("agentmail", "AgentMail", "https://console.agentmail.to", "免费 3 个邮箱 · 每月 3,000 封 · 每天 100 封", needsKey = true,
 +            note = "登录后在控制台建 API Key，Mines 存进保险箱，用 API 读码"),
-+        Provider("agmail", "AGmail", "https://agmail.ai", "免费邮箱 @agmail.ai", needsKey = true, note = "登录后建 API Key"),
++        Provider("agmail", "AGmail", "https://agmail.ai", "免费邮箱 @agmail.ai", needsKey = true, note = "官网 agmail.ai 现在打不开，先用 AgentMail 或 Mail.tm", down = true),
 +        Provider("mailtm", "Mail.tm", "https://mail.tm", "免费临时邮箱 · 不用密钥 · 每秒 8 次", needsKey = false,
 +            note = "临时，只适合一次性注册", temporary = true),
 +        Provider("selfhost", "自建域名 / Cloudflare", "https://dash.cloudflare.com", "要有自己的域名和 Cloudflare 账号", needsKey = true,
@@ -36623,10 +36706,10 @@ index 0000000..ea7dd8b
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/CodeSourcesScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/CodeSourcesScreen.kt
 new file mode 100644
-index 0000000..0630cff
+index 0000000..0ca7d67
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/CodeSourcesScreen.kt
-@@ -0,0 +1,200 @@
+@@ -0,0 +1,215 @@
 +package com.openminis.app.ui.plus
 +
 +import android.widget.Toast
@@ -36691,7 +36774,18 @@ index 0000000..0630cff
 +    val seen by CodeSources.seen.collectAsState()
 +    var keyFor by remember { mutableStateOf<CodeSourcesCore.Provider?>(null) }
 +    var busy by remember { mutableStateOf<String?>(null) }
++    var mailTmErr by remember { mutableStateOf<String?>(null) }
 +    var showAdv by remember { mutableStateOf(false) }
++    // [38.9.11.1] 打开官网 opens inside Mines (was a Custom Tab that failed silently on the user's phone)
++    var webFor by remember { mutableStateOf<Pair<String, String>?>(null) }   // name, url
++    webFor?.let { (name, url) ->
++        androidx.activity.compose.BackHandler { webFor = null }
++        val kind = remember(url) { com.openminis.app.plus.ConnectionKind("aimail:" + name.lowercase(), name, "", "", 0, com.openminis.app.plus.ConnMethod.WEB, loginUrl = url) }
++        WebLoginScreen(kind = kind, url = url, title = name, detect = false,
++            onDone = { _, _ -> webFor = null; CodeSourcesCore.PROVIDERS.firstOrNull { it.name == name && it.needsKey && !it.down }?.let { keyFor = it } },
++            onClose = { webFor = null; CodeSourcesCore.PROVIDERS.firstOrNull { it.name == name && it.needsKey && !it.down }?.let { keyFor = it } })
++        return
++    }
 +
 +    PlusPage("验证码与 AI 邮箱", onBack) {
 +        PlusSection("验证码来源", footer = "登录需要验证码时，只读取该网站最近 10 分钟的邮件，只取验证码或登录链接，不保存邮件内容。") {
@@ -36718,21 +36812,22 @@ index 0000000..0630cff
 +            val list = CodeSourcesCore.PROVIDERS.filter { !it.advanced }
 +            list.forEachIndexed { i, p ->
 +                if (i > 0) CsDivider()
-+                CsProviderRow(p, rev, busy == p.id,
-+                    onOpen = { GoogleAuthRouter.openInCustomTab(ctx, p.url) },
++                CsProviderRow(p, rev, busy == p.id, if (p.id == "mailtm") mailTmErr else null,
++                    onOpen = { webFor = p.name to p.url },
 +                    onKey = { keyFor = p },
 +                    onOpenMailTm = {
 +                        busy = p.id
 +                        scope.launch {
 +                            val why = AgentMailbox.openMailTm(); busy = null; rev++
-+                            Toast.makeText(ctx, why ?: "已开通：${AgentMailbox.address("mailtm")}", Toast.LENGTH_SHORT).show()
++                            mailTmErr = why
++                            Toast.makeText(ctx, why?.let { "没开通：$it" } ?: "已开通：${AgentMailbox.address("mailtm")}", Toast.LENGTH_LONG).show()
 +                        }
 +                    },
 +                    onDisconnect = { AgentMailbox.disconnect(p.id); rev++ },
 +                )
 +            }
 +            Text("Mail.tm 临时邮箱由 mail.tm 提供", fontSize = MT.Meta, color = m.primaryText,
-+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp).clickable { GoogleAuthRouter.openInCustomTab(ctx, "https://mail.tm") }
++                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp).clickable { webFor = "Mail.tm" to "https://mail.tm" }
 +                    .semantics { contentDescription = "打开 mail.tm 官网" })
 +        }
 +
@@ -36781,7 +36876,7 @@ index 0000000..0630cff
 +
 +@Composable
 +private fun CsProviderRow(
-+    p: CodeSourcesCore.Provider, rev: Int, busy: Boolean,
++    p: CodeSourcesCore.Provider, rev: Int, busy: Boolean, err: String?,
 +    onOpen: () -> Unit, onKey: () -> Unit, onOpenMailTm: () -> Unit, onDisconnect: () -> Unit,
 +) {
 +    val m = mines()
@@ -36794,6 +36889,7 @@ index 0000000..0630cff
 +            if (p.temporary) { Spacer(Modifier.width(6.dp)); CsTag("临时 · 一次性", Tone.WARNING) }
 +            Spacer(Modifier.weight(1f))
 +            when {
++                p.down -> CsTag("暂不可用", Tone.WARNING)
 +                ready -> CsTag("已开通", Tone.SUCCESS)
 +                keyOnly -> CsTag("已存 Key", Tone.NEUTRAL)
 +                else -> CsTag("未开通", Tone.NEUTRAL)
@@ -36802,6 +36898,8 @@ index 0000000..0630cff
 +        Text(p.limits, fontSize = MT.Sub, color = m.ink2, modifier = Modifier.padding(top = 2.dp))
 +        if (ready && addr != null) Text(addr, fontSize = MT.Sub, color = m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis)
 +        if (keyOnly) Text("读码接口尚未接通（未验证）", fontSize = MT.Sub, color = m.ink3)
++        if (p.down) { Text(p.note, fontSize = MT.Sub, color = m.ink2, modifier = Modifier.padding(top = 2.dp)); if (keyOnly) Row(Modifier.padding(top = 8.dp)) { SmallPill("断开") { onDisconnect() } }; return@Column }
++        if (err != null && !ready) Text(err, fontSize = MT.Sub, color = toneColors(Tone.DANGER).first, modifier = Modifier.padding(top = 2.dp))
 +        Row(Modifier.padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
 +            if (ready || keyOnly) SmallPill("断开") { onDisconnect() }
 +            else if (p.needsKey) { SmallPill("打开官网") { onOpen() }; SmallPill("填 API Key") { onKey() } }
@@ -52202,6 +52300,56 @@ index 0000000..5ff2ed3
 +        assertEquals(emptyList<String>(), AddressFix.candidates("someone.else@gmail.com", known))     // different person
 +        assertEquals(emptyList<String>(), AddressFix.candidates("alex.demo7400@163.com", known))      // other domain
 +        assertTrue(AddressFix.reason("x@gmail.com", known).startsWith("地址和应用专用密码对不上"))
++    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/AiMailCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/AiMailCoreTest.kt
+new file mode 100644
+index 0000000..b13963f
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/AiMailCoreTest.kt
+@@ -0,0 +1,44 @@
++package com.openminis.app.plus
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class AiMailCoreTest {
++    @Test fun netReasonsArePlainChinese() {
++        assertTrue(AiMailCore.netReason("Mail.tm", "UnknownHostException").contains("DNS"))
++        assertTrue(AiMailCore.netReason("Mail.tm", "SocketTimeoutException").contains("超时"))
++        assertTrue(AiMailCore.netReason("AgentMail", "ConnectException", "Failed to connect to /127.0.0.1:7899").contains("连不上"))
++        assertTrue(AiMailCore.netReason("Mail.tm", "SSLHandshakeException").contains("加密"))
++        assertTrue(AiMailCore.netReason("X", "WeirdException").contains("WeirdException"))
++    }
++
++    @Test fun mailTmHttp() {
++        assertNull(AiMailCore.mailTmHttp(AiMailCore.Step.ACCOUNT, 201))
++        assertTrue(AiMailCore.mailTmHttp(AiMailCore.Step.ACCOUNT, 429)!!.contains("频繁"))
++        assertEquals("这个地址已被占用", AiMailCore.mailTmHttp(AiMailCore.Step.ACCOUNT, 422, "{\"detail\":\"address: This value is already used.\"}"))
++        assertTrue(AiMailCore.mailTmHttp(AiMailCore.Step.TOKEN, 401)!!.contains("登录失败"))
++        assertTrue(AiMailCore.mailTmHttp(AiMailCore.Step.DOMAINS, 503)!!.contains("服务器出错"))
++    }
++
++    @Test fun domainPick() {
++        val j = """{"hydra:member":[{"domain":"priv.tm","isActive":true,"isPrivate":true},{"domain":"off.tm","isActive":false},{"domain":"web.tm","isActive":true,"isPrivate":false}]}"""
++        assertEquals("web.tm", AiMailCore.mailTmDomain(j))
++        assertEquals("a.tm", AiMailCore.mailTmDomain("""{"member":[{"domain":"a.tm"}]}"""))
++        assertNull(AiMailCore.mailTmDomain("""{"hydra:member":[]}"""))
++        assertNull(AiMailCore.mailTmDomain("not json"))
++    }
++
++    @Test fun userName() {
++        val u = AiMailCore.userName(1_760_000_000_000L, -5)
++        assertTrue(u.startsWith("mines")); assertTrue(u.length in 3..64); assertTrue(u == u.lowercase())
++        assertTrue(Regex("[a-z0-9]+").matches(u))
++    }
++
++    @Test fun agmailMarkedDown() {
++        val p = CodeSourcesCore.PROVIDERS.first { it.id == "agmail" }
++        assertTrue(p.down)
++        assertTrue(CodeSourcesCore.PROVIDERS.filter { it.id != "agmail" }.none { it.down })
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/AppPasswordCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/AppPasswordCoreTest.kt
