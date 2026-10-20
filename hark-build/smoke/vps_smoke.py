@@ -124,6 +124,10 @@ try:
     I3911 = "i3911" in open("hark-build/smoke/target").read().splitlines()[1:2][0]   # [38.9.11 int] integrated build screens
 except Exception:
     I3911 = False
+try:
+    I39111 = "i39111" in open("hark-build/smoke/target").read().splitlines()[1:2][0]   # [38.9.11.1 hotfix] fog sky perf + 天空动画 + local proxy
+except Exception:
+    I39111 = False
 if I3911: I397 = True
 if I3910: I397 = True
 if I399: I397 = True
@@ -3261,7 +3265,8 @@ def main():
         else: fns = (b387_linkall, b387_noblack, b387_persist, b387_platforms)
         if HUB: fns = tuple(fns) + (b3891_hub,)   # [38.9.1 c] hub runs after the UI passes
         if I395: fns = (b395_i2, b395_i) if I395B else (b395_i,)   # [38.9.5 i] build-i gate only: 一键关联 / 一键重新登录, gateway, new screens light + dark
-        if I3911: fns = (b3911,)
+        if I39111: fns = (b39111,)
+        elif I3911: fns = (b3911,)
         elif I3910: fns = (b3910,)
         elif I399: fns = (b399,)
         elif I398B: fns = (b398b,)
@@ -6259,6 +6264,160 @@ def b3911(res):
     step("images", images)
     step("files", files)
     print("I3911 RESULT " + json.dumps(o, ensure_ascii=False)[:12000], flush=True)
+
+
+def b39111(res):
+    """[38.9.11.1 hotfix] fog sky on home + chat (light / dark): emulator stills, then the shader forced on the software GPU in
+    流畅 and 精美, frame stats (dumpsys gfxinfo) for each; 外观调节 › 天空动画 row; local proxy probe with the phone's
+    127.0.0.1:7890 = an open proxy on the runner (adb reverse), 7897 = a listener that drops, then with nothing → direct."""
+    o = res.setdefault("i39111", {})
+    T0 = time.time()
+    def step(name, f):
+        t0 = time.time()
+        if t0 - T0 > 80 * 60:
+            page_missing.append(f"i39111 {name} skipped (time budget)"); print(f"I39111 SKIP {name}", flush=True); return
+        try: f()
+        except Exception as e:
+            import traceback; traceback.print_exc(); page_missing.append(f"i39111 {name} error {e}")
+        print(f"I39111 STEP {name} {int(time.time() - t0)} s", flush=True)
+        if not alive(): crashed.append(f"i39111 {name}"); recover(f"i39111 {name}")
+    def shot(name):
+        r = snap("i39111-" + name)
+        subprocess.run(f"cp {OUT}/{step_no:02d}-i39111-{name}.png {OUT}/i39111-{name}.png", shell=True)
+        return r
+    def gfx(tag, secs=10):
+        sh(f"dumpsys gfxinfo {PKG} reset"); time.sleep(secs)
+        g = sh(f"dumpsys gfxinfo {PKG}", timeout=30)
+        o["gfx_" + tag] = " | ".join(l.strip() for l in g.splitlines() if re.search(r"Total frames|Janky frames|50th percentile|90th percentile|99th percentile|Number Slow UI|Number Frame deadline", l))[:500]
+        print("I39111 GFX", tag, o["gfx_" + tag], flush=True)
+    def state(tag):
+        st = result_json("group", "i396 skystate", timeout=15); o["sky_" + tag] = st
+        print("I39111 SKY", tag, json.dumps(st, ensure_ascii=False)[:600], flush=True)
+        return st
+    print("I39111 screen", sh("wm size").strip(), sh("wm density").strip(), flush=True)
+    set_zh()
+    o["seedmodel"] = seed_model()
+    try: result_json("group", "wallpaper off")
+    except Exception: pass
+    o["seedpicker"] = result_json("group", "i398 seedpicker", timeout=30)
+
+    def proxy():
+        # nothing on 7890 / 7897 yet → expect no local proxy (split proxy is off on a fresh install)
+        o["lp_none"] = result_json("group", "i396 localproxy", timeout=40); print("I39111 LP none", o["lp_none"], flush=True)
+        print(adb("reverse", "tcp:7890", "tcp:3130"), adb("reverse", "tcp:7897", "tcp:3129"), adb("reverse", "--list"), flush=True)
+        o["lp_7890"] = result_json("group", "i396 localproxy", timeout=40); print("I39111 LP 7890", o["lp_7890"], flush=True)
+        lp = o["lp_7890"] if isinstance(o["lp_7890"], dict) else {}
+        if lp.get("best") != 7890: selftest_fail.append(f"i39111 localproxy: expected 7890 (open proxy) to be chosen, got {lp}")
+        if any(str(x).startswith("7897:OK") for x in lp.get("probes", [])): selftest_fail.append(f"i39111 localproxy: dropping listener 7897 passed {lp}")
+        adb("reverse", "--remove", "tcp:7890"); time.sleep(1)
+        o["lp_after"] = result_json("group", "i396 localproxy", timeout=40); print("I39111 LP after", o["lp_after"], flush=True)
+        la = o["lp_after"] if isinstance(o["lp_after"], dict) else {}
+        if la.get("best", -1) not in (-1, None): selftest_fail.append(f"i39111 localproxy: a proxy still chosen after 7890 went away {la}")
+        adb("reverse", "--remove-all")
+
+    def home_fog():
+        for mode, sfx in ((1, "light"), (2, "dark")):
+            theme388(mode); healthy_home()
+            result_json("group", "i396 skygpu off", timeout=30)
+            result_json("group", "i396 sky fog static", timeout=20); b381_home(); time.sleep(5)
+            shot(f"home-fog-still-{sfx}"); state(f"still_{sfx}")
+            o[f"gpu_on_{sfx}"] = result_json("group", "i396 skygpu on", timeout=40)
+            result_json("group", "i396 skymode smooth", timeout=20); result_json("group", "i396 sky fog", timeout=20); b381_home(); time.sleep(8)
+            shot(f"home-fog-smooth-{sfx}"); gfx(f"home_smooth_{sfx}", 10); st = state(f"smooth_{sfx}")
+            if isinstance(st, dict) and st.get("error"): page_missing.append(f"i39111 home {sfx}: shader error {st.get('error')}")
+            result_json("group", "i396 skymode rich", timeout=20); time.sleep(6)
+            shot(f"home-fog-rich-{sfx}"); gfx(f"home_rich_{sfx}", 10); state(f"rich_{sfx}")
+            result_json("group", "i396 skymode off", timeout=20); time.sleep(4)
+            gfx(f"home_off_{sfx}", 8); state(f"off_{sfx}")
+            result_json("group", "i396 skymode smooth", timeout=20)
+            result_json("group", "i396 skygpu off", timeout=30)
+
+    def open_chat():
+        result_json("group", "i398 picker", timeout=20); time.sleep(5)
+        for _ in range(4):
+            if tap_text("smoke-model", wait=2): return True
+            scroll_down(); time.sleep(1)
+        back(1); time.sleep(1.5); return False
+
+    def chat_fog():
+        for mode, sfx in ((1, "light"), (2, "dark")):
+            theme388(mode); healthy_home()
+            result_json("group", "i396 skygpu on", timeout=40); result_json("group", "i396 skymode smooth", timeout=20)
+            result_json("group", "i396 sky fog", timeout=20)
+            open_chat()
+            r = dump(); e = edits(r)
+            if e:
+                sh(f"input tap {e[-1][0]} {e[-1][1]}"); time.sleep(0.6); type_text("hello fog"); sh("input keyevent KEYCODE_BACK"); time.sleep(0.6)
+                tap_any(["Send", "发送"], wait=3) or sh("input keyevent KEYCODE_ENTER")
+                time.sleep(12)
+            else: page_missing.append(f"i39111 chat {sfx}: no input")
+            shot(f"chat-fog-smooth-{sfx}"); gfx(f"chat_smooth_{sfx}", 10); st = state(f"chat_smooth_{sfx}")
+            if isinstance(st, dict) and st.get("skies", 0) > 2: selftest_fail.append(f"i39111 chat {sfx}: {st.get('skies')} skies registered")
+            back(1); time.sleep(1.5)
+            result_json("group", "i396 skygpu off", timeout=30)
+
+    def look():
+        theme388(1); healthy_home()
+        route("plus_look", 6); r = shot("look-light"); t = _txt(r); o["look"] = t[:500]
+        if "天空动画" not in t: page_missing.append("i39111 外观调节: 天空动画 row not seen")
+        if tap_text("精美", wait=2): time.sleep(1); o["look_rich"] = state("look_rich"); shot("look-rich")
+        if tap_text("流畅", wait=2): time.sleep(1); o["look_smooth"] = state("look_smooth")
+        back(1); time.sleep(1)
+
+    def aimail():
+        theme388(1); healthy_home()
+        route("plus_code_sources", 6)
+        for _ in range(3):
+            r = dump()
+            if r is not None and find(r, "开通临时邮箱"): break
+            scroll_down(); time.sleep(1)
+        r = shot("aimail-before"); t = _txt(r); o["aimail_before"] = t[:600]
+        if "暂不可用" not in t: page_missing.append("i39111 AI 邮箱: AGmail 暂不可用 not seen")
+        if tap_text("开通临时邮箱", wait=2):
+            for _ in range(15):
+                time.sleep(2); r = dump(); t = _txt(r)
+                if "开通中" not in t: break
+            r = shot("aimail-mailtm"); t = _txt(r); o["aimail_after"] = t[:600]
+            print("I39111 AIMAIL", t[:400], flush=True)
+            if "已开通" not in t and "没开通" not in t and "Mail.tm" not in t: page_missing.append("i39111 Mail.tm: no result line")
+        else: page_missing.append("i39111 Mail.tm: 开通临时邮箱 button not found")
+        if tap_text("打开官网", wait=2):
+            time.sleep(8); r = shot("aimail-site"); o["aimail_site"] = _txt(r)[:300]; back(1); time.sleep(2)
+        else: page_missing.append("i39111 AI 邮箱: 打开官网 not found")
+        back(1); time.sleep(1)
+
+    def images():
+        for mode, sfx in ((1, "light"), (2, "dark")):
+            theme388(mode); healthy_home()
+            result_json("group", "i396 sky fog static", timeout=20)
+            o[f"share_{sfx}"] = result_json("group", "i3911 shareimgs", timeout=30); time.sleep(4)
+            print(sh(f"am start -W -n {PKG}/com.openminis.app.MainActivity --ez shared_content true", timeout=40)[-200:], flush=True); time.sleep(7)
+            shot(f"composer-images-{sfx}")
+            r = dump(); e = edits(r)
+            if not e: page_missing.append(f"i39111 images {sfx}: no input"); back(1); continue
+            sh(f"input tap {e[-1][0]} {e[-1][1]}"); time.sleep(0.6); type_text("look at these images"); sh("input keyevent KEYCODE_BACK"); time.sleep(0.6)
+            tap_any(["Send", "发送"], wait=3) or sh("input keyevent KEYCODE_ENTER")
+            time.sleep(12); shot(f"chat-images-{sfx}")
+            back(1); time.sleep(1.5)
+
+    def logincard():
+        for mode, sfx in ((1, "light"), (2, "dark")):
+            theme388(mode); healthy_home()
+            o[f"logincard_{sfx}"] = result_json("group", "i396 logincard", timeout=20); time.sleep(3)
+            r = shot(f"logincard-{sfx}"); t = _txt(r); o[f"logincard_txt_{sfx}"] = t[:300]
+            for w in ("保存到密码库", "提交", "验证码"):
+                if w not in t: page_missing.append(f"i39111 login card {sfx}: '{w}' not on screen")
+            back(1); time.sleep(1.5)
+
+    step("proxy", proxy)
+    step("logincard", logincard)
+    step("images", images)
+    step("aimail", aimail)
+    step("home_fog", home_fog)
+    step("chat_fog", chat_fog)
+    step("look", look)
+    result_json("group", "i396 sky auto static", timeout=20)
+    print("I39111 RESULT " + json.dumps(o, ensure_ascii=False)[:12000], flush=True)
 
 
 def _in(n, b):
