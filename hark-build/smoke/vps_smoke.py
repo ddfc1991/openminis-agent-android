@@ -120,6 +120,11 @@ try:
     I3910 = "i3910" in open("hark-build/smoke/target").read().splitlines()[1:2][0]   # [38.9.10 i29] sky v7 / swipe title / Clash restart / real proxy check / soak
 except Exception:
     I3910 = False
+try:
+    I3911 = "i3911" in open("hark-build/smoke/target").read().splitlines()[1:2][0]   # [38.9.11 int] integrated build screens
+except Exception:
+    I3911 = False
+if I3911: I397 = True
 if I3910: I397 = True
 if I399: I397 = True
 if I398: I397 = True
@@ -3256,7 +3261,8 @@ def main():
         else: fns = (b387_linkall, b387_noblack, b387_persist, b387_platforms)
         if HUB: fns = tuple(fns) + (b3891_hub,)   # [38.9.1 c] hub runs after the UI passes
         if I395: fns = (b395_i2, b395_i) if I395B else (b395_i,)   # [38.9.5 i] build-i gate only: 一键关联 / 一键重新登录, gateway, new screens light + dark
-        if I3910: fns = (b3910,)
+        if I3911: fns = (b3911,)
+        elif I3910: fns = (b3910,)
         elif I399: fns = (b399,)
         elif I398B: fns = (b398b,)
         elif I398: fns = (b398,)
@@ -6077,6 +6083,184 @@ def b3910(res):
     step("soak", soak)
     step("sky_chat", sky_chat)
     print("I3910 RESULT " + json.dumps({k: v for k, v in o.items() if not k.startswith("meminfo")}, ensure_ascii=False)[:9000], flush=True)
+
+
+def b3911(res):
+    """[38.9.11 int] screens of the integrated 38.9.11 build (A+B+C+D): home sky 晴/雨 light+dark, chat sky light+dark with Chinese
+    tool pills (fake model TOOLZH → task_progress / file_write / memory_get), shared images as a stack in the composer and in the
+    sent message, AI 服务商 (能用/不能用), 模型组 edit, 工作流记录 / 经验 list + detail, 工作位置 servers collapsed / expanded (hook +
+    real taps), 每日简报, file manager (browser + own APK info), 谷歌账号 page, 应用专用密码 guide step 1."""
+    o = res.setdefault("i3911", {})
+    T0 = time.time()
+    def step(name, f):
+        t0 = time.time()
+        if t0 - T0 > 85 * 60:
+            page_missing.append(f"i3911 {name} skipped (time budget)"); print(f"I3911 SKIP {name}", flush=True); return
+        try: f()
+        except Exception as e:
+            import traceback; traceback.print_exc(); page_missing.append(f"i3911 {name} error {e}")
+        print(f"I3911 STEP {name} {int(time.time() - t0)} s", flush=True)
+        if not alive(): crashed.append(f"i3911 {name}"); recover(f"i3911 {name}")
+    def shot(name):
+        r = snap("i3911-" + name)
+        subprocess.run(f"cp {OUT}/{step_no:02d}-i3911-{name}.png {OUT}/i3911-{name}.png", shell=True)
+        return r
+    def wait_for(label, secs=30):
+        t0 = time.time()
+        while time.time() - t0 < secs:
+            r = dump()
+            if r is not None and find(r, label): return r
+            time.sleep(2)
+        return None
+    print("I3911 screen", sh("wm size").strip(), sh("wm density").strip(), flush=True)
+    set_zh()
+    o["seedmodel"] = seed_model()
+    try: result_json("group", "wallpaper off")
+    except Exception: pass
+    o["seedpicker"] = result_json("group", "i398 seedpicker", timeout=30)
+    o["servers"] = result_json("group", "i3911 servers", timeout=20)
+    o["xpseed"] = result_json("group", "i3911 xpseed", timeout=30)
+    print(f"I3911 SEED {o['servers']} {o['xpseed']}", flush=True)
+
+    def sky_home():
+        for mode, sfx in ((1, "light"), (2, "dark")):
+            theme388(mode); healthy_home()
+            for k in ("sunny", "rain"):
+                result_json("group", f"i396 sky {k} static", timeout=20); b381_home(); time.sleep(5)
+                shot(f"home-{k}-{sfx}"); st = result_json("group", "i396 skystate", timeout=10); o[f"home_{k}_{sfx}"] = st
+                if not (isinstance(st, dict) and st.get("scene") == k): selftest_fail.append(f"i3911 home {sfx}: forced {k} but {st}")
+
+    def open_chat():
+        result_json("group", "i398 picker", timeout=20); time.sleep(5)
+        for _ in range(4):
+            if tap_text("smoke-model", wait=2): return True
+            scroll_down(); time.sleep(1)
+        back(1); time.sleep(1.5); return False
+
+    def send(text):
+        r = dump(); e = edits(r)
+        if not e: return False
+        sh(f"input tap {e[-1][0]} {e[-1][1]}"); time.sleep(0.6); type_text(text); sh("input keyevent KEYCODE_BACK"); time.sleep(0.6)
+        tap_any(["Send", "发送"], wait=3) or sh("input keyevent KEYCODE_ENTER")
+        return True
+
+    def chat():
+        for mode, sfx in ((1, "light"), (2, "dark")):
+            theme388(mode); healthy_home()
+            result_json("group", "i396 sky sunny static", timeout=20)
+            open_chat()
+            if not send("TOOLZH 请用工具整理一下"): page_missing.append(f"i3911 chat {sfx}: no input"); back(1); continue
+            r = wait_for("三个工具都跑完了", 60); time.sleep(3)
+            r = shot(f"chat-tools-{sfx}"); t = _txt(r); o[f"chat_tools_{sfx}"] = t[:600]
+            if r is None or "三个工具都跑完了" not in t: page_missing.append(f"i3911 chat {sfx}: final reply not seen")
+            eng = [w for w in ("Task Progress", "File Write", "file_write", "Memory Get", "memory_get", "Execute Shell") if w in t]
+            if eng: selftest_fail.append(f"i3911 chat {sfx}: English tool names on screen {eng}")
+            zh = [w for w in ("任务进度", "写文件", "读记忆") if w in t]; o[f"chat_tools_zh_{sfx}"] = zh
+            result_json("group", "i396 sky rain static", timeout=20); time.sleep(7)
+            shot(f"chat-rain-{sfx}")
+            back(1); time.sleep(1)
+
+    def images():
+        for mode, sfx in ((1, "light"), (2, "dark")):
+            theme388(mode); healthy_home()
+            result_json("group", "i396 sky sunny static", timeout=20)
+            o[f"share_{sfx}"] = result_json("group", "i3911 shareimgs", timeout=30); time.sleep(7)
+            r = shot(f"composer-images-{sfx}")
+            if not send("看看这几张图"): page_missing.append(f"i3911 images {sfx}: no input"); back(1); continue
+            wait_for("你好，我是测试模型", 40); time.sleep(3)
+            r = shot(f"chat-images-{sfx}"); o[f"chat_images_{sfx}"] = _txt(r)[:300]
+            back(1); time.sleep(1)
+
+    def providers():
+        for mode, sfx in ((1, "light"), (2, "dark")):
+            theme388(mode); healthy_home()
+            route("providers", 6); r = shot(f"providers-{sfx}"); t = _txt(r); o[f"providers_{sfx}"] = t[:600]
+            if mode == 1:
+                if tap_any(["全部检测", "检测全部", "重新检测"], wait=3): time.sleep(20); r = shot("providers-checked-light"); o["providers_checked"] = _txt(r)[:600]
+            if not any(w in t for w in ("能用", "不能用", "还没检测", "检测")): page_missing.append(f"i3911 providers {sfx}: no 能用/不能用 wording ({t[:120]})")
+            back(1); time.sleep(1)
+
+    def groups():
+        theme388(1); healthy_home()
+        route("model_groups", 5); r = shot("groups-list-light")
+        if tap_text("个模型", wait=4) or tap_text("默认模型", wait=4):
+            r = shot("group-edit-light"); t = _txt(r)
+            scroll_down(); time.sleep(1); r2 = shot("group-edit-light-2"); t += " " + _txt(r2); o["group_edit"] = t[:800]
+            eng = [w for w in ("Try models in order", "Fall back on rate limits", "Fallback 触发条件") if w in t]
+            if eng: selftest_fail.append(f"i3911 模型组 edit still English: {eng}")
+            back(1); time.sleep(1)
+        else: page_missing.append("i3911 模型组: no group row to open")
+        back(1); time.sleep(1)
+
+    def xp():
+        theme388(1); healthy_home()
+        route("plus_workflows", 6); r = shot("workflows-list-light"); t = _txt(r); o["workflows"] = t[:800]
+        if "<scheduled_task" in t or "st_8f3a" in t or "839201" in t: selftest_fail.append("i3911 工作流记录: raw envelope / code on screen")
+        if tap_text("502", wait=4) or tap_text("new-api", wait=4) or tap_text("梦云", wait=4):
+            r = shot("workflow-detail-light"); o["workflow_detail"] = _txt(r)[:600]; back(1); time.sleep(1)
+        else: page_missing.append("i3911 工作流记录: seeded run not found")
+        back(1); time.sleep(1)
+        route("plus_experience", 6); r = shot("experience-list-light"); o["experience"] = _txt(r)[:800]
+        if tap_text("修 VPS", wait=4) or tap_text("502", wait=4):
+            r = shot("experience-detail-light"); o["experience_detail"] = _txt(r)[:600]; back(1); time.sleep(1)
+        else: page_missing.append("i3911 经验: seeded entry not found")
+        back(1); time.sleep(1)
+
+    def work():
+        for mode, sfx in ((1, "light"), (2, "dark")):
+            theme388(mode); healthy_home()
+            result_json("group", "i3911 servers", timeout=20)
+            route("plus_work_location", 6); r = shot(f"work-collapsed-{sfx}"); t = _txt(r); o[f"work_collapsed_{sfx}"] = t[:600]
+            if "IP 归属地" in t or "限制：" in t: selftest_fail.append(f"i3911 工作位置 {sfx}: details visible while collapsed")
+            if "alvps" not in t: page_missing.append(f"i3911 工作位置 {sfx}: seeded servers not shown")
+            if mode == 1:
+                # a real tap on the card (its name) must open it; a second tap must close it
+                tap_text("alvps", wait=2); r = shot("work-tap-open-light"); t2 = _txt(r); o["work_tap_open"] = t2[:600]
+                if "IP 归属地" not in t2 and "测试连接" not in t2: selftest_fail.append("i3911 工作位置: tap did not expand the card")
+                tap_text("alvps", wait=2); r = dump(); t3 = _txt(r); o["work_tap_close"] = t3[:300]
+                if "IP 归属地" in t3: selftest_fail.append("i3911 工作位置: second tap did not collapse the card")
+            o[f"expand_{sfx}"] = result_json("group", "i3911 expand smoke-alvps", timeout=10); time.sleep(2)
+            r = shot(f"work-expanded-{sfx}"); o[f"work_expanded_{sfx}"] = _txt(r)[:600]
+            result_json("group", "i3911 expand none", timeout=10)
+            back(1); time.sleep(1)
+
+    def digest():
+        theme388(1); healthy_home()
+        route("plus_digest", 8); r = shot("digest-brief-light"); o["digest"] = _txt(r)[:500]
+        if "每日简报" not in o["digest"]: page_missing.append("i3911 每日简报 tab not seen")
+        back(1); time.sleep(1)
+
+    def files():
+        theme388(1); healthy_home()
+        print(sh(f"am start -W -n {PKG}/com.openminis.app.files.FileManagerActivity", timeout=40)[-200:], flush=True); time.sleep(6)
+        r = shot("files-browser-light"); o["files_browser"] = _txt(r)[:500]
+        apk = (result_json("group", "i3911 apkpath", timeout=10) or "")
+        apk = apk if isinstance(apk, str) else str(apk); o["apkpath"] = apk
+        if apk.startswith("/"):
+            print(sh(f"am start -W -n {PKG}/com.openminis.app.files.FileManagerActivity --es com.openminis.app.files.PATH {apk}", timeout=40)[-200:], flush=True); time.sleep(10)
+            r = shot("files-apk-light"); t = _txt(r); o["files_apk"] = t[:600]
+            if "com.openminis.mines.plus" not in t and "1.23.11" not in t: page_missing.append("i3911 file manager: APK info not confirmed")
+            if tap_text("签名", wait=3): shot("files-apk-sign-light")
+        back(3); time.sleep(1)
+
+    def google():
+        theme388(1); healthy_home()
+        result_json("group", "i3911 gemini", timeout=10); time.sleep(5)
+        r = shot("gemini-accounts-light"); o["gemini"] = _txt(r)[:500]; back(1); time.sleep(1)
+        result_json("group", "i3911 apppw", timeout=10); time.sleep(5)
+        r = shot("apppw-step1-light"); o["apppw"] = _txt(r)[:500]; back(1); time.sleep(1)
+
+    step("sky_home", sky_home)
+    step("work", work)
+    step("chat", chat)
+    step("images", images)
+    step("providers", providers)
+    step("groups", groups)
+    step("xp", xp)
+    step("digest", digest)
+    step("files", files)
+    step("google", google)
+    print("I3911 RESULT " + json.dumps(o, ensure_ascii=False)[:12000], flush=True)
 
 
 def _in(n, b):

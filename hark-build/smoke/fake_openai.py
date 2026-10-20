@@ -309,6 +309,39 @@ fetch('/linkfake/send?'+k+'='+encodeURIComponent(v));document.getElementById('fc
             except Exception:
                 pass  # the app hung up on us: that is the expected outcome
             return
+        if "TOOLZH" in last_user_text(msgs) and body.get("stream"):
+            # [38.9.11 int] tool pills must read in Chinese: one turn with three tool calls, then a short final answer
+            after_tool = False
+            for m in reversed(msgs):
+                if m.get("role") == "user": break
+                if m.get("role") == "tool": after_tool = True; break
+            names = [t.get("function", {}).get("name") for t in body.get("tools") or []]
+            self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+            def emit(delta, fin=None):
+                d = {"id": "x", "object": "chat.completion.chunk", "created": int(time.time()), "model": "smoke-model",
+                     "choices": [{"index": 0, "delta": delta, "finish_reason": fin}]}
+                self.wfile.write(b"data: " + json.dumps(d, ensure_ascii=False).encode() + b"\n\n"); self.wfile.flush()
+            if after_tool:
+                emit({"role": "assistant", "content": "三个工具都跑完了：进度已更新，文件已写好，记忆也读过了。"})
+                emit({}, "stop")
+            else:
+                calls = []
+                for nm, args in (("task_progress", {"title": "整理文件", "steps": ["写文件", "读记忆"], "current": 1}),
+                                 ("file_write", {"path": "/var/minis/shared/smoke/toolzh.txt", "content": "工具名测试"}),
+                                 ("memory_get", {"key": "smoke"})):
+                    if nm in names:
+                        t = (body.get("tools") or [])[names.index(nm)].get("function", {})
+                        req = (t.get("parameters") or {}).get("required") or []
+                        a = dict(args); [a.setdefault(k, "smoke") for k in req]
+                        calls.append((nm, a))
+                if not calls: calls = [pick_tool(body.get("tools"))]
+                STATS["toolzh"] = [c[0] for c in calls]
+                emit({"role": "assistant", "content": "好的，我先记一下进度，再写个文件："})
+                emit({"tool_calls": [{"index": i, "id": f"call_zh_{i}", "type": "function", "function": {"name": nm, "arguments": json.dumps(a, ensure_ascii=False)}}
+                                     for i, (nm, a) in enumerate(calls)]})
+                emit({}, "tool_calls")
+            self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
+            return
         if "LOOPTEST" in last_user_text(msgs) and body.get("stream"):
             # [build-30 smoke] A model that repeats the same text + tool call forever.
             STATS["loop_posts"] += 1
