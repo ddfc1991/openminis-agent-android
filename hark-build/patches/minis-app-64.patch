@@ -7104,7 +7104,7 @@ index 3e55128..6770d73 100644
          try {
              val dir = File(context.filesDir, "browser_tabs")
 diff --git a/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt b/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt
-index 9033a1b..b08808a 100644
+index 9033a1b..0493faa 100644
 --- a/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt
 @@ -48,6 +48,9 @@ class BrowserUseManager(
@@ -7148,7 +7148,18 @@ index 9033a1b..b08808a 100644
                      BrowserHistoryStore.getInstance(view.context).record(histUrl, histTitle)
                  }
                  // T-webview-popup-d3c6e10f (Issue 1): after the pool WebView's
-@@ -878,6 +888,8 @@ class BrowserUseManager(
+@@ -850,6 +860,10 @@ class BrowserUseManager(
+                 }
+             }
+         }
++        // [38.9.11.1] sign-in page without a saved login (or a refused one) → the secure login card; values go into the page
++        runCatching {
++            com.openminis.app.plus.AgentLogin.handle(ctx, minesUrl()) { js -> runCatching { evaluateJavascript(js) }.getOrNull() }
++        }.getOrNull()?.let { text += "\n" + it; snap = true }
+         val out = result.copy(text = text)
+         return if (snap) attachSnapshot(out) else out
+     }
+@@ -878,6 +892,8 @@ class BrowserUseManager(
          if (!com.openminis.app.offload.MinisNotificationListenerService.isConnected() && !mailOk) {
              return BrowserActionResult.error("Mines 没有通知使用权，也没有已登录的邮箱，收不到验证码。请让用户在 设置 → 浏览器验证 里打开通知使用权，或把验证码直接告诉你")
          }
@@ -12074,6 +12085,80 @@ index 0000000..dcfc972
 +    fun reason(stored: String, known: Collection<String>): String =
 +        candidates(stored, known).firstOrNull()?.let { "地址和应用专用密码对不上：你填的是 $stored，Mines 里登录的是 $it，地址可能多打或少打了一个字" }
 +            ?: "地址和应用专用密码对不上，请检查地址（$stored），或在 Google 里看看这个应用专用密码是不是被撤销了"
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/AgentLogin.kt b/src/android/app/src/main/java/com/openminis/app/plus/AgentLogin.kt
+new file mode 100644
+index 0000000..12d2502
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/AgentLogin.kt
+@@ -0,0 +1,68 @@
++package com.openminis.app.plus
++
++import android.content.Context
++import org.json.JSONObject
++import java.util.concurrent.ConcurrentHashMap
++
++/**
++ * [Mines-38.9.11.1 hotfix] user: when the AI's browser hits a sign-in page with no saved login (or the saved one is
++ * refused), Mines just waited — no account / password box. Now, after each page-changing browser action:
++ *  1. a password form with an empty password field → a saved login for that site ([SavedLogins]) is filled silently;
++ *  2. none saved, or the page says the password was wrong → the secure [LoginCard] pops (site logo + name, 账号/手机号,
++ *     masked 密码 with eye toggle, optional 验证码, 保存到密码库 on, 提交), with a notification when Mines is in the
++ *     background; the values go straight into the page — the agent only gets a line saying it was filled.
++ * At most one card per site every 2 minutes unless the password was refused.
++ */
++object AgentLogin {
++    private val asked = ConcurrentHashMap<String, Long>()
++    private val filled = ConcurrentHashMap<String, Long>()
++    const val ASK_GAP_MS = 120_000L
++    const val REFUSED_WINDOW_MS = 90_000L
++
++    /** [eval] runs JS in the agent's page and returns its string result (null = failed). Returns a note for the agent, or null. */
++    suspend fun handle(ctx: Context, url: String, eval: suspend (String) -> String?): String? {
++        if (LoginCard.pending.value != null) return null
++        val host = Keychain.hostOf(url).ifBlank { return null }
++        val fj = runCatching { JSONObject(eval(LoginAssist.FIELDS_JS) ?: return null) }.getOrNull() ?: return null
++        if (!fj.optBoolean("pw")) return null           // phone / e-mail code pages: the OTP flow handles them
++        val now = System.currentTimeMillis()
++        val pwEmpty = fj.optBoolean("pwEmpty", true)
++        val err = runCatching { eval(LoginAssist.ERROR_JS) }.getOrNull().orEmpty()
++        val refused = filled[host]?.let { now - it < REFUSED_WINDOW_MS } == true && LoginAssist.PW_WRONG.containsMatchIn(err)
++        if (!pwEmpty && !refused) return null
++        val site = AutoAccounts.siteOf(host).ifBlank { host }
++        if (!refused) {
++            val saved = runCatching { SavedLogins.forUrl(ctx, url) }.getOrNull()
++            if (saved != null && saved.pass.isNotBlank() && eval(SavedLogins.fillJs(saved, false)) != "none") {
++                filled[host] = now
++                return "[登录] 已用密码库里保存的 $site 账号填好账号密码（内容不显示）。点登录按钮继续；如果提示密码不对，Mines 会弹安全输入框让用户重填。"
++            }
++            if (asked[host]?.let { now - it < ASK_GAP_MS } == true) return null
++        }
++        asked[host] = now
++        val code = fj.optBoolean("code") && fj.optBoolean("codeEmpty")
++        val page = LoginMemoryCore.Page(fj.optString("user"), true, code)
++        val ask = LoginMemoryCore.cardFields(page, haveAccount = false, havePassword = false,
++            codeWaitMs = if (code) Long.MAX_VALUE else -1L, refused = refused, siteName = site) ?: return null
++        val memo = runCatching { LoginMemory.memoFor(ctx, host) }.getOrNull()
++        val a = LoginCard.ask(LoginCard.Req(host, site, ask, memo?.account.orEmpty(), runCatching { LoginMemoryCore.lastLine(memo) }.getOrNull()), ctx)
++            ?: return "[登录] 用户关掉了安全登录框，没有填。不要在聊天里问账号密码；需要时再打开登录页，Mines 会再弹框。"
++        val sb = StringBuilder()
++        if (a.account.isNotBlank() || a.password.isNotBlank()) {
++            val e = SavedLogins.Entry(site, "https://$host/", a.account, a.password)
++            if (a.save && a.password.isNotBlank()) runCatching { SavedLogins.put(ctx, e) }
++            val r = eval(SavedLogins.fillJs(e, a.code.isBlank()))
++            filled[host] = System.currentTimeMillis()
++            sb.append(if (r != null && r != "none") "[登录] 用户已在 Mines 的安全输入框里填好账号密码，已直接填进页面" + (if (a.code.isBlank()) "并提交" else "") + "（内容不会给你看）。"
++                else "[登录] 用户填好了账号密码，但这个页面上找不到账号/密码输入框。")
++            if (a.save && a.password.isNotBlank()) sb.append("已保存到密码库，下次自动填。")
++        }
++        if (a.code.isNotBlank()) {
++            val r = eval(HumanVerify.fillJs(a.code, null))
++            sb.append(if (r == "ok") "验证码已填入。" else "验证码没找到输入框。")
++            runCatching { eval(LoginAssist.SUBMIT_JS) }
++        }
++        sb.append("截图确认是否登录成功。")
++        return sb.toString()
++    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/AgentMailbox.kt b/src/android/app/src/main/java/com/openminis/app/plus/AgentMailbox.kt
 new file mode 100644
@@ -17637,6 +17722,38 @@ index 0000000..7f2c27c
 +        }
 +    }
 +}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ImageGridCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/ImageGridCore.kt
+new file mode 100644
+index 0000000..24cddd6
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/ImageGridCore.kt
+@@ -0,0 +1,26 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-38.9.11.1 hotfix] user: images "like Hark", not the fanned card stack. Sent message = a neat grid of rounded
++ * thumbnails: 1 → one larger picture, 2–4 → 2 columns, 5+ → 3 columns (at most 6 tiles, the last one says +N);
++ * composer = a row of small rounded squares, each with its own ×. Pure geometry, unit-tested (ImageGridCoreTest).
++ */
++object ImageGridCore {
++    const val MAX_TILES = 6
++    const val GAP_DP = 4f
++    const val COMPOSER_TILE_DP = 56f
++    const val SINGLE_W_DP = 200f
++
++    fun columns(n: Int): Int = when { n <= 1 -> 1; n <= 4 -> 2; else -> 3 }
++    fun shown(n: Int): Int = n.coerceIn(0, MAX_TILES)
++    /** "+N" on the last shown tile, 0 = none */
++    fun more(n: Int): Int = (n - MAX_TILES).coerceAtLeast(0)
++    fun rows(n: Int): Int { val s = shown(n); val c = columns(n); return if (s == 0) 0 else (s + c - 1) / c }
++    /** square tile edge for 2+ images (dp) */
++    fun tileDp(n: Int): Float = when (columns(n)) { 2 -> 104f; 3 -> 76f; else -> SINGLE_W_DP }
++    /** single image: width fixed, height from its aspect (w / h) clamped to 3:4 … 4:3 */
++    fun singleHeightDp(aspect: Float?): Float = SINGLE_W_DP / (aspect ?: 1f).coerceIn(0.75f, 1.3333f)
++    /** grid outer size (dp) */
++    fun gridWidthDp(n: Int): Float { val c = minOf(columns(n), shown(n)).coerceAtLeast(1); return if (n <= 1) SINGLE_W_DP else c * tileDp(n) + (c - 1) * GAP_DP }
++    fun gridHeightDp(n: Int, singleAspect: Float? = null): Float = if (n <= 1) singleHeightDp(singleAspect) else rows(n) * tileDp(n) + (rows(n) - 1) * GAP_DP
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ImageOnDemandCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/ImageOnDemandCore.kt
 new file mode 100644
 index 0000000..287fe44
@@ -18738,10 +18855,10 @@ index 2069931..20fa494 100644
              if (scan.otpField && scan.otpEmpty && System.currentTimeMillis() - codeFilledAt > 20_000L) {
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/LoginMemory.kt b/src/android/app/src/main/java/com/openminis/app/plus/LoginMemory.kt
 new file mode 100644
-index 0000000..1e8a1f6
+index 0000000..4950fb0
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/LoginMemory.kt
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,181 @@
 +package com.openminis.app.plus
 +
 +import android.content.Context
@@ -18879,13 +18996,34 @@ index 0000000..1e8a1f6
 +    private var waiter: CompletableDeferred<Answer?>? = null
 +
 +    /** Shows the card and waits for the user (null = closed). One card at a time. */
-+    suspend fun ask(r: Req): Answer? {
++    suspend fun ask(r: Req, ctx: Context? = null): Answer? {
 +        demoShown = false
++        // [38.9.11.1] Mines in the background → a notification that opens it (the card is waiting on top)
++        ctx?.let { c -> if ((c.applicationContext as? com.openminis.app.MinisApp)?.isAppForeground() == false) notifyCard(c, r) }
 +        waiter?.complete(null)
 +        val d = CompletableDeferred<Answer?>()
 +        waiter = d
 +        _pending.value = r
 +        return try { d.await() } finally { if (_pending.value?.id == r.id) _pending.value = null }
++    }
++
++    private fun notifyCard(context: Context, r: Req) {
++        runCatching {
++            if (android.os.Build.VERSION.SDK_INT >= 33 && androidx.core.content.ContextCompat.checkSelfPermission(context,
++                    android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) return
++            val nm = context.getSystemService(android.app.NotificationManager::class.java)
++            if (android.os.Build.VERSION.SDK_INT >= 26 && nm.getNotificationChannel("mines_login") == null)
++                nm.createNotificationChannel(android.app.NotificationChannel("mines_login", "需要你登录", android.app.NotificationManager.IMPORTANCE_HIGH))
++            val launch = context.packageManager.getLaunchIntentForPackage(context.packageName)
++            val pi = launch?.let { android.app.PendingIntent.getActivity(context, 7311, it, android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT) }
++            val n = androidx.core.app.NotificationCompat.Builder(context, "mines_login")
++                .setSmallIcon(android.R.drawable.ic_lock_idle_lock)
++                .setContentTitle("需要你登录 ${r.name}")
++                .setContentText("Mines 在等你填账号密码（安全输入框，不会出现在聊天里）")
++                .setPriority(androidx.core.app.NotificationCompat.PRIORITY_HIGH).setAutoCancel(true)
++                .apply { if (pi != null) setContentIntent(pi) }.build()
++            nm.notify(7311, n)
++        }
 +    }
 +
 +    fun answer(a: Answer?) { val w = waiter; waiter = null; _pending.value = null; demoShown = false; w?.complete(a) }
@@ -18897,7 +19035,7 @@ index 0000000..1e8a1f6
 +    fun demo(refused: Boolean) {
 +        demoShown = true
 +        val ask = if (refused) LoginMemoryCore.Ask(listOf(LoginMemoryCore.Field.EMAIL, LoginMemoryCore.Field.PASSWORD), "密码不对，重新输入", true)
-+            else LoginMemoryCore.Ask(listOf(LoginMemoryCore.Field.EMAIL, LoginMemoryCore.Field.PASSWORD), "登录 Notion", false)
++            else LoginMemoryCore.Ask(listOf(LoginMemoryCore.Field.EMAIL, LoginMemoryCore.Field.PASSWORD, LoginMemoryCore.Field.CODE), "登录 Notion", false)
 +        waiter?.complete(null); waiter = CompletableDeferred()
 +        _pending.value = Req("notion.so", "Notion", ask, "smoke@example.com", "上次用 sm***@example.com 登录 · 密码")
 +    }
@@ -22362,7 +22500,7 @@ index 44c570e..987447d 100644
      /** RFC-4180-ish CSV line split (quotes, doubled quotes). */
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SecretRefs.kt b/src/android/app/src/main/java/com/openminis/app/plus/SecretRefs.kt
 new file mode 100644
-index 0000000..96358cf
+index 0000000..c187b6b
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/SecretRefs.kt
 @@ -0,0 +1,112 @@
@@ -22433,7 +22571,7 @@ index 0000000..96358cf
 +            k == "ssh" -> "登录服务器 $host" + if (purpose.isNotBlank()) "（${purpose.take(20)}）" else ""
 +            else -> "登录 $name" + if (purpose.isNotBlank()) "（${purpose.take(20)}）" else ""
 +        }
-+        val a = LoginCard.ask(LoginCard.Req(host, name, LoginMemoryCore.Ask(fields, title, false), account0, null))
++        val a = LoginCard.ask(LoginCard.Req(host, name, LoginMemoryCore.Ask(fields, title, false), account0, null), c)
 +            ?: return "用户关掉了安全输入框，没有填。不要在聊天里要密码；需要时再调用 accounts(action=secret)。"
 +        val user = a.account.ifBlank { account0 }.ifBlank { if (isKey) "key" else "" }
 +        if (a.password.isBlank()) return "没有填密码"
@@ -32145,7 +32283,7 @@ index 917c7bb..1153000 100644
                  // An all-zero row carries nothing worth a capsule.
                  if (u.inputTokens == 0 && u.outputTokens == 0 &&
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt
-index aadbc71..1b6eb12 100644
+index aadbc71..7bbc3e6 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatScreen.kt
 @@ -138,7 +138,7 @@ import androidx.compose.material.icons.filled.RadioButtonChecked
@@ -32482,15 +32620,15 @@ index aadbc71..1b6eb12 100644
 +                    // × drops the last one); other files keep their chips in the row below.
 +                    val stackImages = attachments.filter { it.isImage }
 +                    if (stackImages.isNotEmpty()) {
-+                        com.openminis.app.ui.plus.FannedImageStack(
++                        // [Mines-38.9.11.1] Hark-style row of small rounded thumbnails, each with its own ×
++                        com.openminis.app.ui.plus.ComposerImageRow(
 +                            models = stackImages.map { it.uri },
 +                            onOpen = { idx ->
 +                                previewImageGallery = stackImages.map { ic ->
 +                                    com.openminis.app.ui.components.ImageGalleryItem(model = ic.uri, caption = ic.fileName)
 +                                } to idx
 +                            },
-+                            cardWidth = 52.dp,
-+                            onRemoveLast = { viewModel.removeAttachment(stackImages.last().id) },
++                            onRemove = { idx -> stackImages.getOrNull(idx)?.let { viewModel.removeAttachment(it.id) } },
 +                            modifier = Modifier.padding(start = 14.dp, top = 6.dp, bottom = 2.dp),
 +                        )
 +                    }
@@ -32666,7 +32804,7 @@ index b8ee6a1..5498e04 100644
          .filter { it.isNotEmpty() }
          .joinToString(" ") { it.replaceFirstChar { ch -> ch.uppercase() } }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatUserMessageUI.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatUserMessageUI.kt
-index d99b975..62df468 100644
+index d99b975..72b0b68 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatUserMessageUI.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatUserMessageUI.kt
 @@ -134,7 +134,7 @@ import androidx.compose.material.icons.filled.MoreVert
@@ -32727,19 +32865,16 @@ index d99b975..62df468 100644
                  // T119: while the model is generating, hide every action that
                  // would mutate the in-flight turn. Retry truncates history and
                  // restarts the stream, which corrupts state if it races a live
-@@ -596,25 +606,21 @@ internal fun UserAttachmentList(
+@@ -596,25 +606,18 @@ internal fun UserAttachmentList(
  
      val tileSize = 64.dp
  
 -    FlowRow(
-+    // [Mines-38.9.11 b] images = Hark-style fanned stack (tap → full-screen pager), files keep the 64dp tiles below
++    // [Mines-38.9.11.1] images = Hark-style grid (1 larger · 2–4 two columns · 5+ three columns with +N; tap → full-screen
++    // viewer); files keep the 64dp tiles below. (38.9.11's fanned stack was not what the user meant.)
 +    if (imageUris.isNotEmpty()) {
 +        Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
-+            com.openminis.app.ui.plus.FannedImageStack(
-+                models = imageUris,
-+                onOpen = { previewImageIndex = it },
-+                cardWidth = if (imageUris.size == 1) 150.dp else 118.dp,
-+            )
++            com.openminis.app.ui.plus.ImageGrid(models = imageUris, onOpen = { previewImageIndex = it })
 +        }
 +    }
 +    if (fileNames.isNotEmpty()) FlowRow(
@@ -32764,7 +32899,7 @@ index d99b975..62df468 100644
          fileNames.forEachIndexed { idx, name ->
              val uri = nonImageUris.getOrNull(idx)
              FileAttachmentTile(
-@@ -746,7 +752,7 @@ private fun ImageGalleryDialog(
+@@ -746,7 +749,7 @@ private fun ImageGalleryDialog(
              ) {
                  Icon(
                      androidx.compose.material.icons.Icons.Default.Close,
@@ -40030,10 +40165,10 @@ index 0000000..47b15f9
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ImageStack.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ImageStack.kt
 new file mode 100644
-index 0000000..fd364f7
+index 0000000..b09579a
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/ImageStack.kt
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,155 @@
 +package com.openminis.app.ui.plus
 +
 +import androidx.compose.foundation.background
@@ -40114,6 +40249,78 @@ index 0000000..fd364f7
 +        if (onRemoveLast != null) Box(Modifier.align(Alignment.TopEnd).zIndex(99f).size(22.dp).clip(CircleShape).background(Color.Black.copy(alpha = 0.6f))
 +            .clickable { onRemoveLast() }.semantics { contentDescription = "移除最后一张图片" }, contentAlignment = Alignment.Center) {
 +            Icon(Icons.Outlined.Close, null, tint = Color.White, modifier = Modifier.size(14.dp))
++        }
++    }
++}
++
++/**
++ * [Mines-38.9.11.1] Hark-style images in a sent message: 1 = one larger rounded picture, 2–4 = 2-column grid, 5+ = 3-column
++ * grid (≤ 6 tiles, the last says +N). Tap → full-screen viewer at that index. Geometry in [com.openminis.app.plus.ImageGridCore].
++ */
++@Composable
++fun ImageGrid(models: List<Any>, onOpen: (Int) -> Unit, modifier: Modifier = Modifier) {
++    if (models.isEmpty()) return
++    val m = mines()
++    val G = com.openminis.app.plus.ImageGridCore
++    val n = models.size
++    val aspect = remember(models) { androidx.compose.runtime.mutableStateOf<Float?>(null) }
++    val border = Color.White.copy(alpha = if (m.dark) 0.14f else 0.5f)
++    if (n == 1) {
++        val shape = RoundedCornerShape(16.dp)
++        Box(modifier.size(G.SINGLE_W_DP.dp, G.singleHeightDp(aspect.value).dp).clip(shape).background(m.surface2).border(0.5.dp, border, shape)
++            .clickable { onOpen(0) }.semantics { contentDescription = "图片，点开看大图" }) {
++            AsyncImage(models[0], contentDescription = null, contentScale = ContentScale.Crop,
++                onSuccess = { st -> val d = st.painter.intrinsicSize; if (d.width > 0f && d.height > 0f) aspect.value = d.width / d.height },
++                modifier = Modifier.matchParentSize())
++        }
++        return
++    }
++    val cols = G.columns(n); val tile = G.tileDp(n).dp; val gap = G.GAP_DP.dp
++    val shown = G.shown(n); val more = G.more(n)
++    val shape = RoundedCornerShape(if (cols == 3) 10.dp else 12.dp)
++    androidx.compose.foundation.layout.Column(modifier.semantics(mergeDescendants = true) { contentDescription = "$n 张图片，点开看大图" },
++        verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(gap)) {
++        for (r in 0 until G.rows(n)) {
++            androidx.compose.foundation.layout.Row(horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(gap)) {
++                for (c in 0 until cols) {
++                    val i = r * cols + c
++                    if (i >= shown) break
++                    Box(Modifier.size(tile).clip(shape).background(m.surface2).border(0.5.dp, border, shape).clickable { onOpen(i) }) {
++                        AsyncImage(models[i], contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.matchParentSize())
++                        if (i == shown - 1 && more > 0) Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = 0.45f)), contentAlignment = Alignment.Center) {
++                            Text("+$more", fontSize = MT.Body, fontWeight = FontWeight.SemiBold, color = Color.White)
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
++
++/**
++ * [Mines-38.9.11.1] Hark-style composer row: small rounded-square thumbnails above the input, each with its own small ×.
++ */
++@Composable
++fun ComposerImageRow(models: List<Any>, onOpen: (Int) -> Unit, onRemove: (Int) -> Unit, modifier: Modifier = Modifier) {
++    if (models.isEmpty()) return
++    val m = mines()
++    val G = com.openminis.app.plus.ImageGridCore
++    val shape = RoundedCornerShape(10.dp)
++    val border = Color.White.copy(alpha = if (m.dark) 0.14f else 0.5f)
++    androidx.compose.foundation.lazy.LazyRow(modifier, horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(8.dp),
++        contentPadding = androidx.compose.foundation.layout.PaddingValues(end = 8.dp)) {
++        items(models.size) { i ->
++            Box(Modifier.size((G.COMPOSER_TILE_DP + 6f).dp)) {
++                Box(Modifier.align(Alignment.BottomStart).size(G.COMPOSER_TILE_DP.dp).clip(shape).background(m.surface2).border(0.5.dp, border, shape)
++                    .clickable { onOpen(i) }.semantics { contentDescription = "第 ${i + 1} 张图片，点开看大图" }) {
++                    AsyncImage(models[i], contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.matchParentSize())
++                }
++                Box(Modifier.align(Alignment.TopEnd).size(20.dp).clip(CircleShape).background(if (m.dark) Color(0xE6302A2E) else Color(0xCC1F1A1C))
++                    .border(1.dp, Color.White.copy(alpha = 0.85f), CircleShape)
++                    .clickable { onRemove(i) }.semantics { contentDescription = "移除第 ${i + 1} 张图片" }, contentAlignment = Alignment.Center) {
++                    Icon(Icons.Outlined.Close, null, tint = Color.White, modifier = Modifier.size(12.dp))
++                }
++            }
 +        }
 +    }
 +}
@@ -42004,10 +42211,10 @@ index f69ee42..5be64a6 100644
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/LoginCardUi.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/LoginCardUi.kt
 new file mode 100644
-index 0000000..81946b8
+index 0000000..f005f4a
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/LoginCardUi.kt
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,124 @@
 +package com.openminis.app.ui.plus
 +
 +import androidx.compose.foundation.border
@@ -42117,14 +42324,15 @@ index 0000000..81946b8
 +            }
 +        }
 +        if (r.ask.fields.any { it != Field.CODE }) Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp).padding(top = 6.dp)
-+            .clickable { save = !save }.semantics(mergeDescendants = true) { contentDescription = "保存到保险箱" },
++            .clickable { save = !save }.semantics(mergeDescendants = true) { contentDescription = "保存到密码库" },
 +            verticalAlignment = Alignment.CenterVertically) {
-+            Text("保存到保险箱", fontSize = MT.Body, color = m.ink, modifier = Modifier.weight(1f))
++            Text("保存到密码库", fontSize = MT.Body, color = m.ink, modifier = Modifier.weight(1f))
 +            Switch(save, { save = it }, colors = SwitchDefaults.colors(checkedTrackColor = m.primary))
 +        }
-+        val ready = r.ask.fields.all { values[it].orEmpty().isNotBlank() }
++        // [38.9.11.1] 验证码 is optional next to 账号 / 密码 (required only when it is the card's only field)
++        val ready = r.ask.fields.all { values[it].orEmpty().isNotBlank() || (it == Field.CODE && r.ask.fields.size > 1) }
 +        Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp), horizontalArrangement = Arrangement.End) {
-+            GlassPill(if (r.ask.fields == listOf(Field.CODE)) "确定" else "登录", enabled = ready, modifier = Modifier.fillMaxWidth()) {
++            GlassPill(if (r.ask.fields == listOf(Field.CODE)) "确定" else "提交", enabled = ready, modifier = Modifier.fillMaxWidth()) {
 +                val acct = r.ask.fields.firstOrNull { it == Field.ACCOUNT || it == Field.EMAIL || it == Field.PHONE }?.let { values[it] }?.trim() ?: r.account
 +                LoginCard.answer(LoginCard.Answer(acct, values[Field.PASSWORD].orEmpty(), values[Field.CODE].orEmpty().trim(), save))
 +            }
@@ -53954,6 +54162,43 @@ index 0000000..8aa98d7
 +        assertEquals(IdType.TELEGRAM, gs2.single().type)
 +        assertEquals(1, IdentityCore.linkedVia(recs, IdType.GOOGLE, "someone@gmail.com").size)
 +        assertEquals("通过 Google 登录", IdentityCore.methodText(recs[0]))
++    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/ImageGridCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/ImageGridCoreTest.kt
+new file mode 100644
+index 0000000..ba3ca8e
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/ImageGridCoreTest.kt
+@@ -0,0 +1,31 @@
++package com.openminis.app.plus
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class ImageGridCoreTest {
++    @Test fun columnsByCount() {
++        assertEquals(1, ImageGridCore.columns(1))
++        for (n in 2..4) assertEquals(2, ImageGridCore.columns(n))
++        for (n in 5..12) assertEquals(3, ImageGridCore.columns(n))
++    }
++    @Test fun moreBadge() {
++        assertEquals(0, ImageGridCore.more(6)); assertEquals(1, ImageGridCore.more(7)); assertEquals(4, ImageGridCore.more(10))
++        assertEquals(6, ImageGridCore.shown(10)); assertEquals(3, ImageGridCore.shown(3))
++    }
++    @Test fun rows() {
++        assertEquals(1, ImageGridCore.rows(2)); assertEquals(2, ImageGridCore.rows(3)); assertEquals(2, ImageGridCore.rows(4))
++        assertEquals(2, ImageGridCore.rows(5)); assertEquals(2, ImageGridCore.rows(9)); assertEquals(0, ImageGridCore.rows(0))
++    }
++    @Test fun sizes() {
++        assertEquals(200f, ImageGridCore.gridWidthDp(1), 0.01f)
++        assertEquals(2 * 104f + 4f, ImageGridCore.gridWidthDp(2), 0.01f)
++        assertEquals(3 * 76f + 8f, ImageGridCore.gridWidthDp(7), 0.01f)
++        assertEquals(2 * 104f + 4f, ImageGridCore.gridHeightDp(4), 0.01f)
++        // single: tall photo clamped to 3:4, wide to 4:3
++        assertEquals(200f / 0.75f, ImageGridCore.singleHeightDp(0.3f), 0.01f)
++        assertEquals(150f, ImageGridCore.singleHeightDp(2f), 0.01f)
++        assertTrue(ImageGridCore.gridWidthDp(9) < 260f)   // fits a phone bubble
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/ImageOnDemandCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/ImageOnDemandCoreTest.kt
