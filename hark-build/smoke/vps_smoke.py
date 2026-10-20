@@ -6149,7 +6149,7 @@ def b3911(res):
             theme388(mode); healthy_home()
             result_json("group", "i396 sky sunny static", timeout=20)
             open_chat()
-            if not send("TOOLZH 请用工具整理一下"): page_missing.append(f"i3911 chat {sfx}: no input"); back(1); continue
+            if not send("TOOLZH please use the tools"): page_missing.append(f"i3911 chat {sfx}: no input"); back(1); continue
             r = wait_for("三个工具都跑完了", 60); time.sleep(3)
             r = shot(f"chat-tools-{sfx}"); t = _txt(r); o[f"chat_tools_{sfx}"] = t[:600]
             if r is None or "三个工具都跑完了" not in t: page_missing.append(f"i3911 chat {sfx}: final reply not seen")
@@ -6164,9 +6164,13 @@ def b3911(res):
         for mode, sfx in ((1, "light"), (2, "dark")):
             theme388(mode); healthy_home()
             result_json("group", "i396 sky sunny static", timeout=20)
-            o[f"share_{sfx}"] = result_json("group", "i3911 shareimgs", timeout=30); time.sleep(7)
+            o[f"share_{sfx}"] = result_json("group", "i3911 shareimgs", timeout=30); time.sleep(4)
+            # [smoke2] the hook only persists the PendingShare; a real share also wakes MainActivity (shared_content=true →
+            # ShareCoordinator.processPendingShare → buffer → ChatScreen drains it into the composer). singleTask → onNewIntent.
+            print(sh(f"am start -W -n {PKG}/com.openminis.app.MainActivity --ez shared_content true", timeout=40)[-200:], flush=True); time.sleep(7)
+            r0 = dump(); o[f"composer_{sfx}"] = _txt(r0)[:300]
             r = shot(f"composer-images-{sfx}")
-            if not send("看看这几张图"): page_missing.append(f"i3911 images {sfx}: no input"); back(1); continue
+            if not send("look at these images"): page_missing.append(f"i3911 images {sfx}: no input"); back(1); continue
             wait_for("你好，我是测试模型", 40); time.sleep(3)
             r = shot(f"chat-images-{sfx}"); o[f"chat_images_{sfx}"] = _txt(r)[:300]
             back(1); time.sleep(1)
@@ -6250,16 +6254,10 @@ def b3911(res):
         result_json("group", "i3911 apppw", timeout=10); time.sleep(5)
         r = shot("apppw-step1-light"); o["apppw"] = _txt(r)[:500]; back(1); time.sleep(1)
 
-    step("sky_home", sky_home)
-    step("work", work)
+    # [smoke2] smoke 1 (run 39373174888) covered sky_home/work/providers/groups/xp/digest/google; rerun only what its driver broke
     step("chat", chat)
     step("images", images)
-    step("providers", providers)
-    step("groups", groups)
-    step("xp", xp)
-    step("digest", digest)
     step("files", files)
-    step("google", google)
     print("I3911 RESULT " + json.dumps(o, ensure_ascii=False)[:12000], flush=True)
 
 
