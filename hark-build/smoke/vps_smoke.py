@@ -7147,6 +7147,8 @@ def b39113(res):
         lines = tail(sid, 2000); raw = json.dumps(lines, ensure_ascii=False)
         kinds = {}
         for x in lines: kinds[x.get("t")] = kinds.get(x.get("t"), 0) + 1
+        # the relay consumes the phone's hello (needs a valid 64-hex k) and logs it as relay/connected with the hello's dev fields
+        kinds["hello"] = sum(1 for x in lines if x.get("t") == "relay" and x.get("ev") == "connected" and (x.get("dev") or {}).get("app") == "Mines")
         D["kinds"] = kinds
         D["stall_ms"] = [x.get("ms") for x in lines if x.get("t") == "stall"][:8]
         D["jank_pages"] = sorted({x.get("page") for x in lines if x.get("t") == "jank"})
