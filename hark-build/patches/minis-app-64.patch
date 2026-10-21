@@ -1,5 +1,5 @@
 diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
-index e0c88bb..ae60fed 100644
+index e0c88bb..a15a988 100644
 --- a/src/android/app/build.gradle.kts
 +++ b/src/android/app/build.gradle.kts
 @@ -38,8 +38,8 @@ android {
@@ -8,8 +8,8 @@ index e0c88bb..ae60fed 100644
          targetSdk = 35
 -        versionCode = 35
 -        versionName = "1.21"
-+        versionCode = 50
-+        versionName = "1.23.11.2"
++        versionCode = 51
++        versionName = "1.23.11.3"
  
          testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
  
@@ -22,10 +22,12 @@ index e0c88bb..ae60fed 100644
          }
      }
  
-@@ -370,6 +370,12 @@ dependencies {
+@@ -369,7 +369,13 @@ dependencies {
+     // [Mines-vps-ssh] In-app SSH: first-login key install, health checks with
      // real authentication, server stats, relay/jump fallback. Maintained fork
      // of JSch (BSD) with modern algorithms (rsa-sha2, ecdsa, curve25519).
-     implementation("com.github.mwiede:jsch:0.2.21")
+-    implementation("com.github.mwiede:jsch:0.2.21")
++    implementation("com.github.mwiede:jsch:2.28.8")   // [38.9.11.3] OpenSSH host certificates (InstaBox offers only ssh-ed25519-cert-v01)
 +    // [Mines-38.9.11.2] Bouncy Castle: JSch's ssh-ed25519 / curve25519 on Android (no Java 15 EdDSA / XDH) — InstaBox 2222 host key
 +    implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
 +
@@ -23341,6 +23343,331 @@ index 0000000..4087759
 +    /** round-robin pick from a key pool */
 +    fun pick(pool: List<String>, counter: Long): String? = if (pool.isEmpty()) null else pool[(counter % pool.size).toInt().let { if (it < 0) it + pool.size else it }]
 +}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ProviderRouteCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/ProviderRouteCore.kt
+new file mode 100644
+index 0000000..4bad0d9
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/ProviderRouteCore.kt
+@@ -0,0 +1,176 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-38.9.11.3] user 2026-10-21: 「AI 回复很慢，几乎每个供应商都经常 60 秒超时」 (already before 38.9.11.2).
++ *
++ * Root cause (code): every provider call used the app-wide ProxySelector. With 分流代理 on (or a local proxy that passed
++ * the gstatic probe, e.g. the Clash app on 7890 whose nodes were all dead) EVERY host went through that proxy — China-hosted
++ * providers too (token.sensenova.cn, developer.amd.com.cn …). The CONNECT tunnel and the TLS handshake then ran under the
++ * client's readTimeout (600 s), so a stalled proxy path was only cut by Mines' 60 s first-chunk deadline (or the 120 s
++ * TTFB watchdog); the turn then moved to the next model over the SAME dead path → another 60 s.
++ *
++ * Now, per host:
++ *  - China / directly reachable providers go DIRECT first, foreign API hosts through the proxy first, the other route is
++ *    the automatic fallback; the route that last worked is remembered (30 min) and a route that failed is avoided (5 min);
++ *  - with no memory, a quick probe of both routes (TCP + TLS, ≤ 3 s) picks the one that answered (direct wins ties);
++ *  - connect (DNS + TCP + proxy tunnel + TLS) has its own [CONNECT_MS] budget per route; a timeout there switches route at
++ *    once; both routes failed → the error says so and the turn moves to the next key / provider immediately (no 1/2/4 s
++ *    same-model retries, no 60 s wait); a host with both routes failed in the last [BOTH_DOWN_MS] fails fast;
++ *  - after connecting, the first token has its own budget ([firstTokenMs]); once tokens flow there is no total cap.
++ * Pure, unit-tested (ProviderRouteCoreTest). Android side: [ProviderRoutes].
++ */
++object ProviderRouteCore {
++    enum class Route(val zh: String) { DIRECT("直连"), PROXY("代理") }
++
++    const val CONNECT_MS = 10_000L
++    const val PROBE_MS = 3_000L
++    const val OK_TTL_MS = 30 * 60_000L
++    const val FAIL_TTL_MS = 5 * 60_000L
++    const val BOTH_DOWN_MS = 60_000L
++    /** first token after the connection is up (response headers + first stream event) */
++    const val FIRST_TOKEN_MS = 45_000L
++    /** reasoning models may think before the first byte */
++    const val FIRST_TOKEN_REASONING_MS = 90_000L
++
++    fun firstTokenMs(reasoning: Boolean): Long = if (reasoning) FIRST_TOKEN_REASONING_MS else FIRST_TOKEN_MS
++
++    /** whole budget the chat loop gives a silent stream before it moves on: two routes' connects + the first token */
++    fun silentBudgetMs(reasoning: Boolean): Long = 2 * CONNECT_MS + PROBE_MS + firstTokenMs(reasoning)
++
++    /** mainland-China hosted AI APIs (and .cn): direct first */
++    val DOMESTIC = listOf(
++        ".cn", "deepseek.com", "sensenova.cn", "sensetime.com", "moonshot.cn", "bigmodel.cn", "zhipuai.cn", "siliconflow.cn",
++        "aliyuncs.com", "aliyun.com", "volces.com", "volcengine.com", "baidubce.com", "baidu.com", "tencentcloudapi.com",
++        "hunyuan.cloud.tencent.com", "minimax.chat", "minimaxi.com", "xfyun.cn", "lingyiwanwu.com", "stepfun.com",
++        "baichuan-ai.com", "modelscope.cn", "qnaigc.com", "ppinfra.com", "infini-ai.com", "coze.cn", "doubao.com",
++        "xiaomimimo.com", "longcat.chat", "agnes-ai.com", "codebuddy.ai", "workbuddy.ai",
++    )
++
++    /** foreign API hosts usually blocked / slow from mainland China: proxy first */
++    val FOREIGN = listOf(
++        "openai.com", "chatgpt.com", "anthropic.com", "claude.ai", "googleapis.com", "google.com", "x.ai", "openrouter.ai",
++        "groq.com", "mistral.ai", "together.xyz", "together.ai", "fireworks.ai", "cohere.ai", "cohere.com", "perplexity.ai",
++        "githubcopilot.com", "github.com", "models.github.ai", "azure.com", "huggingface.co", "cerebras.ai", "sambanova.ai",
++        "deepinfra.com", "novita.ai", "workers.dev", "cloudflare.com", "nvidia.com", "opencode.ai",
++    )
++
++    private fun m(h: String, p: String): Boolean = if (p.startsWith(".")) h.endsWith(p) else h == p || h.endsWith(".$p")
++
++    fun isLocal(host: String): Boolean {
++        val h = host.lowercase().trim('[', ']')
++        if (h == "localhost" || h == "::1" || h.endsWith(".local")) return true
++        return Regex("^(10\\.|127\\.|192\\.168\\.|172\\.(1[6-9]|2\\d|3[01])\\.|100\\.(6[4-9]|[7-9]\\d|1[01]\\d|12[0-7])\\.)").containsMatchIn(h)
++    }
++    fun isDomestic(host: String): Boolean { val h = host.lowercase().trimEnd('.'); return DOMESTIC.any { m(h, it) } }
++    fun isForeign(host: String): Boolean { val h = host.lowercase().trimEnd('.'); return !isDomestic(h) && FOREIGN.any { m(h, it) } }
++
++    /** what Mines remembers about one host */
++    data class Mem(
++        val okRoute: Route? = null, val okAt: Long = 0L, val okMs: Long = 0L,
++        val failDirectAt: Long = 0L, val failProxyAt: Long = 0L,
++    ) {
++        fun failedAt(r: Route) = if (r == Route.DIRECT) failDirectAt else failProxyAt
++    }
++
++    fun recordOk(m: Mem?, r: Route, ms: Long, now: Long): Mem {
++        val b = m ?: Mem()
++        return b.copy(okRoute = r, okAt = now, okMs = ms,
++            failDirectAt = if (r == Route.DIRECT) 0L else b.failDirectAt, failProxyAt = if (r == Route.PROXY) 0L else b.failProxyAt)
++    }
++
++    fun recordFail(m: Mem?, r: Route, now: Long): Mem {
++        val b = m ?: Mem()
++        val c = if (r == Route.DIRECT) b.copy(failDirectAt = now) else b.copy(failProxyAt = now)
++        return if (c.okRoute == r) c.copy(okRoute = null, okAt = 0L) else c
++    }
++
++    /** base order for a host before memory: local → direct only; domestic → direct, proxy; foreign → proxy, direct; else direct, proxy */
++    fun baseOrder(host: String, proxyAvailable: Boolean): List<Route> = when {
++        isLocal(host) || !proxyAvailable -> listOf(Route.DIRECT)
++        isForeign(host) -> listOf(Route.PROXY, Route.DIRECT)
++        else -> listOf(Route.DIRECT, Route.PROXY)
++    }
++
++    /** routes to try, in order, for [host] now */
++    fun order(host: String, mem: Mem?, now: Long, proxyAvailable: Boolean): List<Route> {
++        val base = baseOrder(host, proxyAvailable)
++        if (base.size == 1 || mem == null) return base
++        val ok = mem.okRoute?.takeIf { now - mem.okAt in 0 until OK_TTL_MS && it in base }
++        val ordered = if (ok != null) listOf(ok) + base.filter { it != ok } else base
++        // a route that failed recently goes last (both failed: keep the order, the caller decides on fast-fail)
++        val (fresh, failed) = ordered.partition { r -> mem.failedAt(r).let { it == 0L || now - it !in 0 until FAIL_TTL_MS } }
++        return fresh + failed
++    }
++
++    /** both routes failed within [BOTH_DOWN_MS] and nothing worked since → fail at once instead of waiting again */
++    fun bothDownRecently(mem: Mem?, now: Long, proxyAvailable: Boolean): Boolean {
++        if (mem == null) return false
++        val d = mem.failDirectAt > 0 && now - mem.failDirectAt in 0 until BOTH_DOWN_MS
++        val p = !proxyAvailable || (mem.failProxyAt > 0 && now - mem.failProxyAt in 0 until BOTH_DOWN_MS)
++        val okSince = mem.okAt > maxOf(mem.failDirectAt, mem.failProxyAt)
++        return d && p && !okSince
++    }
++
++    /** a probe is needed when there are two routes and no fresh success is remembered */
++    fun needsProbe(host: String, mem: Mem?, now: Long, proxyAvailable: Boolean): Boolean =
++        baseOrder(host, proxyAvailable).size > 1 && (mem?.okRoute == null || now - mem.okAt !in 0 until OK_TTL_MS)
++
++    /** quick probe results (ms, null = failed) → the route to use; direct wins unless the proxy is clearly faster */
++    fun pickByProbe(directMs: Long?, proxyMs: Long?, preferProxy: Boolean = false): Route? = when {
++        directMs == null && proxyMs == null -> null
++        directMs == null -> Route.PROXY
++        proxyMs == null -> Route.DIRECT
++        preferProxy -> if (directMs * 2 + 300 < proxyMs) Route.DIRECT else Route.PROXY
++        else -> if (proxyMs * 2 + 300 < directMs) Route.PROXY else Route.DIRECT
++    }
++
++    /** what a failure means for the next step */
++    enum class Fail { CONNECT, FIRST_TOKEN, RATE, AUTH, SERVER, OTHER }
++
++    fun classify(message: String?, httpStatus: Int? = null): Fail {
++        if (httpStatus == 429) return Fail.RATE
++        if (httpStatus == 401 || httpStatus == 403) return Fail.AUTH
++        if (httpStatus != null && httpStatus >= 500) return Fail.SERVER
++        val s = (message ?: "").lowercase()
++        return when {
++            "连不上" in s || "connect timed out" in s || "failed to connect" in s || "unable to resolve" in s || "no address" in s ||
++                "connection refused" in s || "unexpected end of stream on" in s && "connect" in s || "handshake" in s ||
++                "tunnel" in s || "dns timeout" in s -> Fail.CONNECT
++            "没有任何回应" in s || "ttfb" in s || "first token" in s || "首字" in s -> Fail.FIRST_TOKEN
++            "429" in s || "rate limit" in s || "too many requests" in s -> Fail.RATE
++            "invalid api key" in s || "401" in s || "unauthorized" in s -> Fail.AUTH
++            else -> Fail.OTHER
++        }
++    }
++
++    enum class Next { OTHER_ROUTE, NEXT_KEY, NEXT_PROVIDER, RETRY_SAME }
++
++    /**
++     * After a failure: a connect failure is about the HOST (every key of it shares the path) → other route, then the next
++     * provider; a silent / rate-limited / rejected key → next key of the same provider, then the next provider.
++     */
++    fun next(f: Fail, routesLeft: Int, keysLeft: Int): Next = when (f) {
++        Fail.CONNECT -> if (routesLeft > 0) Next.OTHER_ROUTE else Next.NEXT_PROVIDER
++        Fail.FIRST_TOKEN, Fail.RATE, Fail.AUTH -> if (keysLeft > 0) Next.NEXT_KEY else Next.NEXT_PROVIDER
++        Fail.SERVER -> if (keysLeft > 0) Next.NEXT_KEY else Next.NEXT_PROVIDER
++        Fail.OTHER -> Next.RETRY_SAME
++    }
++
++    /** chat status line while waiting (the UI adds the animated dots): 「正在连接 api.x.cn（直连） 3 秒」 / 「正在思考 12 秒」 */
++    enum class Phase { IDLE, CONNECTING, THINKING }
++
++    fun statusText(phase: Phase, host: String, route: Route?, elapsedMs: Long): String {
++        val s = (elapsedMs / 1000).coerceAtLeast(0)
++        val sec = if (s >= 2) " $s 秒" else ""
++        return when (phase) {
++            Phase.IDLE -> ""
++            Phase.CONNECTING -> "正在连接 ${host.take(40)}" + (route?.let { "（${it.zh}）" } ?: "") + sec
++            Phase.THINKING -> "正在思考$sec"
++        }
++    }
++
++    /** the error text when both routes failed */
++    fun bothFailedText(host: String, directWhy: String?, proxyWhy: String?, triedProxy: Boolean): String =
++        "连不上 $host：直连" + (directWhy?.let { "不通（$it）" } ?: "不通") +
++            (if (triedProxy) "，代理" + (proxyWhy?.let { "不通（$it）" } ?: "不通") else "，没有可用代理") + "。已换下一个"
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ProviderRoutes.kt b/src/android/app/src/main/java/com/openminis/app/plus/ProviderRoutes.kt
+new file mode 100644
+index 0000000..80437e0
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/ProviderRoutes.kt
+@@ -0,0 +1,137 @@
++package com.openminis.app.plus
++
++import com.openminis.app.plus.ProviderRouteCore.Route
++import java.net.InetSocketAddress
++import java.net.Proxy
++import java.net.Socket
++import java.util.concurrent.ConcurrentHashMap
++
++/**
++ * [Mines-38.9.11.3] Android side of [ProviderRouteCore]: per-host route memory (direct vs proxy), the proxy to use, a quick
++ * two-route probe, and the chat status line (「正在连接 … / 正在思考 …」). Used by the provider HTTP clients.
++ */
++object ProviderRoutes {
++    private val mem = ConcurrentHashMap<String, ProviderRouteCore.Mem>()
++
++    /** smoke before-measurement: 38.9.11.2 networking (app-wide proxy for every host, 30 s connect, 120 s caps, 60 s deadline) */
++    @Volatile var legacy: Boolean = false
++    /** smoke: force the proxy behind the PROXY route (e.g. a stalled "Clash" on 127.0.0.1:7890); null = automatic */
++    @Volatile var forcedProxy: Proxy? = null
++
++    /** the proxy behind the PROXY route: Mines' split proxy while it works › a local proxy that passed › none */
++    fun proxy(): Proxy? {
++        forcedProxy?.let { return it }
++        runCatching { if (SplitProxy.active) return Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", SplitProxy.PORT)) }
++        LocalProxy.best?.let { return Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", it)) }
++        return null
++    }
++
++    fun proxyFor(r: Route): Proxy = if (r == Route.DIRECT) Proxy.NO_PROXY else (proxy() ?: Proxy.NO_PROXY)
++
++    fun memOf(host: String): ProviderRouteCore.Mem? = mem[host.lowercase()]
++
++    fun order(host: String): List<Route> = ProviderRouteCore.order(host, memOf(host), System.currentTimeMillis(), proxy() != null)
++
++    fun bothDown(host: String): Boolean = ProviderRouteCore.bothDownRecently(memOf(host), System.currentTimeMillis(), proxy() != null)
++
++    fun ok(host: String, r: Route, ms: Long) { mem[host.lowercase()] = ProviderRouteCore.recordOk(memOf(host), r, ms, System.currentTimeMillis()) }
++    fun fail(host: String, r: Route) { mem[host.lowercase()] = ProviderRouteCore.recordFail(memOf(host), r, System.currentTimeMillis()) }
++    fun forget() = mem.clear()
++
++    /** TCP + TLS handshake to host:port over [p] (HTTP CONNECT for a proxy); ms, or null when it failed within [budgetMs] */
++    fun probeOne(host: String, port: Int, p: Proxy, budgetMs: Long): Long? = runCatching {
++        val t0 = System.currentTimeMillis()
++        val raw: Socket
++        if (p.type() == Proxy.Type.HTTP) {
++            val pa = p.address() as InetSocketAddress
++            raw = Socket(Proxy.NO_PROXY); raw.connect(InetSocketAddress(pa.hostString, pa.port), budgetMs.toInt())
++            raw.soTimeout = budgetMs.toInt()
++            raw.getOutputStream().write("CONNECT $host:$port HTTP/1.1\r\nHost: $host:$port\r\n\r\n".toByteArray())
++            val ins = raw.getInputStream(); val sb = StringBuilder()
++            while (!sb.endsWith("\r\n\r\n") && sb.length < 4096) { val c = ins.read(); if (c < 0) break; sb.append(c.toChar()) }
++            if (!sb.startsWith("HTTP/1.1 200") && !sb.startsWith("HTTP/1.0 200")) { raw.close(); return@runCatching null }
++        } else {
++            raw = Socket(Proxy.NO_PROXY)
++            val left = (budgetMs - (System.currentTimeMillis() - t0)).coerceAtLeast(300L).toInt()
++            raw.connect(InetSocketAddress(host, port), left); raw.soTimeout = budgetMs.toInt()
++        }
++        if (port != 443) { raw.close(); return@runCatching System.currentTimeMillis() - t0 }
++        raw.soTimeout = (budgetMs - (System.currentTimeMillis() - t0)).coerceAtLeast(300L).toInt()
++        val f = javax.net.ssl.SSLSocketFactory.getDefault() as javax.net.ssl.SSLSocketFactory
++        (f.createSocket(raw, host, port, true) as javax.net.ssl.SSLSocket).use { it.startHandshake() }
++        System.currentTimeMillis() - t0
++    }.getOrNull()
++
++    private val probePool = java.util.concurrent.Executors.newCachedThreadPool { r -> Thread(r, "mines-route-probe").apply { isDaemon = true } }
++
++    /** both routes in parallel (≤ [ProviderRouteCore.PROBE_MS]); remembers and returns the pick (null = neither answered) */
++    fun probe(host: String, port: Int): Route? {
++        val px = proxy() ?: return Route.DIRECT
++        val b = ProviderRouteCore.PROBE_MS
++        val fd = probePool.submit<Long?> { probeOne(host, port, Proxy.NO_PROXY, b) }
++        val fp = probePool.submit<Long?> { probeOne(host, port, px, b) }
++        val d = runCatching { fd.get(b + 500, java.util.concurrent.TimeUnit.MILLISECONDS) }.getOrNull()
++        val p = runCatching { fp.get(b + 500, java.util.concurrent.TimeUnit.MILLISECONDS) }.getOrNull()
++        lastProbe = "$host 直连 ${d?.let { "${it}ms" } ?: "✗"} · 代理 ${p?.let { "${it}ms" } ?: "✗"}"
++        android.util.Log.i("ProviderRoutes", "probe $lastProbe")
++        val pick = ProviderRouteCore.pickByProbe(d, p, preferProxy = ProviderRouteCore.isForeign(host))
++        if (d == null) fail(host, Route.DIRECT)
++        if (p == null) fail(host, Route.PROXY)
++        if (pick != null) ok(host, pick, (if (pick == Route.DIRECT) d else p) ?: 0L)
++        return pick
++    }
++    @Volatile var lastProbe: String = ""; private set
++
++    /** routes for one request, probing first when nothing fresh is remembered */
++    fun plan(host: String, port: Int): List<Route> {
++        if (legacy) return listOf(if (proxy() != null) Route.PROXY else Route.DIRECT)
++        val now = System.currentTimeMillis(); val hasProxy = proxy() != null
++        if (ProviderRouteCore.needsProbe(host, memOf(host), now, hasProxy)) {
++            status(ProviderRouteCore.Phase.CONNECTING, host, null)
++            probe(host, port)
++        }
++        return order(host)
++    }
++
++    /**
++     * For clients that cannot pick a route per request (Anthropic / Gemini): an ordered proxy list per host — OkHttp tries
++     * the next entry when connecting on one fails; failures are remembered.
++     */
++    val selector = object : java.net.ProxySelector() {
++        override fun select(uri: java.net.URI?): MutableList<Proxy> {
++            val h = uri?.host ?: return mutableListOf(Proxy.NO_PROXY)
++            return order(h).map { proxyFor(it) }.distinct().toMutableList().ifEmpty { mutableListOf(Proxy.NO_PROXY) }
++        }
++        override fun connectFailed(uri: java.net.URI?, sa: java.net.SocketAddress?, ioe: java.io.IOException?) {
++            val h = uri?.host ?: return
++            val viaProxy = (sa as? InetSocketAddress)?.address?.isLoopbackAddress == true
++            fail(h, if (viaProxy) Route.PROXY else Route.DIRECT)
++        }
++    }
++
++    /** DNS with a 5 s cap: a stalled resolver would otherwise block the call past its connect budget */
++    object TimedDns : okhttp3.Dns {
++        private val pool = java.util.concurrent.Executors.newCachedThreadPool { r -> Thread(r, "mines-provider-dns").apply { isDaemon = true } }
++        override fun lookup(hostname: String): List<java.net.InetAddress> {
++            val f = pool.submit<List<java.net.InetAddress>> { okhttp3.Dns.SYSTEM.lookup(hostname) }
++            return try { f.get(5, java.util.concurrent.TimeUnit.SECONDS) } catch (e: java.util.concurrent.TimeoutException) {
++                f.cancel(true); throw java.net.UnknownHostException("DNS timeout: $hostname")
++            } catch (e: java.util.concurrent.ExecutionException) { throw (e.cause as? java.io.IOException) ?: java.net.UnknownHostException(hostname) }
++        }
++    }
++
++    // ── status line for the chat (one stream at a time is what the user watches) ──
++    data class Status(val phase: ProviderRouteCore.Phase, val host: String, val route: Route?, val since: Long)
++    val status = kotlinx.coroutines.flow.MutableStateFlow(Status(ProviderRouteCore.Phase.IDLE, "", null, 0L))
++    fun status(phase: ProviderRouteCore.Phase, host: String, route: Route?) {
++        val cur = status.value
++        val since = if (cur.phase == phase && cur.host == host) cur.since else System.currentTimeMillis()
++        status.value = Status(phase, host, route, since)
++    }
++    fun idle() { status.value = Status(ProviderRouteCore.Phase.IDLE, "", null, 0L) }
++
++    /** 自检 / smoke: one line per remembered host */
++    fun summary(): String = mem.entries.joinToString(" · ") { (h, m) ->
++        "$h " + (m.okRoute?.zh ?: "?") + (if (m.failDirectAt > 0) " 直连✗" else "") + (if (m.failProxyAt > 0) " 代理✗" else "")
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/RainSkyCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/RainSkyCore.kt
 new file mode 100644
 index 0000000..1dc7ffe
@@ -25657,16 +25984,19 @@ index 0000000..a763f85
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SkyFreezeCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/SkyFreezeCore.kt
 new file mode 100644
-index 0000000..c831465
+index 0000000..d218a44
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/SkyFreezeCore.kt
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,59 @@
 +package com.openminis.app.plus
 +
 +/**
 + * [Mines-38.9.11.2] user 2026-10-21: the sunny sky's flashing stopped 「Q仔」 (the phone's on-screen recognition assistant)
 + * from reading the screen. The sky holds a still frame while the screen is being read or captured, and for 1 s after any
 + * touch / key input or scrolling. Pure, unit-tested (SkyFreezeCoreTest).
++ * [38.9.11.3] user 2026-10-21 (overrides the above): the sky / fog must NOT stop at all. Q仔 is an always-on
++ * accessibility service, so the 38.9.11.2 rule froze the sky permanently on the user's phone. [reason] is kept only as a
++ * diagnostic (what 38.9.11.2 would have done); [holds] is false unless the smoke replays the old rule.
 + */
 +object SkyFreezeCore {
 +    const val INPUT_HOLD_MS = 1000L
@@ -25694,6 +26024,9 @@ index 0000000..c831465
 +        else -> ""
 +    }
 +
++    /** [38.9.11.3] does the sky stop? never — only the smoke's legacy replay of 38.9.11.2 */
++    fun holds(reason: String, legacyReplay: Boolean): Boolean = legacyReplay && reason.isNotEmpty()
++
 +    /** packages of enabled a11y services → how many are not Mines itself */
 +    fun otherServices(enabledPackages: List<String>, ownPackage: String): Int = enabledPackages.count { it.isNotBlank() && it != ownPackage }
 +
@@ -25716,10 +26049,10 @@ index 0000000..c831465
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SkyModeCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/SkyModeCore.kt
 new file mode 100644
-index 0000000..9e79baf
+index 0000000..b0341d7
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/SkyModeCore.kt
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,117 @@
 +package com.openminis.app.plus
 +
 +/**
@@ -25796,6 +26129,32 @@ index 0000000..9e79baf
 +    }
 +    /** smoothstep-free linear blend keeps a constant drift speed; this eases only the very ends a little (no visible pulse) */
 +    fun smooth(k: Float): Float = k
++
++    /**
++     * [38.9.11.3] 「云雾基本不动」: the key frames (1.2 s apart) were only CROSS-FADED, so drifting mist dissolved in place
++     * instead of floating. Now each key layer is shifted by the drift between its cloud time and now, so the mist really
++     * slides. Speed (screen units of a 270-wide sky per second of cloud time) = the dominant mid layer's wind / texel scale
++     * in sky.agsl, negative = towards the left (cnoise samples at uv + wind·t). 0 = no shift (晴 / 日落 / 夜 keep 38.9.11.2).
++     */
++    fun driftUps(sceneKey: String): Float = when (sceneKey) {
++        "fog" -> -8.5f / 0.36f        // 雾 layer 2 (wind 8.5, scale 0.36)
++        "cloudy" -> -10.0f / 0.30f    // 多云 mid layer
++        "overcast" -> -5.5f / 0.32f   // 阴 mid layer
++        else -> 0f
++    }
++
++    /** extra sky width rendered on each side of a key (units of 270) so a shifted key never shows an edge */
++    fun marginUnits(sceneKey: String, m: Mode, chat: Boolean): Float {
++        val v = kotlin.math.abs(driftUps(sceneKey)); if (v == 0f) return 0f
++        // worst shift: key k-1 at u→1 is 2 key steps old; cloud rate ≤ MAX_RATE
++        return (v * WindDriftCore.MAX_RATE * 2f * keyMs(m, chat) / 1000f + 4f).coerceAtMost(90f)
++    }
++
++    /** horizontal shift (px) of a key rendered at cloud time [keyCt] when the sky is at [nowCt]; clamped to the margin */
++    fun shiftPx(sceneKey: String, nowCt: Float, keyCt: Float, widthPx: Float, marginUnits: Float): Float {
++        val units = (driftUps(sceneKey) * (nowCt - keyCt)).coerceIn(-marginUnits, marginUnits)
++        return units * widthPx / 270f
++    }
 +
 +    /**
 +     * The one-live-sky registry: every shown sky registers a token; only the newest one animates, the rest hold a still
@@ -26464,10 +26823,10 @@ index 0000000..57fab93
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SshNetCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/SshNetCore.kt
 new file mode 100644
-index 0000000..6b1065e
+index 0000000..68863b5
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/SshNetCore.kt
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,43 @@
 +package com.openminis.app.plus
 +
 +/**
@@ -26488,7 +26847,13 @@ index 0000000..6b1065e
 +        if (localProxy != null) add(Route.LOCAL_PROXY)
 +    }
 +
-+    const val SERVER_HOST_KEY = "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-512,rsa-sha2-256,ssh-rsa"
++    /** [38.9.11.3] OpenSSH host certificates (JSch ≥ 2.27, mwiede): InstaBox api.instabox.sh:2222 offers ONLY
++     *  ssh-ed25519-cert-v01@openssh.com. Plain keys stay first so a server that offers both keeps its pinned fingerprint;
++     *  with no @cert-authority known, JSch checks the certificate's own key (host_certificate_to_key_fallback = yes),
++     *  so the pin is the same SHA256 fingerprint as the plain key. */
++    const val HOST_CERTS = "ssh-ed25519-cert-v01@openssh.com,ecdsa-sha2-nistp256-cert-v01@openssh.com,ecdsa-sha2-nistp384-cert-v01@openssh.com," +
++        "ecdsa-sha2-nistp521-cert-v01@openssh.com,rsa-sha2-512-cert-v01@openssh.com,rsa-sha2-256-cert-v01@openssh.com"
++    const val SERVER_HOST_KEY = "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-512,rsa-sha2-256," + HOST_CERTS + ",ssh-rsa"
 +    const val PUBKEY_ALGOS = "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-512,rsa-sha2-256,ssh-rsa"
 +    const val KEX = "curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521," +
 +        "diffie-hellman-group-exchange-sha256,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,diffie-hellman-group14-sha256,diffie-hellman-group14-sha1"
@@ -26502,6 +26867,7 @@ index 0000000..6b1065e
 +        "ssh-ed25519" to "com.jcraft.jsch.bc.SignatureEd25519",
 +        "ssh-ed448" to "com.jcraft.jsch.bc.SignatureEd448",
 +        "xdh" to "com.jcraft.jsch.bc.XDH",
++        "host_certificate_to_key_fallback" to "yes",
 +    )
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/TaskProgress.kt b/src/android/app/src/main/java/com/openminis/app/plus/TaskProgress.kt
@@ -28138,10 +28504,10 @@ index 0000000..1453506
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/WindDriftCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/WindDriftCore.kt
 new file mode 100644
-index 0000000..aa59216
+index 0000000..8b89688
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/WindDriftCore.kt
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,92 @@
 +package com.openminis.app.plus
 +
 +/**
@@ -28161,6 +28527,14 @@ index 0000000..aa59216
 +    const val MIN_RATE = 0.08f
 +    const val MAX_RATE = 1.0f
 +    const val TAU_S = 20f
++    /**
++     * [38.9.11.3] user 2026-10-21: 「云雾基本不动」 — after the 流畅 scale (×0.6) a calm / unknown wind gave ×0.05–0.3, i.e.
++     * the mist crept a few pixels a second and read as standing still. The effective drift never goes below this (slow,
++     * but clearly floating: the mid fog layer crosses the screen in about 40 s).
++     */
++    const val VISIBLE_MIN = 0.3f
++    /** the rate the shader clock follows: wind target × the mode's scale, never below [VISIBLE_MIN] */
++    fun effective(target: Float, modeScale: Float): Float = maxOf(target * modeScale, VISIBLE_MIN).coerceAtMost(MAX_RATE)
 +    /** a jump of the page clock larger than this (resume, smoke clock shift) re-bases the clock instead of drifting */
 +    const val MAX_STEP_S = 5f
 +
@@ -29484,7 +29858,7 @@ index 1d773a2..5489e65 100644
          coroutineScope {
              val bg = slow.map { id -> async { one(id) } }
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-index af13c1b..cc4d520 100644
+index af13c1b..89a2435 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 @@ -2,6 +2,8 @@ package com.openminis.app.plus.group
@@ -29496,7 +29870,7 @@ index af13c1b..cc4d520 100644
  import kotlinx.coroutines.runBlocking
  import org.json.JSONArray
  import org.json.JSONObject
-@@ -15,12 +17,719 @@ import org.json.JSONObject
+@@ -15,12 +17,781 @@ import org.json.JSONObject
   *   … --arg 'reset'
   */
  object GroupSelfTest {
@@ -30086,6 +30460,68 @@ index af13c1b..cc4d520 100644
 +                    else -> "i3911 servers | expand <id|first|none> | xpseed | shareimgs | gemini | apppw | apkpath"
 +                }
 +            }
++            // [Mines-38.9.11.3] smoke: 'i39113 latency <legacy|new> <proxy host:port|none> <baseUrl> [model]' (one streaming request
++            // through the real OpenAIProvider: ms until the first chunk or the error; legacy = 38.9.11.2 networking + 60 s deadline) ·
++            // 'route <host> [port]' · 'routeforget' · 'skydrift legacy|new' · 'a11yfake <n>' · 'skystate'
++            "i39113" -> {
++                val sub = rest.substringBefore(' ').trim(); val arg2 = rest.substringAfter(' ', "").trim()
++                val R = com.openminis.app.plus.ProviderRoutes
++                when (sub) {
++                    "latency" -> kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
++                        val a = arg2.split(' ').filter { it.isNotBlank() }
++                        val legacy = a.getOrNull(0) == "legacy"
++                        val px = a.getOrNull(1)?.takeIf { it != "none" }?.let { hp ->
++                            java.net.Proxy(java.net.Proxy.Type.HTTP, java.net.InetSocketAddress(hp.substringBefore(':'), hp.substringAfter(':').toInt())) }
++                        val base = a.getOrNull(2) ?: "https://api.deepseek.com/v1"
++                        val modelId = a.getOrNull(3) ?: "deepseek-chat"
++                        R.legacy = legacy; R.forcedProxy = px; R.forget()
++                        val prov = com.openminis.app.provider.openai.OpenAIProvider(apiKey = "sk-mines-smoke-latency", model = com.openminis.app.data.model.LLMModel(modelId, modelId, "openai"), basePath = base)
++                        val deadline = if (legacy) com.openminis.app.ui.chat.MINES_FIRST_CHUNK_MS else com.openminis.app.plus.ProviderRouteCore.silentBudgetMs(false)
++                        val t0 = System.currentTimeMillis()
++                        val phases = JSONArray()
++                        val watch = kotlinx.coroutines.GlobalScope.launch { var last = ""; while (true) { val st = R.status.value; val line = "${st.phase}:${st.route ?: ""}"; if (line != last) { phases.put("${System.currentTimeMillis() - t0}ms $line"); last = line }; kotlinx.coroutines.delay(100) } }
++                        val outcome = try {
++                            kotlinx.coroutines.withTimeout(deadline) {
++                                prov.streamMessage(listOf(com.openminis.app.data.model.LLMMessage(role = com.openminis.app.data.model.LLMMessage.Role.USER, content = "hi")), null, 16)
++                                    .collect { throw RuntimeException("first-chunk") }
++                                "completed"
++                            }
++                        } catch (e: kotlinx.coroutines.TimeoutCancellationException) { "deadline ${deadline / 1000}s (chat gives up)" }
++                        catch (e: Throwable) {
++                            val m = (e.cause?.message ?: e.message ?: e.javaClass.simpleName)
++                            if (m.contains("first-chunk")) "first chunk" else "error: " + m.take(160)
++                        }
++                        val ms = System.currentTimeMillis() - t0
++                        watch.cancel(); R.legacy = false
++                        val o = JSONObject().put("mode", if (legacy) "legacy" else "new").put("proxy", px?.toString() ?: "none").put("base", base)
++                            .put("ms", ms).put("outcome", outcome).put("phases", phases).put("routes", R.summary()).put("probe", R.lastProbe)
++                        R.forcedProxy = null; R.idle()
++                        o.toString()
++                    }
++                    "route" -> kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
++                        val host = arg2.substringBefore(' '); val port = arg2.substringAfter(' ', "443").toIntOrNull() ?: 443
++                        val t0 = System.currentTimeMillis(); val plan = R.plan(host, port)
++                        JSONObject().put("plan", JSONArray(plan.map { it.name })).put("ms", System.currentTimeMillis() - t0).put("probe", R.lastProbe)
++                            .put("domestic", com.openminis.app.plus.ProviderRouteCore.isDomestic(host)).put("summary", R.summary()).toString()
++                    }
++                    "routeforget" -> { R.forget(); R.forcedProxy = null; R.legacy = false; "forgot" }
++                    "skydrift" -> {
++                        val legacy = arg2 == "legacy"
++                        com.openminis.app.ui.plus.SkyFreeze.legacyFreeze = legacy
++                        com.openminis.app.ui.plus.WeatherSky.legacyDrift = legacy
++                        com.openminis.app.ui.plus.WeatherSky.bump()
++                        "drift=" + (if (legacy) "legacy(38.9.11.2)" else "new")
++                    }
++                    "a11yfake" -> { com.openminis.app.ui.plus.SkyFreeze.fakeOtherServices = arg2.toIntOrNull() ?: -1; "fake=" + com.openminis.app.ui.plus.SkyFreeze.fakeOtherServices }
++                    "skystate" -> {
++                        val F = com.openminis.app.ui.plus.SkyFreeze; val W = com.openminis.app.ui.plus.WeatherSky
++                        JSONObject().put("frozen", F.frozen()).put("reason38_9_11_2", F.lastReason).put("legacyFreeze", F.legacyFreeze)
++                            .put("legacyDrift", W.legacyDrift).put("signals", F.signals.toString()).put("shot", W.lastShot).put("drift", W.lastDrift)
++                            .put("keyRenders", W.keyRenders).put("frames", W.frames).put("level", W.level).put("mode", W.lastMode).put("wind", W.windRateLabel()).toString()
++                    }
++                    else -> "i39113 latency <legacy|new> <host:port|none> <baseUrl> [model] | route <host> [port] | routeforget | skydrift legacy|new | a11yfake <n> | skystate"
++                }
++            }
 +            // [Mines-38.9.11.2] smoke: 'i39112 incog <url>' (open a 无痕 session) · 'incogstate' · 'incogforce process|auto' ·
 +            // 'normal <url>' (home browser) · 'skylegacy on|off' (38.9.11.1 sky behaviour for before / after) · 'skylevel <n>' ·
 +            // 'atomic' (AtomicStore round trip on the device: 3 writes, main corrupted → bak1, all corrupted → notice)
@@ -30216,7 +30652,7 @@ index af13c1b..cc4d520 100644
              "partners" -> {
                  val l = Partners.refresh(context, rescanApps = true)
                  JSONArray(l.map { JSONObject().put("id", it.id).put("name", it.spec.name).put("state", it.state.name).put("model", it.model).put("via", it.via) }).toString()
-@@ -136,6 +845,13 @@ object GroupSelfTest {
+@@ -136,6 +907,13 @@ object GroupSelfTest {
                  GroupStore.add(gid, GroupMsg(GroupStore.newId(), parts.getOrElse(2) { "host" }, "成员A", "", parts.getOrElse(3) { "好的，结论：照这个办。" }))
                  "ok"
              }
@@ -30230,7 +30666,7 @@ index af13c1b..cc4d520 100644
              "kbrun" -> { val n = com.openminis.app.plus.ChatKnowledge.runNow(context); "organised=$n" }
              "kbstate" -> {
                  val l = com.openminis.app.plus.ChatKnowledge.load(context)
-@@ -151,6 +867,11 @@ object GroupSelfTest {
+@@ -151,6 +929,11 @@ object GroupSelfTest {
                  JSONObject().put("title", g.title).put("care", g.care).put("kind", g.kind)
                      .put("weather", com.openminis.app.plus.HomeGreeting.cachedWeather(context)?.let { "${it.code}/${it.temp}" } ?: "none").toString()
              }
@@ -30242,7 +30678,7 @@ index af13c1b..cc4d520 100644
              "greetweather" -> {
                  context.getSharedPreferences("mines_greeting", Context.MODE_PRIVATE).edit().remove("w_try").apply()
                  com.openminis.app.plus.HomeGreeting.refreshWeather(context)
-@@ -238,6 +959,112 @@ object GroupSelfTest {
+@@ -238,6 +1021,112 @@ object GroupSelfTest {
              "wallpaper" -> { com.openminis.app.plus.PlusPrefs.init(context)
                  if (parts.getOrElse(0) { "" } == "off") com.openminis.app.plus.PlusPrefs.update(context) { it.copy(wallpaper = "") }
                  com.openminis.app.plus.PlusPrefs.state.value.wallpaper.ifBlank { "none" } }
@@ -30355,7 +30791,7 @@ index af13c1b..cc4d520 100644
              "fogstate" -> JSONObject().put("t", com.openminis.app.ui.plus.FogClock.t.toDouble()).put("draws", com.openminis.app.ui.plus.FogClock.draws)
                  .put("still", com.openminis.app.ui.plus.FogClock.stillSeen)
                  .put("scale", android.provider.Settings.Global.getFloat(context.contentResolver, android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, -1f).toDouble()).toString()
-@@ -288,3 +1115,29 @@ object GroupSelfTest {
+@@ -288,3 +1177,29 @@ object GroupSelfTest {
          return JSONObject().put("chat", sid).put("group", g.id).put("direct", d.id).put("directName", dn).toString()
      }
  }
@@ -31476,6 +31912,22 @@ index 33a16dd..2a70714 100644
                  }
              }
              // [T-android-provider-type-parity] Types this build can decode and
+diff --git a/src/android/app/src/main/java/com/openminis/app/provider/anthropic/AnthropicProvider.kt b/src/android/app/src/main/java/com/openminis/app/provider/anthropic/AnthropicProvider.kt
+index f93e3ee..59854f6 100644
+--- a/src/android/app/src/main/java/com/openminis/app/provider/anthropic/AnthropicProvider.kt
++++ b/src/android/app/src/main/java/com/openminis/app/provider/anthropic/AnthropicProvider.kt
+@@ -74,7 +74,10 @@ class AnthropicProvider(
+     private val isCustomEndpoint: Boolean = basePath != "https://api.anthropic.com"
+ 
+     private val client = OkHttpClient.Builder()
+-        .connectTimeout(30, TimeUnit.SECONDS)
++        // [38.9.11.3] per-host route (China direct / foreign via proxy, the other as fallback), 10 s connect, DNS ≤ 5 s
++        .connectTimeout(com.openminis.app.plus.ProviderRouteCore.CONNECT_MS, TimeUnit.MILLISECONDS)
++        .proxySelector(com.openminis.app.plus.ProviderRoutes.selector)
++        .dns(com.openminis.app.plus.ProviderRoutes.TimedDns)
+         .readTimeout(10, TimeUnit.MINUTES)
+         .writeTimeout(30, TimeUnit.SECONDS)
+         // [T-android-stale-conn-retry-hang] Shared pool — see NetworkMonitor.
 diff --git a/src/android/app/src/main/java/com/openminis/app/provider/gemini/CodeAssistTransport.kt b/src/android/app/src/main/java/com/openminis/app/provider/gemini/CodeAssistTransport.kt
 new file mode 100644
 index 0000000..1542892
@@ -31503,10 +31955,10 @@ index 0000000..1542892
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/provider/gemini/GeminiProvider.kt b/src/android/app/src/main/java/com/openminis/app/provider/gemini/GeminiProvider.kt
-index c7faa27..9718584 100644
+index c7faa27..1f3b70b 100644
 --- a/src/android/app/src/main/java/com/openminis/app/provider/gemini/GeminiProvider.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/provider/gemini/GeminiProvider.kt
-@@ -37,6 +37,8 @@ class GeminiProvider(
+@@ -37,11 +37,16 @@ class GeminiProvider(
      private val apiKey: String,
      override var model: LLMModel = LLMModel.gemini25Flash,
      private val basePath: String = "https://generativelanguage.googleapis.com/v1beta",
@@ -31515,7 +31967,16 @@ index c7faa27..9718584 100644
  ) : LLMProvider {
      override val name = "Google"
  
-@@ -59,6 +61,7 @@ class GeminiProvider(
+     private val client = OkHttpClient.Builder()
+-        .connectTimeout(30, TimeUnit.SECONDS)
++        // [38.9.11.3] per-host route (China direct / foreign via proxy, the other as fallback), 10 s connect, DNS ≤ 5 s
++        .connectTimeout(com.openminis.app.plus.ProviderRouteCore.CONNECT_MS, TimeUnit.MILLISECONDS)
++        .proxySelector(com.openminis.app.plus.ProviderRoutes.selector)
++        .dns(com.openminis.app.plus.ProviderRoutes.TimedDns)
+         .readTimeout(10, TimeUnit.MINUTES)
+         .writeTimeout(30, TimeUnit.SECONDS)
+         // [T-android-stale-conn-retry-hang] Shared pool — see NetworkMonitor.
+@@ -59,6 +64,7 @@ class GeminiProvider(
          thinkingLevel: ThinkingLevel,
      ): LLMResponse = withContext(Dispatchers.IO) {
          val body = buildRequestBody(messages, systemPrompt, maxTokens, temperature, imageParts, tools, thinkingLevel)
@@ -31523,7 +31984,7 @@ index c7faa27..9718584 100644
          val url = "$basePath/models/${model.id}:generateContent?key=$apiKey"
          val request = Request.Builder()
              .url(url)
-@@ -69,14 +72,15 @@ class GeminiProvider(
+@@ -69,14 +75,15 @@ class GeminiProvider(
              .applyUserAgentOverride(null)
              .build()
  
@@ -31541,7 +32002,7 @@ index c7faa27..9718584 100644
          val text = extractText(json)
          val finishReason = extractFinishReason(json)
          val usage = extractUsage(json)
-@@ -123,6 +127,7 @@ class GeminiProvider(
+@@ -123,6 +130,7 @@ class GeminiProvider(
          thinkingLevel: ThinkingLevel,
      ): Flow<LLMStreamChunk> = callbackFlow {
          val body = buildRequestBody(messages, systemPrompt, maxTokens, temperature, imageParts, tools, thinkingLevel)
@@ -31549,7 +32010,7 @@ index c7faa27..9718584 100644
          val url = "$basePath/models/${model.id}:streamGenerateContent?alt=sse&key=$apiKey"
          val request = Request.Builder()
              .url(url)
-@@ -132,7 +137,8 @@ class GeminiProvider(
+@@ -132,7 +140,8 @@ class GeminiProvider(
              .applyUserAgentOverride(null)
              .build()
  
@@ -31559,7 +32020,7 @@ index c7faa27..9718584 100644
          if (!response.isSuccessful) {
              val errorBody = response.body?.string() ?: ""
              response.close()
-@@ -149,7 +155,7 @@ class GeminiProvider(
+@@ -149,7 +158,7 @@ class GeminiProvider(
                  if (!l.startsWith("data: ")) continue
                  val payload = l.removePrefix("data: ")
  
@@ -31721,10 +32182,10 @@ index 0000000..e0d0088
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/provider/openai/ConnRetry.kt b/src/android/app/src/main/java/com/openminis/app/provider/openai/ConnRetry.kt
 new file mode 100644
-index 0000000..4f353d0
+index 0000000..171ba74
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/provider/openai/ConnRetry.kt
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,57 @@
 +package com.openminis.app.provider.openai
 +
 +import java.io.IOException
@@ -31742,7 +32203,8 @@ index 0000000..4f353d0
 + */
 +object ConnRetry {
 +    private val h1Hosts = ConcurrentHashMap.newKeySet<String>()
-+    @Volatile private var h1Client: OkHttpClient? = null
++    /** [38.9.11.3] one HTTP/1.1 client per route (proxy), so the direct / proxy choice of a request is kept */
++    private val h1Clients = ConcurrentHashMap<String, OkHttpClient>()
 +
 +    fun useH1(host: String): Boolean = host.lowercase() in h1Hosts
 +    fun rememberH1(host: String) { h1Hosts.add(host.lowercase()) }
@@ -31773,11 +32235,13 @@ index 0000000..4f353d0
 +    }
 +
 +    /** same settings as the provider's client, HTTP/1.1 only and a private, non-reused pool */
-+    fun h1(base: OkHttpClient): OkHttpClient = h1Client ?: base.newBuilder()
-+        .protocols(listOf(Protocol.HTTP_1_1))
-+        .connectionPool(ConnectionPool(0, 1, TimeUnit.SECONDS))
-+        .retryOnConnectionFailure(true)
-+        .build().also { h1Client = it }
++    fun h1(base: OkHttpClient): OkHttpClient = h1Clients.getOrPut(base.proxy.toString()) {
++        base.newBuilder()
++            .protocols(listOf(Protocol.HTTP_1_1))
++            .connectionPool(ConnectionPool(0, 1, TimeUnit.SECONDS))
++            .retryOnConnectionFailure(true)
++            .build()
++    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/provider/openai/OpenAIModelsApi.kt b/src/android/app/src/main/java/com/openminis/app/provider/openai/OpenAIModelsApi.kt
 index b599f7a..ed6e560 100644
@@ -31806,7 +32270,7 @@ index b599f7a..ed6e560 100644
          val request = Request.Builder()
              .url(url)
 diff --git a/src/android/app/src/main/java/com/openminis/app/provider/openai/OpenAIProvider.kt b/src/android/app/src/main/java/com/openminis/app/provider/openai/OpenAIProvider.kt
-index 4bfea36..a683f30 100644
+index 4bfea36..e865f09 100644
 --- a/src/android/app/src/main/java/com/openminis/app/provider/openai/OpenAIProvider.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/provider/openai/OpenAIProvider.kt
 @@ -320,6 +320,9 @@ class OpenAIProvider private constructor(
@@ -31819,7 +32283,18 @@ index 4bfea36..a683f30 100644
      private val isOAuth: Boolean get() = oauthTokenProvider != null
  
      // MARK: - Image passthrough [T-android-model-use-image-passthrough GH#62]
-@@ -615,7 +618,7 @@ class OpenAIProvider private constructor(
+@@ -574,7 +577,9 @@ class OpenAIProvider private constructor(
+     // through AppLogger.info at the OkHttpEvents tag with the call's
+     // identity hash so concurrent streams can be disambiguated.
+     private val client = OkHttpClient.Builder()
+-        .connectTimeout(30, TimeUnit.SECONDS)
++        // [38.9.11.3] 10 s per route (was 30 s); DNS capped at 5 s (a blocked getaddrinfo ignores call.cancel())
++        .connectTimeout(com.openminis.app.plus.ProviderRouteCore.CONNECT_MS, TimeUnit.MILLISECONDS)
++        .dns(com.openminis.app.plus.ProviderRoutes.TimedDns)
+         .readTimeout(600, TimeUnit.SECONDS)
+         .writeTimeout(30, TimeUnit.SECONDS)
+         // [T-android-stale-conn-retry-hang] Shared pool so NetworkMonitor's
+@@ -615,7 +620,7 @@ class OpenAIProvider private constructor(
          get() = isOpenRouter && model.id.lowercase().startsWith("anthropic/")
  
      /** Detect DashScope (Alibaba Qwen) base URL. */
@@ -31828,7 +32303,7 @@ index 4bfea36..a683f30 100644
  
      /**
       * [T-android-mistral-reasoning-422] (GH OpenMinis#87, iOS 29065ca0)
-@@ -844,6 +847,12 @@ class OpenAIProvider private constructor(
+@@ -844,6 +849,12 @@ class OpenAIProvider private constructor(
          // this body kill us?" could not be answered from the log. We measure
          // around the call and report the realised length, so an OOM thrown here
          // now arrives with an attributed stack instead of anonymously.
@@ -31841,41 +32316,175 @@ index 4bfea36..a683f30 100644
          val memBefore = com.openminis.app.diagnostics.MemorySnapshot.capture()
          val serStartNs = System.nanoTime()
          val bodyStr = try {
-@@ -957,15 +966,30 @@ class OpenAIProvider private constructor(
+@@ -900,26 +911,48 @@ class OpenAIProvider private constructor(
+         // listener fills in (upload-done timestamp + physical connection) so the
+         // watchdog below can (a) start the TTFB clock only after upload and
+         // (b) evict THIS ONE connection on timeout.
++        // [Mines-38.9.11.3] user: 「AI 回复很慢，几乎每个供应商都经常 60 秒超时」. Each request now picks a ROUTE for its host
++        // (ProviderRoutes / ProviderRouteCore): China / directly reachable providers direct first, foreign API hosts through the
++        // proxy first, the other route as an automatic fallback, the route that worked remembered. Connect (DNS + TCP + proxy
++        // tunnel + TLS) has its own 10 s budget per route — before, the tunnel / handshake ran under readTimeout (600 s) and a
++        // dead proxy path was only cut by the 60 s first-chunk deadline. Both routes failed → fallbackable ProviderError at
++        // once (next key / provider, no same-model 1/2/4 s retries). Connected but silent → first-token budget
++        // (45 s, 90 s for reasoning models), then the next provider. Flowing streams keep no total cap.
++        val rHost = request.url.host
++        val rPort = request.url.port
++        val legacyNet = com.openminis.app.plus.ProviderRoutes.legacy   // smoke before-measurement: 38.9.11.2 behaviour
++        val firstTokenMs = if (legacyNet) STREAM_TTFB_TIMEOUT_MS else com.openminis.app.plus.ProviderRouteCore.firstTokenMs(model.supportsReasoning == true)
++        val connectCapMs = if (legacyNet) STREAM_UPLOAD_CAP_MS else com.openminis.app.plus.ProviderRouteCore.CONNECT_MS
++        if (!legacyNet && com.openminis.app.plus.ProviderRoutes.bothDown(rHost)) {
++            com.openminis.app.plus.ProviderRoutes.idle()
++            throw LLMError.ProviderError("连不上 $rHost：1 分钟内直连和代理都没通，先换下一个")
++        }
++        val routes = kotlinx.coroutines.runInterruptible(Dispatchers.IO) { com.openminis.app.plus.ProviderRoutes.plan(rHost, rPort) }
++        var lastWhy: String? = null
++        var directWhy: String? = null
++        var proxyWhy: String? = null
++        var resp0: okhttp3.Response? = null
++        var routedClient: OkHttpClient = client
++        var liveCall: Call? = null
++        for ((ri, route) in routes.withIndex()) {
++        com.openminis.app.plus.ProviderRoutes.status(com.openminis.app.plus.ProviderRouteCore.Phase.CONNECTING, rHost, route)
++        val rClient = if (legacyNet) client.newBuilder().proxy(com.openminis.app.plus.ProviderRoutes.proxy() ?: java.net.Proxy.NO_PROXY).connectTimeout(30, TimeUnit.SECONDS).build()
++            else client.newBuilder().proxy(com.openminis.app.plus.ProviderRoutes.proxyFor(route)).build()
+         val watchState = CallWatchState()
+-        val call = client.newCall(request.newBuilder().tag(CallWatchState::class.java, watchState).build())
++        // [Mines-38.9.9] a host whose HTTP/2 / pooled connection was dropped before answering uses a fresh HTTP/1.1 client
++        val call = (if (ConnRetry.useH1(rHost)) ConnRetry.h1(rClient) else rClient).newCall(request.newBuilder().tag(CallWatchState::class.java, watchState).build())
+         // [T-android-stale-conn-retry-hang] Time-to-first-byte watchdog. A
+         // request written into a dead pooled h2 tunnel (local proxy socket
+         // survives a network flap) produces NO further events — no headers,
+         // no failure — until the 600s read timeout, so the UI showed
+         // "thinking" forever.
+         //
+-        // [T-android-ttfb-upload-split / #188] The window is split in two so
+-        // slow-but-healthy uploads aren't mistaken for a dead connection:
+-        //   1. UPLOAD phase (call start → requestBodyEnd): bounded loosely by
+-        //      STREAM_UPLOAD_CAP_MS. writeTimeout(30s) already catches a fully
+-        //      stalled socket; this only catches slow-trickle-forever.
+-        //   2. TTFB phase (requestBodyEnd → response headers): the tight
+-        //      STREAM_TTFB_TIMEOUT_MS budget, measured FROM upload completion.
+-        // On timeout we cancel the call AND evict just this connection so the
+-        // auto-retry gets a fresh one (a sibling session's connection is never
+-        // touched — no evictAll). Once headers arrive the watchdog stops and a
+-        // flowing SSE stream has NO total-duration limit, as before.
++        // [T-android-ttfb-upload-split / #188] The window is split so slow-but-healthy uploads aren't mistaken for a dead
++        // connection: CONNECT (call start → connection acquired, [38.9.11.3] 10 s), UPLOAD (→ requestBodyEnd, loose cap),
++        // FIRST TOKEN (requestBodyEnd → response headers, [38.9.11.3] firstTokenMs). On timeout we cancel the call AND evict
++        // just this connection (never evictAll). Once headers arrive the watchdog stops; a flowing SSE stream has no total cap.
+         val ttfbTimedOut = java.util.concurrent.atomic.AtomicBoolean(false)
++        var timedOutPhaseSeen: String? = null
+         val headersArrived = java.util.concurrent.atomic.AtomicBoolean(false)
+         val callStartNanos = System.nanoTime()
+         val ttfbWatchdog = launch {
+@@ -928,28 +961,31 @@ class OpenAIProvider private constructor(
+             while (!headersArrived.get()) {
+                 val uploadDoneAt = watchState.uploadDoneAtNanos.get()
+                 val nowNanos = System.nanoTime()
+-                if (uploadDoneAt == 0L) {
+-                    // Still uploading (or connecting) — loose upload-phase cap.
+-                    val elapsedMs = (nowNanos - callStartNanos) / 1_000_000L
++                val elapsedMs = (nowNanos - callStartNanos) / 1_000_000L
++                if (watchState.acquiredAtNanos.get() == 0L) {
++                    if (elapsedMs >= connectCapMs) { timedOutPhase = "connect"; break }
++                } else if (uploadDoneAt == 0L) {
++                    if (com.openminis.app.plus.ProviderRoutes.status.value.phase != com.openminis.app.plus.ProviderRouteCore.Phase.THINKING)
++                        com.openminis.app.plus.ProviderRoutes.status(com.openminis.app.plus.ProviderRouteCore.Phase.THINKING, rHost, route)
++                    // Still uploading — loose upload-phase cap.
+                     if (elapsedMs >= STREAM_UPLOAD_CAP_MS) { timedOutPhase = "upload"; break }
+                 } else {
+-                    // Upload finished — tight TTFB budget measured from that point.
++                    if (com.openminis.app.plus.ProviderRoutes.status.value.phase != com.openminis.app.plus.ProviderRouteCore.Phase.THINKING)
++                        com.openminis.app.plus.ProviderRoutes.status(com.openminis.app.plus.ProviderRouteCore.Phase.THINKING, rHost, route)
++                    // Upload finished — first-token budget measured from that point.
+                     val sinceUploadMs = (nowNanos - uploadDoneAt) / 1_000_000L
+-                    if (sinceUploadMs >= STREAM_TTFB_TIMEOUT_MS) { timedOutPhase = "ttfb"; break }
++                    if (sinceUploadMs >= firstTokenMs) { timedOutPhase = "ttfb"; break }
+                 }
+                 delay(pollMs)
+             }
+             if (timedOutPhase != null && !headersArrived.get()) {
++                timedOutPhaseSeen = timedOutPhase
+                 ttfbTimedOut.set(true)
+-                val budgetS = if (timedOutPhase == "ttfb") STREAM_TTFB_TIMEOUT_MS / 1000 else STREAM_UPLOAD_CAP_MS / 1000
+                 com.openminis.app.logging.AppLogger.warning(
+                     "OpenAIProvider",
+-                    "[T-android-ttfb-upload-split] no response headers ($timedOutPhase phase, ${budgetS}s) — cancelling call + evicting connection (stale pooled connection?)",
++                    "[38.9.11.3] $rHost via ${route.name}: no progress in the $timedOutPhase phase — cancelling call + evicting connection",
+                 )
+                 call.cancel()
+-                // Targeted eviction: close ONLY this call's physical connection so
+-                // the retry can't reuse it. Never evictAll — concurrent sessions
+-                // may hold healthy connections in the shared pool.
+                 try {
+                     watchState.connection.get()?.socket()?.close()
+                 } catch (_: Throwable) {
+@@ -957,19 +993,56 @@ class OpenAIProvider private constructor(
                  }
              }
          }
 -        val response = try {
 -            call.execute()
-+        var response = try {
-+            // [Mines-38.9.9] user (paid relay, every 快速测试 「connection closed」): a host whose HTTP/2 / pooled connection is
-+            // dropped by the server or a proxy before the answer goes out over a fresh HTTP/1.1 connection from now on
-+            if (ConnRetry.useH1(request.url.host)) {
-+                headersArrived.set(true)
-+                ConnRetry.h1(client).newCall(request).execute()
-+            } else call.execute()
-         } catch (e: IOException) {
-             if (ttfbTimedOut.get()) {
-                 throw LLMError.TransientError(
-                     "no response from server (${STREAM_TTFB_TIMEOUT_MS / 1000}s TTFB) — check network/proxy",
-                 )
+-        } catch (e: IOException) {
+-            if (ttfbTimedOut.get()) {
+-                throw LLMError.TransientError(
+-                    "no response from server (${STREAM_TTFB_TIMEOUT_MS / 1000}s TTFB) — check network/proxy",
+-                )
++        try {
++            resp0 = try {
++                call.execute()
++            } catch (e: IOException) {
++                val connected = watchState.acquiredAtNanos.get() != 0L
++                if (ttfbTimedOut.get() && timedOutPhaseSeen == "ttfb") {
++                    com.openminis.app.plus.ProviderRoutes.ok(rHost, route, 0L)   // the path works; the server is silent
++                    throw LLMError.ProviderError("连上了 $rHost，但 ${firstTokenMs / 1000} 秒没有回应（首字超时），先换下一个")
++                }
++                if (ttfbTimedOut.get() && timedOutPhaseSeen == "upload") {
++                    throw LLMError.TransientError("请求发了 ${STREAM_UPLOAD_CAP_MS / 1000} 秒还没发完（网络太慢）")
++                }
++                if (!connected || (ttfbTimedOut.get() && timedOutPhaseSeen == "connect")) {
++                    // connect-phase failure on this route → remember, switch route at once
++                    val why = if (timedOutPhaseSeen == "connect") "${com.openminis.app.plus.ProviderRouteCore.CONNECT_MS / 1000} 秒没连上" else (e.message ?: e.javaClass.simpleName).take(60)
++                    if (route == com.openminis.app.plus.ProviderRouteCore.Route.DIRECT) directWhy = why else proxyWhy = why
++                    lastWhy = why
++                    com.openminis.app.plus.ProviderRoutes.fail(rHost, route)
++                    com.openminis.app.logging.AppLogger.warning("OpenAIProvider", "[38.9.11.3] $rHost ${route.name} connect failed ($why) — ${if (ri < routes.size - 1) "trying the other route" else "no route left"}")
++                    null
++                } else if (ConnRetry.isDropped(e) && !ConnRetry.useH1(rHost)) {
++                    headersArrived.set(true)
++                    com.openminis.app.logging.AppLogger.warning("OpenAIProvider", "[conn-retry] $rHost ${e.javaClass.simpleName}: ${e.message} — retrying once on a fresh HTTP/1.1 connection")
++                    try { watchState.connection.get()?.socket()?.close() } catch (_: Throwable) {}
++                    val r2 = try { ConnRetry.h1(rClient).newCall(request).execute() } catch (e2: IOException) {
++                        throw LLMError.TransientError(ConnRetry.zh(e2) + "（已换新连接重试 1 次）")
++                    }
++                    ConnRetry.rememberH1(rHost)
++                    r2
++                } else if (ConnRetry.isDropped(e)) throw LLMError.TransientError(ConnRetry.zh(e))
++                else throw e
              }
 -            throw e
-+            if (ConnRetry.isDropped(e) && !ConnRetry.useH1(request.url.host)) {
-+                headersArrived.set(true)
-+                com.openminis.app.logging.AppLogger.warning("OpenAIProvider", "[conn-retry] ${request.url.host} ${e.javaClass.simpleName}: ${e.message} — retrying once on a fresh HTTP/1.1 connection")
-+                try { watchState.connection.get()?.socket()?.close() } catch (_: Throwable) {}
-+                val r2 = try { ConnRetry.h1(client).newCall(request).execute() } catch (e2: IOException) {
-+                    throw LLMError.TransientError(ConnRetry.zh(e2) + "（已换新连接重试 1 次）")
-+                }
-+                ConnRetry.rememberH1(request.url.host)
-+                r2
-+            } else if (ConnRetry.isDropped(e)) throw LLMError.TransientError(ConnRetry.zh(e))
-+            else throw e
          } finally {
              headersArrived.set(true)
              ttfbWatchdog.cancel()
-@@ -991,6 +1015,19 @@ class OpenAIProvider private constructor(
+         }
++        if (resp0 != null) {
++            routedClient = rClient
++            liveCall = call
++            val acq = watchState.acquiredAtNanos.get()
++            com.openminis.app.plus.ProviderRoutes.ok(rHost, route, if (acq != 0L) (acq - callStartNanos) / 1_000_000L else 0L)
++            break
++        }
++        }
++        if (resp0 == null) {
++            com.openminis.app.plus.ProviderRoutes.idle()
++            throw LLMError.ProviderError(com.openminis.app.plus.ProviderRouteCore.bothFailedText(rHost, directWhy, proxyWhy,
++                routes.contains(com.openminis.app.plus.ProviderRouteCore.Route.PROXY)).let { if (routes.size == 1 && lastWhy != null) "连不上 $rHost（$lastWhy），已换下一个" else it })
++        }
++        var response: okhttp3.Response = resp0!!
+         // T321: response-side diagnostic log (status + select header values).
+         run {
+             val rh = response.headers
+@@ -991,6 +1064,19 @@ class OpenAIProvider private constructor(
                  "[T321] ← HTTP ${response.code} error body: $errorBody"
              )
              response.close()
@@ -31884,7 +32493,7 @@ index 4bfea36..a683f30 100644
 +                ThinkingParamFallback.remember(basePath)
 +                ThinkingParamFallback.strip(body)
 +                com.openminis.app.logging.AppLogger.warning("OpenAIProvider", "[thinking-fallback] ${request.url.host} rejects \"thinking\" — retrying with reasoning_effort only")
-+                val retry = client.newCall(buildRequest(body.toString())).execute()
++                val retry = routedClient.newCall(buildRequest(body.toString())).execute()
 +                if (retry.isSuccessful) response = retry
 +                else {
 +                    val eb = retry.body?.string() ?: ""
@@ -31895,7 +32504,7 @@ index 4bfea36..a683f30 100644
              // T302: skip the LLMRequestLog write entirely on release builds —
              // not just to avoid the (already-truncated) retention cost, but to
              // dodge constructing the Entry / headerMap copies that go with it.
-@@ -1008,6 +1045,7 @@ class OpenAIProvider private constructor(
+@@ -1008,6 +1094,7 @@ class OpenAIProvider private constructor(
                  )
              }
              throw mapHttpError(response.code, errorBody)
@@ -31903,7 +32512,16 @@ index 4bfea36..a683f30 100644
          }
          if (com.openminis.app.BuildConfig.DEBUG) {
              com.openminis.app.debug.LLMRequestLog.add(
-@@ -1117,6 +1155,8 @@ class OpenAIProvider private constructor(
+@@ -1043,7 +1130,7 @@ class OpenAIProvider private constructor(
+             }
+             channel.close()
+             awaitClose {
+-                try { call.cancel() } catch (_: Exception) {}
++                try { liveCall?.cancel() } catch (_: Exception) {}
+                 try { response.close() } catch (_: Exception) {}
+             }
+             return@callbackFlow
+@@ -1117,6 +1204,8 @@ class OpenAIProvider private constructor(
                  val payload = l.removePrefix("data:").let {
                      if (it.startsWith(" ")) it.removePrefix(" ") else it
                  }
@@ -31912,7 +32530,16 @@ index 4bfea36..a683f30 100644
                  if (payload == "[DONE]") {
                      // [T-android-think-prefix-stream] Flush whatever the parser
                      // still holds (a cross-chunk tag tail, or an unterminated
-@@ -3918,17 +3958,19 @@ class OpenAIProvider private constructor(
+@@ -1753,7 +1842,7 @@ class OpenAIProvider private constructor(
+         // is also explicit so connection-pool leaks are impossible if cancel
+         // races with the finally block.
+         awaitClose {
+-            try { call.cancel() } catch (_: Exception) {}
++            try { liveCall?.cancel() } catch (_: Exception) {}
+             try { response.close() } catch (_: Exception) {}
+         }
+     }
+@@ -3918,17 +4007,19 @@ class OpenAIProvider private constructor(
      }
  
      private fun mapHttpError(statusCode: Int, body: String): LLMError {
@@ -31943,6 +32570,23 @@ index 4bfea36..a683f30 100644
  
          val transientCodes = setOf(500, 502, 503, 504, 529)
          if (statusCode in transientCodes) {
+@@ -3976,6 +4067,8 @@ private class CallWatchState {
+     val uploadDoneAtNanos = java.util.concurrent.atomic.AtomicLong(0L)
+     /** Physical connection serving this call, captured at connectionAcquired. */
+     val connection = java.util.concurrent.atomic.AtomicReference<okhttp3.Connection?>(null)
++    /** [38.9.11.3] when the connection was acquired (monotonic nanos; 0 = still connecting) — the connect-phase budget */
++    val acquiredAtNanos = java.util.concurrent.atomic.AtomicLong(0L)
+ }
+ 
+ /**
+@@ -4102,6 +4195,7 @@ private class OkHttpNetTraceListener : EventListener() {
+         // [T-android-ttfb-upload-split / #188] Capture the physical connection so
+         // the TTFB watchdog can evict THIS ONE on timeout (targeted, never the pool).
+         call.request().tag(CallWatchState::class.java)?.connection?.set(connection)
++        call.request().tag(CallWatchState::class.java)?.acquiredAtNanos?.compareAndSet(0L, System.nanoTime())
+         com.openminis.app.logging.AppLogger.info(
+             tag,
+             "[${callTag(call)}] +${ms()}ms connectionAcquired conn#$conn route=${connection.route()} proto=${connection.protocol()}"
 diff --git a/src/android/app/src/main/java/com/openminis/app/provider/openai/ThinkingParamFallback.kt b/src/android/app/src/main/java/com/openminis/app/provider/openai/ThinkingParamFallback.kt
 new file mode 100644
 index 0000000..3d850da
@@ -33634,6 +34278,34 @@ index db88af7..1025dd8 100644
  import androidx.compose.material3.rememberModalBottomSheetState
  import androidx.compose.material3.Icon
  import androidx.compose.material3.IconButton
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatIndicators.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatIndicators.kt
+index 48bdd62..4fe1d0c 100644
+--- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatIndicators.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatIndicators.kt
+@@ -164,12 +164,22 @@ internal fun TypingIndicator() {
+     val soulMeta by com.openminis.app.agent.SoulStore.cachedMetadata.collectAsState()
+     val soulName = soulMeta.name.trim().ifEmpty { "Mines" }
+ 
++    // [Mines-38.9.11.3] what the request is doing: 「正在连接 api.xxx（直连）… 3 秒」 then 「正在思考… 12 秒」 (user: replies felt
++    // stuck — now the wait says whether it is the network or the model)
++    val net by com.openminis.app.plus.ProviderRoutes.status.collectAsState()
++    var secTick by remember { mutableStateOf(0) }
++    LaunchedEffect(net.phase, net.host) { while (net.phase != com.openminis.app.plus.ProviderRouteCore.Phase.IDLE) { kotlinx.coroutines.delay(1000); secTick++ } }
++    val netLine = remember(net, secTick) {
++        if (net.phase == com.openminis.app.plus.ProviderRouteCore.Phase.IDLE) ""
++        else com.openminis.app.plus.ProviderRouteCore.statusText(net.phase, net.host, net.route, System.currentTimeMillis() - net.since)
++    }
++
+     Row(
+         modifier = Modifier.padding(top = 2.dp, bottom = 8.dp),
+         verticalAlignment = Alignment.Bottom,
+     ) {
+         Text(
+-            text = stringResource(R.string.chat_typing_indicator, soulName),
++            text = netLine.ifEmpty { stringResource(R.string.chat_typing_indicator, soulName) },
+             fontSize = 15.sp,
+             color = ChatColors.tertiaryText,
+         )
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatMiscViews.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatMiscViews.kt
 index 2cfa24b..2d0ad0d 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatMiscViews.kt
@@ -34673,7 +35345,7 @@ index d99b975..72b0b68 100644
                  )
              }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
-index e0d0cae..3e50786 100644
+index e0d0cae..0a9c287 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
 @@ -89,6 +89,7 @@ import kotlinx.coroutines.flow.combine
@@ -34889,7 +35561,7 @@ index e0d0cae..3e50786 100644
          turnLoop@ for (turn in 0 until turnCap) {
              // [T-android-switch-model-next-request] The user picked another
              // model while this turn ran. Apply it HERE, before the next
-@@ -11356,7 +11461,10 @@ class ChatViewModel(
+@@ -11356,10 +11461,17 @@ class ChatViewModel(
                              thinkingLevel = if (currentProvider.model.supportsReasoning == true) (turnThinkingOverride ?: _thinkingLevel.value) else ThinkingLevel.OFF,
                          )
                      }
@@ -34897,11 +35569,26 @@ index e0d0cae..3e50786 100644
 +                    // [Mines-38.9.1] user 2026-10-17: after a 429 the next member never answered and the turn sat on
 +                    // 「正在思考…」 forever. No first chunk within MINES_FIRST_CHUNK_MS = this member is dead for now →
 +                    // fallbackable ProviderError, so the group moves on (or the turn ends with the reason) instead of hanging.
-+                    (if (scriptedTurn != null) turnChunks else turnChunks.minesFirstChunkDeadline(MINES_FIRST_CHUNK_MS)).collect { chunk ->
++                    // [Mines-38.9.11.3] the provider now bounds connect (10 s per route) and first token (45 s / 90 s reasoning) itself and
++                    // moves on at once; this deadline is only the backstop = both routes' connects + probe + first token.
++                    (if (scriptedTurn != null) turnChunks else turnChunks.minesFirstChunkDeadline(
++                        com.openminis.app.plus.ProviderRouteCore.silentBudgetMs(currentProvider.model.supportsReasoning == true))).collect { chunk ->
                  // [T-STALL-DIAG] Mark first byte back from the provider and log
                  // the time-to-first-chunk once per turn.
                  if (firstChunkSeen.compareAndSet(false, true)) {
-@@ -12122,7 +12230,17 @@ class ChatViewModel(
++                    com.openminis.app.plus.ProviderRoutes.idle()   // [38.9.11.3] 「正在连接 / 正在思考」 ends with the first token
+                     // [T-switch-model-retry-counter-reset] The retried attempt is
+                     // producing output, so the ladder is done. isBoundToAbandonedModel()
+                     // reads these counters; left set until the stream COMPLETES, a
+@@ -11803,6 +11915,7 @@ class ChatViewModel(
+                         // success, error, or cancellation — so it can never
+                         // outlive its turn and spam the log.
+                         firstChunkWatchdog.cancel()
++                        com.openminis.app.plus.ProviderRoutes.idle()
+                         if (!firstChunkSeen.get()) {
+                             println(
+                                 "[T-STALL-DIAG] stream ENDED-WITHOUT-CHUNK sid=$diagSid turn=$turn " +
+@@ -12122,7 +12235,17 @@ class ChatViewModel(
                          null
                      } else {
                          _activeEntryId.value?.let { triedEntryIds.add(it) }
@@ -34920,7 +35607,7 @@ index e0d0cae..3e50786 100644
                              ?.also { triedEntryIds.add(it.entryId) }
                              ?: buildFallbackProviders(currentProvider)
                                  .firstOrNull { it.entryId !in triedEntryIds }
-@@ -12138,7 +12256,7 @@ class ChatViewModel(
+@@ -12138,7 +12261,7 @@ class ChatViewModel(
                      val next = nextCandidate?.provider
                      if (next != null && nextCandidate != null) {
                          val reason = when {
@@ -34929,7 +35616,7 @@ index e0d0cae..3e50786 100644
                              actual is com.openminis.app.data.model.LLMError.ProviderError -> actual.detail
                              else -> actual.message ?: "Error"
                          }
-@@ -12227,7 +12345,8 @@ class ChatViewModel(
+@@ -12227,7 +12350,8 @@ class ChatViewModel(
                                  persistBinding("""{"type":"entry","entryId":"${newEntry.id}"}""")
                              }
                          }
@@ -34939,7 +35626,7 @@ index e0d0cae..3e50786 100644
                          allToolBlocks.removeAll { it.kind == "info" }
                          allToolBlocks.add(0, AssistantBlock(
                              id = "fallback_info_$turn",
-@@ -12343,6 +12462,23 @@ class ChatViewModel(
+@@ -12343,6 +12467,23 @@ class ChatViewModel(
                  val turnParts = buildTurnParts(allToolBlocks, turnStartBlockIndex, toolInputMap)
                  val blockMeta = allToolBlocks.filter { it.kind == "tool_use" }.associateBy { it.id }
                  persistAssistantTurn(turnParts, lastUsage, turnReasoningContent, blockMeta, uiAssistantId = assistantId, streamMs = turnStreamMs)
@@ -34963,7 +35650,7 @@ index e0d0cae..3e50786 100644
                  // [T-error-persist-android] Empty-response hint: the model ended a
                  // turn (finish=stop/end_turn) with no visible text anywhere in the
                  // reply and no tool blocks — the user just sees a blank bubble.
-@@ -12812,7 +12948,12 @@ class ChatViewModel(
+@@ -12812,7 +12953,12 @@ class ChatViewModel(
                          }
  
                          android.util.Log.d("ToolChain[VM]", "[turn=$turn] executeTool START name=$name args=${argsStr.take(200)}")
@@ -34976,7 +35663,7 @@ index e0d0cae..3e50786 100644
                          android.util.Log.d("ToolChain[VM]", "[turn=$turn] executeTool END name=$name success=${result.success} title=${result.toolTitle} outputLen=${result.output.length} output=${result.output.take(200)}")
  
                          // Record post-execution. WARNING text is appended to the tool
-@@ -12853,7 +12994,7 @@ class ChatViewModel(
+@@ -12853,7 +12999,7 @@ class ChatViewModel(
                              } else {
                                  result.output
                              }
@@ -34985,7 +35672,7 @@ index e0d0cae..3e50786 100644
                              // [T-truncated-args-visibility #119] A call built from
                              // truncated args must not render as a clean success — that
                              // silence is the reported bug. Show it with the same weight
-@@ -12945,6 +13086,62 @@ class ChatViewModel(
+@@ -12945,6 +13091,62 @@ class ChatViewModel(
                  .filterIsInstance<AgentContentPart.ToolResult>()
                  .firstNotNullOfOrNull { failGuard.onResult(it.name, it.isError, it.content) }
              if (failStop != null) AppLogger.warning(TAG_STREAM, "[FailGuard] turn=$turn $failStop")
@@ -35048,7 +35735,7 @@ index e0d0cae..3e50786 100644
              // [Mines-loop-34] weak / flash model on a long tool run → one gentle hint to switch in 模型路由
              if (!weakModelHinted && helperConfig == null && runGuard.toolCalls >= 15 &&
                  com.openminis.app.plus.ModelHealth.isWeak(currentProvider.model.id, currentProvider.model.displayName)) {
-@@ -13244,12 +13441,19 @@ class ChatViewModel(
+@@ -13244,12 +13446,19 @@ class ChatViewModel(
  
      private suspend fun executeTool(
          name: String,
@@ -35069,7 +35756,7 @@ index e0d0cae..3e50786 100644
          // T330: tri-state permission gating moved into the offload IPC
          // handler (OffloadGate). The CLIs land there whether the LLM
          // emitted a named tool call or a raw shell command, so the gate
-@@ -13294,6 +13498,13 @@ class ChatViewModel(
+@@ -13294,6 +13503,13 @@ class ChatViewModel(
                  // skill. The repository compares a directory signature in the
                  // background and only reloads when /var/minis/skills changed.
                  skillRepository?.requestReload("shell_execute")
@@ -35083,7 +35770,7 @@ index e0d0cae..3e50786 100644
              }
              // [T-tools-granular-switches] Refuse a switched-off tool at the
              // dispatcher too, not only by omitting it from the schema: a model
-@@ -13355,6 +13566,19 @@ class ChatViewModel(
+@@ -13355,6 +13571,19 @@ class ChatViewModel(
                  kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.MinesSelfCheckTool.run(context, argsJson) }
              com.openminis.app.plus.KnowledgeBase.TOOL_NAME ->
                  kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.KnowledgeBase.runTool(context, argsJson) }
@@ -35103,7 +35790,7 @@ index e0d0cae..3e50786 100644
              else -> ToolExecutionResult("Unknown tool: $name", false)
          }
      }
-@@ -15429,7 +15653,7 @@ CLI tools at /usr/local/bin with the `android-` prefix give you access to Androi
+@@ -15429,7 +15658,7 @@ CLI tools at /usr/local/bin with the `android-` prefix give you access to Androi
  - android-speech — microphone transcription (`listen [--language BCP47] [--max N] [--timeout SEC]`; `status`). Requires RECORD_AUDIO.
  - android-weather <latitude> <longitude> — Open-Meteo forecast (current + hourly + daily). No API key needed.
  - android-shizuku-cli — invoke privileged Android system APIs (package management, settings, system commands) via Shizuku when granted. Curated subcommands return structured JSON; for anything not covered, fall back to `android-shizuku-cli exec <any shell command>` which runs the command via `sh -c` with Shizuku privilege (same surface as `adb shell`). Run with no args (or --help) for the subcommand list.
@@ -35112,7 +35799,7 @@ index e0d0cae..3e50786 100644
  - minis-open <url-or-path>: Opens a resource inside Minis without leaving the chat. Accepts http/https URLs (→ built-in WebKit preview) and chat-resource file paths under /var/minis/** (→ built-in file preview, routed by extension: images to the image viewer, .md to markdown preview, .html to HTML preview, .pdf/office docs to QuickLook, audio/video to the media player, else share sheet). Examples: minis-open https://example.com, minis-open /var/minis/workspace/report.md, minis-open /var/minis/attachments/chart.png. Prefer this over android-open for anything that can be previewed in-app so the user doesn't lose conversation context. Run android-open via shell_execute for non-web schemes (tel:, mailto:, geo:, intent:, etc.) or when the user explicitly wants the system handler.
  - minis-sessions-cli: Read chat history. `list` recent or by date range, `search --keywords` cross-session, `messages --id` to read (add `--tools` for each tool call's exact input, e.g. the shell command, and its output). Run --help for full options.
  - minis-model-use: Invoke other LLM models pre-configured by the user. Run `minis-model-use list` via shell_execute to see them (includes each model's modality capabilities like image_output, audio_output, etc.), `minis-model-use search <query>` to filter by name/provider. `minis-model-use run --model <id_or_name>` sends an OpenAI-compatible messages request; pass input via --input <json_file> or stdin, output goes to stdout or --output <path>. The OpenAI shape is the PRIMARY input for every model and modality; standard params are auto-converted to the underlying provider, so do not hand-write provider-native bodies as the primary input. For provider-specific extras the standard schema doesn't model (web-search plugins, image-to-image fields, TTS/video or other custom endpoints), escape hatches exist for OpenAI-compatible providers (they error or are ignored on Anthropic/Gemini models): `extra_body` (object merged verbatim into the request body), a custom `endpoint` path, and a top-level `passthrough` envelope for fully verbatim requests with RAW (unparsed) responses. Results may carry `warnings` (fields that were ignored/downgraded and why) and `applied_extras` (which extras actually took effect) — read them to self-correct. Run --help for the full contract before using these. Models may support multimodal output (image generation, TTS/audio, video) — check the modalities field in list output. For image_output models, pass generation params in the input JSON: top-level `n`/`size`/`quality`/`prompt` (OpenAI /images/generations style) or `generation_config.{aspect_ratio,image_size,number_of_images,person_generation}` (Gemini). Run with --help for full usage.${modelUseDelegateNote}
-@@ -15487,10 +15711,32 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15487,10 +15716,32 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
  
          return buildString {
              append(base)
@@ -35145,7 +35832,7 @@ index e0d0cae..3e50786 100644
              if (mcpFragment != null) {
                  append("\n\n")
                  append(mcpFragment)
-@@ -15503,6 +15749,25 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15503,6 +15754,25 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                  append("\n\n")
                  append(dailyMemoryFragment)
              }
@@ -35171,7 +35858,7 @@ index e0d0cae..3e50786 100644
              // Runtime context goes last so the prefix above stays byte-stable
              // across requests within the same day. Keep ordering deterministic
              // (date → tz → lang → model count) — any reorder defeats the cache.
-@@ -15854,11 +16119,69 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15854,11 +16124,69 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
              }
          }
  
@@ -35242,7 +35929,7 @@ index e0d0cae..3e50786 100644
              append("<user-attached-files>\n")
              for (m in metas) {
                  val urlPath = m.linuxPath.removePrefix("/var/minis/")
-@@ -15874,6 +16197,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15874,6 +16202,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
              }
              append("</user-attached-files>")
          }
@@ -35250,7 +35937,7 @@ index e0d0cae..3e50786 100644
  
          // Order matches UserAttachmentList convention: images first, then files.
          return PreparedAttachments(
-@@ -17072,6 +17396,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -17072,6 +17401,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
      }
  
      override fun onCleared() {
@@ -35259,7 +35946,7 @@ index e0d0cae..3e50786 100644
          // [T-sub-agents-queue] Nothing can re-enter a queued delegation once
          // this view model is gone; leaving the starter installed would let the
          // registry call into a cleared VM.
-@@ -17123,6 +17449,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -17123,6 +17454,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
              try {
                  val count = chatRepository.messageCount(sid)
                  if (count > 0) return@launch
@@ -35268,7 +35955,7 @@ index e0d0cae..3e50786 100644
                  AppLogger.info(
                      TAG,
                      "cleanupIfEmptyOnExit: deleting empty session $sid (no persisted messages)",
-@@ -17602,6 +17930,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -17602,6 +17935,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                              continue
                          }
                          if (!mime.startsWith("image/")) continue
@@ -35277,7 +35964,7 @@ index e0d0cae..3e50786 100644
                          val file = java.io.File(mediaStore.mediaBaseDir, rel)
                          if (!file.exists()) continue
                          val original = try { file.readBytes() } catch (_: Exception) { continue }
-@@ -17693,16 +18023,9 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -17693,16 +18028,9 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
       * e.g. `file_write` → "Write File", `shell_execute` → "Execute Shell".
       */
      private fun friendlyToolTitle(toolName: String): String = when (toolName) {
@@ -35297,7 +35984,7 @@ index e0d0cae..3e50786 100644
              .split('_')
              .filter { it.isNotEmpty() }
              .joinToString(" ") { it.replaceFirstChar { ch -> ch.uppercase() } }
-@@ -17756,3 +18079,28 @@ internal fun warmUpBudget(window: Int?, compactThreshold: Int?, ratio: Double, f
+@@ -17756,3 +18084,28 @@ internal fun warmUpBudget(window: Int?, compactThreshold: Int?, ratio: Double, f
      val line = if (threshold > 0) threshold else w
      return (line / ratio).toInt() - fixedTokens
  }
@@ -45298,7 +45985,7 @@ index 9625470..86a0e4d 100644
  import androidx.compose.material3.LinearProgressIndicator
  import androidx.compose.material3.MaterialTheme
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt
-index 92e996b..0887159 100644
+index 92e996b..c268d76 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesDesign.kt
 @@ -13,6 +13,7 @@ import androidx.compose.ui.Modifier
@@ -45370,7 +46057,7 @@ index 92e996b..0887159 100644
  /** Semantic icon-circle colours: (icon tint, circle fill). */
  enum class Tone { DANGER, WARNING, SUCCESS, INFO, VIOLET, TEAL, NEUTRAL, ACCENT }
  
-@@ -175,81 +201,201 @@ fun toneColors(tone: Tone): Pair<Color, Color> {
+@@ -175,81 +201,202 @@ fun toneColors(tone: Tone): Pair<Color, Color> {
   * Drawn behind every Plus page and the home list when no photo wallpaper is set.
   */
  @Composable
@@ -45607,11 +46294,12 @@ index 92e996b..0887159 100644
      @Volatile var stillSeen: Boolean = false
 +    /** [Mines-38.9.5 i11] the fog holds still until this time (a page is being scrolled) */
 +    @Volatile var holdUntil: Long = 0L
-+    fun hold(ms: Long = 350L) { holdUntil = System.currentTimeMillis() + ms }
++    /** [38.9.11.3] user 2026-10-21: the sky / fog must never stop — scrolling no longer holds it (kept as a no-op for callers) */
++    @Suppress("UNUSED_PARAMETER") fun hold(ms: Long = 350L) {}
      private var lastMs = 0L
      fun tick(nowMs: Long) {
          if (lastMs != 0L) { val d = (nowMs - lastMs).coerceIn(0L, 100L); t += d / 1000f }
-@@ -272,18 +418,27 @@ fun currentCharacter(): String {
+@@ -272,18 +419,27 @@ fun currentCharacter(): String {
   * from here; the system font scale multiplies them (the user's phone runs ≈ 1.18).
   */
  object MT {
@@ -46984,10 +47672,10 @@ index 4ee1029..0bca501 100644
              OutlinedButton(onClick = { obtain() }, modifier = Modifier.weight(1f).heightIn(min = 52.dp)) { Text("自动配置") }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/SkyFreeze.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/SkyFreeze.kt
 new file mode 100644
-index 0000000..72ad66a
+index 0000000..f1907ce
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/SkyFreeze.kt
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,70 @@
 +package com.openminis.app.ui.plus
 +
 +import android.app.Activity
@@ -46995,8 +47683,9 @@ index 0000000..72ad66a
 +import com.openminis.app.plus.SkyFreezeCore
 +
 +/**
-+ * [Mines-38.9.11.2] Android side of [SkyFreezeCore]: listeners update [signals]; the sky reads [frozen] each frame (cheap).
-+ * Installed by MainActivity.
++ * [Mines-38.9.11.2] Android side of [SkyFreezeCore]: listeners update [signals] (still shown in 自检 / smoke).
++ * [38.9.11.3] user 2026-10-21: the sky never freezes any more — [frozen] is false unless the smoke replays the 38.9.11.2
++ * rule for its before-recording ([legacyFreeze]).
 + */
 +object SkyFreeze {
 +    @Volatile var signals = SkyFreezeCore.Signals(); private set
@@ -47004,9 +47693,16 @@ index 0000000..72ad66a
 +    /** smoke only: ignore the a11y / capture signals (the emulator's own a11y-driving service would freeze every capture) */
 +    @Volatile var ignoreSignals: Boolean = false
 +
++    /** smoke before-recording only: 38.9.11.2 behaviour (freeze while a11y / capture / input …) */
++    @Volatile var legacyFreeze: Boolean = false
++    /** smoke: pretend this many other accessibility services are enabled (Q仔 on the user's phone) */
++    @Volatile var fakeOtherServices: Int = -1
++
 +    fun frozen(now: Long = System.currentTimeMillis()): Boolean {
-+        val s = if (ignoreSignals) SkyFreezeCore.Signals(lastInputMs = signals.lastInputMs) else signals
-+        val r = SkyFreezeCore.reason(s, now); lastReason = r; return r.isNotEmpty()
++        var s = if (ignoreSignals) SkyFreezeCore.Signals(lastInputMs = signals.lastInputMs) else signals
++        if (fakeOtherServices >= 0) s = s.copy(otherA11yServices = fakeOtherServices)
++        val r = SkyFreezeCore.reason(s, now); lastReason = r
++        return SkyFreezeCore.holds(r, legacyFreeze)
 +    }
 +
 +    fun input() { signals = signals.copy(lastInputMs = System.currentTimeMillis()) }
@@ -48689,10 +49385,10 @@ index 0000000..6e9e598
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WeatherSky.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WeatherSky.kt
 new file mode 100644
-index 0000000..eb88b6e
+index 0000000..fc3368c
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WeatherSky.kt
-@@ -0,0 +1,593 @@
+@@ -0,0 +1,633 @@
 +package com.openminis.app.ui.plus
 +
 +import com.openminis.app.plus.SkyFreezeCore
@@ -48743,6 +49439,8 @@ index 0000000..eb88b6e
 +    @Volatile var lastScene: Scene = Scene.CLOUDY
 +    @Volatile var lastMode: String = ""
 +    @Volatile var lastShot: String = ""
++    /** [38.9.11.3] smoke / 自检: the drift shift of the last animated key composite */
++    @Volatile var lastDrift: String = ""
 +    @Volatile var shaderError: String? = null
 +    @Volatile var frames: Long = 0
 +    val tick = kotlinx.coroutines.flow.MutableStateFlow(0)
@@ -48797,8 +49495,11 @@ index 0000000..eb88b6e
 +                else runCatching { com.openminis.app.plus.HomeGreeting.windNow(c)?.first }.getOrNull()
 +            windTarget = WindDriftCore.targetRate(windMs)
 +        }
-+        cloud.advance(t, windTarget * rateScale)
++        // [38.9.11.3] never slower than WindDriftCore.VISIBLE_MIN (the smoke's before-recording replays the old rate)
++        cloud.advance(t, if (legacyDrift) windTarget * rateScale else WindDriftCore.effective(windTarget, rateScale))
 +    }
++    /** [38.9.11.3] smoke before-recording only: 38.9.11.2 drift (old slow rate, keys only cross-faded, no shift) */
++    @Volatile var legacyDrift: Boolean = false
 +    /** sky clock (s) for a wall-clock instant */
 +    fun skyTime(ms: Long): Float = WeatherSkyCore.skyTime(ms, java.util.TimeZone.getDefault().getOffset(ms).toLong())
 +
@@ -48985,9 +49686,13 @@ index 0000000..eb88b6e
 +    // [38.9.11.2] three key slots: the B-spline blend uses keys k-1, k, k+1 (the 38.9.11.1 linear blend used two)
 +    val sky = arrayOfNulls<Any>(3); val p2 = arrayOfNulls<Any>(3)
 +    val t = longArrayOf(Long.MIN_VALUE, Long.MIN_VALUE, Long.MIN_VALUE)
++    /** [38.9.11.3] cloud time each key was rendered at (drift shift) + the side margin (px of the key node) */
++    val ct = FloatArray(3); var mq = 0; var margin = -1f
++    /** [38.9.11.3] the last animated composite (slots, alphas, shifts): a still frame re-draws exactly this (no jump) */
++    val lastSlot = IntArray(3) { -1 }; val lastAl = FloatArray(3); val lastDx = FloatArray(3); val lastKt = LongArray(3); var lastValid = false
 +    /** live path (雨 / 雪) nodes: [sky, sky-prev, p2, p2-prev] */
 +    val live = arrayOfNulls<Any>(4)
-+    fun reset() { t[0] = Long.MIN_VALUE; t[1] = Long.MIN_VALUE; t[2] = Long.MIN_VALUE }
++    fun reset() { t[0] = Long.MIN_VALUE; t[1] = Long.MIN_VALUE; t[2] = Long.MIN_VALUE; lastValid = false }
 +}
 +
 +@Composable
@@ -49022,7 +49727,9 @@ index 0000000..eb88b6e
 +    val liveTok by WeatherSky.liveToken.collectAsState()
 +    val isLive = token != 0L && liveTok == token
 +    val liveScene = SkyModeCore.liveScene(cur.key)
-+    val fps = if (gpu == null || level >= 2) 0 else SkyModeCore.loopFps(mode, liveScene, isLive)
++    // [38.9.11.3] the sky never stops on its own: the frame governor's level 2 only stills the expensive live path (雨 / 雪);
++    // key-frame scenes (≈ one small shader frame per 1.2 s) keep drifting. 关闭 / battery saver / reduce motion still stop it.
++    val fps = if (gpu == null || (level >= 2 && liveScene)) 0 else SkyModeCore.loopFps(mode, liveScene, isLive)
 +    // [sky-e] the governor watches whenever this sky animates (also at L1, so it can recover)
 +    val watch = gpu != null && isLive && SkyModeCore.loopFps(mode, liveScene, true) > 0
 +    WeatherSky.lastScene = cur
@@ -49062,7 +49769,10 @@ index 0000000..eb88b6e
 +                    lastWall = wall
 +                    // still while a page is being scrolled
 +                    // [38.9.11.2] also still while the screen is read / captured, another window is on top, or 1 s after input
-+                    if (wall < FogClock.holdUntil || (!WeatherSky.legacySky && SkyFreeze.frozen(wall))) heldMs.longValue += dt
++                    // [38.9.11.3] user 2026-10-21: the sky must NOT stop — no hold on scroll / touch / a11y / capture / split screen /
++                    // overlays (38.9.11.2 froze it while any accessibility service was on → Q仔 kept it frozen for good).
++                    // Only the smoke's before-recording replays the 38.9.11.2 rule (SkyFreeze.legacyFreeze).
++                    if (SkyFreeze.frozen(wall)) heldMs.longValue += dt
 +                    if (prev != null && wall - fadeStart.longValue > WeatherSkyCore.FADE_MS) prev = null
 +                    frameNow.longValue = WeatherSky.now() - heldMs.longValue
 +                    fps > 0 || prev != null
@@ -49137,11 +49847,29 @@ index 0000000..eb88b6e
 +    // [38.9.11.2] key frames keep one resolution per mode: a governor level change no longer re-renders both keys at another
 +    // size (a visible pop / blur flash); the key path costs ≈ 1 shader frame per key anyway. 雨 / 雪 (live path) still degrade.
 +    val div = if (WeatherSky.legacySky) SkyModeCore.skyDiv(mode, level) else SkyModeCore.skyDiv(mode, 0)
-+    if (k.scene != s || k.dark != dark || k.chat != chat || k.w != w || k.h != h || k.div != div || k.blur != mp.blurPx || k.calm != mp.calm || k.hq != mp.hq) {
-+        k.scene = s; k.dark = dark; k.chat = chat; k.w = w; k.h = h; k.div = div; k.blur = mp.blurPx; k.calm = mp.calm; k.hq = mp.hq; k.reset()
++    val margin = if (WeatherSky.legacySky || WeatherSky.legacyDrift) 0f else SkyModeCore.marginUnits(s.key, mode, chat)
++    if (k.scene != s || k.dark != dark || k.chat != chat || k.w != w || k.h != h || k.div != div || k.blur != mp.blurPx || k.calm != mp.calm || k.hq != mp.hq || k.margin != margin) {
++        k.scene = s; k.dark = dark; k.chat = chat; k.w = w; k.h = h; k.div = div; k.blur = mp.blurPx; k.calm = mp.calm; k.hq = mp.hq; k.margin = margin; k.reset()
 +    }
 +    val qw = kotlin.math.ceil(w / div).toInt().coerceAtLeast(1); val qh = kotlin.math.ceil(h / div).toInt().coerceAtLeast(1)
++    // [38.9.11.3] side margin in key pixels (the shader's 270 units span qw)
++    val mq = kotlin.math.ceil(margin * qw / 270f).toInt(); k.mq = mq
 +    val still = !animating
++    // [38.9.11.3] a still frame (关闭 / battery saver / governor on 雨雪 / held page) right after the sky moved re-draws the exact
++    // last composite — 38.9.11.2 switched to the single nearest key, a 4.5–6.2 % brightness jump
++    if (still && !WeatherSky.forceStatic && !WeatherSky.legacySky && k.lastValid && (0..2).all { j -> k.lastSlot[j] in 0..2 && k.t[k.lastSlot[j]] == k.lastKt[j] }) {
++        for (j in 0..2) {
++            val n = k.sky[k.lastSlot[j]] as? android.graphics.RenderNode ?: continue
++            val a = if (j == 0) alpha else alpha * k.lastAl[j]
++            if (a <= 0.003f) continue
++            n.alpha = a
++            nc.save(); nc.translate(k.lastDx[j], 0f); nc.scale(w / qw, h / qh); nc.translate(-mq.toFloat(), 0f); nc.drawRenderNode(n); nc.restore()
++            val n3 = k.p2[k.lastSlot[j]] as? android.graphics.RenderNode
++            if (n3 != null && g.pass2(s) != null) { n3.alpha = a; nc.save(); nc.scale(w / n3.width, h / n3.height); nc.drawRenderNode(n3); nc.restore() }
++        }
++        WeatherSky.lastShot = "v7.3 held-exact ${s.key} ${mode.key}"
++        return
++    }
 +    val step = SkyModeCore.keyMs(mode, chat)
 +    // a still page: the smoke's forced instant › a live 关闭 page = the minute's key › a held page (home under the chat)
 +    // keeps the newest key it already has (no re-render)
@@ -49170,11 +49898,13 @@ index 0000000..eb88b6e
 +        val n = (k.sky[i] as? android.graphics.RenderNode) ?: android.graphics.RenderNode("mines-skykey-$slot-$i").also { k.sky[i] = it }
 +        n.setRenderEffect(android.graphics.RenderEffect.createBlurEffect(mp.blurPx, mp.blurPx, android.graphics.Shader.TileMode.CLAMP))
 +        n.setUseCompositingLayer(true, null)
-+        n.setPosition(0, 0, qw, qh)
++        n.setPosition(0, 0, qw + 2 * mq, qh)
 +        val sh = g.sky(s)
 +        g.uniforms(sh, s, dark, chat, qw.toFloat(), qh.toFloat(), tt, ct, mp.calm, mp.hq)
-+        val rc = n.beginRecording(qw, qh)
-+        try { g.paint.shader = sh; rc.drawPaint(g.paint) } finally { g.paint.shader = null; n.endRecording() }
++        // [38.9.11.3] the key is rendered mq px wider on both sides (the shader's coordinates continue past the screen edge)
++        val rc = n.beginRecording(qw + 2 * mq, qh)
++        try { rc.translate(mq.toFloat(), 0f); g.paint.shader = sh; rc.drawPaint(g.paint) } finally { g.paint.shader = null; n.endRecording() }
++        k.ct[i] = ct
 +        val p2 = g.pass2(s)
 +        if (p2 != null) {
 +            val d2 = SkyPerfCore.pass2Div(level)
@@ -49189,11 +49919,11 @@ index 0000000..eb88b6e
 +        k.t[i] = tk
 +        WeatherSky.keyRenders++
 +    }
-+    fun put(i: Int, a: Float) {
++    fun put(i: Int, a: Float, dx: Float = 0f) {
 +        if (a <= 0.003f) return
 +        val n = k.sky[i] as? android.graphics.RenderNode ?: return
 +        n.alpha = a
-+        nc.save(); nc.scale(w / qw, h / qh); nc.drawRenderNode(n); nc.restore()
++        nc.save(); nc.translate(dx, 0f); nc.scale(w / qw, h / qh); nc.translate(-mq.toFloat(), 0f); nc.drawRenderNode(n); nc.restore()
 +        val n3 = k.p2[i] as? android.graphics.RenderNode
 +        if (n3 != null && g.pass2(s) != null) {
 +            n3.alpha = a
@@ -49212,7 +49942,13 @@ index 0000000..eb88b6e
 +            val free = k.t.indices.first { i -> i !in slot.toList() && k.t[i] !in need }
 +            render(free, need[j]); slot[j] = free
 +        }
-+        put(slot[0], alpha); put(slot[1], alpha * al[1]); put(slot[2], alpha * al[2])
++        // [38.9.11.3] each key slides by the drift since its cloud time → the mist floats instead of dissolving in place
++        val nowCt = if (margin > 0f) WeatherSky.cloudPeek(t) else 0f
++        val dx = FloatArray(3) { j -> if (margin > 0f) SkyModeCore.shiftPx(s.key, nowCt, k.ct[slot[j]], w, margin) else 0f }
++        put(slot[0], alpha, dx[0]); put(slot[1], alpha * al[1], dx[1]); put(slot[2], alpha * al[2], dx[2])
++        for (j in 0..2) { k.lastSlot[j] = slot[j]; k.lastKt[j] = k.t[slot[j]]; k.lastDx[j] = dx[j] }
++        k.lastAl[0] = 1f; k.lastAl[1] = al[1]; k.lastAl[2] = al[2]; k.lastValid = true
++        WeatherSky.lastDrift = "dx=${"%.1f".format(dx[0])}/${"%.1f".format(dx[1])}/${"%.1f".format(dx[2])} ct=${"%.2f".format(nowCt)}"
 +        WeatherSky.lastShot = "v7.2 key3 ${s.key} t=${"%.1f".format(t)} keys=${need[0] / 1000f}..${need[2] / 1000f} u=${"%.2f".format(u)} ${mode.key}${s.pass2?.let { " +$it" } ?: ""}"
 +        return
 +    }
@@ -57313,6 +58049,126 @@ index 0000000..95c4fa3
 +        assertEquals("c", ProviderMergeCore.pick(pool, -1))
 +    }
 +}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/ProviderRouteCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/ProviderRouteCoreTest.kt
+new file mode 100644
+index 0000000..f4f415f
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/ProviderRouteCoreTest.kt
+@@ -0,0 +1,114 @@
++package com.openminis.app.plus
++
++import com.openminis.app.plus.ProviderRouteCore.Fail
++import com.openminis.app.plus.ProviderRouteCore.Next
++import com.openminis.app.plus.ProviderRouteCore.Route
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import java.io.File
++
++/** [Mines-38.9.11.3] provider routes: China direct / foreign via proxy, remembered fallback, fast failover, timeouts. */
++class ProviderRouteCoreTest {
++    private val now = 10_000_000L
++
++    @Test fun chinaHostsGoDirectFirst() {
++        for (h in listOf("token.sensenova.cn", "developer.amd.com.cn", "api.deepseek.com", "api.moonshot.cn", "open.bigmodel.cn",
++            "api.siliconflow.cn", "dashscope.aliyuncs.com", "ark.cn-beijing.volces.com", "qianfan.baidubce.com", "apihub.agnes-ai.com"))
++            assertEquals(h, listOf(Route.DIRECT, Route.PROXY), ProviderRouteCore.order(h, null, now, proxyAvailable = true))
++    }
++
++    @Test fun foreignHostsGoThroughTheProxyFirst() {
++        for (h in listOf("api.openai.com", "api.anthropic.com", "generativelanguage.googleapis.com", "openrouter.ai", "api.x.ai", "api.groq.com"))
++            assertEquals(h, listOf(Route.PROXY, Route.DIRECT), ProviderRouteCore.order(h, null, now, proxyAvailable = true))
++        // the 中转 / unknown hosts: direct first (no proxy forced on them)
++        assertEquals(listOf(Route.DIRECT, Route.PROXY), ProviderRouteCore.order("relay.example.net", null, now, true))
++    }
++
++    @Test fun noProxyOrLocalMeansDirectOnly() {
++        assertEquals(listOf(Route.DIRECT), ProviderRouteCore.order("api.openai.com", null, now, proxyAvailable = false))
++        for (h in listOf("127.0.0.1", "10.0.2.2", "192.168.1.5", "localhost", "100.100.1.2"))
++            assertEquals(h, listOf(Route.DIRECT), ProviderRouteCore.order(h, null, now, true))
++    }
++
++    @Test fun memoryWinsAndFailedRouteGoesLast() {
++        // sensenova worked through the proxy last time → proxy first for 30 min
++        val m = ProviderRouteCore.recordOk(null, Route.PROXY, 120, now)
++        assertEquals(listOf(Route.PROXY, Route.DIRECT), ProviderRouteCore.order("token.sensenova.cn", m, now + 60_000, true))
++        assertEquals(listOf(Route.DIRECT, Route.PROXY), ProviderRouteCore.order("token.sensenova.cn", m, now + ProviderRouteCore.OK_TTL_MS + 1, true))
++        // openai: the proxy (dead Clash) failed → direct first for 5 min
++        val f = ProviderRouteCore.recordFail(null, Route.PROXY, now)
++        assertEquals(listOf(Route.DIRECT, Route.PROXY), ProviderRouteCore.order("api.openai.com", f, now + 1000, true))
++        assertEquals(listOf(Route.PROXY, Route.DIRECT), ProviderRouteCore.order("api.openai.com", f, now + ProviderRouteCore.FAIL_TTL_MS + 1, true))
++        // a remembered route that then fails is dropped
++        val m2 = ProviderRouteCore.recordFail(m, Route.PROXY, now + 10)
++        assertEquals(null, m2.okRoute)
++    }
++
++    @Test fun bothDownFailsFastForAMinute() {
++        var m = ProviderRouteCore.recordFail(null, Route.DIRECT, now)
++        assertFalse(ProviderRouteCore.bothDownRecently(m, now + 10, true))
++        m = ProviderRouteCore.recordFail(m, Route.PROXY, now + 20)
++        assertTrue(ProviderRouteCore.bothDownRecently(m, now + 30, true))
++        assertFalse(ProviderRouteCore.bothDownRecently(m, now + 20 + ProviderRouteCore.BOTH_DOWN_MS + 1, true))
++        assertTrue(ProviderRouteCore.bothDownRecently(ProviderRouteCore.recordFail(null, Route.DIRECT, now), now + 5, proxyAvailable = false))
++        assertFalse(ProviderRouteCore.bothDownRecently(ProviderRouteCore.recordOk(m, Route.DIRECT, 50, now + 40), now + 50, true))
++    }
++
++    @Test fun probePicksTheRouteThatAnswered() {
++        assertEquals(Route.DIRECT, ProviderRouteCore.pickByProbe(300, null))
++        assertEquals(Route.PROXY, ProviderRouteCore.pickByProbe(null, 400))
++        assertEquals(null, ProviderRouteCore.pickByProbe(null, null))
++        assertEquals(Route.DIRECT, ProviderRouteCore.pickByProbe(500, 300))          // direct wins near-ties
++        assertEquals(Route.PROXY, ProviderRouteCore.pickByProbe(2500, 300))          // proxy clearly faster
++        assertEquals(Route.PROXY, ProviderRouteCore.pickByProbe(300, 500, preferProxy = true))
++        assertTrue(ProviderRouteCore.needsProbe("token.sensenova.cn", null, now, true))
++        assertFalse(ProviderRouteCore.needsProbe("token.sensenova.cn", null, now, false))
++        assertFalse(ProviderRouteCore.needsProbe("token.sensenova.cn", ProviderRouteCore.recordOk(null, Route.DIRECT, 80, now), now + 1000, true))
++    }
++
++    @Test fun timeoutsAreSeparateAndBounded() {
++        assertEquals(10_000L, ProviderRouteCore.CONNECT_MS)
++        assertTrue(ProviderRouteCore.firstTokenMs(false) in 30_000L..60_000L)
++        assertTrue(ProviderRouteCore.firstTokenMs(true) > ProviderRouteCore.firstTokenMs(false))
++        // a dead first route costs ≤ 10 s before the second is tried (was: up to the 60 s chat deadline)
++        assertTrue(ProviderRouteCore.CONNECT_MS + ProviderRouteCore.PROBE_MS < 15_000L)
++        assertEquals(2 * ProviderRouteCore.CONNECT_MS + ProviderRouteCore.PROBE_MS + ProviderRouteCore.firstTokenMs(false), ProviderRouteCore.silentBudgetMs(false))
++    }
++
++    @Test fun failoverDecisions() {
++        assertEquals(Fail.CONNECT, ProviderRouteCore.classify("连不上 token.sensenova.cn：直连不通"))
++        assertEquals(Fail.CONNECT, ProviderRouteCore.classify("failed to connect to /127.0.0.1:7890"))
++        assertEquals(Fail.FIRST_TOKEN, ProviderRouteCore.classify("60 秒没有任何回应"))
++        assertEquals(Fail.RATE, ProviderRouteCore.classify("x", 429))
++        assertEquals(Fail.AUTH, ProviderRouteCore.classify("x", 401))
++        assertEquals(Fail.SERVER, ProviderRouteCore.classify("x", 503))
++        assertEquals(Next.OTHER_ROUTE, ProviderRouteCore.next(Fail.CONNECT, routesLeft = 1, keysLeft = 4))
++        assertEquals(Next.NEXT_PROVIDER, ProviderRouteCore.next(Fail.CONNECT, routesLeft = 0, keysLeft = 4))   // keys share the host
++        assertEquals(Next.NEXT_KEY, ProviderRouteCore.next(Fail.RATE, 0, 2))
++        assertEquals(Next.NEXT_PROVIDER, ProviderRouteCore.next(Fail.FIRST_TOKEN, 1, 0))
++    }
++
++    @Test fun statusLine() {
++        assertEquals("正在连接 token.sensenova.cn（直连）", ProviderRouteCore.statusText(ProviderRouteCore.Phase.CONNECTING, "token.sensenova.cn", Route.DIRECT, 900))
++        assertEquals("正在连接 api.openai.com（代理） 3 秒", ProviderRouteCore.statusText(ProviderRouteCore.Phase.CONNECTING, "api.openai.com", Route.PROXY, 3200))
++        assertEquals("正在思考 12 秒", ProviderRouteCore.statusText(ProviderRouteCore.Phase.THINKING, "x", Route.DIRECT, 12_400))
++        assertEquals("", ProviderRouteCore.statusText(ProviderRouteCore.Phase.IDLE, "x", null, 0))
++        val t = ProviderRouteCore.bothFailedText("api.x.cn", "10 秒没连上", "10 秒没连上", true)
++        assertTrue(t, t.contains("直连") && t.contains("代理") && t.contains("换下一个"))
++    }
++
++    /** the provider clients really use the routes (source wiring) */
++    @Test fun wiring() {
++        fun f(p: String) = listOf(File(p), File("app/$p")).first { it.exists() }.readText()
++        val oa = f("src/main/java/com/openminis/app/provider/openai/OpenAIProvider.kt")
++        assertTrue(oa.contains("ProviderRoutes.plan(rHost, rPort)") && oa.contains("ProviderRoutes.proxyFor(route)") && oa.contains("acquiredAtNanos"))
++        assertTrue(oa.contains("connectTimeout(com.openminis.app.plus.ProviderRouteCore.CONNECT_MS"))
++        for (p in listOf("src/main/java/com/openminis/app/provider/anthropic/AnthropicProvider.kt", "src/main/java/com/openminis/app/provider/gemini/GeminiProvider.kt"))
++            assertTrue(p, f(p).contains("proxySelector(com.openminis.app.plus.ProviderRoutes.selector)"))
++        val vm = f("src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt")
++        assertTrue(vm.contains("ProviderRouteCore.silentBudgetMs("))
++        assertTrue(f("src/main/java/com/openminis/app/ui/chat/ChatIndicators.kt").contains("ProviderRoutes.status"))
++    }
++}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/RainSkyCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/RainSkyCoreTest.kt
 new file mode 100644
 index 0000000..4110d5a
@@ -58030,10 +58886,10 @@ index 0000000..3ecce48
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/SkyFreezeCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/SkyFreezeCoreTest.kt
 new file mode 100644
-index 0000000..71b72f4
+index 0000000..65832d1
 --- /dev/null
 +++ b/src/android/app/src/test/java/com/openminis/app/plus/SkyFreezeCoreTest.kt
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,62 @@
 +package com.openminis.app.plus
 +
 +import org.junit.Assert.assertEquals
@@ -58058,6 +58914,19 @@ index 0000000..71b72f4
 +        assertEquals("", SkyFreezeCore.reason(S.copy(lastInputMs = now - 1000), now))
 +        assertEquals(1, SkyFreezeCore.otherServices(listOf("com.openminis.mines.plus", "com.realme.qzai", ""), "com.openminis.mines.plus"))
 +        assertEquals(0, SkyFreezeCore.otherServices(listOf("com.openminis.mines.plus"), "com.openminis.mines.plus"))
++    }
++
++    /** [38.9.11.3] user: the sky never stops — with Q仔 (an a11y service) on, while recording, touching, split screen … */
++    @Test fun neverHolds() {
++        val now = 100_000L
++        for (sig in listOf(S.copy(otherA11yServices = 1), S.copy(touchExploration = true), S.copy(screenRecording = true),
++            S.copy(screenshotAtMs = now - 500), S.copy(multiWindow = true), S.copy(windowFocused = false), S.copy(lastInputMs = now - 10))) {
++            val r = SkyFreezeCore.reason(sig, now)
++            assertTrue("diagnostic reason for $sig", r.isNotEmpty())
++            assertEquals("sky must keep moving: $r", false, SkyFreezeCore.holds(r, legacyReplay = false))
++            assertEquals(true, SkyFreezeCore.holds(r, legacyReplay = true))   // smoke before-recording only
++        }
++        assertEquals(false, SkyFreezeCore.holds("", legacyReplay = true))
 +    }
 +
 +    @Test fun bsplineIsC1AcrossKeys() {
@@ -58085,10 +58954,10 @@ index 0000000..71b72f4
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/SkyModeCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/SkyModeCoreTest.kt
 new file mode 100644
-index 0000000..ae98ce4
+index 0000000..120ae12
 --- /dev/null
 +++ b/src/android/app/src/test/java/com/openminis/app/plus/SkyModeCoreTest.kt
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,100 @@
 +package com.openminis.app.plus
 +
 +import com.openminis.app.plus.SkyModeCore.Mode
@@ -58164,6 +59033,29 @@ index 0000000..ae98ce4
 +        val chat = r.enter(); assertTrue(r.isLive(chat)); assertFalse(r.isLive(home))
 +        r.leave(chat); assertTrue(r.isLive(home))
 +        r.leave(home); assertEquals(0, r.size()); assertEquals(0L, r.live())
++    }
++
++    /** [38.9.11.3] 云雾 really floats: keys slide by the drift, margins cover the worst shift, 晴 / 夜 untouched */
++    @Test fun fogDriftShift() {
++        assertTrue(SkyModeCore.driftUps("fog") < 0f && SkyModeCore.driftUps("cloudy") < 0f && SkyModeCore.driftUps("overcast") < 0f)
++        assertEquals(0f, SkyModeCore.driftUps("sunny"), 0f); assertEquals(0f, SkyModeCore.driftUps("night"), 0f)
++        assertEquals(0f, SkyModeCore.marginUnits("sunny", Mode.SMOOTH, false), 0f)
++        for (m in listOf(Mode.SMOOTH, Mode.RICH)) for (chat in listOf(false, true)) {
++            val mg = SkyModeCore.marginUnits("fog", m, chat)
++            // worst case: oldest key (2 steps) at the fastest effective rate stays inside the margin (no edge shows)
++            val worst = kotlin.math.abs(SkyModeCore.driftUps("fog")) * WindDriftCore.MAX_RATE * 2f * SkyModeCore.keyMs(m, chat) / 1000f
++            assertTrue("$m chat=$chat margin $mg vs $worst", mg >= worst || mg == 90f)
++        }
++        // an older key moves left-to-right back into place: shift is positive... direction: older key (smaller ct) → negative dx
++        val w = 1080f
++        val older = SkyModeCore.shiftPx("fog", nowCt = 100f, keyCt = 99f, widthPx = w, marginUnits = 60f)
++        val newer = SkyModeCore.shiftPx("fog", nowCt = 100f, keyCt = 100.5f, widthPx = w, marginUnits = 60f)
++        assertTrue(older < 0f && newer > 0f)
++        assertEquals(SkyModeCore.driftUps("fog") * w / 270f, older, 1e-3f)
++        assertEquals(60f * w / 270f, SkyModeCore.shiftPx("fog", 0f, 1000f, w, 60f), 1e-3f)   // clamped to the margin
++        // visible but slow: at the floor rate the mid fog layer crosses the screen in 25–90 s
++        val crossS = 270f / (kotlin.math.abs(SkyModeCore.driftUps("fog")) * WindDriftCore.VISIBLE_MIN)
++        assertTrue("fog crosses in $crossS s", crossS in 25f..90f)
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/SkyPerfCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/SkyPerfCoreTest.kt
@@ -58379,10 +59271,10 @@ index 0000000..454e41c
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/SshNetCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/SshNetCoreTest.kt
 new file mode 100644
-index 0000000..b96b2af
+index 0000000..16ca47b
 --- /dev/null
 +++ b/src/android/app/src/test/java/com/openminis/app/plus/SshNetCoreTest.kt
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,54 @@
 +package com.openminis.app.plus
 +
 +import com.openminis.app.plus.SshNetCore.Route
@@ -58410,6 +59302,23 @@ index 0000000..b96b2af
 +        assertTrue("ssh-ed25519" in SshNetCore.PUBKEY_ALGOS.split(',') && "rsa-sha2-512" in SshNetCore.PUBKEY_ALGOS.split(','))
 +        assertEquals("com.jcraft.jsch.bc.SignatureEd25519", SshNetCore.GLOBAL["ssh-ed25519"])
 +        assertTrue(SshNetCore.KEX.startsWith("curve25519-sha256"))
++    }
++
++    /** [38.9.11.3] InstaBox offers only ssh-ed25519-cert-v01@openssh.com (negotiation failed with 0.2.21) */
++    @Test fun hostCertificates() {
++        val hk = SshNetCore.SERVER_HOST_KEY.split(',')
++        for (c in listOf("ssh-ed25519-cert-v01@openssh.com", "rsa-sha2-512-cert-v01@openssh.com", "rsa-sha2-256-cert-v01@openssh.com", "ecdsa-sha2-nistp256-cert-v01@openssh.com"))
++            assertTrue("server_host_key has $c", c in hk)
++        // plain keys before certificates (servers offering both keep their pinned plain-key fingerprint)
++        assertTrue(hk.indexOf("rsa-sha2-256") < hk.indexOf("ssh-ed25519-cert-v01@openssh.com"))
++        // the negotiation InstaBox needs: first client entry the server also offers
++        val server = listOf("ssh-ed25519-cert-v01@openssh.com")
++        assertEquals("ssh-ed25519-cert-v01@openssh.com", hk.firstOrNull { it in server })
++        assertEquals("yes", SshNetCore.GLOBAL["host_certificate_to_key_fallback"])
++        fun f(vararg c: String) = c.map { File(it) }.first { it.exists() }.readText()
++        val gradle = f("build.gradle.kts", "app/build.gradle.kts")
++        val v = Regex("com.github.mwiede:jsch:(\\d+)\\.(\\d+)").find(gradle)!!.groupValues
++        assertTrue("JSch with OpenSSH certificate support (>= 2.27)", v[1].toInt() > 2 || (v[1].toInt() == 2 && v[2].toInt() >= 27))
 +    }
 +
 +    @Test fun wiring() {
@@ -59129,10 +60038,10 @@ index 0000000..ccfc5fe
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/WindDriftCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/WindDriftCoreTest.kt
 new file mode 100644
-index 0000000..504da1e
+index 0000000..6f18f75
 --- /dev/null
 +++ b/src/android/app/src/test/java/com/openminis/app/plus/WindDriftCoreTest.kt
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,114 @@
 +package com.openminis.app.plus
 +
 +import org.junit.Assert.assertEquals
@@ -59237,6 +60146,14 @@ index 0000000..504da1e
 +        val c = WindDriftCore.Clock(); c.legacy = true
 +        c.advance(100f, 0.5f); val b = c.advance(101.2f, 0.5f)
 +        assertEquals(b, c.advance(100f, 0.5f), 1e-4f)
++    }
++
++    /** [38.9.11.3] 「云雾基本不动」: the effective rate never drops below the visible floor, never above the max */
++    @Test fun visibleFloor() {
++        assertEquals(WindDriftCore.VISIBLE_MIN, WindDriftCore.effective(WindDriftCore.targetRate(0.0), 0.6f), 1e-6f)
++        assertEquals(WindDriftCore.VISIBLE_MIN, WindDriftCore.effective(WindDriftCore.targetRate(null), 0.6f), 1e-6f)
++        assertEquals(0.6f, WindDriftCore.effective(WindDriftCore.targetRate(15.0), 0.6f), 1e-6f)
++        assertTrue(WindDriftCore.effective(5f, 5f) <= WindDriftCore.MAX_RATE)
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/WorkflowLogCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/WorkflowLogCoreTest.kt
