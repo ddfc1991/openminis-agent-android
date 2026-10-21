@@ -6753,7 +6753,7 @@ def perf_transitions_39113(tag, chat_node):
                 if len(v) >= len(hdr):
                     d = dict(zip(hdr, v))
                     try:
-                        if int(d["Flags"]) != 0: continue
+                        if int(d["Flags"]) & 0x1: continue   # skip only WINDOW_VISIBILITY_CHANGED; first-draw / slow frames stay
                         iv, fc = int(d["IntendedVsync"]), int(d["FrameCompleted"])
                         if fc > iv > 0: rows.append((fc - iv) / 1e6)
                     except Exception: pass
@@ -6770,8 +6770,11 @@ def perf_transitions_39113(tag, chat_node):
     cfg = PERFETTO_CFG_39113.replace("%PKG%", PKG).replace("%DUR%", str(dur))
     trace = f"/data/misc/perfetto-traces/mines-{tag}.pftrace"
     sh(f"rm -f {trace}")
-    pf = subprocess.Popen(["adb", "shell", "perfetto", "--txt", "-c", "-", "-o", trace], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    pf.stdin.write(cfg); pf.stdin.close()
+    open("/tmp/pf39113.pbtxt", "w").write(cfg); adb("push", "/tmp/pf39113.pbtxt", "/data/local/tmp/pf39113.pbtxt")
+    # config through stdin (Android 12+: traced cannot read a file in /data/local/tmp); --background prints the pid and detaches
+    pfo = sh(f"cat /data/local/tmp/pf39113.pbtxt | perfetto --txt -c - -o {trace} --background 2>&1", timeout=60)
+    print("perfetto start:", pfo.strip()[-500:], flush=True)
+    m = re.findall(r"^\s*(\d+)\s*$", pfo, re.M); pfpid = m[-1] if m else None
     time.sleep(4)
     def one(name, action):
         sh(f"dumpsys gfxinfo {PKG} reset"); time.sleep(0.5)
@@ -6789,10 +6792,12 @@ def perf_transitions_39113(tag, chat_node):
         one(f"settings_back{rep}", lambda: (sh("input keyevent KEYCODE_BACK"), True)[1])
         one(f"chat_back_home{rep}", lambda: (sh("input keyevent KEYCODE_BACK"), True)[1])
         go_home(); time.sleep(2)
-    time.sleep(1); sh("pkill -TERM -x perfetto")   # stop early: perfetto writes the trace on SIGTERM
-    try: out, _ = pf.communicate(timeout=90)
-    except Exception: pf.kill(); out = "killed"
-    print("perfetto:", (out or "")[-400:], flush=True)
+    time.sleep(1)
+    print("perfetto stop:", sh(f"kill -TERM {pfpid} 2>&1" if pfpid else "pkill -TERM -x perfetto 2>&1"), flush=True)   # SIGTERM = flush + write
+    for _ in range(40):
+        if not sh("pidof perfetto").strip(): break
+        time.sleep(1)
+    print("perfetto trace:", sh(f"ls -la {trace} 2>&1"), flush=True)
     name = f"perf-{tag}.pftrace"
     print(adb("pull", trace, f"{OUT}/{name}"), flush=True)
     T["trace"] = name if os.path.exists(f"{OUT}/{name}") else None
@@ -7042,9 +7047,56 @@ def b39113(res):
     step("ledger", ledger)
     step("crash", crash)
     step("errzh", errzh)
+
+    def stress():
+        # [38.9.11.3 f] user 15:43: crashes on the phone → rapid page switching, chat open/close, rotation, background/foreground,
+        # process death in background, then a seeded monkey run inside Mines. Counts FATAL / ANR from the crash buffer + logcat.
+        theme388(1); healthy_home()
+        sh("logcat -b crash -c"); t0 = sh("date +%s").strip(); st = {"loops": 0, "dead": 0, "notes": []}
+        def chat_row():
+            for t, d, x, y, n in nodes(dump()):
+                if any(k in (t + d) for k in ("GARBAGETEST", "你好，我是测试模型", "hello")) and y > 300: return (x, y)
+        sh("settings put system accelerometer_rotation 0")
+        for i in range(12):
+            c = chat_row()
+            if c: sh(f"input tap {c[0]} {c[1]}"); time.sleep(0.6)
+            sh("input keyevent KEYCODE_BACK"); time.sleep(0.3)
+            if c: sh(f"input tap {c[0]} {c[1]}"); time.sleep(0.25); sh("input keyevent KEYCODE_BACK"); time.sleep(0.25)   # open/close mid-transition
+            selftest("route", ["settings", "plus_digest", "providers", "plus_knowledge"][i % 4], timeout=20); time.sleep(0.4)
+            sh("input keyevent KEYCODE_BACK"); time.sleep(0.3)
+            if i % 3 == 0:
+                sh("settings put system user_rotation 1"); time.sleep(1.2); sh("settings put system user_rotation 0"); time.sleep(1.2)
+            if i % 4 == 1:
+                sh("input keyevent KEYCODE_HOME"); time.sleep(0.8)
+                sh(f"monkey -p {PKG} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1"); time.sleep(1.5)
+            if i % 6 == 5:   # process death while in the background, then restore
+                sh("input keyevent KEYCODE_HOME"); time.sleep(0.8); sh(f"am kill {PKG}"); time.sleep(0.8)
+                sh(f"monkey -p {PKG} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1"); time.sleep(3)
+            st["loops"] += 1
+            if not alive(): st["dead"] += 1; st["notes"].append(f"not alive after loop {i}"); relaunch(); time.sleep(3)
+        sh("settings put system user_rotation 0")
+        shot("stress-after-loops")
+        # seeded monkey inside Mines (no system keys, no app switches; nav + touch + motion)
+        mk = sh(f"monkey -p {PKG} -s 39113 --throttle 120 --pct-syskeys 0 --pct-appswitch 0 --pct-anyevent 0 --ignore-security-exceptions -v 1200 2>&1 | tail -5", timeout=600)
+        st["monkey_tail"] = mk.strip()[-400:]
+        st["monkey_crash"] = ("CRASH" in mk) or ("Monkey aborted" in mk and "crash" in mk.lower())
+        st["monkey_anr"] = "NOT RESPONDING" in mk
+        sh("settings put system user_rotation 0")
+        if not alive(): relaunch(); time.sleep(4)
+        cb = adb("logcat", "-d", "-v", "threadtime", "-b", "crash", timeout=60)
+        st["fatal"] = cb.count("FATAL EXCEPTION"); st["crash_buffer"] = cb[-3000:]
+        an = sh(f"logcat -d -t '{t0}.000' -b main,system | grep -c 'ANR in {PKG}'").strip() if t0.isdigit() else "?"
+        st["anr"] = an
+        o["stress"] = st; print("I39113 STRESS", json.dumps(st, ensure_ascii=False)[:5000], flush=True)
+        shot("stress-end")
+        if st["fatal"] or st["monkey_crash"] or st["monkey_anr"] or (an.isdigit() and int(an) > 0):
+            selftest_fail.append(f"i39113 stress: fatal={st['fatal']} monkey_crash={st['monkey_crash']} anr={an}")
+        healthy_home()
+
     step("latency", latency)
     step("sky", sky)
     result_json("group", "i396 sky auto static", timeout=20)
+    if "stress" in (open("hark-build/smoke/target").read().splitlines()[1:2] or [""])[0]: step("stress", stress)
     print("I39113 RESULT " + json.dumps(o, ensure_ascii=False)[:14000], flush=True)
 
 
