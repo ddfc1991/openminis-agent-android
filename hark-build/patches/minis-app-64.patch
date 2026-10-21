@@ -1,5 +1,5 @@
 diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
-index e0c88bb..a15a988 100644
+index e0c88bb..03bfd8f 100644
 --- a/src/android/app/build.gradle.kts
 +++ b/src/android/app/build.gradle.kts
 @@ -38,8 +38,8 @@ android {
@@ -8,8 +8,8 @@ index e0c88bb..a15a988 100644
          targetSdk = 35
 -        versionCode = 35
 -        versionName = "1.21"
-+        versionCode = 51
-+        versionName = "1.23.11.3"
++        versionCode = 52
++        versionName = "1.23.11.3.1"
  
          testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
  
@@ -6001,10 +6001,10 @@ index 7660141..9949f04 100644
          // language settings (it did: every launch reset it, so system Settings → Apps → Mines → 语言 never stuck)
          if (code.isEmpty()) return
 diff --git a/src/android/app/src/main/java/com/openminis/app/MinisApp.kt b/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
-index e48d0e0..534baeb 100644
+index e48d0e0..737f113 100644
 --- a/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
-@@ -241,9 +241,31 @@ class MinisApp : Application(), ImageLoaderFactory {
+@@ -241,9 +241,32 @@ class MinisApp : Application(), ImageLoaderFactory {
      @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
      override fun onCreate() {
          super.onCreate()
@@ -6020,6 +6020,7 @@ index e48d0e0..534baeb 100644
          runCatching { com.openminis.app.plus.SplitProxy.init(this) }
 +        // [38.9.11.1] probe the local proxy ports (7890 / 7897 / 7899 / …) — only a port that passes is ever exported
 +        runCatching { com.openminis.app.plus.LocalProxy.init(this) }
++        runCatching { com.openminis.app.util.EncryptedPrefsFactory.prewarm(this, "oauth_prefs", "provider_secrets") }   // [38.9.11.3.1] off the main thread
 +        runCatching { com.openminis.app.plus.BadKeys.init(this) }   // [38.9.11.3] invalid-key marks (fingerprints), read off the main thread
 +        // [Mines-38.9.10 i29] memory guard (heap watch + trim + OOM summary), wired as i28 designed
 +        runCatching { com.openminis.app.plus.MemGuard.install(this) }
@@ -6036,7 +6037,7 @@ index e48d0e0..534baeb 100644
          runCatching { com.openminis.app.plus.ChatOrganizer.init(this) }
          runCatching { com.openminis.app.plus.SmartRouter.init(this) }
          // [T-android-content-capture-off] Opt every Compose window out of
-@@ -415,6 +437,8 @@ class MinisApp : Application(), ImageLoaderFactory {
+@@ -415,6 +438,8 @@ class MinisApp : Application(), ImageLoaderFactory {
          // and running before it would delay that decision for no gain.
          Thread {
              com.openminis.app.crash.ExitInfoCollector.collect(this)
@@ -6045,7 +6046,7 @@ index e48d0e0..534baeb 100644
          }.apply { isDaemon = true; name = "exit-info-collect" }.start()
  
          // Hard short-circuit: when checkAtLaunch flips safe-mode ON, skip
-@@ -776,6 +800,8 @@ class MinisApp : Application(), ImageLoaderFactory {
+@@ -776,6 +801,8 @@ class MinisApp : Application(), ImageLoaderFactory {
          // repository is up, on IO, and only at cold start: a restore happens
          // within a single app run, so it can never straddle this.
          kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
@@ -6054,7 +6055,7 @@ index e48d0e0..534baeb 100644
              runCatching {
                  com.openminis.app.data.session.OrphanChildSweeper.sweep(this@MinisApp, chatRepository)
              }.onFailure {
-@@ -783,6 +809,19 @@ class MinisApp : Application(), ImageLoaderFactory {
+@@ -783,6 +810,19 @@ class MinisApp : Application(), ImageLoaderFactory {
              }
          }
  
@@ -6074,7 +6075,7 @@ index e48d0e0..534baeb 100644
          // T180-bg-notif: background-settings + task-completion notifier.
          // The notifier is wired into SessionActivityTracker's completion
          // hook so any session whose stream finishes (success or error)
-@@ -1079,6 +1118,7 @@ class MinisApp : Application(), ImageLoaderFactory {
+@@ -1079,6 +1119,7 @@ class MinisApp : Application(), ImageLoaderFactory {
       */
      override fun onTrimMemory(level: Int) {
          super.onTrimMemory(level)
@@ -23937,6 +23938,38 @@ index 495166b..7e716b3 100644
      // ---- redaction ----
  
      private val secretPatterns = listOf(
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/OnceCache.kt b/src/android/app/src/main/java/com/openminis/app/plus/OnceCache.kt
+new file mode 100644
+index 0000000..261f03f
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/OnceCache.kt
+@@ -0,0 +1,26 @@
++package com.openminis.app.plus
++
++import java.util.concurrent.ConcurrentHashMap
++
++/**
++ * [38.9.11.3.1] Build-once cache: one build per key, a per-key lock (never one lock for all keys), a hit never takes a
++ * lock, and a failed build is not cached (the next call tries again). Used by EncryptedPrefsFactory so a credential
++ * check reads an already-open store instead of re-opening it through the Android Keystore every time.
++ */
++class OnceCache<V : Any> {
++    private val values = ConcurrentHashMap<String, V>()
++    private val locks = ConcurrentHashMap<String, Any>()
++
++    fun peek(key: String): V? = values[key]
++
++    fun get(key: String, build: () -> V): V {
++        values[key]?.let { return it }
++        val lock = locks.computeIfAbsent(key) { Any() }
++        synchronized(lock) {
++            values[key]?.let { return it }
++            val v = build()
++            values[key] = v
++            return v
++        }
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PartnerGateway.kt b/src/android/app/src/main/java/com/openminis/app/plus/PartnerGateway.kt
 new file mode 100644
 index 0000000..607ed43
@@ -37388,7 +37421,7 @@ index d99b975..72b0b68 100644
                  )
              }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
-index e0d0cae..424803d 100644
+index e0d0cae..7105e70 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
 @@ -89,6 +89,7 @@ import kotlinx.coroutines.flow.combine
@@ -37552,7 +37585,21 @@ index e0d0cae..424803d 100644
          }
          // Persist the current model binding so it survives re-entry
          val groupId = _selectedGroupId.value
-@@ -7470,6 +7562,7 @@ class ChatViewModel(
+@@ -6526,6 +6618,13 @@ class ChatViewModel(
+             // one; only a crossing that happens while the user is here counts.
+             // The glow still paints from `contextUsage`, so a heavy session
+             // looks heavy on open — it just does not interrupt.
++            // [38.9.11.3.1] the fixed share needs the tool list, whose vision check reads stored credentials (Android
++            // Keystore — seconds on some phones, and Tink serialises it behind one lock): work it out off the main thread
++            // so the publish below only does arithmetic. (ANR on realme RMX5062, 2026-10-21.)
++            if (contextFixedTokens == 0) runCatching {
++                val fixed = withContext(Dispatchers.IO) { ContextSizeMeter.estimateFixedTokens(buildSystemPrompt(), agentTools) }
++                if (contextFixedTokens == 0) contextFixedTokens = fixed
++            }
+             withContext(Dispatchers.Main) {
+                 _contextUsageHint.value = null
+                 // [T-ctx-measure-outbound] The glow's source was never reset on
+@@ -7470,6 +7569,7 @@ class ChatViewModel(
              val idx = if (currentIdx >= 0) (currentIdx + offset) % members.size else offset
              val entryId = members[idx]
              val entry = config.modelEntries.find { it.id == entryId } ?: continue
@@ -37560,7 +37607,7 @@ index e0d0cae..424803d 100644
              val instance = config.instances.find { it.id == entry.providerInstanceId } ?: continue
              if (!instance.isEnabled) continue
              // [T-android-group-resolve-skip-uncredentialed] Credential test via
-@@ -7546,6 +7639,7 @@ class ChatViewModel(
+@@ -7546,6 +7646,7 @@ class ChatViewModel(
              if (entryId == activeEntry) continue
              val entry = config.modelEntries.find { it.id == entryId } ?: continue
              if (entry.isHidden) continue
@@ -37568,7 +37615,7 @@ index e0d0cae..424803d 100644
              // Skip an entry that is merely the same model we just failed on.
              if (entry.model.id == primaryProvider.model.id &&
                  entry.providerInstanceId ==
-@@ -9058,7 +9152,9 @@ class ChatViewModel(
+@@ -9058,7 +9159,9 @@ class ChatViewModel(
          // [T-android-stop-sibling-subagent] New work in this session lifts the
          // stop: delegations from here on may drive the turn again.
          com.openminis.app.agent.jobs.AgentJobRegistry.clearDelegationMute(activeSessionId)
@@ -37579,7 +37626,7 @@ index e0d0cae..424803d 100644
      }
  
      /**
-@@ -9119,6 +9215,8 @@ class ChatViewModel(
+@@ -9119,6 +9222,8 @@ class ChatViewModel(
          // scheduled fire into an idle chat) reach this funnel without the
          // public sendMessage, and are new work too.
          com.openminis.app.agent.jobs.AgentJobRegistry.clearDelegationMute(activeSessionId)
@@ -37588,7 +37635,7 @@ index e0d0cae..424803d 100644
          // [T-android-paste-mediaref] `[Pasted#N]` markers are NOT expanded here
          // any more.
          //
-@@ -9514,6 +9612,27 @@ class ChatViewModel(
+@@ -9514,6 +9619,27 @@ class ChatViewModel(
       *  true at runAgentLoop ~4015) leaves the "Mines is thinking" indicator
       *  on screen even though streaming is over. The flag is per-message and
       *  is not implicitly cleared by isStreaming=false. */
@@ -37616,7 +37663,7 @@ index e0d0cae..424803d 100644
      private fun setInlineError(errorText: String) {
          // [T-error-persist-android] Never let an empty/blank error string reach
          // the banner. The UI gate is `message.error?.let { … }` — a non-null ""
-@@ -9521,10 +9640,15 @@ class ChatViewModel(
+@@ -9521,10 +9647,15 @@ class ChatViewModel(
          // would stick across reloads. An exception with a blank `message`
          // (`e.message ?: "Unknown error"` only guards null, not "") is the
          // realistic source. Coalesce to a generic non-empty message.
@@ -37633,7 +37680,7 @@ index e0d0cae..424803d 100644
          // T-streaming-side-channel: before mutating the canonical message,
          // drain any in-flight streaming delta so the error frame carries
          // the actual accumulated content (otherwise the user sees content
-@@ -9571,6 +9695,7 @@ class ChatViewModel(
+@@ -9571,6 +9702,7 @@ class ChatViewModel(
       * Mirrors iOS streamWithAutoRetry: `chatMessage?.error = desc` without dropping the loop.
       */
      private fun setTransientInlineError(errorText: String) {
@@ -37641,7 +37688,7 @@ index e0d0cae..424803d 100644
          val msgs = _messages.value.toMutableList()
          val lastAssistantIdx = msgs.indexOfLast { it.role == "assistant" }
          if (lastAssistantIdx < 0) return
-@@ -9581,6 +9706,7 @@ class ChatViewModel(
+@@ -9581,6 +9713,7 @@ class ChatViewModel(
  
      /** Clear any inline error on the last assistant message (used after successful retry). */
      private fun clearInlineError() {
@@ -37649,7 +37696,7 @@ index e0d0cae..424803d 100644
          val msgs = _messages.value.toMutableList()
          val lastAssistantIdx = msgs.indexOfLast { it.role == "assistant" }
          if (lastAssistantIdx < 0) return
-@@ -10763,6 +10889,12 @@ class ChatViewModel(
+@@ -10763,6 +10896,12 @@ class ChatViewModel(
          // [Mines-loop-34] same failing tool + same error 3× → stop; weak-model hint once per run
          val failGuard = com.openminis.app.agent.FailurePatternGuard()
          var weakModelHinted = false
@@ -37662,7 +37709,7 @@ index e0d0cae..424803d 100644
          turnLoop@ for (turn in 0 until turnCap) {
              // [T-android-switch-model-next-request] The user picked another
              // model while this turn ran. Apply it HERE, before the next
-@@ -11242,6 +11374,7 @@ class ChatViewModel(
+@@ -11242,6 +11381,7 @@ class ChatViewModel(
              val degen = com.openminis.app.agent.DegenerationDetector()
              var degenRetries = 0
              var degenForceFallback = false
@@ -37670,7 +37717,7 @@ index e0d0cae..424803d 100644
              var turnThinkingOverride: ThinkingLevel? = null
              while (!collectDone) {
                  try {
-@@ -11356,10 +11489,17 @@ class ChatViewModel(
+@@ -11356,10 +11496,17 @@ class ChatViewModel(
                              thinkingLevel = if (currentProvider.model.supportsReasoning == true) (turnThinkingOverride ?: _thinkingLevel.value) else ThinkingLevel.OFF,
                          )
                      }
@@ -37689,7 +37736,7 @@ index e0d0cae..424803d 100644
                      // [T-switch-model-retry-counter-reset] The retried attempt is
                      // producing output, so the ladder is done. isBoundToAbandonedModel()
                      // reads these counters; left set until the stream COMPLETES, a
-@@ -11803,6 +11943,7 @@ class ChatViewModel(
+@@ -11803,6 +11950,7 @@ class ChatViewModel(
                          // success, error, or cancellation — so it can never
                          // outlive its turn and spam the log.
                          firstChunkWatchdog.cancel()
@@ -37697,7 +37744,7 @@ index e0d0cae..424803d 100644
                          if (!firstChunkSeen.get()) {
                              println(
                                  "[T-STALL-DIAG] stream ENDED-WITHOUT-CHUNK sid=$diagSid turn=$turn " +
-@@ -12093,6 +12234,27 @@ class ChatViewModel(
+@@ -12093,6 +12241,27 @@ class ChatViewModel(
                          )
                          // Fall through: the user still gets the real reason.
                      }
@@ -37725,7 +37772,7 @@ index e0d0cae..424803d 100644
                      val isFallbackableError =
                          (actual as? com.openminis.app.data.model.LLMError)?.isFallbackable == true
                      // [T-ctx-overflow-no-cross-fallback] A context-length rejection
-@@ -12122,7 +12284,17 @@ class ChatViewModel(
+@@ -12122,7 +12291,17 @@ class ChatViewModel(
                          null
                      } else {
                          _activeEntryId.value?.let { triedEntryIds.add(it) }
@@ -37744,7 +37791,7 @@ index e0d0cae..424803d 100644
                              ?.also { triedEntryIds.add(it.entryId) }
                              ?: buildFallbackProviders(currentProvider)
                                  .firstOrNull { it.entryId !in triedEntryIds }
-@@ -12138,10 +12310,10 @@ class ChatViewModel(
+@@ -12138,10 +12317,10 @@ class ChatViewModel(
                      val next = nextCandidate?.provider
                      if (next != null && nextCandidate != null) {
                          val reason = when {
@@ -37757,7 +37804,7 @@ index e0d0cae..424803d 100644
                          // [T-android-model-indicator-flash-on-endpoint-retry]
                          // Same-model recovery is a TRANSPARENT retry, not a real
                          // model switch. A model group can hold several entries
-@@ -12227,7 +12399,8 @@ class ChatViewModel(
+@@ -12227,7 +12406,8 @@ class ChatViewModel(
                                  persistBinding("""{"type":"entry","entryId":"${newEntry.id}"}""")
                              }
                          }
@@ -37767,7 +37814,7 @@ index e0d0cae..424803d 100644
                          allToolBlocks.removeAll { it.kind == "info" }
                          allToolBlocks.add(0, AssistantBlock(
                              id = "fallback_info_$turn",
-@@ -12343,6 +12516,23 @@ class ChatViewModel(
+@@ -12343,6 +12523,23 @@ class ChatViewModel(
                  val turnParts = buildTurnParts(allToolBlocks, turnStartBlockIndex, toolInputMap)
                  val blockMeta = allToolBlocks.filter { it.kind == "tool_use" }.associateBy { it.id }
                  persistAssistantTurn(turnParts, lastUsage, turnReasoningContent, blockMeta, uiAssistantId = assistantId, streamMs = turnStreamMs)
@@ -37791,7 +37838,7 @@ index e0d0cae..424803d 100644
                  // [T-error-persist-android] Empty-response hint: the model ended a
                  // turn (finish=stop/end_turn) with no visible text anywhere in the
                  // reply and no tool blocks — the user just sees a blank bubble.
-@@ -12812,7 +13002,12 @@ class ChatViewModel(
+@@ -12812,7 +13009,12 @@ class ChatViewModel(
                          }
  
                          android.util.Log.d("ToolChain[VM]", "[turn=$turn] executeTool START name=$name args=${argsStr.take(200)}")
@@ -37804,7 +37851,7 @@ index e0d0cae..424803d 100644
                          android.util.Log.d("ToolChain[VM]", "[turn=$turn] executeTool END name=$name success=${result.success} title=${result.toolTitle} outputLen=${result.output.length} output=${result.output.take(200)}")
  
                          // Record post-execution. WARNING text is appended to the tool
-@@ -12853,7 +13048,7 @@ class ChatViewModel(
+@@ -12853,7 +13055,7 @@ class ChatViewModel(
                              } else {
                                  result.output
                              }
@@ -37813,7 +37860,7 @@ index e0d0cae..424803d 100644
                              // [T-truncated-args-visibility #119] A call built from
                              // truncated args must not render as a clean success — that
                              // silence is the reported bug. Show it with the same weight
-@@ -12945,6 +13140,62 @@ class ChatViewModel(
+@@ -12945,6 +13147,62 @@ class ChatViewModel(
                  .filterIsInstance<AgentContentPart.ToolResult>()
                  .firstNotNullOfOrNull { failGuard.onResult(it.name, it.isError, it.content) }
              if (failStop != null) AppLogger.warning(TAG_STREAM, "[FailGuard] turn=$turn $failStop")
@@ -37876,7 +37923,7 @@ index e0d0cae..424803d 100644
              // [Mines-loop-34] weak / flash model on a long tool run → one gentle hint to switch in 模型路由
              if (!weakModelHinted && helperConfig == null && runGuard.toolCalls >= 15 &&
                  com.openminis.app.plus.ModelHealth.isWeak(currentProvider.model.id, currentProvider.model.displayName)) {
-@@ -13244,12 +13495,19 @@ class ChatViewModel(
+@@ -13244,12 +13502,19 @@ class ChatViewModel(
  
      private suspend fun executeTool(
          name: String,
@@ -37897,7 +37944,7 @@ index e0d0cae..424803d 100644
          // T330: tri-state permission gating moved into the offload IPC
          // handler (OffloadGate). The CLIs land there whether the LLM
          // emitted a named tool call or a raw shell command, so the gate
-@@ -13294,6 +13552,13 @@ class ChatViewModel(
+@@ -13294,6 +13559,13 @@ class ChatViewModel(
                  // skill. The repository compares a directory signature in the
                  // background and only reloads when /var/minis/skills changed.
                  skillRepository?.requestReload("shell_execute")
@@ -37911,7 +37958,7 @@ index e0d0cae..424803d 100644
              }
              // [T-tools-granular-switches] Refuse a switched-off tool at the
              // dispatcher too, not only by omitting it from the schema: a model
-@@ -13355,6 +13620,19 @@ class ChatViewModel(
+@@ -13355,6 +13627,19 @@ class ChatViewModel(
                  kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.MinesSelfCheckTool.run(context, argsJson) }
              com.openminis.app.plus.KnowledgeBase.TOOL_NAME ->
                  kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.KnowledgeBase.runTool(context, argsJson) }
@@ -37931,7 +37978,7 @@ index e0d0cae..424803d 100644
              else -> ToolExecutionResult("Unknown tool: $name", false)
          }
      }
-@@ -15429,7 +15707,7 @@ CLI tools at /usr/local/bin with the `android-` prefix give you access to Androi
+@@ -15429,7 +15714,7 @@ CLI tools at /usr/local/bin with the `android-` prefix give you access to Androi
  - android-speech — microphone transcription (`listen [--language BCP47] [--max N] [--timeout SEC]`; `status`). Requires RECORD_AUDIO.
  - android-weather <latitude> <longitude> — Open-Meteo forecast (current + hourly + daily). No API key needed.
  - android-shizuku-cli — invoke privileged Android system APIs (package management, settings, system commands) via Shizuku when granted. Curated subcommands return structured JSON; for anything not covered, fall back to `android-shizuku-cli exec <any shell command>` which runs the command via `sh -c` with Shizuku privilege (same surface as `adb shell`). Run with no args (or --help) for the subcommand list.
@@ -37940,7 +37987,7 @@ index e0d0cae..424803d 100644
  - minis-open <url-or-path>: Opens a resource inside Minis without leaving the chat. Accepts http/https URLs (→ built-in WebKit preview) and chat-resource file paths under /var/minis/** (→ built-in file preview, routed by extension: images to the image viewer, .md to markdown preview, .html to HTML preview, .pdf/office docs to QuickLook, audio/video to the media player, else share sheet). Examples: minis-open https://example.com, minis-open /var/minis/workspace/report.md, minis-open /var/minis/attachments/chart.png. Prefer this over android-open for anything that can be previewed in-app so the user doesn't lose conversation context. Run android-open via shell_execute for non-web schemes (tel:, mailto:, geo:, intent:, etc.) or when the user explicitly wants the system handler.
  - minis-sessions-cli: Read chat history. `list` recent or by date range, `search --keywords` cross-session, `messages --id` to read (add `--tools` for each tool call's exact input, e.g. the shell command, and its output). Run --help for full options.
  - minis-model-use: Invoke other LLM models pre-configured by the user. Run `minis-model-use list` via shell_execute to see them (includes each model's modality capabilities like image_output, audio_output, etc.), `minis-model-use search <query>` to filter by name/provider. `minis-model-use run --model <id_or_name>` sends an OpenAI-compatible messages request; pass input via --input <json_file> or stdin, output goes to stdout or --output <path>. The OpenAI shape is the PRIMARY input for every model and modality; standard params are auto-converted to the underlying provider, so do not hand-write provider-native bodies as the primary input. For provider-specific extras the standard schema doesn't model (web-search plugins, image-to-image fields, TTS/video or other custom endpoints), escape hatches exist for OpenAI-compatible providers (they error or are ignored on Anthropic/Gemini models): `extra_body` (object merged verbatim into the request body), a custom `endpoint` path, and a top-level `passthrough` envelope for fully verbatim requests with RAW (unparsed) responses. Results may carry `warnings` (fields that were ignored/downgraded and why) and `applied_extras` (which extras actually took effect) — read them to self-correct. Run --help for the full contract before using these. Models may support multimodal output (image generation, TTS/audio, video) — check the modalities field in list output. For image_output models, pass generation params in the input JSON: top-level `n`/`size`/`quality`/`prompt` (OpenAI /images/generations style) or `generation_config.{aspect_ratio,image_size,number_of_images,person_generation}` (Gemini). Run with --help for full usage.${modelUseDelegateNote}
-@@ -15487,10 +15765,32 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15487,10 +15772,32 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
  
          return buildString {
              append(base)
@@ -37973,7 +38020,7 @@ index e0d0cae..424803d 100644
              if (mcpFragment != null) {
                  append("\n\n")
                  append(mcpFragment)
-@@ -15503,6 +15803,26 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15503,6 +15810,26 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                  append("\n\n")
                  append(dailyMemoryFragment)
              }
@@ -38000,7 +38047,7 @@ index e0d0cae..424803d 100644
              // Runtime context goes last so the prefix above stays byte-stable
              // across requests within the same day. Keep ordering deterministic
              // (date → tz → lang → model count) — any reorder defeats the cache.
-@@ -15854,11 +16174,69 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15854,11 +16181,69 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
              }
          }
  
@@ -38071,7 +38118,7 @@ index e0d0cae..424803d 100644
              append("<user-attached-files>\n")
              for (m in metas) {
                  val urlPath = m.linuxPath.removePrefix("/var/minis/")
-@@ -15874,6 +16252,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15874,6 +16259,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
              }
              append("</user-attached-files>")
          }
@@ -38079,7 +38126,7 @@ index e0d0cae..424803d 100644
  
          // Order matches UserAttachmentList convention: images first, then files.
          return PreparedAttachments(
-@@ -17072,6 +17451,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -17072,6 +17458,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
      }
  
      override fun onCleared() {
@@ -38088,7 +38135,7 @@ index e0d0cae..424803d 100644
          // [T-sub-agents-queue] Nothing can re-enter a queued delegation once
          // this view model is gone; leaving the starter installed would let the
          // registry call into a cleared VM.
-@@ -17123,6 +17504,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -17123,6 +17511,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
              try {
                  val count = chatRepository.messageCount(sid)
                  if (count > 0) return@launch
@@ -38097,7 +38144,7 @@ index e0d0cae..424803d 100644
                  AppLogger.info(
                      TAG,
                      "cleanupIfEmptyOnExit: deleting empty session $sid (no persisted messages)",
-@@ -17602,6 +17985,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -17602,6 +17992,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                              continue
                          }
                          if (!mime.startsWith("image/")) continue
@@ -38106,7 +38153,7 @@ index e0d0cae..424803d 100644
                          val file = java.io.File(mediaStore.mediaBaseDir, rel)
                          if (!file.exists()) continue
                          val original = try { file.readBytes() } catch (_: Exception) { continue }
-@@ -17693,16 +18078,9 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -17693,16 +18085,9 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
       * e.g. `file_write` → "Write File", `shell_execute` → "Execute Shell".
       */
      private fun friendlyToolTitle(toolName: String): String = when (toolName) {
@@ -38126,7 +38173,7 @@ index e0d0cae..424803d 100644
              .split('_')
              .filter { it.isNotEmpty() }
              .joinToString(" ") { it.replaceFirstChar { ch -> ch.uppercase() } }
-@@ -17756,3 +18134,28 @@ internal fun warmUpBudget(window: Int?, compactThreshold: Int?, ratio: Double, f
+@@ -17756,3 +18141,28 @@ internal fun warmUpBudget(window: Int?, compactThreshold: Int?, ratio: Double, f
      val line = if (threshold > 0) threshold else w
      return (line / ratio).toInt() - fixedTokens
  }
@@ -56777,6 +56824,35 @@ index 9c18509..512f8a2 100644
              navigationIconContentColor = m.ink, titleContentColor = m.ink, actionIconContentColor = m.ink,
          ),
          scrollBehavior = scrollBehavior,
+diff --git a/src/android/app/src/main/java/com/openminis/app/util/EncryptedPrefsFactory.kt b/src/android/app/src/main/java/com/openminis/app/util/EncryptedPrefsFactory.kt
+index 9ce8f4a..e6fa70c 100644
+--- a/src/android/app/src/main/java/com/openminis/app/util/EncryptedPrefsFactory.kt
++++ b/src/android/app/src/main/java/com/openminis/app/util/EncryptedPrefsFactory.kt
+@@ -36,7 +36,23 @@ import java.security.KeyStore
+ object EncryptedPrefsFactory {
+     private const val TAG = "EncryptedPrefsFactory"
+ 
+-    fun safeCreate(context: Context, fileName: String): SharedPreferences {
++    // [38.9.11.3.1] one open store per file for the life of the process. Opening one decrypts its Tink keysets through
++    // the Android Keystore (seconds on some phones) under Tink's single global lock, and callers like
++    // ProviderRepository.hasAnyCredential / OAuthManager.needsReauth used to re-open it on every check — on the main
++    // thread too, which waited behind another thread's open and hit an ANR (realme RMX5062, 2026-10-21).
++    private val cache = com.openminis.app.plus.OnceCache<SharedPreferences>()
++
++    fun safeCreate(context: Context, fileName: String): SharedPreferences =
++        cache.get(fileName) { createUncached(context.applicationContext ?: context, fileName) }
++
++    /** [38.9.11.3.1] open the stores the UI checks most, on a background thread, so the first check finds them open. */
++    fun prewarm(context: Context, vararg fileNames: String) {
++        val app = context.applicationContext ?: context
++        Thread({ fileNames.forEach { n -> runCatching { safeCreate(app, n) } } }, "mines-prefs-warm")
++            .apply { isDaemon = true }.start()
++    }
++
++    private fun createUncached(context: Context, fileName: String): SharedPreferences {
+         runCatching { return build(context, fileName) }
+             .onFailure { Log.w(TAG, "first create($fileName) failed: ${it.message}") }
+ 
 diff --git a/src/android/app/src/main/java/com/openminis/app/webapp/AddToHomeSheet.kt b/src/android/app/src/main/java/com/openminis/app/webapp/AddToHomeSheet.kt
 index c7c3b29..0dea9fa 100644
 --- a/src/android/app/src/main/java/com/openminis/app/webapp/AddToHomeSheet.kt
@@ -60899,6 +60975,56 @@ index 0000000..b47e69d
 +        val m = mapOf("a|b" to Stats(ok = 2, fail = 1, done = 1, last5xxAt = 5, latencyMs = 12.5, lastOkAt = 9))
 +        assertEquals(m, ModelScoreCore.fromJson(ModelScoreCore.toJson(m)))
 +        assertTrue(ModelScoreCore.summary("修 502", listOf(Call("shell", true, "boom")), listOf("curl x")).contains("✗ shell"))
++    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/OnceCacheTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/OnceCacheTest.kt
+new file mode 100644
+index 0000000..559d0e0
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/OnceCacheTest.kt
+@@ -0,0 +1,44 @@
++package com.openminis.app.plus
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertSame
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.TimeUnit
++import java.util.concurrent.atomic.AtomicInteger
++
++class OnceCacheTest {
++    /** 8 threads ask at once: one build, everyone gets the same instance. */
++    @Test fun buildsOncePerKey() {
++        val c = OnceCache<Any>(); val builds = AtomicInteger(); val go = CountDownLatch(1); val got = arrayOfNulls<Any>(8)
++        val ts = (0 until 8).map { i -> Thread { go.await(); got[i] = c.get("oauth_prefs") { builds.incrementAndGet(); Thread.sleep(200); Any() } } }
++        ts.forEach { it.start() }; go.countDown(); ts.forEach { it.join(5000) }
++        assertEquals(1, builds.get()); got.forEach { assertSame(got[0], it) }
++    }
++
++    /**
++     * The 2026-10-21 ANR shape: a background thread is stuck in a slow build (Keystore taking seconds) while the main
++     * thread asks for a store. Old code re-built on every call and so waited on the same lock; now an open store is
++     * returned at once, and a slow build of another key does not block it.
++     */
++    @Test fun hitNeverWaitsOnASlowBuild() {
++        val c = OnceCache<String>()
++        c.get("oauth_prefs") { "open" }
++        val inBuild = CountDownLatch(1); val release = CountDownLatch(1)
++        val slow = Thread { c.get("provider_secrets") { inBuild.countDown(); release.await(10, TimeUnit.SECONDS); "late" } }.apply { start() }
++        assertTrue(inBuild.await(2, TimeUnit.SECONDS))
++        val t0 = System.nanoTime()
++        val v = c.get("oauth_prefs") { error("must not rebuild") }
++        val ms = (System.nanoTime() - t0) / 1_000_000
++        assertEquals("open", v); assertTrue("hit took $ms ms", ms < 50)
++        release.countDown(); slow.join(5000); assertEquals("late", c.peek("provider_secrets"))
++    }
++
++    /** A failed build is not remembered: the next call builds again. */
++    @Test fun failureNotCached() {
++        val c = OnceCache<String>(); var n = 0
++        runCatching { c.get("k") { n++; throw IllegalStateException("keystore busy") } }
++        assertEquals("ok", c.get("k") { n++; "ok" }); assertEquals(2, n)
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/ProviderHealthCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/ProviderHealthCoreTest.kt
