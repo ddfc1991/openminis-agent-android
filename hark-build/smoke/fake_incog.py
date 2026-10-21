@@ -31,7 +31,7 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store"); self.end_headers(); self.wfile.write(b)
     def do_GET(self):
         u = urlparse(self.path); q = {k: v[0] for k, v in parse_qs(u.query).items()}
-        if u.path == "/t": return self._s(200, PAGE)
+        if u.path == "/t" or u.path.startswith("/t/"): return self._s(200, PAGE)
         if u.path == "/sw.js": return self._s(200, "self.addEventListener('fetch',()=>{})", "application/javascript")
         if u.path == "/report":
             with L: R.append(q)

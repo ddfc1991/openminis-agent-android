@@ -5532,7 +5532,14 @@ def b397(res, sub=False):
         step("agents-" + sfx, lambda sfx=sfx: agents(sfx))
     theme388(1); healthy_home()
     step("takeover", takeover)
+    def ssh():
+        o["ssh_local_ed25519"] = result_json("group", "i39112 sshprobe 10.0.2.2 22", timeout=60)
+        o["ssh_instabox"] = result_json("group", "i39112 sshprobe api.instabox.sh 2222", timeout=60)
+        print("I39112 SSH", o["ssh_local_ed25519"], "|", o["ssh_instabox"], flush=True)
+        if "Algorithm negotiation fail" in str(o["ssh_local_ed25519"]): selftest_fail.append(f"i39112 ssh-ed25519-only sshd: {o['ssh_local_ed25519']}")
+
     step("incog", incog)
+    step("ssh", ssh)
     step("engineer", engineer)
     step("market", market)
     step("dsh", dsh)
@@ -6473,12 +6480,12 @@ def b39112(res):
         theme388(1); healthy_home()
         istate("start")
         # 1 normal browser writes everything
-        result_json("group", f"i39112 normal {U}?act=set&tag=normal", timeout=30); time.sleep(6)
+        result_json("group", f"i39112 normal {U}/normal?act=set&tag=normal", timeout=30); time.sleep(6)
         r = last("normal"); o["normal_set"] = r; shot("normal-set")
         if not r or r.get("ck") != "normal" or r.get("ls") != "normal": selftest_fail.append(f"i39112 normal browser did not store: {r}")
         back(1); time.sleep(2)
         # 2 无痕 must see none of it
-        st = result_json("group", f"i39112 incog {U}?act=read&tag=incog1", timeout=30); time.sleep(6)
+        st = result_json("group", f"i39112 incog {U}/incog1?act=read&tag=incog1", timeout=30); time.sleep(6)
         r = last("incog1"); o["incog1"] = r; rr = shot("incog-read-empty"); t = _txt(rr)
         o["path"] = (st or {}).get("lastPath") if isinstance(st, dict) else None
         if "无痕" not in t: page_missing.append("i39112 无痕 indicator not on screen")
@@ -6486,7 +6493,7 @@ def b39112(res):
         if not empty(r): selftest_fail.append(f"i39112 无痕 saw normal data: {r}")
         istate("open1")
         # 3 write inside 无痕, read back (sanity), then 清除并关闭
-        result_json("group", f"i39112 incog {U}?act=set&tag=incogset", timeout=30); time.sleep(6)
+        result_json("group", f"i39112 incog {U}/incogset?act=set&tag=incogset", timeout=30); time.sleep(6)
         r = last("incogset"); o["incogset"] = r; shot("incog-set")
         if not r or r.get("ck") != "incogset": page_missing.append(f"i39112 无痕 could not write (page may not work there): {r}")
         clear_close("close1"); s1 = istate("closed1"); shot("after-clear")
@@ -6494,28 +6501,48 @@ def b39112(res):
         if s1.get("dirs"): selftest_fail.append(f"i39112 :incog data dirs left after close: {s1.get('dirs')}")
         if s1.get("open"): selftest_fail.append(f"i39112 profiles still open after close: {s1.get('open')}")
         # 4 reopen → gone
-        result_json("group", f"i39112 incog {U}?act=read&tag=incog2", timeout=30); time.sleep(6)
+        result_json("group", f"i39112 incog {U}/incog2?act=read&tag=incog2", timeout=30); time.sleep(6)
         r = last("incog2"); o["incog2"] = r; shot("incog-reopen-empty")
         if not empty(r): selftest_fail.append(f"i39112 reopened 无痕 still has data: {r}")
         clear_close("close2")
         # 5 normal browser unaffected
-        result_json("group", f"i39112 normal {U}?act=read&tag=normal2", timeout=30); time.sleep(6)
+        result_json("group", f"i39112 normal {U}/normal2?act=read&tag=normal2", timeout=30); time.sleep(6)
         r = last("normal2"); o["normal2"] = r; shot("normal-after")
         if not r or r.get("ck") != "normal" or r.get("ls") != "normal" or r.get("idb") != "normal": selftest_fail.append(f"i39112 normal browser lost its data: {r}")
         back(1); time.sleep(2)
+        # 5b 每个对话的隔离: conversation A's agent browser vs conversation B vs the home browser
+        ca = result_json("group", f"i39112 conv smokeConvA {U}/convA?act=set&tag=convA", timeout=30); time.sleep(8)
+        o["conv_open_a"] = ca; r = last("convA"); o["convA"] = r
+        result_json("group", f"i39112 conv smokeConvB {U}/convB?act=read&tag=convB", timeout=30); time.sleep(8)
+        r = last("convB"); o["convB"] = r
+        result_json("group", f"i39112 conv smokeConvA {U}/convA2?act=read&tag=convA2", timeout=30); time.sleep(8)
+        r2 = last("convA2"); o["convA2"] = r2
+        result_json("group", f"i39112 normal {U}/normal3?act=read&tag=normal3", timeout=30); time.sleep(6)
+        r3 = last("normal3"); o["normal3"] = r3; back(1); time.sleep(1.5)
+        o["conv_state"] = result_json("group", "i39112 convstate", timeout=20)
+        conv_active = isinstance(ca, dict) and ca.get("active")
+        o["conv_path"] = "profile" if conv_active else "none (no MULTI_PROFILE: conversations share the default profile)"
+        print("I39112 CONV", o["conv_path"], json.dumps({k: o.get(k) for k in ("convA", "convB", "convA2", "normal3")}, ensure_ascii=False), flush=True)
+        if conv_active:
+            if not empty(o["convB"]): selftest_fail.append(f"i39112 conversation B saw A's data: {o['convB']}")
+            if not r2 or r2.get("ck") != "convA": selftest_fail.append(f"i39112 conversation A lost its data: {r2}")
+            if not r3 or r3.get("ck") != "normal": selftest_fail.append(f"i39112 home browser changed by a conversation: {r3}")
+        else: UNTESTABLE.append("i39112 per-conversation profiles: emulator WebView has no MULTI_PROFILE")
+        result_json("group", "i39112 convdel smokeConvA", timeout=20); result_json("group", "i39112 convdel smokeConvB", timeout=20)
+        time.sleep(3); o["conv_state_after_delete"] = result_json("group", "i39112 convstate", timeout=20)
         # 6 dark theme top bar
         theme388(2); healthy_home()
-        result_json("group", f"i39112 incog {U}?act=read&tag=incogdark", timeout=30); time.sleep(6); shot("incog-dark")
+        result_json("group", f"i39112 incog {U}/incogdark?act=read&tag=incogdark", timeout=30); time.sleep(6); shot("incog-dark")
         clear_close("closedark"); theme388(1); healthy_home()
         # 7 kill-safe: write in 无痕, force-stop the whole app, relaunch → leftovers wiped
-        result_json("group", f"i39112 incog {U}?act=set&tag=incogkill", timeout=30); time.sleep(6)
+        result_json("group", f"i39112 incog {U}/incogkill?act=set&tag=incogkill", timeout=30); time.sleep(6)
         istate("before_kill")
         sh(f"am force-stop {PKG}"); time.sleep(2)
         sh(f"monkey -p {PKG} -c android.intent.category.LAUNCHER 1"); time.sleep(14)
         sk = istate("after_relaunch")
         if sk.get("marker") or sk.get("dirs"): selftest_fail.append(f"i39112 kill-safe: leftovers after relaunch {sk}")
         healthy_home()
-        result_json("group", f"i39112 incog {U}?act=read&tag=incog3", timeout=30); time.sleep(6)
+        result_json("group", f"i39112 incog {U}/incog3?act=read&tag=incog3", timeout=30); time.sleep(6)
         r = last("incog3"); o["incog3"] = r
         if not empty(r): selftest_fail.append(f"i39112 kill-safe: data survived a force-stop: {r}")
         clear_close("close3")
@@ -6572,9 +6599,71 @@ def b39112(res):
             result_json("group", "i39112 skylegacy off", timeout=15); result_json("group", "i39112 skylevel 0", timeout=15)
             result_json("group", "i396 skygpu off", timeout=30)
 
+    def ssh():
+        # B/C: local sshd offers ONLY ssh-ed25519 host keys (38.9.11.1 JSch on Android: 「Algorithm negotiation fail」)
+        o["ssh_local_ed25519"] = result_json("group", "i39112 sshprobe 10.0.2.2 22", timeout=60)
+        o["ssh_instabox"] = result_json("group", "i39112 sshprobe api.instabox.sh 2222", timeout=60)
+        print("I39112 SSH", o["ssh_local_ed25519"], "|", o["ssh_instabox"], flush=True)
+        r = str(o["ssh_local_ed25519"])
+        if "hostkey=ssh-ed25519" not in r and "connected ssh-ed25519" not in r: selftest_fail.append(f"i39112 ssh-ed25519-only sshd: {r}")
+
+    def proxy():
+        # A: a local proxy that really gets out (open proxy on 7890) is used with 分流代理 OFF; 严格代理 blocks when none passes
+        print(adb("reverse", "tcp:7890", "tcp:3130"), flush=True)
+        o["px_7890"] = result_json("group", "i396 localproxy", timeout=40); print("I39112 PX 7890", o["px_7890"], flush=True)
+        a = o["px_7890"] if isinstance(o["px_7890"], dict) else {}
+        if a.get("source") != "local:7890" or "7890" not in str(a.get("http_proxy")): selftest_fail.append(f"i39112 sandbox did not take the passing local proxy: {a}")
+        adb("reverse", "--remove", "tcp:7890"); time.sleep(1)
+        o["px_none"] = result_json("group", "i396 localproxy", timeout=40); print("I39112 PX none", o["px_none"], flush=True)
+        o["px_strict_on"] = result_json("group", "i39112 strict on", timeout=40); print("I39112 PX strict on", o["px_strict_on"], flush=True)
+        b = o["px_strict_on"] if isinstance(o["px_strict_on"], dict) else {}
+        if b.get("source") != "blocked" or b.get("http_proxy") != "http://127.0.0.1:1": selftest_fail.append(f"i39112 严格代理 did not block: {b}")
+        for mode, sfx in ((1, "light"), (2, "dark")):
+            theme388(mode); healthy_home(); route("plus_sandbox", 5)
+            for _ in range(6):
+                if "严格代理" in _txt(snap("i39112-probe-sandbox")): break
+                scroll_down(); time.sleep(1)
+            shot(f"strict-on-{sfx}"); back(1); time.sleep(1)
+        o["px_strict_off"] = result_json("group", "i39112 strict off", timeout=40); print("I39112 PX strict off", o["px_strict_off"], flush=True)
+        c = o["px_strict_off"] if isinstance(o["px_strict_off"], dict) else {}
+        if c.get("source") == "blocked": selftest_fail.append(f"i39112 严格代理 off still blocked: {c}")
+        theme388(1); healthy_home(); route("plus_sandbox", 5)
+        for _ in range(6):
+            if "严格代理" in _txt(snap("i39112-probe-sandbox2")): break
+            scroll_down(); time.sleep(1)
+        shot("strict-off-light"); back(1); time.sleep(1)
+
+    def merge():
+        # D: 3 providers on one host → card → preview → 确定合并 (1 left, 3-key pool, union of models) → 撤销 (3 again)
+        theme388(1); healthy_home()
+        o["merge_seed"] = result_json("group", "i39112 mergeseed", timeout=30); print("I39112 MERGE seed", o["merge_seed"], flush=True)
+        route("providers", 6); r = shot("merge-card"); t = _txt(r)
+        if "合并重复供应商" not in t: page_missing.append(f"i39112 merge card not on providers page ({t[:160]})")
+        if tap_text("看看怎么合并", wait=3): shot("merge-preview")
+        else: page_missing.append("i39112 看看怎么合并 not found")
+        if tap_text("确定合并", wait=4):
+            o["merge_after"] = result_json("group", "i39112 mergestate", timeout=30); print("I39112 MERGE after", o["merge_after"], flush=True)
+            shot("merge-done")
+            m = o["merge_after"] if isinstance(o["merge_after"], dict) else {}
+            if m.get("count") != 1 or m.get("pools") != [3] or m.get("models") != [2] or m.get("backup") is not True:
+                selftest_fail.append(f"i39112 merge result wrong: {m}")
+            if tap_text("撤销", exact=True, wait=4):
+                o["merge_undo"] = result_json("group", "i39112 mergestate", timeout=30); print("I39112 MERGE undo", o["merge_undo"], flush=True)
+                shot("merge-undone")
+                u = o["merge_undo"] if isinstance(o["merge_undo"], dict) else {}
+                if u.get("count") != 3 or u.get("backup") is not False: selftest_fail.append(f"i39112 撤销 did not restore: {u}")
+            else: page_missing.append("i39112 撤销 not found")
+        else: page_missing.append("i39112 确定合并 not found")
+        back(1); time.sleep(1)
+        theme388(2); healthy_home(); route("providers", 6); shot("merge-card-dark"); back(1); theme388(1); healthy_home()
+        result_json("group", "i39112 mergeclean", timeout=30)
+
     step("incog", incog)
     step("atomic", atomic)
     step("sky", sky)
+    step("ssh", ssh)
+    step("proxy", proxy)
+    step("merge", merge)
     result_json("group", "i39112 skyfreeze on", timeout=15)
     result_json("group", "i396 sky auto static", timeout=20)
     print("I39112 RESULT " + json.dumps(o, ensure_ascii=False)[:12000], flush=True)
