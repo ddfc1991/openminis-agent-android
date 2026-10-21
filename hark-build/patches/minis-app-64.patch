@@ -27858,10 +27858,10 @@ index 0000000..d218a44
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SkyModeCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/SkyModeCore.kt
 new file mode 100644
-index 0000000..3967be9
+index 0000000..1edcf1e
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/SkyModeCore.kt
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,131 @@
 +package com.openminis.app.plus
 +
 +/**
@@ -27904,9 +27904,18 @@ index 0000000..3967be9
 +        Mode.OFF -> Params(keyMs = 60_000L, blendFps = 0, liveFps = 0, skyDiv = 4f, blurPx = 2.2f, calm = 1f, hq = 0f, cloudRate = 0.6f, chatKeyFactor = 1f)
 +    }
 +
-+    /** the effective mode: battery saver / reduce motion / a forced still behave like 关闭 */
++    /** the effective mode: only a forced still (smoke) behaves like 关闭. [38.9.11.3 h] user 2026-10-21 「所有壁纸都不会动」
++     *  (battery saver off): battery saver / animator scale 0 (realme sets it) no longer stop the sky — see [lowPowerFps] */
 +    fun effective(chosen: Mode, powerSave: Boolean, reduceMotion: Boolean, forcedStatic: Boolean): Mode =
-+        if (powerSave || reduceMotion || forcedStatic) Mode.OFF else chosen
++        if (forcedStatic) Mode.OFF else chosen
++
++    /** [38.9.11.3 h] battery saver / animator scale 0: keep drifting at ≤ this frame rate (never 0 unless 关闭) */
++    const val LOW_POWER_FPS = 10
++    fun lowPowerFps(fps: Int, powerSave: Boolean, reduceMotion: Boolean): Int =
++        if ((powerSave || reduceMotion) && fps > 0) minOf(fps, LOW_POWER_FPS) else fps
++    /** [38.9.11.3 h] frame rate when the shader is unavailable (stills path: the still pans slowly) or the governor
++     *  calmed 雨 / 雪 (level ≥ 2): low, never 0 */
++    const val FALLBACK_FPS = 8
 +
 +    /** key-frame spacing for a page (chat updates slower: it sits behind text) */
 +    fun keyMs(m: Mode, chat: Boolean): Long { val p = params(m); return if (chat) (p.keyMs * p.chatKeyFactor).toLong() else p.keyMs }
@@ -51800,10 +51809,10 @@ index 0000000..6e9e598
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WeatherSky.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WeatherSky.kt
 new file mode 100644
-index 0000000..25f88a1
+index 0000000..24688f7
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WeatherSky.kt
-@@ -0,0 +1,672 @@
+@@ -0,0 +1,679 @@
 +package com.openminis.app.ui.plus
 +
 +import com.openminis.app.plus.SkyFreezeCore
@@ -52171,7 +52180,11 @@ index 0000000..25f88a1
 +    val liveScene = SkyModeCore.liveScene(cur.key)
 +    // [38.9.11.3] the sky never stops on its own: the frame governor's level 2 only stills the expensive live path (雨 / 雪);
 +    // key-frame scenes (≈ one small shader frame per 1.2 s) keep drifting. 关闭 / battery saver / reduce motion still stop it.
-+    val fps = (if (gpu == null || (level >= 2 && liveScene)) 0 else SkyModeCore.loopFps(mode, liveScene, isLive))
++    // [38.9.11.3 h] 「所有壁纸都不会动」: no shader (stills) / governor-calmed 雨雪 / battery saver / animator scale 0 keep a low
++    // frame rate instead of 0 — only 关闭 (or an older sky under the newest) is still
++    val fps = SkyModeCore.loopFps(mode, liveScene, isLive)
++        .let { f -> if (f > 0 && (gpu == null || (level >= 2 && liveScene))) minOf(f, SkyModeCore.FALLBACK_FPS) else f }
++        .let { f -> SkyModeCore.lowPowerFps(f, powerSave, animOff) }
 +        .let { f -> WeatherSky.fpsCap.let { cap -> if (cap > 0 && f > 0) minOf(f, cap) else f } }
 +    // [sky-e] the governor watches whenever this sky animates (also at L1, so it can recover)
 +    val watch = gpu != null && isLive && SkyModeCore.loopFps(mode, liveScene, true) > 0
@@ -52254,7 +52267,10 @@ index 0000000..25f88a1
 +                    }
 +                    val b = WeatherSky.still(ctx, s, dark) ?: return
 +                    paint.alpha = (255 * alpha).toInt().coerceIn(0, 255)
-+                    rect.set(0f, 0f, w, h)
++                    // [38.9.11.3 h] stills path drifts too: a slow pan of the still (≈ 3 % of the width over ~90 s), 6 % overscan
++                    val ph = nowMs / 1000.0 * 2.0 * Math.PI / 90.0
++                    val dx = (kotlin.math.sin(ph) * 0.03 * w).toFloat(); val dy = (kotlin.math.cos(ph * 0.7) * 0.015 * h).toFloat()
++                    rect.set(-0.03f * w + dx, -0.03f * h + dy, 1.03f * w + dx, 1.03f * h + dy)
 +                    nc.drawBitmap(b, null, rect, paint)
 +                    paint.alpha = 255
 +                    WeatherSky.lastShot = "still_${s.key}_${if (dark) "d" else "l"}"
@@ -61994,10 +62010,10 @@ index 0000000..65832d1
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/SkyModeCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/SkyModeCoreTest.kt
 new file mode 100644
-index 0000000..120ae12
+index 0000000..f2bb0f8
 --- /dev/null
 +++ b/src/android/app/src/test/java/com/openminis/app/plus/SkyModeCoreTest.kt
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,105 @@
 +package com.openminis.app.plus
 +
 +import com.openminis.app.plus.SkyModeCore.Mode
@@ -62029,11 +62045,16 @@ index 0000000..120ae12
 +        assertTrue(1000f / s.keyMs <= 1f)
 +    }
 +
-+    @Test fun saverReduceMotionAndForcedStillAreOff() {
-+        assertEquals(Mode.OFF, SkyModeCore.effective(Mode.RICH, powerSave = true, reduceMotion = false, forcedStatic = false))
-+        assertEquals(Mode.OFF, SkyModeCore.effective(Mode.SMOOTH, false, true, false))
++    @Test fun saverAndReduceMotionKeepDriftingOnlyForcedStillIsOff() {
++        assertEquals(Mode.RICH, SkyModeCore.effective(Mode.RICH, powerSave = true, reduceMotion = false, forcedStatic = false))
++        assertEquals(Mode.SMOOTH, SkyModeCore.effective(Mode.SMOOTH, false, true, false))
 +        assertEquals(Mode.OFF, SkyModeCore.effective(Mode.SMOOTH, false, false, true))
 +        assertEquals(Mode.RICH, SkyModeCore.effective(Mode.RICH, false, false, false))
++        assertEquals(SkyModeCore.LOW_POWER_FPS, SkyModeCore.lowPowerFps(30, powerSave = true, reduceMotion = false))
++        assertEquals(SkyModeCore.LOW_POWER_FPS, SkyModeCore.lowPowerFps(30, false, true))
++        assertEquals(30, SkyModeCore.lowPowerFps(30, false, false))
++        assertEquals(0, SkyModeCore.lowPowerFps(0, true, true))   // 关闭 stays still
++        assertTrue(SkyModeCore.FALLBACK_FPS > 0)
 +    }
 +
 +    @Test fun loopOnlyForTheLiveOwnerAndNotWhenOff() {
