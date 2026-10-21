@@ -15718,10 +15718,10 @@ index 0000000..a479211
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Diag.kt b/src/android/app/src/main/java/com/openminis/app/plus/Diag.kt
 new file mode 100644
-index 0000000..1829fb7
+index 0000000..aff5310
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/Diag.kt
-@@ -0,0 +1,430 @@
+@@ -0,0 +1,469 @@
 +package com.openminis.app.plus
 +
 +import android.app.Activity
@@ -15775,6 +15775,11 @@ index 0000000..1829fb7
 +    val notice = MutableStateFlow<String?>(null)
 +    /** pending request_screenshot_of_mines_only: the command id waiting for 「允许发送截图？」 */
 +    val shotAsk = MutableStateFlow<String?>(null)
++
++    /** [38.9.11.3 g2] remote config: active changes (one per key), shown in-app with 「撤销」; all undone when 诊断 turns off */
++    data class Change(val key: String, val from: String, val to: String, val at: Long)
++    val changes = MutableStateFlow<List<Change>>(emptyList())
++    @Volatile var navAnimOff = false
 +
 +    @Volatile private var ws: WebSocket? = null
 +    @Volatile private var connected = false
@@ -15851,6 +15856,7 @@ index 0000000..1829fb7
 +    }
 +
 +    @Synchronized private fun stop(statusText: String?) {
++        changes.value.forEach { applyConfig(it.key, "default") }; changes.value = emptyList()
 +        stopWatchdog(); unhookFrames()
 +        gen++
 +        runCatching { ws?.close(1000, "off") }; ws = null; connected = false
@@ -15985,6 +15991,13 @@ index 0000000..1829fb7
 +                .put("stack", DiagCore.scrubStack(stackText(Looper.getMainLooper().thread.stackTrace), 60))))
 +            "set_log_level" -> { level = v.args["level"] as String; send(DiagCore.result(id, cmd, JSONObject().put("level", level))) }
 +            "get_recent_crash" -> send(DiagCore.result(id, cmd, recentCrash()))
++            "set_config" -> {
++                val k = v.args["key"] as String; val to = v.args["value"] as String; val from = configNow(k)
++                applyConfig(k, to)
++                changes.value = changes.value.filter { it.key != k } + if (to == "default") emptyList() else listOf(Change(k, from, to, System.currentTimeMillis()))
++                android.util.Log.i(TAG, "remote config $k: $from -> $to")
++                send(DiagCore.result(id, cmd, JSONObject().put("key", k).put("from", from).put("to", to)))
++            }
 +            "show_notice" -> { val t = v.args["text"] as String; main.post { notice.value = t }; send(DiagCore.result(id, cmd, JSONObject().put("shown", true))) }
 +            "capture_jank_trace" -> {
 +                val secs = v.args["seconds"] as Int
@@ -16007,6 +16020,32 @@ index 0000000..1829fb7
 +                    send(DiagCore.result(id, cmd, JSONObject().put("denied", true).put("why", "60 秒内没有回答"))) } }, 60_000L)
 +            }
 +        }
++    }
++
++    private fun configNow(key: String): String = when (key) {
++        "sky_mode" -> com.openminis.app.ui.plus.WeatherSky.modeOverride?.key ?: "default"
++        "sky_fps_cap" -> com.openminis.app.ui.plus.WeatherSky.fpsCap.takeIf { it > 0 }?.toString() ?: "default"
++        "nav_anim" -> if (navAnimOff) "off" else "default"
++        "log_level" -> if (level == "warn") "default" else level
++        else -> "default"
++    }
++
++    private fun applyConfig(key: String, value: String) {
++        val W = com.openminis.app.ui.plus.WeatherSky
++        when (key) {
++            "sky_mode" -> { W.modeOverride = if (value == "default") null else SkyModeCore.parse(value); W.bump() }
++            "sky_fps_cap" -> { W.fpsCap = value.toIntOrNull() ?: 0; W.bump() }
++            "nav_anim" -> navAnimOff = value == "off"
++            "log_level" -> level = if (value == "default") "warn" else value
++        }
++    }
++
++    /** UI: one tap 「撤销」 → back to the user's own value */
++    fun revertConfig(key: String) {
++        val c = changes.value.firstOrNull { it.key == key } ?: return
++        applyConfig(key, "default"); changes.value = changes.value.filter { it.key != key }
++        android.util.Log.i(TAG, "remote config $key reverted by the user")
++        bg?.post { send(JSONObject().put("t", "config_reverted").put("key", key).put("was", c.to).put("by", "user")) }
 +    }
 +
 +    /** UI: the user's answer to 「允许发送截图？」 */
@@ -16154,10 +16193,10 @@ index 0000000..1829fb7
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/DiagCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/DiagCore.kt
 new file mode 100644
-index 0000000..95a1017
+index 0000000..497d5df
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/DiagCore.kt
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,242 @@
 +package com.openminis.app.plus
 +
 +import com.openminis.app.crash.CrashRedactCore
@@ -16177,7 +16216,7 @@ index 0000000..95a1017
 +    const val MAX_ON_MS = 24L * 3600_000L
 +    const val TS_WINDOW_MS = 5L * 60_000L
 +    val WHITELIST = setOf("ping", "capture_jank_trace", "dump_main_thread_now", "set_log_level", "get_recent_crash",
-+        "show_notice", "request_screenshot_of_mines_only")
++        "show_notice", "request_screenshot_of_mines_only", "set_config")
 +    val LOG_LEVELS = listOf("error", "warn", "info", "debug")
 +
 +    // ------------------------------------------------------------------ config (诊断码)
@@ -16354,6 +16393,11 @@ index 0000000..95a1017
 +                if (!only("level")) return null
 +                val l = a.optString("level"); if (l !in LOG_LEVELS) null else mapOf("level" to l)
 +            }
++            "set_config" -> {
++                if (keys != setOf("key", "value")) return null
++                val k = a.optString("key"); val v = configValue(k, a.opt("value")?.toString()) ?: return null
++                mapOf("key" to k, "value" to v)
++            }
 +            "show_notice" -> {
 +                if (!only("text")) return null
 +                val t = notice(a.optString("text")) ?: return null
@@ -16361,6 +16405,26 @@ index 0000000..95a1017
 +            }
 +            else -> null
 +        }
++    }
++
++    /** [38.9.11.3 g2] remote config: Mines-internal switches only, in-memory (process death / 诊断关闭 / 24 h → back to the
++     *  user's own values), bounded values; "default" = the user's own value. Labels are what the in-app card shows. */
++    val CONFIG_LABELS = linkedMapOf("sky_mode" to "天空动画", "sky_fps_cap" to "天空动画帧率上限", "nav_anim" to "翻页动画", "log_level" to "诊断日志级别")
++    fun configValue(key: String, raw: String?): String? {
++        val v = (raw ?: "").trim()
++        if (v == "default" && key in CONFIG_LABELS) return v
++        return when (key) {
++            "sky_mode" -> v.takeIf { it in setOf("smooth", "rich", "off") }
++            "sky_fps_cap" -> v.toIntOrNull()?.takeIf { it in 5..30 }?.toString()
++            "nav_anim" -> v.takeIf { it in setOf("on", "off") }
++            "log_level" -> v.takeIf { it in LOG_LEVELS }
++            else -> null
++        }
++    }
++    fun configShown(key: String, value: String): String = when (value) {
++        "default" -> "你的设置"
++        "smooth" -> "流畅"; "rich" -> "精美"; "off" -> "关闭"; "on" -> "打开"
++        else -> if (key == "sky_fps_cap") "$value 帧" else value
 +    }
 +
 +    /** a notice the phone will show: plain Chinese text, ≤ 80 chars, no links, no control characters; must contain Chinese */
@@ -31657,7 +31721,7 @@ index 1d773a2..5489e65 100644
          coroutineScope {
              val bg = slow.map { id -> async { one(id) } }
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-index af13c1b..7e9ae25 100644
+index af13c1b..40cdc31 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 @@ -2,6 +2,8 @@ package com.openminis.app.plus.group
@@ -31669,7 +31733,7 @@ index af13c1b..7e9ae25 100644
  import kotlinx.coroutines.runBlocking
  import org.json.JSONArray
  import org.json.JSONObject
-@@ -15,12 +17,889 @@ import org.json.JSONObject
+@@ -15,12 +17,892 @@ import org.json.JSONObject
   *   … --arg 'reset'
   */
  object GroupSelfTest {
@@ -32419,11 +32483,14 @@ index af13c1b..7e9ae25 100644
 +                            "code" -> JSONObject().put("ok", D.setCode(context, v.takeIf { it != "none" })).toString()
 +                            "on" -> { kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) { D.setOn(context, true) }; "on" }
 +                            "off" -> { kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) { D.setOn(context, false) }; "off" }
++                            "revert" -> { kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) { D.revertConfig(v) }; "reverted $v" }
 +                            "shot" -> { val id = D.shotAsk.value ?: ""; kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) { if (id.isNotEmpty()) D.answerShot(id, v == "allow") }; JSONObject().put("id", id).toString() }
 +                            "stall" -> { val ms = v.toLongOrNull()?.coerceIn(50L, 3000L) ?: 400L
 +                                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) { Thread.sleep(ms) }; "stalled $ms" }
 +                            else -> JSONObject().put("on", D.on.value).put("status", D.status.value).put("connected", D.isConnected()).put("sid", D.sessionId())
-+                                .put("notice", D.notice.value ?: "").put("shotAsk", D.shotAsk.value ?: "").toString()
++                                .put("notice", D.notice.value ?: "").put("shotAsk", D.shotAsk.value ?: "")
++                                .put("changes", JSONArray(D.changes.value.map { "${it.key}=${it.to}" })).put("navAnimOff", D.navAnimOff)
++                                .put("fpsCap", com.openminis.app.ui.plus.WeatherSky.fpsCap).put("skyMode", com.openminis.app.ui.plus.WeatherSky.mode(context).key).toString()
 +                        }
 +                    }
 +                    else -> "i39113 latency <legacy|new> <host:port|none> <baseUrl> [model] | route <host> [port] | routeforget | skydrift legacy|new | a11yfake <n> | skystate | keyseed|keycheck|keyclean | ledger [text] | ledgerclean | crashdemo | errzh [base] | diag code|on|off|state|shot|stall"
@@ -32559,7 +32626,7 @@ index af13c1b..7e9ae25 100644
              "partners" -> {
                  val l = Partners.refresh(context, rescanApps = true)
                  JSONArray(l.map { JSONObject().put("id", it.id).put("name", it.spec.name).put("state", it.state.name).put("model", it.model).put("via", it.via) }).toString()
-@@ -136,6 +1015,13 @@ object GroupSelfTest {
+@@ -136,6 +1018,13 @@ object GroupSelfTest {
                  GroupStore.add(gid, GroupMsg(GroupStore.newId(), parts.getOrElse(2) { "host" }, "成员A", "", parts.getOrElse(3) { "好的，结论：照这个办。" }))
                  "ok"
              }
@@ -32573,7 +32640,7 @@ index af13c1b..7e9ae25 100644
              "kbrun" -> { val n = com.openminis.app.plus.ChatKnowledge.runNow(context); "organised=$n" }
              "kbstate" -> {
                  val l = com.openminis.app.plus.ChatKnowledge.load(context)
-@@ -151,6 +1037,11 @@ object GroupSelfTest {
+@@ -151,6 +1040,11 @@ object GroupSelfTest {
                  JSONObject().put("title", g.title).put("care", g.care).put("kind", g.kind)
                      .put("weather", com.openminis.app.plus.HomeGreeting.cachedWeather(context)?.let { "${it.code}/${it.temp}" } ?: "none").toString()
              }
@@ -32585,7 +32652,7 @@ index af13c1b..7e9ae25 100644
              "greetweather" -> {
                  context.getSharedPreferences("mines_greeting", Context.MODE_PRIVATE).edit().remove("w_try").apply()
                  com.openminis.app.plus.HomeGreeting.refreshWeather(context)
-@@ -238,6 +1129,112 @@ object GroupSelfTest {
+@@ -238,6 +1132,112 @@ object GroupSelfTest {
              "wallpaper" -> { com.openminis.app.plus.PlusPrefs.init(context)
                  if (parts.getOrElse(0) { "" } == "off") com.openminis.app.plus.PlusPrefs.update(context) { it.copy(wallpaper = "") }
                  com.openminis.app.plus.PlusPrefs.state.value.wallpaper.ifBlank { "none" } }
@@ -32698,7 +32765,7 @@ index af13c1b..7e9ae25 100644
              "fogstate" -> JSONObject().put("t", com.openminis.app.ui.plus.FogClock.t.toDouble()).put("draws", com.openminis.app.ui.plus.FogClock.draws)
                  .put("still", com.openminis.app.ui.plus.FogClock.stillSeen)
                  .put("scale", android.provider.Settings.Global.getFloat(context.contentResolver, android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, -1f).toDouble()).toString()
-@@ -288,3 +1285,29 @@ object GroupSelfTest {
+@@ -288,3 +1288,29 @@ object GroupSelfTest {
          return JSONObject().put("chat", sid).put("group", g.id).put("direct", d.id).put("directName", dn).toString()
      }
  }
@@ -40199,7 +40266,7 @@ index 4d47007..ff9c589 100644
                      tint = MaterialTheme.colorScheme.onSurfaceVariant,
                  )
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt b/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
-index fff9cbd..caafcd7 100644
+index fff9cbd..17cd625 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
 @@ -533,6 +533,11 @@ fun AppNavigation(
@@ -40223,7 +40290,36 @@ index fff9cbd..caafcd7 100644
      // Mines: one-time offer to pull data from the earlier Mines install.
      com.openminis.app.ui.plus.MinesMigrationPrompt(
          onOpen = { navController.safeNavigate(com.openminis.app.ui.plus.PlusRoutes.MIGRATE) },
-@@ -688,6 +693,9 @@ fun AppNavigation(
+@@ -580,24 +585,28 @@ fun AppNavigation(
+         // flashes; the slightly longer enter spec (300ms vs 220ms) is
+         // covered by the same guard.
+         enterTransition = {
++            if (com.openminis.app.plus.Diag.navAnimOff) androidx.compose.animation.EnterTransition.None else   // [38.9.11.3 g2] 远程诊断 nav_anim=off
+             slideIntoContainer(
+                 AnimatedContentTransitionScope.SlideDirection.Start,
+                 animationSpec = tween(300, easing = EmphasizedDecelerate),
+             ) + fadeIn(animationSpec = tween(300, easing = EmphasizedDecelerate))
+         },
+         exitTransition = {
++            if (com.openminis.app.plus.Diag.navAnimOff) androidx.compose.animation.ExitTransition.None else   // [38.9.11.3 g2] 远程诊断 nav_anim=off
+             slideOutOfContainer(
+                 AnimatedContentTransitionScope.SlideDirection.Start,
+                 animationSpec = tween(200, easing = EmphasizedAccelerate),
+             ) + fadeOut(animationSpec = tween(200, easing = EmphasizedAccelerate))
+         },
+         popEnterTransition = {
++            if (com.openminis.app.plus.Diag.navAnimOff) androidx.compose.animation.EnterTransition.None else   // [38.9.11.3 g2] 远程诊断 nav_anim=off
+             slideIntoContainer(
+                 AnimatedContentTransitionScope.SlideDirection.End,
+                 animationSpec = tween(300, easing = EmphasizedDecelerate),
+             ) + fadeIn(animationSpec = tween(300, easing = EmphasizedDecelerate))
+         },
+         popExitTransition = {
++            if (com.openminis.app.plus.Diag.navAnimOff) androidx.compose.animation.ExitTransition.None else   // [38.9.11.3 g2] 远程诊断 nav_anim=off
+             slideOutOfContainer(
+                 AnimatedContentTransitionScope.SlideDirection.End,
+                 animationSpec = tween(200, easing = EmphasizedAccelerate),
+@@ -688,6 +697,9 @@ fun AppNavigation(
          composable(com.openminis.app.ui.plus.PlusRoutes.VOICE_SETTINGS) {
              com.openminis.app.ui.plus.VoiceSettingsScreen(onBack = { navController.safePopBackStack() })
          }
@@ -40233,7 +40329,7 @@ index fff9cbd..caafcd7 100644
          composable(com.openminis.app.ui.plus.PlusRoutes.CARDS) {
              com.openminis.app.ui.plus.PayCardsScreen(onBack = { navController.safePopBackStack() })
          }
-@@ -700,12 +708,43 @@ fun AppNavigation(
+@@ -700,12 +712,43 @@ fun AppNavigation(
          composable(com.openminis.app.ui.plus.PlusRoutes.UPDATE) {
              com.openminis.app.ui.plus.UpdateScreen(onBack = { navController.safePopBackStack() })
          }
@@ -42576,10 +42672,10 @@ index f8cc6b9..05f469b 100644
  }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/DiagUi.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/DiagUi.kt
 new file mode 100644
-index 0000000..d5240b8
+index 0000000..43c6e3d
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/DiagUi.kt
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,103 @@
 +package com.openminis.app.ui.plus
 +
 +import androidx.compose.foundation.clickable
@@ -42590,6 +42686,7 @@ index 0000000..d5240b8
 +import androidx.compose.foundation.layout.fillMaxSize
 +import androidx.compose.foundation.layout.fillMaxWidth
 +import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.navigationBarsPadding
 +import androidx.compose.foundation.layout.padding
 +import androidx.compose.foundation.layout.statusBarsPadding
 +import androidx.compose.foundation.layout.width
@@ -42648,6 +42745,24 @@ index 0000000..d5240b8
 +                    Text("来自诊断：$text", fontSize = MT.Body, color = m.ink, maxLines = 3, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
 +                    Text("关闭", fontSize = MT.Meta, fontWeight = FontWeight.SemiBold, color = m.primaryText, maxLines = 1,
 +                        modifier = Modifier.heightIn(min = 44.dp).clip(RoundedCornerShape(50)).clickable { Diag.notice.value = null }.padding(horizontal = 10.dp, vertical = 12.dp))
++                }
++            }
++        }
++    }
++    // [38.9.11.3 g2] every remote config change stays visible until undone (one tap) or 诊断 turns off
++    val ch by Diag.changes.collectAsState()
++    if (ch.isNotEmpty()) {
++        Box(Modifier.fillMaxSize().navigationBarsPadding().padding(bottom = 132.dp), contentAlignment = Alignment.BottomCenter) {
++            GlassToast(Modifier.widthIn(max = 460.dp).padding(horizontal = 16.dp), shape = RoundedCornerShape(22.dp)) {
++                Column(Modifier.fillMaxWidth()) {
++                    ch.forEach { c ->
++                        Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(start = 16.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
++                            Text("诊断改了：${com.openminis.app.plus.DiagCore.CONFIG_LABELS[c.key] ?: c.key} → ${com.openminis.app.plus.DiagCore.configShown(c.key, c.to)}",
++                                fontSize = MT.Body, color = m.ink, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
++                            Text("撤销", fontSize = MT.Meta, fontWeight = FontWeight.SemiBold, color = m.primaryText, maxLines = 1,
++                                modifier = Modifier.heightIn(min = 44.dp).clip(RoundedCornerShape(50)).clickable { Diag.revertConfig(c.key) }.padding(horizontal = 10.dp, vertical = 12.dp))
++                        }
++                    }
 +                }
 +            }
 +        }
@@ -51685,10 +51800,10 @@ index 0000000..6e9e598
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WeatherSky.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WeatherSky.kt
 new file mode 100644
-index 0000000..3464361
+index 0000000..25f88a1
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WeatherSky.kt
-@@ -0,0 +1,668 @@
+@@ -0,0 +1,672 @@
 +package com.openminis.app.ui.plus
 +
 +import com.openminis.app.plus.SkyFreezeCore
@@ -51750,7 +51865,10 @@ index 0000000..3464361
 +    fun bump() { tick.value++ }
 +
 +    // [38.9.11.1] 设置 › 外观调节 › 天空动画: 流畅 (default) / 精美 / 关闭 (still)
-+    fun mode(c: android.content.Context): SkyModeCore.Mode = SkyModeCore.parse(c.getSharedPreferences("mines_sky", 0).getString("mode", null))
++    /** [38.9.11.3 g2] 远程诊断 remote config (in-memory only; null / 0 = the user's own setting) */
++    @Volatile var modeOverride: SkyModeCore.Mode? = null
++    @Volatile var fpsCap: Int = 0
++    fun mode(c: android.content.Context): SkyModeCore.Mode = modeOverride ?: SkyModeCore.parse(c.getSharedPreferences("mines_sky", 0).getString("mode", null))
 +    fun setMode(c: android.content.Context, m: SkyModeCore.Mode) { c.getSharedPreferences("mines_sky", 0).edit().putString("mode", m.key).apply(); bump() }
 +    /** [38.9.11.1] one live sky at a time (main thread) */
 +    val registry = SkyModeCore.Registry()
@@ -52053,7 +52171,8 @@ index 0000000..3464361
 +    val liveScene = SkyModeCore.liveScene(cur.key)
 +    // [38.9.11.3] the sky never stops on its own: the frame governor's level 2 only stills the expensive live path (雨 / 雪);
 +    // key-frame scenes (≈ one small shader frame per 1.2 s) keep drifting. 关闭 / battery saver / reduce motion still stop it.
-+    val fps = if (gpu == null || (level >= 2 && liveScene)) 0 else SkyModeCore.loopFps(mode, liveScene, isLive)
++    val fps = (if (gpu == null || (level >= 2 && liveScene)) 0 else SkyModeCore.loopFps(mode, liveScene, isLive))
++        .let { f -> WeatherSky.fpsCap.let { cap -> if (cap > 0 && f > 0) minOf(f, cap) else f } }
 +    // [sky-e] the governor watches whenever this sky animates (also at L1, so it can recover)
 +    val watch = gpu != null && isLive && SkyModeCore.loopFps(mode, liveScene, true) > 0
 +    WeatherSky.lastScene = cur
@@ -58376,10 +58495,10 @@ index 0000000..361ab4e
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/DiagCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/DiagCoreTest.kt
 new file mode 100644
-index 0000000..f15cc8b
+index 0000000..012f5d5
 --- /dev/null
 +++ b/src/android/app/src/test/java/com/openminis/app/plus/DiagCoreTest.kt
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,166 @@
 +package com.openminis.app.plus
 +
 +import org.json.JSONObject
@@ -58489,7 +58608,7 @@ index 0000000..f15cc8b
 +        val j = DiagCore.jankEvent("chat/9f8e7d6c-1234-5678", 40, 10, 487.04, 120.0)
 +        assertEquals("chat/*", j.getString("page")); assertEquals(25.0, j.getDouble("janky_pct"), 0.01); assertEquals(487.0, j.getDouble("slowest_ms"), 0.01)
 +        val h = DiagCore.hello(sid, "1.23.11.3", 51, "realme RMX5062", 35)
-+        assertEquals("hello", h.getString("t")); assertEquals(7, h.getJSONArray("caps").length())
++        assertEquals("hello", h.getString("t")); assertEquals(8, h.getJSONArray("caps").length())
 +        val s = DiagCore.stallEvent("settings", 350, "java.lang.Thread.sleep(Native Method)\n\tat com.openminis.app.X.y(X.kt:1)")
 +        assertTrue(s.getString("stack").contains("X.kt:1"))
 +        val c = DiagCore.crashEvent("ANR", "上次 Mines 卡住", "Reason: ANR\nAuthorization: Bearer sk-smokesecret0123456789abcd\n\tat a.b(C.kt:1)")
@@ -58527,6 +58646,23 @@ index 0000000..f15cc8b
 +        assertEquals(0, DiagCore.frameSum(emptyList(), 16.7).frames)
 +        val h = DiagCore.hello(sid, "1.23.11.3", 51, "x", 35, "ab".repeat(32))
 +        assertTrue(DiagCore.validKey(h.getString("k"))); assertFalse(DiagCore.validKey("xyz"))
++    }
++
++    @Test fun remoteConfigBounded() {
++        fun c(k: String, v: Any) = JSONObject().put("key", k).put("value", v)
++        assertEquals(mapOf("key" to "sky_fps_cap", "value" to "15"), DiagCore.checkArgs("set_config", c("sky_fps_cap", 15)))
++        assertNotNull(DiagCore.checkArgs("set_config", c("nav_anim", "off")))
++        assertNotNull(DiagCore.checkArgs("set_config", c("sky_mode", "default")))
++        assertNull(DiagCore.checkArgs("set_config", c("sky_fps_cap", 120)))
++        assertNull(DiagCore.checkArgs("set_config", c("sky_fps_cap", 0)))
++        assertNull(DiagCore.checkArgs("set_config", c("nav_anim", "maybe")))
++        assertNull(DiagCore.checkArgs("set_config", c("screen_brightness", "10")))
++        assertNull(DiagCore.checkArgs("set_config", c("shell", "rm -rf /")))
++        assertNull(DiagCore.checkArgs("set_config", c("sky_mode", "off").put("extra", 1)))
++        assertNull(DiagCore.checkArgs("set_config", JSONObject().put("key", "nav_anim")))
++        val raw = cmd("set_config", c("nav_anim", "off"))
++        val v = ok(raw); assertTrue(v is DiagCore.Verdict.Ok)
++        assertEquals("翻页动画", DiagCore.CONFIG_LABELS["nav_anim"]); assertEquals("关闭", DiagCore.configShown("nav_anim", "off"))
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/EngineerModeTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/EngineerModeTest.kt
