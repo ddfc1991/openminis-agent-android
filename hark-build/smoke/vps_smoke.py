@@ -128,6 +128,11 @@ try:
     I39111 = "i39111" in open("hark-build/smoke/target").read().splitlines()[1:2][0]   # [38.9.11.1 hotfix] fog sky perf + 天空动画 + local proxy
 except Exception:
     I39111 = False
+try:
+    I39112 = "i39112" in open("hark-build/smoke/target").read().splitlines()[1:2][0]   # [38.9.11.2] 无痕 isolation + 晴 flash capture
+except Exception:
+    I39112 = False
+if I39112: I39111 = True
 if I3911: I397 = True
 if I3910: I397 = True
 if I399: I397 = True
@@ -3265,7 +3270,8 @@ def main():
         else: fns = (b387_linkall, b387_noblack, b387_persist, b387_platforms)
         if HUB: fns = tuple(fns) + (b3891_hub,)   # [38.9.1 c] hub runs after the UI passes
         if I395: fns = (b395_i2, b395_i) if I395B else (b395_i,)   # [38.9.5 i] build-i gate only: 一键关联 / 一键重新登录, gateway, new screens light + dark
-        if I39111: fns = (b39111,)
+        if I39112: fns = (b39112,)
+        elif I39111: fns = (b39111,)
         elif I3911: fns = (b3911,)
         elif I3910: fns = (b3910,)
         elif I399: fns = (b399,)
@@ -6418,6 +6424,160 @@ def b39111(res):
     step("look", look)
     result_json("group", "i396 sky auto static", timeout=20)
     print("I39111 RESULT " + json.dumps(o, ensure_ascii=False)[:12000], flush=True)
+
+
+def b39112(res):
+    """[38.9.11.2] 无痕: normal browser sets cookie + localStorage + IndexedDB + Cache + SW on a local page; a 无痕 session must
+    see none; set inside 无痕, 清除并关闭, reopen → gone; normal browser still has its own; kill-safe (force-stop during a
+    session → wiped on next launch). 晴 「闪光」: screenrecord the sunny sky (light / dark) with the 38.9.11.1 behaviour
+    (skylegacy on) and the fix, governor level stepped 0→1→2→0 during each recording; luminance analysed offline."""
+    import urllib.request
+    o = res.setdefault("i39112", {})
+    T0 = time.time()
+    def step(name, f):
+        t0 = time.time()
+        if t0 - T0 > 85 * 60:
+            page_missing.append(f"i39112 {name} skipped (time budget)"); print(f"I39112 SKIP {name}", flush=True); return
+        try: f()
+        except Exception as e:
+            import traceback; traceback.print_exc(); page_missing.append(f"i39112 {name} error {e}")
+        print(f"I39112 STEP {name} {int(time.time() - t0)} s", flush=True)
+        if not alive(): crashed.append(f"i39112 {name}"); recover(f"i39112 {name}")
+    def shot(name):
+        r = snap("i39112-" + name)
+        subprocess.run(f"cp {OUT}/{step_no:02d}-i39112-{name}.png {OUT}/i39112-{name}.png", shell=True)
+        return r
+    def reports():
+        try: return json.loads(urllib.request.urlopen("http://127.0.0.1:8099/reports", timeout=5).read().decode())
+        except Exception as e: print("reports error", e, flush=True); return []
+    def last(tag, wait=20):
+        for _ in range(wait):
+            m = [r for r in reports() if r.get("tag") == tag]
+            if m: return m[-1]
+            time.sleep(1)
+        return None
+    U = "http://localhost:8099/t"
+    def empty(r): return r is not None and not r.get("ck") and not r.get("ls") and not r.get("idb") and not r.get("cache") and r.get("sw") in ("0", 0)
+    def istate(tag):
+        st = result_json("group", "i39112 incogstate", timeout=20); o["state_" + tag] = st; print("I39112 STATE", tag, st, flush=True); return st if isinstance(st, dict) else {}
+    def clear_close(tag):
+        if not tap_text("清除并关闭", wait=4): page_missing.append(f"i39112 {tag}: 清除并关闭 not found"); back(1)
+        time.sleep(4)
+    print("I39112 screen", sh("wm size").strip(), sh("wm density").strip(), flush=True)
+    set_zh()
+    try: result_json("group", "wallpaper off")
+    except Exception: pass
+
+    def incog():
+        print(adb("reverse", "tcp:8099", "tcp:8099"), flush=True)
+        theme388(1); healthy_home()
+        istate("start")
+        # 1 normal browser writes everything
+        result_json("group", f"i39112 normal {U}?act=set&tag=normal", timeout=30); time.sleep(6)
+        r = last("normal"); o["normal_set"] = r; shot("normal-set")
+        if not r or r.get("ck") != "normal" or r.get("ls") != "normal": selftest_fail.append(f"i39112 normal browser did not store: {r}")
+        back(1); time.sleep(2)
+        # 2 无痕 must see none of it
+        st = result_json("group", f"i39112 incog {U}?act=read&tag=incog1", timeout=30); time.sleep(6)
+        r = last("incog1"); o["incog1"] = r; rr = shot("incog-read-empty"); t = _txt(rr)
+        o["path"] = (st or {}).get("lastPath") if isinstance(st, dict) else None
+        if "无痕" not in t: page_missing.append("i39112 无痕 indicator not on screen")
+        if "清除并关闭" not in t: page_missing.append("i39112 清除并关闭 not on screen")
+        if not empty(r): selftest_fail.append(f"i39112 无痕 saw normal data: {r}")
+        istate("open1")
+        # 3 write inside 无痕, read back (sanity), then 清除并关闭
+        result_json("group", f"i39112 incog {U}?act=set&tag=incogset", timeout=30); time.sleep(6)
+        r = last("incogset"); o["incogset"] = r; shot("incog-set")
+        if not r or r.get("ck") != "incogset": page_missing.append(f"i39112 无痕 could not write (page may not work there): {r}")
+        clear_close("close1"); s1 = istate("closed1"); shot("after-clear")
+        if s1.get("process"): selftest_fail.append("i39112 :incog process still running after 清除并关闭")
+        if s1.get("dirs"): selftest_fail.append(f"i39112 :incog data dirs left after close: {s1.get('dirs')}")
+        if s1.get("open"): selftest_fail.append(f"i39112 profiles still open after close: {s1.get('open')}")
+        # 4 reopen → gone
+        result_json("group", f"i39112 incog {U}?act=read&tag=incog2", timeout=30); time.sleep(6)
+        r = last("incog2"); o["incog2"] = r; shot("incog-reopen-empty")
+        if not empty(r): selftest_fail.append(f"i39112 reopened 无痕 still has data: {r}")
+        clear_close("close2")
+        # 5 normal browser unaffected
+        result_json("group", f"i39112 normal {U}?act=read&tag=normal2", timeout=30); time.sleep(6)
+        r = last("normal2"); o["normal2"] = r; shot("normal-after")
+        if not r or r.get("ck") != "normal" or r.get("ls") != "normal" or r.get("idb") != "normal": selftest_fail.append(f"i39112 normal browser lost its data: {r}")
+        back(1); time.sleep(2)
+        # 6 dark theme top bar
+        theme388(2); healthy_home()
+        result_json("group", f"i39112 incog {U}?act=read&tag=incogdark", timeout=30); time.sleep(6); shot("incog-dark")
+        clear_close("closedark"); theme388(1); healthy_home()
+        # 7 kill-safe: write in 无痕, force-stop the whole app, relaunch → leftovers wiped
+        result_json("group", f"i39112 incog {U}?act=set&tag=incogkill", timeout=30); time.sleep(6)
+        istate("before_kill")
+        sh(f"am force-stop {PKG}"); time.sleep(2)
+        sh(f"monkey -p {PKG} -c android.intent.category.LAUNCHER 1"); time.sleep(14)
+        sk = istate("after_relaunch")
+        if sk.get("marker") or sk.get("dirs"): selftest_fail.append(f"i39112 kill-safe: leftovers after relaunch {sk}")
+        healthy_home()
+        result_json("group", f"i39112 incog {U}?act=read&tag=incog3", timeout=30); time.sleep(6)
+        r = last("incog3"); o["incog3"] = r
+        if not empty(r): selftest_fail.append(f"i39112 kill-safe: data survived a force-stop: {r}")
+        clear_close("close3")
+        # 8 forced process path where profiles exist (no-op on the emulator, which has none)
+        o["reports"] = reports()[-20:]
+        print("I39112 INCOG", json.dumps({k: o.get(k) for k in ("path", "normal_set", "incog1", "incogset", "incog2", "normal2", "incog3")}, ensure_ascii=False), flush=True)
+
+    def atomic():
+        o["atomic"] = result_json("group", "i39112 atomic", timeout=20); print("I39112 ATOMIC", o["atomic"], flush=True)
+        a = o["atomic"] if isinstance(o["atomic"], dict) else {}
+        if a.get("fresh") != "v3@main" or a.get("mainBad") != "v2@bak1" or a.get("allBad") is not True:
+            selftest_fail.append(f"i39112 atomic store on device: {a}")
+
+    def sky():
+        o["freeze_signals"] = result_json("group", "i39112 skyfreeze state", timeout=15); print("I39112 FREEZE", o["freeze_signals"], flush=True)
+        result_json("group", "i39112 skyfreeze ignore", timeout=15)   # measure the sky itself (the emulator's a11y would freeze it)
+        for mode, sfx in ((1, "light"), (2, "dark")):
+            theme388(mode); healthy_home()
+            o[f"gpu_{sfx}"] = result_json("group", "i396 skygpu on", timeout=40)
+            result_json("group", "i396 skymode smooth", timeout=20)
+            for leg in ("on", "off"):
+                tag = f"{'before' if leg == 'on' else 'after'}-{sfx}"
+                result_json("group", f"i39112 skylegacy {leg}", timeout=15)
+                result_json("group", "i39112 skylevel 0", timeout=15)
+                result_json("group", "i396 sky sunny", timeout=20); b381_home(); time.sleep(8)
+                sh("rm -f /sdcard/sky.mp4")
+                p = subprocess.Popen(["adb", "shell", "screenrecord", "--time-limit", "9", "--bit-rate", "12000000", "/sdcard/sky.mp4"])
+                t0 = time.time()
+                for at, lv in ((3.0, 1), (5.0, 2), (6.5, 0)):
+                    while time.time() - t0 < at: time.sleep(0.05)
+                    result_json("group", f"i39112 skylevel {lv}", timeout=10)
+                    print("I39112 LEVEL", tag, lv, round(time.time() - t0, 2), flush=True)
+                try: p.wait(timeout=30)
+                except Exception: p.kill()
+                time.sleep(1)
+                print(adb("pull", "/sdcard/sky.mp4", f"{OUT}/i39112-sky-{tag}.mp4"), flush=True)
+                shot(f"sky-{tag}")
+                o[f"sky_{tag}"] = result_json("group", "i396 skystate", timeout=15)
+            # freeze check (fixed build): key input from 2 s to 4.5 s → the sky must hold still until 1 s after the last tap
+            if sfx == "light":
+                result_json("group", "i39112 skylegacy off", timeout=15); result_json("group", "i39112 skylevel 0", timeout=15)
+                b381_home(); time.sleep(6)
+                sh("rm -f /sdcard/sky.mp4")
+                p = subprocess.Popen(["adb", "shell", "screenrecord", "--time-limit", "8", "--bit-rate", "12000000", "/sdcard/sky.mp4"])
+                t0 = time.time()
+                W, H = 1080, 2412
+                while time.time() - t0 < 2.0: time.sleep(0.05)
+                while time.time() - t0 < 4.5:
+                    sh("input keyevent 59"); time.sleep(0.25)   # SHIFT_LEFT: an input event that changes nothing on screen
+                print("I39112 TAPS end", round(time.time() - t0, 2), flush=True)
+                try: p.wait(timeout=30)
+                except Exception: p.kill()
+                time.sleep(1); print(adb("pull", "/sdcard/sky.mp4", f"{OUT}/i39112-sky-freeze-light.mp4"), flush=True)
+            result_json("group", "i39112 skylegacy off", timeout=15); result_json("group", "i39112 skylevel 0", timeout=15)
+            result_json("group", "i396 skygpu off", timeout=30)
+
+    step("incog", incog)
+    step("atomic", atomic)
+    step("sky", sky)
+    result_json("group", "i39112 skyfreeze on", timeout=15)
+    result_json("group", "i396 sky auto static", timeout=20)
+    print("I39112 RESULT " + json.dumps(o, ensure_ascii=False)[:12000], flush=True)
 
 
 def _in(n, b):
