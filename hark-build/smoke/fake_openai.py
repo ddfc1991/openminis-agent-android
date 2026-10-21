@@ -236,6 +236,10 @@ fetch('/linkfake/send?'+k+'='+encodeURIComponent(v));document.getElementById('fc
 @media (prefers-color-scheme: dark){ .drawer{background:transparent;color:#eee} }</style></head>
 <body><div style="padding:18px 18px 18px 40%"><h2>API Keys</h2><p>Your API keys are listed below. Do not share your API key with others.</p><p>gsk_…old (created 3 days ago)</p></div>
 <nav class="drawer" data-state="open"><div>Playground</div><div>API Keys</div><div>Dashboard</div><div>Docs</div><div>Settings</div><div>Sign Out</div></nav></body></html>""")
+        if self.path.startswith("/badkey/"):   # [38.9.11.3] 测试全部密钥: sk-bad-* answers 401
+            if "sk-bad" in (self.headers.get("Authorization") or ""):
+                return self._json({"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}}, 401)
+            return self._json({"object": "list", "data": [{"id": "smoke-model", "object": "model", "owned_by": "smoke"}]})
         if self.path.rstrip("/").endswith("/models"):
             return self._json({"object": "list", "data": [{"id": "smoke-model", "object": "model", "owned_by": "smoke"}]})
         self._json({"ok": True})

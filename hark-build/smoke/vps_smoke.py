@@ -132,6 +132,11 @@ try:
     I39112 = "i39112" in open("hark-build/smoke/target").read().splitlines()[1:2][0]   # [38.9.11.2] 无痕 isolation + 晴 flash capture
 except Exception:
     I39112 = False
+try:
+    I39113 = "i39113" in open("hark-build/smoke/target").read().splitlines()[1:2][0]   # [38.9.11.3] provider latency + continuous fog drift + SSH cert
+except Exception:
+    I39113 = False
+if I39113: I39112 = True
 if I39112: I39111 = True
 if I3911: I397 = True
 if I3910: I397 = True
@@ -3251,6 +3256,11 @@ def main():
         relaunch(); snap("relaunch-with-home"); check("cold launch with chats (home list)")
         dump_fatal()
         user_like_state()
+    if I39113:   # [38.9.11.3] speed before / after (adb only; also runs on 38.9.11.2 with MINES_PERF_ONLY=1)
+        try: perf_39113(os.environ.get("MINES_PERF_TAG", "new"))
+        except Exception as e:
+            import traceback; traceback.print_exc(); page_missing.append(f"perf error {e}")
+        if PERF_ONLY: return finish(lc)
     if I396 or I397:   # [i17] onboarding may have been killed by the GMS death: make sure the app is up with a model
         if not alive(): recover("onboarding")
         seed_model()
@@ -3270,7 +3280,8 @@ def main():
         else: fns = (b387_linkall, b387_noblack, b387_persist, b387_platforms)
         if HUB: fns = tuple(fns) + (b3891_hub,)   # [38.9.1 c] hub runs after the UI passes
         if I395: fns = (b395_i2, b395_i) if I395B else (b395_i,)   # [38.9.5 i] build-i gate only: 一键关联 / 一键重新登录, gateway, new screens light + dark
-        if I39112: fns = (b39112,)
+        if I39113: fns = (b39113,)
+        elif I39112: fns = (b39112,)
         elif I39111: fns = (b39111,)
         elif I3911: fns = (b3911,)
         elif I3910: fns = (b3910,)
@@ -6702,6 +6713,228 @@ def finish(lc):
     sys.exit(1 if (crashed or fatal or selftest_fail) else 0)
 
 
+
+PERF_ONLY = os.environ.get("MINES_PERF_ONLY") == "1"
+
+
+def perf_39113(tag):
+    """[38.9.11.3] speed before / after on the same emulator, adb only (works on 38.9.11.2 too): cold start (am start -W, x5),
+    PSS after idle, janky frames while scrolling home + opening a chat + scrolling it (dumpsys gfxinfo), and home → chat
+    open time from a screenrecord of the tap (sky set static for that part only; analysed offline: first changed frame →
+    settled)."""
+    P = {"tag": tag}
+    def total_ms(out):
+        m = re.search(r"TotalTime:\s*(\d+)", out or ""); return int(m.group(1)) if m else None
+    ts = []
+    for i in range(5):
+        sh(f"am force-stop {PKG}"); time.sleep(2.5)
+        ts.append(total_ms(sh(f"am start -W -n {PKG}/com.openminis.app.MainActivity", timeout=60))); time.sleep(7)
+    P["cold_ms"] = ts
+    dismiss_dialogs(); go_home(); time.sleep(10)
+    mi = sh(f"dumpsys meminfo {PKG}", timeout=60)
+    m = re.search(r"TOTAL PSS:\s*(\d+)", mi) or re.search(r"\n\s*TOTAL\s+(\d+)", mi)
+    P["pss_kb"] = int(m.group(1)) if m else None
+    def chat_node():
+        root = dump()
+        for t, d, x, y, n in nodes(root):
+            if ("hello" in t.lower() or "hello" in d.lower()) and y > 300: return (x, y)
+        return None
+    def gfx():
+        g = sh(f"dumpsys gfxinfo {PKG}", timeout=60)
+        out = {}
+        for k, rx in (("frames", r"Total frames rendered:\s*(\d+)"), ("janky", r"Janky frames:\s*(\d+)"), ("janky_pct", r"Janky frames:\s*\d+\s*\(([\d.]+)%\)"),
+                      ("p50", r"50th percentile:\s*(\d+)ms"), ("p90", r"90th percentile:\s*(\d+)ms"), ("p95", r"95th percentile:\s*(\d+)ms"), ("p99", r"99th percentile:\s*(\d+)ms")):
+            mm = re.search(rx, g); out[k] = float(mm.group(1)) if mm else None
+        return out
+    # janky frames with the sky as the user has it
+    sh(f"dumpsys gfxinfo {PKG} reset")
+    for _ in range(3): sh("input swipe 540 1800 540 900 350"); time.sleep(0.8); sh("input swipe 540 900 540 1800 350"); time.sleep(0.8)
+    c = chat_node()
+    if c:
+        sh(f"input tap {c[0]} {c[1]}"); time.sleep(3)
+        for _ in range(3): sh("input swipe 540 1500 540 900 300"); time.sleep(0.7); sh("input swipe 540 900 540 1500 300"); time.sleep(0.7)
+        sh("input keyevent KEYCODE_BACK"); time.sleep(2.5)
+    else:
+        UNTESTABLE.append(f"perf {tag}: no chat row on home to open")
+    P["gfx"] = gfx()
+    # home → chat open: screenrecord around the tap, sky static so only the page change moves
+    try: result_json("group", "i396 skymode off", timeout=20)
+    except Exception: pass
+    time.sleep(2)
+    P["open_videos"] = []
+    for i in range(3):
+        go_home(); time.sleep(2.5)
+        c = chat_node()
+        if not c: break
+        sh("rm -f /sdcard/open.mp4")
+        pr = subprocess.Popen(["adb", "shell", "screenrecord", "--time-limit", "6", "--bit-rate", "8000000", "/sdcard/open.mp4"])
+        time.sleep(2.0); sh(f"input tap {c[0]} {c[1]}")
+        try: pr.wait(timeout=20)
+        except Exception: pr.kill()
+        time.sleep(1); name = f"perf-{tag}-open{i}.mp4"
+        print(adb("pull", "/sdcard/open.mp4", f"{OUT}/{name}"), flush=True); P["open_videos"].append(name)
+        sh("input keyevent KEYCODE_BACK"); time.sleep(2)
+    try: result_json("group", "i396 skymode smooth", timeout=20)
+    except Exception: pass
+    go_home()
+    print("PERF39113 " + json.dumps(P, ensure_ascii=False), flush=True)
+    return P
+
+
+def b39113(res):
+    """[38.9.11.3] (1) provider latency: one streaming request through the real OpenAIProvider with a stalled local 'Clash'
+    (accepts, never answers) on 127.0.0.1:7890 — 38.9.11.2 networking (legacy) vs the new per-host routes; (2) the sky never
+    stops: fog recordings light / dark, before = 38.9.11.2 (a11y freeze rule + slow cross-faded drift, a fake 'other a11y
+    service' = Q仔), after = new with Mines' own accessibility service really enabled + idle, plus scrolls / taps during the
+    recording and a governor level-2 step; motion + luminance analysed offline; (3) SSH key exchange with InstaBox."""
+    o = res.setdefault("i39113", {})
+    T0 = time.time()
+    def step(name, f):
+        t0 = time.time()
+        if t0 - T0 > 80 * 60:
+            page_missing.append(f"i39113 {name} skipped (time budget)"); print(f"I39113 SKIP {name}", flush=True); return
+        try: f()
+        except Exception as e:
+            import traceback; traceback.print_exc(); page_missing.append(f"i39113 {name} error {e}")
+        print(f"I39113 STEP {name} {int(time.time() - t0)} s", flush=True)
+        if not alive(): crashed.append(f"i39113 {name}"); recover(f"i39113 {name}")
+    def shot(name):
+        r = snap("i39113-" + name)
+        subprocess.run(f"cp {OUT}/{step_no:02d}-i39113-{name}.png {OUT}/i39113-{name}.png", shell=True)
+        return r
+    print("I39113 screen", sh("wm size").strip(), sh("wm density").strip(), flush=True)
+    set_zh()
+    try: result_json("group", "wallpaper off")
+    except Exception: pass
+
+    def latency():
+        print(adb("reverse", "tcp:7890", "tcp:3131"), flush=True)   # stalled 'Clash'
+        cases = [
+            ("legacy", "127.0.0.1:7890", "https://api.deepseek.com/v1", "deepseek-chat"),
+            ("new", "127.0.0.1:7890", "https://api.deepseek.com/v1", "deepseek-chat"),
+            ("legacy", "127.0.0.1:7890", "https://token.sensenova.cn/v1", "SenseChat-5"),
+            ("new", "127.0.0.1:7890", "https://token.sensenova.cn/v1", "SenseChat-5"),
+            ("legacy", "127.0.0.1:7890", "https://api.openai.com/v1", "gpt-4o-mini"),
+            ("new", "127.0.0.1:7890", "https://api.openai.com/v1", "gpt-4o-mini"),
+            ("new", "127.0.0.1:7890", "http://10.0.2.2:8088/v1", "smoke-model"),
+            ("new", "none", "https://api.deepseek.com/v1", "deepseek-chat"),
+        ]
+        o["latency"] = []
+        for mode, px, base, model in cases:
+            r = result_json("group", f"i39113 latency {mode} {px} {base} {model}", timeout=150)
+            o["latency"].append(r); print("I39113 LAT", json.dumps(r, ensure_ascii=False), flush=True)
+        # same host again right away: the remembered route (no probe)
+        r = result_json("group", "i39113 latency new 127.0.0.1:7890 https://api.openai.com/v1 gpt-4o-mini", timeout=150)
+        o["latency_repeat_note"] = "latency hook forgets routes per call; repeat = fresh probe"; o["latency"].append(r)
+        print(adb("reverse", "tcp:7890", "tcp:3130"), flush=True)   # a working open proxy: foreign host should go through it
+        r = result_json("group", "i39113 latency new 127.0.0.1:7890 https://api.openai.com/v1 gpt-4o-mini", timeout=150)
+        o["latency"].append(r); print("I39113 LAT open-proxy", json.dumps(r, ensure_ascii=False), flush=True)
+        adb("reverse", "--remove", "tcp:7890")
+        result_json("group", "i39113 routeforget", timeout=15)
+        bad = [x for x in o["latency"] if isinstance(x, dict) and x.get("mode") == "new" and x.get("ms", 0) > 25000]
+        if bad: selftest_fail.append(f"i39113 new routes still slow (>25 s): {[(b.get('base'), b.get('ms'), b.get('outcome')) for b in bad]}")
+
+    def sky():
+        A11Y = f"{PKG}/com.openminis.app.accessibility.MinisAccessibilityService"
+        for mode, sfx in ((1, "light"), (2, "dark")):
+            theme388(mode); healthy_home()
+            o[f"gpu_{sfx}"] = result_json("group", "i396 skygpu on", timeout=40)
+            result_json("group", "i396 skymode smooth", timeout=20)
+            for leg in ("before", "after"):
+                tag = f"{leg}-{sfx}"
+                result_json("group", f"i39113 skydrift {'legacy' if leg == 'before' else 'new'}", timeout=15)
+                result_json("group", "i39112 skyfreeze on", timeout=15)          # real signals (no smoke ignore)
+                result_json("group", "i39113 a11yfake 1", timeout=15)           # Q仔-like other a11y service present
+                if leg == "after":
+                    sh(f"settings put secure enabled_accessibility_services {A11Y}"); sh("settings put secure accessibility_enabled 1"); time.sleep(2)
+                    o[f"a11y_enabled_{sfx}"] = sh("settings get secure enabled_accessibility_services").strip()
+                result_json("group", "i39112 skylevel 0", timeout=15)
+                result_json("group", "i396 sky fog", timeout=20); b381_home(); time.sleep(8)
+                o[f"skystate_pre_{tag}"] = result_json("group", "i39113 skystate", timeout=15)
+                sh("rm -f /sdcard/sky.mp4")
+                p = subprocess.Popen(["adb", "shell", "screenrecord", "--time-limit", "14", "--bit-rate", "12000000", "/sdcard/sky.mp4"])
+                t0 = time.time(); ev = []
+                def at(sec):
+                    while time.time() - t0 < sec: time.sleep(0.05)
+                # 0–4 s idle · 4–7 s touch: scroll down / up + key events · 7–9.5 s governor level 2 · 9.5–14 s idle
+                at(4.0); ev.append(("touch", round(time.time() - t0, 2)))
+                sh("input swipe 540 1700 540 1300 400"); sh("input keyevent 59"); sh("input swipe 540 1300 540 1700 400"); sh("input keyevent 59")
+                at(7.0); result_json("group", "i39112 skylevel 2", timeout=10); ev.append(("level2", round(time.time() - t0, 2)))
+                at(9.5); result_json("group", "i39112 skylevel 0", timeout=10); ev.append(("level0", round(time.time() - t0, 2)))
+                try: p.wait(timeout=30)
+                except Exception: p.kill()
+                time.sleep(1)
+                print(adb("pull", "/sdcard/sky.mp4", f"{OUT}/i39113-fog-{tag}.mp4"), flush=True)
+                o[f"events_{tag}"] = ev
+                o[f"skystate_{tag}"] = result_json("group", "i39113 skystate", timeout=15)
+                print("I39113 SKY", tag, json.dumps(o[f"skystate_{tag}"], ensure_ascii=False)[:600], flush=True)
+                shot(f"fog-{tag}")
+                if leg == "after":
+                    sh("settings put secure enabled_accessibility_services ''"); sh("settings put secure accessibility_enabled 0")
+            result_json("group", "i39113 a11yfake -1", timeout=15); result_json("group", "i39113 skydrift new", timeout=15)
+            result_json("group", "i39112 skylevel 0", timeout=15)
+            result_json("group", "i396 skygpu off", timeout=30)
+
+    def ssh():
+        o["ssh_instabox"] = result_json("group", "i39112 sshprobe api.instabox.sh 2222", timeout=60)
+        o["ssh_local_ed25519"] = result_json("group", "i39112 sshprobe 10.0.2.2 22", timeout=60)
+        print("I39113 SSH", o["ssh_instabox"], "|", o["ssh_local_ed25519"], flush=True)
+        r = str(o["ssh_instabox"])
+        if "negotiation fail" in r.lower() or ("hostkey=ssh-ed25519" not in r and "connected ssh-ed25519" not in r):
+            selftest_fail.append(f"i39113 InstaBox kex: {r}")
+
+    def keys():
+        # 测试全部密钥: provider with 3 keys on the fake endpoint, #2 → 401; tap the card on the providers page, then the hook's state
+        theme388(1); healthy_home()
+        o["key_seed"] = result_json("group", "i39113 keyseed", timeout=30)
+        route("providers", 6); r = shot("keys-card"); t = _txt(r)
+        if "测试全部密钥" not in t: page_missing.append(f"i39113 测试全部密钥 card not on providers page ({t[:160]})")
+        if tap_text("开始", exact=True, wait=12): shot("keys-result")
+        else: page_missing.append("i39113 开始 (测试全部密钥) not found")
+        o["key_check"] = result_json("group", "i39113 keycheck", timeout=90); print("I39113 KEYS", o["key_check"], flush=True)
+        k = o["key_check"] if isinstance(o["key_check"], dict) else {}
+        if k.get("bad2") is not True or k.get("good1") is not False: selftest_fail.append(f"i39113 key marks wrong: {k}")
+        if any(x and x.endswith("-bad-2") for x in (k.get("picks") or [])) or "bad-2" in "".join(str(x) for x in (k.get("picks") or [])):
+            selftest_fail.append(f"i39113 key pool still picks the invalid key: {k.get('picks')}")
+        if "#2 无效" not in "".join(k.get("summary") or []): selftest_fail.append(f"i39113 key summary: {k.get('summary')}")
+        back(1); time.sleep(1)
+        result_json("group", "i39113 keyclean", timeout=30)
+
+    def ledger():
+        # 台账: two saved accounts on a fake sign-in page; the chat names the 测试 one → filled without the card, chip on screen
+        theme388(1); healthy_home()
+        o["ledger"] = result_json("group", "i39113 ledger 用测试号登录一下看看", timeout=60); print("I39113 LEDGER", o["ledger"], flush=True)
+        time.sleep(0.5); shot("ledger-chip")
+        l = o["ledger"] if isinstance(o["ledger"], dict) else {}
+        f = {}
+        try: f = json.loads(l.get("fields") or "{}")
+        except Exception: pass
+        if f.get("u") != "test@ledger-smoke.test" or f.get("pl") != len("pw-test-22222"): selftest_fail.append(f"i39113 台账 fill wrong: {l}")
+        if l.get("cardShown"): selftest_fail.append("i39113 台账: password card popped although the account is saved")
+        if "pw-test" in json.dumps(l) or "pw-main" in json.dumps(l): selftest_fail.append("i39113 台账: a password reached the agent text")
+        o["ledger_named"] = result_json("group", "i39113 ledger 换 main@ledger-smoke.test 登录", timeout=60)
+        try:
+            if json.loads((o["ledger_named"] or {}).get("fields") or "{}").get("u") != "main@ledger-smoke.test": selftest_fail.append(f"i39113 台账 named account not used: {o['ledger_named']}")
+        except Exception as e: selftest_fail.append(f"i39113 台账 named: {e}")
+        result_json("group", "i39113 ledgerclean", timeout=30)
+
+    def crash():
+        theme388(1); healthy_home()
+        o["crash"] = result_json("group", "i39113 crashdemo", timeout=30); print("I39113 CRASH", o["crash"], flush=True)
+        time.sleep(0.5); shot("crash-card")
+        c = o["crash"] if isinstance(o["crash"], dict) else {}
+        if c.get("leak") or not c.get("kept") or "ANR" not in str(c.get("card")): selftest_fail.append(f"i39113 crash card / redaction: {c}")
+        tap_text("关闭", exact=True, wait=2)
+
+    step("ssh", ssh)
+    step("keys", keys)
+    step("ledger", ledger)
+    step("crash", crash)
+    step("latency", latency)
+    step("sky", sky)
+    result_json("group", "i396 sky auto static", timeout=20)
+    print("I39113 RESULT " + json.dumps(o, ensure_ascii=False)[:14000], flush=True)
+
+
 if __name__ == "__main__":
     main()
-

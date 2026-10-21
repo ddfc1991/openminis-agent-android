@@ -50,6 +50,22 @@ adb push smoke-wall.jpg /sdcard/Pictures/smoke-wall.png
 adb shell am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d file:///sdcard/Pictures/smoke-wall.png
 adb shell content call --uri content://media/external/file --method scan_volume --arg external_primary 2>/dev/null
 python3 -m pip install -q --break-system-packages pillow 2>/dev/null || python3 -m pip install -q pillow 2>/dev/null || true   # [build-38.4] screenshot paint check
+# [38.9.11.3] speed before / after on this same emulator: the previous APK (target line 3) gets the same onboarding + the
+# adb-only perf step first (MINES_PERF_ONLY), then the new APK is installed again for the full run (perf tag new)
+if [ -n "$OLD_APK" ] && [ -f "$OLD_APK" ] && sed -n 2p hark-build/smoke/target | grep -q perf; then
+  adb uninstall com.openminis.mines.plus >/dev/null 2>&1
+  adb install -g "$OLD_APK" && echo "PERF_OLD_INSTALL: ok"
+  adb shell cmd locale set-app-locales com.openminis.mines.plus --locales en-US
+  for p in POST_NOTIFICATIONS RECORD_AUDIO; do adb shell pm grant com.openminis.mines.plus android.permission.$p 2>/dev/null; done
+  adb shell appops set com.openminis.mines.plus SYSTEM_ALERT_WINDOW allow 2>/dev/null
+  mkdir -p smoke-out-old
+  OUT=smoke-out-old MINES_PERF_ONLY=1 MINES_PERF_TAG=old timeout 2400 python3 hark-build/smoke/vps_smoke.py; echo "PERF_OLD rc=$?"
+  adb uninstall com.openminis.mines.plus >/dev/null 2>&1
+  adb install -g "$APK" && echo "PERF_NEW_REINSTALL: ok"
+  adb shell cmd locale set-app-locales com.openminis.mines.plus --locales en-US
+  for p in POST_NOTIFICATIONS RECORD_AUDIO; do adb shell pm grant com.openminis.mines.plus android.permission.$p 2>/dev/null; done
+  adb shell appops set com.openminis.mines.plus SYSTEM_ALERT_WINDOW allow 2>/dev/null
+fi
 python3 hark-build/smoke/vps_smoke.py
 rc=$?
 # [38.8 v5] if the emulator went away during the drive, stop here instead of waiting forever for the device
