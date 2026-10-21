@@ -6001,7 +6001,7 @@ index 7660141..9949f04 100644
          // language settings (it did: every launch reset it, so system Settings → Apps → Mines → 语言 never stuck)
          if (code.isEmpty()) return
 diff --git a/src/android/app/src/main/java/com/openminis/app/MinisApp.kt b/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
-index e48d0e0..737f113 100644
+index e48d0e0..57c9802 100644
 --- a/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
 @@ -241,9 +241,32 @@ class MinisApp : Application(), ImageLoaderFactory {
@@ -6020,7 +6020,7 @@ index e48d0e0..737f113 100644
          runCatching { com.openminis.app.plus.SplitProxy.init(this) }
 +        // [38.9.11.1] probe the local proxy ports (7890 / 7897 / 7899 / …) — only a port that passes is ever exported
 +        runCatching { com.openminis.app.plus.LocalProxy.init(this) }
-+        runCatching { com.openminis.app.util.EncryptedPrefsFactory.prewarm(this, "oauth_prefs", "provider_secrets") }   // [38.9.11.3.1] off the main thread
++        runCatching { com.openminis.app.util.EncryptedPrefsFactory.prewarm(this, *com.openminis.app.util.EncryptedPrefsFactory.UI_STORES) }   // [38.9.11.3.1] off the main thread
 +        runCatching { com.openminis.app.plus.BadKeys.init(this) }   // [38.9.11.3] invalid-key marks (fingerprints), read off the main thread
 +        // [Mines-38.9.10 i29] memory guard (heap watch + trim + OOM summary), wired as i28 designed
 +        runCatching { com.openminis.app.plus.MemGuard.install(this) }
@@ -23491,10 +23491,10 @@ index 0000000..0b4d211
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MinesAutofillService.kt b/src/android/app/src/main/java/com/openminis/app/plus/MinesAutofillService.kt
 new file mode 100644
-index 0000000..9fbf83f
+index 0000000..c8738d2
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/MinesAutofillService.kt
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,183 @@
 +package com.openminis.app.plus
 +
 +import android.app.Activity
@@ -23530,7 +23530,17 @@ index 0000000..9fbf83f
 +
 +    data class Fields(val user: AutofillId?, val pass: AutofillId?, val webDomain: String, val pkg: String, val userText: String, val passText: String)
 +
++    // [38.9.11.3.1] fill / save run off the main thread: SavedLogins decrypts through Android Keystore (seconds on some
++    // phones) and this service shares Mines' main thread — the realme ANR 2026-10-22 00:23 came right after two binds.
++    private val worker = java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "mines-autofill").apply { isDaemon = true } }
++
++    override fun onDestroy() { worker.shutdown(); super.onDestroy() }
++
 +    override fun onFillRequest(request: FillRequest, cancellationSignal: CancellationSignal, callback: FillCallback) {
++        runCatching { worker.execute { fill(request, callback) } }.onFailure { callback.onSuccess(null) }
++    }
++
++    private fun fill(request: FillRequest, callback: FillCallback) {
 +        runCatching {
 +            val st = request.fillContexts.lastOrNull()?.structure ?: return callback.onSuccess(null)
 +            val f = parse(st)
@@ -23554,10 +23564,14 @@ index 0000000..9fbf83f
 +            if (f.pass != null) b.setSaveInfo(SaveInfo.Builder(SaveInfo.SAVE_DATA_TYPE_PASSWORD or (if (f.user != null) SaveInfo.SAVE_DATA_TYPE_USERNAME else 0), ids).build())
 +            if (cands.isEmpty() && f.pass == null) return callback.onSuccess(null)
 +            callback.onSuccess(b.build())
-+        }.onFailure { callback.onSuccess(null) }
++        }.onFailure { runCatching { callback.onSuccess(null) } }
 +    }
 +
 +    override fun onSaveRequest(request: SaveRequest, callback: SaveCallback) {
++        runCatching { worker.execute { save(request, callback) } }.onFailure { callback.onSuccess() }
++    }
++
++    private fun save(request: SaveRequest, callback: SaveCallback) {
 +        runCatching {
 +            val st = request.fillContexts.lastOrNull()?.structure
 +            val f = st?.let { parse(it) }
@@ -23568,7 +23582,7 @@ index 0000000..9fbf83f
 +                if (f.userText.isNotBlank()) AutoAccounts.record(this, name, if (f.webDomain.isNotBlank()) Keychain.root(f.webDomain) else host, f.userText, AutoAccounts.LINKED, "自动填")
 +            }
 +        }
-+        callback.onSuccess()
++        runCatching { callback.onSuccess() }
 +    }
 +
 +    companion object {
@@ -35759,10 +35773,10 @@ index e75c624..b403b26 100644
              "tool_title" to AgentToolParam("string", "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Create Python statistics script', 'Write configuration file'). Use the same language as the user."),
              "path" to AgentToolParam("string", "Absolute Linux path to write (e.g. /root/test.txt)"),
 diff --git a/src/android/app/src/main/java/com/openminis/app/tools/VisionGroupResolver.kt b/src/android/app/src/main/java/com/openminis/app/tools/VisionGroupResolver.kt
-index 7004a5c..b8f8ec5 100644
+index 7004a5c..41378af 100644
 --- a/src/android/app/src/main/java/com/openminis/app/tools/VisionGroupResolver.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/tools/VisionGroupResolver.kt
-@@ -86,7 +86,27 @@ object VisionGroupResolver {
+@@ -86,7 +86,39 @@ object VisionGroupResolver {
       * individually, so one dangling reference cannot disqualify a good sibling.
       */
      fun candidates(repo: ProviderRepository, context: Context?, seed: Int = 0): List<Pair<ProviderInstance, ModelEntry>> =
@@ -35774,12 +35788,24 @@ index 7004a5c..b8f8ec5 100644
 +     * capable model the user already has working (enabled, credentialed, not hidden), Google-account Gemini first, so a
 +     * picture is described instead of "当前模型不能看图片". Only credentialed instances — an auto pick must be able to answer.
 +     */
++    /**
++     * [38.9.11.3.1] The main thread (tool list for the context estimate on chat open / send) never waits for the encrypted
++     * stores' first open — Android Keystore, 5–12 s on some phones, behind Tink's one global lock (3 ANRs on a realme,
++     * 2026-10-21/22). Until they are open the instance counts as credentialed, the same rule as Vision Group members:
++     * a missing credential surfaces at request time, where this runs off the main thread with the real check.
++     */
++    private fun credentialedNoWait(repo: ProviderRepository, inst: ProviderInstance): Boolean {
++        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper() &&
++            !com.openminis.app.util.EncryptedPrefsFactory.isOpen(*com.openminis.app.util.EncryptedPrefsFactory.UI_STORES)) return true
++        return runCatching { repo.hasAnyCredential(inst) }.getOrDefault(false)
++    }
++
 +    private fun autoCandidates(repo: ProviderRepository): List<Pair<ProviderInstance, ModelEntry>> = runCatching {
 +        val cfg = repo.config.value
 +        cfg.modelEntries.asSequence()
 +            .filter { !it.isHidden && it.model.hasImageInput }
 +            .mapNotNull { e -> cfg.instances.firstOrNull { it.id == e.providerInstanceId }?.let { it to e } }
-+            .filter { (inst, _) -> inst.isEnabled && runCatching { repo.hasAnyCredential(inst) }.getOrDefault(false) }
++            .filter { (inst, _) -> inst.isEnabled && credentialedNoWait(repo, inst) }
 +            .sortedWith(compareBy<Pair<ProviderInstance, ModelEntry>>(
 +                { if (it.first.providerType == com.openminis.app.data.model.ProviderType.gemini) 0 else 1 },
 +                { if (it.second.model.id.contains("flash", true) || it.second.model.id.contains("mini", true)) 0 else 1 },
@@ -35791,7 +35817,7 @@ index 7004a5c..b8f8ec5 100644
  
      /**
       * [T-android-image-path-metadata] Path note appended AFTER the pixels for a
-@@ -288,6 +308,26 @@ object VisionGroupResolver {
+@@ -288,6 +320,26 @@ object VisionGroupResolver {
          return VisionResult.Failure(detail)
      }
  
@@ -56825,22 +56851,31 @@ index 9c18509..512f8a2 100644
          ),
          scrollBehavior = scrollBehavior,
 diff --git a/src/android/app/src/main/java/com/openminis/app/util/EncryptedPrefsFactory.kt b/src/android/app/src/main/java/com/openminis/app/util/EncryptedPrefsFactory.kt
-index 9ce8f4a..e6fa70c 100644
+index 9ce8f4a..0b0c398 100644
 --- a/src/android/app/src/main/java/com/openminis/app/util/EncryptedPrefsFactory.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/util/EncryptedPrefsFactory.kt
-@@ -36,7 +36,23 @@ import java.security.KeyStore
+@@ -36,7 +36,33 @@ import java.security.KeyStore
  object EncryptedPrefsFactory {
      private const val TAG = "EncryptedPrefsFactory"
  
--    fun safeCreate(context: Context, fileName: String): SharedPreferences {
 +    // [38.9.11.3.1] one open store per file for the life of the process. Opening one decrypts its Tink keysets through
 +    // the Android Keystore (seconds on some phones) under Tink's single global lock, and callers like
 +    // ProviderRepository.hasAnyCredential / OAuthManager.needsReauth used to re-open it on every check — on the main
 +    // thread too, which waited behind another thread's open and hit an ANR (realme RMX5062, 2026-10-21).
 +    private val cache = com.openminis.app.plus.OnceCache<SharedPreferences>()
 +
-+    fun safeCreate(context: Context, fileName: String): SharedPreferences =
-+        cache.get(fileName) { createUncached(context.applicationContext ?: context, fileName) }
++    /** [38.9.11.3.1] the stores the chat screen / provider routing read; opened in the background at app start */
++    val UI_STORES = arrayOf("oauth_prefs", "provider_secrets", "mines_gemini_accounts")
++
+     fun safeCreate(context: Context, fileName: String): SharedPreferences {
++        cache.peek(fileName)?.let { return it }
++        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper())
++            Log.w(TAG, "first open of $fileName on the main thread (Keystore; may block)")
++        return cache.get(fileName) { createUncached(context.applicationContext ?: context, fileName) }
++    }
++
++    /** [38.9.11.3.1] true once every named store is open (a read is then a map lookup, no Keystore, no Tink lock) */
++    fun isOpen(vararg fileNames: String): Boolean = fileNames.all { cache.peek(it) != null }
 +
 +    /** [38.9.11.3.1] open the stores the UI checks most, on a background thread, so the first check finds them open. */
 +    fun prewarm(context: Context, vararg fileNames: String) {
