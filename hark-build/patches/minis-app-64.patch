@@ -30978,7 +30978,7 @@ index 1d773a2..5489e65 100644
          coroutineScope {
              val bg = slow.map { id -> async { one(id) } }
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-index af13c1b..5842454 100644
+index af13c1b..0eb62a7 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 @@ -2,6 +2,8 @@ package com.openminis.app.plus.group
@@ -31003,7 +31003,7 @@ index af13c1b..5842454 100644
 +        .put("renderer", com.openminis.app.ui.plus.WeatherSky.renderer).put("measured", com.openminis.app.ui.plus.WeatherSky.measuredFrames)
 +        .put("slow", com.openminis.app.ui.plus.WeatherSky.slowFrames).put("lastFrameMs", com.openminis.app.ui.plus.WeatherSky.lastFrameMs.toDouble())
 +        .put("wind", com.openminis.app.ui.plus.WeatherSky.windRateLabel())
-+        .put("keyRenders", com.openminis.app.ui.plus.WeatherSky.keyRenders).put("skies", com.openminis.app.ui.plus.WeatherSky.registry.size())
++        .put("keyRenders", com.openminis.app.ui.plus.WeatherSky.keyRenders).put("keyLost", com.openminis.app.ui.plus.WeatherSky.keyLost).put("skies", com.openminis.app.ui.plus.WeatherSky.registry.size())
 +        .put("liveToken", com.openminis.app.ui.plus.WeatherSky.liveToken.value).toString()
 +
      fun handle(context: Context, arg: String): String = runBlocking {
@@ -31637,7 +31637,7 @@ index af13c1b..5842454 100644
 +                        val F = com.openminis.app.ui.plus.SkyFreeze; val W = com.openminis.app.ui.plus.WeatherSky
 +                        JSONObject().put("frozen", F.frozen()).put("reason38_9_11_2", F.lastReason).put("legacyFreeze", F.legacyFreeze)
 +                            .put("legacyDrift", W.legacyDrift).put("signals", F.signals.toString()).put("shot", W.lastShot).put("drift", W.lastDrift)
-+                            .put("keyRenders", W.keyRenders).put("frames", W.frames).put("level", W.level).put("mode", W.lastMode).put("wind", W.windRateLabel()).toString()
++                            .put("keyRenders", W.keyRenders).put("keyLost", W.keyLost).put("frames", W.frames).put("level", W.level).put("mode", W.lastMode).put("wind", W.windRateLabel()).toString()
 +                    }
 +                    // [38.9.11.3 c] 测试全部密钥: a provider on the runner's fake endpoint with 3 keys, #2 answers 401
 +                    "keyseed", "keycheck", "keyclean" -> kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
@@ -31716,13 +31716,13 @@ index af13c1b..5842454 100644
 +                    // [38.9.11.3 f] smoke only: a real 每日简报 run on three fake feeds (403 / cut connection / ok) → its Chinese note lines,
 +                    // plus ErrZhCore lines for a TTS model and the chat-capable filter; the user's own sources are restored afterwards
 +                    "errzh" -> kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-+                        val H = com.openminis.app.plus.Horizon; val K = com.openminis.app.plus.HorizonCore
++                        val H = com.openminis.app.plus.Horizon
 +                        val base = arg2.ifBlank { "http://10.0.2.2:8088" }
 +                        val keep = H.sources(context)
 +                        H.setSources(context, listOf(
-+                            K.Source("smk403", K.Kind.RSS, "$base/rss403", "Reddit 测试源", "测试"),
-+                            K.Source("smkeof", K.Kind.RSS, "$base/rsseof", "Hacker News 测试源", "测试"),
-+                            K.Source("smkok", K.Kind.RSS, "$base/rssok", "正常测试源", "测试")))
++                            com.openminis.app.plus.HorizonCore.Source("smk403", com.openminis.app.plus.HorizonCore.Kind.RSS, "$base/rss403", "Reddit 测试源", "测试"),
++                            com.openminis.app.plus.HorizonCore.Source("smkeof", com.openminis.app.plus.HorizonCore.Kind.RSS, "$base/rsseof", "Hacker News 测试源", "测试"),
++                            com.openminis.app.plus.HorizonCore.Source("smkok", com.openminis.app.plus.HorizonCore.Kind.RSS, "$base/rssok", "正常测试源", "测试")))
 +                        val b = runCatching { kotlinx.coroutines.withTimeoutOrNull(120_000) { H.run(context) } }.getOrNull()
 +                        H.setSources(context, keep)
 +                        val o = JSONObject().put("notes", org.json.JSONArray(b?.notes ?: emptyList<String>())).put("lastError", H.lastError)
@@ -50901,10 +50901,10 @@ index 0000000..6e9e598
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/WeatherSky.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/WeatherSky.kt
 new file mode 100644
-index 0000000..284ba1a
+index 0000000..d8d6f22
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/WeatherSky.kt
-@@ -0,0 +1,637 @@
+@@ -0,0 +1,649 @@
 +package com.openminis.app.ui.plus
 +
 +import com.openminis.app.plus.SkyFreezeCore
@@ -50973,6 +50973,8 @@ index 0000000..284ba1a
 +    val liveToken = kotlinx.coroutines.flow.MutableStateFlow(0L)
 +    /** smoke / 自检: shader renders (key frames + live frames) since launch */
 +    @Volatile var keyRenders: Long = 0
++    /** [38.9.11.3 f] key nodes found without a recording (HWUI dropped them) and recorded again */
++    @Volatile var keyLost: Long = 0
 +    fun enabled(c: android.content.Context): Boolean = c.getSharedPreferences("mines_sky", 0).getBoolean("on", true)
 +    fun setEnabled(c: android.content.Context, on: Boolean) { c.getSharedPreferences("mines_sky", 0).edit().putBoolean("on", on).apply(); bump() }
 +
@@ -51370,6 +51372,16 @@ index 0000000..284ba1a
 +    val margin = if (WeatherSky.legacySky || WeatherSky.legacyDrift) 0f else SkyModeCore.marginUnits(s.key, mode, chat)
 +    if (k.scene != s || k.dark != dark || k.chat != chat || k.w != w || k.h != h || k.div != div || k.blur != mp.blurPx || k.calm != mp.calm || k.hq != mp.hq || k.margin != margin) {
 +        k.scene = s; k.dark = dark; k.chat = chat; k.w = w; k.h = h; k.div = div; k.blur = mp.blurPx; k.calm = mp.calm; k.hq = mp.hq; k.margin = margin; k.reset()
++    }
++    // [38.9.11.3 f] HWUI's destroyHardwareResources (window hidden / trim memory / surface change) deletes the display lists of
++    // these cached key nodes too; they then draw NOTHING until replaced — smoke saw the dark fog vanish to the page colour for
++    // 1.5 s and fade back over 3 keys. A key whose node lost its recording counts as not rendered and is recorded again.
++    for (i in 0..2) if (k.t[i] != Long.MIN_VALUE) {
++        val n = k.sky[i] as? android.graphics.RenderNode
++        val n3 = k.p2[i] as? android.graphics.RenderNode
++        if (n == null || !n.hasDisplayList() || (g.pass2(s) != null && (n3 == null || !n3.hasDisplayList()))) {
++            k.t[i] = Long.MIN_VALUE; k.lastValid = false; WeatherSky.keyLost++
++        }
 +    }
 +    val qw = kotlin.math.ceil(w / div).toInt().coerceAtLeast(1); val qh = kotlin.math.ceil(h / div).toInt().coerceAtLeast(1)
 +    // [38.9.11.3] side margin in key pixels (the shader's 270 units span qw)
