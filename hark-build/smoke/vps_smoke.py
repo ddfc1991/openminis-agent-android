@@ -3259,7 +3259,7 @@ def main():
         relaunch(); snap("relaunch-with-home"); check("cold launch with chats (home list)")
         dump_fatal()
         user_like_state()
-    if I39113 and "skyonly" not in open("hark-build/smoke/target").read().splitlines()[1]:   # [38.9.11.3] speed before / after (adb only; also runs on 38.9.11.2 with MINES_PERF_ONLY=1)
+    if I39113 and "skyonly" not in open("hark-build/smoke/target").read().splitlines()[1] and "diagsoak" not in open("hark-build/smoke/target").read().splitlines()[1]:   # [38.9.11.3] speed before / after (adb only; also runs on 38.9.11.2 with MINES_PERF_ONLY=1)
         try: perf_39113(os.environ.get("MINES_PERF_TAG", "new"))
         except Exception as e:
             import traceback; traceback.print_exc(); page_missing.append(f"perf error {e}")
@@ -6935,9 +6935,11 @@ def b39113(res):
     o = res.setdefault("i39113", {})
     T0 = time.time()
     SKYONLY = "skyonly" in (open("hark-build/smoke/target").read().splitlines()[1:2] or [""])[0]
+    DIAGSOAK = "diagsoak" in (open("hark-build/smoke/target").read().splitlines()[1:2] or [""])[0]
     def step(name, f):
         t0 = time.time()
         if SKYONLY and name != "skyall": return   # [38.9.11.3 h] sky-drift-only run
+        if DIAGSOAK and name not in ("diag", "diagsoak", "skyshort"): return   # [38.9.11.3.1] keystore-ANR hotfix gate
         if t0 - T0 > 80 * 60:
             page_missing.append(f"i39113 {name} skipped (time budget)"); print(f"I39113 SKIP {name}", flush=True); return
         try: f()
@@ -7294,6 +7296,101 @@ def b39113(res):
         o["skyall"] = R
         print("I39113 SKYALL_SUMMARY " + json.dumps({k: v["cells3s"] for k, v in R.items()}), flush=True)
 
+    def diagsoak():
+        # [38.9.11.3.1] real phone ANR 2026-10-21 23:41 with 诊断 on: main thread waited ~5–12 s on Android Keystore
+        # (EncryptedSharedPreferences re-opened on every credential check). Sustained run with 诊断 on: chat open/close
+        # (loadSession → tool list → credential checks), page switches, pings over the relay every ~30 s, then the stress
+        # block with 诊断 still on. Gate: ANR 0, FATAL 0, no relay stall > 2 s, no stall stack in Keystore / Tink / EncryptedPrefs.
+        import base64 as _b64
+        S = {"loops": 0, "dead": 0, "pings_sent": 0, "pings_ok": 0}
+        tok = os.environ.get("DIAG_TOKEN", "mdk_smoke_token_0123456789abcdef")
+        env = dict(os.environ, DIAG_CTL=os.environ.get("DIAG_CTL", os.path.abspath("diag.sock")))
+        def ctl(*a):
+            return subprocess.run(["python3", "hark-build/smoke/diag_ctl.py", *a], env=env, capture_output=True, text=True, timeout=30).stdout.strip()
+        def tail(sid, n=4000):
+            return [json.loads(x) for x in ctl("tail", sid, str(n)).splitlines() if x.startswith("{")]
+        code = "mdiag1:" + _b64.urlsafe_b64encode(json.dumps({"t": tok, "e": [["ws://10.0.2.2:8097/mdiag/dev", ""]]}).encode()).decode().rstrip("=")
+        theme388(1); healthy_home()
+        sh("logcat -b crash -c"); t0 = sh("date +%s").strip()
+        result_json("group", "i39113 diag code " + code, timeout=20); result_json("group", "i39113 diag on", timeout=20)
+        sid = ""; t1 = time.time(); st = None
+        while time.time() - t1 < 40:
+            st = result_json("group", "i39113 diag state", timeout=20)
+            if isinstance(st, dict) and st.get("connected"): sid = st.get("sid", ""); break
+            time.sleep(2)
+        if not sid:
+            selftest_fail.append(f"i39113 diagsoak: never connected ({st})"); o["diagsoak"] = S; return
+        def chat_row():
+            for t, d, x, y, n in nodes(dump()):
+                if any(k in (t + d) for k in ("GARBAGETEST", "你好，我是测试模型", "hello")) and y > 300: return (x, y)
+        T1 = time.time(); last_ping = 0.0; pending = []
+        while time.time() - T1 < 8 * 60:
+            c = chat_row()
+            if c:
+                sh(f"input tap {c[0]} {c[1]}"); time.sleep(1.2)
+                sh("input swipe 540 900 540 1600 200"); time.sleep(0.4)
+                sh("input keyevent KEYCODE_BACK"); time.sleep(0.5)
+            selftest("route", ["settings", "plus_digest", "providers", "plus_knowledge"][S["loops"] % 4], timeout=20); time.sleep(0.6)
+            sh("input keyevent KEYCODE_BACK"); time.sleep(0.4)
+            if S["loops"] % 5 == 4:
+                sh("input keyevent KEYCODE_HOME"); time.sleep(0.8)
+                sh(f"monkey -p {PKG} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1"); time.sleep(1.5)
+            if time.time() - last_ping > 30:
+                last_ping = time.time()
+                try: cid = json.loads(ctl("send", sid, "ping", "{}")).get("id")
+                except Exception: cid = None
+                S["pings_sent"] += 1
+                if cid: pending.append(cid)
+            S["loops"] += 1
+            if not alive(): S["dead"] += 1; relaunch(); time.sleep(3)
+        time.sleep(3)
+        got = {x.get("id") for x in tail(sid) if x.get("t") == "result"}
+        S["pings_ok"] = sum(1 for c in pending if c in got)
+        shot("diagsoak-after-loops")
+        stress()   # 诊断 still on
+        time.sleep(12)
+        lines = tail(sid)
+        stalls = [x for x in lines if x.get("t") == "stall"]
+        S["stalls"] = len(stalls); S["stall_ms_max"] = max([x.get("ms", 0) for x in stalls] or [0])
+        S["stall_top"] = sorted([(x.get("ms"), x.get("page")) for x in stalls], key=lambda v: -(v[0] or 0))[:6]
+        ks = [x for x in stalls if re.search(r"keystore|EncryptedSharedPreferences|crypto\.tink|EncryptedPrefsFactory", x.get("stack", ""), re.I)]
+        S["keystore_stalls"] = len(ks); S["keystore_stall_stacks"] = [x.get("stack", "")[:600] for x in ks[:2]]
+        S["reconnects"] = sum(1 for x in lines if x.get("t") == "relay" and x.get("ev") == "connected")
+        S["live_at_end"] = sid in (json.loads(ctl("list") or "{}").get("live") or {})
+        cb = adb("logcat", "-d", "-v", "threadtime", "-b", "crash", timeout=60)
+        S["fatal"] = cb.count("FATAL EXCEPTION")
+        S["anr"] = sh(f"logcat -d -t '{t0}.000' -b main,system | grep -c 'ANR in {PKG}'").strip() if t0.isdigit() else "?"
+        o["diagsoak"] = S; print("I39113 DIAGSOAK " + json.dumps(S, ensure_ascii=False)[:5000], flush=True)
+        subprocess.run(f"cp diag-data/{sid}.jsonl {OUT}/diagsoak-session.jsonl", shell=True)
+        if S["fatal"] or S["dead"] or (S["anr"].isdigit() and int(S["anr"]) > 0) or S["anr"] == "?":
+            selftest_fail.append(f"i39113 diagsoak: fatal={S['fatal']} dead={S['dead']} anr={S['anr']}")
+        if S["keystore_stalls"]: selftest_fail.append(f"i39113 diagsoak: main-thread stall in Keystore/EncryptedPrefs: {S['keystore_stall_stacks'][:1]}")
+        if S["stall_ms_max"] > 2000: selftest_fail.append(f"i39113 diagsoak: main-thread stall {S['stall_ms_max']} ms: {S['stall_top']}")
+        if S["pings_sent"] and S["pings_ok"] < 0.8 * S["pings_sent"]: selftest_fail.append(f"i39113 diagsoak: pings {S['pings_ok']}/{S['pings_sent']}")
+        result_json("group", "i39113 diag off", timeout=20); time.sleep(2); result_json("group", "i39113 diag code none", timeout=20)
+        healthy_home()
+
+    def skyshort():
+        # [38.9.11.3.1] short sky regression check: default + animator scale 0, light + dark, automatic path (no forced
+        # shader — the forced-shader skyall hangs SwiftShader). Recorded with tag 'hf', compared offline with h2's skyall.
+        R = {}
+        scales0 = [sh(f"settings get global {g}").strip() for g in ("animator_duration_scale", "window_animation_scale", "transition_animation_scale")]
+        sh("cmd power set-mode 0; cmd battery reset")
+        for cname, scale in (("default", 1), ("anim0", 0)):
+            sh(f"settings put global animator_duration_scale {scale}; settings put global window_animation_scale {scale}; settings put global transition_animation_scale {scale}")
+            for mode, sfx in ((1, "light"), (2, "dark")):
+                theme388(mode); healthy_home()
+                result_json("group", "i396 skymode smooth", timeout=20)
+                result_json("group", "i396 skygpu off", timeout=40)
+                sky_frames_39113("hf", cname, sfx, "stills", R, keep=(sfx == "light"))
+        for g, v in zip(("animator_duration_scale", "window_animation_scale", "transition_animation_scale"), scales0):
+            sh(f"settings put global {g} {v if v not in ('', 'null') else 1}")
+        result_json("group", "i396 sky auto", timeout=20)
+        o["skyshort"] = R
+        print("I39113 SKYSHORT_SUMMARY " + json.dumps({k: v["cells3s"] for k, v in R.items()}), flush=True)
+
+    step("diagsoak", diagsoak)
+    step("skyshort", skyshort)
     step("latency", latency)
     step("sky", sky)
     step("skyall", skyall)
