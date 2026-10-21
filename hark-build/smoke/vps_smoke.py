@@ -7111,6 +7111,27 @@ def b39113(res):
         x = wait_result(sid, cid, 25); b = (x or {}).get("body", {})
         D["steps"]["request_screenshot_of_mines_only"] = (x or {}).get("t", "none"); D["shot"] = {"w": b.get("w"), "h": b.get("h"), "jpeg_kb": len(b.get("jpeg_b64", "")) * 3 // 4 // 1024}
         if not D["shot_ask_seen"] or not b.get("jpeg_b64"): selftest_fail.append(f"i39113 diag screenshot: ask={D['shot_ask_seen']} body={str(b)[:200]}")
+        # [g2] signed remote config: bounded keys, shown in-app, one-tap 「撤销」, all undone when 诊断 turns off
+        cfg = {}
+        for k, v in (("sky_fps_cap", 15), ("nav_anim", "off"), ("sky_mode", "off")):
+            cid = send(sid, "set_config", {"key": k, "value": v}); x = wait_result(sid, cid)
+            cfg[k] = (x or {}).get("body"); 
+            if not x or x.get("t") != "result": selftest_fail.append(f"i39113 diag set_config {k}: {x}")
+        stc = result_json("group", "i39113 diag state", timeout=20); D["config_state"] = {k: (stc or {}).get(k) for k in ("changes", "navAnimOff", "fpsCap", "skyMode")}
+        if not (isinstance(stc, dict) and stc.get("fpsCap") == 15 and stc.get("navAnimOff") is True and stc.get("skyMode") == "off" and len(stc.get("changes") or []) == 3):
+            selftest_fail.append(f"i39113 diag config not applied: {D['config_state']}")
+        route("settings", 2); back(1); time.sleep(1)   # one page flip with nav_anim off
+        r = shot("diag-config-card"); tc = _txt(r); D["config_card_seen"] = "诊断改了" in tc and "撤销" in tc
+        if not D["config_card_seen"]: selftest_fail.append("i39113 diag config card not shown")
+        tapped = tap_text("撤销", exact=True, wait=2)   # the user's one tap undoes the top change
+        st2 = result_json("group", "i39113 diag state", timeout=20); D["after_one_tap"] = (st2 or {}).get("changes")
+        if not tapped or len((st2 or {}).get("changes") or []) != 2: selftest_fail.append(f"i39113 diag one-tap revert failed: tapped={tapped} {D['after_one_tap']}")
+        D["config_results"] = cfg
+        cfgbad = {}
+        for k, v in (("sky_fps_cap", 120), ("screen_brightness", "10"), ("shell", "id")):
+            cid = send(sid, "set_config", {"key": k, "value": v}); cfgbad[k] = (wait_result(sid, cid) or {}).get("reason")
+        D["config_rejected"] = cfgbad
+        if any(r != "参数不合法" for r in cfgbad.values()): selftest_fail.append(f"i39113 diag bad config not rejected: {cfgbad}")
         # must be refused by the phone
         bad = {}
         cid = send(sid, "rm_rf", {}, extra={"DIAG_TEST_UNLISTED": "1"}); bad["unlisted"] = (wait_result(sid, cid) or {}).get("reason")
@@ -7133,10 +7154,14 @@ def b39113(res):
         leaks += re.findall(r"sk-[A-Za-z0-9]{12,}", raw)[:3]
         D["leaks"] = leaks
         if leaks: selftest_fail.append(f"i39113 diag payload leaked: {leaks}")
+        if not kinds.get("config_reverted"): selftest_fail.append(f"i39113 diag one-tap revert not logged to the relay: {kinds}")
         for k in ("hello", "mem", "jank", "stall"):
             if not kinds.get(k): selftest_fail.append(f"i39113 diag no '{k}' event: {kinds}")
         result_json("group", "i39113 diag off", timeout=20); time.sleep(3)
         D["state_after_off"] = result_json("group", "i39113 diag state", timeout=20)
+        so = D["state_after_off"] if isinstance(D["state_after_off"], dict) else {}
+        if so.get("changes") or so.get("navAnimOff") or so.get("fpsCap") or so.get("skyMode") == "off":
+            selftest_fail.append(f"i39113 diag off did not undo remote config: {so}")
         D["live_after_off"] = (json.loads(ctl("list") or "{}").get("live") or {})
         if sid in D["live_after_off"]: selftest_fail.append("i39113 diag still connected after off")
         result_json("group", "i39113 diag code none", timeout=20)

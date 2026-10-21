@@ -17,7 +17,7 @@ SESSION_CAP = int(os.environ.get("DIAG_SESSION_CAP", str(20 << 20)))
 DIR_CAP = int(os.environ.get("DIAG_DIR_CAP", str(200 << 20)))
 MSG_CAP = 600 * 1024
 WHITELIST = {"ping", "capture_jank_trace", "dump_main_thread_now", "set_log_level", "get_recent_crash", "show_notice",
-             "request_screenshot_of_mines_only"}
+             "request_screenshot_of_mines_only", "set_config"}
 SESS = {}   # sid -> {"ws", "since", "dev", "k"}
 MAX_LIVE = int(os.environ.get("DIAG_MAX_LIVE", "16"))
 RATE = {}   # peer ip -> [connect times in the last 60 s]
