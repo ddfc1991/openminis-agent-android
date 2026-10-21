@@ -4,16 +4,21 @@ Windows come from trace_marker prints 'mines-T:<name>:B' / ':E' written by vps_s
 slices, GC / lock-contention slices, frame timeline jank, and the app frames most often on the main thread's stack while a
 frame was late (callstack sampling). Prints one JSON object."""
 import sys, json, re, collections
-from perfetto.trace_processor import TraceProcessor
+import os
+for k in list(os.environ):
+    if 'proxy' in k.lower(): del os.environ[k]
+from perfetto.trace_processor import TraceProcessor, TraceProcessorConfig
 
 path, pkg = sys.argv[1], sys.argv[2]
-tp = TraceProcessor(trace=path)
+# [g] the mines-T markers are ftrace 'print' events: the Python API skips raw ftrace unless asked (windows were empty in CI)
+tp = TraceProcessor(trace=path, config=TraceProcessorConfig(bin_path=os.environ.get('TP_BIN') or None, load_timeout=90, ingest_ftrace_in_raw=True))
 def q(sql):
     try: return [r.__dict__ for r in tp.query(sql)]
     except Exception as e: return [{"error": str(e)[:300]}]
 
 out = {"trace": path.split("/")[-1]}
-proc = q(f"select upid, pid, name from process where name like '{pkg}%' order by (name = '{pkg}') desc, upid desc")
+# [g] the kernel comm is truncated ('com.openminis.mines.'): match either way
+proc = q(f"select upid, pid, name from process where name like '{pkg}%' or ('{pkg}' like name || '%' and length(name) >= 12) order by (name = '{pkg}') desc, upid desc")
 proc = [p for p in proc if "error" not in p]
 if not proc: print(json.dumps({"error": "app process not in trace", **out})); sys.exit(0)
 upid, pid = proc[0]["upid"], proc[0]["pid"]
@@ -68,6 +73,26 @@ for name, v in sorted(win.items()):
     o["frametimeline"] = fr[0] if fr else None
     per[name] = o
 out["per_window"] = per
+# [g] named blockers per window: main waiting on RenderThread (postAndWait), BitmapFactory in draw (decodeBitmap), Compose measure,
+# binder calls on main; RenderThread shader compiles / glyph atlas uploads / flushes
+bl = {}
+for name, v in sorted(win.items()):
+    if "B" not in v or "E" not in v or mu is None: continue
+    t0, t1 = v["B"], v["E"]
+    r = q(f"""select round(sum(case when s.name = 'postAndWait' then s.dur else 0 end)/1e6,1) as wait_render_ms,
+              round(sum(case when s.name = 'decodeBitmap' then s.dur else 0 end)/1e6,1) as decode_bitmap_ms,
+              round(max(case when s.name like 'AndroidOwner:measure%' then s.dur else 0 end)/1e6,1) as max_measure_ms,
+              round(sum(case when s.name like 'binder transaction%' then s.dur else 0 end)/1e6,1) as binder_ms,
+              round(max(case when s.name like 'Choreographer#doFrame%' then s.dur else 0 end)/1e6,1) as worst_frame_ms
+              from slice s join thread_track tt on s.track_id = tt.id where tt.utid = {mu} and s.ts >= {t0} and s.ts < {t1}""")
+    o = r[0] if r else {}
+    rr = q(f"""select round(sum(case when s.name like 'shader_compile%' then s.dur else 0 end)/1e6,1) as shader_compile_ms,
+               round(sum(case when s.name like 'AtlasTextOp%' then s.dur else 0 end)/1e6,1) as glyph_atlas_ms,
+               round(sum(case when s.name like 'eglSwapBuffers%' then s.dur else 0 end)/1e6,1) as swap_ms
+               from slice s join thread_track tt on s.track_id = tt.id join thread t using(utid) where t.upid = {upid} and t.name = 'RenderThread' and s.ts >= {t0} and s.ts < {t1}""")
+    if rr: o.update(rr[0])
+    bl[name] = o
+out["blockers"] = bl
 out["main_top_slices_ms"] = agg_main.most_common(12)
 out["render_top_slices_ms"] = agg_rt.most_common(8)
 out["main_state_ms"] = agg_state.most_common()

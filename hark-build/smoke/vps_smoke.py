@@ -7042,11 +7042,114 @@ def b39113(res):
         route("plus_digest", 8); time.sleep(2); r = shot("errzh-brief"); o["errzh_page"] = _txt(r)[:600]
         back(1); time.sleep(1)
 
+    def diag():
+        # [38.9.11.3 g] 远程诊断: the emulator connects to a test relay on the runner (ws://10.0.2.2:8097, relay.py from
+        # hark-build/smoke), streams data with no secrets, runs every whitelisted command, rejects everything else.
+        import base64 as _b64
+        D = {"steps": {}}
+        tok = os.environ.get("DIAG_TOKEN", "mdk_smoke_token_0123456789abcdef")
+        env = dict(os.environ, DIAG_CTL=os.environ.get("DIAG_CTL", os.path.abspath("diag.sock")))
+        def ctl(*a, extra=None):
+            e = dict(env, **(extra or {}))
+            r = subprocess.run(["python3", "hark-build/smoke/diag_ctl.py", *a], env=e, capture_output=True, text=True, timeout=30)
+            return r.stdout.strip()
+        def tail(sid, n=400):
+            return [json.loads(x) for x in ctl("tail", sid, str(n)).splitlines() if x.startswith("{")]
+        def wait_result(sid, cid, sec=20, kind=("result", "rejected")):
+            t1 = time.time()
+            while time.time() - t1 < sec:
+                for x in tail(sid):
+                    if x.get("t") in kind and x.get("id") == cid: return x
+                time.sleep(1)
+            return None
+        def send(sid, cmd, args=None, extra=None):
+            r = ctl("send", sid, cmd, json.dumps(args or {}, ensure_ascii=False), extra=extra)
+            try: return json.loads(r).get("id")
+            except Exception: return None
+        code = "mdiag1:" + _b64.urlsafe_b64encode(json.dumps({"t": tok, "e": [["ws://10.0.2.2:8097/mdiag/dev", ""]]}).encode()).decode().rstrip("=")
+        theme388(1); healthy_home()
+        D["code"] = result_json("group", "i39113 diag code " + code, timeout=20)
+        st0 = result_json("group", "i39113 diag state", timeout=20); D["state_off"] = st0
+        result_json("group", "i39113 diag on", timeout=20)
+        sid = ""; t1 = time.time()
+        while time.time() - t1 < 40:
+            st = result_json("group", "i39113 diag state", timeout=20)
+            if isinstance(st, dict) and st.get("connected"): sid = st.get("sid", ""); break
+            time.sleep(2)
+        D["state_on"] = st; print("I39113 DIAG state", st, flush=True)
+        if not sid:
+            selftest_fail.append(f"i39113 diag: never connected ({st})"); o["diag"] = D; return
+        if "诊断已连接（双向）" not in str(st.get("status")): selftest_fail.append(f"i39113 diag status wrong: {st}")
+        # the settings row (normal text size) while connected
+        route("settings", 3); tap_text("测试与上报", wait=3)
+        for _ in range(4):
+            if find(dump(), "远程诊断"): break
+            scroll_down()
+        r = shot("diag-settings"); D["settings_txt"] = _txt(r)[:400]; back(2); time.sleep(1)
+        # some page switches + one forced 400 ms main-thread stall (watchdog), then wait for the 10 s jank flush
+        for rt in ("settings", "plus_digest", "providers"):
+            route(rt, 1.5); back(1); time.sleep(0.8)
+        result_json("group", "i39113 diag stall 450", timeout=20); time.sleep(12)
+        # every whitelisted command
+        for cmd, args in (("ping", {}), ("dump_main_thread_now", {}), ("set_log_level", {"level": "info"}), ("get_recent_crash", {}),
+                          ("show_notice", {"text": "测试通知：诊断正常"})):
+            cid = send(sid, cmd, args); x = wait_result(sid, cid) if cid else None
+            D["steps"][cmd] = (x or {}).get("t", "none"); D.setdefault("bodies", {})[cmd] = json.dumps((x or {}).get("body", {}), ensure_ascii=False)[:300]
+            if not x or x.get("t") != "result": selftest_fail.append(f"i39113 diag {cmd}: {x}")
+        time.sleep(1); stn = result_json("group", "i39113 diag state", timeout=20)
+        r = shot("diag-notice"); D["notice_seen"] = "测试通知：诊断正常" in _txt(r) or "测试通知" in str((stn or {}).get("notice"))
+        if not D["notice_seen"]: selftest_fail.append("i39113 diag show_notice banner not shown")
+        cid = send(sid, "capture_jank_trace", {"seconds": 4})
+        for rt in ("settings", "plus_digest"):
+            route(rt, 1); back(1); time.sleep(0.5)
+        x = wait_result(sid, cid, 20); D["steps"]["capture_jank_trace"] = (x or {}).get("t", "none")
+        D["trace"] = {k: (x or {}).get("body", {}).get(k) for k in ("frames", "janky", "slowest_ms", "p90_ms", "pages")}
+        if not x or x.get("t") != "result": selftest_fail.append(f"i39113 diag capture_jank_trace: {x}")
+        cid = send(sid, "request_screenshot_of_mines_only"); time.sleep(3)
+        r = shot("diag-shot-ask"); D["shot_ask_seen"] = "允许发送截图" in _txt(r)
+        result_json("group", "i39113 diag shot allow", timeout=20)
+        x = wait_result(sid, cid, 25); b = (x or {}).get("body", {})
+        D["steps"]["request_screenshot_of_mines_only"] = (x or {}).get("t", "none"); D["shot"] = {"w": b.get("w"), "h": b.get("h"), "jpeg_kb": len(b.get("jpeg_b64", "")) * 3 // 4 // 1024}
+        if not D["shot_ask_seen"] or not b.get("jpeg_b64"): selftest_fail.append(f"i39113 diag screenshot: ask={D['shot_ask_seen']} body={str(b)[:200]}")
+        # must be refused by the phone
+        bad = {}
+        cid = send(sid, "rm_rf", {}, extra={"DIAG_TEST_UNLISTED": "1"}); bad["unlisted"] = (wait_result(sid, cid) or {}).get("reason")
+        cid = send(sid, "ping", {}, extra={"DIAG_TEST_BADSIG": "1"}); bad["badsig"] = (wait_result(sid, cid) or {}).get("reason")
+        cid = send(sid, "set_log_level", {"level": "verbose"}); bad["badarg"] = (wait_result(sid, cid) or {}).get("reason")
+        cid = send(sid, "show_notice", {"text": "打开 https://evil.example 领奖"}); bad["link_notice"] = (wait_result(sid, cid) or {}).get("reason")
+        cid = send(sid, "capture_jank_trace", {"seconds": 300}); bad["too_long"] = (wait_result(sid, cid) or {}).get("reason")
+        D["rejected"] = bad; print("I39113 DIAG rejected", bad, flush=True)
+        if not str(bad.get("unlisted", "")).startswith("不在白名单"): selftest_fail.append(f"i39113 diag unknown command not rejected: {bad}")
+        if bad.get("badsig") != "签名不对": selftest_fail.append(f"i39113 diag bad signature not rejected: {bad}")
+        if any(bad.get(k) != "参数不合法" for k in ("badarg", "link_notice", "too_long")): selftest_fail.append(f"i39113 diag bad args not rejected: {bad}")
+        # what reached the relay: kinds + no secrets / chat content
+        lines = tail(sid, 2000); raw = json.dumps(lines, ensure_ascii=False)
+        kinds = {}
+        for x in lines: kinds[x.get("t")] = kinds.get(x.get("t"), 0) + 1
+        D["kinds"] = kinds
+        D["stall_ms"] = [x.get("ms") for x in lines if x.get("t") == "stall"][:8]
+        D["jank_pages"] = sorted({x.get("page") for x in lines if x.get("t") == "jank"})
+        leaks = [w for w in ("sk-smokesecret", "MinesSmoke-2026", "13690688658", "hunter2", "smoke-key", "你好，我是测试模型", "GARBAGETEST") if w in raw]
+        leaks += re.findall(r"sk-[A-Za-z0-9]{12,}", raw)[:3]
+        D["leaks"] = leaks
+        if leaks: selftest_fail.append(f"i39113 diag payload leaked: {leaks}")
+        for k in ("hello", "mem", "jank", "stall"):
+            if not kinds.get(k): selftest_fail.append(f"i39113 diag no '{k}' event: {kinds}")
+        result_json("group", "i39113 diag off", timeout=20); time.sleep(3)
+        D["state_after_off"] = result_json("group", "i39113 diag state", timeout=20)
+        D["live_after_off"] = (json.loads(ctl("list") or "{}").get("live") or {})
+        if sid in D["live_after_off"]: selftest_fail.append("i39113 diag still connected after off")
+        result_json("group", "i39113 diag code none", timeout=20)
+        o["diag"] = D; print("I39113 DIAG " + json.dumps(D, ensure_ascii=False)[:5000], flush=True)
+        subprocess.run(f"cp diag-data/{sid}.jsonl {OUT}/diag-session.jsonl", shell=True)
+        healthy_home()
+
     step("ssh", ssh)
     step("keys", keys)
     step("ledger", ledger)
     step("crash", crash)
     step("errzh", errzh)
+    step("diag", diag)
 
     def stress():
         # [38.9.11.3 f] user 15:43: crashes on the phone → rapid page switching, chat open/close, rotation, background/foreground,
