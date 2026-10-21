@@ -30552,7 +30552,7 @@ index 1d773a2..5489e65 100644
          coroutineScope {
              val bg = slow.map { id -> async { one(id) } }
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-index af13c1b..89a2435 100644
+index af13c1b..a42eca4 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 @@ -2,6 +2,8 @@ package com.openminis.app.plus.group
@@ -30564,7 +30564,7 @@ index af13c1b..89a2435 100644
  import kotlinx.coroutines.runBlocking
  import org.json.JSONArray
  import org.json.JSONObject
-@@ -15,12 +17,781 @@ import org.json.JSONObject
+@@ -15,12 +17,855 @@ import org.json.JSONObject
   *   … --arg 'reset'
   */
  object GroupSelfTest {
@@ -31213,7 +31213,81 @@ index af13c1b..89a2435 100644
 +                            .put("legacyDrift", W.legacyDrift).put("signals", F.signals.toString()).put("shot", W.lastShot).put("drift", W.lastDrift)
 +                            .put("keyRenders", W.keyRenders).put("frames", W.frames).put("level", W.level).put("mode", W.lastMode).put("wind", W.windRateLabel()).toString()
 +                    }
-+                    else -> "i39113 latency <legacy|new> <host:port|none> <baseUrl> [model] | route <host> [port] | routeforget | skydrift legacy|new | a11yfake <n> | skystate"
++                    // [38.9.11.3 c] 测试全部密钥: a provider on the runner's fake endpoint with 3 keys, #2 answers 401
++                    "keyseed", "keycheck", "keyclean" -> kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
++                        val app = context.applicationContext as com.openminis.app.MinisApp
++                        val repo = app.providerRepository
++                        val base = arg2.ifBlank { "http://10.0.2.2:8088/badkey" }
++                        fun mine() = repo.config.value.instances.filter { it.label == "密钥测试" }
++                        if (sub == "keyclean") { mine().forEach { repo.removeInstance(it.id) }; listOf("sk-good-1", "sk-bad-2", "sk-good-3").forEach { com.openminis.app.plus.BadKeys.clear(it) } }
++                        if (sub == "keyseed" && mine().isEmpty()) {
++                            val inst = com.openminis.app.data.model.ProviderInstance(id = java.util.UUID.randomUUID().toString(), label = "密钥测试",
++                                providerType = com.openminis.app.data.model.ProviderType.openAI, credentialType = com.openminis.app.data.model.ProviderCredential.apiKey,
++                                customBaseURL = base, isEnabled = true)
++                            repo.addInstance(inst); repo.saveApiKey(inst.id, "sk-good-1"); repo.setKeyPool(inst.id, listOf("sk-good-1", "sk-bad-2", "sk-good-3"))
++                        }
++                        val o = JSONObject().put("count", mine().size)
++                        if (sub == "keycheck") {
++                            val rows = com.openminis.app.plus.KeyCheck.runAll(repo).filter { it.label == "密钥测试" }
++                            o.put("summary", JSONArray(com.openminis.app.plus.KeyCheckCore.summary(rows)))
++                            o.put("bad2", com.openminis.app.plus.BadKeys.isBad("sk-bad-2")).put("good1", com.openminis.app.plus.BadKeys.isBad("sk-good-1"))
++                            mine().firstOrNull()?.let { i -> o.put("picks", JSONArray((0 until 6).map { repo.usableApiKey(i)?.takeLast(6) })) }
++                            o.put("zh401", com.openminis.app.plus.ProviderRouteCore.zhError("Invalid API key: sk-bad", "密钥测试", switched = true))
++                            o.put("zhEos", com.openminis.app.plus.ProviderRouteCore.zhError("unexpected end of stream on https://api.lixil.top/...", "AWS中转"))
++                        }
++                        o.toString()
++                    }
++                    // [38.9.11.3 c] 台账 auto-fill: two saved accounts for a fake sign-in page; the conversation names the 2nd →
++                    // AgentLogin fills it without the card, shows the chip; returns what the page fields hold (password only as length)
++                    "ledger" -> {
++                        val host = "login.ledger-smoke.test"; val url = "https://$host/signin"; val sid = "smoke-ledger-conv"
++                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
++                            com.openminis.app.plus.SavedLogins.put(context, com.openminis.app.plus.SavedLogins.Entry("台账测试", "https://ledger-smoke.test/", "main@ledger-smoke.test", "pw-main-111"))
++                            com.openminis.app.plus.SavedLogins.put(context, com.openminis.app.plus.SavedLogins.Entry("台账测试", "https://ledger-smoke.test/", "test@ledger-smoke.test", "pw-test-22222"))
++                            com.openminis.app.plus.Ledger.setNote(context, host, "test@ledger-smoke.test", "测试")
++                        }
++                        com.openminis.app.plus.Ledger.noteText(sid, arg2.ifBlank { "用测试号登录一下看看" })
++                        val html = "<html><head><meta name='viewport' content='width=device-width'></head><body><h3>登录</h3>" +
++                            "<input id='u' type='email' placeholder='邮箱'><br><input id='p' type='password' placeholder='密码'><br><button>登录</button></body></html>"
++                        suspend fun <T> um(block: () -> T): T = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) { block() }
++                        val wv = um { android.webkit.WebView(context.applicationContext).also { it.settings.javaScriptEnabled = true
++                            it.measure(android.view.View.MeasureSpec.makeMeasureSpec(1080, android.view.View.MeasureSpec.EXACTLY), android.view.View.MeasureSpec.makeMeasureSpec(1920, android.view.View.MeasureSpec.EXACTLY))
++                            it.layout(0, 0, 1080, 1920); it.loadDataWithBaseURL(url, html, "text/html", "utf-8", null) } }
++                        kotlinx.coroutines.delay(2500)
++                        suspend fun ev(js: String): String? {
++                            val d = kotlinx.coroutines.CompletableDeferred<String?>()
++                            um { wv.evaluateJavascript(js) { r -> d.complete(r) } }
++                            val raw = kotlinx.coroutines.withTimeoutOrNull(5000) { d.await() } ?: return null
++                            return runCatching { org.json.JSONTokener(raw).nextValue()?.toString() }.getOrNull() ?: raw
++                        }
++                        val card0 = com.openminis.app.plus.LoginCard.pending.value != null
++                        val note = com.openminis.app.plus.AgentLogin.handle(context, url, sid) { js -> ev(js) }
++                        val fields = ev("(function(){return JSON.stringify({u:document.getElementById('u').value,pl:document.getElementById('p').value.length})})()")
++                        val card = com.openminis.app.plus.LoginCard.pending.value != null
++                        um { wv.destroy() }
++                        JSONObject().put("note", note ?: "").put("fields", fields ?: "").put("cardShown", card && !card0)
++                            .put("chip", com.openminis.app.plus.Ledger.chip.value?.let { com.openminis.app.plus.LedgerCore.chip(com.openminis.app.plus.LedgerCore.Cand("", it.host, it.account)) } ?: "")
++                            .put("agent", com.openminis.app.plus.Ledger.agentLines(context, host, sid, null)).toString()
++                    }
++                    "ledgerclean" -> kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
++                        val keep = com.openminis.app.plus.SavedLogins.all(context).filterNot { it.host.endsWith("ledger-smoke.test") }
++                        com.openminis.app.plus.SavedLogins.clear(context); keep.forEach { com.openminis.app.plus.SavedLogins.put(context, it) }
++                        com.openminis.app.plus.Ledger.clearChip(null); "cleaned"
++                    }
++                    // [38.9.11.3 c] crash card: a fake crash report with secrets in it → card on screen; returns the copied text's redaction
++                    "crashdemo" -> kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
++                        val d = java.io.File(context.filesDir, "logs").also { it.mkdirs() }
++                        val f = java.io.File(d, "crash-2099-01-01_00-00-00.log")
++                        f.writeText("=== Minis Java/Kotlin Crash ===\nReason: ANR\nAuthorization: Bearer sk-smokesecret0123456789abcd\npassword=hunter2 phone 13690688658\n\tat com.openminis.app.X.y(X.kt:1)\n")
++                        context.getSharedPreferences("mines_crash_card", android.content.Context.MODE_PRIVATE).edit().putLong("seen", 1L).commit()
++                        com.openminis.app.crash.CrashCard.check(context)
++                        val off = com.openminis.app.crash.CrashCard.offer.value
++                        val t = off?.let { com.openminis.app.crash.CrashCard.text(it) }.orEmpty()
++                        f.delete()
++                        JSONObject().put("card", off?.title ?: "").put("leak", listOf("sk-smokesecret", "hunter2", "13690688658").filter { it in t })
++                            .put("kept", t.contains("X.kt:1")).toString()
++                    }
++                    else -> "i39113 latency <legacy|new> <host:port|none> <baseUrl> [model] | route <host> [port] | routeforget | skydrift legacy|new | a11yfake <n> | skystate | keyseed|keycheck|keyclean | ledger [text] | ledgerclean | crashdemo"
 +                }
 +            }
 +            // [Mines-38.9.11.2] smoke: 'i39112 incog <url>' (open a 无痕 session) · 'incogstate' · 'incogforce process|auto' ·
@@ -31346,7 +31420,7 @@ index af13c1b..89a2435 100644
              "partners" -> {
                  val l = Partners.refresh(context, rescanApps = true)
                  JSONArray(l.map { JSONObject().put("id", it.id).put("name", it.spec.name).put("state", it.state.name).put("model", it.model).put("via", it.via) }).toString()
-@@ -136,6 +907,13 @@ object GroupSelfTest {
+@@ -136,6 +981,13 @@ object GroupSelfTest {
                  GroupStore.add(gid, GroupMsg(GroupStore.newId(), parts.getOrElse(2) { "host" }, "成员A", "", parts.getOrElse(3) { "好的，结论：照这个办。" }))
                  "ok"
              }
@@ -31360,7 +31434,7 @@ index af13c1b..89a2435 100644
              "kbrun" -> { val n = com.openminis.app.plus.ChatKnowledge.runNow(context); "organised=$n" }
              "kbstate" -> {
                  val l = com.openminis.app.plus.ChatKnowledge.load(context)
-@@ -151,6 +929,11 @@ object GroupSelfTest {
+@@ -151,6 +1003,11 @@ object GroupSelfTest {
                  JSONObject().put("title", g.title).put("care", g.care).put("kind", g.kind)
                      .put("weather", com.openminis.app.plus.HomeGreeting.cachedWeather(context)?.let { "${it.code}/${it.temp}" } ?: "none").toString()
              }
@@ -31372,7 +31446,7 @@ index af13c1b..89a2435 100644
              "greetweather" -> {
                  context.getSharedPreferences("mines_greeting", Context.MODE_PRIVATE).edit().remove("w_try").apply()
                  com.openminis.app.plus.HomeGreeting.refreshWeather(context)
-@@ -238,6 +1021,112 @@ object GroupSelfTest {
+@@ -238,6 +1095,112 @@ object GroupSelfTest {
              "wallpaper" -> { com.openminis.app.plus.PlusPrefs.init(context)
                  if (parts.getOrElse(0) { "" } == "off") com.openminis.app.plus.PlusPrefs.update(context) { it.copy(wallpaper = "") }
                  com.openminis.app.plus.PlusPrefs.state.value.wallpaper.ifBlank { "none" } }
@@ -31485,7 +31559,7 @@ index af13c1b..89a2435 100644
              "fogstate" -> JSONObject().put("t", com.openminis.app.ui.plus.FogClock.t.toDouble()).put("draws", com.openminis.app.ui.plus.FogClock.draws)
                  .put("still", com.openminis.app.ui.plus.FogClock.stillSeen)
                  .put("scale", android.provider.Settings.Global.getFloat(context.contentResolver, android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, -1f).toDouble()).toString()
-@@ -288,3 +1177,29 @@ object GroupSelfTest {
+@@ -288,3 +1251,29 @@ object GroupSelfTest {
          return JSONObject().put("chat", sid).put("group", g.id).put("direct", d.id).put("directName", dn).toString()
      }
  }
