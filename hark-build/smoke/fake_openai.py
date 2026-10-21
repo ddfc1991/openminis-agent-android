@@ -136,6 +136,23 @@ class H(BaseHTTPRequestHandler):
             return self._json({"task": {"status": "stopped"}})
         if "/manus/v2/task.listMessages" in self.path:
             return self._json({"messages": [{"type": "assistant_message", "assistant_message": {"content": "Manus 做完了：任务已完成，结论如下。"}}]})
+        # [38.9.11.3 f] 每日简报 sources for the errzh hook: refused / connection cut / a normal feed
+        if self.path.startswith("/rss403"):
+            b = b"forbidden"; self.send_response(403); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+        if self.path.startswith("/rsseof"):
+            self.close_connection = True
+            try: self.connection.shutdown(2)
+            except Exception: pass
+            return
+        if self.path.startswith("/rssok"):
+            now = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())
+            items = "".join(f"<item><title>测试新闻 {i}：手机 AI 助手更新</title><link>https://example.com/n{i}</link><pubDate>{now}</pubDate><description>第 {i} 条测试摘要。</description></item>" for i in range(1, 4))
+            b = f'<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>ok</title>{items}</channel></rss>'.encode()
+            self.send_response(200); self.send_header("Content-Type", "application/rss+xml; charset=utf-8"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+        if self.path.startswith("/stats/reset"):
+            # [38.9.11.3] each vps_smoke.py run (perf "old" pass, then the full "new" pass) starts from zero counters
+            STATS.clear(); STATS.update({"garbage_posts": 0, "loop_posts": 0, "saw_warning": False, "empty_tool_content": 0, "tool_msgs": 0, "tool": None})
+            return self._json(STATS)
         if self.path.startswith("/stats"):
             return self._json(STATS)
         # [build-33] simulated Gmail Atom feed with a fresh code mail + a page with a one-time-code field

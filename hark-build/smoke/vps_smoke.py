@@ -3236,6 +3236,9 @@ def main():
     m = re.search(r"(\d+)x(\d+)", sh("wm size"))
     if m: SCREEN[0], SCREEN[1] = int(m.group(1)), int(m.group(2))
     print("screen", SCREEN, flush=True)
+    # [38.9.11.3] the fake model server lives across both vps_smoke.py passes (perf old, then new): zero its counters
+    try: print("fake stats reset:", subprocess.run("curl -s http://127.0.0.1:8088/stats/reset", shell=True, capture_output=True, text=True, timeout=10).stdout, flush=True)
+    except Exception as ex: print("fake stats reset failed:", ex, flush=True)
     sh("settings put global window_animation_scale 0; settings put global transition_animation_scale 0; settings put global animator_duration_scale 0")
     adb("logcat", "-c")
     lc = subprocess.Popen(f"adb logcat -v threadtime > {OUT}/logcat.txt", shell=True)
@@ -6717,6 +6720,91 @@ def finish(lc):
 PERF_ONLY = os.environ.get("MINES_PERF_ONLY") == "1"
 
 
+PERFETTO_CFG_39113 = """
+buffers: { size_kb: 98304 fill_policy: DISCARD }
+buffers: { size_kb: 32768 fill_policy: DISCARD }
+data_sources: { config { name: "linux.ftrace" target_buffer: 0 ftrace_config {
+  ftrace_events: "sched/sched_switch" ftrace_events: "sched/sched_wakeup" ftrace_events: "sched/sched_waking"
+  ftrace_events: "sched/sched_blocked_reason" ftrace_events: "ftrace/print"
+  atrace_categories: "gfx" atrace_categories: "view" atrace_categories: "am" atrace_categories: "wm" atrace_categories: "dalvik"
+  atrace_categories: "input" atrace_categories: "binder_driver" atrace_categories: "res" atrace_categories: "sched"
+  atrace_apps: "%PKG%" } } }
+data_sources: { config { name: "linux.process_stats" target_buffer: 1 process_stats_config { scan_all_processes_on_start: true } } }
+data_sources: { config { name: "android.surfaceflinger.frametimeline" target_buffer: 1 } }
+data_sources: { config { name: "linux.perf" target_buffer: 1 perf_event_config { timebase { frequency: 500 }
+  callstack_sampling { scope { target_cmdline: "%PKG%" } kernel_frames: false } } } }
+duration_ms: %DUR%
+"""
+
+
+def perf_transitions_39113(tag, chat_node):
+    """home → chat, chat → settings (in-app route), settings → back, chat → back home. Each: gfxinfo reset, the switch,
+    3 s, then framestats → frames, janky (>16.7 ms) %, slowest frame ms. A trace_marker 'mines-T:<name>:B/E' (and
+    /proc/uptime as a fallback) brackets each switch in the Perfetto trace, analysed by perfetto39113.py."""
+    T = {}
+    def framestats():
+        g = sh(f"dumpsys gfxinfo {PKG} framestats", timeout=60)
+        rows, hdr = [], None
+        for line in g.splitlines():
+            line = line.strip()
+            if line.startswith("Flags,"): hdr = line.rstrip(",").split(","); continue
+            if hdr and re.match(r"^\d+,", line):
+                v = line.rstrip(",").split(",")
+                if len(v) >= len(hdr):
+                    d = dict(zip(hdr, v))
+                    try:
+                        if int(d["Flags"]) != 0: continue
+                        iv, fc = int(d["IntendedVsync"]), int(d["FrameCompleted"])
+                        if fc > iv > 0: rows.append((fc - iv) / 1e6)
+                    except Exception: pass
+            elif hdr and line.startswith("---PROFILEDATA---") and rows: hdr = None
+        j = sum(1 for x in rows if x > 16.7)
+        return {"frames": len(rows), "janky_pct": round(100.0 * j / len(rows), 1) if rows else None,
+                "slowest_ms": round(max(rows), 1) if rows else None, "over_32ms": sum(1 for x in rows if x > 32),
+                "p50_ms": round(sorted(rows)[len(rows) // 2], 1) if rows else None}
+    def mark(txt):
+        for f in ("/sys/kernel/tracing/trace_marker", "/sys/kernel/debug/tracing/trace_marker"):
+            if "denied" not in sh(f"echo '{txt}' > {f} 2>&1; echo rc=$?") : break
+        return sh("cat /proc/uptime").split()[0]
+    dur = 180000
+    cfg = PERFETTO_CFG_39113.replace("%PKG%", PKG).replace("%DUR%", str(dur))
+    trace = f"/data/misc/perfetto-traces/mines-{tag}.pftrace"
+    sh(f"rm -f {trace}")
+    pf = subprocess.Popen(["adb", "shell", "perfetto", "--txt", "-c", "-", "-o", trace], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    pf.stdin.write(cfg); pf.stdin.close()
+    time.sleep(4)
+    def one(name, action):
+        sh(f"dumpsys gfxinfo {PKG} reset"); time.sleep(0.5)
+        b = mark(f"mines-T:{name}:B"); ok = action(); time.sleep(3.0); e = mark(f"mines-T:{name}:E")
+        r = framestats(); r["ok"] = bool(ok); r["uptime"] = [b, e]; T[name] = r
+        print(f"PERFT {tag} {name} {json.dumps(r)}", flush=True)
+    go_home(); time.sleep(3)
+    def to_chat():
+        c = chat_node()
+        if c: sh(f"input tap {c[0]} {c[1]}")
+        return bool(c)
+    for rep in (1, 2):
+        one(f"home_to_chat{rep}", to_chat)
+        one(f"chat_to_settings{rep}", lambda: (selftest("route", "settings", timeout=20), True)[1])
+        one(f"settings_back{rep}", lambda: (sh("input keyevent KEYCODE_BACK"), True)[1])
+        one(f"chat_back_home{rep}", lambda: (sh("input keyevent KEYCODE_BACK"), True)[1])
+        go_home(); time.sleep(2)
+    time.sleep(1); sh("pkill -TERM -x perfetto")   # stop early: perfetto writes the trace on SIGTERM
+    try: out, _ = pf.communicate(timeout=90)
+    except Exception: pf.kill(); out = "killed"
+    print("perfetto:", (out or "")[-400:], flush=True)
+    name = f"perf-{tag}.pftrace"
+    print(adb("pull", trace, f"{OUT}/{name}"), flush=True)
+    T["trace"] = name if os.path.exists(f"{OUT}/{name}") else None
+    if T["trace"]:
+        try:
+            r = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "perfetto39113.py"), f"{OUT}/{name}", PKG],
+                               capture_output=True, text=True, timeout=600)
+            print("PERFETTO39113 " + tag + " " + (r.stdout or "")[-6000:] + (r.stderr or "")[-1500:], flush=True)
+        except Exception as ex: print("perfetto analysis failed", ex, flush=True)
+    return T
+
+
 def perf_39113(tag):
     """[38.9.11.3] speed before / after on the same emulator, adb only (works on 38.9.11.2 too): cold start (am start -W, x5),
     PSS after idle, janky frames while scrolling home + opening a chat + scrolling it (dumpsys gfxinfo), and home → chat
@@ -6738,6 +6826,9 @@ def perf_39113(tag):
         root = dump()
         for t, d, x, y, n in nodes(root):
             if ("hello" in t.lower() or "hello" in d.lower()) and y > 300: return (x, y)
+        # [38.9.11.3] home's 最近对话 row shows the last message (GARBAGETEST / the reply), not "hello"
+        for t, d, x, y, n in nodes(root):
+            if any(k in (t + d) for k in ("GARBAGETEST", "你好，我是测试模型")) and y > 300: return (x, y)
         return None
     def gfx():
         g = sh(f"dumpsys gfxinfo {PKG}", timeout=60)
@@ -6757,6 +6848,10 @@ def perf_39113(tag):
     else:
         UNTESTABLE.append(f"perf {tag}: no chat row on home to open")
     P["gfx"] = gfx()
+    # [38.9.11.3 f] page switches (user: 「切页面卡在半路」): per transition gfxinfo framestats (janky %, slowest frame) inside one
+    # Perfetto trace (sched + atrace gfx/view/am/wm/dalvik/input/binder + frametimeline + main-thread callstack sampling)
+    try: P["transitions"] = perf_transitions_39113(tag, chat_node)
+    except Exception as ex: P["transitions"] = {"error": str(ex)}; print("perf transitions error", ex, flush=True)
     # home → chat open: screenrecord around the tap, sky static so only the page change moves
     try: result_json("group", "i396 skymode off", timeout=20)
     except Exception: pass
@@ -6765,7 +6860,7 @@ def perf_39113(tag):
     for i in range(3):
         go_home(); time.sleep(2.5)
         c = chat_node()
-        if not c: break
+        if not c: UNTESTABLE.append(f"perf {tag}: open video {i}: no chat row on home"); break
         sh("rm -f /sdcard/open.mp4")
         pr = subprocess.Popen(["adb", "shell", "screenrecord", "--time-limit", "6", "--bit-rate", "8000000", "/sdcard/open.mp4"])
         time.sleep(2.0); sh(f"input tap {c[0]} {c[1]}")
@@ -6923,13 +7018,30 @@ def b39113(res):
         o["crash"] = result_json("group", "i39113 crashdemo", timeout=30); print("I39113 CRASH", o["crash"], flush=True)
         time.sleep(0.5); shot("crash-card")
         c = o["crash"] if isinstance(o["crash"], dict) else {}
-        if c.get("leak") or not c.get("kept") or "ANR" not in str(c.get("card")): selftest_fail.append(f"i39113 crash card / redaction: {c}")
+        lk = c.get("leak"); lk = [] if lk in (None, "", "[]") else lk   # the app sends the list as the string "[]" when nothing leaked
+        if lk or not c.get("kept") or "ANR" not in str(c.get("card")): selftest_fail.append(f"i39113 crash card / redaction: {c}")
         tap_text("关闭", exact=True, wait=2)
+
+    def errzh():
+        # [38.9.11.3 f] Chinese-only error lines: a real 每日简报 run on fake feeds (403 / cut connection / ok) + TTS model line + chat filter
+        theme388(1); healthy_home()
+        o["errzh"] = result_json("group", "i39113 errzh", timeout=150); print("I39113 ERRZH", o["errzh"], flush=True)
+        z = o["errzh"] if isinstance(o["errzh"], dict) else {}
+        lines = [str(x) for x in (z.get("notes") or [])] + [str(z.get("lastError") or ""), str(z.get("tts") or ""), str(z.get("legacy") or "")]
+        eng = [l for l in lines if l and re.search(r"[A-Za-z]{4,}", re.sub(r"(Reddit|Hacker News|Memoh|tts-1|LocalLLaMA|HTTP)", "", l))]
+        if eng: selftest_fail.append(f"i39113 errzh English left: {eng}")
+        if not any("拒绝访问" in l for l in lines): selftest_fail.append(f"i39113 errzh no 403 line: {lines}")
+        if not any("连接中断" in l for l in lines): selftest_fail.append(f"i39113 errzh no cut-connection line: {lines}")
+        cc = z.get("chatCapable") or {}
+        if cc.get("tts-1") or cc.get("text-embedding-3-small") or cc.get("dall-e-3") or not cc.get("gpt-4o-mini"): selftest_fail.append(f"i39113 chatCapable wrong: {cc}")
+        route("plus_digest", 8); time.sleep(2); r = shot("errzh-brief"); o["errzh_page"] = _txt(r)[:600]
+        back(1); time.sleep(1)
 
     step("ssh", ssh)
     step("keys", keys)
     step("ledger", ledger)
     step("crash", crash)
+    step("errzh", errzh)
     step("latency", latency)
     step("sky", sky)
     result_json("group", "i396 sky auto static", timeout=20)

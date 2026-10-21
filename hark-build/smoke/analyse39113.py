@@ -56,7 +56,63 @@ def open_time(mp4, thr=0.6):
                 open_ms=int((t[settled] - t[first]) * 1000))
 
 
+def drift(mp4, y0=0.30, y1=0.80, ww=540, gap=1.5, windows=((0.0, 4.0, "idle"), (4.0, 7.0, "touch"), (9.6, 14.0, "idle2"))):
+    """[38.9.11.3 f] cloud drift in device px/s (phase correlation of the sky band between frames ≥gap s apart, x shift only)
+    and frame-to-frame brightness change (% of mean luminance), per window of the smoke's recording (0–4 s idle, 4–7 s touch,
+    9.6–14 s idle). The band sits below the conversation card and above the input bar."""
+    hh = int(ww * 2412 / 1080)
+    p = subprocess.run(["ffmpeg", "-v", "error", "-i", mp4, "-fps_mode", "passthrough", "-vf", f"scale={ww}:{hh}:flags=area,format=gray",
+                        "-f", "rawvideo", "-"], capture_output=True)
+    a = np.frombuffer(p.stdout, np.uint8); n = a.size // (ww * hh)
+    f = a[:n * ww * hh].reshape(n, hh, ww).astype(np.float32)[:, int(hh * y0):int(hh * y1), :]
+    t = np.array(pts(mp4)[:n]); n = min(n, len(t)); f = f[:n]; t = t[:n] - (t[0] if n else 0)
+    scale = 1080.0 / ww
+    win = np.hanning(f.shape[2])[None, :] * np.hanning(f.shape[1])[:, None]
+    def blur(x, k=9):
+        c = np.cumsum(np.pad(x, ((0, 0), (k, k)), mode="edge"), axis=1); x = (c[:, 2 * k:] - c[:, :-2 * k]) / (2 * k)
+        c = np.cumsum(np.pad(x, ((k, k), (0, 0)), mode="edge"), axis=0); return (c[2 * k:, :] - c[:-2 * k, :]) / (2 * k)
+    def shift(a0, a1):
+        # global x shift (px of this scale) by least squares on blurred frames (static film grain averaged out); 2 iterations
+        b0, b1 = blur(a0), blur(a1); dx = 0.0
+        for _ in range(3):
+            xs = np.arange(b1.shape[1], dtype=np.float32)
+            w1 = np.array([np.interp(xs + dx, xs, r) for r in b1])   # a1 moved back by dx
+            ix = np.gradient((b0 + w1) / 2, axis=1); it = w1 - b0
+            m = slice(20, -20)
+            dx += -float((ix[:, m] * it[:, m]).sum() / max((ix[:, m] ** 2).sum(), 1e-6))
+        return dx
+    def shift_pc(a0, a1):
+        A = np.fft.fft2((a0 - a0.mean()) * win); B = np.fft.fft2((a1 - a1.mean()) * win)
+        R = A * np.conj(B); R /= np.maximum(np.abs(R), 1e-9)
+        c = np.real(np.fft.ifft2(R)); iy, ix = np.unravel_index(np.argmax(c), c.shape)
+        W = c.shape[1]
+        l, r = c[iy, (ix - 1) % W], c[iy, (ix + 1) % W]; d = (l - r) / (2 * (l - 2 * c[iy, ix] + r) + 1e-9)
+        x = ix + d; x = x - W if x > W / 2 else x
+        return -x
+    lum = f.mean(axis=(1, 2)); dl = np.abs(np.diff(lum)) / np.maximum(lum[:-1], 1) * 100
+    out = dict(file=mp4.split("/")[-1], frames=int(n), lum_mean=round(float(lum.mean()), 1),
+               lum_min=round(float(lum.min()), 1), lum_max=round(float(lum.max()), 1),
+               lum_step_max_pct=round(float(dl.max()), 2) if len(dl) else 0, lum_steps_over_1pct=int((dl > 1).sum()))
+    for t0, t1, name in windows:
+        idx = [i for i in range(n) if t0 <= t[i] < t1]
+        sp = []; i = 0
+        while i < len(idx):
+            j = next((q for q in idx if t[q] >= t[idx[i]] + gap), None)
+            if j is None: break
+            dt = t[j] - t[idx[i]]; sp.append(shift(f[idx[i]], f[j]) * scale / dt); i = idx.index(j)
+        seg = dl[[k for k in idx if k < len(dl)]] if idx else np.array([])
+        out[name] = dict(drift_px_s=round(float(np.median(sp)), 2) if sp else None, drift_samples=len(sp),
+                         lum_step_max_pct=round(float(seg.max()), 2) if len(seg) else None, frames=len(idx))
+    # whole recording: first frame vs each frame ≥3 s later (median px/s)
+    whole = [shift(f[0], f[i]) * scale / t[i] for i in range(n) if t[i] >= 3.0]
+    out["whole_drift_px_s"] = round(float(np.median(whole)), 2) if whole else None
+    return out
+
+
 if __name__ == "__main__":
+    if sys.argv[1] == "drift":
+        for m in sys.argv[2:]: print(json.dumps(drift(m), ensure_ascii=False))
+        sys.exit(0)
     mode = sys.argv[1]
     for m in sys.argv[2:]:
         r = fog(m) if mode == "fog" else open_time(m)
