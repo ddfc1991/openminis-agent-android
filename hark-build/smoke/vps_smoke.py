@@ -3259,11 +3259,22 @@ def main():
         relaunch(); snap("relaunch-with-home"); check("cold launch with chats (home list)")
         dump_fatal()
         user_like_state()
-    if I39113:   # [38.9.11.3] speed before / after (adb only; also runs on 38.9.11.2 with MINES_PERF_ONLY=1)
+    if I39113 and "skyonly" not in open("hark-build/smoke/target").read().splitlines()[1]:   # [38.9.11.3] speed before / after (adb only; also runs on 38.9.11.2 with MINES_PERF_ONLY=1)
         try: perf_39113(os.environ.get("MINES_PERF_TAG", "new"))
         except Exception as e:
             import traceback; traceback.print_exc(); page_missing.append(f"perf error {e}")
-        if PERF_ONLY: return finish(lc)
+        if PERF_ONLY:
+            if os.environ.get("MINES_PERF_TAG") == "old":   # [38.9.11.3 h] the same sky strips on 38.9.11.2 (default settings, shader path)
+                Rold = {}; sc0 = sh("settings get global animator_duration_scale").strip(); Rold["animator_scale_was"] = sc0
+                sh("settings put global animator_duration_scale 1")
+                for mode, sfx in ((1, "light"), (2, "dark")):
+                    try:
+                        theme388(mode); healthy_home(); result_json("group", "i396 skygpu on", timeout=40)
+                        sky_frames_39113("old", "default", sfx, "gpu", Rold, keep=True)
+                    except Exception as e: print("sky old error", e, flush=True)
+                sh(f"settings put global animator_duration_scale {sc0 if sc0 not in ('', 'null') else 1}")
+                print("I39113 SKYOLD " + json.dumps(Rold, ensure_ascii=False), flush=True)
+            return finish(lc)
     if I396 or I397:   # [i17] onboarding may have been killed by the GMS death: make sure the app is up with a model
         if not alive(): recover("onboarding")
         seed_model()
@@ -6717,6 +6728,40 @@ def finish(lc):
 
 
 
+SKY_SCENES_39113 = ("sunny", "cloudy", "overcast", "fog", "rain", "snow", "night", "sunset")
+
+
+def sky_cells_39113(a, b, thr=1.0):
+    """8×8 grid of mean |Δ| (grey levels): (cells above thr, mean over all cells)"""
+    from PIL import Image, ImageChops, ImageStat
+    d = ImageChops.difference(Image.open(a).convert("L"), Image.open(b).convert("L")); W, H = d.size; n = 0; tot = 0.0
+    for i in range(8):
+        for j in range(8):
+            m = ImageStat.Stat(d.crop((i * W // 8, j * H // 8, (i + 1) * W // 8, (j + 1) * H // 8))).mean[0]; tot += m
+            if m > thr: n += 1
+    return n, round(tot / 64, 2)
+
+
+def sky_frames_39113(tag, cname, sfx, path, R, keep):
+    """[38.9.11.3 h] user 20:39 「最起码和你这样动才行」: per scene three screenshots at 0 / 1.5 / 3 s on home; the sky must
+    visibly change within 3 s (≥ 12 of 64 grid cells with mean |Δ| > 1 grey level between frame 0 and frame 2)"""
+    for sc in SKY_SCENES_39113:
+        k = f"{tag}/{cname}/{sfx}/{path}/{sc}"
+        result_json("group", f"i396 sky {sc}", timeout=20); b381_home(); time.sleep(3)
+        fs = [f"{OUT}/sky-{tag}-{cname}-{sfx}-{path}-{sc}-{i}.png" for i in range(3)]
+        t0 = time.time()
+        for i, f in enumerate(fs):
+            while time.time() - t0 < 1.5 * i: time.sleep(0.05)
+            subprocess.run(f"adb exec-out screencap -p > {f}", shell=True)
+        st = result_json("group", "i396 skystate", timeout=15)
+        try: n, mean = sky_cells_39113(fs[0], fs[2]); n1, _ = sky_cells_39113(fs[0], fs[1])
+        except Exception as e: n, mean, n1 = -1, str(e)[:60], -1
+        R[k] = {"cells3s": n, "cells1_5s": n1, "mean3s": mean, "mode": (st or {}).get("mode", "") if isinstance(st, dict) else str(st)[:200]}
+        print("I39113 SKYALL", k, json.dumps(R[k], ensure_ascii=False), flush=True)
+        if tag == "new" and not (isinstance(n, int) and n >= 12): selftest_fail.append(f"i39113 sky not visibly moving in 3 s: {k} {R[k]}")
+        if not keep: subprocess.run("rm -f " + " ".join(fs), shell=True)
+
+
 PERF_ONLY = os.environ.get("MINES_PERF_ONLY") == "1"
 
 
@@ -6889,8 +6934,10 @@ def b39113(res):
     recording and a governor level-2 step; motion + luminance analysed offline; (3) SSH key exchange with InstaBox."""
     o = res.setdefault("i39113", {})
     T0 = time.time()
+    SKYONLY = "skyonly" in (open("hark-build/smoke/target").read().splitlines()[1:2] or [""])[0]
     def step(name, f):
         t0 = time.time()
+        if SKYONLY and name != "skyall": return   # [38.9.11.3 h] sky-drift-only run
         if t0 - T0 > 80 * 60:
             page_missing.append(f"i39113 {name} skipped (time budget)"); print(f"I39113 SKIP {name}", flush=True); return
         try: f()
@@ -7223,8 +7270,33 @@ def b39113(res):
             selftest_fail.append(f"i39113 stress: fatal={st['fatal']} monkey_crash={st['monkey_crash']} anr={an}")
         healthy_home()
 
+    def skyall():
+        # [38.9.11.3 h] user 2026-10-21 20:17 「所有壁纸都不会动」: every sky scene × light / dark × (default, animator scale 0,
+        # battery saver) × (shader path = phones, stills path = no shader): two screenshots 5 s apart must differ across the
+        # sky within 3 s (sky_frames_39113; a clock tick or a cursor changes 1–2 grid cells, a drifting sky most of them)
+        R = {}
+        scales0 = [sh(f"settings get global {g}").strip() for g in ("animator_duration_scale", "window_animation_scale", "transition_animation_scale")]
+        for cname, scale, saver in (("default", 1, False), ("anim0", 0, False), ("saver", 1, True)):
+            sh(f"settings put global animator_duration_scale {scale}; settings put global window_animation_scale {scale}; settings put global transition_animation_scale {scale}")
+            if saver: sh("cmd battery unplug; cmd power set-mode 1")
+            else: sh("cmd power set-mode 0; cmd battery reset")
+            for mode, sfx in ((1, "light"), (2, "dark")):
+                theme388(mode); healthy_home()
+                result_json("group", "i396 skymode smooth", timeout=20)
+                for path in ("gpu", "stills"):
+                    result_json("group", f"i396 skygpu {'on' if path == 'gpu' else 'off'}", timeout=40)
+                    sky_frames_39113("new", cname, sfx, path, R, keep=(cname == "default"))
+        sh("cmd power set-mode 0; cmd battery reset")
+        for g, v in zip(("animator_duration_scale", "window_animation_scale", "transition_animation_scale"), scales0):
+            sh(f"settings put global {g} {v if v not in ('', 'null') else 1}")
+        o["skyall_scales_before"] = scales0
+        result_json("group", "i396 skygpu off", timeout=30); result_json("group", "i396 sky auto", timeout=20)
+        o["skyall"] = R
+        print("I39113 SKYALL_SUMMARY " + json.dumps({k: v["cells3s"] for k, v in R.items()}), flush=True)
+
     step("latency", latency)
     step("sky", sky)
+    step("skyall", skyall)
     result_json("group", "i396 sky auto static", timeout=20)
     if "stress" in (open("hark-build/smoke/target").read().splitlines()[1:2] or [""])[0]: step("stress", stress)
     print("I39113 RESULT " + json.dumps(o, ensure_ascii=False)[:14000], flush=True)
