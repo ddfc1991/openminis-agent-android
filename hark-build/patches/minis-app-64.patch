@@ -7157,7 +7157,7 @@ index 0000000..b8dbb3f
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/browser/BrowserTabPool.kt b/src/android/app/src/main/java/com/openminis/app/browser/BrowserTabPool.kt
-index 3e55128..f680e70 100644
+index 3e55128..298ee35 100644
 --- a/src/android/app/src/main/java/com/openminis/app/browser/BrowserTabPool.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/browser/BrowserTabPool.kt
 @@ -27,7 +27,17 @@ import java.util.concurrent.ConcurrentHashMap
@@ -7248,7 +7248,7 @@ index 3e55128..f680e70 100644
      private fun createTab(
          tabs: MutableList<Tab>,
          url: String? = null,
-@@ -1184,6 +1218,22 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
+@@ -1184,7 +1218,24 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
  
          val id = nextTabId++
          val webView = WebView(context)
@@ -7269,9 +7269,11 @@ index 3e55128..f680e70 100644
 +            }
 +        }
          com.openminis.app.plus.PayCards.install(webView)  // [Mines-cards-35.1] 填卡 into payment iframes
++        if (com.openminis.app.plus.SandboxNet.strict) com.openminis.app.plus.WebProxy.guardWebRtc(webView)   // [38.9.11.3] 严格代理: no WebRTC IP leak
          // [T-android-minis-url-session-scope] Hand the manager a LIVE reader of
          // this pool's session id (set later via setSession) plus a context, so
-@@ -1207,6 +1257,9 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
+         // `minis://workspace/...` resolves against this chat's sandbox instead
+@@ -1207,6 +1258,9 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
          manager.onCloseWindow = { handleCloseWindow(manager) }
          wireDownloadHandlers(manager)
  
@@ -7281,7 +7283,7 @@ index 3e55128..f680e70 100644
          val tab = Tab(id = id, manager = manager)
          tabs.add(tab)
          _tabs.value = tabs.toList()
-@@ -1670,6 +1723,7 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
+@@ -1670,6 +1724,7 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
              webView.stopLoading()
              (webView.parent as? android.view.ViewGroup)?.removeView(webView)
              webView.loadUrl("about:blank")
@@ -7289,7 +7291,7 @@ index 3e55128..f680e70 100644
              webView.destroy()
          } catch (t: Throwable) {
              Log.w(TAG, "Tab ${tab.id} teardown failed: ${t.message}")
-@@ -1705,7 +1759,7 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
+@@ -1705,7 +1760,7 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
          releaseTabResources(tab)
          forgetTab(id, currentTabs)
          saveState()
@@ -7298,7 +7300,7 @@ index 3e55128..f680e70 100644
      }
  
      override fun preemptTabForRegistry(id: Int) {
-@@ -1721,7 +1775,7 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
+@@ -1721,7 +1776,7 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
          preemptedTabIds.add(id)
          forgetTab(id, currentTabs)
          saveState()
@@ -7307,7 +7309,7 @@ index 3e55128..f680e70 100644
      }
  
      override fun evictAllIdleForMemoryPressure(): Int {
-@@ -1852,6 +1906,7 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
+@@ -1852,6 +1907,7 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
      // -- Disk Persistence --
  
      private fun saveState() {
@@ -7316,7 +7318,7 @@ index 3e55128..f680e70 100644
          try {
              val dir = File(context.filesDir, "browser_tabs")
 diff --git a/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt b/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt
-index 9033a1b..f30cdc3 100644
+index 9033a1b..52bc747 100644
 --- a/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/browser/BrowserUseManager.kt
 @@ -48,6 +48,9 @@ class BrowserUseManager(
@@ -7422,6 +7424,19 @@ index 9033a1b..f30cdc3 100644
                  _isLoading.value = false
                  deferred.complete(Unit)
                  navigationDeferred = null
+@@ -1347,7 +1365,11 @@ class BrowserUseManager(
+     private suspend fun type(selector: String?, text: String?): BrowserActionResult {
+         if (selector == null) return BrowserActionResult.error("type requires 'selector'")
+         if (text == null) return BrowserActionResult.error("type requires 'text'")
+-        return evaluateAndReturn(BrowserUseJS.type(selector, text))
++        // [38.9.11.3] {{secret:ID}} / {{user:ID}} (台账 / 多号注册) become the real values only inside the page
++        val real = runCatching { com.openminis.app.plus.SecretRefs.fill(text) }.getOrDefault(text)
++        if (real == text) return evaluateAndReturn(BrowserUseJS.type(selector, text))
++        val r = evaluateAndReturn(BrowserUseJS.type(selector, real))
++        return runCatching { r.copy(text = com.openminis.app.plus.SecretRefs.scrub(r.text)) }.getOrDefault(r)
+     }
+ 
+     // -- Get Text --
 diff --git a/src/android/app/src/main/java/com/openminis/app/browser/ConvProfiles.kt b/src/android/app/src/main/java/com/openminis/app/browser/ConvProfiles.kt
 new file mode 100644
 index 0000000..be0f4b8
@@ -7582,10 +7597,10 @@ index 0000000..9950a1e
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/browser/Incognito.kt b/src/android/app/src/main/java/com/openminis/app/browser/Incognito.kt
 new file mode 100644
-index 0000000..6a533ce
+index 0000000..b6aae6f
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/browser/Incognito.kt
-@@ -0,0 +1,174 @@
+@@ -0,0 +1,181 @@
 +package com.openminis.app.browser
 +
 +import android.content.Context
@@ -7616,7 +7631,11 @@ index 0000000..6a533ce
 +
 +    fun supported(): Boolean = runCatching { WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE) }.getOrDefault(false)
 +
-+    fun path(): IncognitoCore.Path = IncognitoCore.path(supported() && !forceProcess, android.os.Build.VERSION.SDK_INT)
++    /** [38.9.11.3] 无痕 uses 严格代理 by default (never the real IP) */
++    @Volatile var strict: Boolean = com.openminis.app.plus.StrictWebCore.STRICT_INCOGNITO_DEFAULT
++    // [38.9.11.3] strict and no passing proxy → the :incog process (its own proxy override blocks) instead of a main-process profile
++    fun path(): IncognitoCore.Path = IncognitoCore.path(supported() && !forceProcess &&
++        !com.openminis.app.plus.StrictWebCore.incognitoInProcess(true, strict, runCatching { com.openminis.app.plus.WebProxy.passingPort() }.getOrNull()), android.os.Build.VERSION.SDK_INT)
 +
 +    private fun marker(c: Context) = File(c.applicationContext.filesDir, MARKER)
 +    fun markOpen(c: Context, open: Boolean) { runCatching { val f = marker(c); if (open) f.writeText(System.currentTimeMillis().toString()) else f.delete() } }
@@ -7650,6 +7669,8 @@ index 0000000..6a533ce
 +        markOpen(c, true)
 +        val i = Intent(c, IncognitoActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
 +        if (!url.isNullOrBlank()) i.putExtra(IncognitoActivity.EXTRA_URL, url)
++        // [38.9.11.3] the :incog process has no LocalProxy: hand it the proxy rule (passing port, or a closed port when strict)
++        com.openminis.app.plus.StrictWebCore.rule(strict, runCatching { com.openminis.app.plus.WebProxy.passingPort() }.getOrNull())?.let { i.putExtra(IncognitoActivity.EXTRA_PROXY, it) }
 +        c.startActivity(i)
 +    }
 +
@@ -7676,6 +7697,7 @@ index 0000000..6a533ce
 +    @Suppress("DEPRECATION")
 +    fun harden(wv: WebView, profile: String?) {
 +        val pol = IncognitoCore.POLICY
++        com.openminis.app.plus.WebProxy.guardWebRtc(wv)   // [38.9.11.3] no WebRTC IP leak in 无痕
 +        runCatching {
 +            wv.settings.cacheMode = if (pol.noCache) WebSettings.LOAD_NO_CACHE else WebSettings.LOAD_DEFAULT
 +            wv.settings.saveFormData = pol.saveFormData
@@ -7762,10 +7784,10 @@ index 0000000..6a533ce
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/browser/IncognitoActivity.kt b/src/android/app/src/main/java/com/openminis/app/browser/IncognitoActivity.kt
 new file mode 100644
-index 0000000..670eaed
+index 0000000..485a620
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/browser/IncognitoActivity.kt
-@@ -0,0 +1,222 @@
+@@ -0,0 +1,229 @@
 +package com.openminis.app.browser
 +
 +import android.annotation.SuppressLint
@@ -7805,6 +7827,7 @@ index 0000000..670eaed
 +class IncognitoActivity : Activity() {
 +    companion object {
 +        const val EXTRA_URL = "url"
++        const val EXTRA_PROXY = "mines_proxy_rule"   // [38.9.11.3]
 +        private const val TAG = "MinesIncog"
 +    }
 +
@@ -7870,6 +7893,12 @@ index 0000000..670eaed
 +        progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 100; visibility = View.GONE }
 +
 +        IncognitoProcess.webViewStarted = true
++        // [38.9.11.3] this process's own proxy override: the passing proxy, or a closed port (strict) — never direct
++        intent?.getStringExtra(EXTRA_PROXY)?.let { rule -> runCatching {
++            if (androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.PROXY_OVERRIDE))
++                androidx.webkit.ProxyController.getInstance().setProxyOverride(androidx.webkit.ProxyConfig.Builder().addProxyRule(rule)
++                    .addBypassRule("localhost").addBypassRule("127.0.0.1").build(), { it.run() }) {}
++        } }
 +        val wv = WebView(this)
 +        web = wv
 +        wv.settings.apply {
@@ -8697,6 +8726,19 @@ index b3b898b..89cb76f 100644
              // 3. DB rows. deleteSessionOnly is the non-cascading primitive; the
              //    cascade is this loop, which already walked the subtree.
              repo.deleteSessionOnly(id)
+diff --git a/src/android/app/src/main/java/com/openminis/app/debug/HeadlessChatRunner.kt b/src/android/app/src/main/java/com/openminis/app/debug/HeadlessChatRunner.kt
+index fdf59ee..7faa383 100644
+--- a/src/android/app/src/main/java/com/openminis/app/debug/HeadlessChatRunner.kt
++++ b/src/android/app/src/main/java/com/openminis/app/debug/HeadlessChatRunner.kt
+@@ -142,7 +142,7 @@ internal object HeadlessChatRunner {
+         withContext(Dispatchers.IO) {
+             val app = app(context)
+             val resolvedModel = modelId
+-                ?: app.providerRepository.allVisibleEntries().firstOrNull()?.baseModel?.id
++                ?: app.providerRepository.allVisibleEntries().firstOrNull { com.openminis.app.plus.ErrZhCore.chatCapable(it.baseModel.id) }?.baseModel?.id
+                 ?: "unknown"
+             val s = app.chatRepository.createSession(modelId = resolvedModel, title = null)
+             // Mark source so the UI session list shows it came from RPC.
 diff --git a/src/android/app/src/main/java/com/openminis/app/files/ApkAlignCore.kt b/src/android/app/src/main/java/com/openminis/app/files/ApkAlignCore.kt
 new file mode 100644
 index 0000000..6d50a4e
@@ -12977,12 +13019,34 @@ index 0000000..1777ac4
 +            (if (ways.isNotEmpty()) " · 登录方式：" + orderText(ways, providers) else " · 没有可用的登录方式"))
 +    }
 +}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/AccountsPrompt.kt b/src/android/app/src/main/java/com/openminis/app/plus/AccountsPrompt.kt
+new file mode 100644
+index 0000000..14e16c5
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/AccountsPrompt.kt
+@@ -0,0 +1,16 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-38.9.11.3] user 2026-10-21 (frustrated): the 台账 rule lives in the agent's BUILT-IN system prompt, not only in code.
++ * Pure (AccountsPromptTest asserts the wording, that AccountsTool.PROMPT starts with it, that the prompt builder always
++ * appends it and that the accounts tool is always registered).
++ */
++object AccountsPrompt {
++    /** [38.9.11.3] the 台账 rule in the agent's built-in system prompt (user 2026-10-21, AccountsPromptTest asserts it) */
++    const val LEDGER_RULE = "【台账规则·必须遵守】任务只要涉及账号——登录、注册、多号/多账号注册、换号、用某平台的 API key / token / cookie——你必须先自己调用 accounts 工具查台账：" +
++        "accounts(action=list) 看每个账号在哪些平台、有哪些 token / API key / cookie（已登录会话）和备注；accounts(action=ledger, site) 看这个网站台账里的账号和推荐用哪个；" +
++        "然后自己选、自己用，不要问用户台账里已经有的东西（账号、邮箱、密码、密钥、验证码邮箱）。多号注册：accounts(action=register_pick, site, count) 从台账自动取还没在这个网站注册过的邮箱（已注册的自动跳过）并生成密码；" +
++        "每个注册完 accounts(action=register_done, site, account, ok) 写回台账（备注 注册于 日期）；新拿到的 token / API key 用 accounts(action=secret, kind=api_key) 存进台账。" +
++        "密码、密钥、token 只用 secret id：{{secret:ID}} / {{user:ID}}（shell 命令和 browser 的 type 里都能用，Mines 替换成真值），绝不在聊天、日志、文件里写出真值。"
++
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/AccountsTool.kt b/src/android/app/src/main/java/com/openminis/app/plus/AccountsTool.kt
 new file mode 100644
-index 0000000..f6b7ee4
+index 0000000..c4d3f70
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/AccountsTool.kt
-@@ -0,0 +1,334 @@
+@@ -0,0 +1,350 @@
 +package com.openminis.app.plus
 +
 +import android.annotation.SuppressLint
@@ -13022,7 +13086,10 @@ index 0000000..f6b7ee4
 +    /** site → last hidden re-login result line (shown on the account row / detail and to the agent) */
 +    val lastResult = ConcurrentHashMap<String, String>()
 +
-+    const val PROMPT = "Linked accounts: before signing in anywhere call accounts(action=pick or login, site) — Mines signs in with the user's linked account (kept session → saved password → Google/GitHub → code from the user's own mailbox). Never ask the user for a password; if several accounts fit, ask once which one, then accounts(action=remember). " +
++    const val LEDGER_RULE = AccountsPrompt.LEDGER_RULE
++
++    const val PROMPT = LEDGER_RULE + "\n" +
++        "Linked accounts: before signing in anywhere call accounts(action=pick or login, site) — Mines signs in with the user's linked account (kept session → saved password → Google/GitHub → code from the user's own mailbox). Never ask the user for a password; only if the 台账 cannot decide, ask once which one, then accounts(action=remember). " +
 +        "Any password / API key / SSH or VPS password / token you need (not a website sign-in): call accounts(action=secret, site=<domain or server IP>, kind=ssh|password|api_key, account=<user if known>) — a saved one is used silently, otherwise Mines pops a secure input card for the user; you get {{secret:ID}} / {{user:ID}} placeholders to put in shell commands (Mines substitutes them and masks output). NEVER ask the user to type a password, key or code in chat, and never echo, store or write it to files."
 +
 +    fun definition() = AgentToolDefinition(
@@ -13031,19 +13098,23 @@ index 0000000..f6b7ee4
 +            "action=list: everything with status and the ways in. action=pick site=<domain or URL>: which account to use there (asks the user once when there are several). " +
 +            "action=login site=…: sign that site in (reuses the kept session — the browser tool shares it — else signs in by itself; a human-only captcha returns the reason). " +
 +            "action=status site=…: check the sign-in for real. action=remember site=… account=…: remember the user's choice. " +
++            "action=register_pick site=… count=N: 多号注册 — N e-mails from the 台账 not yet registered on that site, each pre-saved with a generated password; returns {{user:ID}} / {{secret:ID}} (type them in the browser as is). action=register_done site=… account=… ok=true|false [note=…]: write the result back to the 台账 (备注 注册于 日期) or drop a failed one. " +
 +            "action=ledger site=…: the 台账 (saved-password) accounts for that site, best first, and which one Mines fills (no card pops for them). action=use site=… account=…: use that 台账 account in this conversation. " +
 +            "action=secret site=… kind=ssh|password|api_key [account=…] [name=…] [purpose=…]: get a password / key WITHOUT seeing it — saved one silently, else a secure input card pops for the user; returns {{secret:ID}} / {{user:ID}} placeholders for shell commands.",
 +        parameters = mapOf(
 +            "tool_title" to AgentToolParam("string", "A concise 5-10 word summary shown to the user. Use the same language as the user."),
-+            "action" to AgentToolParam("string", "list | pick | login | status | remember | secret | ledger | use", enumValues = listOf("list", "pick", "login", "status", "remember", "secret", "ledger", "use")),
++            "action" to AgentToolParam("string", "list | pick | login | status | remember | secret | ledger | use | register_pick | register_done", enumValues = listOf("list", "pick", "login", "status", "remember", "secret", "ledger", "use", "register_pick", "register_done")),
 +            "kind" to AgentToolParam("string", "secret: ssh (server / VPS password), password (any other account), api_key (key / token)"),
 +            "name" to AgentToolParam("string", "secret: what it is, shown on the card (e.g. 梦云 VPS, OpenAI)"),
 +            "purpose" to AgentToolParam("string", "secret: why you need it, a few words in the user's language"),
 +            "site" to AgentToolParam("string", "Domain or URL, e.g. aliyun.com or https://bailian.console.aliyun.com"),
-+            "account" to AgentToolParam("string", "remember / use: the account (address / user name)"),
++            "account" to AgentToolParam("string", "remember / use / register_done: the account (address / user name)"),
++            "count" to AgentToolParam("integer", "register_pick: how many accounts to register (1–20)"),
++            "ok" to AgentToolParam("boolean", "register_done: true = the account was created, false = failed (removed from the 台账)"),
++            "note" to AgentToolParam("string", "register_done: extra 备注 (a few words)"),
 +        ),
 +        required = listOf("tool_title", "action"),
-+        propertyOrdering = listOf("tool_title", "action", "site", "account", "kind", "name", "purpose"),
++        propertyOrdering = listOf("tool_title", "action", "site", "account", "count", "ok", "note", "kind", "name", "purpose"),
 +    )
 +
 +    // ---------------- building the account list ----------------
@@ -13119,6 +13190,15 @@ index 0000000..f6b7ee4
 +                val h = Keychain.hostOf(if (site.contains("://")) site else "https://$site").ifBlank { site }
 +                ToolExecutionResult(Ledger.agentLines(c, h, sid, boundFor(sid, h)), true)
 +            }
++            "register_pick" -> {
++                if (site.isBlank()) return@runCatching ToolExecutionResult("site 是空的", false)
++                ToolExecutionResult(Ledger.registerPick(c, site, a.optInt("count", 1).coerceIn(1, 20)), true)
++            }
++            "register_done" -> {
++                val acct = a.optString("account").trim()
++                if (site.isBlank() || acct.isBlank()) return@runCatching ToolExecutionResult("site 和 account 都要填", false)
++                ToolExecutionResult(Ledger.registerDone(c, site, acct, a.optBoolean("ok", true), a.optString("note").trim()), true)
++            }
 +            "use" -> {
 +                val acct = a.optString("account").trim()
 +                if (site.isBlank() || acct.isBlank()) return@runCatching ToolExecutionResult("site 和 account 都要填", false)
@@ -13153,7 +13233,7 @@ index 0000000..f6b7ee4
 +                if (res.ok) TaskProgress.onTurnStart(sid) else if (res.needsUser) TaskProgress.onWaiting(sid, res.line)
 +                ToolExecutionResult(res.line, res.ok)
 +            }
-+            else -> ToolExecutionResult("action 只能是 list / pick / login / status / remember / secret / ledger / use", false)
++            else -> ToolExecutionResult("action 只能是 list / pick / login / status / remember / secret / ledger / use / register_pick / register_done", false)
 +        }
 +    }.getOrElse { ToolExecutionResult("Error: ${it.message}", false) }
 +
@@ -13716,7 +13796,7 @@ index 0000000..13e9991
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/AppAgents.kt b/src/android/app/src/main/java/com/openminis/app/plus/AppAgents.kt
 new file mode 100644
-index 0000000..ea74f70
+index 0000000..adb2a42
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/AppAgents.kt
 @@ -0,0 +1,274 @@
@@ -13903,7 +13983,7 @@ index 0000000..ea74f70
 +        val a = c.applicationContext as? com.openminis.app.MinisApp ?: return null
 +        val repo = a.providerRepository
 +        val cheapRe = Regex("(?i)(flash|mini|lite|haiku|turbo|nano|small|air|8b|7b)")
-+        val entries = repo.allVisibleEntries().sortedByDescending { cheapRe.containsMatchIn(it.baseModel.id) }.take(2)
++        val entries = repo.allVisibleEntries().filter { ErrZhCore.chatCapable(it.baseModel.id) }.sortedByDescending { cheapRe.containsMatchIn(it.baseModel.id) }.take(2)
 +        for (e in entries) {
 +            val inst = repo.instance(e.providerInstanceId)?.takeIf { it.isEnabled } ?: continue
 +            val key = repo.usableApiKey(inst) ?: continue
@@ -14729,10 +14809,10 @@ index 549a879..6ef5bf4 100644
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ClashConfigCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/ClashConfigCore.kt
 new file mode 100644
-index 0000000..c999f4d
+index 0000000..85b31b3
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/ClashConfigCore.kt
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,80 @@
 +package com.openminis.app.plus
 +
 +/**
@@ -14790,8 +14870,8 @@ index 0000000..c999f4d
 +        }
 +        val names = nodes.joinToString(", ") { "\"${esc(it.name)}\"" }
 +        sb.append("proxy-groups:\n")
-+        sb.append("  - name: 自动选择\n    type: url-test\n    proxies: [$names]\n    url: https://www.gstatic.com/generate_204\n    interval: 60\n    tolerance: 80\n    lazy: true\n")
-+        sb.append("  - name: 代理\n    type: fallback\n    proxies: [自动选择, $names]\n    url: https://www.gstatic.com/generate_204\n    interval: 60\n    lazy: true\n")
++        sb.append("  - name: 自动选择\n    type: url-test\n    proxies: [$names]\n$HC    tolerance: 80\n")
++        sb.append("  - name: 代理\n    type: fallback\n    proxies: [自动选择, $names]\n$HC")
 +        sb.append("rules:\n")
 +        for (d in listOf("google.com", "gmail.com", "googlemail.com", "googleapis.com", "gstatic.com", "googleusercontent.com", "youtube.com", "ggpht.com"))
 +            sb.append("  - DOMAIN-SUFFIX,$d,代理\n")
@@ -14800,6 +14880,13 @@ index 0000000..c999f4d
 +        sb.append("  - MATCH,代理\n")
 +        return sb.toString()
 +    }
++
++    /**
++     * [38.9.11.3] user: the embedded Clash is there so the sandbox goes through the proxy — the group must always sit on a
++     * LIVE node: a real HTTP check (generate_204 must answer 204 within 3 s) every 30 s, not lazy (checked even when idle),
++     * a node failing twice is skipped until it passes again. url-test picks the fastest live node; fallback the first live.
++     */
++    const val HC = "    url: https://www.gstatic.com/generate_204\n    expected-status: 204\n    interval: 30\n    timeout: 3000\n    max-failed-times: 2\n    lazy: false\n"
 +
 +    private fun esc(s: String) = s.replace("\\", "\\\\").replace("\"", "\\\"")
 +
@@ -15298,10 +15385,10 @@ index 0000000..f7782b8
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ClashSubCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/ClashSubCore.kt
 new file mode 100644
-index 0000000..d027a85
+index 0000000..8d7c83a
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/ClashSubCore.kt
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,141 @@
 +package com.openminis.app.plus
 +
 +import org.json.JSONObject
@@ -15387,8 +15474,9 @@ index 0000000..d027a85
 +    /** Config that lets mihomo parse share links itself from [providerPath] (written next to config.yaml). */
 +    fun providerConfig(header: String, providerPath: String): String = header +
 +        "mode: rule\nlog-level: info\nipv6: false\n" +
-+        "proxy-providers:\n  订阅:\n    type: file\n    path: $providerPath\n    health-check:\n      enable: true\n      url: https://www.gstatic.com/generate_204\n      interval: 300\n" +
-+        "proxy-groups:\n  - name: 自动选择\n    type: url-test\n    use: [订阅]\n    url: https://www.gstatic.com/generate_204\n    interval: 300\n    tolerance: 80\n    lazy: true\n" +
++        // [38.9.11.3] live node for the sandbox: real 204 check every 60 s (subscriptions can hold many nodes), not lazy, 3 s timeout
++        "proxy-providers:\n  订阅:\n    type: file\n    path: $providerPath\n    health-check:\n      enable: true\n      url: https://www.gstatic.com/generate_204\n      interval: 60\n      timeout: 3000\n      lazy: false\n      expected-status: 204\n" +
++        "proxy-groups:\n  - name: 自动选择\n    type: url-test\n    use: [订阅]\n    url: https://www.gstatic.com/generate_204\n    expected-status: 204\n    interval: 60\n    timeout: 3000\n    max-failed-times: 2\n    tolerance: 80\n    lazy: false\n" +
 +        "  - name: 代理\n    type: select\n    proxies: [自动选择]\n    use: [订阅]\n" +
 +        "rules:\n  - GEOIP,LAN,DIRECT\n  - DOMAIN-SUFFIX,cn,DIRECT\n  - MATCH,代理\n"
 +
@@ -15791,6 +15879,86 @@ index cde53b3..a21d1b2 100644
  
      /** Installed, enabled plugins that inject a Web UI widget (from status.json). */
      fun widgetPlugins(context: Context): List<String> = runCatching {
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ErrZhCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/ErrZhCore.kt
+new file mode 100644
+index 0000000..f510a2a
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/ErrZhCore.kt
+@@ -0,0 +1,74 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-38.9.11.3] user (partially blind, cannot read English UI text): every error a person sees is ONE short Chinese line;
++ * the raw English stays behind 「复制详情」. Also: which models may do chat at all. Pure, unit-tested (ErrZhCoreTest).
++ */
++object ErrZhCore {
++    private fun l(s: String?) = (s ?: "").lowercase()
++
++    /** worth one more try on the other route: refused (403), cut connection, timeout */
++    fun retryable(raw: String?): Boolean = l(raw).let { s ->
++        Regex("\\b403\\b").containsMatchIn(s) || "eof" in s || "stream was reset" in s || "unexpected end of stream" in s ||
++            "connection reset" in s || "timeout" in s || "timed out" in s || "broken pipe" in s || "socket closed" in s
++    }
++
++    /** a news / feed source: 「Reddit 拒绝访问，已跳过」「Hacker News 连接中断，已重试」 */
++    fun source(name: String, raw: String?, retried: Boolean = false, recovered: Boolean = false): String {
++        val s = l(raw); val n = friendly(name)
++        if (recovered) return "$n 连接中断，已重试成功"
++        val tail = if (retried) "，重试也不行，已跳过" else "，已跳过"
++        return when {
++            Regex("\\b(401|403)\\b").containsMatchIn(s) -> "$n 拒绝访问$tail"
++            Regex("\\b404\\b").containsMatchIn(s) -> "$n 地址不存在$tail"
++            Regex("\\b429\\b").containsMatchIn(s) || "too many" in s -> "$n 访问太频繁$tail"
++            Regex("\\b5\\d\\d\\b").containsMatchIn(s) -> "$n 服务器出错$tail"
++            "eof" in s || "reset" in s || "unexpected end" in s || "broken pipe" in s || "socket closed" in s -> "$n 连接中断$tail"
++            "timeout" in s || "timed out" in s -> "$n 等太久没回应$tail"
++            "unable to resolve" in s || "unknownhost" in s || "no address" in s -> "$n 网络不通（域名解析失败）$tail"
++            "connect" in s && ("refused" in s || "failed" in s) -> "$n 网络不通$tail"
++            "ssl" in s || "certificate" in s || "handshake" in s -> "$n 加密连接失败$tail"
++            else -> "$n 暂时读不到$tail"
++        }
++    }
++
++    /** source names as the user knows them */
++    fun friendly(name: String): String = when {
++        name.startsWith("r/") -> "Reddit（$name）"
++        name.equals("hn", true) || name.contains("hacker news", true) -> "Hacker News"
++        else -> name
++    }
++
++    /** the model refused because it is not a chat model (TTS / embedding / image) */
++    fun notChat(raw: String?): Boolean = l(raw).let { s ->
++        "cannot be used with chat" in s || "not a chat model" in s || "does not support chat" in s || "text-to-speech" in s ||
++            "is not supported for chat" in s || "embedding model" in s || "not supported in v1/chat/completions" in s
++    }
++
++    /** a model failure for the user: one Chinese line (ProviderRouteCore.zhError covers keys / cut streams / 429 / timeouts) */
++    fun model(id: String, raw: String?, switched: Boolean = true): String {
++        val tail = if (switched) "，已换下一个" else ""
++        if (notChat(raw)) return "模型 $id 不能用来聊天$tail"
++        ProviderRouteCore.zhError(raw, "模型 $id", switched)?.let { return it }
++        val s = l(raw)
++        return when {
++            Regex("\\b400\\b").containsMatchIn(s) -> "模型 $id 不接受这个请求（400）$tail"
++            Regex("\\b404\\b").containsMatchIn(s) -> "模型 $id 不存在或已下线$tail"
++            Regex("\\b5\\d\\d\\b").containsMatchIn(s) -> "模型 $id 的服务器出错$tail"
++            else -> "模型 $id 没回应$tail"
++        }
++    }
++
++    private val NON_CHAT = Regex("(?i)(^|[-_/.:])(tts|speech|whisper|transcri\\w*|asr|embed\\w*|bge|rerank\\w*|moderation|dall-e|gpt-image|imagen|flux|" +
++        "stable-diffusion|sdxl|sd3|kolors|cogview|wanx|seedream|seededit|midjourney|image-gen|vision-embed|clip|musicgen|lyria|veo|sora|kling)([-_/.:]|\\d|$)")
++
++    /** may this model id be used for chat / writing tasks (TTS, embedding, image, video, audio-only models may not) */
++    fun chatCapable(id: String): Boolean = !NON_CHAT.containsMatchIn(id)
++
++    /** a stored line from before 38.9.11.3 (「r/LocalLLaMA：HTTP 403」): its English part becomes the Chinese line */
++    fun legacyNote(line: String): String {
++        val name = line.substringBefore('：', ""); val raw = line.substringAfter('：', line)
++        val hasEnglishOnly = raw.none { it in '\u4e00'..'\u9fff' } && raw.any { it.isLetter() }
++        return if (name.isNotBlank() && hasEnglishOnly) source(name, raw) else line
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Experience.kt b/src/android/app/src/main/java/com/openminis/app/plus/Experience.kt
 new file mode 100644
 index 0000000..eda700a
@@ -17878,10 +18046,10 @@ index 0000000..89bd621
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Horizon.kt b/src/android/app/src/main/java/com/openminis/app/plus/Horizon.kt
 new file mode 100644
-index 0000000..2dbe0d4
+index 0000000..f426799
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/Horizon.kt
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,256 @@
 +package com.openminis.app.plus
 +
 +import android.content.Context
@@ -17897,6 +18065,7 @@ index 0000000..2dbe0d4
 +import kotlinx.coroutines.sync.Mutex
 +import kotlinx.coroutines.sync.withLock
 +import kotlinx.coroutines.withContext
++import kotlinx.coroutines.asContextElement
 +import okhttp3.OkHttpClient
 +import okhttp3.Request
 +import java.io.File
@@ -17924,6 +18093,12 @@ index 0000000..2dbe0d4
 +    private val _stage = MutableStateFlow("")
 +    val stage: StateFlow<String> = _stage.asStateFlow()
 +    @Volatile var lastError: String = ""; private set
++    /** [38.9.11.3] the raw (English) details behind the Chinese lines — only for 「复制详情」 */
++    val details: MutableList<String> = java.util.Collections.synchronizedList(ArrayList())
++    private fun detail(s: String) { details += s.take(300); while (details.size > 30) details.removeAt(0) }
++    /** [38.9.11.3] models that answered 「cannot be used with chat」: never picked again for the briefing */
++    private fun nonChat(c: Context): Set<String> = c.getSharedPreferences(PREFS, 0).getStringSet("non_chat", emptySet()) ?: emptySet()
++    private fun markNonChat(c: Context, id: String) { val p = c.getSharedPreferences(PREFS, 0); p.edit().putStringSet("non_chat", nonChat(c) + id).apply() }
 +
 +    fun today(): String = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date())
 +
@@ -17967,7 +18142,20 @@ index 0000000..2dbe0d4
 +            _stage.value = "正在读 ${src.size} 个来源"
 +            val since = System.currentTimeMillis() - 30 * 3_600_000L
 +            val raw = coroutineScope {
-+                src.map { s -> async { runCatching { fetch(app, s, since) }.getOrElse { notes += "${s.name}：${(it.message ?: it.javaClass.simpleName).take(60)}"; emptyList() } } }.awaitAll()
++                src.map { s -> async {
++                    // [38.9.11.3] one short Chinese line per failed source; 403 / cut connection → one retry on the other route
++                    val first = runCatching { fetch(app, s, since) }
++                    first.getOrNull() ?: run {
++                        val raw1 = first.exceptionOrNull().let { it?.message ?: it?.javaClass?.simpleName ?: "" }
++                        detail("${s.name}: $raw1")
++                        if (!ErrZhCore.retryable(raw1)) { notes += ErrZhCore.source(s.name, raw1); return@run emptyList<Raw>() }
++                        val second = runCatching { withContext(altRoute.asContextElement(true)) { fetch(app, s, since) } }
++                        second.getOrNull()?.also { notes += ErrZhCore.source(s.name, raw1, recovered = true) } ?: run {
++                            val raw2 = second.exceptionOrNull().let { it?.message ?: it?.javaClass?.simpleName ?: "" }
++                            detail("${s.name} (retry): $raw2"); notes += ErrZhCore.source(s.name, raw2.ifBlank { raw1 }, retried = true); emptyList()
++                        }
++                    }
++                } }.awaitAll()
 +            }.flatten()
 +            val merged = HorizonCore.mergeCrossSource(raw.filter { it.at == 0L || it.at >= since })
 +            if (merged.isEmpty()) { lastError = "一条都没读到" + (notes.firstOrNull()?.let { "（$it）" } ?: ""); return@withContext null }
@@ -18018,7 +18206,7 @@ index 0000000..2dbe0d4
 +            _brief.value = b; lastError = ""
 +            b
 +        } catch (t: Throwable) {
-+            lastError = (t.message ?: t.javaClass.simpleName).take(160); null
++            detail("run: ${t.message ?: t.javaClass.simpleName}"); lastError = ErrZhCore.source("简报", t.message ?: t.javaClass.simpleName).replace("，已跳过", ""); null
 +        } finally { _busy.value = false; _stage.value = ""; lock.unlock() }
 +    }
 +
@@ -18032,8 +18220,19 @@ index 0000000..2dbe0d4
 +    }
 +
 +    // ---------------------------------------------------------------- sources
++    /** [38.9.11.3] set for the retry of a failed source: the other route (direct ↔ the user's proxy) */
++    private val altRoute = ThreadLocal<Boolean>()
++
++    private fun clientFor(url: String): OkHttpClient {
++        if (altRoute.get() != true) return http
++        val host = runCatching { java.net.URI(url).host }.getOrNull() ?: return http
++        val order = ProviderRoutes.order(host)
++        val alt = order.getOrNull(1) ?: order.firstOrNull() ?: return http
++        return http.newBuilder().proxy(ProviderRoutes.proxyFor(alt)).build()
++    }
++
 +    private fun get(url: String, ua: String = MINES_MOBILE_UA): String {
-+        http.newCall(Request.Builder().url(url).header("User-Agent", ua).header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8").build()).execute().use { r ->
++        clientFor(url).newCall(Request.Builder().url(url).header("User-Agent", ua).header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8").build()).execute().use { r ->
 +            if (!r.isSuccessful) throw IllegalStateException("HTTP ${r.code}")
 +            return r.body?.string().orEmpty()
 +        }
@@ -18076,9 +18275,11 @@ index 0000000..2dbe0d4
 +        if (a != null) {
 +            val repo = a.providerRepository
 +            val cheapRe = Regex("(?i)(flash|mini|lite|haiku|turbo|nano|small|air|v3|chat)")
++            val bad = nonChat(c)
 +            val entries = runCatching { repo.allVisibleEntries() }.getOrDefault(emptyList()).filter { e ->
 +                val inst = repo.instance(e.providerInstanceId)
-+                inst != null && inst.isEnabled && !(inst.customBaseURL ?: "").contains("127.0.0.1")
++                inst != null && inst.isEnabled && !(inst.customBaseURL ?: "").contains("127.0.0.1") &&
++                    ErrZhCore.chatCapable(e.baseModel.id) && e.baseModel.id !in bad   // [38.9.11.3] never TTS / embedding / image models
 +            }.sortedByDescending { cheapRe.containsMatchIn(it.baseModel.id) }.take(3)
 +            for (e in entries) {
 +                val inst = repo.instance(e.providerInstanceId) ?: continue
@@ -18089,12 +18290,17 @@ index 0000000..2dbe0d4
 +                            .sendMessage(messages = listOf(com.openminis.app.data.model.LLMMessage(role = com.openminis.app.data.model.LLMMessage.Role.USER, content = prompt)),
 +                                systemPrompt = system, maxTokens = maxTokens).text
 +                    }
-+                }.onFailure { lastError = "${e.baseModel.id}：${it.message ?: it.javaClass.simpleName}".take(160) }.getOrNull()
++                }.onFailure {
++                    val raw = it.message ?: it.javaClass.simpleName
++                    detail("${e.baseModel.id}: $raw")
++                    if (ErrZhCore.notChat(raw)) markNonChat(c, e.baseModel.id)
++                    lastError = ErrZhCore.model(e.baseModel.id, raw)
++                }.getOrNull()
 +                if (!r.isNullOrBlank()) return r to e.baseModel.id
 +            }
 +        }
 +        if (MemohKey.configured()) {
-+            val r = runCatching { MemohKey.reply(system, prompt) }.onFailure { lastError = "Memoh：${it.message}".take(160) }.getOrNull()
++            val r = runCatching { MemohKey.reply(system, prompt) }.onFailure { detail("Memoh: ${it.message}"); lastError = ErrZhCore.model("Memoh", it.message, switched = false) }.getOrNull()
 +            if (!r.isNullOrBlank()) return r to "Memoh"
 +        }
 +        return null
@@ -19986,10 +20192,10 @@ index 0000000..e26a8e1
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Ledger.kt b/src/android/app/src/main/java/com/openminis/app/plus/Ledger.kt
 new file mode 100644
-index 0000000..fc4f8c2
+index 0000000..248d3bf
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/Ledger.kt
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,151 @@
 +package com.openminis.app.plus
 +
 +import android.content.Context
@@ -20093,9 +20299,52 @@ index 0000000..fc4f8c2
 +        val p = LedgerCore.pick(cs, textOf(sid), bound)
 +        val now = System.currentTimeMillis()
 +        val sb = StringBuilder("台账里 $host 的账号（不含密码，按 Mines 的选择排序）：\n")
-+        p.ordered.forEach { sb.append("- ").append(LedgerCore.line(it, it.account.equals(bound, true), now)).append('\n') }
++        p.ordered.forEach { sb.append("- ").append(LedgerCore.line(it, it.account.equals(bound, true), now))
++            .append(" · 密码 {{secret:").append(SecretRefs.idForSaved(c, it.host, it.account)).append("}}").append('\n') }
 +        p.cand?.let { sb.append("会用：").append(it.account).append("（").append(p.why?.zh.orEmpty()).append("）。登录页出现时 Mines 自动填，不弹框；要换就 accounts(action=use, site, account)。") }
 +        return sb.toString().trim()
++    }
++    // ── [38.9.11.3] 多号注册: e-mails from the 台账, new accounts written back (RegisterCore) ──
++    private fun today(): String = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date())
++    private val rnd = java.security.SecureRandom()
++
++    /** [n] e-mails for registering on [site] (unused there), each pre-saved to the 台账 with a fresh password + 「注册中」;
++     *  returns one line per account for the agent: e-mail, {{user:ID}} / {{secret:ID}}, whether Mines can read its code */
++    fun registerPick(c: Context, site: String, n: Int): String {
++        val host = site.trim().lowercase().removePrefix("https://").removePrefix("http://").substringBefore('/').removePrefix("www.")
++        if (host.isBlank()) return "site 是空的"
++        val all = runCatching { SavedLogins.all(c) }.getOrDefault(emptyList())
++        val ledger = all.map { it.host to it.user }
++        val idents = runCatching { IdentityStore.current(c).filter { it.type == IdentityCore.IdType.EMAIL }.map { it.value } }.getOrDefault(emptyList())
++        val boxes = runCatching { CodeSources.enabledBoxes(c).map { it.label } }.getOrDefault(emptyList())
++        val pool0 = RegisterCore.pool(ledger, idents, emptySet())
++        val readable = pool0.filter { m -> boxes.any { it.contains(m.addr, ignoreCase = true) } }.map { it.addr }.toSet()
++        val pool = RegisterCore.pool(ledger, idents, readable)
++        val used = RegisterCore.usedOn(ledger, host)
++        val got = RegisterCore.pick(pool, used, n)
++        if (got.isEmpty()) return "台账里没有还没在 $host 注册过的邮箱（已用 ${used.size} 个）。可以用手机号或请用户在「账号」里加邮箱；不要在聊天里要密码。"
++        val d = today()
++        val sb = StringBuilder("从台账取了 ${got.size} 个还没在 $host 注册过的邮箱（已自动跳过 ${used.size} 个注册过的），每个都已生成密码并先存进台账（备注 注册中）：\n")
++        got.forEachIndexed { i, m ->
++            SavedLogins.put(c, SavedLogins.Entry(AutoAccounts.siteOf(host).ifBlank { host }, "https://$host/", m.addr, RegisterCore.password(rnd)))
++            setNote(c, host, m.addr, RegisterCore.note(d, false))
++            val id = SecretRefs.idForSaved(c, host, m.addr)
++            sb.append("${i + 1}. ${m.addr} · 账号 {{user:$id}} · 密码 {{secret:$id}}" + (if (m.readable) " · Mines 能读这个邮箱的验证码" else " · 验证码要从这个邮箱取") + "\n")
++        }
++        sb.append("在 browser 的 type 里直接写 {{user:ID}} / {{secret:ID}}，Mines 输入时换成真值（你看不到）。每个注册完调用 accounts(action=register_done, site, account, ok=true|false)。")
++        return sb.toString()
++    }
++
++    /** one registration finished: ok → 备注 「注册于 日期」 (+ [extra]); failed → removed from the 台账 again */
++    fun registerDone(c: Context, site: String, account: String, ok: Boolean, extra: String = ""): String {
++        val host = site.trim().lowercase().removePrefix("https://").removePrefix("http://").substringBefore('/').removePrefix("www.")
++        val e = runCatching { SavedLogins.find(c, host, account) }.getOrNull() ?: return "台账里没有 $host 的 $account（先用 register_pick）"
++        if (ok) {
++            setNote(c, e.host.ifBlank { host }, e.user, RegisterCore.note(today(), true, extra)); markOk(c, e.host.ifBlank { host }, e.user)
++            return "已写进台账：$host · ${e.user} · 备注 ${RegisterCore.note(today(), true, extra)}（密码用 {{secret:${SecretRefs.idForSaved(c, host, e.user)}}}）"
++        }
++        SavedLogins.remove(c, e.host, e.user)
++        return "没注册成功：已把 $host · ${e.user} 从台账删掉"
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/LedgerCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/LedgerCore.kt
@@ -20230,10 +20479,10 @@ index 0000000..8a7fdb0
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/LocalProxy.kt b/src/android/app/src/main/java/com/openminis/app/plus/LocalProxy.kt
 new file mode 100644
-index 0000000..e9816c8
+index 0000000..991e104
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/LocalProxy.kt
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,112 @@
 +package com.openminis.app.plus
 +
 +import android.content.Context
@@ -20254,6 +20503,14 @@ index 0000000..e9816c8
 +    private const val TAG = "LocalProxy"
 +    @Volatile var probes: List<LocalProxyCore.Probe> = emptyList(); private set
 +    @Volatile var best: Int? = null; private set
++    /** [38.9.11.3] the user's node: the port that last passed (kept across a failed check while it still listens) */
++    @Volatile var lastGood: Int? = null; private set
++    /** [38.9.11.3] the PROXY route for AI provider calls (LocalProxyCore.nodeFor); re-checks itself every 30 s while failing */
++    fun node(): Int? {
++        val n = LocalProxyCore.nodeFor(probes, best, lastGood)
++        if (best == null && n != null && System.currentTimeMillis() - at >= LocalProxyCore.NODE_RECHECK_MS) request(LocalProxyCore.Why.FAILURE)
++        return n
++    }
 +    @Volatile var at: Long = 0L; private set
 +    @Volatile var lastWhy: String = ""; private set
 +    @Volatile private var ctx: Context? = null
@@ -20264,7 +20521,8 @@ index 0000000..e9816c8
 +    val probedOnce: Boolean get() = at > 0L
 +    fun usable(port: Int): Boolean = LocalProxyCore.usable(probes, port, probedOnce)
 +    fun bestUrl(): String? = best?.let { LocalProxyCore.url(it) }
-+    fun summary(): String = if (!probedOnce) "本机代理还没检测" else LocalProxyCore.summary(probes, best)
++    fun summary(): String = if (!probedOnce) "本机代理还没检测" else LocalProxyCore.summary(probes, best) +
++        (LocalProxyCore.nodeNote(best, LocalProxyCore.nodeFor(probes, best, lastGood))?.let { "；$it" } ?: "")
 +
 +    fun init(c: Context) {
 +        if (ctx != null) return
@@ -20327,6 +20585,8 @@ index 0000000..e9816c8
 +            val before = best; val beforeProbed = probedOnce
 +            val beforeSplit = LocalProxyCore.ok(probes, SplitProxy.PORT)
 +            probes = res; best = LocalProxyCore.select(res, order); at = System.currentTimeMillis(); lastWhy = why
++            best?.let { lastGood = it }
++            LocalProxyCore.nodeNote(best, LocalProxyCore.nodeFor(res, best, lastGood))?.let { Log.w(TAG, it) }
 +            Log.i(TAG, "probe ($why): ${summary()}")
 +            if (!beforeProbed || before != best || beforeSplit != LocalProxyCore.ok(res, SplitProxy.PORT)) {
 +                runCatching { SplitProxy.reapplyWeb() }
@@ -20337,10 +20597,10 @@ index 0000000..e9816c8
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/LocalProxyCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/LocalProxyCore.kt
 new file mode 100644
-index 0000000..2eac8a4
+index 0000000..b3e9c79
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/LocalProxyCore.kt
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,66 @@
 +package com.openminis.app.plus
 +
 +/**
@@ -20381,6 +20641,21 @@ index 0000000..2eac8a4
 +        Why.FAILURE -> lastAt <= 0L || now - lastAt >= FAIL_GAP_MS
 +        Why.STALE -> lastAt <= 0L || now - lastAt >= TTL_MS
 +    }
++
++    /**
++     * [38.9.11.3] user: the proxy is their own node, deliberately configured — never dropped silently. For AI provider calls
++     * the PROXY route uses [best] (passed a real request); when the last check failed but the user's node (the port that last
++     * passed, [lastGood]) is still LISTENING, it stays the PROXY route: each foreign host is then checked by a real
++     * CONNECT + TLS through it (ProviderRoutes.probe, ≤ PROBE_MS) and falls back to direct at once when it does not answer.
++     * A port that stopped listening (Clash closed) is not used.
++     */
++    fun nodeFor(probes: List<Probe>, best: Int?, lastGood: Int?): Int? =
++        best ?: lastGood?.takeIf { lg -> probes.any { it.port == lg && it.result == Result.FAIL } }
++
++    /** while the user's node fails its check: re-check every [NODE_RECHECK_MS] (instead of the 10 min TTL) */
++    const val NODE_RECHECK_MS = 30_000L
++    fun nodeNote(best: Int?, node: Int?): String? =
++        if (best == null && node != null) "代理节点 127.0.0.1:$node 刚才检测没通过：仍保留给国外服务先试（不通会立刻直连），${NODE_RECHECK_MS / 1000} 秒后再测" else null
 +
 +    fun url(port: Int) = "http://127.0.0.1:$port"
 +
@@ -22086,7 +22361,7 @@ index 0000000..6534bd7
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MarketZh.kt b/src/android/app/src/main/java/com/openminis/app/plus/MarketZh.kt
 new file mode 100644
-index 0000000..e6bc1f2
+index 0000000..44d01e2
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/MarketZh.kt
 @@ -0,0 +1,114 @@
@@ -22179,7 +22454,7 @@ index 0000000..e6bc1f2
 +        if (a != null) {
 +            val repo = a.providerRepository
 +            val cheapRe = Regex("(?i)(flash|mini|lite|haiku|turbo|nano|small|air|8b|7b)")
-+            val entries = repo.allVisibleEntries().filter { e ->
++            val entries = repo.allVisibleEntries().filter { e -> if (!ErrZhCore.chatCapable(e.baseModel.id)) return@filter false   // [38.9.11.3] no TTS / embedding / image models
 +                val inst = repo.instance(e.providerInstanceId)
 +                inst != null && inst.isEnabled && !(inst.customBaseURL ?: "").contains("127.0.0.1")
 +            }.sortedByDescending { cheapRe.containsMatchIn(it.baseModel.id) }.take(3)
@@ -23245,6 +23520,19 @@ index 1eb2cf1..42ae7bd 100644
              }.getOrElse { Item("OpenRouter", "读取失败（${it.message}）") }
          }
          last = out; lastAt = System.currentTimeMillis()
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlainVoice.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlainVoice.kt
+index fcf799c..bcb7ade 100644
+--- a/src/android/app/src/main/java/com/openminis/app/plus/PlainVoice.kt
++++ b/src/android/app/src/main/java/com/openminis/app/plus/PlainVoice.kt
+@@ -80,7 +80,7 @@ class PlainVoice(private val context: Context, initialNote: String? = null) {
+         sessionId?.let { return it }
+         val app = context.applicationContext as? MinisApp ?: return null
+         val model = app.providerRepository.lastUsedVisibleEntry()?.baseModel?.id
+-            ?: app.providerRepository.allVisibleEntries().firstOrNull()?.baseModel?.id ?: return null
++            ?: app.providerRepository.allVisibleEntries().firstOrNull { com.openminis.app.plus.ErrZhCore.chatCapable(it.baseModel.id) }?.baseModel?.id ?: return null
+         val s = app.chatRepository.createSession(modelId = model, title = "语音对话")
+         runCatching { app.chatRepository.dao.updateSource(s.id, "voice") }
+         sessionId = s.id
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/PlusConnect.kt b/src/android/app/src/main/java/com/openminis/app/plus/PlusConnect.kt
 index 6e513f5..85676d7 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/PlusConnect.kt
@@ -23989,10 +24277,10 @@ index 0000000..675c792
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ProviderRouteCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/ProviderRouteCore.kt
 new file mode 100644
-index 0000000..fd72560
+index 0000000..9d85808
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/ProviderRouteCore.kt
-@@ -0,0 +1,200 @@
+@@ -0,0 +1,201 @@
 +package com.openminis.app.plus
 +
 +/**
@@ -24079,9 +24367,10 @@ index 0000000..fd72560
 +        return if (c.okRoute == r) c.copy(okRoute = null, okAt = 0L) else c
 +    }
 +
-+    /** base order for a host before memory: local → direct only; domestic → direct, proxy; foreign → proxy, direct; else direct, proxy */
++    /** base order for a host before memory: local → direct only; domestic → direct only; foreign → proxy, direct; else direct, proxy */
 +    fun baseOrder(host: String, proxyAvailable: Boolean): List<Route> = when {
 +        isLocal(host) || !proxyAvailable -> listOf(Route.DIRECT)
++        isDomestic(host) -> listOf(Route.DIRECT)   // [38.9.11.3] user: China providers never go through Clash / the node
 +        isForeign(host) -> listOf(Route.PROXY, Route.DIRECT)
 +        else -> listOf(Route.DIRECT, Route.PROXY)
 +    }
@@ -24195,10 +24484,10 @@ index 0000000..fd72560
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ProviderRoutes.kt b/src/android/app/src/main/java/com/openminis/app/plus/ProviderRoutes.kt
 new file mode 100644
-index 0000000..80437e0
+index 0000000..c5161da
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/ProviderRoutes.kt
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,139 @@
 +package com.openminis.app.plus
 +
 +import com.openminis.app.plus.ProviderRouteCore.Route
@@ -24223,7 +24512,9 @@ index 0000000..80437e0
 +    fun proxy(): Proxy? {
 +        forcedProxy?.let { return it }
 +        runCatching { if (SplitProxy.active) return Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", SplitProxy.PORT)) }
-+        LocalProxy.best?.let { return Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", it)) }
++        // [38.9.11.3] the user's own node stays the PROXY route even when its last check failed (still listening) — each
++        // host is then probed through it for real and falls back to direct fast
++        LocalProxy.node()?.let { return Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", it)) }
 +        return null
 +    }
 +
@@ -24524,6 +24815,64 @@ index 0000000..3819e0f
 +        return Report(host, port, paths, ReachCore.verdict(paths))
 +    }
 +}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/RegisterCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/RegisterCore.kt
+new file mode 100644
+index 0000000..17b8130
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/RegisterCore.kt
+@@ -0,0 +1,52 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-38.9.11.3] 多号注册 (user 2026-10-21): when the agent registers several accounts on a site it takes the e-mails
++ * from the 台账 itself — never asks the user — picking ones NOT yet registered on that site, mailboxes Mines can read codes
++ * from first, least-used first; every new account goes back into the 台账 (site, e-mail, secret id, 备注 「注册于 日期」).
++ * Pure, unit-tested (RegisterCoreTest). No password passes through here.
++ */
++object RegisterCore {
++    data class Mail(val addr: String, val readable: Boolean = false, val sites: Int = 0)
++
++    private val EMAIL = Regex("^[A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,}$")
++    fun isEmail(s: String) = EMAIL.matches(s.trim())
++
++    /**
++     * The e-mail pool: every address known to the 台账 ([ledger] = (host, account) pairs), identities and code mailboxes,
++     * deduplicated (case-insensitive); [readable] = addresses whose mailbox Mines can read codes from.
++     */
++    fun pool(ledger: List<Pair<String, String>>, identities: List<String>, readable: Set<String>): List<Mail> {
++        val count = HashMap<String, Int>(); val first = LinkedHashMap<String, String>()
++        ledger.forEach { (_, a) -> if (isEmail(a)) { val k = a.trim().lowercase(); first.putIfAbsent(k, a.trim()); count[k] = (count[k] ?: 0) + 1 } }
++        (identities + readable).forEach { a -> if (isEmail(a)) first.putIfAbsent(a.trim().lowercase(), a.trim()) }
++        val rd = readable.map { it.trim().lowercase() }.toSet()
++        return first.map { (k, v) -> Mail(v, k in rd, count[k] ?: 0) }
++    }
++
++    /** e-mails already used on [site] (same registrable domain), from the 台账 */
++    fun usedOn(ledger: List<Pair<String, String>>, site: String): Set<String> =
++        ledger.filter { (h, _) -> LedgerCore.sameSite(h, site) }.map { it.second.trim().lowercase() }.toSet()
++
++    /** up to [n] e-mails for registering on [site]: unused there, readable mailboxes first, then the least used overall */
++    fun pick(pool: List<Mail>, used: Set<String>, n: Int, exclude: Set<String> = emptySet()): List<Mail> {
++        val skip = used + exclude.map { it.lowercase() }
++        return pool.filter { it.addr.lowercase() !in skip }
++            .sortedWith(compareByDescending<Mail> { it.readable }.thenBy { it.sites }.thenBy { it.addr.lowercase() })
++            .take(n.coerceIn(0, 20))
++    }
++
++    /** the 台账 备注 of a new account */
++    fun note(date: String, ok: Boolean, extra: String = ""): String =
++        (if (ok) "注册于 $date" else "注册中 $date") + (if (extra.isNotBlank()) " · " + extra.take(30) else "")
++
++    /** a strong password: 16 chars, upper + lower + digit + symbol, from [rnd] (SecureRandom on the device) */
++    fun password(rnd: java.util.Random, len: Int = 16): String {
++        val U = "ABCDEFGHJKLMNPQRSTUVWXYZ"; val L = "abcdefghijkmnpqrstuvwxyz"; val D = "23456789"; val S = "!@#%^*-_+"
++        val all = U + L + D + S
++        val cs = mutableListOf(U[rnd.nextInt(U.length)], L[rnd.nextInt(L.length)], D[rnd.nextInt(D.length)], S[rnd.nextInt(S.length)])
++        while (cs.size < len.coerceAtLeast(8)) cs += all[rnd.nextInt(all.length)]
++        for (i in cs.indices.reversed()) { val j = rnd.nextInt(i + 1); val t = cs[i]; cs[i] = cs[j]; cs[j] = t }
++        return cs.joinToString("")
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Relogin.kt b/src/android/app/src/main/java/com/openminis/app/plus/Relogin.kt
 new file mode 100644
 index 0000000..f008441
@@ -24716,7 +25065,7 @@ index 0000000..27ee1f7
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SandboxNet.kt b/src/android/app/src/main/java/com/openminis/app/plus/SandboxNet.kt
-index d75d0ae..9e730c4 100644
+index d75d0ae..c4f633d 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/SandboxNet.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/SandboxNet.kt
 @@ -66,6 +66,7 @@ object SandboxNet {
@@ -24727,7 +25076,7 @@ index d75d0ae..9e730c4 100644
      }
  
      fun setMode(context: Context, m: ProxyMode) {
-@@ -75,6 +76,14 @@ object SandboxNet {
+@@ -75,6 +76,15 @@ object SandboxNet {
          scope.launch { runCatching { com.openminis.app.sandbox.ExecutionCoordinator.broadcastProxyChange() } }
      }
  
@@ -24736,13 +25085,14 @@ index d75d0ae..9e730c4 100644
 +    fun setStrict(context: Context, on: Boolean) {
 +        init(context); strict = on
 +        prefs?.edit()?.putBoolean("strict_proxy", on)?.apply()
++        runCatching { WebProxy.apply(SplitProxy.webOn()) }   // [38.9.11.3] the app's WebViews follow 严格代理 too (block, never direct)
 +        scope.launch { runCatching { com.openminis.app.sandbox.ExecutionCoordinator.broadcastProxyChange() } }
 +    }
 +
      fun noProxy(): String = (listOf("localhost", "127.0.0.1", "::1") + DIRECT_SUFFIXES).joinToString(",")
  
      /** Does anything accept a TCP connection at host:port within [ms]? */
-@@ -87,6 +96,7 @@ object SandboxNet {
+@@ -87,6 +97,7 @@ object SandboxNet {
          val np = if (url.isNotEmpty()) noProxy() else ""
          return linkedMapOf(
              "http_proxy" to url, "https_proxy" to url, "HTTP_PROXY" to url, "HTTPS_PROXY" to url,
@@ -24750,7 +25100,7 @@ index d75d0ae..9e730c4 100644
              "no_proxy" to np, "NO_PROXY" to np, "MINES_PROXY_SOURCE" to proxySource,
          )
      }
-@@ -103,6 +113,8 @@ object SandboxNet {
+@@ -103,6 +114,8 @@ object SandboxNet {
              proxySource = "off"; _status.value = "沙箱不用代理，全部直连（软件源自动选国内镜像）"
              return block("")
          }
@@ -24759,7 +25109,7 @@ index d75d0ae..9e730c4 100644
          SplitProxy.sandboxEnv()?.let { env ->
              proxySource = "split"
              val up = SplitProxy.settings.value.hasUpstream
-@@ -110,21 +122,35 @@ object SandboxNet {
+@@ -110,21 +123,35 @@ object SandboxNet {
              else "走分流代理 127.0.0.1:${SplitProxy.PORT}，但没填代理服务器：境外源会直连"
              return env + ("MINES_PROXY_SOURCE" to proxySource) + ("no_proxy" to noProxy()) + ("NO_PROXY" to noProxy())
          }
@@ -24837,7 +25187,7 @@ index 0000000..22fc34f
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SavedLogins.kt b/src/android/app/src/main/java/com/openminis/app/plus/SavedLogins.kt
-index 44c570e..22e9f88 100644
+index 44c570e..253cf50 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/SavedLogins.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/SavedLogins.kt
 @@ -52,11 +52,15 @@ object SavedLogins {
@@ -24860,7 +25210,7 @@ index 44c570e..22e9f88 100644
          cache = l; return l
      }
  
-@@ -64,10 +68,32 @@ object SavedLogins {
+@@ -64,10 +68,37 @@ object SavedLogins {
  
      private fun save(c: Context, l: List<Entry>) {
          val a = JSONArray(); l.forEach { a.put(JSONObject().put("n", it.name).put("u", it.url).put("l", it.user).put("p", it.pass)) }
@@ -24891,10 +25241,15 @@ index 44c570e..22e9f88 100644
 +        return l.firstOrNull { user.isNotBlank() && it.user.equals(user, true) } ?: if (anyUser || user.isBlank()) l.firstOrNull() else null
 +    }
 +
++    /** [38.9.11.3] remove one login (a 多号注册 that failed) */
++    fun remove(c: Context, host: String, user: String) {
++        save(c, all(c).filterNot { it.host.equals(host.removePrefix("www."), true) && it.user.equals(user, true) })
++    }
++
      fun clear(c: Context) { c.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().clear().apply(); cache = emptyList() }
  
      /** RFC-4180-ish CSV line split (quotes, doubled quotes). */
-@@ -122,7 +148,7 @@ object SavedLogins {
+@@ -122,7 +153,7 @@ object SavedLogins {
       * JS: types [e] into the visible username / password fields (React-safe setter + input events) and, when [submit],
       * presses the sign-in button. Returns 'filled' / 'user' (only the user field — two-step forms) / 'none'.
       */
@@ -24903,7 +25258,7 @@ index 44c570e..22e9f88 100644
  function vis(x){var r=x.getBoundingClientRect();return r.width>4&&r.height>4&&getComputedStyle(x).visibility!='hidden';}
  function setv(x,v){var p=Object.getPrototypeOf(x);var d=Object.getOwnPropertyDescriptor(p,'value');if(d&&d.set)d.set.call(x,v);else x.value=v;x.dispatchEvent(new Event('input',{bubbles:true}));x.dispatchEvent(new Event('change',{bubbles:true}));}
  var ins=[].slice.call(document.querySelectorAll('input')).filter(function(x){return vis(x)&&!x.disabled&&!x.readOnly;});
-@@ -131,8 +157,9 @@ var us=ins.find(function(x){var h=((x.type||'')+' '+(x.name||'')+' '+(x.id||'')+
+@@ -131,8 +162,9 @@ var us=ins.find(function(x){var h=((x.type||'')+' '+(x.name||'')+' '+(x.id||'')+
  var out='none';
  var uv=${JSONObject.quote(e.user)};var isTel=us&&(us.type=='tel'||/手机|phone|mobile|tel/.test(((us.name||'')+' '+(us.id||'')+' '+(us.placeholder||'')).toLowerCase()));
  if(us&&isTel&&!/^\+?[0-9][0-9 \-]{5,18}$/.test(uv))us=null;   // [Mines-38.7 v11] smoke: 「smoke_user」 went into a 手机号 field
@@ -24917,10 +25272,10 @@ index 44c570e..22e9f88 100644
   if(bs.length){setTimeout(function(){bs[bs.length-1].click();},400);}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SecretRefs.kt b/src/android/app/src/main/java/com/openminis/app/plus/SecretRefs.kt
 new file mode 100644
-index 0000000..c187b6b
+index 0000000..8ce5b3b
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/SecretRefs.kt
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,134 @@
 +package com.openminis.app.plus
 +
 +import android.content.Context
@@ -25032,6 +25387,28 @@ index 0000000..c187b6b
 +    }
 +
 +    fun scrub(text: String): String = if (used.isEmpty()) text else SecretRefsCore.scrub(text, used)
++
++    /**
++     * [38.9.11.3] the browser's type action: {{secret:ID}} / {{user:ID}} in the text become the real values right before they
++     * are typed into the page (the agent never sees them; the tool output is scrubbed). Unknown ids are left as they are.
++     */
++    fun fill(text: String): String {
++        if (!text.contains("{{")) return text
++        val r = Regex("""\{\{\s*(secret|user)\s*:\s*([A-Za-z0-9_]{1,48})\s*\}\}""")
++        val out = r.replace(text) { m ->
++            val v = valueOf(m.groupValues[2])
++            val x = if (m.groupValues[1] == "secret") v?.second else v?.first
++            if (x.isNullOrEmpty()) m.value else { if (m.groupValues[1] == "secret") used += x; x }
++        }
++        return out
++    }
++
++    /** [38.9.11.3] a 台账 account the agent may use: remembered, returned as its secret id (never the value) */
++    fun idForSaved(c: Context, host: String, account: String): String {
++        init(c)
++        val id = SecretRefsCore.idFor("password", host, account)
++        remember(c, Ref(id, host, account)); return id
++    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SecretRefsCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/SecretRefsCore.kt
 new file mode 100644
@@ -27045,7 +27422,7 @@ index 2b50977..3f3e165 100644
          val out = ArrayList<Digest.Item>()
          // [Mines-38.7] every signed-in account of a platform is read with ITS OWN session (isolated store / saved set);
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt b/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt
-index 4290a7b..b883e0a 100644
+index 4290a7b..2049113 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/SplitProxy.kt
 @@ -61,16 +61,25 @@ object SplitProxy {
@@ -27077,7 +27454,7 @@ index 4290a7b..b883e0a 100644
      }
  
      /** Health of one upstream: latency in ms, or null when the check failed. */
-@@ -107,7 +116,10 @@ object SplitProxy {
+@@ -107,7 +116,11 @@ object SplitProxy {
      private val autoCache = ConcurrentHashMap<String, Pair<Boolean, Long>>()
      @Volatile private var previousSelector: ProxySelector? = null
  
@@ -27085,11 +27462,12 @@ index 4290a7b..b883e0a 100644
 +    // [38.9.11.1] only while a real request through 127.0.0.1:7899 passed (LocalProxy probe); listening alone is not enough
 +    val active: Boolean get() = _settings.value.enabled && _running.value && LocalProxy.usable(PORT)
 +    /** [38.9.11.1] re-apply the WebView override after a local-proxy probe changed what works */
-+    fun reapplyWeb() { val s = _settings.value; if (s.enabled && _running.value) WebProxy.apply(s.forApp) }
++    fun reapplyWeb() { val s = _settings.value; if (s.enabled && _running.value) WebProxy.apply(s.forApp) else if (SandboxNet.strict) WebProxy.apply(false) }   // [38.9.11.3] strict: block instead of direct
++    fun webOn(): Boolean = _settings.value.let { it.enabled && it.forApp } && _running.value
  
      fun init(context: Context) {
          ctxRef = context.applicationContext
-@@ -141,6 +153,8 @@ object SplitProxy {
+@@ -141,6 +154,8 @@ object SplitProxy {
                  (0 until a.length()).map { i -> a.getJSONObject(i).let { Upstream(it.optString("t", "http"), it.optString("h"), it.optInt("p"), it.optString("l")) } }
              }.getOrDefault(emptyList()),
              autoSwitch = p.getBoolean("autoswitch", true),
@@ -27098,7 +27476,7 @@ index 4290a7b..b883e0a 100644
          )
      }
  
-@@ -148,16 +162,20 @@ object SplitProxy {
+@@ -148,16 +163,20 @@ object SplitProxy {
          init(context)
          val n = block(_settings.value)
          _settings.value = n
@@ -27120,7 +27498,7 @@ index 4290a7b..b883e0a 100644
      }
  
      fun addPreset(context: Context, preset: Preset) = update(context) { s ->
-@@ -205,6 +223,8 @@ object SplitProxy {
+@@ -205,6 +224,8 @@ object SplitProxy {
          "github.com", "githubusercontent.com", "githubassets.com", "ghcr.io", "docker.io", "docker.com",
          "crates.io", "golang.org", "go.dev", "rustup.rs", "rust-lang.org", "huggingface.co", "gradle.org", "maven.org",
          "googleapis.com", "google.com", "gstatic.com",
@@ -27129,7 +27507,7 @@ index 4290a7b..b883e0a 100644
      )
      private fun builtinForeign(host: String): Boolean {
          val h = host.lowercase().trimEnd('.')
-@@ -241,12 +261,16 @@ object SplitProxy {
+@@ -241,12 +262,16 @@ object SplitProxy {
              override fun select(uri: URI?): MutableList<Proxy> {
                  val host = uri?.host
                  val s = _settings.value
@@ -27148,7 +27526,7 @@ index 4290a7b..b883e0a 100644
                  prev?.connectFailed(uri, sa, ioe)
              }
          })
-@@ -258,11 +282,16 @@ object SplitProxy {
+@@ -258,11 +283,16 @@ object SplitProxy {
          if (!s.enabled || !s.forSandbox) return null
          // [Mines-net-26] Never point the sandbox at a port nobody listens on.
          if (!_running.value || server?.isClosed != false) return null
@@ -27166,7 +27544,7 @@ index 4290a7b..b883e0a 100644
      }
  
      // ── the proxy server ───────────────────────────────────────────────
-@@ -284,6 +313,7 @@ object SplitProxy {
+@@ -284,6 +314,7 @@ object SplitProxy {
                  }
              }, "split-proxy-accept").apply { isDaemon = true }.start()
              Log.i(TAG, "listening on $PORT")
@@ -27174,7 +27552,7 @@ index 4290a7b..b883e0a 100644
          } catch (e: Exception) {
              Log.w(TAG, "start failed: ${e.message}")
              _running.value = false
-@@ -292,6 +322,7 @@ object SplitProxy {
+@@ -292,6 +323,7 @@ object SplitProxy {
  
      @Synchronized
      private fun stop() {
@@ -27182,7 +27560,7 @@ index 4290a7b..b883e0a 100644
          runCatching { server?.close() }
          server = null
          _running.value = false
-@@ -301,19 +332,41 @@ object SplitProxy {
+@@ -301,19 +333,41 @@ object SplitProxy {
      // ── [Mines-proxy-auto] health checks + failover ────────────────────
  
      private const val CHECK_EVERY_MS = 60_000L
@@ -27226,7 +27604,7 @@ index 4290a7b..b883e0a 100644
      /** Checks every configured upstream once (blocking; call off the main thread). */
      /** [Mines-design-33] consecutive failed checks per proxy (memory only). */
      private val fails = java.util.concurrent.ConcurrentHashMap<String, Int>()
-@@ -324,7 +377,8 @@ object SplitProxy {
+@@ -324,7 +378,8 @@ object SplitProxy {
          val m = HashMap<String, Health>()
          for (u in ups) m[u.key] = check(u)
          _health.value = m
@@ -27236,7 +27614,7 @@ index 4290a7b..b883e0a 100644
          pruneDead()
          pickCurrent()
      }
-@@ -352,14 +406,43 @@ object SplitProxy {
+@@ -352,14 +407,43 @@ object SplitProxy {
          if (n != st) { Log.i(TAG, "pruned dead auto-detected proxies"); update(c, { n }); fails.keys.retainAll(n.all.map { it.key }.toSet()) }
      }
  
@@ -27287,7 +27665,7 @@ index 4290a7b..b883e0a 100644
      }
  
      private fun pickCurrent() {
-@@ -379,10 +462,14 @@ object SplitProxy {
+@@ -379,10 +463,14 @@ object SplitProxy {
       * dead proxy. Unchecked proxies count as usable until the first check.
       */
      private fun activeUpstream(s: Settings): Upstream? {
@@ -27303,7 +27681,7 @@ index 4290a7b..b883e0a 100644
          if (!s.autoSwitch) return ups.first().takeIf { alive(it) }
          val key = _current.value
          return ups.firstOrNull { it.key == key && alive(it) } ?: ups.firstOrNull { alive(it) }
-@@ -390,7 +477,7 @@ object SplitProxy {
+@@ -390,7 +478,7 @@ object SplitProxy {
  
      /** Marks a failed upstream and moves to the next one right away. */
      private fun markFailed(u: Upstream, e: Throwable) {
@@ -27312,7 +27690,7 @@ index 4290a7b..b883e0a 100644
          pickCurrent()
      }
  
-@@ -434,7 +521,7 @@ object SplitProxy {
+@@ -434,7 +522,7 @@ object SplitProxy {
                  if (seen.add(it.upstream.host + ":" + it.upstream.port)) out += it
              }
          } finally { pool.shutdownNow() }
@@ -27321,7 +27699,7 @@ index 4290a7b..b883e0a 100644
      }
  
      private fun isLoopback(h: String) = h == "127.0.0.1" || h == "localhost" || h == "::1"
-@@ -504,12 +591,18 @@ object SplitProxy {
+@@ -504,12 +592,18 @@ object SplitProxy {
                  val leg = open(host, port, method.equals("CONNECT", true)) ?: run {
                      c.getOutputStream().write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n".toByteArray()); return
                  }
@@ -27341,7 +27719,7 @@ index 4290a7b..b883e0a 100644
                      } else {
                          val u = URI(target)
                          val origin = (u.rawPath?.ifEmpty { "/" } ?: "/") + (u.rawQuery?.let { "?$it" } ?: "")
-@@ -541,6 +634,7 @@ object SplitProxy {
+@@ -541,6 +635,7 @@ object SplitProxy {
  
      private val tags = java.util.Collections.synchronizedMap(java.util.WeakHashMap<Socket, String>())
      private fun Socket.getTag(): String? = tags[this]
@@ -27349,7 +27727,7 @@ index 4290a7b..b883e0a 100644
  
      private const val IDLE_MS = 180_000L
  
-@@ -566,7 +660,12 @@ object SplitProxy {
+@@ -566,7 +661,12 @@ object SplitProxy {
      }
  
      /** Opens the outbound leg according to the rules. */
@@ -27363,7 +27741,7 @@ index 4290a7b..b883e0a 100644
  
      private fun open(host: String, port: Int, tunnel: Boolean): Leg? {
          val s = _settings.value
-@@ -592,6 +691,7 @@ object SplitProxy {
+@@ -592,6 +692,7 @@ object SplitProxy {
              }
          }
          if (mode == Mode.AUTO && !useProxy) autoDirect = alive != null
@@ -27371,7 +27749,7 @@ index 4290a7b..b883e0a 100644
          return runCatching {
              if (!useProxy) {
                  record(host, when {
-@@ -610,7 +710,8 @@ object SplitProxy {
+@@ -610,7 +711,8 @@ object SplitProxy {
                      // Fail over to the next healthy proxy, or direct when none is left.
                      markFailed(u, e)
                      val next = activeUpstream(_settings.value)
@@ -27381,7 +27759,7 @@ index 4290a7b..b883e0a 100644
                          record(host, "${mode.label}→代理 ${u.host}:${u.port} 失败，改直连")
                          Leg(direct(host, port, 10_000), false)
                      } else {
-@@ -622,20 +723,27 @@ object SplitProxy {
+@@ -622,20 +724,27 @@ object SplitProxy {
          }.getOrNull()
      }
  
@@ -27563,6 +27941,43 @@ index 0000000..68863b5
 +        "xdh" to "com.jcraft.jsch.bc.XDH",
 +        "host_certificate_to_key_fallback" to "yes",
 +    )
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/StrictWebCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/StrictWebCore.kt
+new file mode 100644
+index 0000000..52d3f47
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/StrictWebCore.kt
+@@ -0,0 +1,31 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-38.9.11.3] user: the sandbox / the agent's 无痕 browser must never expose the real IP.
++ *  - 严格代理 on (or a 无痕 session — strict by default): the WebView proxy override is the passing proxy, or a closed port
++ *    ([BLOCK]) when none passes — never cleared to direct. An HTTP proxy rule means Chromium sends the host name in CONNECT,
++ *    so DNS is resolved by the proxy, not the phone.
++ *  - WebRTC cannot reveal local / public IPs: [WEBRTC_JS] (document start) removes RTCPeerConnection & co.
++ * Pure, unit-tested (StrictWebCoreTest).
++ */
++object StrictWebCore {
++    const val BLOCK = "127.0.0.1:1"
++    /** 无痕 sessions use 严格代理 unless the user turns it off */
++    const val STRICT_INCOGNITO_DEFAULT = true
++
++    /** the WebView proxy rule: a passing port; strict and none → [BLOCK]; else null = no override (direct) */
++    fun rule(strict: Boolean, port: Int?): String? = when {
++        port != null -> "127.0.0.1:$port"
++        strict -> BLOCK
++        else -> null
++    }
++
++    /** a 无痕 session in the main process cannot have its own proxy: with strict and no passing proxy it opens in the
++     *  separate :incog process, whose own override can block */
++    fun incognitoInProcess(profileSupported: Boolean, strictIncognito: Boolean, port: Int?): Boolean =
++        !profileSupported || (strictIncognito && port == null)
++
++    const val WEBRTC_JS = "(function(){try{var n=['RTCPeerConnection','webkitRTCPeerConnection','mozRTCPeerConnection','RTCDataChannel','RTCIceCandidate','RTCSessionDescription'];" +
++        "n.forEach(function(k){try{Object.defineProperty(window,k,{value:undefined,writable:false,configurable:false});}catch(e){try{window[k]=undefined;}catch(e2){}}});" +
++        "if(navigator.mediaDevices){try{navigator.mediaDevices.getUserMedia=function(){return Promise.reject(new Error('blocked'));};}catch(e){}}}catch(e){}})();"
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/TaskProgress.kt b/src/android/app/src/main/java/com/openminis/app/plus/TaskProgress.kt
 new file mode 100644
@@ -29003,10 +29418,10 @@ index 0000000..90409aa
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/WebProxy.kt b/src/android/app/src/main/java/com/openminis/app/plus/WebProxy.kt
 new file mode 100644
-index 0000000..e8e8a9d
+index 0000000..a1bf758
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/WebProxy.kt
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,38 @@
 +package com.openminis.app.plus
 +
 +/**
@@ -29016,21 +29431,32 @@ index 0000000..e8e8a9d
 + */
 +object WebProxy {
 +    @Volatile var applied: Boolean = false; private set
++    /** the port the app's WebViews should use now (split proxy while it works › a local proxy that passed), null = none */
++    fun passingPort(): Int? = if (LocalProxy.usable(SplitProxy.PORT) && runCatching { SplitProxy.active }.getOrDefault(false)) SplitProxy.PORT else LocalProxy.best
++
 +    fun apply(on: Boolean) {
 +        runCatching {
 +            if (!androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.PROXY_OVERRIDE)) return
 +            val pc = androidx.webkit.ProxyController.getInstance()
 +            val ex = java.util.concurrent.Executor { it.run() }
-+            if (on) {
-+                // [38.9.11.1] the split proxy only while it really works, else a local proxy that passed, else no override
-+                val port = if (LocalProxy.usable(SplitProxy.PORT)) SplitProxy.PORT else LocalProxy.best
-+                if (port == null) { if (applied) pc.clearProxyOverride(ex) { applied = false }; return }
-+                val cfg = androidx.webkit.ProxyConfig.Builder()
-+                    .addProxyRule("127.0.0.1:$port")
-+                    .addBypassRule("localhost").addBypassRule("127.0.0.1").addBypassRule("10.0.2.2")
-+                    .build()
-+                pc.setProxyOverride(cfg, ex) { applied = true }
-+            } else if (applied) pc.clearProxyOverride(ex) { applied = false }
++            // [38.9.11.1] the split proxy only while it really works, else a local proxy that passed, else no override
++            // [38.9.11.3] 严格代理: never cleared to direct — a closed port blocks instead (StrictWebCore)
++            val strict = SandboxNet.strict
++            val rule = StrictWebCore.rule(strict, if (on || strict) passingPort() else null)
++            if (rule == null) { if (applied) pc.clearProxyOverride(ex) { applied = false }; return }
++            val cfg = androidx.webkit.ProxyConfig.Builder()
++                .addProxyRule(rule)
++                .addBypassRule("localhost").addBypassRule("127.0.0.1").addBypassRule("10.0.2.2")
++                .build()
++            pc.setProxyOverride(cfg, ex) { applied = true }
++        }
++    }
++
++    /** [38.9.11.3] WebRTC IP leak guard at document start (strict / 无痕 WebViews) */
++    fun guardWebRtc(wv: android.webkit.WebView) {
++        runCatching {
++            if (androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.DOCUMENT_START_SCRIPT))
++                androidx.webkit.WebViewCompat.addDocumentStartJavaScript(wv, StrictWebCore.WEBRTC_JS, setOf("*"))
 +        }
 +    }
 +}
@@ -29873,7 +30299,7 @@ index 0000000..295d217
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/XpTitles.kt b/src/android/app/src/main/java/com/openminis/app/plus/XpTitles.kt
 new file mode 100644
-index 0000000..e7de54f
+index 0000000..82d857b
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/XpTitles.kt
 @@ -0,0 +1,138 @@
@@ -29996,7 +30422,7 @@ index 0000000..e7de54f
 +        ProviderHealth.init(c)
 +        val bad = ProviderHealth.checks.value.filterValues { !it.ok }.keys
 +        val cheapRe = Regex("(?i)(flash|mini|lite|haiku|turbo|nano|small|air|8b|7b)")
-+        val entries = repo.allVisibleEntries().filter { e ->
++        val entries = repo.allVisibleEntries().filter { e -> if (!ErrZhCore.chatCapable(e.baseModel.id)) return@filter false   // [38.9.11.3] no TTS / embedding / image models
 +            val inst = repo.instance(e.providerInstanceId)
 +            inst != null && inst.isEnabled && e.providerInstanceId !in bad && !(inst.customBaseURL ?: "").contains("127.0.0.1")
 +        }.sortedByDescending { cheapRe.containsMatchIn(it.baseModel.id) }.take(3)
@@ -34397,6 +34823,19 @@ index 0000000..c201780
 +            }
 +        })
 +}
+diff --git a/src/android/app/src/main/java/com/openminis/app/scheduled/ScheduledAgentRunner.kt b/src/android/app/src/main/java/com/openminis/app/scheduled/ScheduledAgentRunner.kt
+index d5ec586..71d24c2 100644
+--- a/src/android/app/src/main/java/com/openminis/app/scheduled/ScheduledAgentRunner.kt
++++ b/src/android/app/src/main/java/com/openminis/app/scheduled/ScheduledAgentRunner.kt
+@@ -307,7 +307,7 @@ object ScheduledAgentRunner {
+                                 // the auth error.
+                                 ?.let { g -> app.providerRepository.availableMemberEntries(g).firstOrNull()?.model?.id }
+                     }
+-                    ?: app.providerRepository.allVisibleEntries().firstOrNull()?.baseModel?.id
++                    ?: app.providerRepository.allVisibleEntries().firstOrNull { com.openminis.app.plus.ErrZhCore.chatCapable(it.baseModel.id) }?.baseModel?.id
+                     ?: run {
+                         AppLogger.warning(TAG, "task ${task.id}: no provider — abort")
+                         return null
 diff --git a/src/android/app/src/main/java/com/openminis/app/service/AgentNotificationContent.kt b/src/android/app/src/main/java/com/openminis/app/service/AgentNotificationContent.kt
 index 78fd559..2eb8191 100644
 --- a/src/android/app/src/main/java/com/openminis/app/service/AgentNotificationContent.kt
@@ -36154,7 +36593,7 @@ index d99b975..72b0b68 100644
                  )
              }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
-index e0d0cae..4ea0bd3 100644
+index e0d0cae..50a4e13 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
 @@ -89,6 +89,7 @@ import kotlinx.coroutines.flow.combine
@@ -36723,7 +37162,7 @@ index e0d0cae..4ea0bd3 100644
              if (mcpFragment != null) {
                  append("\n\n")
                  append(mcpFragment)
-@@ -15503,6 +15801,25 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15503,6 +15801,26 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                  append("\n\n")
                  append(dailyMemoryFragment)
              }
@@ -36743,13 +37182,14 @@ index e0d0cae..4ea0bd3 100644
 +                com.openminis.app.plus.AppAgents.promptLine(context)?.let { append("\n"); append(it) }
 +                // [Mines-38.9.5 i] progress card + linked accounts + 工作位置 self-registration
 +                append("\n"); append(com.openminis.app.plus.TaskProgress.PROMPT)
-+                append("\n"); append(com.openminis.app.plus.AccountsTool.PROMPT)
 +                append("\n"); append(com.openminis.app.plus.WorkspaceStore.PROMPT)
 +            }
++            // [38.9.11.3] the 台账 / accounts rule: always in the built-in prompt (outside the runCatching above, helpers too)
++            append("\n\n"); append(com.openminis.app.plus.AccountsTool.PROMPT)
              // Runtime context goes last so the prefix above stays byte-stable
              // across requests within the same day. Keep ordering deterministic
              // (date → tz → lang → model count) — any reorder defeats the cache.
-@@ -15854,11 +16171,69 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15854,11 +16172,69 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
              }
          }
  
@@ -36820,7 +37260,7 @@ index e0d0cae..4ea0bd3 100644
              append("<user-attached-files>\n")
              for (m in metas) {
                  val urlPath = m.linuxPath.removePrefix("/var/minis/")
-@@ -15874,6 +16249,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -15874,6 +16250,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
              }
              append("</user-attached-files>")
          }
@@ -36828,7 +37268,7 @@ index e0d0cae..4ea0bd3 100644
  
          // Order matches UserAttachmentList convention: images first, then files.
          return PreparedAttachments(
-@@ -17072,6 +17448,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -17072,6 +17449,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
      }
  
      override fun onCleared() {
@@ -36837,7 +37277,7 @@ index e0d0cae..4ea0bd3 100644
          // [T-sub-agents-queue] Nothing can re-enter a queued delegation once
          // this view model is gone; leaving the starter installed would let the
          // registry call into a cleared VM.
-@@ -17123,6 +17501,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -17123,6 +17502,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
              try {
                  val count = chatRepository.messageCount(sid)
                  if (count > 0) return@launch
@@ -36846,7 +37286,7 @@ index e0d0cae..4ea0bd3 100644
                  AppLogger.info(
                      TAG,
                      "cleanupIfEmptyOnExit: deleting empty session $sid (no persisted messages)",
-@@ -17602,6 +17982,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -17602,6 +17983,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                              continue
                          }
                          if (!mime.startsWith("image/")) continue
@@ -36855,7 +37295,7 @@ index e0d0cae..4ea0bd3 100644
                          val file = java.io.File(mediaStore.mediaBaseDir, rel)
                          if (!file.exists()) continue
                          val original = try { file.readBytes() } catch (_: Exception) { continue }
-@@ -17693,16 +18075,9 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
+@@ -17693,16 +18076,9 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
       * e.g. `file_write` → "Write File", `shell_execute` → "Execute Shell".
       */
      private fun friendlyToolTitle(toolName: String): String = when (toolName) {
@@ -36875,7 +37315,7 @@ index e0d0cae..4ea0bd3 100644
              .split('_')
              .filter { it.isNotEmpty() }
              .joinToString(" ") { it.replaceFirstChar { ch -> ch.uppercase() } }
-@@ -17756,3 +18131,28 @@ internal fun warmUpBudget(window: Int?, compactThreshold: Int?, ratio: Double, f
+@@ -17756,3 +18132,28 @@ internal fun warmUpBudget(window: Int?, compactThreshold: Int?, ratio: Double, f
      val line = if (threshold > 0) threshold else w
      return (line / ratio).toInt() - fixedTokens
  }
@@ -41406,7 +41846,7 @@ index f8cc6b9..05f469b 100644
      }
  }
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
-index b529a74..30fc63e 100644
+index b529a74..238bdb4 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
 @@ -20,7 +20,9 @@ import androidx.compose.foundation.border
@@ -41747,7 +42187,7 @@ index b529a74..30fc63e 100644
                      ActIcon("⋯", "更多", m.ink2, onMore)
                  }
 -                error?.let { e -> Text("没能开始：$e", fontSize = 12.sp, lineHeight = 17.sp, color = toneColors(Tone.DANGER).first, modifier = Modifier.padding(top = 2.dp, bottom = 6.dp, end = 8.dp)) }
-+                error?.let { e -> Text("没能开始：$e", fontSize = MT.Caption, lineHeight = MT.CaptionLH, color = toneColors(Tone.DANGER).first, modifier = Modifier.padding(top = 2.dp, bottom = 6.dp, end = 8.dp)) }
++                error?.let { e -> Text("没能开始：" + (if (e.any { it in '\u4e00'..'\u9fff' }) e else com.openminis.app.plus.ErrZhCore.source("这个来源", e).removePrefix("这个来源 ")) /* [38.9.11.3] Chinese only */, fontSize = MT.Caption, lineHeight = MT.CaptionLH, color = toneColors(Tone.DANGER).first, modifier = Modifier.padding(top = 2.dp, bottom = 6.dp, end = 8.dp)) }
              }
          }
      }
@@ -41837,7 +42277,7 @@ index b529a74..30fc63e 100644
                  }
              }
 -            error?.let { e -> Text("没能开始：$e", fontSize = 13.sp, color = toneColors(Tone.DANGER).first, modifier = Modifier.padding(top = 10.dp)) }
-+            error?.let { e -> Text("没能开始：$e", fontSize = MT.Caption, color = toneColors(Tone.DANGER).first, modifier = Modifier.padding(top = 10.dp)) }
++            error?.let { e -> Text("没能开始：" + (if (e.any { it in '\u4e00'..'\u9fff' }) e else com.openminis.app.plus.ErrZhCore.source("这个来源", e).removePrefix("这个来源 ")) /* [38.9.11.3] Chinese only */, fontSize = MT.Caption, color = toneColors(Tone.DANGER).first, modifier = Modifier.padding(top = 10.dp)) }
              Spacer(Modifier.height(20.dp))
          }
          Box(Modifier.fillMaxWidth().height(1.dp).background(mc.hairline))
@@ -43357,10 +43797,10 @@ index 0000000..2b674e6
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/HorizonBriefPane.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/HorizonBriefPane.kt
 new file mode 100644
-index 0000000..47b15f9
+index 0000000..bf40ca1
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/HorizonBriefPane.kt
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,188 @@
 +package com.openminis.app.ui.plus
 +
 +import androidx.compose.foundation.clickable
@@ -43429,7 +43869,12 @@ index 0000000..47b15f9
 +                }
 +                Text(line, fontSize = MT.Caption, lineHeight = MT.CaptionLH, color = m.ink2,
 +                    modifier = Modifier.semantics { contentDescription = "简报状态：$line" })
-+                b?.notes?.takeIf { it.isNotEmpty() && !busy }?.let { n -> Text(n.joinToString("；"), fontSize = MT.Caption, lineHeight = MT.CaptionLH, color = m.ink3, modifier = Modifier.padding(top = 4.dp)) }
++                // [38.9.11.3] Chinese lines only; the raw English only behind 「复制详情」
++                b?.notes?.takeIf { it.isNotEmpty() && !busy }?.let { n -> Text(n.map { com.openminis.app.plus.ErrZhCore.legacyNote(it) }.joinToString("；"), fontSize = MT.Caption, lineHeight = MT.CaptionLH, color = m.ink3, modifier = Modifier.padding(top = 4.dp)) }
++                if (!busy && Horizon.details.isNotEmpty()) Text("复制详情", fontSize = MT.Caption, color = m.primaryText, modifier = Modifier.padding(top = 2.dp).clickable {
++                    runCatching { ctx.getSystemService(android.content.ClipboardManager::class.java).setPrimaryClip(android.content.ClipData.newPlainText("Mines 简报详情", Horizon.details.joinToString("\n"))) }
++                    android.widget.Toast.makeText(ctx, "已复制详情", android.widget.Toast.LENGTH_SHORT).show()
++                }.padding(vertical = 8.dp))
 +                Spacer(Modifier.height(10.dp))
 +                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
 +                    GlassPill(if (busy) "正在生成…" else "重新生成", enabled = !busy) { shownDay = null; Horizon.runAsync(ctx) }
@@ -56304,6 +56749,53 @@ index 0000000..cbb4091
 +        assertTrue(AccountsCore.Stuck.CODE.needsUser); assertFalse(AccountsCore.Stuck.NETWORK.needsUser)
 +    }
 +}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/AccountsPromptTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/AccountsPromptTest.kt
+new file mode 100644
+index 0000000..9a5bfeb
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/AccountsPromptTest.kt
+@@ -0,0 +1,41 @@
++package com.openminis.app.plus
++
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import java.io.File
++
++/** [Mines-38.9.11.3] the 台账 rule is in the agent's built-in system prompt and the accounts tool is always registered. */
++class AccountsPromptTest {
++    private fun src(rel: String) = listOf(File("src/main/java/com/openminis/app/$rel"), File("app/src/main/java/com/openminis/app/$rel")).first { it.exists() }.readText()
++
++    @Test fun ruleWording() {
++        val r = AccountsPrompt.LEDGER_RULE
++        listOf("多号", "注册", "登录", "换号", "accounts(action=list)", "accounts(action=ledger", "register_pick", "register_done",
++            "token", "API key", "cookie", "备注", "不要问用户台账里已经有的东西", "{{secret:ID}}", "绝不在聊天、日志、文件里写出真值")
++            .forEach { assertTrue("rule lacks $it", r.contains(it)) }
++    }
++
++    @Test fun promptStartsWithRule_andIsAlwaysAppended() {
++        val tool = src("plus/AccountsTool.kt")
++        assertTrue(tool.contains("const val LEDGER_RULE = AccountsPrompt.LEDGER_RULE"))
++        assertTrue(tool.contains("const val PROMPT = LEDGER_RULE + "))
++        val vm = src("ui/chat/ChatViewModel.kt")
++        val i = vm.indexOf("append(com.openminis.app.plus.AccountsTool.PROMPT)")
++        assertTrue(i > 0)
++        // not behind a helper / language condition: the line before it is the 38.9.11.3 always-comment
++        val before = vm.substring(maxOf(0, i - 260), i)
++        assertTrue(before.contains("always in the built-in prompt"))
++        assertFalse(before.contains("if (!isHelper"))
++    }
++
++    @Test fun toolAlwaysRegistered() {
++        val t = src("tools/AgentTools.kt")
++        val line = t.lines().first { it.contains("AccountsTool.definition()") }.trim()
++        assertTrue("accounts tool must be unconditional: $line", line.startsWith("add(com.openminis.app.plus.AccountsTool.definition())"))
++        val vm = src("ui/chat/ChatViewModel.kt")
++        assertTrue(vm.contains("com.openminis.app.plus.AccountsTool.TOOL_NAME ->"))
++        val tool = src("plus/AccountsTool.kt")
++        listOf("\"ledger\" ->", "\"use\" ->", "\"register_pick\" ->", "\"register_done\" ->", "\"secret\" ->").forEach { assertTrue(it, tool.contains(it)) }
++    }
++}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/AddressFixTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/AddressFixTest.kt
 new file mode 100644
 index 0000000..5ff2ed3
@@ -56671,7 +57163,7 @@ index 0000000..bac4e7e
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/ClashConfigCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/ClashConfigCoreTest.kt
 new file mode 100644
-index 0000000..fb51493
+index 0000000..fce6ed0
 --- /dev/null
 +++ b/src/android/app/src/test/java/com/openminis/app/plus/ClashConfigCoreTest.kt
 @@ -0,0 +1,26 @@
@@ -56695,7 +57187,7 @@ index 0000000..fb51493
 +
 +    @Test fun fromNodesHasGroupsAndGoogleRules() {
 +        val o = ClashConfigCore.fromNodes(listOf(ClashConfigCore.Node("自己填代理", "http", "h.test", 3128, "u", "p\"w")), "k")
-+        assertTrue(o.contains("type: url-test")); assertTrue(o.contains("type: fallback")); assertTrue(o.contains("interval: 60")); assertTrue(o.contains("lazy: true"))
++        assertTrue(o.contains("type: url-test")); assertTrue(o.contains("type: fallback")); assertTrue(o.contains("interval: 30")); assertTrue(o.contains("lazy: false")); assertTrue(o.contains("expected-status: 204")); assertTrue(o.contains("max-failed-times: 2"))   // [38.9.11.3] live node, real check
 +        assertTrue(o.contains("DOMAIN-SUFFIX,gmail.com,代理")); assertTrue(o.contains("DOMAIN-SUFFIX,cn,DIRECT")); assertTrue(o.contains("MATCH,代理"))
 +        assertTrue(o.contains("password: \"p\\\"w\""))
 +        assertTrue(ClashConfigCore.looksLikeClashYaml(o)); assertFalse(ClashConfigCore.looksLikeClashYaml("c3M6Ly9hYmM="))
@@ -57056,6 +57548,48 @@ index 0000000..8f3718b
 +        assertTrue("ENGINEER gate missing in buildSystemPrompt", i > 0)
 +        assertTrue(t.indexOf("append(com.openminis.app.agent.EngineerMode.PROMPT)", i) in i..(i + 300))
 +        assertTrue("must come after 技能优先", t.indexOf("SkillFirst.PROMPT") in 1 until i)
++    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/ErrZhCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/ErrZhCoreTest.kt
+new file mode 100644
+index 0000000..23a225c
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/ErrZhCoreTest.kt
+@@ -0,0 +1,36 @@
++package com.openminis.app.plus
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class ErrZhCoreTest {
++    @Test fun screenshotErrorsBecomeChinese() {
++        assertEquals("Reddit（r/LocalLLaMA） 拒绝访问，已跳过", ErrZhCore.source("r/LocalLLaMA", "HTTP 403"))
++        assertEquals("Hacker News 连接中断，重试也不行，已跳过", ErrZhCore.source("Hacker News", "java.io.EOFException", retried = true))
++        assertEquals("Hacker News 连接中断，已重试成功", ErrZhCore.source("Hacker News", "EOFException", recovered = true))
++        assertEquals("Telegram 连接中断，已跳过", ErrZhCore.source("Telegram", "stream was reset: CANCEL"))
++        assertEquals("模型 mistralai/voxtral-mini-tts-3-0 不能用来聊天，已换下一个",
++            ErrZhCore.model("mistralai/voxtral-mini-tts-3-0", "HTTP 400 text-to-speech model cannot be used with chat"))
++        listOf(ErrZhCore.source("X", "weird"), ErrZhCore.model("m", "weird")).forEach { assertTrue(it.any { c -> c in '\u4e00'..'\u9fff' }) }
++    }
++
++    @Test fun retryOnlyForRefusedOrCut() {
++        assertTrue(ErrZhCore.retryable("HTTP 403")); assertTrue(ErrZhCore.retryable("stream was reset: CANCEL")); assertTrue(ErrZhCore.retryable("EOFException"))
++        assertFalse(ErrZhCore.retryable("HTTP 404")); assertFalse(ErrZhCore.retryable("JSON parse error"))
++    }
++
++    @Test fun nonChatModelsFiltered() {
++        listOf("mistralai/voxtral-mini-tts-3-0", "tts-1", "gpt-4o-mini-tts", "whisper-1", "text-embedding-3-small", "BAAI/bge-m3", "jina-reranker-v2",
++            "dall-e-3", "gpt-image-1", "black-forest-labs/FLUX.1-schnell", "imagen-3.0", "stabilityai/stable-diffusion-xl", "Kwai-Kolors/Kolors", "omni-moderation-latest", "veo-2")
++            .forEach { assertFalse(it, ErrZhCore.chatCapable(it)) }
++        listOf("deepseek-chat", "gpt-4o-mini", "mistralai/voxtral-small-24b", "gemini-2.5-flash", "qwen3-235b-a22b", "claude-haiku-4-5", "glm-4.5-air", "SenseChat-5", "kimi-k2")
++            .forEach { assertTrue(it, ErrZhCore.chatCapable(it)) }
++        assertTrue(ErrZhCore.notChat("This text-to-speech model cannot be used with chat"))
++    }
++    @Test fun oldStoredNotesTranslated() {
++        assertEquals("Reddit（r/LocalLLaMA） 拒绝访问，已跳过", ErrZhCore.legacyNote("r/LocalLLaMA：HTTP 403"))
++        assertEquals("没连上模型：按热度挑选", ErrZhCore.legacyNote("没连上模型：按热度挑选"))
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/FeedRefreshTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/FeedRefreshTest.kt
@@ -58599,10 +59133,10 @@ index 0000000..c0a782e
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/LocalProxyCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/LocalProxyCoreTest.kt
 new file mode 100644
-index 0000000..87acdc1
+index 0000000..d2bcb95
 --- /dev/null
 +++ b/src/android/app/src/test/java/com/openminis/app/plus/LocalProxyCoreTest.kt
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,81 @@
 +package com.openminis.app.plus
 +
 +import com.openminis.app.plus.LocalProxyCore.Probe
@@ -58671,6 +59205,17 @@ index 0000000..87acdc1
 +        assertTrue(s.startsWith("用 127.0.0.1:7890"))
 +        assertTrue(s.contains("7899 ✗")); assertFalse(s.contains("1080"))
 +        assertEquals("http://127.0.0.1:7890", LocalProxyCore.url(7890))
++    }
++
++    /** [38.9.11.3] the user's own node is kept (still listening, check failed) and dropped only when it stops listening */
++    @Test fun userNodeKeptNotDropped() {
++        fun P(p: Int, r: LocalProxyCore.Result) = LocalProxyCore.Probe(p, r)
++        assertEquals(7890, LocalProxyCore.nodeFor(listOf(P(7890, LocalProxyCore.Result.OK)), 7890, 7890))
++        assertEquals(7890, LocalProxyCore.nodeFor(listOf(P(7890, LocalProxyCore.Result.FAIL)), null, 7890))       // failed check: still the PROXY route
++        assertEquals(null, LocalProxyCore.nodeFor(listOf(P(7890, LocalProxyCore.Result.DOWN)), null, 7890))       // Clash closed: not used
++        assertEquals(null, LocalProxyCore.nodeFor(listOf(P(7890, LocalProxyCore.Result.FAIL)), null, null))       // never passed: nothing to keep
++        assertTrue(LocalProxyCore.nodeNote(null, 7890)!!.contains("仍保留"))
++        assertEquals(null, LocalProxyCore.nodeNote(7890, 7890))
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/LoginMemoryCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/LoginMemoryCoreTest.kt
@@ -59314,10 +59859,10 @@ index 0000000..95c4fa3
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/ProviderRouteCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/ProviderRouteCoreTest.kt
 new file mode 100644
-index 0000000..f4f415f
+index 0000000..13a35fc
 --- /dev/null
 +++ b/src/android/app/src/test/java/com/openminis/app/plus/ProviderRouteCoreTest.kt
-@@ -0,0 +1,114 @@
+@@ -0,0 +1,116 @@
 +package com.openminis.app.plus
 +
 +import com.openminis.app.plus.ProviderRouteCore.Fail
@@ -59336,7 +59881,7 @@ index 0000000..f4f415f
 +    @Test fun chinaHostsGoDirectFirst() {
 +        for (h in listOf("token.sensenova.cn", "developer.amd.com.cn", "api.deepseek.com", "api.moonshot.cn", "open.bigmodel.cn",
 +            "api.siliconflow.cn", "dashscope.aliyuncs.com", "ark.cn-beijing.volces.com", "qianfan.baidubce.com", "apihub.agnes-ai.com"))
-+            assertEquals(h, listOf(Route.DIRECT, Route.PROXY), ProviderRouteCore.order(h, null, now, proxyAvailable = true))
++            assertEquals(h, listOf(Route.DIRECT), ProviderRouteCore.order(h, null, now, proxyAvailable = true))   // [38.9.11.3] direct only
 +    }
 +
 +    @Test fun foreignHostsGoThroughTheProxyFirst() {
@@ -59355,8 +59900,9 @@ index 0000000..f4f415f
 +    @Test fun memoryWinsAndFailedRouteGoesLast() {
 +        // sensenova worked through the proxy last time → proxy first for 30 min
 +        val m = ProviderRouteCore.recordOk(null, Route.PROXY, 120, now)
-+        assertEquals(listOf(Route.PROXY, Route.DIRECT), ProviderRouteCore.order("token.sensenova.cn", m, now + 60_000, true))
-+        assertEquals(listOf(Route.DIRECT, Route.PROXY), ProviderRouteCore.order("token.sensenova.cn", m, now + ProviderRouteCore.OK_TTL_MS + 1, true))
++        assertEquals(listOf(Route.PROXY, Route.DIRECT), ProviderRouteCore.order("relay.example.net", m, now + 60_000, true))
++        assertEquals(listOf(Route.DIRECT, Route.PROXY), ProviderRouteCore.order("relay.example.net", m, now + ProviderRouteCore.OK_TTL_MS + 1, true))
++        assertEquals(listOf(Route.DIRECT), ProviderRouteCore.order("token.sensenova.cn", m, now + 60_000, true))   // China: never the proxy
 +        // openai: the proxy (dead Clash) failed → direct first for 5 min
 +        val f = ProviderRouteCore.recordFail(null, Route.PROXY, now)
 +        assertEquals(listOf(Route.DIRECT, Route.PROXY), ProviderRouteCore.order("api.openai.com", f, now + 1000, true))
@@ -59383,7 +59929,8 @@ index 0000000..f4f415f
 +        assertEquals(Route.DIRECT, ProviderRouteCore.pickByProbe(500, 300))          // direct wins near-ties
 +        assertEquals(Route.PROXY, ProviderRouteCore.pickByProbe(2500, 300))          // proxy clearly faster
 +        assertEquals(Route.PROXY, ProviderRouteCore.pickByProbe(300, 500, preferProxy = true))
-+        assertTrue(ProviderRouteCore.needsProbe("token.sensenova.cn", null, now, true))
++        assertFalse(ProviderRouteCore.needsProbe("token.sensenova.cn", null, now, true))   // [38.9.11.3] China: direct only, no probe
++        assertTrue(ProviderRouteCore.needsProbe("relay.example.net", null, now, true))
 +        assertFalse(ProviderRouteCore.needsProbe("token.sensenova.cn", null, now, false))
 +        assertFalse(ProviderRouteCore.needsProbe("token.sensenova.cn", ProviderRouteCore.recordOk(null, Route.DIRECT, 80, now), now + 1000, true))
 +    }
@@ -59551,6 +60098,59 @@ index 0000000..cd2afa7
 +        val j = """{"us1.node.check-host.net":[{"time":0.12,"address":"1.2.3.4"}],"de1.node.check-host.net":[{"error":"Connection timed out"}],"jp1.node.check-host.net":null}"""
 +        assertEquals(Triple(1, 2, 1), ReachCore.parseCheckHost(j))
 +        assertEquals(Triple(0, 0, 0), ReachCore.parseCheckHost("nope"))
++    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/RegisterCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/RegisterCoreTest.kt
+new file mode 100644
+index 0000000..348cc05
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/RegisterCoreTest.kt
+@@ -0,0 +1,47 @@
++package com.openminis.app.plus
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class RegisterCoreTest {
++    private val ledger = listOf(
++        "github.com" to "a@163.com", "login.github.com" to "B@163.com", "openai.com" to "a@163.com",
++        "openai.com" to "c@gmail.com", "x.com" to "not-an-email", "deepseek.com" to "d@qq.com")
++
++    @Test fun poolDedupesAndCounts() {
++        val p = RegisterCore.pool(ledger, listOf("e@gmail.com", "A@163.com"), setOf("c@gmail.com"))
++        assertEquals(listOf("a@163.com", "B@163.com", "c@gmail.com", "d@qq.com", "e@gmail.com"), p.map { it.addr })
++        assertEquals(2, p.first { it.addr == "a@163.com" }.sites)
++        assertTrue(p.first { it.addr == "c@gmail.com" }.readable)
++        assertFalse(p.any { it.addr == "not-an-email" })
++    }
++
++    @Test fun skipsAlreadyRegisteredOnSite() {
++        val p = RegisterCore.pool(ledger, emptyList(), emptySet())
++        val used = RegisterCore.usedOn(ledger, "www.github.com")
++        assertEquals(setOf("a@163.com", "b@163.com"), used)
++        val got = RegisterCore.pick(p, used, 5).map { it.addr }
++        assertFalse(got.contains("a@163.com")); assertFalse(got.contains("B@163.com"))
++        assertEquals(setOf("c@gmail.com", "d@qq.com"), got.toSet())
++    }
++
++    @Test fun readableFirstThenLeastUsed_andCount() {
++        val p = RegisterCore.pool(ledger, listOf("z@gmail.com"), setOf("d@qq.com"))
++        val got = RegisterCore.pick(p, RegisterCore.usedOn(ledger, "new-site.io"), 3).map { it.addr }
++        assertEquals("d@qq.com", got[0])            // its mailbox can be read for the code
++        assertEquals(3, got.size)
++        assertEquals("z@gmail.com", got[1])         // never used anywhere
++        assertTrue(RegisterCore.pick(p, emptySet(), 2, exclude = setOf("D@QQ.com")).none { it.addr == "d@qq.com" })
++        assertEquals(0, RegisterCore.pick(p, emptySet(), 0).size)
++    }
++
++    @Test fun noteAndPassword() {
++        assertEquals("注册于 2026-10-21", RegisterCore.note("2026-10-21", true))
++        assertEquals("注册中 2026-10-21 · 第2个", RegisterCore.note("2026-10-21", false, "第2个"))
++        val pw = RegisterCore.password(java.util.Random(7))
++        assertEquals(16, pw.length)
++        assertTrue(pw.any { it.isUpperCase() } && pw.any { it.isLowerCase() } && pw.any { it.isDigit() } && pw.any { !it.isLetterOrDigit() })
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/RouteStatusCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/RouteStatusCoreTest.kt
@@ -60590,6 +61190,40 @@ index 0000000..16ca47b
 +        assertTrue("Bouncy Castle bundled for JSch ed25519", gradle.contains("org.bouncycastle:bcprov-jdk18on"))
 +        val ssh = f("src/main/java/com/openminis/app/plus/VpsSsh.kt", "app/src/main/java/com/openminis/app/plus/VpsSsh.kt")
 +        assertTrue(ssh.contains("SshNetCore.GLOBAL.forEach") && ssh.contains("java.net.Proxy.NO_PROXY") && ssh.contains("bindSocket(s)"))
++    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/StrictWebCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/StrictWebCoreTest.kt
+new file mode 100644
+index 0000000..527195e
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/StrictWebCoreTest.kt
+@@ -0,0 +1,28 @@
++package com.openminis.app.plus
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class StrictWebCoreTest {
++    @Test fun neverDirectWhenStrict() {
++        assertEquals("127.0.0.1:7890", StrictWebCore.rule(true, 7890))
++        assertEquals(StrictWebCore.BLOCK, StrictWebCore.rule(true, null))
++        assertNull(StrictWebCore.rule(false, null))
++        assertEquals("127.0.0.1:7899", StrictWebCore.rule(false, 7899))
++    }
++
++    @Test fun incognitoGoesToOwnProcessWhenItCannotBeProxied() {
++        assertTrue(StrictWebCore.STRICT_INCOGNITO_DEFAULT)
++        assertTrue(StrictWebCore.incognitoInProcess(true, true, null))
++        assertFalse(StrictWebCore.incognitoInProcess(true, true, 7890))
++        assertFalse(StrictWebCore.incognitoInProcess(true, false, null))
++        assertTrue(StrictWebCore.incognitoInProcess(false, false, 7890))
++    }
++
++    @Test fun webRtcScriptRemovesPeerConnection() {
++        listOf("RTCPeerConnection", "webkitRTCPeerConnection", "RTCDataChannel", "getUserMedia").forEach { assertTrue(StrictWebCore.WEBRTC_JS.contains(it)) }
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/SwipeRevealCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/SwipeRevealCoreTest.kt
