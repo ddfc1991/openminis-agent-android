@@ -57,7 +57,7 @@ index 5531557..72c919f 100644
 +-keep class org.bouncycastle.math.ec.rfc8032.** { *; }
 +-dontwarn org.bouncycastle.**
 diff --git a/src/android/app/src/main/AndroidManifest.xml b/src/android/app/src/main/AndroidManifest.xml
-index 3855cc1..a9dadcd 100644
+index 3855cc1..f0ad8d3 100644
 --- a/src/android/app/src/main/AndroidManifest.xml
 +++ b/src/android/app/src/main/AndroidManifest.xml
 @@ -2,6 +2,10 @@
@@ -226,7 +226,7 @@ index 3855cc1..a9dadcd 100644
          <!-- [Mines-38.7] Android's one-message SMS consent dialog (phones with Google Play, no SMS permission) -->
          <activity
              android:name=".plus.SmsConsentActivity"
-@@ -642,6 +759,18 @@
+@@ -642,6 +759,23 @@
  
          <!-- FileProvider for sharing exported JSON (provider config, etc.)
               to other apps. Paths exposed are under app-scoped cache. -->
@@ -242,6 +242,11 @@ index 3855cc1..a9dadcd 100644
 +                <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
 +            </intent-filter>
 +        </provider>
++        <!-- [Mines-38.9.12.1] smoke only: a WebView in the ":acra" process (stale reporter process), started by the self-test -->
++        <service
++            android:name="com.openminis.app.plus.AcraProbeService"
++            android:process=":acra"
++            android:exported="false" />
          <!-- [Mines-selftest-29] adb-only (uid 2000/0, checked in code) hook for the CI smoke test. -->
          <provider
              android:name="com.openminis.app.plus.SelfTestProvider"
@@ -6030,15 +6035,21 @@ index 7660141..5729206 100644
          // language settings (it did: every launch reset it, so system Settings → Apps → Mines → 语言 never stuck)
          if (code.isEmpty()) return
 diff --git a/src/android/app/src/main/java/com/openminis/app/MinisApp.kt b/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
-index e48d0e0..e53abe9 100644
+index e48d0e0..cade2ba 100644
 --- a/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/MinisApp.kt
-@@ -241,9 +241,34 @@ class MinisApp : Application(), ImageLoaderFactory {
+@@ -241,9 +241,40 @@ class MinisApp : Application(), ImageLoaderFactory {
      @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
      override fun onCreate() {
          super.onCreate()
 +        // [Mines-38.9.11.2] the ":incog" process (无痕 browser without WebView profiles): own WebView data dir, nothing else
 +        if (com.openminis.app.browser.IncognitoProcess.onAppCreate(this)) return
++        // [Mines-38.9.12.1] user's crash loop 2026-10-23 07:20 (LaunchBeacon restartCount=122): the ACRA reporter process
++        // ":acra", left alive after the OOM, ran this onCreate down to SplitProxy → WebProxy → ProxyController, so IT took the
++        // WebView data-dir lock and every new main process died at launch ("Using WebView from more than one process").
++        // Any process that is not the main one (and not :incog, handled above) gets its own WebView data dir and NO app init
++        // — this guard sits above every Mines init (the old :acra early-return further down came after SplitProxy).
++        if (com.openminis.app.plus.ProcessGuard.secondary(this)) return
 +        // [Mines-38.9.11.2] kill-safe 无痕: leftovers of a session the system killed are wiped once the app is idle
 +        runCatching { com.openminis.app.browser.ConvProfiles.init(this) }
 +        runCatching { android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
@@ -6068,7 +6079,7 @@ index e48d0e0..e53abe9 100644
          runCatching { com.openminis.app.plus.ChatOrganizer.init(this) }
          runCatching { com.openminis.app.plus.SmartRouter.init(this) }
          // [T-android-content-capture-off] Opt every Compose window out of
-@@ -415,6 +440,8 @@ class MinisApp : Application(), ImageLoaderFactory {
+@@ -415,6 +446,8 @@ class MinisApp : Application(), ImageLoaderFactory {
          // and running before it would delay that decision for no gain.
          Thread {
              com.openminis.app.crash.ExitInfoCollector.collect(this)
@@ -6077,7 +6088,7 @@ index e48d0e0..e53abe9 100644
          }.apply { isDaemon = true; name = "exit-info-collect" }.start()
  
          // Hard short-circuit: when checkAtLaunch flips safe-mode ON, skip
-@@ -776,6 +803,8 @@ class MinisApp : Application(), ImageLoaderFactory {
+@@ -776,6 +809,8 @@ class MinisApp : Application(), ImageLoaderFactory {
          // repository is up, on IO, and only at cold start: a restore happens
          // within a single app run, so it can never straddle this.
          kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
@@ -6086,7 +6097,7 @@ index e48d0e0..e53abe9 100644
              runCatching {
                  com.openminis.app.data.session.OrphanChildSweeper.sweep(this@MinisApp, chatRepository)
              }.onFailure {
-@@ -783,6 +812,19 @@ class MinisApp : Application(), ImageLoaderFactory {
+@@ -783,6 +818,19 @@ class MinisApp : Application(), ImageLoaderFactory {
              }
          }
  
@@ -6106,7 +6117,7 @@ index e48d0e0..e53abe9 100644
          // T180-bg-notif: background-settings + task-completion notifier.
          // The notifier is wired into SessionActivityTracker's completion
          // hook so any session whose stream finishes (success or error)
-@@ -797,6 +839,16 @@ class MinisApp : Application(), ImageLoaderFactory {
+@@ -797,6 +845,16 @@ class MinisApp : Application(), ImageLoaderFactory {
          )
          SessionActivityTracker.setCompletionListener { sessionId, isError ->
              backgroundTaskNotifier.notifyTaskCompleted(sessionId, isError)
@@ -6123,7 +6134,7 @@ index e48d0e0..e53abe9 100644
          }
  
          // [T-android-config-confirm-timeout] Wire the config-confirm background
-@@ -1079,6 +1131,7 @@ class MinisApp : Application(), ImageLoaderFactory {
+@@ -1079,6 +1137,7 @@ class MinisApp : Application(), ImageLoaderFactory {
       */
      override fun onTrimMemory(level: Int) {
          super.onTrimMemory(level)
@@ -8508,10 +8519,10 @@ index 47befb1..f9698b3 100644
                  lastHeal = "switched ${layerName(from)}→${layerName(to)} ink=$ink text=$shown url=$u"
 diff --git a/src/android/app/src/main/java/com/openminis/app/browser/WebPrewarm.kt b/src/android/app/src/main/java/com/openminis/app/browser/WebPrewarm.kt
 new file mode 100644
-index 0000000..db33444
+index 0000000..7cd8992
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/browser/WebPrewarm.kt
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,44 @@
 +package com.openminis.app.browser
 +
 +import android.content.Context
@@ -8536,6 +8547,7 @@ index 0000000..db33444
 +        // killed (「isolated not needed」) and the first sign-in page cold-started it again. Asking again keeps it longer.
 +        if (again && holder != null) { main.removeCallbacks(release); main.postDelayed(release, keepMs); return }
 +        if (done && !again) return
++        runCatching { com.openminis.app.plus.WebProxy.markReady() }   // [Mines-38.9.12.1] proxy override before the first WebView
 +        main.post {
 +            if (holder != null) { main.removeCallbacks(release); main.postDelayed(release, keepMs); return@post }
 +            if (done && !again) return@post
@@ -13634,6 +13646,43 @@ index 0000000..c4d3f70
 +    }
 +    fun set(kindOrBase: String, on: Boolean) = GroupPrefs.put("svcignore_" + PlusVault.baseId(kindOrBase), if (on) "1" else "0")
 +    fun list(ids: Collection<String>): List<String> = ids.filter { ignored(it) }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/AcraProbeService.kt b/src/android/app/src/main/java/com/openminis/app/plus/AcraProbeService.kt
+new file mode 100644
+index 0000000..556acd8
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/AcraProbeService.kt
+@@ -0,0 +1,31 @@
++package com.openminis.app.plus
++
++import android.app.Service
++import android.content.Intent
++import android.os.Handler
++import android.os.IBinder
++import android.os.Looper
++
++/**
++ * [Mines-38.9.12.1] smoke only (started by the adb-only self-test, never by the app): a service in the ":acra" process —
++ * the process ACRA's reporter uses — that starts WebView there and stays up for a while, i.e. the user's 2026-10-23
++ * state of a stale ":acra" process holding WebView while the main process launches. With [ProcessGuard] the ":acra"
++ * WebView uses its own data dir and MinisApp init is skipped there, so the main launch must not crash.
++ */
++class AcraProbeService : Service() {
++    override fun onBind(intent: Intent?): IBinder? = null
++    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
++        runCatching {
++            val wv = android.webkit.WebView(applicationContext)
++            wv.loadDataWithBaseURL("https://acra-probe.test/", "<p>acra probe</p>", "text/html", "utf-8", null)
++            held = wv
++            getSharedPreferences("mines_acra_probe", MODE_PRIVATE).edit()
++                .putInt("pid", android.os.Process.myPid()).putString("proc", ProcessGuard.processName).putLong("at", System.currentTimeMillis()).commit()
++        }.onFailure { e ->
++            getSharedPreferences("mines_acra_probe", MODE_PRIVATE).edit().putString("err", "${e.javaClass.simpleName}: ${e.message}".take(200)).commit()
++        }
++        Handler(Looper.getMainLooper()).postDelayed({ runCatching { held?.destroy() }; held = null; stopSelf() }, 180_000L)
++        return START_NOT_STICKY
++    }
++    private var held: android.webkit.WebView? = null
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/AddressFix.kt b/src/android/app/src/main/java/com/openminis/app/plus/AddressFix.kt
 new file mode 100644
@@ -25576,6 +25625,80 @@ index 18b343c..f6b549e 100644
          else "直连不通，已改用：${best.name}（${best.ms} ms）"
      }
  }
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ProcessGuard.kt b/src/android/app/src/main/java/com/openminis/app/plus/ProcessGuard.kt
+new file mode 100644
+index 0000000..83c8368
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/ProcessGuard.kt
+@@ -0,0 +1,47 @@
++package com.openminis.app.plus
++
++import android.app.Application
++import android.util.Log
++
++/**
++ * [Mines-38.9.12.1] Which process of the package this is (user's crash loop 2026-10-23 07:20: the ACRA ":acra" reporter
++ * process ran the full MinisApp.onCreate, started WebView via ProxyController and held the WebView data-dir lock, so the
++ * main process died at every launch). A secondary process (":acra", anything but the main one and ":incog", which has its
++ * own handling) gets its own WebView data-dir suffix before anything could touch WebView, and MinisApp skips all init.
++ * The main process never waits for another one; it only notes whether one is alive (smoke / logs).
++ */
++object ProcessGuard {
++    @Volatile var processName: String = ""; private set
++    @Volatile private var mainKnown: Boolean? = null
++    /** true in the main process (computed on first use when [secondary] has not run, e.g. in a unit-less path) */
++    val isMain: Boolean get() = mainKnown ?: runCatching {
++        val pn = com.openminis.app.browser.IncognitoProcess.processName()
++        val pkg = com.openminis.app.BuildConfig.APPLICATION_ID
++        ProcessGuardCore.isMain(pn, pkg)
++    }.getOrDefault(true).also { mainKnown = it }
++    /** other processes of the package alive when the main process started (names), for the smoke readout */
++    @Volatile var othersAtStart: List<String> = emptyList(); private set
++
++    /** MinisApp.onCreate, first thing: true = secondary process (init skipped). Never throws. */
++    fun secondary(app: Application): Boolean {
++        val pn = runCatching { com.openminis.app.browser.IncognitoProcess.processName() }.getOrNull()
++        processName = pn ?: ""
++        val main = ProcessGuardCore.isMain(pn, app.packageName)
++        mainKnown = main
++        if (!main) {
++            val suffix = ProcessGuardCore.dataSuffix(pn, app.packageName)
++            if (android.os.Build.VERSION.SDK_INT >= 28) runCatching { android.webkit.WebView.setDataDirectorySuffix(suffix) }
++            Log.i("MinesProcess", "secondary process $pn: own WebView dir '$suffix', app init skipped")
++            return true
++        }
++        runCatching {
++            val am = app.getSystemService(android.app.ActivityManager::class.java)
++            val me = android.os.Process.myPid()
++            othersAtStart = am?.runningAppProcesses.orEmpty().filter { it.pid != me && it.processName.startsWith(app.packageName) }.map { "${it.processName}(${it.pid})" }
++            if (othersAtStart.isNotEmpty()) Log.i("MinesProcess", "main start with other processes alive (not waited for): $othersAtStart")
++        }
++        // the WebView proxy override is applied once the main looper is idle (after launch), never inside onCreate
++        runCatching { android.os.Looper.myQueue().addIdleHandler { runCatching { WebProxy.markReady() }; false } }
++        return false
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ProcessGuardCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/ProcessGuardCore.kt
+new file mode 100644
+index 0000000..29124a4
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/ProcessGuardCore.kt
+@@ -0,0 +1,15 @@
++package com.openminis.app.plus
++
++/** [Mines-38.9.12.1] pure rules for [ProcessGuard] (unit-tested). */
++object ProcessGuardCore {
++    /** main = the process named exactly like the package (an unknown name counts as main: never skip init by mistake) */
++    fun isMain(processName: String?, packageName: String): Boolean =
++        processName.isNullOrBlank() || processName == packageName
++
++    /** WebView data-dir suffix for a secondary process: "com.x:acra" → "acra"; only [A-Za-z0-9_], never empty */
++    fun dataSuffix(processName: String?, packageName: String): String {
++        val raw = processName.orEmpty().removePrefix(packageName).trimStart(':', '.')
++        val clean = raw.filter { it.isLetterOrDigit() || it == '_' }
++        return clean.ifEmpty { "proc" }
++    }
++}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/ProviderHealth.kt b/src/android/app/src/main/java/com/openminis/app/plus/ProviderHealth.kt
 new file mode 100644
 index 0000000..83a5baa
@@ -31372,10 +31495,10 @@ index 0000000..90409aa
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/WebProxy.kt b/src/android/app/src/main/java/com/openminis/app/plus/WebProxy.kt
 new file mode 100644
-index 0000000..a1bf758
+index 0000000..d1a2ae8
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/WebProxy.kt
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,63 @@
 +package com.openminis.app.plus
 +
 +/**
@@ -31388,8 +31511,33 @@ index 0000000..a1bf758
 +    /** the port the app's WebViews should use now (split proxy while it works › a local proxy that passed), null = none */
 +    fun passingPort(): Int? = if (LocalProxy.usable(SplitProxy.PORT) && runCatching { SplitProxy.active }.getOrDefault(false)) SplitProxy.PORT else LocalProxy.best
 +
++    /**
++     * [Mines-38.9.12.1] ProxyController.getInstance() starts Chromium and takes the WebView data-dir lock. It is no longer
++     * touched from Application.onCreate: until [ready] (main looper idle after launch, or the first WebView warm-up) the
++     * wanted state is only remembered, then applied once — any failure (a lock held by another process) is caught and
++     * logged, never a crash at launch.
++     */
++    @Volatile private var ready = false
++    @Volatile private var pending: Boolean? = null
++    @Volatile var lastError: String = ""; private set
++
++    /** main process only, never from Application.onCreate itself */
++    fun markReady() {
++        if (ready) return
++        if (!ProcessGuard.isMain) return
++        ready = true
++        val p = pending ?: return
++        pending = null
++        apply(p)
++    }
++
 +    fun apply(on: Boolean) {
-+        runCatching {
++        if (!ready || !ProcessGuard.isMain) { pending = on; return }
++        try { applyNow(on) } catch (t: Throwable) { lastError = "${t.javaClass.simpleName}: ${t.message}".take(200); android.util.Log.w("WebProxy", "proxy override failed: $lastError") }
++    }
++
++    private fun applyNow(on: Boolean) {
++        run {
 +            if (!androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.PROXY_OVERRIDE)) return
 +            val pc = androidx.webkit.ProxyController.getInstance()
 +            val ex = java.util.concurrent.Executor { it.run() }
@@ -33029,7 +33177,7 @@ index 1d773a2..5489e65 100644
          coroutineScope {
              val bg = slow.map { id -> async { one(id) } }
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-index af13c1b..994aece 100644
+index af13c1b..c8b5f67 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 @@ -2,6 +2,9 @@ package com.openminis.app.plus.group
@@ -33042,7 +33190,7 @@ index af13c1b..994aece 100644
  import kotlinx.coroutines.runBlocking
  import org.json.JSONArray
  import org.json.JSONObject
-@@ -15,12 +18,1061 @@ import org.json.JSONObject
+@@ -15,12 +18,1088 @@ import org.json.JSONObject
   *   … --arg 'reset'
   */
  object GroupSelfTest {
@@ -33801,7 +33949,34 @@ index af13c1b..994aece 100644
 +                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { for (id in ids()) runCatching { app.chatRepository.deleteSession(id) } }
 +                        sp.edit().clear().commit(); "cleaned"
 +                    }
-+                    else -> "i39121 seed | slots | shots <n> | gate | oomkill | safe | clean"
++                    // ':acra' WebView holder (stale reporter process) · kill only the main process · WebView + proxy readout in main
++                    "acrastart" -> {
++                        context.getSharedPreferences("mines_acra_probe", android.content.Context.MODE_PRIVATE).edit().clear().commit()
++                        context.startService(android.content.Intent(context, com.openminis.app.plus.AcraProbeService::class.java))
++                        kotlinx.coroutines.delay(6000)
++                        val am = context.getSystemService(android.app.ActivityManager::class.java)
++                        val procs = am.runningAppProcesses.orEmpty().filter { it.processName.startsWith(context.packageName) }.map { "${it.processName}(${it.pid})" }
++                        val pp = context.getSharedPreferences("mines_acra_probe", android.content.Context.MODE_MULTI_PROCESS)
++                        JSONObject().put("procs", JSONArray(procs)).put("probePid", pp.getInt("pid", 0)).put("probeProc", pp.getString("proc", "")).put("err", pp.getString("err", "")).toString()
++                    }
++                    "killmain" -> { android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({ android.os.Process.killProcess(android.os.Process.myPid()) }, 1200); "killing ${android.os.Process.myPid()}" }
++                    "webcheck" -> {
++                        val am = context.getSystemService(android.app.ActivityManager::class.java)
++                        val procs = am.runningAppProcesses.orEmpty().filter { it.processName.startsWith(context.packageName) }.map { "${it.processName}(${it.pid})" }
++                        val d = kotlinx.coroutines.CompletableDeferred<String>()
++                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
++                            runCatching {
++                                val wv = android.webkit.WebView(context.applicationContext); wv.settings.javaScriptEnabled = true
++                                wv.webViewClient = object : android.webkit.WebViewClient() { override fun onPageFinished(v: android.webkit.WebView, u: String?) { v.evaluateJavascript("document.title") { t -> d.complete(t ?: ""); v.destroy() } } }
++                                wv.loadDataWithBaseURL("https://webcheck.test/", "<title>webcheck-ok</title><p>x</p>", "text/html", "utf-8", null)
++                            }.onFailure { d.complete("ERR ${it.javaClass.simpleName}: ${it.message}") }
++                        }
++                        val t = kotlinx.coroutines.withTimeoutOrNull(15_000) { d.await() } ?: "timeout"
++                        JSONObject().put("procs", JSONArray(procs)).put("title", t).put("pid", android.os.Process.myPid())
++                            .put("othersAtStart", JSONArray(com.openminis.app.plus.ProcessGuard.othersAtStart))
++                            .put("proxyError", com.openminis.app.plus.WebProxy.lastError).toString()
++                    }
++                    else -> "i39121 seed | slots | shots <n> | gate | oomkill | safe | clean | acrastart | killmain | webcheck"
 +                }
 +            }
 +            "i39113" -> {
@@ -34104,7 +34279,7 @@ index af13c1b..994aece 100644
              "partners" -> {
                  val l = Partners.refresh(context, rescanApps = true)
                  JSONArray(l.map { JSONObject().put("id", it.id).put("name", it.spec.name).put("state", it.state.name).put("model", it.model).put("via", it.via) }).toString()
-@@ -136,6 +1188,13 @@ object GroupSelfTest {
+@@ -136,6 +1215,13 @@ object GroupSelfTest {
                  GroupStore.add(gid, GroupMsg(GroupStore.newId(), parts.getOrElse(2) { "host" }, "成员A", "", parts.getOrElse(3) { "好的，结论：照这个办。" }))
                  "ok"
              }
@@ -34118,7 +34293,7 @@ index af13c1b..994aece 100644
              "kbrun" -> { val n = com.openminis.app.plus.ChatKnowledge.runNow(context); "organised=$n" }
              "kbstate" -> {
                  val l = com.openminis.app.plus.ChatKnowledge.load(context)
-@@ -151,6 +1210,11 @@ object GroupSelfTest {
+@@ -151,6 +1237,11 @@ object GroupSelfTest {
                  JSONObject().put("title", g.title).put("care", g.care).put("kind", g.kind)
                      .put("weather", com.openminis.app.plus.HomeGreeting.cachedWeather(context)?.let { "${it.code}/${it.temp}" } ?: "none").toString()
              }
@@ -34130,7 +34305,7 @@ index af13c1b..994aece 100644
              "greetweather" -> {
                  context.getSharedPreferences("mines_greeting", Context.MODE_PRIVATE).edit().remove("w_try").apply()
                  com.openminis.app.plus.HomeGreeting.refreshWeather(context)
-@@ -238,6 +1302,112 @@ object GroupSelfTest {
+@@ -238,6 +1329,112 @@ object GroupSelfTest {
              "wallpaper" -> { com.openminis.app.plus.PlusPrefs.init(context)
                  if (parts.getOrElse(0) { "" } == "off") com.openminis.app.plus.PlusPrefs.update(context) { it.copy(wallpaper = "") }
                  com.openminis.app.plus.PlusPrefs.state.value.wallpaper.ifBlank { "none" } }
@@ -34243,7 +34418,7 @@ index af13c1b..994aece 100644
              "fogstate" -> JSONObject().put("t", com.openminis.app.ui.plus.FogClock.t.toDouble()).put("draws", com.openminis.app.ui.plus.FogClock.draws)
                  .put("still", com.openminis.app.ui.plus.FogClock.stillSeen)
                  .put("scale", android.provider.Settings.Global.getFloat(context.contentResolver, android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, -1f).toDouble()).toString()
-@@ -288,3 +1458,29 @@ object GroupSelfTest {
+@@ -288,3 +1485,29 @@ object GroupSelfTest {
          return JSONObject().put("chat", sid).put("group", g.id).put("direct", d.id).put("directName", dn).toString()
      }
  }
@@ -64342,6 +64517,34 @@ index 0000000..559d0e0
 +        val c = OnceCache<String>(); var n = 0
 +        runCatching { c.get("k") { n++; throw IllegalStateException("keystore busy") } }
 +        assertEquals("ok", c.get("k") { n++; "ok" }); assertEquals(2, n)
++    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/ProcessGuardCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/ProcessGuardCoreTest.kt
+new file mode 100644
+index 0000000..7f3f8f3
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/ProcessGuardCoreTest.kt
+@@ -0,0 +1,22 @@
++package com.openminis.app.plus
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/** [Mines-38.9.12.1] :acra must never run app init or share the main WebView data dir. */
++class ProcessGuardCoreTest {
++    private val pkg = "com.openminis.mines.plus"
++    @Test fun main() {
++        assertTrue(ProcessGuardCore.isMain(pkg, pkg))
++        assertTrue(ProcessGuardCore.isMain(null, pkg))
++        assertFalse(ProcessGuardCore.isMain("$pkg:acra", pkg))
++        assertFalse(ProcessGuardCore.isMain("$pkg:incog", pkg))
++    }
++    @Test fun suffix() {
++        assertEquals("acra", ProcessGuardCore.dataSuffix("$pkg:acra", pkg))
++        assertEquals("remote_1", ProcessGuardCore.dataSuffix("$pkg:remote-_1", pkg))
++        assertEquals("proc", ProcessGuardCore.dataSuffix("$pkg:", pkg))
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/ProviderHealthCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/ProviderHealthCoreTest.kt
