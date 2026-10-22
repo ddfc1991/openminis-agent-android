@@ -19856,10 +19856,18 @@ index 0000000..2ae44d2
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/HumanVerify.kt b/src/android/app/src/main/java/com/openminis/app/plus/HumanVerify.kt
-index 7eb3e58..32c8352 100644
+index 7eb3e58..923ee49 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/HumanVerify.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/HumanVerify.kt
-@@ -179,6 +179,20 @@ return JSON.stringify({kind:kind,otp:cands.length>0,split:single.length>=4,otpEm
+@@ -147,6 +147,7 @@ return JSON.stringify({kind:kind,otp:cands.length>0,split:single.length>=4,otpEm
+                 .apply { if (pi != null) setContentIntent(pi) }
+                 .build()
+             nm.notify(NOTIF_ID, n)
++            MinesCall.onNeedsAttention(context, "需要你验证", "${p.host.ifBlank { "网页" }} 弹出了${p.kind}，Mines 在等你")   // [Mines-38.9.12 b]
+         }
+     }
+ 
+@@ -179,6 +180,20 @@ return JSON.stringify({kind:kind,otp:cands.length>0,split:single.length>=4,otpEm
          currentUrl: suspend () -> String,
          maxWaitMs: Long = WAIT_SLICE_MS,
      ): String {
@@ -19880,7 +19888,7 @@ index 7eb3e58..32c8352 100644
          val prior = _pending.value
          if (prior == null || prior.url.substringBefore('#') != url.substringBefore('#')) {
              val p = Pending(url, kind)
-@@ -219,6 +233,9 @@ return JSON.stringify({kind:kind,otp:cands.length>0,split:single.length>=4,otpEm
+@@ -219,6 +234,9 @@ return JSON.stringify({kind:kind,otp:cands.length>0,split:single.length>=4,otpEm
      /** Codes already handed out (memory only), so the same mail is not filled twice. */
      private val used = java.util.Collections.synchronizedMap(LinkedHashMap<String, Long>())
  
@@ -19890,7 +19898,7 @@ index 7eb3e58..32c8352 100644
      fun armedSince(): Long = armedAt
  
      /** A page is asking for a code (or the agent said it requested one). */
-@@ -240,7 +257,7 @@ return JSON.stringify({kind:kind,otp:cands.length>0,split:single.length>=4,otpEm
+@@ -240,7 +258,7 @@ return JSON.stringify({kind:kind,otp:cands.length>0,split:single.length>=4,otpEm
      private fun startMailWatch() {
          val ctx = appCtx ?: return
          if (watching || !_settings.value.otpAutofill) return
@@ -19899,7 +19907,7 @@ index 7eb3e58..32c8352 100644
          watching = true
          val since = armedAt - EARLY_MS
          watchScope.launch {
-@@ -248,7 +265,8 @@ return JSON.stringify({kind:kind,otp:cands.length>0,split:single.length>=4,otpEm
+@@ -248,7 +266,8 @@ return JSON.stringify({kind:kind,otp:cands.length>0,split:single.length>=4,otpEm
                  val start = System.currentTimeMillis()
                  while (System.currentTimeMillis() - start < OTP_WINDOW_MS && System.currentTimeMillis() - armedAt <= OTP_WINDOW_MS) {
                      if (hasFreshCode()) break
@@ -20693,6 +20701,104 @@ index 0000000..95104c4
 +        }
 +        return Layout(maxX - minX, maxY - minY, cards)
 +    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Inbox3912Core.kt b/src/android/app/src/main/java/com/openminis/app/plus/Inbox3912Core.kt
+new file mode 100644
+index 0000000..8627583
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/Inbox3912Core.kt
+@@ -0,0 +1,92 @@
++package com.openminis.app.plus
++
++/**
++ * [Mines-38.9.12 b] pure helpers for the 消息 验证码 tab / mailbox 摘要 (design ws2 ①) and the 注册台账 (ws2 ③).
++ * No Android, unit-tested (Inbox3912CoreTest).
++ */
++object Inbox3912Core {
++    const val CODE_WINDOW_MS = 30L * 60_000L     // codes older than 30 min are shown as 已过期
++    const val SHOW_MS = 24L * 3600_000L          // the tab lists the last 24 h
++
++    data class MailLite(val id: String, val from: String, val subject: String, val text: String, val at: Long, val box: String)
++    data class Code(val mailId: String, val code: String, val site: String, val box: String, val at: Long, val fresh: Boolean)
++
++    private val SITE_WORDS = Regex("(?i)\\b(GitHub|Google|Cloudflare|Railway|ModelScope|OpenAI|Vercel|Hugging ?Face|Microsoft|Apple|Oracle|Aliyun|阿里云|OKX|Binance|Discord|X|Twitter|Telegram|Notion|Supabase|Netlify|Render|Fly\\.io|Docker)\\b")
++
++    /** who sent the code: a known brand in subject/from, else the sender name, else the sender domain */
++    fun siteOf(from: String, subject: String): String {
++        SITE_WORDS.find(subject)?.let { return it.value }
++        SITE_WORDS.find(from)?.let { return it.value }
++        val name = from.substringBefore('<').trim().trim('"')
++        if (name.isNotBlank() && !name.contains('@')) return name.take(24)
++        val dom = from.substringAfter('@', "").substringBefore('>').trim()
++        return dom.split('.').let { p -> if (p.size >= 2) p[p.size - 2] else dom }.replaceFirstChar { it.uppercase() }.ifBlank { "未知来源" }
++    }
++
++    /** codes found in the last 24 h of mail, newest first, one per mail */
++    fun codes(mails: List<MailLite>, now: Long, extract: (String) -> String?): List<Code> =
++        mails.asSequence().filter { now - it.at in 0..SHOW_MS }.sortedByDescending { it.at }
++            .mapNotNull { m -> extract(m.subject + "\n" + m.text)?.let { c -> Code(m.id, c, siteOf(m.from, m.subject), m.box, m.at, now - m.at <= CODE_WINDOW_MS) } }
++            .distinctBy { it.mailId }.toList()
++
++    /** 482917 → 482 917 for reading; letters kept as they are */
++    fun spaced(code: String): String = if (code.length == 6 && code.all { it.isDigit() }) code.substring(0, 3) + " " + code.substring(3) else code
++
++    private val ACT = Regex("(?i)(到期|过期|续费|安全|异常|风险|轮换|泄露|失败|欠费|suspend|expir|security|alert|breach|rotate|failed|overdue|action required)")
++
++    data class Summary(val today: Int, val unread: Int, val codes: Int, val needAct: List<String>, val line: String)
++
++    /** a short local summary of today's mail: how many, which need action (security / expiry / failures), the rest */
++    fun summary(mails: List<MailLite>, unread: Int, codes: Int, startOfDay: Long): Summary {
++        val today = mails.filter { it.at >= startOfDay }
++        val act = today.filter { ACT.containsMatchIn(it.subject) }.map { it.subject.trim().take(28) }.distinct()
++        val line = when {
++            today.isEmpty() -> "今天还没有新邮件。"
++            act.isEmpty() -> "今天 ${today.size} 封，没有需要处理的事项" + (if (codes > 0) "；$codes 个验证码在「验证码」里。" else "。")
++            else -> "需要处理：" + act.take(2).joinToString("；") + (if (act.size > 2) " 等 ${act.size} 项" else "") +
++                "。其余 ${today.size - act.size} 封为通知或订阅" + (if (codes > 0) "，$codes 个验证码。" else "。")
++        }
++        return Summary(today.size, unread, codes, act, line)
++    }
++
++    // ── 注册台账 ──
++    enum class RegSt(val zh: String) { DONE("已验证"), PENDING("未完成"), ROTATE("待轮换"), SAVED("已保存") }
++
++    data class RegRow(val host: String, val account: String, val note: String, val st: RegSt)
++
++    /** status from the 台账 备注 written by register_pick / register_done (RegisterCore.note) */
++    fun regStatus(note: String): RegSt = when {
++        note.startsWith("注册于") -> RegSt.DONE
++        note.startsWith("注册中") -> RegSt.PENDING
++        note.contains("轮换") -> RegSt.ROTATE
++        else -> RegSt.SAVED
++    }
++
++    /** group 台账 rows by the mailbox they were registered with (accounts that are e-mails); the rest under 其他 */
++    fun byMailbox(rows: List<RegRow>): List<Pair<String, List<RegRow>>> =
++        rows.groupBy { if (it.account.contains('@')) it.account.lowercase() else "其他账号" }
++            .entries.sortedWith(compareBy<Map.Entry<String, List<RegRow>>> { it.key == "其他账号" }.thenByDescending { it.value.size })
++            .map { it.key to it.value.sortedBy { r -> r.host } }
++
++    /** k7q2abc@mail.tm → k7q2••@mail.tm */
++    fun maskMail(a: String): String {
++        val at = a.indexOf('@'); if (at <= 0) return a
++        val u = a.substring(0, at); return u.take(minOf(4, (u.length + 1) / 2)) + "••" + a.substring(at)
++    }
++
++    /** the one-click registration task handed to a new Mines conversation (agent uses accounts register_pick / register_done) */
++    fun registerTask(platform: String, url: String, tempBox: String?): String = buildString {
++        append("帮我注册 $platform（$url）。\n")
++        append("1. 用 accounts(action=register_pick, site=$url, n=1) 从台账取一个还没在该平台注册过的邮箱，并生成强密码（自动存进台账，备注 注册中）")
++        if (!tempBox.isNullOrBlank()) append("；没有可用邮箱时用临时邮箱 $tempBox")
++        append("。\n2. 打开注册页填写，验证码从邮箱自动读取。\n3. 完成后调用 accounts(action=register_done, ok=true)，失败则 ok=false。\n")
++        append("遵守平台规则：一人一号、不批量注册；遇到人机验证、手机号验证或付款时停下来叫我，不要绕过。")
++    }
++
++    val PLATFORMS = listOf(
++        "Cloudflare" to "https://dash.cloudflare.com/sign-up", "GitHub" to "https://github.com/signup",
++        "Railway" to "https://railway.com/login", "Vercel" to "https://vercel.com/signup",
++        "Hugging Face" to "https://huggingface.co/join", "ModelScope" to "https://www.modelscope.cn/register",
++        "Supabase" to "https://supabase.com/dashboard/sign-up", "Netlify" to "https://app.netlify.com/signup",
++    )
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/KeyAgent.kt b/src/android/app/src/main/java/com/openminis/app/plus/KeyAgent.kt
 index cf4e560..a2cea36 100644
@@ -22077,10 +22183,10 @@ index 2069931..20fa494 100644
              if (scan.otpField && scan.otpEmpty && System.currentTimeMillis() - codeFilledAt > 20_000L) {
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/LoginMemory.kt b/src/android/app/src/main/java/com/openminis/app/plus/LoginMemory.kt
 new file mode 100644
-index 0000000..37204df
+index 0000000..5a2d35c
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/LoginMemory.kt
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,195 @@
 +package com.openminis.app.plus
 +
 +import android.content.Context
@@ -22258,6 +22364,7 @@ index 0000000..37204df
 +                .setPriority(androidx.core.app.NotificationCompat.PRIORITY_HIGH).setAutoCancel(true)
 +                .apply { if (pi != null) setContentIntent(pi) }.build()
 +            nm.notify(7311, n)
++            MinesCall.onNeedsAttention(context, "需要你登录", "${r.name} 需要登录，Mines 在等你")   // [Mines-38.9.12 b]
 +        }
 +    }
 +
@@ -22763,10 +22870,10 @@ index 0000000..10f5af9
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MailInbox.kt b/src/android/app/src/main/java/com/openminis/app/plus/MailInbox.kt
 new file mode 100644
-index 0000000..43e01c1
+index 0000000..79aa3e6
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/MailInbox.kt
-@@ -0,0 +1,361 @@
+@@ -0,0 +1,373 @@
 +package com.openminis.app.plus
 +
 +import android.content.Context
@@ -23122,6 +23229,18 @@ index 0000000..43e01c1
 +            accts[2].id to AcctState(St.OK, "", now, 0, 33),
 +            accts[3].id to AcctState(St.AUTH, "授权码不对或已失效：到 163 网页的 设置 → POP3/SMTP/IMAP 重新生成", now, 1),
 +        )
++    }
++
++    /** [Mines-38.9.12 b] adb self-test: two verification-code mails on top of [fakeFill] (验证码 tab screenshots) */
++    fun fakeCodes(now: Long = System.currentTimeMillis()) {
++        if (!fake) fakeFill(now)
++        val a = _accounts.value.firstOrNull() ?: return
++        _mails.value = listOf(
++            Mail("fakec1", a.id, "k7q2demo@mail.tm", "mail.tm", "Cloudflare", "noreply@notify.cloudflare.com", "Your Cloudflare verification code",
++                "Your verification code is 482917. It expires in 10 minutes.", now - 4 * 60_000L, true, null),
++            Mail("fakec2", a.id, a.address, a.provider, "Railway", "team@railway.app", "Railway sign-in code",
++                "Use the code 731 055 to finish signing in to Railway.", now - 2 * 3_600_000L, false, null),
++        ) + _mails.value.filter { !it.id.startsWith("fakec") }
 +    }
 +
 +    fun fakeOff(context: Context) { fake = false; _mails.value = emptyList(); _states.value = emptyMap(); lastAt = 0L; load(context) }
@@ -24064,10 +24183,10 @@ index 0000000..c8738d2
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MinesCall.kt b/src/android/app/src/main/java/com/openminis/app/plus/MinesCall.kt
 new file mode 100644
-index 0000000..3b09afa
+index 0000000..807df11
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/MinesCall.kt
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,93 @@
 +package com.openminis.app.plus
 +
 +import android.app.NotificationChannel
@@ -24131,6 +24250,25 @@ index 0000000..3b09afa
 +        // no notification permission / full-screen intent refused while the screen is on → open the call screen directly
 +        val fsOk = Build.VERSION.SDK_INT < 34 || runCatching { app.getSystemService(NotificationManager::class.java).canUseFullScreenIntent() }.getOrDefault(false)
 +        if (!canNotify || !fsOk) runCatching { app.startActivity(i) }
++    }
++
++    /** [Mines-38.9.12 b] also ring for needs-attention events (sign-in card, human check, payment confirm); on by default once 来电 is on */
++    fun attention(c: Context) = c.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("attn", true)
++    fun setAttention(c: Context, on: Boolean) = c.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean("attn", on).apply()
++
++    private fun inForeground(): Boolean = runCatching {
++        val i = android.app.ActivityManager.RunningAppProcessInfo(); android.app.ActivityManager.getMyMemoryState(i)
++        i.importance <= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND
++    }.getOrDefault(true)
++
++    /** self-test: would a needs-attention event ring right now (no ring) */
++    fun attentionDecision(c: Context): String = "on=${enabled(c)} attn=${attention(c)} fg=${inForeground()} ring=${enabled(c) && attention(c) && !inForeground()}"
++
++    /** a task is waiting on the user (sign-in, human check, payment) while Mines is in the background → ring (≤ once a minute) */
++    fun onNeedsAttention(c: Context, title: String, body: String, sessionId: String? = null, force: Boolean = false) {
++        if (!force && (!enabled(c) || !attention(c) || inForeground())) return
++        if (!force && System.currentTimeMillis() - lastRungAt < 60_000L) return
++        ring(c, title, body, sessionId)
 +    }
 +
 +    fun cancel(c: Context) { runCatching { NotificationManagerCompat.from(c.applicationContext).cancel(NOTIF_ID) } }
@@ -32505,7 +32643,7 @@ index 1d773a2..5489e65 100644
          coroutineScope {
              val bg = slow.map { id -> async { one(id) } }
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-index af13c1b..9360189 100644
+index af13c1b..43fe4ab 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 @@ -2,6 +2,8 @@ package com.openminis.app.plus.group
@@ -32517,7 +32655,7 @@ index af13c1b..9360189 100644
  import kotlinx.coroutines.runBlocking
  import org.json.JSONArray
  import org.json.JSONObject
-@@ -15,12 +17,966 @@ import org.json.JSONObject
+@@ -15,12 +17,972 @@ import org.json.JSONObject
   *   … --arg 'reset'
   */
  object GroupSelfTest {
@@ -33181,7 +33319,13 @@ index af13c1b..9360189 100644
 +                        .putExtra("title", "任务完成 · 12 家报价已汇总").putExtra("body", "最低是 Vultr \$12/月，接起来我跟你说细节，或者直接转成文字。")) }; "ok" }
 +                    "pool" -> JSONObject().put("reads", com.openminis.app.ui.plus.WorkPoolLive.reads).put("nodes", JSONArray(com.openminis.app.ui.plus.WorkPoolLive.nodes.values.map {
 +                        JSONObject().put("name", it.name).put("role", it.role.name).put("online", it.online).put("mem", it.memPct) })).toString()
-+                    else -> "i3912 kbseed | kbclean | kbstate | autologin | autoclean | call | pool"
++                    // [Mines-38.9.12 b] 'mailcodes' (fake mailbox + 2 code mails) · 'codes' (验证码 tab readout) · 'mailoff' · 'attn' · 'reg'
++                    "mailcodes" -> { com.openminis.app.plus.MailInbox.fakeCodes(); com.openminis.app.ui.plus.Codes3912.state() }
++                    "codes" -> com.openminis.app.ui.plus.Codes3912.state()
++                    "mailoff" -> { com.openminis.app.plus.MailInbox.fakeOff(context); "ok" }
++                    "attn" -> com.openminis.app.plus.MinesCall.attentionDecision(context)
++                    "reg" -> JSONObject().put("rows", com.openminis.app.ui.plus.Register3912.lastRows).put("temp", com.openminis.app.ui.plus.Register3912.lastTemp).toString()
++                    else -> "i3912 kbseed | kbclean | kbstate | autologin | autoclean | call | pool | mailcodes | codes | mailoff | attn | reg"
 +                }
 +            }
 +            "i39113" -> {
@@ -33484,7 +33628,7 @@ index af13c1b..9360189 100644
              "partners" -> {
                  val l = Partners.refresh(context, rescanApps = true)
                  JSONArray(l.map { JSONObject().put("id", it.id).put("name", it.spec.name).put("state", it.state.name).put("model", it.model).put("via", it.via) }).toString()
-@@ -136,6 +1092,13 @@ object GroupSelfTest {
+@@ -136,6 +1098,13 @@ object GroupSelfTest {
                  GroupStore.add(gid, GroupMsg(GroupStore.newId(), parts.getOrElse(2) { "host" }, "成员A", "", parts.getOrElse(3) { "好的，结论：照这个办。" }))
                  "ok"
              }
@@ -33498,7 +33642,7 @@ index af13c1b..9360189 100644
              "kbrun" -> { val n = com.openminis.app.plus.ChatKnowledge.runNow(context); "organised=$n" }
              "kbstate" -> {
                  val l = com.openminis.app.plus.ChatKnowledge.load(context)
-@@ -151,6 +1114,11 @@ object GroupSelfTest {
+@@ -151,6 +1120,11 @@ object GroupSelfTest {
                  JSONObject().put("title", g.title).put("care", g.care).put("kind", g.kind)
                      .put("weather", com.openminis.app.plus.HomeGreeting.cachedWeather(context)?.let { "${it.code}/${it.temp}" } ?: "none").toString()
              }
@@ -33510,7 +33654,7 @@ index af13c1b..9360189 100644
              "greetweather" -> {
                  context.getSharedPreferences("mines_greeting", Context.MODE_PRIVATE).edit().remove("w_try").apply()
                  com.openminis.app.plus.HomeGreeting.refreshWeather(context)
-@@ -238,6 +1206,112 @@ object GroupSelfTest {
+@@ -238,6 +1212,112 @@ object GroupSelfTest {
              "wallpaper" -> { com.openminis.app.plus.PlusPrefs.init(context)
                  if (parts.getOrElse(0) { "" } == "off") com.openminis.app.plus.PlusPrefs.update(context) { it.copy(wallpaper = "") }
                  com.openminis.app.plus.PlusPrefs.state.value.wallpaper.ifBlank { "none" } }
@@ -33623,7 +33767,7 @@ index af13c1b..9360189 100644
              "fogstate" -> JSONObject().put("t", com.openminis.app.ui.plus.FogClock.t.toDouble()).put("draws", com.openminis.app.ui.plus.FogClock.draws)
                  .put("still", com.openminis.app.ui.plus.FogClock.stillSeen)
                  .put("scale", android.provider.Settings.Global.getFloat(context.contentResolver, android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, -1f).toDouble()).toString()
-@@ -288,3 +1362,29 @@ object GroupSelfTest {
+@@ -288,3 +1368,29 @@ object GroupSelfTest {
          return JSONObject().put("chat", sid).put("group", g.id).put("direct", d.id).put("directName", dn).toString()
      }
  }
@@ -41150,7 +41294,7 @@ index 4d47007..ff9c589 100644
                      tint = MaterialTheme.colorScheme.onSurfaceVariant,
                  )
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt b/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
-index fff9cbd..55d893e 100644
+index fff9cbd..daf77bb 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/navigation/AppNavigation.kt
 @@ -533,6 +533,11 @@ fun AppNavigation(
@@ -41213,7 +41357,7 @@ index fff9cbd..55d893e 100644
          composable(com.openminis.app.ui.plus.PlusRoutes.CARDS) {
              com.openminis.app.ui.plus.PayCardsScreen(onBack = { navController.safePopBackStack() })
          }
-@@ -700,12 +712,53 @@ fun AppNavigation(
+@@ -700,12 +712,59 @@ fun AppNavigation(
          composable(com.openminis.app.ui.plus.PlusRoutes.UPDATE) {
              com.openminis.app.ui.plus.UpdateScreen(onBack = { navController.safePopBackStack() })
          }
@@ -41254,6 +41398,12 @@ index fff9cbd..55d893e 100644
 +        }
 +        composable(com.openminis.app.ui.plus.Routes3912.WORKPOOL) {
 +            com.openminis.app.ui.plus.WorkPoolScreen(onBack = { navController.safePopBackStack() }, go = { navController.safeNavigate(it) })
++        }
++        composable(com.openminis.app.ui.plus.Routes3912.REGISTER) {
++            com.openminis.app.ui.plus.RegisterLedgerScreen(onBack = { navController.safePopBackStack() }, go = { navController.safeNavigate(it) })
++        }
++        composable(com.openminis.app.ui.plus.Routes3912.CONNECT) {
++            com.openminis.app.ui.plus.QuickConnectScreen(onBack = { navController.safePopBackStack() }, go = { navController.safeNavigate(it) })
 +        }
          composable(com.openminis.app.ui.plus.PlusRoutes.MIGRATE) {
              com.openminis.app.ui.plus.MigrateScreen(onBack = { navController.safePopBackStack() })
@@ -43674,7 +43824,7 @@ index 0000000..43c6e3d
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
-index b529a74..238bdb4 100644
+index b529a74..9e961b0 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/DigestScreen.kt
 @@ -20,7 +20,9 @@ import androidx.compose.foundation.border
@@ -43775,7 +43925,7 @@ index b529a74..238bdb4 100644
                      modifier = Modifier.background(androidx.compose.ui.graphics.Brush.verticalGradient(listOf(mines().bg.copy(alpha = 0.96f), mines().bg.copy(alpha = 0.90f), mines().bg.copy(alpha = 0f))))
                          .statusBarsPadding().padding(bottom = 2.dp),
                      leading = { WarmRoundButton(Icons.AutoMirrored.Filled.ArrowBack, "返回", onClick = onBack) },
-@@ -158,37 +184,71 @@ fun DigestScreen(onBack: () -> Unit) {
+@@ -158,37 +184,75 @@ fun DigestScreen(onBack: () -> Unit) {
              },
          ) { pad ->
            // [Mines-feed-32] pull down to refresh (no big 刷新 button)
@@ -43792,7 +43942,7 @@ index b529a74..238bdb4 100644
 +                  val line = try {
 +                      kotlinx.coroutines.withTimeoutOrNull(60_000L) {
 +                          if (tab == BRIEF_TAB) com.openminis.app.plus.Horizon.runAsync(context).await()?.let { b -> "简报已更新：${b.items.size} 条" } ?: ("没生成出来：" + com.openminis.app.plus.Horizon.lastError.ifBlank { "稍后再试" })
-+                          else if (tab == MAIL_TAB) com.openminis.app.plus.FeedRefresh.line(com.openminis.app.plus.MailInbox.refresh(context, force = true))
++                          else if (tab == MAIL_TAB || tab == CODE_TAB) com.openminis.app.plus.FeedRefresh.line(com.openminis.app.plus.MailInbox.refresh(context, force = true))
 +                          else com.openminis.app.plus.FeedRefresh.line(Digest.refreshAsync(context, com.openminis.app.plus.FeedRefresh.Mode.PULL).await())
 +                      } ?: "还在读，读完会自动更新"
 +                  } finally { pulled = false }
@@ -43826,14 +43976,14 @@ index b529a74..238bdb4 100644
 +                    // [Mines-38.8] 「邮箱」 right after 为你推荐: every signed-in mailbox in one inbox
 +                    val mailAccts by com.openminis.app.plus.MailInbox.accounts.collectAsState()
 +                    @Suppress("UNUSED_VARIABLE") val mailStates by com.openminis.app.plus.MailInbox.states.collectAsState()
-+                    val tabs = listOf(WarmTab(BRIEF_TAB, "每日简报", 0), WarmTab(FOR_YOU, "为你推荐", 0), WarmTab(MAIL_TAB, "邮箱", if (mailAccts.isEmpty()) 0 else com.openminis.app.plus.MailInbox.unreadTotal())) + listOf(Digest.Tab.ACCOUNT, Digest.Tab.X, Digest.Tab.GITHUB, Digest.Tab.DEAL).map { t ->
++                    val tabs = listOf(WarmTab(BRIEF_TAB, "每日简报", 0), WarmTab(FOR_YOU, "为你推荐", 0), WarmTab(MAIL_TAB, "邮箱", if (mailAccts.isEmpty()) 0 else com.openminis.app.plus.MailInbox.unreadTotal()), WarmTab(CODE_TAB, "验证码", Codes3912.fresh(com.openminis.app.plus.MailInbox.mails.collectAsState().value).size)) + listOf(Digest.Tab.ACCOUNT, Digest.Tab.X, Digest.Tab.GITHUB, Digest.Tab.DEAL).map { t ->
 +                        WarmTab(t.name, t.label, items.count { tabOf(it) == t && !(t == Digest.Tab.ACCOUNT && isResolved(it, patrol)) }, danger = t == Digest.Tab.ACCOUNT)
                      } + (items.count { it.tab == Digest.Tab.OTHER }.takeIf { it > 0 }?.let { listOf(WarmTab(Digest.Tab.OTHER.name, "其他", it)) } ?: emptyList())
                      WarmTabs(tabs, curTab, onSelect = { k -> tabSel = k })
 -                    feedClean(Digest.lastError)?.let { Text(it, fontSize = 12.sp, color = mines().ink3, maxLines = 1, overflow = TextOverflow.Ellipsis,
 +                    val rl = resultLine
 +                    if (rl != null) RefreshResultLine(rl)
-+                    else if (curTab != MAIL_TAB && curTab != BRIEF_TAB) feedClean(Digest.lastError)?.let { Text(it, fontSize = MT.Caption, color = mines().ink3, maxLines = 1, overflow = TextOverflow.Ellipsis,
++                    else if (curTab != MAIL_TAB && curTab != BRIEF_TAB && curTab != CODE_TAB) feedClean(Digest.lastError)?.let { Text(it, fontSize = MT.Caption, color = mines().ink3, maxLines = 1, overflow = TextOverflow.Ellipsis,
                          modifier = Modifier.padding(horizontal = 24.dp)) }
                  }
 -                val shown = (if (curTab == "ALL" || curTab == FOR_YOU) items else items.filter { tabOf(it).name == curTab }).take(80)
@@ -43841,11 +43991,15 @@ index b529a74..238bdb4 100644
 +                if (curTab == BRIEF_TAB) item(key = "brief") {
 +                    HorizonBriefPane(onOpenWeb = { u -> onBack(); PlusNav.openBrowser.value = u })
 +                }
++                if (curTab == CODE_TAB) item(key = "codes") { CodeInboxPane() }   // [Mines-38.9.12 b] 验证码 tab (design ws2 ①)
 +                if (curTab == MAIL_TAB) item(key = "mailbox") {
++                    androidx.compose.foundation.layout.Column {
++                    MailSummaryCard()   // [Mines-38.9.12 b] 摘要 card on top of the mailbox
 +                    MailboxPane(mailTick, onOpenWeb = { u -> onBack(); PlusNav.openBrowser.value = u })
++                    }
 +                }
-+                val shown = if (curTab == MAIL_TAB || curTab == BRIEF_TAB) emptyList() else (if (curTab == "ALL" || curTab == FOR_YOU) items else items.filter { tabOf(it).name == curTab }).take(80)
-+                if (shown.isEmpty() && !busy && curTab != MAIL_TAB && curTab != BRIEF_TAB) item(key = "empty") {
++                val shown = if (curTab == MAIL_TAB || curTab == BRIEF_TAB || curTab == CODE_TAB) emptyList() else (if (curTab == "ALL" || curTab == FOR_YOU) items else items.filter { tabOf(it).name == curTab }).take(80)
++                if (shown.isEmpty() && !busy && curTab != MAIL_TAB && curTab != BRIEF_TAB && curTab != CODE_TAB) item(key = "empty") {
                      Text(when (curTab) {
                          Digest.Tab.X.name -> "X 上暂时没有新消息。右上角「关注设置」可以加要关注的人和话题"
                          Digest.Tab.ACCOUNT.name -> "账号都正常，没有要你处理的异常"
@@ -43855,7 +44009,7 @@ index b529a74..238bdb4 100644
                  }
                  val now = System.currentTimeMillis()
                  val startOfDay = java.util.Calendar.getInstance().apply { set(java.util.Calendar.HOUR_OF_DAY, 0); set(java.util.Calendar.MINUTE, 0); set(java.util.Calendar.SECOND, 0) }.timeInMillis
-@@ -202,7 +262,8 @@ fun DigestScreen(onBack: () -> Unit) {
+@@ -202,7 +266,8 @@ fun DigestScreen(onBack: () -> Unit) {
                      } }
                      list.forEach { m ->
                          item(key = m.id) {
@@ -43865,12 +44019,12 @@ index b529a74..238bdb4 100644
                                  onOpen = { Digest.opened(context, m); detailFor = m },
                                  onLong = { menuFor = m },
                                  onLike = { Digest.like(context, m); android.widget.Toast.makeText(context, "好的，以后多推这类", android.widget.Toast.LENGTH_SHORT).show() },
-@@ -217,16 +278,16 @@ fun DigestScreen(onBack: () -> Unit) {
+@@ -217,16 +282,16 @@ fun DigestScreen(onBack: () -> Unit) {
                          }
                      }
                  }
 -                item(key = "add_sources") {
-+                if (curTab != MAIL_TAB && curTab != BRIEF_TAB) item(key = "add_sources") {
++                if (curTab != MAIL_TAB && curTab != BRIEF_TAB && curTab != CODE_TAB) item(key = "add_sources") {
                      @Suppress("UNUSED_EXPRESSION") resumes
                      @Suppress("UNUSED_EXPRESSION") vault
                      val rows = com.openminis.app.plus.AutoSources.missing(context)
@@ -43885,7 +44039,7 @@ index b529a74..238bdb4 100644
                      }
                  }
              }
-@@ -283,8 +344,7 @@ fun DigestScreen(onBack: () -> Unit) {
+@@ -283,8 +348,7 @@ fun DigestScreen(onBack: () -> Unit) {
          MinesSheet(onDismiss = { sourcesOpen = false }) {
              Row(Modifier.fillMaxWidth().padding(start = 24.dp, end = 12.dp, top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                  Column(Modifier.weight(1f)) {
@@ -43895,7 +44049,7 @@ index b529a74..238bdb4 100644
                  }
                  GlassTextButton("关闭") { sourcesOpen = false }
              }
-@@ -344,7 +404,7 @@ fun DigestScreen(onBack: () -> Unit) {
+@@ -344,7 +408,7 @@ fun DigestScreen(onBack: () -> Unit) {
          val wm = mines()
          MinesDialog("我关注的", onDismiss = { editFollows = false }, confirm = "保存", onConfirm = {
              Digest.setFollows(context, text.lines()); Digest.setSenders(context, who.lines()); Digest.setLanguages(context, langs); editFollows = false
@@ -43904,7 +44058,15 @@ index b529a74..238bdb4 100644
          }) {
              Text("话题：一行一个关键词、币种或项目，命中的排前面", fontSize = MT.Caption, lineHeight = MT.CaptionLH, color = wm.ink2)
              OutlinedTextField(text, { text = it }, minLines = 3, maxLines = 5, modifier = Modifier.fillMaxWidth(),
-@@ -413,7 +473,7 @@ private fun FeedChip(label: String, selected: Boolean, onClick: () -> Unit) {
+@@ -360,6 +424,7 @@ fun DigestScreen(onBack: () -> Unit) {
+ }
+ 
+ private const val FOR_YOU = "FOR_YOU"
++private const val CODE_TAB = "CODE"
+ 
+ /**
+  * 💬 讨论: a new Mines chat about this card, sent at once (the old share hand-off was never consumed on
+@@ -413,7 +478,7 @@ private fun FeedChip(label: String, selected: Boolean, onClick: () -> Unit) {
      // [Mines-design-34] selected = ink pill, others = strong glass + hairline (design33 02-feed)
      val m = mines()
      val shape = RoundedCornerShape(50)
@@ -43913,7 +44075,7 @@ index b529a74..238bdb4 100644
          color = if (selected) m.surface else m.ink, maxLines = 1,
          modifier = Modifier.heightIn(min = 44.dp).clip(shape).background(if (selected) m.ink else m.glassStrong)
              .border(1.dp, if (selected) Color.Transparent else m.hairline, shape).clickable(onClick = onClick)
-@@ -431,6 +491,59 @@ private fun repoOf(it: Digest.Item): String? = listOfNotNull(it.url, it.title, i
+@@ -431,6 +496,59 @@ private fun repoOf(it: Digest.Item): String? = listOfNotNull(it.url, it.title, i
      repoRe.find(t)?.groupValues?.get(1)?.removeSuffix(".git")?.trimEnd('.', ')')
  }?.takeIf { r -> r.split('/').let { p -> p.size == 2 && p[0] !in setOf("orgs", "topics", "trending", "settings", "sponsors") } }
  
@@ -43973,7 +44135,7 @@ index b529a74..238bdb4 100644
  /** What the card's / sheet's main button says (follows the action, not a generic 开始吧). */
  private val warnRx = Regex("(?i)警告|警惕|小心|注意|风险|骗|钓鱼|假冒|盗号|被盗|漏洞|scam|phishing|warning|beware|exploit|hack")
  private val howRx = Regex("(?i)教程|指南|手把手|入门|步骤|怎么|如何|方法|技巧|攻略|tutorial|guide|how to|tips")
-@@ -477,20 +590,20 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
+@@ -477,20 +595,20 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
                  Box(Modifier.size(32.dp).clip(androidx.compose.foundation.shape.CircleShape)
                      .background(androidx.compose.ui.graphics.Brush.linearGradient(listOf(Color(0xFFE08A6B), Color(0xFFB5532F)))),
                      contentAlignment = Alignment.Center) {
@@ -43997,7 +44159,7 @@ index b529a74..238bdb4 100644
                      val mark = when { isX -> com.openminis.app.R.drawable.ic_brand_x; isGh -> com.openminis.app.R.drawable.ic_brand_github; else -> 0 }
                      if (mark != 0) androidx.compose.foundation.Image(androidx.compose.ui.res.painterResource(mark), contentDescription = it.source,
                          modifier = Modifier.padding(start = 6.dp).size(14.dp))
-@@ -500,10 +613,10 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
+@@ -500,10 +618,10 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
                      modifier = Modifier.padding(top = 4.dp, end = 8.dp))
                  // GitHub: Chinese on top (big), the English name/description underneath in small print
                  if (isGh) feedClean(it.title)?.takeIf { t -> t != headline }?.let { en ->
@@ -44010,7 +44172,7 @@ index b529a74..238bdb4 100644
                      modifier = Modifier.padding(top = 6.dp).clip(RoundedCornerShape(50)).background(toneBg).padding(horizontal = 8.dp, vertical = 2.dp)) }
                  if (isX) repoOf(it)?.let { r -> RepoMiniCard(r, null, null) }
                  if (isX) it.image?.let { img ->
-@@ -529,7 +642,7 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
+@@ -529,7 +647,7 @@ private fun FeedCard(it: Digest.Item, onOpen: () -> Unit, onLong: () -> Unit, on
                      Spacer(Modifier.weight(1f))
                      ActIcon("⋯", "更多", m.ink2, onMore)
                  }
@@ -44019,7 +44181,7 @@ index b529a74..238bdb4 100644
              }
          }
      }
-@@ -543,20 +656,20 @@ private fun TextAct(icon: androidx.compose.ui.graphics.vector.ImageVector, label
+@@ -543,20 +661,20 @@ private fun TextAct(icon: androidx.compose.ui.graphics.vector.ImageVector, label
          .padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
          com.openminis.app.ui.brand.MinesIcon(icon, null, tint = m.ink, modifier = Modifier.size(22.dp))
          Spacer(Modifier.width(5.dp))
@@ -44043,7 +44205,7 @@ index b529a74..238bdb4 100644
  }
  
  /** Brand logo of the source when there is one, else a soft 3D-looking gradient orb with an emoji. */
-@@ -611,7 +724,7 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
+@@ -611,7 +729,7 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
      // [Mines-38.5] sheet stops below the status bar, frosted glass, read time teaches 为你推荐
      val opened = remember(m.id) { System.currentTimeMillis() }
      androidx.compose.runtime.DisposableEffect(m.id) { onDispose { Digest.dwelled(context, m, System.currentTimeMillis() - opened) } }
@@ -44052,7 +44214,7 @@ index b529a74..238bdb4 100644
          modifier = Modifier.statusBarsPadding().padding(top = 8.dp),
          containerColor = glassVeil(), shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp)) {
          GlassWindowEffect()
-@@ -621,22 +734,22 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
+@@ -621,22 +739,22 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
                  Spacer(Modifier.width(12.dp))
                  Column(Modifier.weight(1f)) {
                      Text(listOfNotNull(Digest.Tab.values().firstOrNull { it == m.tab }?.let { t -> if (t == Digest.Tab.FOLLOW) "X" else t.label }, m.source.takeIf { it.isNotBlank() })
@@ -44080,7 +44242,7 @@ index b529a74..238bdb4 100644
                  }
              }
              m.image?.let { img ->
-@@ -646,8 +759,8 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
+@@ -646,8 +764,8 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
              }
              if (steps.isNotEmpty()) {
                  Row(Modifier.padding(top = 22.dp).fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -44091,7 +44253,7 @@ index b529a74..238bdb4 100644
                  }
                  Column(Modifier.padding(top = 8.dp).fillMaxWidth().clip(RoundedCornerShape(20.dp)).background(mc.surface2.copy(alpha = if (mc.dark) 1f else 0.7f))) {
                      steps.forEachIndexed { i, (t, sub) ->
-@@ -673,13 +786,13 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
+@@ -673,13 +791,13 @@ private fun DetailSheet(m: Digest.Item, onDismiss: () -> Unit, onStart: (List<Pa
                  Row(Modifier.padding(top = 14.dp).fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(mc.surface2.copy(alpha = if (mc.dark) 1f else 0.7f))
                      .clickable { openOriginal(context, m) }.heightIn(min = 56.dp).padding(horizontal = 14.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
                      Column(Modifier.weight(1f)) {
@@ -44109,7 +44271,7 @@ index b529a74..238bdb4 100644
              Spacer(Modifier.height(20.dp))
          }
          Box(Modifier.fillMaxWidth().height(1.dp).background(mc.hairline))
-@@ -809,3 +922,18 @@ fun glueNumbers(s: String): String = numUnit.replace(s) { m ->
+@@ -809,3 +927,18 @@ fun glueNumbers(s: String): String = numUnit.replace(s) { m ->
      val tail = m.groupValues[5]
      num + (if (sp.isNotEmpty()) "\u00A0" else "\u2060") + unit + (if (tail.isNotEmpty()) "\u00A0" + tail else "")
  }
@@ -45819,10 +45981,10 @@ index 0000000..bf40ca1
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/Hub3912.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/Hub3912.kt
 new file mode 100644
-index 0000000..151acbc
+index 0000000..8ddc187
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/Hub3912.kt
-@@ -0,0 +1,300 @@
+@@ -0,0 +1,309 @@
 +package com.openminis.app.ui.plus
 +
 +import androidx.compose.foundation.background
@@ -45874,6 +46036,8 @@ index 0000000..151acbc
 +    const val APPS = "plus_apps_hub"
 +    const val AUTOLOGIN = "plus_auto_login"
 +    const val WORKPOOL = "plus_work_pool"
++    const val REGISTER = "plus_register_ledger"   // [Mines-38.9.12 b] 注册台账 (ws2 ③)
++    const val CONNECT = "plus_quick_connect"      // [Mines-38.9.12 b] 服务器快速连接 (ws2 ④)
 +}
 +
 +private fun ic(n: String) = com.openminis.app.ui.brand.MinesIcons.named(n)!!
@@ -45897,6 +46061,8 @@ index 0000000..151acbc
 +        HubTile("工作区", "layout-dashboard", Color(0xFF3E9C93), Routes3912.WORKPOOL),
 +        HubTile("技能", "sparkles", Color(0xFFC9932F), PlusRoutes.PLUGINS),
 +        HubTile("自动登录", "fingerprint", Color(0xFF6B5E58), Routes3912.AUTOLOGIN),
++        HubTile("注册台账", "user", Color(0xFFB0574F), Routes3912.REGISTER),
++        HubTile("快速连接", "terminal", Color(0xFF35607F), Routes3912.CONNECT),
 +    )
 +    PlusPage("应用", onBack) {
 +        MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp)) {
@@ -45924,8 +46090,11 @@ index 0000000..151acbc
 +            PlusRow(ic("stethoscope"), "诊断", "测试与上报", onClick = { go(PlusRoutes.REPORT) })
 +        }
 +        var callOn by remember { mutableStateOf(com.openminis.app.plus.MinesCall.enabled(ctx)) }
-+        PlusSection("提醒", footer = "Mines 在后台完成任务或出错时，像来电一样响铃，可接听语音对话、转文字或挂断。只用手机本地通知，不产生通话费用。") {
++        PlusSection("提醒", footer = "Mines 在后台完成任务、出错或需要你处理（登录、验证）时，像来电一样响铃，可接听语音对话、转文字或挂断。只用手机本地通知，不产生通话费用。") {
 +            SwitchRow("任务完成来电提醒", "应用内来电 · 免费", callOn) { callOn = it; com.openminis.app.plus.MinesCall.setEnabled(ctx, it) }
++            WarmDivider(16.dp)
++            var attnOn by remember { mutableStateOf(com.openminis.app.plus.MinesCall.attention(ctx)) }
++            SwitchRow("需要你处理时也来电", "登录、人机验证等待你时", attnOn && callOn) { attnOn = it; com.openminis.app.plus.MinesCall.setAttention(ctx, it) }
 +            WarmDivider(16.dp)
 +            PlusRow(ic("phone"), "试一下来电", onClick = {
 +                ctx.startActivity(android.content.Intent(ctx, MinesCallActivity::class.java).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -46048,6 +46217,8 @@ index 0000000..151acbc
 +        WarmGroupLabel("节点", "添加节点 ›") { go(PlusRoutes.WORK) }
 +        if (servers.isEmpty()) InfoLine("还没有服务器。在「电脑与服务器」里添加后会自动加入工作区。")
 +        nodes.sortedBy { if (it.role == WorkPoolCore.Role.EXCLUDED) 1 else 0 }.forEach { n -> NodeCard(n) }
++        // the trading VM is never scheduled — shown greyed so it is clear why it is not in the pool (it is not a Mines server)
++        if (nodes.none { it.role == WorkPoolCore.Role.EXCLUDED }) NodeCard(WorkPoolCore.Node("hatch", "青怡 Hatch VM", "", WorkPoolCore.Role.EXCLUDED, true))
 +        MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp)) {
 +            PlusRow(ic("plus"), "云端扩容", "内存不足时按需启动 · 空闲 15 分钟自动关机 · 不使用付费资源", chevron = false,
 +                trailing = { Switch(burst, onCheckedChange = { burst = it; prefs.edit().putBoolean("burst", it).apply() }) })
@@ -46122,6 +46293,382 @@ index 0000000..151acbc
 +        Text(value, fontSize = MT.Meta, color = m.ink2, fontFamily = FontFamily.Monospace, modifier = Modifier.padding(start = 10.dp).width(78.dp), maxLines = 1,
 +            textAlign = androidx.compose.ui.text.style.TextAlign.End)
 +    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/Hub3912b.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/Hub3912b.kt
+new file mode 100644
+index 0000000..da2ebc1
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/Hub3912b.kt
+@@ -0,0 +1,370 @@
++package com.openminis.app.ui.plus
++
++import androidx.compose.foundation.background
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.Switch
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.semantics.contentDescription
++import androidx.compose.ui.semantics.semantics
++import androidx.compose.ui.text.font.FontFamily
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import com.openminis.app.plus.Inbox3912Core
++import com.openminis.app.plus.MailInbox
++import com.openminis.app.plus.PlusPrefs
++import com.openminis.app.ui.brand.MinesIcon
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++
++/** [Mines-38.9.12 b] design ws2 ① 验证码 tab + 摘要, ③ 注册台账, ④ 服务器快速连接 */
++private fun ic2(n: String) = com.openminis.app.ui.brand.MinesIcons.named(n)!!
++
++object Codes3912 {
++    fun lite(mails: List<MailInbox.Mail>) = mails.map { Inbox3912Core.MailLite(it.id, it.from.ifBlank { it.fromAddr } + " <" + it.fromAddr + ">", it.subject, it.text, it.at, it.address) }
++    fun all(mails: List<MailInbox.Mail>, now: Long = System.currentTimeMillis()) =
++        Inbox3912Core.codes(lite(mails), now) { com.openminis.app.plus.MailParse.extractCode(it) }
++    fun fresh(mails: List<MailInbox.Mail>) = all(mails).filter { it.fresh }
++    /** self-test readout */
++    fun state(): String = org.json.JSONObject().put("codes", all(MailInbox.mails.value).size).put("fresh", fresh(MailInbox.mails.value).size)
++        .put("summary", summary().line).toString()
++    fun summary(): Inbox3912Core.Summary {
++        val ms = MailInbox.mails.value
++        val c = java.util.Calendar.getInstance().apply { set(java.util.Calendar.HOUR_OF_DAY, 0); set(java.util.Calendar.MINUTE, 0); set(java.util.Calendar.SECOND, 0) }
++        return Inbox3912Core.summary(lite(ms), MailInbox.unreadTotal(), all(ms).size, c.timeInMillis)
++    }
++}
++
++private fun copy(ctx: android.content.Context, label: String, text: String) {
++    runCatching {
++        val cm = ctx.getSystemService(android.content.ClipboardManager::class.java)
++        val clip = android.content.ClipData.newPlainText(label, text)
++        // sensitive: hidden from the clipboard preview on Android 13+
++        clip.description.extras = android.os.PersistableBundle().apply { putBoolean("android.content.extra.IS_SENSITIVE", true) }
++        cm.setPrimaryClip(clip)
++    }
++}
++
++// ───────────────────────────── 消息 · 摘要 (ws2 ①) ─────────────────────────────
++
++@Composable
++fun MailSummaryCard() {
++    val m = mines()
++    val mails by MailInbox.mails.collectAsState()
++    if (mails.isEmpty()) return
++    val s = remember(mails) { Codes3912.summary() }
++    MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp)) {
++        Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp).semantics { contentDescription = "邮件摘要" }) {
++            Row(verticalAlignment = Alignment.CenterVertically) {
++                Text("摘要 · 今日 ${s.today} 封", fontSize = MT.Meta, color = m.ink2, modifier = Modifier.weight(1f))
++                if (s.needAct.isNotEmpty()) StatusPill("需处理 ${s.needAct.size}", false)
++            }
++            Text(s.line, fontSize = MT.Sub, color = m.ink, modifier = Modifier.padding(top = 6.dp), maxLines = 3, overflow = TextOverflow.Ellipsis)
++        }
++    }
++}
++
++// ───────────────────────────── 消息 · 验证码 (ws2 ①) ─────────────────────────────
++
++@Composable
++fun CodeInboxPane() {
++    val m = mines()
++    val ctx = LocalContext.current
++    val mails by MailInbox.mails.collectAsState()
++    remember { com.openminis.app.plus.AutoLogin.init(ctx); 0 }
++    val pol by com.openminis.app.plus.AutoLogin.policy.collectAsState()
++    var tick by remember { mutableStateOf(0) }
++    LaunchedEffect(Unit) { while (true) { kotlinx.coroutines.delay(30_000L); tick++ } }   // fresh → 已过期 without a reload
++    val codes = remember(mails, tick) { Codes3912.all(mails) }
++    val fmt = remember { java.text.SimpleDateFormat("HH:mm", java.util.Locale.US) }
++    var copied by remember { mutableStateOf<String?>(null) }
++    Column {
++        MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp)) {
++            PlusRow(ic2("key-round"), "验证码自动填入", if (pol.codeAutoRead) "登录时自动从已关联邮箱读取并填入" else "已关闭，需要时手动复制", chevron = false,
++                trailing = { Switch(pol.codeAutoRead, onCheckedChange = { com.openminis.app.plus.AutoLogin.setCodeAutoRead(ctx, it) }) })
++        }
++        if (codes.isEmpty()) InfoLine(if (mails.isEmpty()) "还没有关联邮箱。在「邮箱」里添加后，收到的验证码会出现在这里。" else "最近 24 小时的邮件里没有验证码。")
++        codes.forEach { c ->
++            MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp)) {
++                Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp).semantics { contentDescription = "验证码 ${c.site}" }) {
++                    Row(verticalAlignment = Alignment.CenterVertically) {
++                        Box(Modifier.size(36.dp).clip(CircleShape).background(Color(0xFF4F7FB5)), contentAlignment = Alignment.Center) {
++                            Text(c.site.take(1).uppercase(), color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = MT.Body)
++                        }
++                        Column(Modifier.weight(1f).padding(start = 12.dp)) {
++                            Text(c.site + " 验证码", fontSize = MT.Body, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
++                            Text(Inbox3912Core.maskMail(c.box) + " · " + (if (c.fresh) "30 分钟内有效" else "可能已过期"), fontSize = MT.Meta, color = m.ink2, maxLines = 1)
++                        }
++                        Text(fmt.format(java.util.Date(c.at)), fontSize = MT.Meta, color = m.ink2)
++                    }
++                    Row(Modifier.padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
++                        Text(Inbox3912Core.spaced(c.code), fontSize = 24.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.SemiBold,
++                            color = if (c.fresh) Color(0xFFC0633F) else m.ink3, modifier = Modifier.weight(1f))
++                        Text(if (copied == c.mailId) "已复制" else "复制", fontSize = MT.Sub, color = m.primaryText,
++                            modifier = Modifier.clip(RoundedCornerShape(50)).background(m.container).clickable {
++                                copy(ctx, "验证码", c.code); copied = c.mailId
++                            }.padding(horizontal = 14.dp, vertical = 6.dp).semantics { contentDescription = "复制验证码" })
++                    }
++                }
++            }
++        }
++        Text("只读取验证码本身，邮件正文不保存。复制的验证码在系统剪贴板里标记为敏感内容。", fontSize = MT.Meta, color = m.ink3,
++            modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp))
++    }
++}
++
++// ───────────────────────────── 注册台账 (ws2 ③) ─────────────────────────────
++
++object Register3912 {
++    @Volatile var lastRows: Int = -1
++    @Volatile var lastTemp: Int = -1
++    fun rows(c: android.content.Context): List<Inbox3912Core.RegRow> = runCatching {
++        com.openminis.app.plus.SavedLogins.all(c).map { e ->
++            val host = e.host.ifBlank { e.name }
++            val note = runCatching { com.openminis.app.plus.Ledger.cands(c, host).firstOrNull { it.account.equals(e.user, true) }?.note }.getOrNull().orEmpty()
++            Inbox3912Core.RegRow(host, e.user, note, Inbox3912Core.regStatus(note))
++        }
++    }.getOrDefault(emptyList())
++}
++
++@Composable
++fun RegisterLedgerScreen(onBack: () -> Unit, go: (String) -> Unit) {
++    val m = mines()
++    val ctx = LocalContext.current
++    val scope = rememberCoroutineScope()
++    var rows by remember { mutableStateOf<List<Inbox3912Core.RegRow>?>(null) }
++    var boxes by remember { mutableStateOf(com.openminis.app.plus.AgentMailbox.boxes()) }
++    var busy by remember { mutableStateOf<String?>(null) }
++    var pick by remember { mutableStateOf(false) }
++    LaunchedEffect(Unit) {
++        rows = withContext(Dispatchers.IO) { Register3912.rows(ctx) }
++        Register3912.lastRows = rows?.size ?: 0; Register3912.lastTemp = boxes.size
++    }
++    val all = rows.orEmpty()
++    val groups = remember(all) { Inbox3912Core.byMailbox(all) }
++    val temp = com.openminis.app.plus.AgentMailbox.address("mailtm")
++    PlusPage("注册台账", onBack, actions = {
++        Box(Modifier.size(40.dp).clip(CircleShape).clickable { pick = true }.semantics { contentDescription = "一键注册" }, contentAlignment = Alignment.Center) {
++            MinesIcon(ic2("plus"), null, tint = m.ink, modifier = Modifier.size(20.dp))
++        }
++    }) {
++        Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
++            Tile3912("临时邮箱", "${boxes.size}", if (temp != null) "Mail.tm 可用" else "未创建", Modifier.weight(1f))
++            Tile3912("已注册平台", if (rows == null) "…" else "${all.map { it.host }.distinct().size}",
++                "已验证 ${all.count { it.st == Inbox3912Core.RegSt.DONE }} · 未完成 ${all.count { it.st == Inbox3912Core.RegSt.PENDING }}", Modifier.weight(1f))
++        }
++        MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp)) {
++            Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
++                Row(verticalAlignment = Alignment.CenterVertically) {
++                    Text("一键注册", fontSize = MT.Body, fontWeight = FontWeight.Medium, color = m.ink, modifier = Modifier.weight(1f))
++                    Text(busy ?: (if (temp == null) "新建临时邮箱" else "开始注册"), fontSize = MT.Sub, color = Color(0xFFC0633F),
++                        modifier = Modifier.clip(RoundedCornerShape(50)).background(Color(0x22C0633F)).clickable(enabled = busy == null) {
++                            if (temp != null) { pick = true; return@clickable }
++                            busy = "正在创建…"
++                            scope.launch {
++                                val why = com.openminis.app.plus.AgentMailbox.openMailTm()
++                                boxes = com.openminis.app.plus.AgentMailbox.boxes()
++                                busy = null
++                                if (why == null) pick = true else android.widget.Toast.makeText(ctx, why, android.widget.Toast.LENGTH_LONG).show()
++                            }
++                        }.padding(horizontal = 12.dp, vertical = 5.dp))
++                }
++                Text("选择平台 → 生成邮箱与密码 → 自动收码 → 写入台账", fontSize = MT.Sub, color = m.ink2, modifier = Modifier.padding(top = 6.dp))
++                Text("遵守平台规则：一人一号，不批量注册；遇到人机验证、手机号或付款时停下来问你。", fontSize = MT.Meta, color = m.ink3, modifier = Modifier.padding(top = 4.dp))
++            }
++        }
++        WarmGroupLabel("按邮箱", "全部 ›") { go(PlusRoutes.KEYCHAIN) }
++        if (rows != null && all.isEmpty()) InfoLine("台账里还没有账号。一键注册完成的账号会自动出现在这里。")
++        groups.take(8).forEach { (box, list) ->
++            MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp)) {
++                Column(Modifier.padding(vertical = 6.dp)) {
++                    Row(Modifier.padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
++                        Text(Inbox3912Core.maskMail(box), fontSize = MT.Sub, fontFamily = FontFamily.Monospace, color = m.ink, modifier = Modifier.weight(1f), maxLines = 1)
++                        val tempBox = box.endsWith("@" + (temp?.substringAfter('@') ?: "\u0000"))
++                        StatusPill(if (tempBox) "临时" else "长期", null)
++                    }
++                    list.take(6).forEach { r ->
++                        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
++                            Box(Modifier.size(34.dp).clip(RoundedCornerShape(9.dp)).background(Color(0xFFD9822F)), contentAlignment = Alignment.Center) {
++                                Text(r.host.take(2).uppercase(), color = Color.White, fontSize = MT.Meta, fontWeight = FontWeight.SemiBold)
++                            }
++                            Column(Modifier.weight(1f).padding(start = 12.dp)) {
++                                Text(r.host, fontSize = MT.Body, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
++                                Text("密码 ••••••" + (r.note.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""), fontSize = MT.Meta, color = m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis)
++                            }
++                            StatusPill(r.st.zh, when (r.st) { Inbox3912Core.RegSt.DONE -> true; Inbox3912Core.RegSt.PENDING, Inbox3912Core.RegSt.ROTATE -> false; else -> null })
++                        }
++                    }
++                }
++            }
++        }
++    }
++    if (pick) AlertDialog(onDismissRequest = { pick = false }, confirmButton = { TextButton({ pick = false }) { Text("取消") } },
++        title = { Text("选择要注册的平台") },
++        text = {
++            Column {
++                Inbox3912Core.PLATFORMS.forEach { (name, url) ->
++                    Text(name, fontSize = MT.Body, color = m.ink, modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).clickable {
++                        pick = false
++                        startDraft(ctx, Inbox3912Core.registerTask(name, url, temp))
++                    }.padding(vertical = 10.dp, horizontal = 6.dp))
++                }
++            }
++        })
++}
++
++/** a new Mines conversation with [text] waiting in the input (same hand-off as 知识库 「在对话中引用」) */
++internal fun startDraft(ctx: android.content.Context, text: String) {
++    runCatching {
++        com.openminis.app.share.SharedShareStore.savePendingShare(ctx, com.openminis.app.share.PendingShare(
++            listOf(com.openminis.app.share.PendingShare.Item(com.openminis.app.share.PendingShare.Item.Kind.INLINE_TEXT, text)), System.currentTimeMillis()))
++        com.openminis.app.share.ShareCoordinator.processPendingShare(ctx)
++    }
++    PlusNav.go(com.openminis.app.ui.navigation.Routes.chat("__new__" + java.util.UUID.randomUUID()))
++}
++
++@Composable
++private fun Tile3912(label: String, big: String, sub: String, modifier: Modifier) {
++    val m = mines()
++    MinesCard(modifier) {
++        Column(Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
++            Text(label, fontSize = MT.Sub, color = m.ink2)
++            Text(big, fontSize = MT.Display, fontWeight = FontWeight.SemiBold, color = m.ink, modifier = Modifier.padding(top = 6.dp))
++            Text(sub, fontSize = MT.Meta, color = m.ink2, modifier = Modifier.padding(top = 2.dp), maxLines = 1, overflow = TextOverflow.Ellipsis)
++        }
++    }
++}
++
++// ───────────────────────────── 服务器快速连接 (ws2 ④) ─────────────────────────────
++
++object Connect3912 {
++    private fun p(c: android.content.Context) = c.applicationContext.getSharedPreferences("mines_connect", android.content.Context.MODE_PRIVATE)
++    fun sshFallback(c: android.content.Context) = p(c).getBoolean("ssh_fallback", true)
++    fun setSshFallback(c: android.content.Context, v: Boolean) = p(c).edit().putBoolean("ssh_fallback", v).apply()
++    fun keepAlive(c: android.content.Context) = p(c).getBoolean("keepalive", true)
++    fun setKeepAlive(c: android.content.Context, v: Boolean) = p(c).edit().putBoolean("keepalive", v).apply()
++    @Volatile var lastConnect: String = ""
++
++    /** one tap: WS link first (mines-link worker, 15 s heartbeat); no link / link down → SSH (only when the fallback is on) */
++    suspend fun connect(c: android.content.Context, s: com.openminis.app.plus.VpsServer): String = withContext(Dispatchers.IO) {
++        com.openminis.app.plus.MinesLink.init(c)
++        val t0 = System.currentTimeMillis()
++        val conn = runCatching { com.openminis.app.plus.MinesLink.conn(s) }.getOrNull()
++        if (conn != null) {
++            runCatching { conn.kick() }
++            repeat(16) { if (com.openminis.app.plus.MinesLink.isOnline(s.id)) return@withContext "WS 已连接 · ${System.currentTimeMillis() - t0} ms".also { lastConnect = it }; kotlinx.coroutines.delay(250) }
++        }
++        if (!sshFallback(c)) return@withContext (if (conn == null) "这台还没开 WS 通道" else "WS 暂时连不上").also { lastConnect = it }
++        val r = runCatching { com.openminis.app.plus.VpsSsh.run(c, s, "echo ok", 15_000, 1) }.getOrNull()
++        (if (r?.first?.exit == 0) "SSH 已连接 · ${System.currentTimeMillis() - t0} ms" else "连不上：" + (r?.first?.output?.lines()?.lastOrNull { it.isNotBlank() }?.take(40) ?: "网络不通")).also { lastConnect = it }
++    }
++}
++
++@Composable
++fun QuickConnectScreen(onBack: () -> Unit, go: (String) -> Unit) {
++    val m = mines()
++    val ctx = LocalContext.current
++    val scope = rememberCoroutineScope()
++    PlusPrefs.init(ctx)
++    remember { com.openminis.app.plus.MinesLink.init(ctx); 0 }
++    val st by PlusPrefs.state.collectAsState()
++    val links by com.openminis.app.plus.MinesLink.states.collectAsState()
++    var unlocked by remember { mutableStateOf(com.openminis.app.plus.PayCards.isUnlocked()) }
++    var fallback by remember { mutableStateOf(Connect3912.sshFallback(ctx)) }
++    var keep by remember { mutableStateOf(Connect3912.keepAlive(ctx)) }
++    val status = remember { androidx.compose.runtime.mutableStateMapOf<String, String>() }
++    val servers = st.servers.filter { it.enabled }
++    fun withKey(then: () -> Unit) {
++        if (com.openminis.app.plus.PayCards.isUnlocked()) { unlocked = true; then(); return }
++        com.openminis.app.plus.PayCards.unlock(ctx, "解锁钥匙服务") { ok, why -> unlocked = ok; if (ok) then() else why?.let { android.widget.Toast.makeText(ctx, it, android.widget.Toast.LENGTH_SHORT).show() } }
++    }
++    PlusPage("连接", onBack, actions = {
++        Box(Modifier.size(40.dp).clip(CircleShape).clickable { go(PlusRoutes.WORK) }.semantics { contentDescription = "添加服务器" }, contentAlignment = Alignment.Center) {
++            MinesIcon(ic2("plus"), null, tint = m.ink, modifier = Modifier.size(20.dp))
++        }
++    }) {
++        MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp), onClick = { withKey {} }) {
++            PlusRow(ic2("key-round"), "钥匙服务", "手机硬件密钥 · 指纹解锁 · ${servers.count { it.authorized }} 台已授权", chevron = false,
++                trailing = { StatusPill(if (unlocked) "已解锁" else "就绪", true) })
++        }
++        WarmGroupLabel("一键连接", if (keep) "默认 WS 通道 · 15 秒心跳" else "默认 WS 通道")
++        if (servers.isEmpty()) InfoLine("还没有服务器。点右上角 ＋ 添加。")
++        if (servers.isNotEmpty()) MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp)) {
++            Column(Modifier.padding(vertical = 4.dp)) {
++                servers.forEachIndexed { i, s ->
++                    if (i > 0) WarmDivider(16.dp)
++                    val link = links[s.id]?.first
++                    val ws = s.linkToken.isNotBlank() || s.relay.startsWith("ws")
++                    val route = when {
++                        link == com.openminis.app.plus.MinesLink.State.ONLINE -> "wss 在线"
++                        ws -> "wss" + (s.linkUrl.substringAfterLast(':', "").takeIf { it.isNotBlank() && it.all(Char::isDigit) }?.let { " :$it" } ?: "")
++                        else -> "ssh :${s.port}"
++                    }
++                    Row(Modifier.fillMaxWidth().clickable { status[s.id] = "连接中…"; scope.launch { status[s.id] = Connect3912.connect(ctx, s) } }
++                        .padding(horizontal = 16.dp, vertical = 10.dp).semantics { contentDescription = "连接 ${s.name}" }, verticalAlignment = Alignment.CenterVertically) {
++                        Column(Modifier.weight(1f)) {
++                            Text(s.name.ifBlank { s.host }, fontSize = MT.Body, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
++                            Text(route + (if (s.lastLatencyMs >= 0) " · 延迟 ${s.lastLatencyMs} ms" else if (s.lastLatencyMs == -2) " · 不可达" else "") +
++                                (status[s.id]?.let { " · $it" } ?: ""), fontSize = MT.Meta, color = m.ink2, fontFamily = FontFamily.Monospace, maxLines = 1, overflow = TextOverflow.Ellipsis)
++                        }
++                        Chip3912("终端") {
++                            withKey {
++                                val entry = "${s.user}@${s.host}:${s.port}" + (s.relay.trim().takeIf { it.isNotEmpty() }?.let { "|$it" } ?: "")
++                                go(com.openminis.app.ui.navigation.Routes.terminal("MINIS_VPS_SERVERS='$entry' minis-vps shell"))
++                            }
++                        }
++                        Chip3912("详情") { go(PlusRoutes.server(s.id)) }
++                    }
++                }
++            }
++        }
++        WarmGroupLabel("新服务器")
++        MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp)) {
++            Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
++                Text("首次接入", fontSize = MT.Body, fontWeight = FontWeight.Medium, color = m.ink)
++                Text("输入 IP 与 root 密码一次 → 下发钥匙 → 开启 WS 通道。之后一键连接走 WS，SSH 只用于初次接入和备用。", fontSize = MT.Sub, color = m.ink2, modifier = Modifier.padding(top = 6.dp))
++                Box(Modifier.fillMaxWidth().padding(top = 12.dp).clip(RoundedCornerShape(12.dp)).background(Color(0xFFD06A3A)).clickable { go(PlusRoutes.WORK) }
++                    .padding(vertical = 12.dp).semantics { contentDescription = "添加服务器" }, contentAlignment = Alignment.Center) {
++                    Text("添加服务器", color = Color.White, fontSize = MT.Body, fontWeight = FontWeight.Medium)
++                }
++            }
++        }
++        PlusSection(null) {
++            SwitchRow("断线自动重连", "WS 失效时回落 SSH", fallback) { fallback = it; Connect3912.setSshFallback(ctx, it) }
++            WarmDivider(16.dp)
++            SwitchRow("连接保活", "15 秒心跳", keep) { keep = it; Connect3912.setKeepAlive(ctx, it) }
++        }
++    }
++}
++
++@Composable
++private fun Chip3912(label: String, onClick: () -> Unit) {
++    Text(label, fontSize = MT.Meta, color = Color(0xFFC0633F), modifier = Modifier.padding(start = 6.dp).clip(RoundedCornerShape(8.dp))
++        .background(Color(0x22C0633F)).clickable(onClick = onClick).padding(horizontal = 10.dp, vertical = 5.dp).semantics { contentDescription = label })
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/ImageStack.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/ImageStack.kt
 new file mode 100644
@@ -62084,6 +62631,72 @@ index 0000000..5fd2cb2
 +        assertEquals(0.75f, C.clampAspect(0.75f))
 +        // a tall screenshot is clamped, so the card never grows past width / MIN_ASPECT
 +        assertTrue(C.layout(1, 100f, listOf(0.1f)).height <= 100f / C.MIN_ASPECT + 0.01f)
++    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/Inbox3912CoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/Inbox3912CoreTest.kt
+new file mode 100644
+index 0000000..dcdd064
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/Inbox3912CoreTest.kt
+@@ -0,0 +1,60 @@
++package com.openminis.app.plus
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class Inbox3912CoreTest {
++    private val now = 1_800_000_000_000L
++    private fun m(id: String, from: String, subj: String, text: String, ago: Long) = Inbox3912Core.MailLite(id, from, subj, text, now - ago, "temp")
++    private val ex: (String) -> String? = { t -> Regex("(?<![0-9])([0-9]{6})(?![0-9])").find(t)?.value }
++
++    @Test fun codesNewestFirstFreshFlag() {
++        val c = Inbox3912Core.codes(listOf(
++            m("a", "Cloudflare <noreply@cloudflare.com>", "Your Cloudflare verification code", "code 482917", 5 * 60_000L),
++            m("b", "noreply@railway.app", "Sign in", "your code is 123456", 3 * 3600_000L),
++            m("c", "news@x.com", "Weekly digest", "no code here", 60_000L),
++            m("d", "old@x.com", "code", "999999", 30 * 3600_000L),
++        ), now, ex)
++        assertEquals(listOf("a", "b"), c.map { it.mailId })
++        assertTrue(c[0].fresh); assertFalse(c[1].fresh)
++        assertEquals("Cloudflare", c[0].site)
++    }
++
++    @Test fun siteFallbacks() {
++        assertEquals("Acme Mail", Inbox3912Core.siteOf("\"Acme Mail\" <a@acme.io>", "hello"))
++        assertEquals("Acme", Inbox3912Core.siteOf("a@acme.io", "hello"))
++    }
++
++    @Test fun spacedAndMask() {
++        assertEquals("482 917", Inbox3912Core.spaced("482917"))
++        assertEquals("AB12", Inbox3912Core.spaced("AB12"))
++        assertEquals("k7q2••@mail.tm", Inbox3912Core.maskMail("k7q2abcd@mail.tm"))
++    }
++
++    @Test fun summaryFlagsActionItems() {
++        val s = Inbox3912Core.summary(listOf(
++            m("a", "g@glados", "套餐到期提醒", "", 60_000L), m("b", "r@railway", "Security alert: rotate token", "", 120_000L),
++            m("c", "n@news", "Newsletter", "", 180_000L)), 2, 1, now - 3600_000L)
++        assertEquals(3, s.today); assertEquals(2, s.needAct.size)
++        assertTrue(s.line.startsWith("需要处理"))
++        assertEquals("今天还没有新邮件。", Inbox3912Core.summary(emptyList(), 0, 0, now).line)
++    }
++
++    @Test fun regStatusAndGrouping() {
++        assertEquals(Inbox3912Core.RegSt.DONE, Inbox3912Core.regStatus("注册于 10-23"))
++        assertEquals(Inbox3912Core.RegSt.PENDING, Inbox3912Core.regStatus("注册中 10-23"))
++        val g = Inbox3912Core.byMailbox(listOf(
++            Inbox3912Core.RegRow("railway.com", "a@mail.tm", "", Inbox3912Core.RegSt.SAVED),
++            Inbox3912Core.RegRow("cloudflare.com", "A@mail.tm", "", Inbox3912Core.RegSt.DONE),
++            Inbox3912Core.RegRow("x.com", "user1", "", Inbox3912Core.RegSt.SAVED)))
++        assertEquals("a@mail.tm", g[0].first); assertEquals(2, g[0].second.size); assertEquals("cloudflare.com", g[0].second[0].host)
++        assertEquals("其他账号", g.last().first)
++    }
++
++    @Test fun registerTaskObeysRules() {
++        val t = Inbox3912Core.registerTask("Cloudflare", "https://dash.cloudflare.com/sign-up", "k7q2@mail.tm")
++        assertTrue(t.contains("register_pick")); assertTrue(t.contains("不要绕过")); assertTrue(t.contains("k7q2@mail.tm"))
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/IncognitoCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/IncognitoCoreTest.kt
