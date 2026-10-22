@@ -6994,6 +6994,37 @@ def b3912(res):
         route("settings", 4); shot("settings-dark")
         route("plus_apps_hub", 4); shot("apps-dark")
         route("plus_auto_login", 4); shot("autologin-dark")
+        route("plus_quick_connect", 4); shot("connect-dark")
+        route("plus_register_ledger", 5); shot("register-dark")
+    def pages2():   # [38.9.12 b] 消息 验证码 tab + 摘要 · 注册台账 · 快速连接 · 来电 needs-attention gate
+        theme388(1); healthy_home()
+        c0 = result_json("group", "i3912 mailcodes", timeout=20) or {}
+        o["codes"] = c0
+        try:
+            if int(c0.get("codes", 0)) < 2 or int(c0.get("fresh", 0)) < 1: selftest_fail.append(f"i3912 验证码: codes not extracted {c0}")
+        except Exception as e: selftest_fail.append(f"i3912 验证码 readout {e} {c0}")
+        route("plus_digest", 5)
+        if open_tab("验证码"):
+            time.sleep(1); r = shot("codes-light")
+            if r is not None and not find(r, "482 917"): page_missing.append("i3912 验证码 tab: 482 917 not shown")
+            if r is not None and not find(r, "复制"): page_missing.append("i3912 验证码 tab: 复制 missing")
+        else: page_missing.append("i3912 消息: 验证码 tab not found")
+        if open_tab("邮箱"):
+            time.sleep(1); r = shot("mail-light")
+            if r is not None and not (find(r, "摘要") or find(r, "邮件摘要")): page_missing.append("i3912 邮箱: 摘要 card missing")
+        else: page_missing.append("i3912 消息: 邮箱 tab not found")
+        result_json("group", "i3912 mailoff", timeout=15)
+        route("plus_register_ledger", 6); r = shot("register-light")
+        if r is not None and not find(r, "一键注册"): page_missing.append("i3912 注册台账: 一键注册 missing")
+        o["reg"] = result_json("group", "i3912 reg", timeout=15)
+        route("plus_quick_connect", 5); r = shot("connect-light")
+        if r is not None and not (find(r, "钥匙服务") and find(r, "添加服务器")): page_missing.append("i3912 快速连接: 钥匙服务 / 添加服务器 missing")
+        route("plus_apps_hub", 4); r = shot("apps2-light")
+        if r is not None and not (find(r, "注册台账") and find(r, "快速连接")): page_missing.append("i3912 应用: new tiles missing")
+        a = selftest("group", "i3912 attn", timeout=15)
+        o["attn"] = str(a)[-160:]
+        if "ring=true" in str(a): selftest_fail.append(f"i3912 来电: needs-attention would ring while Mines is in the foreground: {a}")
+        back(1); time.sleep(1)
     def call():
         result_json("group", "i3912 call", timeout=15); time.sleep(4)
         r = shot("call")
@@ -7004,6 +7035,7 @@ def b3912(res):
     step("light", light_pages)
     step("kb", kb)
     step("dark", dark_pages)
+    step("pages2", pages2)
     step("call", call)
     try: result_json("group", "i3912 autoclean", timeout=20)
     except Exception: pass
@@ -7436,7 +7468,14 @@ def b39113(res):
         time.sleep(12)
         lines = tail(sid)
         stalls = [x for x in lines if x.get("t") == "stall"]
-        S["stalls"] = len(stalls); S["stall_ms_max"] = max([x.get("ms", 0) for x in stalls] or [0])
+        S["stalls"] = len(stalls)
+        # [38.9.12 driver] a main thread parked in HardwareRenderer (nSyncAndDrawFrame / nSetStopped) is waiting for the
+        # emulator's software-GPU RenderThread (SwiftShader), not running app code: gated separately at 4 s (smoke 39826658586:
+        # 2045 ms in nSetStopped on HOME, app-code max 780 ms)
+        def _render_wait(x): return any("HardwareRenderer" in l for l in x.get("stack", "").split("\n")[1:3])
+        S["render_wait_ms_max"] = max([x.get("ms", 0) for x in stalls if _render_wait(x)] or [0])
+        stalls = [x for x in stalls if not _render_wait(x)] + [x for x in stalls if _render_wait(x) and x.get("ms", 0) > 4000]
+        S["stall_ms_max"] = max([x.get("ms", 0) for x in stalls] or [0])
         S["stall_top"] = sorted([(x.get("ms"), x.get("page")) for x in stalls], key=lambda v: -(v[0] or 0))[:6]
         ks = [x for x in stalls if re.search(r"keystore|EncryptedSharedPreferences|crypto\.tink|EncryptedPrefsFactory", x.get("stack", ""), re.I)]
         S["keystore_stalls"] = len(ks); S["keystore_stall_stacks"] = [x.get("stack", "")[:600] for x in ks[:2]]
