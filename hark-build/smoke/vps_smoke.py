@@ -133,6 +133,10 @@ try:
 except Exception:
     I39112 = False
 try:
+    I3912 = "i3912" in open("hark-build/smoke/target").read().splitlines()[1:2][0].split()   # [38.9.12] new pages + 账号自动调用
+except Exception:
+    I3912 = False
+try:
     I39113 = "i39113" in open("hark-build/smoke/target").read().splitlines()[1:2][0]   # [38.9.11.3] provider latency + continuous fog drift + SSH cert
 except Exception:
     I39113 = False
@@ -3294,7 +3298,7 @@ def main():
         else: fns = (b387_linkall, b387_noblack, b387_persist, b387_platforms)
         if HUB: fns = tuple(fns) + (b3891_hub,)   # [38.9.1 c] hub runs after the UI passes
         if I395: fns = (b395_i2, b395_i) if I395B else (b395_i,)   # [38.9.5 i] build-i gate only: 一键关联 / 一键重新登录, gateway, new screens light + dark
-        if I39113: fns = (b39113,)
+        if I39113: fns = ((b3912,) if I3912 else ()) + (b39113,)
         elif I39112: fns = (b39112,)
         elif I39111: fns = (b39111,)
         elif I3911: fns = (b3911,)
@@ -6924,6 +6928,87 @@ def perf_39113(tag):
     go_home()
     print("PERF39113 " + json.dumps(P, ensure_ascii=False), flush=True)
     return P
+
+
+def b3912(res):
+    """[38.9.12] screenshots of the new / changed pages (light + dark) + the 账号自动调用 gate (GitHub-via-Google page with no
+    台账 password must press the provider button, never pop the password card, never type a password) + NEXUS HUD frames."""
+    o = res.setdefault("i3912", {})
+    def shot(name):
+        r = snap("i3912-" + name)
+        subprocess.run(f"cp {OUT}/{step_no:02d}-i3912-{name}.png {OUT}/i3912-{name}.png", shell=True)
+        return r
+    def step(name, f):
+        t0 = time.time()
+        try: f()
+        except Exception as e:
+            import traceback; traceback.print_exc(); page_missing.append(f"i3912 {name} error {e}")
+        print(f"I3912 STEP {name} {int(time.time() - t0)} s", flush=True)
+        if not alive(): crashed.append(f"i3912 {name}"); recover(f"i3912 {name}")
+    set_zh()
+    try: result_json("group", "wallpaper off")
+    except Exception: pass
+    def autologin():
+        r = result_json("group", "i3912 autologin", timeout=60) or {}
+        o["autologin"] = r; print("I3912 AUTOLOGIN " + json.dumps(r, ensure_ascii=False), flush=True)
+        if r.get("cardShown"): selftest_fail.append("i3912 autologin: password card popped for an account that signs in via Google")
+        if str(r.get("clicked")) != "1": selftest_fail.append(f"i3912 autologin: 'Continue with Google' not pressed: {r}")
+        if str(r.get("pwLen")) not in ("0", ""): selftest_fail.append(f"i3912 autologin: a password was typed: {r}")
+        if "Continue with Google" not in str(r.get("note")): selftest_fail.append(f"i3912 autologin: agent note wrong: {r.get('note')}")
+    def light_pages():
+        theme388(1); healthy_home(); shot("home-light")
+        route("plus_apps_hub", 5); shot("apps-light")
+        route("plus_auto_login", 4); shot("autologin-light")
+        route("plus_work_pool", 14); shot("workpool-light")
+        o["pool"] = result_json("group", "i3912 pool", timeout=15)
+        back(1); time.sleep(1)
+    def kb():
+        theme388(2); healthy_home()
+        result_json("group", "i3912 kbseed", timeout=30)
+        route("plus_knowledge", 5)
+        k0 = result_json("group", "i3912 kbstate", timeout=15) or {}
+        shot("kb"); time.sleep(3)
+        k1 = result_json("group", "i3912 kbstate", timeout=15) or {}
+        o["kb_frames"] = [k0.get("frames"), k1.get("frames")]
+        try:
+            if not (int(k1.get("frames", 0)) > int(k0.get("frames", 0)) + 5): selftest_fail.append(f"i3912 知识库 HUD not animating: {o['kb_frames']}")
+        except Exception as e: selftest_fail.append(f"i3912 kb frames {e}")
+        shot("kb-2")
+        result_json("group", "i3912 kbselect 0", timeout=15); time.sleep(4)
+        o["kb_sel"] = (result_json("group", "i3912 kbstate", timeout=15) or {}).get("selected")
+        r = shot("kb-focus")
+        if not o["kb_sel"]: selftest_fail.append("i3912 知识库: topic focus did not select")
+        if r is not None and not (find(r, "在对话中引用") and find(r, "生成主题摘要")): page_missing.append("i3912 kb detail buttons not in dump")
+        result_json("group", "i3912 kbselect -1", timeout=15); time.sleep(2)
+        # battery: frames stop while the app is in the background
+        sh("input keyevent KEYCODE_HOME"); time.sleep(2)
+        b0 = (result_json("group", "i3912 kbstate", timeout=15) or {}).get("frames"); time.sleep(4)
+        b1 = (result_json("group", "i3912 kbstate", timeout=15) or {}).get("frames")
+        o["kb_bg_frames"] = [b0, b1]
+        if b0 is not None and b1 is not None and int(b1) - int(b0) > 3: selftest_fail.append(f"i3912 知识库 HUD keeps drawing in the background: {o['kb_bg_frames']}")
+        adb("shell", "monkey", "-p", PKG, "-c", "android.intent.category.LAUNCHER", "1"); time.sleep(5)
+        result_json("group", "i3912 kbclean", timeout=30)
+    def dark_pages():
+        healthy_home(); shot("home-dark")
+        sh(f"am start -n {PKG}/com.openminis.app.MainActivity --es mines_route settings"); time.sleep(3)
+        route("settings", 4); shot("settings-dark")
+        route("plus_apps_hub", 4); shot("apps-dark")
+        route("plus_auto_login", 4); shot("autologin-dark")
+    def call():
+        result_json("group", "i3912 call", timeout=15); time.sleep(4)
+        r = shot("call")
+        if r is None or not (find(r, "接听") and find(r, "挂断") and find(r, "转文字")): selftest_fail.append("i3912 来电 screen buttons missing")
+        tap_text("挂断", exact=True, wait=3)
+        if not alive(): crashed.append("i3912 call hangup")
+    step("autologin", autologin)
+    step("light", light_pages)
+    step("kb", kb)
+    step("dark", dark_pages)
+    step("call", call)
+    try: result_json("group", "i3912 autoclean", timeout=20)
+    except Exception: pass
+    theme388(1)
+    print("I3912 RESULT " + json.dumps(o, ensure_ascii=False)[:6000], flush=True)
 
 
 def b39113(res):
