@@ -13844,10 +13844,10 @@ index 0000000..3ad00a5
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/AgentMailbox.kt b/src/android/app/src/main/java/com/openminis/app/plus/AgentMailbox.kt
 new file mode 100644
-index 0000000..faafdea
+index 0000000..d8d7acd
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/AgentMailbox.kt
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,258 @@
 +package com.openminis.app.plus
 +
 +import android.content.Context
@@ -13942,7 +13942,7 @@ index 0000000..faafdea
 +    /** 已开通 = has what it needs to read mail (a key, or the Mail.tm account). */
 +    fun ready(id: String): Boolean = when (id) {
 +        "mailtm" -> PlusVault.secretExtra(V, "mailtm_pass") != null && address("mailtm") != null
-+        "selfhost" -> false
++        "selfhost" -> selfConfig() != null && address("selfhost") != null   // [38.9.12.1] base + token (vault) + a domain from /api/health
 +        "agmail" -> false   // key can be saved; its read API is not wired / verified yet — never claimed as a code source
 +        else -> key(id) != null
 +    }
@@ -14018,6 +14018,73 @@ index 0000000..faafdea
 +        return if (c in 200..299) JSONObject(b).optString("token").takeIf { it.isNotBlank() } else null
 +    }
 +
++    // ---------------- [Mines-38.9.12.1] 自建域名 / Cloudflare (the user's own inbox API, SelfMailCore) ----------------
++
++    /** base URL + bearer token from the encrypted vault (never in code / prefs) */
++    fun selfConfig(): SelfMailCore.Config? {
++        val b = PlusVault.secretExtra(V, "selfhost_url")?.takeIf { it.isNotBlank() } ?: return null
++        val t = PlusVault.secretExtra(V, "selfhost_token")?.takeIf { it.isNotBlank() } ?: return null
++        return SelfMailCore.Config(b, t)
++    }
++    /** the domain /api/health reported (shown on the row) */
++    fun selfDomain(): String? = address("selfhost")
++
++    private val _selfMails = MutableStateFlow<List<MailParse.Mail>>(emptyList())
++    /** last read of the self-hosted inbox (验证码 tab) and the address each message went to */
++    val selfMails: StateFlow<List<MailParse.Mail>> = _selfMails.asStateFlow()
++    @Volatile var selfTo: Map<String, String> = emptyMap(); private set
++
++    private fun del(url: String, bearer: String): Pair<Int, String> =
++        exec(Request.Builder().url(url).header("Accept", "application/json").header("Authorization", "Bearer $bearer").delete().build())
++
++    /** 开通: GET /api/health with the token; saved only when it answers ok with a domain. null = ok, else a plain reason. */
++    suspend fun connectSelfHost(base: String, token: String): String? = withContext(Dispatchers.IO) {
++        val b = SelfMailCore.normBase(base) ?: return@withContext "地址要以 https:// 开头"
++        if (!SelfMailCore.tokenOk(token.trim())) return@withContext "令牌格式不对"
++        runCatching {
++            val (code, body) = get("$b/api/health", token.trim())
++            if (code == 401 || code == 403) return@runCatching "令牌不对（$code）"
++            if (code !in 200..299) return@runCatching "收件服务没有正常回复（HTTP $code）"
++            val dom = SelfMailCore.parseHealth(body) ?: return@runCatching "收件服务没有报告域名"
++            PlusVault.setSecretExtra(V, "selfhost_url", b); PlusVault.setSecretExtra(V, "selfhost_token", token.trim())
++            setAddress("selfhost", dom)
++            null
++        }.getOrElse { AiMailCore.netReason("自建域名", it.javaClass.simpleName, it.message) }
++    }
++
++    /** a new address on the user's domain (unlimited); null when not connected / it failed */
++    suspend fun selfNewAddress(prefix: String?): String? = withContext(Dispatchers.IO) {
++        val c = selfConfig() ?: return@withContext null
++        runCatching {
++            val (code, body) = post("${c.base}/api/mailboxes", JSONObject().apply { if (!prefix.isNullOrBlank()) put("prefix", prefix) }, c.token)
++            if (code in 200..299) SelfMailCore.parseAddress(body) else null
++        }.getOrNull()
++    }
++
++    suspend fun selfBoxes(): List<SelfMailCore.Box> = withContext(Dispatchers.IO) {
++        val c = selfConfig() ?: return@withContext emptyList()
++        runCatching { val (code, body) = get("${c.base}/api/mailboxes", c.token); if (code in 200..299) SelfMailCore.parseMailboxes(body) else emptyList() }.getOrDefault(emptyList())
++    }
++
++    suspend fun selfDelete(id: String): Boolean = withContext(Dispatchers.IO) {
++        val c = selfConfig() ?: return@withContext false
++        runCatching { del("${c.base}/api/messages/" + java.net.URLEncoder.encode(id.removePrefix("sh:"), "UTF-8"), c.token).first in 200..299 }.getOrDefault(false)
++    }
++
++    /** last 24 h of mail to the newest 8 addresses (the API reads per address) */
++    suspend fun selfRecent(): List<MailParse.Mail> = withContext(Dispatchers.IO) {
++        val c = selfConfig() ?: return@withContext emptyList()
++        val since = System.currentTimeMillis() - 24 * 3_600_000L
++        val out = ArrayList<MailParse.Mail>(); val to = HashMap<String, String>()
++        for (b in selfBoxes().sortedByDescending { it.createdAt }.take(8)) runCatching {
++            val (code, body) = get("${c.base}/api/messages?to=" + java.net.URLEncoder.encode(b.address, "UTF-8") + "&since=$since&limit=50", c.token)
++            if (code in 200..299) { out += SelfMailCore.parseMessages(body); to += SelfMailCore.toOf(body) }
++        }
++        val list = out.distinctBy { it.id }.sortedByDescending { it.at }
++        _selfMails.value = list; selfTo = to
++        list
++    }
++
 +    /** Recent mail of every ready AI 邮箱 (subject + preview only). */
 +    suspend fun recent(c: Context): List<MailParse.Mail> = withContext(Dispatchers.IO) {
 +        val out = ArrayList<MailParse.Mail>()
@@ -14026,6 +14093,7 @@ index 0000000..faafdea
 +            val (code, body) = get("https://api.agentmail.to/v0/inboxes/" + java.net.URLEncoder.encode(id, "UTF-8") + "/messages?limit=10", key("agentmail"))
 +            if (code in 200..299) out += CodeSourcesCore.agentMailMessages(body)
 +        }
++        if (ready("selfhost")) runCatching { out += selfRecent() }
 +        if (ready("mailtm")) runCatching {
 +            mailTmToken()?.let { t -> val (code, body) = get("https://api.mail.tm/messages?page=1", t); if (code in 200..299) out += CodeSourcesCore.mailTmMessages(body) }
 +        }
@@ -14033,6 +14101,7 @@ index 0000000..faafdea
 +    }
 +
 +    fun disconnect(id: String) {
++        if (id == "selfhost") { PlusVault.setSecretExtra(V, "selfhost_url", null); PlusVault.setSecretExtra(V, "selfhost_token", null); _selfMails.value = emptyList() }
 +        setKey(id, null); setAddress(id, null)
 +        if (id == "mailtm") PlusVault.setSecretExtra(V, "mailtm_pass", null)
 +    }
@@ -20941,10 +21010,10 @@ index 0000000..95104c4
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/Inbox3912Core.kt b/src/android/app/src/main/java/com/openminis/app/plus/Inbox3912Core.kt
 new file mode 100644
-index 0000000..8627583
+index 0000000..6bc929a
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/Inbox3912Core.kt
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,100 @@
 +package com.openminis.app.plus
 +
 +/**
@@ -21027,6 +21096,14 @@ index 0000000..8627583
 +        append("1. 用 accounts(action=register_pick, site=$url, n=1) 从台账取一个还没在该平台注册过的邮箱，并生成强密码（自动存进台账，备注 注册中）")
 +        if (!tempBox.isNullOrBlank()) append("；没有可用邮箱时用临时邮箱 $tempBox")
 +        append("。\n2. 打开注册页填写，验证码从邮箱自动读取。\n3. 完成后调用 accounts(action=register_done, ok=true)，失败则 ok=false。\n")
++        append("遵守平台规则：一人一号、不批量注册；遇到人机验证、手机号验证或付款时停下来叫我，不要绕过。")
++    }
++
++    /** [Mines-38.9.12.1] register with a fresh address on the user's own domain (codes are read from that inbox) */
++    fun registerTaskSelf(platform: String, url: String, address: String): String = buildString {
++        append("帮我注册 $platform（$url）。\n")
++        append("1. 用这个新邮箱注册：$address（我自己的域名，收件已接通）。用 accounts(action=register_pick, site=$url, n=1) 生成强密码并存进台账（备注 注册中），账号填这个邮箱。\n")
++        append("2. 打开注册页填写，验证码会从这个邮箱自动读取。\n3. 完成后调用 accounts(action=register_done, ok=true)，失败则 ok=false。\n")
 +        append("遵守平台规则：一人一号、不批量注册；遇到人机验证、手机号验证或付款时停下来叫我，不要绕过。")
 +    }
 +
@@ -23107,10 +23184,10 @@ index 0000000..10f5af9
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/MailInbox.kt b/src/android/app/src/main/java/com/openminis/app/plus/MailInbox.kt
 new file mode 100644
-index 0000000..79aa3e6
+index 0000000..48631dd
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/MailInbox.kt
-@@ -0,0 +1,373 @@
+@@ -0,0 +1,375 @@
 +package com.openminis.app.plus
 +
 +import android.content.Context
@@ -23280,6 +23357,8 @@ index 0000000..79aa3e6
 +                }
 +            }
 +            _mails.value = all.distinctBy { it.id }.sortedByDescending { it.at }
++            // [Mines-38.9.12.1] the self-hosted domain inbox feeds the 验证码 tab too (when connected)
++            if (!fake && AgentMailbox.ready("selfhost")) runCatching { withTimeoutOrNull(20_000L) { AgentMailbox.selfRecent() } }
 +            // [Mines-38.8] welcome / verify-your-email mail from a site not in 账号关联 yet → recorded (no reminder needed)
 +            if (!fake) _mails.value.take(60).forEach { m -> runCatching { AutoAccounts.onMail(context, m.from, m.fromAddr, m.subject, m.address) } }
 +            // [Mines-38.9] new-device / abnormal sign-in mails → 账号关联 alert (是我 / 不是我)
@@ -27552,6 +27631,115 @@ index 0000000..62b87de
 +        var out = text
 +        values.filter { it.length >= 4 }.sortedByDescending { it.length }.forEach { v -> out = out.replace(v, "••••") }
 +        return out
++    }
++}
+diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SelfMailCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/SelfMailCore.kt
+new file mode 100644
+index 0000000..d996551
+--- /dev/null
++++ b/src/android/app/src/main/java/com/openminis/app/plus/SelfMailCore.kt
+@@ -0,0 +1,103 @@
++package com.openminis.app.plus
++
++import org.json.JSONArray
++import org.json.JSONObject
++
++/**
++ * [Mines-38.9.12.1] user 2026-10-23 08:07: 「自建域名 / Cloudflare」 always said 未开通. Client rules for the user's own
++ * inbox API (Cloudflare Email Routing catch-all → Worker → KV), pure and unit-tested (SelfMailCoreTest):
++ *   GET /api/health → {ok, domain} · POST /api/mailboxes {prefix?} → {address} · GET /api/mailboxes → [{address, createdAt, count}]
++ *   GET /api/messages?to=&since=&limit= → [{id, to, from, subject, text, html?, receivedAt}] · DELETE /api/messages/<id>
++ * Auth: `Authorization: Bearer <token>`. The token is only ever stored in the encrypted vault, never in code.
++ */
++object SelfMailCore {
++    const val SOURCE = "自建域名"
++
++    data class Config(val base: String, val token: String)
++    data class Box(val address: String, val createdAt: Long, val count: Int)
++
++    /**
++     * What the user pasted: `mines-mail://<host>/<path>#<token>` (→ https://<host>/<path>), or an https URL and the token
++     * on separate lines (either order). Null when there is no https base or no token.
++     */
++    fun parseConfig(raw: String?): Config? {
++        val s = raw?.trim().orEmpty()
++        if (s.isEmpty()) return null
++        if (s.startsWith("mines-mail://", ignoreCase = true)) {
++            val rest = s.substring("mines-mail://".length)
++            val hash = rest.indexOf('#'); if (hash <= 0) return null
++            val token = rest.substring(hash + 1).trim()
++            val base = normBase("https://" + rest.substring(0, hash)) ?: return null
++            return if (tokenOk(token)) Config(base, token) else null
++        }
++        val parts = s.split('\n', '\r', ' ', '\t').map { it.trim() }.filter { it.isNotEmpty() }
++        val url = parts.firstOrNull { it.startsWith("https://", true) } ?: return null
++        val token = parts.firstOrNull { it != url && tokenOk(it) } ?: return null
++        return normBase(url)?.let { Config(it, token) }
++    }
++
++    /** https only, no trailing slash, no query / fragment, no trailing "/api" (the client adds it) */
++    fun normBase(u: String?): String? {
++        val s = u?.trim().orEmpty().substringBefore('#').substringBefore('?').trimEnd('/')
++        if (!s.startsWith("https://", true)) return null
++        val host = s.substring(8).substringBefore('/')
++        if (host.isBlank() || !host.contains('.') || host.any { it.isWhitespace() }) return null
++        return s.removeSuffix("/api")
++    }
++
++    fun tokenOk(t: String?): Boolean = t != null && t.length in 16..512 && t.none { it.isWhitespace() || it == '#' } && !t.startsWith("http", true)
++
++    /** {ok:true, domain:"x"} → "x" (null when not ok) */
++    fun parseHealth(json: String): String? = runCatching {
++        val o = JSONObject(json)
++        if (!o.optBoolean("ok", false)) null else o.optString("domain").trim().lowercase().takeIf { it.contains('.') }
++    }.getOrNull()
++
++    fun parseAddress(json: String): String? = runCatching { JSONObject(json).optString("address").trim().takeIf { it.contains('@') } }.getOrNull()
++
++    private fun arr(json: String, key: String): JSONArray? = runCatching {
++        val t = json.trim(); if (t.startsWith("[")) JSONArray(t) else JSONObject(t).optJSONArray(key)
++    }.getOrNull()
++
++    fun parseMailboxes(json: String): List<Box> {
++        val a = arr(json, "mailboxes") ?: return emptyList()
++        return (0 until a.length()).mapNotNull { i ->
++            val o = a.optJSONObject(i) ?: return@mapNotNull null
++            val ad = o.optString("address").trim(); if (!ad.contains('@')) return@mapNotNull null
++            Box(ad, time(o.opt("createdAt")), o.optInt("count", 0))
++        }
++    }
++
++    /** messages → MailParse.Mail (source 自建域名); the html part is only used when there is no text */
++    fun parseMessages(json: String): List<MailParse.Mail> {
++        val a = arr(json, "messages") ?: return emptyList()
++        return (0 until a.length()).mapNotNull { i ->
++            val o = a.optJSONObject(i) ?: return@mapNotNull null
++            val id = o.optString("id"); if (id.isBlank()) return@mapNotNull null
++            val text = o.optString("text").ifBlank { stripHtml(o.optString("html")) }
++            MailParse.Mail("sh:$id", SOURCE, o.optString("from"), o.optString("subject"), text.take(4000), time(o.opt("receivedAt")))
++        }
++    }
++
++    /** the address a message was sent to (for the 验证码 row), from the same JSON */
++    fun toOf(json: String): Map<String, String> {
++        val a = arr(json, "messages") ?: return emptyMap()
++        return (0 until a.length()).mapNotNull { i -> a.optJSONObject(i)?.let { "sh:" + it.optString("id") to it.optString("to") } }.toMap()
++    }
++
++    /** epoch ms number, epoch seconds, or ISO text → ms */
++    fun time(v: Any?): Long = when (v) {
++        is Number -> v.toLong().let { if (it in 1..99_999_999_999L) it * 1000 else it }
++        is String -> v.toLongOrNull()?.let { time(it) } ?: CodeSourcesCore.iso(v)
++        else -> 0L
++    }
++
++    fun stripHtml(h: String): String = h.replace(Regex("(?is)<(script|style)[^>]*>.*?</\\1>"), " ").replace(Regex("<[^>]+>"), " ")
++        .replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace(Regex("\\s+"), " ").trim()
++
++    /** prefix for a new address: platform name → lowercase letters / digits, ≤ 16, plus a short suffix */
++    fun prefixFor(platform: String, n: Int): String {
++        val p = platform.lowercase().filter { it in 'a'..'z' || it in '0'..'9' }.take(16).ifEmpty { "mines" }
++        return p + "-" + n.toString(36).takeLast(4)
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/SelfMap.kt b/src/android/app/src/main/java/com/openminis/app/plus/SelfMap.kt
@@ -43322,10 +43510,10 @@ index 0000000..ea7dd8b
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/CodeSourcesScreen.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/CodeSourcesScreen.kt
 new file mode 100644
-index 0000000..0ca7d67
+index 0000000..dcc6ea7
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/CodeSourcesScreen.kt
-@@ -0,0 +1,215 @@
+@@ -0,0 +1,254 @@
 +package com.openminis.app.ui.plus
 +
 +import android.widget.Toast
@@ -43391,7 +43579,8 @@ index 0000000..0ca7d67
 +    var keyFor by remember { mutableStateOf<CodeSourcesCore.Provider?>(null) }
 +    var busy by remember { mutableStateOf<String?>(null) }
 +    var mailTmErr by remember { mutableStateOf<String?>(null) }
-+    var showAdv by remember { mutableStateOf(false) }
++    var showAdv by remember { mutableStateOf(AgentMailbox.ready("selfhost")) }
++    var selfOpen by remember { mutableStateOf(false) }   // [38.9.12.1] 自建域名 开通 dialog
 +    // [38.9.11.1] 打开官网 opens inside Mines (was a Custom Tab that failed silently on the user's phone)
 +    var webFor by remember { mutableStateOf<Pair<String, String>?>(null) }   // name, url
 +    webFor?.let { (name, url) ->
@@ -43451,12 +43640,49 @@ index 0000000..0ca7d67
 +            Text("高级 · 可选", fontSize = MT.Meta, color = m.ink2, modifier = Modifier.weight(1f))
 +            MinesIcon(MinesIcons.named(if (showAdv) "chevron-up" else "chevron-down")!!, if (showAdv) "收起高级选项" else "展开高级选项", tint = m.ink3, modifier = Modifier.size(16.dp))
 +        }
-+        if (showAdv) PlusSection(null, footer = "需要自己的域名和 Cloudflare 账号；多数用户不需要。") {
++        if (showAdv) PlusSection(null, footer = "需要自己的域名和 Cloudflare 账号（收件服务部署在你的 Cloudflare 上）；多数用户不需要。") {
 +            CodeSourcesCore.PROVIDERS.filter { it.advanced }.forEach { p ->
-+                PlusRow(MinesIcons.named("globe"), p.name, p.limits, value = "未开通", chevron = false)
++                // [Mines-38.9.12.1] the user's own inbox API on Cloudflare: 开通 (URL + token) / domain / 断开
++                CsProviderRow(p, rev, busy == p.id, null, onOpen = { webFor = p.name to p.url }, onKey = { selfOpen = true },
++                    onOpenMailTm = {}, onDisconnect = { AgentMailbox.disconnect(p.id); rev++ })
 +            }
 +        }
 +        Spacer(Modifier.size(24.dp))
++    }
++
++    if (selfOpen) {
++        var url by remember { mutableStateOf(AgentMailbox.selfConfig()?.base.orEmpty()) }
++        var token by remember { mutableStateOf("") }
++        var err by remember { mutableStateOf<String?>(null) }
++        AlertDialog(
++            onDismissRequest = { selfOpen = false },
++            title = { Text("开通自建域名收件", fontSize = MT.PageTitle) },
++            text = {
++                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
++                    Text("填收件服务的地址和令牌（部署在你的 Cloudflare 上）。令牌只存进保险箱。", fontSize = MT.Sub, color = m.ink2)
++                    OutlinedTextField(url, { url = it.trim(); err = null }, singleLine = true,
++                        placeholder = { Text("https://…", fontSize = MT.Sub) }, modifier = Modifier.fillMaxWidth())
++                    OutlinedTextField(token, { token = it.trim(); err = null }, singleLine = true, visualTransformation = PasswordVisualTransformation(),
++                        placeholder = { Text("令牌", fontSize = MT.Sub) }, modifier = Modifier.fillMaxWidth())
++                    Text("从剪贴板粘贴", fontSize = MT.Sub, color = m.primaryText, modifier = Modifier.clickable {
++                        val clip = runCatching { ctx.getSystemService(android.content.ClipboardManager::class.java)?.primaryClip?.getItemAt(0)?.coerceToText(ctx)?.toString() }.getOrNull()
++                        val cfg = com.openminis.app.plus.SelfMailCore.parseConfig(clip)
++                        if (cfg != null) { url = cfg.base; token = cfg.token; err = null } else err = "剪贴板里没有 mines-mail:// 链接或「https 地址 + 令牌」"
++                    }.padding(vertical = 6.dp).semantics { contentDescription = "从剪贴板粘贴" })
++                    err?.let { Text(it, fontSize = MT.Sub, color = toneColors(Tone.DANGER).first) }
++                }
++            },
++            confirmButton = {
++                TextButton(enabled = busy == null, onClick = {
++                    busy = "selfhost"
++                    scope.launch {
++                        val why = AgentMailbox.connectSelfHost(url, token); busy = null
++                        if (why == null) { selfOpen = false; rev++; Toast.makeText(ctx, "已开通：@${AgentMailbox.selfDomain()}", Toast.LENGTH_SHORT).show() } else err = why
++                    }
++                }) { Text(if (busy == "selfhost") "验证中…" else "开通") }
++            },
++            dismissButton = { TextButton(onClick = { selfOpen = false }) { Text("取消") } },
++        )
 +    }
 +
 +    keyFor?.let { p ->
@@ -43512,12 +43738,13 @@ index 0000000..0ca7d67
 +            }
 +        }
 +        Text(p.limits, fontSize = MT.Sub, color = m.ink2, modifier = Modifier.padding(top = 2.dp))
-+        if (ready && addr != null) Text(addr, fontSize = MT.Sub, color = m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis)
++        if (ready && addr != null) Text(if (p.id == "selfhost") "@$addr · 地址不限量" else addr, fontSize = MT.Sub, color = m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis)
 +        if (keyOnly) Text("读码接口尚未接通（未验证）", fontSize = MT.Sub, color = m.ink3)
 +        if (p.down) { Text(p.note, fontSize = MT.Sub, color = m.ink2, modifier = Modifier.padding(top = 2.dp)); if (keyOnly) Row(Modifier.padding(top = 8.dp)) { SmallPill("断开") { onDisconnect() } }; return@Column }
 +        if (err != null && !ready) Text(err, fontSize = MT.Sub, color = toneColors(Tone.DANGER).first, modifier = Modifier.padding(top = 2.dp))
 +        Row(Modifier.padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
 +            if (ready || keyOnly) SmallPill("断开") { onDisconnect() }
++            else if (p.id == "selfhost") SmallPill("开通") { onKey() }
 +            else if (p.needsKey) { SmallPill("打开官网") { onOpen() }; SmallPill("填 API Key") { onKey() } }
 +            else SmallPill(if (busy) "开通中…" else "开通临时邮箱") { if (!busy) onOpenMailTm() }
 +        }
@@ -47110,10 +47337,10 @@ index 0000000..543ce3e
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/Hub3912b.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/Hub3912b.kt
 new file mode 100644
-index 0000000..95ade33
+index 0000000..110ac15
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/Hub3912b.kt
-@@ -0,0 +1,370 @@
+@@ -0,0 +1,389 @@
 +package com.openminis.app.ui.plus
 +
 +import androidx.compose.foundation.background
@@ -47163,7 +47390,9 @@ index 0000000..95ade33
 +private fun ic2(n: String) = com.openminis.app.ui.brand.MinesIcons.named(n)!!
 +
 +object Codes3912 {
-+    fun lite(mails: List<MailInbox.Mail>) = mails.map { Inbox3912Core.MailLite(it.id, it.from.ifBlank { it.fromAddr } + " <" + it.fromAddr + ">", it.subject, it.text, it.at, it.address) }
++    fun lite(mails: List<MailInbox.Mail>) = mails.map { Inbox3912Core.MailLite(it.id, it.from.ifBlank { it.fromAddr } + " <" + it.fromAddr + ">", it.subject, it.text, it.at, it.address) } +
++        // [Mines-38.9.12.1] + mail to the user's own domain (自建域名)
++        com.openminis.app.plus.AgentMailbox.selfMails.value.map { Inbox3912Core.MailLite(it.id, it.from, it.subject, it.text, it.at, com.openminis.app.plus.AgentMailbox.selfTo[it.id].orEmpty()) }
 +    fun all(mails: List<MailInbox.Mail>, now: Long = System.currentTimeMillis()) =
 +        Inbox3912Core.codes(lite(mails), now) { com.openminis.app.plus.MailParse.extractCode(it) }
 +    fun fresh(mails: List<MailInbox.Mail>) = all(mails).filter { it.fresh }
@@ -47285,13 +47514,16 @@ index 0000000..95ade33
 +    val all = rows.orEmpty()
 +    val groups = remember(all) { Inbox3912Core.byMailbox(all) }
 +    val temp = com.openminis.app.plus.AgentMailbox.address("mailtm")
++    // [Mines-38.9.12.1] the user's own domain (unlimited addresses) is the preferred source when connected
++    val selfDom = remember { if (com.openminis.app.plus.AgentMailbox.ready("selfhost")) com.openminis.app.plus.AgentMailbox.selfDomain() else null }
++    var useSelf by remember { mutableStateOf(selfDom != null) }
 +    PlusPage("注册台账", onBack, actions = {
 +        Box(Modifier.size(40.dp).clip(CircleShape).clickable { pick = true }.semantics { contentDescription = "一键注册" }, contentAlignment = Alignment.Center) {
 +            MinesIcon(ic2("plus"), null, tint = m.ink, modifier = Modifier.size(20.dp))
 +        }
 +    }) {
 +        Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-+            Tile3912("临时邮箱", "${boxes.size}", if (temp != null) "Mail.tm 可用" else "未创建", Modifier.weight(1f))
++            Tile3912("临时邮箱", if (selfDom != null) "∞" else "${boxes.size}", if (selfDom != null) "自建域名 @$selfDom" else if (temp != null) "Mail.tm 可用" else "未创建", Modifier.weight(1f))
 +            Tile3912("已注册平台", if (rows == null) "…" else "${all.map { it.host }.distinct().size}",
 +                "已验证 ${all.count { it.st == Inbox3912Core.RegSt.DONE }} · 未完成 ${all.count { it.st == Inbox3912Core.RegSt.PENDING }}", Modifier.weight(1f))
 +        }
@@ -47299,9 +47531,9 @@ index 0000000..95ade33
 +            Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
 +                Row(verticalAlignment = Alignment.CenterVertically) {
 +                    Text("一键注册", fontSize = MT.Body, fontWeight = FontWeight.Medium, color = m.ink, modifier = Modifier.weight(1f))
-+                    Text(busy ?: (if (temp == null) "新建临时邮箱" else "开始注册"), fontSize = MT.Sub, color = Color(0xFFC0633F),
++                    Text(busy ?: (if (temp == null && selfDom == null) "新建临时邮箱" else "开始注册"), fontSize = MT.Sub, color = Color(0xFFC0633F),
 +                        modifier = Modifier.clip(RoundedCornerShape(50)).background(Color(0x22C0633F)).clickable(enabled = busy == null) {
-+                            if (temp != null) { pick = true; return@clickable }
++                            if (temp != null || selfDom != null) { pick = true; return@clickable }
 +                            busy = "正在创建…"
 +                            scope.launch {
 +                                val why = com.openminis.app.plus.AgentMailbox.openMailTm()
@@ -47345,10 +47577,24 @@ index 0000000..95ade33
 +        title = { Text("选择要注册的平台") },
 +        text = {
 +            Column {
++                // [Mines-38.9.12.1] mailbox source: 自建域名 (a fresh address per platform) or the Mail.tm box
++                if (selfDom != null) Row(Modifier.fillMaxWidth().padding(bottom = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                    listOf(true to "自建域名", false to (if (temp != null) "Mail.tm" else "台账邮箱")).forEach { (v, label) ->
++                        Text(label, fontSize = MT.Sub, color = if (useSelf == v) Color.White else m.ink,
++                            modifier = Modifier.clip(RoundedCornerShape(50)).background(if (useSelf == v) Color(0xFFC0633F) else Color(0x14000000))
++                                .clickable { useSelf = v }.padding(horizontal = 12.dp, vertical = 5.dp).semantics { contentDescription = "邮箱来源 $label" })
++                    }
++                }
 +                Inbox3912Core.PLATFORMS.forEach { (name, url) ->
 +                    Text(name, fontSize = MT.Body, color = m.ink, modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).clickable {
 +                        pick = false
-+                        startDraft(ctx, Inbox3912Core.registerTask(name, url, temp))
++                        if (selfDom != null && useSelf) scope.launch {
++                            busy = "正在建邮箱…"
++                            val addr = com.openminis.app.plus.AgentMailbox.selfNewAddress(com.openminis.app.plus.SelfMailCore.prefixFor(name, (System.currentTimeMillis() / 1000).toInt()))
++                            busy = null
++                            if (addr == null) android.widget.Toast.makeText(ctx, "自建域名没建出邮箱，先用台账邮箱", android.widget.Toast.LENGTH_LONG).show()
++                            startDraft(ctx, if (addr != null) Inbox3912Core.registerTaskSelf(name, url, addr) else Inbox3912Core.registerTask(name, url, temp))
++                        } else startDraft(ctx, Inbox3912Core.registerTask(name, url, temp))
 +                    }.padding(vertical = 10.dp, horizontal = 6.dp))
 +                }
 +            }
@@ -65402,6 +65648,65 @@ index 0000000..2f17e86
 +        val t = C.scrub("pw=hunter2 and hunter22 and abc", listOf("hunter2", "hunter22", "abc"))
 +        assertEquals("pw=•••• and •••• and abc", t)
 +        assertEquals("x", C.scrub("x", emptyList()))
++    }
++}
+diff --git a/src/android/app/src/test/java/com/openminis/app/plus/SelfMailCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/SelfMailCoreTest.kt
+new file mode 100644
+index 0000000..b459223
+--- /dev/null
++++ b/src/android/app/src/test/java/com/openminis/app/plus/SelfMailCoreTest.kt
+@@ -0,0 +1,53 @@
++package com.openminis.app.plus
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/** [Mines-38.9.12.1] self-hosted inbox API client parsing (no token in code: test tokens are made up). */
++class SelfMailCoreTest {
++    private val tok = "tEsT_0123456789abcdefXYZ"
++
++    @Test fun config() {
++        val c = SelfMailCore.parseConfig("mines-mail://mail.example.org/inbox#$tok")!!
++        assertEquals("https://mail.example.org/inbox", c.base); assertEquals(tok, c.token)
++        val d = SelfMailCore.parseConfig("https://mail.example.org/api/\n$tok\n")!!
++        assertEquals("https://mail.example.org", d.base)
++        assertEquals("https://x.example.org", SelfMailCore.parseConfig("$tok\nhttps://x.example.org")!!.base)
++        assertNull(SelfMailCore.parseConfig("http://mail.example.org\n$tok"))     // https only
++        assertNull(SelfMailCore.parseConfig("mines-mail://mail.example.org#short"))
++        assertNull(SelfMailCore.parseConfig("https://mail.example.org"))
++        assertNull(SelfMailCore.parseConfig(""))
++    }
++
++    @Test fun health() {
++        assertEquals("ydn44086.dpdns.org", SelfMailCore.parseHealth("""{"ok":true,"domain":"ydn44086.dpdns.org"}"""))
++        assertNull(SelfMailCore.parseHealth("""{"ok":false}"""))
++        assertNull(SelfMailCore.parseHealth("not json"))
++        assertEquals("a1@ydn44086.dpdns.org", SelfMailCore.parseAddress("""{"address":"a1@ydn44086.dpdns.org"}"""))
++    }
++
++    @Test fun mailboxes() {
++        val b = SelfMailCore.parseMailboxes("""[{"address":"gh-1@d.org","createdAt":1761180000000,"count":3},{"address":"bad"}]""")
++        assertEquals(1, b.size); assertEquals(3, b[0].count); assertEquals(1761180000000L, b[0].createdAt)
++        assertEquals(1, SelfMailCore.parseMailboxes("""{"mailboxes":[{"address":"x@d.org","createdAt":"2026-10-23T00:00:00Z"}]}""").size)
++    }
++
++    @Test fun messages() {
++        val j = """[{"id":"m1","to":"gh-1@d.org","from":"GitHub <noreply@github.com>","subject":"Your code","text":"Code: 482913","receivedAt":1761180000000},
++                    {"id":"m2","to":"gh-1@d.org","from":"x@y.com","subject":"s","text":"","html":"<p>Hi <b>there</b> 123456</p>","receivedAt":1761180000},
++                    {"to":"no-id@d.org"}]"""
++        val ms = SelfMailCore.parseMessages(j)
++        assertEquals(2, ms.size)
++        assertEquals("sh:m1", ms[0].id); assertEquals(SelfMailCore.SOURCE, ms[0].source); assertEquals(1761180000000L, ms[0].at)
++        assertEquals("Hi there 123456", ms[1].text); assertEquals(1761180000000L, ms[1].at)   // seconds → ms
++        assertEquals("gh-1@d.org", SelfMailCore.toOf(j)["sh:m1"])
++        assertTrue(SelfMailCore.parseMessages("garbage").isEmpty())
++    }
++
++    @Test fun prefix() {
++        assertTrue(SelfMailCore.prefixFor("Hugging Face", 123456).startsWith("huggingface-"))
++        assertTrue(SelfMailCore.prefixFor("中文", 1).startsWith("mines-"))
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/SelfMapCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/SelfMapCoreTest.kt
