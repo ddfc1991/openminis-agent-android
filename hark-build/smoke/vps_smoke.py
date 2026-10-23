@@ -137,6 +137,10 @@ try:
 except Exception:
     I3912 = False
 try:
+    I39121 = "i39121" in open("hark-build/smoke/target").read().splitlines()[1:2][0].split()   # [38.9.12.1] OOM hotfix repro + safe start
+except Exception:
+    I39121 = False
+try:
     I39113 = "i39113" in open("hark-build/smoke/target").read().splitlines()[1:2][0]   # [38.9.11.3] provider latency + continuous fog drift + SSH cert
 except Exception:
     I39113 = False
@@ -3298,7 +3302,7 @@ def main():
         else: fns = (b387_linkall, b387_noblack, b387_persist, b387_platforms)
         if HUB: fns = tuple(fns) + (b3891_hub,)   # [38.9.1 c] hub runs after the UI passes
         if I395: fns = (b395_i2, b395_i) if I395B else (b395_i,)   # [38.9.5 i] build-i gate only: 一键关联 / 一键重新登录, gateway, new screens light + dark
-        if I39113: fns = ((b3912,) if I3912 else ()) + (b39113,)
+        if I39113: fns = ((b39121,) if I39121 else ()) + ((b3912,) if I3912 else ()) + (b39113,)
         elif I39112: fns = (b39112,)
         elif I39111: fns = (b39111,)
         elif I3911: fns = (b3911,)
@@ -6713,7 +6717,9 @@ def finish(lc):
     fatal = [i for i, l in enumerate(log)
              if ("FATAL EXCEPTION" in l or "Fatal signal" in l or " ANR in " in l)
              and PKG in "\n".join(log[i:i + 4])
-             and "CrashedByAdbException" not in "\n".join(log[i:i + 4])]   # [i30] am crash in the i3910 Clash step is intentional
+             and "CrashedByAdbException" not in "\n".join(log[i:i + 4])
+             and "MinesSmokeOomSimulation" not in "\n".join(log[i:i + 6])]   # [38.9.12.1] the i39121 OOM kill is intentional   # [i30] am crash in the i3910 Clash step is intentional
+    print("intentional OOM-simulation FATALs (not counted):", sum(1 for l in log if "MinesSmokeOomSimulation" in l and "OutOfMemoryError" in l), flush=True)
     print("intentional am crash FATALs (not counted):", sum(1 for l in log if "CrashedByAdbException: shell-induced crash" in l and "AndroidRuntime" in l), flush=True)
     print("=" * 30, "FATAL EXCEPTIONS:", len(fatal), flush=True)
     for i in fatal:
@@ -7041,6 +7047,220 @@ def b3912(res):
     except Exception: pass
     theme388(1)
     print("I3912 RESULT " + json.dumps(o, ensure_ascii=False)[:6000], flush=True)
+
+
+def b39121(res):
+    """[38.9.12.1] OOM hotfix: reproduce the user's 2026-10-23 state — 5 agent sessions holding slots, one ~300-message chat
+    (newest, so the old auto-reopen would land in it), repeated browser screenshots in 5 pools at once on a desktop viewport
+    (≈ 9 Mpx, the size that asked for 36 MB) — then an OutOfMemoryError on the main thread through the real crash path, and a
+    relaunch that must start into safe mode: home (not the long chat), card 「上次内存不足退出，已暂停 5 个任务」, 0 crash."""
+    o = res.setdefault("i39121", {})
+    def shot(name):
+        r = snap("i39121-" + name)
+        subprocess.run(f"cp {OUT}/{step_no:02d}-i39121-{name}.png {OUT}/i39121-{name}.png", shell=True)
+        return r
+    def fail(m): selftest_fail.append("i39121 " + m); print("I39121 FAIL " + m, flush=True)
+    set_zh(); healthy_home()
+    # (A) stale ":acra" process holding WebView while the main process launches (user's crash loop 07:20, restartCount 122)
+    try:
+        a = result_json("group", "i39121 acrastart", timeout=60) or {}
+        o["acra_start"] = a; print("I39121 ACRA " + json.dumps(a, ensure_ascii=False), flush=True)
+        if not any(":acra" in str(p) for p in (a.get("procs") or [])): fail(f":acra probe process not running: {a}")
+        if a.get("err"): fail(f":acra probe WebView failed: {a.get('err')}")
+        sh("logcat -b crash -c")
+        result_json("group", "i39121 killmain", timeout=20)
+        for _ in range(15):
+            time.sleep(1)
+            if not alive(): break
+        o["acra_alive_after_kill"] = sh(f"pidof {PKG}:acra").strip()
+        if not o["acra_alive_after_kill"]: fail(":acra probe died with the main process (test not meaningful)")
+        print(sh(f"am start -W -n {PKG}/com.openminis.app.MainActivity", timeout=90)[-300:], flush=True); time.sleep(12)
+        o["acra_main_alive"] = alive()
+        if not o["acra_main_alive"]: fail("main process not running after launch beside a live :acra"); crashed.append("i39121 acra"); recover("i39121 acra")
+        w = result_json("group", "i39121 webcheck", timeout=40) or {}
+        o["acra_webcheck"] = w; print("I39121 ACRA WEBCHECK " + json.dumps(w, ensure_ascii=False), flush=True)
+        if "webcheck-ok" not in str(w.get("title")): fail(f"WebView in main beside :acra failed: {w}")
+        cb = adb("logcat", "-d", "-b", "crash", timeout=30)
+        o["acra_lock_crash"] = "more than one process" in cb
+        if o["acra_lock_crash"] or "FATAL EXCEPTION" in cb: fail("crash after launching beside :acra: " + cb[-800:])
+        shot("acra-main")
+        set_zh(); healthy_home()
+    except Exception as e:
+        import traceback; traceback.print_exc(); fail(f"acra step error {e}")
+    # (B) 首页 reverted to 38.9.11.3.1 (no 今日概览) · 来电 转文字 / 接听 stay on the call screen
+    try:
+        r = healthy_home(); shot("home")
+        for bad in ("今日概览", "账号巡查"):
+            if r is not None and find(r, bad): fail(f"home still shows {bad}")
+        sh(f"pm grant {PKG} android.permission.RECORD_AUDIO")
+        result_json("group", "i3912 call", timeout=20); time.sleep(4); rr = shot("call-ring")
+        if rr is not None and any("示例" in t for t in texts(rr)): fail("ring screen still says 示例")
+        if tap_text("转文字", exact=True, wait=4):
+            r = dump(); shot("call-text")
+            o["call_text"] = result_json("group", "i39121 callstate", timeout=15)
+            if not (r is not None and find(r, "打开对话") and find(r, "Vultr")): fail(f"转文字 did not show the text on the call screen: {o['call_text']}")
+            tap_text("关闭", exact=True, wait=2)
+        else: fail("转文字 button missing")
+        result_json("group", "i3912 call", timeout=20); time.sleep(4)
+        if tap_text("接听", exact=True, wait=10):
+            r = dump(); shot("call-incall")
+            o["call_in"] = result_json("group", "i39121 callstate", timeout=15)
+            print("I39121 CALL " + json.dumps(o["call_in"], ensure_ascii=False), flush=True)
+            if not (r is not None and find(r, "通话中") and find(r, "静音") and find(r, "挂断")): fail(f"接听 did not turn into the in-call screen: {o['call_in']}")
+            if r is not None and find(r, "实时语音"): fail("接听 jumped to the 实时语音 page")
+            if r is not None and not (find(r, "扬声器") and any(re.search(r"通话中 \d\d:\d\d", t) for t in texts(r))): fail("in-call timer / 扬声器 missing")
+            if r is not None and any("示例" in t for t in texts(r)): fail("in-call screen says 示例")
+            act = sh("dumpsys activity activities | grep -E 'topResumedActivity|mResumedActivity' | head -2")
+            o["call_top"] = act.strip()[-200:]
+            if "MinesCallActivity" not in act: fail(f"接听 left the call screen: {act.strip()[-200:]}")
+            time.sleep(6)
+            r2 = dump(); shot("call-incall-6s")
+            o["call_in_6s"] = result_json("group", "i39121 callstate", timeout=15)
+            if r2 is None or not find(r2, "挂断"): fail("call screen gone 6 s after 接听")
+            if tap_text("静音", exact=True, wait=1.5):
+                o["call_muted"] = result_json("group", "i39121 callstate", timeout=15)
+                if '"muted":true' not in str(o["call_muted"]).replace(" ", ""): fail(f"静音 did not toggle: {o['call_muted']}")
+                tap_text("取消静音", exact=True, wait=1)
+            else: fail("静音 button missing")
+            if tap_text("扬声器", wait=1.5):
+                o["call_speaker"] = result_json("group", "i39121 callstate", timeout=15)
+            else: fail("扬声器 button missing")
+            if not alive(): fail("app died in the call"); crashed.append("i39121 call"); recover("i39121 call")
+            else: tap_text("挂断", exact=True, wait=3)
+        else: fail("接听 button missing")
+        if not alive(): fail("app died after hang-up"); crashed.append("i39121 hangup"); recover("i39121 hangup")
+        healthy_home()
+    except Exception as e:
+        import traceback; traceback.print_exc(); fail(f"home/call step error {e}")
+    # (C) 知识库 HUD (kb_v3b): sphere between search and 最近收录, ≤ 8 nodes, stats row, frames advancing
+    try:
+        healthy_home(); result_json("group", "i3912 kbseed", timeout=30)
+        route("plus_knowledge", 5)
+        k0 = result_json("group", "i3912 kbstate", timeout=15) or {}
+        r = shot("kb"); time.sleep(3)
+        k1 = result_json("group", "i3912 kbstate", timeout=15) or {}
+        o["kb_frames"] = [k0.get("frames"), k1.get("frames")]
+        try:
+            if not (int(k1.get("frames", 0)) > int(k0.get("frames", 0)) + 5): fail(f"知识库 HUD not animating: {o['kb_frames']}")
+        except Exception as e: fail(f"kb frames {e}")
+        o["kb_texts"] = texts(r)[:60] if r is not None else []
+        for lab in ("ENTRIES", "CLUSTERS", "LAST SYNC", "INDEXED", "RECENT INGEST"):
+            if r is not None and not find(r, lab): fail(f"知识库: {lab} missing")
+        shot("kb-2")
+        if not alive(): fail("app died on 知识库"); crashed.append("i39121 kb"); recover("i39121 kb")
+        result_json("group", "i3912 kbclean", timeout=30)
+        back(1); time.sleep(1)
+    except Exception as e:
+        import traceback; traceback.print_exc(); fail(f"kb step error {e}")
+    # (D) 验证码与AI邮箱 → 高级 · 可选 → 自建域名 / Cloudflare → 开通 opens the config dialog
+    try:
+        healthy_home(); route("plus_code_sources", 5); shot("codesrc")
+        ok = tap_text("高级 · 可选", exact=True, wait=2)
+        if not ok:
+            scroll_down(); ok = tap_text("高级 · 可选", exact=True, wait=2)
+        if not ok: fail("高级 · 可选 row missing")
+        else:
+            for _ in range(3):
+                r = dump()
+                if find(r, "自建域名 / Cloudflare"): break
+                scroll_down()
+            r = dump(); shot("mail-adv")
+            if not find(r, "自建域名 / Cloudflare"): fail("自建域名 / Cloudflare row missing")
+            # tap the 开通 pill that sits below the 自建域名 row (the last exact 开通 on screen)
+            row = find(r, "自建域名 / Cloudflare")
+            pills = [(x, y) for t, d, x, y, n in nodes(r) if (t == "开通" or d == "开通") and row and y > row[1]]
+            if not pills: scroll_down(); r = dump(); row = find(r, "自建域名 / Cloudflare"); pills = [(x, y) for t, d, x, y, n in nodes(r) if (t == "开通" or d == "开通") and (not row or y > row[1])]
+            if pills:
+                sh(f"input tap {pills[0][0]} {pills[0][1]}"); time.sleep(2)
+                r = dump(); shot("mail-adv-dialog")
+                o["selfhost_dialog"] = bool(find(r, "开通自建域名收件"))
+                if not o["selfhost_dialog"]: fail("自建域名 开通 did not open the config dialog")
+                if not find(r, "从剪贴板粘贴"): fail("自建域名 dialog: 从剪贴板粘贴 missing")
+                tap_text("取消", exact=True, wait=1.5)
+            else: fail("自建域名 开通 pill missing")
+        if not alive(): fail("app died on 验证码与AI邮箱"); crashed.append("i39121 codesrc"); recover("i39121 codesrc")
+        back(1); time.sleep(1)
+    except Exception as e:
+        import traceback; traceback.print_exc(); fail(f"mail adv step error {e}")
+    o["heap0"] = result_json("group", "i3910 heap", timeout=20)
+    seed = result_json("group", "i39121 seed", timeout=400) or {}
+    o["seed"] = seed; print("I39121 SEED " + json.dumps(seed, ensure_ascii=False)[:600], flush=True)
+    ids = seed.get("ids") if isinstance(seed, dict) else None
+    if not ids or len(ids) != 5: fail(f"seed failed: {seed}"); return
+    try:
+        if int(seed.get("messages", 0)) < 290: fail(f"long chat has {seed.get('messages')} messages")
+    except Exception: pass
+    sl = result_json("group", "i39121 slots", timeout=60) or {}
+    o["slots"] = sl; print("I39121 SLOTS " + json.dumps(sl, ensure_ascii=False), flush=True)
+    if not isinstance(sl, dict) or int(sl.get("running", 0)) != 5: fail(f"5 slots not held: {sl}")
+    o["shots"] = []
+    for rnd in range(3):
+        t0 = time.time()
+        x = result_json("group", "i39121 shots 6", timeout=900) or {}
+        o["shots"].append(x); print(f"I39121 SHOTS round {rnd} {int(time.time() - t0)} s " + json.dumps(x, ensure_ascii=False)[:1500], flush=True)
+        if not alive(): fail(f"app died during screenshot round {rnd}"); crashed.append("i39121 shots"); recover("i39121 shots"); return
+        pools = x.get("pools") if isinstance(x, dict) else None
+        if not pools: fail(f"round {rnd}: no result {x}"); continue
+        for i, p in enumerate(pools):
+            if int(p.get("err", 0)) > 0 or int(p.get("ok", 0)) < 6: fail(f"round {rnd} pool {i}: {p}")
+            if int(p.get("maxW", 0)) > 1280: fail(f"round {rnd} pool {i}: screenshot {p.get('maxW')} px wide (> 1280)")
+    # the long chat opens and renders (300 messages, nothing auto-resumes)
+    route("chat/" + ids[0], 8); shot("long-chat")
+    if not alive(): fail("app died opening the long chat"); crashed.append("i39121 long chat"); recover("i39121 long chat"); return
+    o["heap_long"] = result_json("group", "i3910 heap", timeout=20)
+    back(1); time.sleep(2); healthy_home()
+    # still 5 slots (the 5 'running' tasks), then the OOM on the main thread
+    result_json("group", "i39121 slots", timeout=60)
+    route("chat/" + ids[0], 6)   # die while the long chat is open, like the phone
+    o["gate"] = result_json("group", "i39121 gate", timeout=20)
+    k = result_json("group", "i39121 oomkill", timeout=20) or {}
+    o["oomkill"] = k
+    dead = False
+    for _ in range(20):
+        time.sleep(1)
+        if not alive(): dead = True; break
+    o["killed"] = dead
+    if not dead: fail("OOM simulation did not end the process")
+    # relaunch: must come up in safe mode
+    t0 = time.time()
+    print(sh(f"am start -W -n {PKG}/com.openminis.app.MainActivity", timeout=90)[-300:], flush=True)
+    time.sleep(12)
+    o["relaunch_s"] = int(time.time() - t0)
+    o["alive_after"] = alive()
+    if not o["alive_after"]: fail("app not running after relaunch"); crashed.append("i39121 relaunch"); recover("i39121 relaunch"); return
+    r = dump(); txt = texts(r)
+    o["home_after"] = bool(find(r, "最近对话"))
+    o["card_after"] = next((t for t in txt if "上次内存不足退出" in t), "")
+    o["long_chat_reopened"] = any("第 1" in t and "步" in t for t in txt)
+    st = result_json("group", "i39121 safe", timeout=20) or {}
+    o["safe"] = st; print("I39121 SAFE " + json.dumps(st, ensure_ascii=False)[:900], flush=True)
+    shot("safe-start")
+    if not o["home_after"]: fail("relaunch did not land on home")
+    if o["long_chat_reopened"]: fail("relaunch reopened the long chat")
+    if "已暂停 5 个任务" not in o["card_after"]: fail(f"safe-start card wrong: {o['card_after']!r} {st}")
+    if not (isinstance(st, dict) and st.get("forceHome") is True): fail(f"forceHome not set: {st}")
+    time.sleep(20)
+    if not alive(): fail("app died 30 s after the safe start"); crashed.append("i39121 after relaunch"); recover("i39121 after relaunch"); return
+    shot("safe-start-30s")
+    # 继续 on the first task opens that chat (nothing resumed by itself); the card keeps the other 4
+    if tap_text("继续", exact=True, wait=6):
+        shot("continue"); o["continue_alive"] = alive()
+        if not o["continue_alive"]: fail("app died after 继续"); crashed.append("i39121 continue"); recover("i39121 continue"); return
+        back(1); time.sleep(2)
+        r = healthy_home(); o["card_after_continue"] = next((t for t in texts(r) if "上次内存不足退出" in t), "")
+        shot("after-continue")
+        if "已暂停 4 个任务" not in o["card_after_continue"]: fail(f"card after 继续: {o['card_after_continue']!r}")
+    else:
+        fail("继续 button not found")
+    # a second cold start is a normal one (forceHome only once), the card stays until 知道了
+    sh(f"am force-stop {PKG}"); time.sleep(2); sh(f"am start -W -n {PKG}/com.openminis.app.MainActivity", timeout=90); time.sleep(10)
+    o["second_start"] = result_json("group", "i39121 safe", timeout=20)
+    if tap_text("知道了", exact=True, wait=3): o["dismissed"] = True
+    o["after_dismiss"] = result_json("group", "i39121 safe", timeout=20)
+    shot("dismissed")
+    result_json("group", "i39121 clean", timeout=120)
+    o["heap_end"] = result_json("group", "i3910 heap", timeout=20)
+    print("I39121 RESULT " + json.dumps(o, ensure_ascii=False)[:12000], flush=True)
 
 
 def b39113(res):
