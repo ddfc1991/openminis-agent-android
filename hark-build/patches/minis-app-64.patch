@@ -57,10 +57,10 @@ index 5531557..72c919f 100644
 +-keep class org.bouncycastle.math.ec.rfc8032.** { *; }
 +-dontwarn org.bouncycastle.**
 diff --git a/src/android/app/src/main/AndroidManifest.xml b/src/android/app/src/main/AndroidManifest.xml
-index 3855cc1..f0ad8d3 100644
+index 3855cc1..a93a5d2 100644
 --- a/src/android/app/src/main/AndroidManifest.xml
 +++ b/src/android/app/src/main/AndroidManifest.xml
-@@ -2,6 +2,10 @@
+@@ -2,11 +2,17 @@
  <manifest xmlns:android="http://schemas.android.com/apk/res/android"
      xmlns:tools="http://schemas.android.com/tools">
  
@@ -71,7 +71,14 @@ index 3855cc1..f0ad8d3 100644
      <uses-permission android:name="android.permission.INTERNET" />
      <!-- T33: Check Update — needed to launch the system installer for the
           downloaded APK. The user must additionally grant "install unknown
-@@ -255,6 +259,14 @@
+          apps" for this package the first time they upgrade. -->
+     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
++    <!-- [Mines-38.9.12.1] 来电 in-call 扬声器 switch -->
++    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+     <!-- [Mines-38.1] BiometricPrompt needs USE_BIOMETRIC (USE_FINGERPRINT for API 28) -->
+     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+@@ -255,6 +261,14 @@
                  <category android:name="android.intent.category.BROWSABLE" />
                  <data android:scheme="minis" />
              </intent-filter>
@@ -86,7 +93,7 @@ index 3855cc1..f0ad8d3 100644
          </activity>
  
          <!-- T-android-dynamic-app-icon: launcher-icon aliases. Exactly
-@@ -319,6 +331,20 @@
+@@ -319,6 +333,20 @@
          </activity-alias>
  
          <!-- Share receiver activity -->
@@ -107,7 +114,7 @@ index 3855cc1..f0ad8d3 100644
          <activity
              android:name=".share.ShareReceiverActivity"
              android:exported="true"
-@@ -405,6 +431,45 @@
+@@ -405,6 +433,45 @@
              </intent-filter>
          </activity>
  
@@ -153,7 +160,7 @@ index 3855cc1..f0ad8d3 100644
          <!-- T-pwa-1 (renamed Pwa → WebApp): WebApp shortcut host.
               Reachable only via explicit Intent from a pinned launcher
               shortcut (ACTION_OPEN_WEBAPP + extras). Old ACTION_OPEN_PWA
-@@ -412,6 +477,17 @@
+@@ -412,6 +479,17 @@
               home-screen icons pinned before the rename are not preserved
               and will return "intent not found" on tap; the user has to
               re-add them from inside the app. -->
@@ -171,7 +178,7 @@ index 3855cc1..f0ad8d3 100644
          <activity
              android:name=".webapp.WebAppActivity"
              android:label="@string/webapp_activity_label"
-@@ -511,6 +587,41 @@
+@@ -511,6 +589,41 @@
                  android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                  android:value="Desk pet: an animated companion overlay the user turned on" />
          </service>
@@ -213,7 +220,7 @@ index 3855cc1..f0ad8d3 100644
          <service
              android:name=".plus.WakeWordService"
              android:exported="false"
-@@ -586,6 +697,12 @@
+@@ -586,6 +699,12 @@
                  <action android:name="android.provider.Telephony.SMS_RECEIVED" />
              </intent-filter>
          </receiver>
@@ -226,7 +233,7 @@ index 3855cc1..f0ad8d3 100644
          <!-- [Mines-38.7] Android's one-message SMS consent dialog (phones with Google Play, no SMS permission) -->
          <activity
              android:name=".plus.SmsConsentActivity"
-@@ -642,6 +759,23 @@
+@@ -642,6 +761,23 @@
  
          <!-- FileProvider for sharing exported JSON (provider config, etc.)
               to other apps. Paths exposed are under app-scoped cache. -->
@@ -24788,10 +24795,10 @@ index 495166b..7e716b3 100644
      private val secretPatterns = listOf(
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/NexusCore.kt b/src/android/app/src/main/java/com/openminis/app/plus/NexusCore.kt
 new file mode 100644
-index 0000000..3872669
+index 0000000..3307cf6
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/NexusCore.kt
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,186 @@
 +package com.openminis.app.plus
 +
 +import kotlin.math.PI
@@ -24945,6 +24952,35 @@ index 0000000..3872669
 +    /** 「INDEXED」: share of entries that the model organised (byModel), one decimal; 0 entries → "—" */
 +    fun indexed(total: Int, byModel: Int): String =
 +        if (total <= 0) "—" else String.format(java.util.Locale.US, "%.1f%%", 100.0 * byModel.coerceIn(0, total) / total)
++
++    /** [Mines-38.9.12.1] topic nodes sit out on the orbit (radius in sphere units), not on the sphere shell */
++    const val NODE_R = 1.75f   // = the drawn orbit's radius: the nodes ride on it
++    /** [Mines-38.9.12.1] node latitudes for the orbit layout: small, so the 8 nodes spread round the orbit ellipse */
++    private val ORBIT_LATS = intArrayOf(8, -6, 10, -9, 5, -4, -10, 7)
++
++    /** unit directions for up to 8 nodes spread evenly round the orbit (alternating small latitudes) */
++    fun orbitDirs(n: Int): FloatArray {
++        val k = n.coerceIn(0, 8)
++        val out = FloatArray(k * 3)
++        for (i in 0 until k) {
++            val lo = i * 2 * PI / maxOf(k, 1) + 0.3; val la = Math.toRadians(ORBIT_LATS[i].toDouble())
++            out[i * 3] = (cos(la) * cos(lo)).toFloat(); out[i * 3 + 1] = sin(la).toFloat(); out[i * 3 + 2] = (cos(la) * sin(lo)).toFloat()
++        }
++        return out
++    }
++
++    /**
++     * [Mines-38.9.12.1] the viz box between the search field ([top]) and the bottom panel ([bottom]) on a [w]-wide page:
++     * centre y and sphere scale (px per unit) so sphere + orbit fill it like the design (phone 2026-10-23: sphere sat high
++     * and small with an empty band below). Returns (cy, scale, floorY).
++     */
++    fun layout(w: Float, top: Float, bottom: Float): Triple<Float, Float, Float> {
++        val hgt = (bottom - top).coerceAtLeast(1f)
++        val cy = top + hgt * 0.47f
++        val scale = minOf(w * 0.235f, hgt * 0.26f)
++        val floor = minOf(bottom - 4f, cy + scale * 1.18f)
++        return Triple(cy, scale, floor)
++    }
 +
 +    /** frame interval cap: battery saver 15 fps, otherwise 60 fps (the loop skips frames that come sooner) */
 +    fun frameGapMs(powerSave: Boolean): Long = if (powerSave) 66L else 16L
@@ -33177,7 +33213,7 @@ index 1d773a2..5489e65 100644
          coroutineScope {
              val bg = slow.map { id -> async { one(id) } }
 diff --git a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
-index af13c1b..c8b5f67 100644
+index af13c1b..2af7355 100644
 --- a/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/plus/group/GroupSelfTest.kt
 @@ -2,6 +2,9 @@ package com.openminis.app.plus.group
@@ -33190,7 +33226,7 @@ index af13c1b..c8b5f67 100644
  import kotlinx.coroutines.runBlocking
  import org.json.JSONArray
  import org.json.JSONObject
-@@ -15,12 +18,1088 @@ import org.json.JSONObject
+@@ -15,12 +18,1089 @@ import org.json.JSONObject
   *   … --arg 'reset'
   */
  object GroupSelfTest {
@@ -33976,7 +34012,8 @@ index af13c1b..c8b5f67 100644
 +                            .put("othersAtStart", JSONArray(com.openminis.app.plus.ProcessGuard.othersAtStart))
 +                            .put("proxyError", com.openminis.app.plus.WebProxy.lastError).toString()
 +                    }
-+                    else -> "i39121 seed | slots | shots <n> | gate | oomkill | safe | clean | acrastart | killmain | webcheck"
++                    "callstate" -> com.openminis.app.ui.plus.CallState.json()
++                    else -> "i39121 seed | slots | shots <n> | gate | oomkill | safe | clean | acrastart | killmain | webcheck | callstate"
 +                }
 +            }
 +            "i39113" -> {
@@ -34279,7 +34316,7 @@ index af13c1b..c8b5f67 100644
              "partners" -> {
                  val l = Partners.refresh(context, rescanApps = true)
                  JSONArray(l.map { JSONObject().put("id", it.id).put("name", it.spec.name).put("state", it.state.name).put("model", it.model).put("via", it.via) }).toString()
-@@ -136,6 +1215,13 @@ object GroupSelfTest {
+@@ -136,6 +1216,13 @@ object GroupSelfTest {
                  GroupStore.add(gid, GroupMsg(GroupStore.newId(), parts.getOrElse(2) { "host" }, "成员A", "", parts.getOrElse(3) { "好的，结论：照这个办。" }))
                  "ok"
              }
@@ -34293,7 +34330,7 @@ index af13c1b..c8b5f67 100644
              "kbrun" -> { val n = com.openminis.app.plus.ChatKnowledge.runNow(context); "organised=$n" }
              "kbstate" -> {
                  val l = com.openminis.app.plus.ChatKnowledge.load(context)
-@@ -151,6 +1237,11 @@ object GroupSelfTest {
+@@ -151,6 +1238,11 @@ object GroupSelfTest {
                  JSONObject().put("title", g.title).put("care", g.care).put("kind", g.kind)
                      .put("weather", com.openminis.app.plus.HomeGreeting.cachedWeather(context)?.let { "${it.code}/${it.temp}" } ?: "none").toString()
              }
@@ -34305,7 +34342,7 @@ index af13c1b..c8b5f67 100644
              "greetweather" -> {
                  context.getSharedPreferences("mines_greeting", Context.MODE_PRIVATE).edit().remove("w_try").apply()
                  com.openminis.app.plus.HomeGreeting.refreshWeather(context)
-@@ -238,6 +1329,112 @@ object GroupSelfTest {
+@@ -238,6 +1330,112 @@ object GroupSelfTest {
              "wallpaper" -> { com.openminis.app.plus.PlusPrefs.init(context)
                  if (parts.getOrElse(0) { "" } == "off") com.openminis.app.plus.PlusPrefs.update(context) { it.copy(wallpaper = "") }
                  com.openminis.app.plus.PlusPrefs.state.value.wallpaper.ifBlank { "none" } }
@@ -34418,7 +34455,7 @@ index af13c1b..c8b5f67 100644
              "fogstate" -> JSONObject().put("t", com.openminis.app.ui.plus.FogClock.t.toDouble()).put("draws", com.openminis.app.ui.plus.FogClock.draws)
                  .put("still", com.openminis.app.ui.plus.FogClock.stillSeen)
                  .put("scale", android.provider.Settings.Global.getFloat(context.contentResolver, android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, -1f).toDouble()).toString()
-@@ -288,3 +1485,29 @@ object GroupSelfTest {
+@@ -288,3 +1486,29 @@ object GroupSelfTest {
          return JSONObject().put("chat", sid).put("group", g.id).put("direct", d.id).put("directName", dn).toString()
      }
  }
@@ -46758,7 +46795,7 @@ index 0000000..bf40ca1
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/Hub3912.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/Hub3912.kt
 new file mode 100644
-index 0000000..8ddc187
+index 0000000..543ce3e
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/Hub3912.kt
 @@ -0,0 +1,309 @@
@@ -46875,7 +46912,7 @@ index 0000000..8ddc187
 +            WarmDivider(16.dp)
 +            PlusRow(ic("phone"), "试一下来电", onClick = {
 +                ctx.startActivity(android.content.Intent(ctx, MinesCallActivity::class.java).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-+                    .putExtra("title", "任务完成 · 示例").putExtra("body", "这是一次来电提醒示例。接听进入语音对话，转文字打开对话。"))
++                    .putExtra("title", "测试来电").putExtra("body", "你好，我是 Mines。接听后我先把这句话念给你，然后你可以直接和我说话。"))   // [38.9.12.1] no 「示例」
 +            })
 +        }
 +    }
@@ -50934,10 +50971,10 @@ index 9625470..86a0e4d 100644
  import androidx.compose.material3.MaterialTheme
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesCallActivity.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesCallActivity.kt
 new file mode 100644
-index 0000000..f0b7eb3
+index 0000000..7b181de
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/MinesCallActivity.kt
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,333 @@
 +package com.openminis.app.ui.plus
 +
 +import android.content.Intent
@@ -50976,7 +51013,19 @@ index 0000000..f0b7eb3
 +import androidx.compose.foundation.shape.RoundedCornerShape
 +import androidx.compose.material3.Text
 +import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
 +import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableLongStateOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.items
++import androidx.compose.foundation.lazy.rememberLazyListState
++import androidx.compose.foundation.layout.widthIn
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.MutableStateFlow
 +import androidx.compose.ui.Alignment
 +import androidx.compose.ui.Modifier
 +import androidx.compose.ui.draw.clip
@@ -50994,10 +51043,28 @@ index 0000000..f0b7eb3
 +import com.openminis.app.ui.brand.MinesIcon
 +import com.openminis.app.ui.brand.MinesIcons
 +
-+/** [Mines-38.9.12] the Mines 来电 screen (design ws2 ⑤): 挂断 · 转文字 · 接听. */
++/**
++ * [Mines-38.9.12] the Mines 来电 screen (design ws2 ⑤): 挂断 · 转文字 · 接听.
++ * [Mines-38.9.12.1] user 2026-10-23: 接听 no longer jumps to the 实时语音 page — the call screen itself becomes the in-call
++ * screen (timer, the caller's message read aloud first, then live voice on the same engine as 实时语音 — Gemini Live, or
++ * its backup channel —, 静音 / 扬声器 / 挂断, orb + waveform from the voice level, live caption bubbles). 转文字 stays here
++ * too: the message and the conversation's latest reply as text bubbles, with a small 「打开对话」 link.
++ */
 +class MinesCallActivity : ComponentActivity() {
 +    private var tone: Ringtone? = null
 +    private val h = android.os.Handler(android.os.Looper.getMainLooper())
++    private var tts: android.speech.tts.TextToSpeech? = null
++    /** RING → TEXT / CALL */
++    val mode = MutableStateFlow("ring")
++    val note = MutableStateFlow("")
++    val muted = MutableStateFlow(false)
++    val speaker = MutableStateFlow(true)
++    val summary = MutableStateFlow("")
++    private var body = ""
++    private var sid: String? = null
++    private val micAsk = registerForActivityResult(androidx.activity.result.contract.ActivityResultContracts.RequestPermission()) { ok ->
++        if (ok) startVoice() else note.value = "没有麦克风权限，只能听不能说。可以在系统设置里给 Mines 麦克风权限。"
++    }
 +
 +    override fun onCreate(savedInstanceState: Bundle?) {
 +        super.onCreate(savedInstanceState)
@@ -51005,8 +51072,9 @@ index 0000000..f0b7eb3
 +        else @Suppress("DEPRECATION") window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON)
 +        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 +        val title = intent.getStringExtra("title").orEmpty().ifBlank { "任务完成" }
-+        val body = intent.getStringExtra("body").orEmpty()
-+        val sid = intent.getStringExtra("sid")
++        body = intent.getStringExtra("body").orEmpty()
++        sid = intent.getStringExtra("sid")
++        CallState.last = this
 +        if (!intent.getBooleanExtra("silent", false)) runCatching {
 +            tone = RingtoneManager.getRingtone(this, RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE))?.apply {
 +                audioAttributes = AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
@@ -51015,56 +51083,215 @@ index 0000000..f0b7eb3
 +            }
 +        }
 +        h.postDelayed({ stopTone() }, 30_000L)
-+        h.postDelayed({ if (!isFinishing) finish() }, 45_000L)
++        h.postDelayed({ if (!isFinishing && mode.value == "ring") finish() }, 45_000L)   // unanswered: give up
 +        setContent {
-+            CallScreen(title, body,
-+                onHangUp = { done(null) },
-+                onText = { done(if (!sid.isNullOrBlank()) "chat/$sid" else "sessions") },
-+                onAnswer = { done(PlusRoutes.VOICE) })
++            CallScreen(this, title, body,
++                onHangUp = { hangUp() },
++                onText = { toText() },
++                onAnswer = { answer() },
++                onOpenChat = { openChat() })
 +        }
 +    }
 +
 +    private fun stopTone() { runCatching { tone?.stop() }; tone = null }
 +
-+    private fun done(route: String?) {
-+        stopTone(); MinesCall.cancel(this)
-+        if (route != null) runCatching {
-+            startActivity(Intent(this, com.openminis.app.MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-+                .putExtra("mines_route", route))
++    fun toText() {
++        stopTone(); MinesCall.cancel(this); mode.value = "text"
++        val s = sid ?: return
++        loadSummary(s)
++    }
++
++    private fun loadSummary(s: String) {
++        Thread({
++            runCatching {
++                val app = applicationContext as com.openminis.app.MinisApp
++                val last = kotlinx.coroutines.runBlocking { app.chatRepository.loadMessages(s).lastOrNull { it.role == "assistant" } } ?: return@runCatching
++                val arr = org.json.JSONArray(last.partsJson)
++                val txt = buildString { for (i in 0 until arr.length()) { val o = arr.optJSONObject(i) ?: continue; if (o.optString("type") == "text") append(o.optString("value")) } }.trim()
++                if (txt.isNotBlank() && txt != body.trim()) summary.value = txt.take(1200)
++            }
++        }, "mines-call-summary").start()
++    }
++
++    fun answer() {
++        stopTone(); MinesCall.cancel(this); mode.value = "call"
++        CallState.answeredAt = android.os.SystemClock.elapsedRealtime()
++        applySpeaker(true)
++        // the caller's message first, then the live voice (so the mic does not hear the read-out)
++        if (body.isNotBlank()) speakThen(body) { askOrStart() } else askOrStart()
++    }
++
++    private fun askOrStart() {
++        if (isFinishing || mode.value != "call") return
++        if (androidx.core.content.ContextCompat.checkSelfPermission(this, android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED) startVoice()
++        else runCatching { micAsk.launch(android.Manifest.permission.RECORD_AUDIO) }
++    }
++
++    private fun startVoice() {
++        if (isFinishing || mode.value != "call") return
++        val r = runCatching { com.openminis.app.plus.VoiceSession.start(this) }.getOrNull()
++        when (r) {
++            com.openminis.app.plus.VoiceSession.StartResult.OK, com.openminis.app.plus.VoiceSession.StartResult.ALREADY -> note.value = ""
++            // no Gemini key: the same backup channel 实时语音 uses (phone recognition → Mines → read-out)
++            else -> { runCatching { com.openminis.app.plus.VoiceSession.startBackup(this, null) }; note.value = "普通语音通道" }
 +        }
++        CallState.voiceStarted = r?.name ?: "BACKUP"
++    }
++
++    private fun speakThen(text: String, then: () -> Unit) {
++        var done = false
++        val fin: () -> Unit = { if (!done) { done = true; h.post { then() } } }
++        h.postDelayed({ fin() }, (4_000L + text.length * 260L).coerceAtMost(40_000L))   // never wait forever
++        tts = android.speech.tts.TextToSpeech(applicationContext, android.speech.tts.TextToSpeech.OnInitListener { st ->
++            val t = tts
++            if (st != android.speech.tts.TextToSpeech.SUCCESS || t == null) fin()
++            else {
++                runCatching { t.language = java.util.Locale.CHINA }
++                t.setOnUtteranceProgressListener(object : android.speech.tts.UtteranceProgressListener() {
++                    override fun onStart(id: String?) { CallState.spoke = true }
++                    override fun onDone(id: String?) { fin() }
++                    @Deprecated("Deprecated in Java") override fun onError(id: String?) { fin() }
++                })
++                if (t.speak(text, android.speech.tts.TextToSpeech.QUEUE_FLUSH, null, "mines-call") != android.speech.tts.TextToSpeech.SUCCESS) fin()
++            }
++        })
++    }
++
++    fun toggleMute() {
++        val m = !muted.value; muted.value = m
++        com.openminis.app.plus.VoiceSession.live.value?.setMuted(m)
++        com.openminis.app.plus.VoiceSession.backup.value?.let { if (m) it.stop() else it.start() }
++    }
++
++    fun toggleSpeaker() { applySpeaker(!speaker.value) }
++
++    @Suppress("DEPRECATION")
++    private fun applySpeaker(on: Boolean) {
++        speaker.value = on
++        runCatching { getSystemService(android.media.AudioManager::class.java)?.isSpeakerphoneOn = on }
++    }
++
++    fun hangUp() {
++        stopTone(); MinesCall.cancel(this)
++        if (mode.value == "call") runCatching { com.openminis.app.plus.VoiceSession.stop(this) }
 +        finish()
 +    }
 +
-+    override fun onDestroy() { stopTone(); h.removeCallbacksAndMessages(null); super.onDestroy() }
++    fun openChat() {
++        hangUp()
++        runCatching {
++            startActivity(Intent(this, com.openminis.app.MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
++                .putExtra("mines_route", if (!sid.isNullOrBlank()) "chat/$sid" else "sessions"))
++        }
++    }
++
++    override fun onDestroy() {
++        stopTone(); h.removeCallbacksAndMessages(null)
++        runCatching { tts?.stop(); tts?.shutdown() }; tts = null
++        if (mode.value == "call") runCatching { com.openminis.app.plus.VoiceSession.stop(this) }
++        if (CallState.last === this) CallState.last = null
++        super.onDestroy()
++    }
 +}
 +
++/** smoke / 自检 readout of the last call screen */
++object CallState {
++    @Volatile var last: MinesCallActivity? = null
++    @Volatile var answeredAt = 0L
++    @Volatile var voiceStarted = ""
++    @Volatile var spoke = false
++    fun json(): String = org.json.JSONObject().put("mode", last?.mode?.value ?: "none").put("voice", voiceStarted).put("spoke", spoke)
++        .put("muted", last?.muted?.value ?: false).put("speaker", last?.speaker?.value ?: false).put("summary", (last?.summary?.value ?: "").take(80)).toString()
++}
++
++private fun mmss(ms: Long): String { val s = (ms / 1000).coerceAtLeast(0); return "%02d:%02d".format(s / 60, s % 60) }
++
 +@Composable
-+private fun CallScreen(title: String, body: String, onHangUp: () -> Unit, onText: () -> Unit, onAnswer: () -> Unit) {
++private fun CallScreen(a: MinesCallActivity, title: String, body: String, onHangUp: () -> Unit, onText: () -> Unit, onAnswer: () -> Unit, onOpenChat: () -> Unit) {
++    val mode by a.mode.collectAsState()
++    val muted by a.muted.collectAsState()
++    val speaker by a.speaker.collectAsState()
++    val note by a.note.collectAsState()
++    val summary by a.summary.collectAsState()
++    val live by com.openminis.app.plus.VoiceSession.live.collectAsState()
++    val backup by com.openminis.app.plus.VoiceSession.backup.collectAsState()
++    val zeroLevel = remember { MutableStateFlow(0f) }
++    val noLines = remember { MutableStateFlow(emptyList<com.openminis.app.plus.GeminiLive.Line>()) }
++    val level by (live?.level ?: zeroLevel).collectAsState()
++    val liveLines by (live?.lines ?: backup?.lines ?: noLines).collectAsState()
++    var now by remember { mutableLongStateOf(android.os.SystemClock.elapsedRealtime()) }
++    LaunchedEffect(mode) { while (mode == "call") { now = android.os.SystemClock.elapsedRealtime(); delay(500) } }
 +    val inf = rememberInfiniteTransition(label = "call")
 +    val pulse by inf.animateFloat(0f, 1f, infiniteRepeatable(tween(2400, easing = LinearEasing), RepeatMode.Restart), label = "pulse")
++    val wave by inf.animateFloat(0f, 6.283f, infiniteRepeatable(tween(1400, easing = LinearEasing), RepeatMode.Restart), label = "wave")
++    val inCall = mode == "call"
++    val textMode = mode == "text"
 +    Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF0C1626), Color(0xFF122338), Color(0xFF0A1220))))) {
 +        Canvas(Modifier.fillMaxSize()) {
-+            val c = Offset(size.width / 2f, size.height * 0.30f)
-+            val base = size.width * 0.17f
++            val c = Offset(size.width / 2f, size.height * (if (textMode) 0.14f else 0.30f))
++            val base = size.width * (if (textMode) 0.09f else 0.17f)
++            val lv = if (inCall) (0.15f + level.coerceIn(0f, 1f)) else 0f
 +            for (k in 0 until 4) {
 +                val f = (pulse + k / 4f) % 1f
 +                drawCircle(Color(0xFF7AE8FF).copy(alpha = 0.22f * (1 - f)), radius = base * (1.2f + 2.4f * f), center = c, style = Stroke(1.5.dp.toPx()))
 +            }
-+            drawCircle(Brush.radialGradient(listOf(Color(0xFFFFFFFF), Color(0xFF9FF0FF), Color(0xFF2B7EA6), Color(0x00102030)), center = c, radius = base * 1.25f),
-+                radius = base * 1.25f, center = c)
++            val orb = base * 1.25f * (1f + 0.18f * lv)
++            drawCircle(Brush.radialGradient(listOf(Color(0xFFFFFFFF), Color(0xFF9FF0FF), Color(0xFF2B7EA6), Color(0x00102030)), center = c, radius = orb),
++                radius = orb, center = c)
++            if (inCall) {   // waveform under the orb, driven by the voice level
++                val bars = 28; val bw = size.width * 0.6f / bars; val y0 = c.y + base * 2.2f
++                for (b in 0 until bars) {
++                    val amp = (0.25f + 0.75f * lv) * (0.35f + 0.65f * kotlin.math.abs(kotlin.math.sin(wave + b * 0.55f)))
++                    val hh = 6.dp.toPx() + amp * base * 0.7f
++                    val x = size.width * 0.2f + b * bw + bw / 2f
++                    drawLine(Color(0xFF9FF0FF).copy(alpha = 0.75f), Offset(x, y0 - hh / 2f), Offset(x, y0 + hh / 2f), strokeWidth = bw * 0.45f)
++                }
++            }
 +        }
 +        Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().padding(horizontal = 28.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-+            Spacer(Modifier.fillMaxHeight(0.40f))
-+            Text("Mines", color = Color.White, fontSize = 30.sp, fontWeight = FontWeight.SemiBold)
-+            Text(title, color = Color(0xFFB8CCE0), fontSize = 14.sp, modifier = Modifier.padding(top = 6.dp))
-+            if (body.isNotBlank()) Text(body, color = Color(0xFFE6EEF6), fontSize = 14.sp, lineHeight = 21.sp, textAlign = TextAlign.Start, maxLines = 5,
++            Spacer(Modifier.fillMaxHeight(if (textMode) 0.24f else if (inCall) 0.47f else 0.40f))
++            Text("Mines", color = Color.White, fontSize = if (textMode) 22.sp else 30.sp, fontWeight = FontWeight.SemiBold)
++            Text(if (inCall) "通话中 " + mmss(now - CallState.answeredAt) else title, color = Color(0xFFB8CCE0), fontSize = 14.sp, modifier = Modifier.padding(top = 6.dp))
++            if (note.isNotBlank()) Text(note, color = Color(0xFF8FA6BD), fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp))
++            if (!inCall && !textMode && body.isNotBlank()) Text(body, color = Color(0xFFE6EEF6), fontSize = 14.sp, lineHeight = 21.sp, textAlign = TextAlign.Start, maxLines = 5,
 +                modifier = Modifier.padding(top = 22.dp).fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Color(0x1FFFFFFF))
 +                    .border(1.dp, Color(0x29FFFFFF), RoundedCornerShape(18.dp)).padding(horizontal = 16.dp, vertical = 14.dp))
-+            Spacer(Modifier.weight(1f))
-+            Row(Modifier.fillMaxWidth().padding(bottom = 36.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-+                CallButton("挂断", "x", Color(0xFFE5483E), onHangUp)
-+                CallButton("转文字", "messages-square", Color(0xFF3A4656), onText)
-+                CallButton("接听", "mic", Color(0xFF34B562), onAnswer)
++            if (textMode || inCall) {
++                // caption / transcript bubbles: the message, the latest reply (转文字), then the live lines
++                val bubbles = buildList {
++                    if (body.isNotBlank()) add(false to body)
++                    if (textMode && summary.isNotBlank()) add(false to summary)
++                    liveLines.takeLast(30).forEach { add(it.user to it.text) }
++                }
++                val ls = rememberLazyListState()
++                LaunchedEffect(bubbles.size) { if (bubbles.isNotEmpty()) ls.animateScrollToItem(bubbles.size - 1) }
++                LazyColumn(Modifier.fillMaxWidth().weight(1f).padding(top = 16.dp), state = ls, verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                    items(bubbles) { (user, text) ->
++                        Box(Modifier.fillMaxWidth(), contentAlignment = if (user) Alignment.CenterEnd else Alignment.CenterStart) {
++                            Text(text, color = Color(0xFFE6EEF6), fontSize = 14.sp, lineHeight = 21.sp,
++                                modifier = Modifier.widthIn(max = 300.dp).clip(RoundedCornerShape(16.dp))
++                                    .background(if (user) Color(0x3334B562) else Color(0x1FFFFFFF))
++                                    .border(1.dp, Color(0x22FFFFFF), RoundedCornerShape(16.dp)).padding(horizontal = 14.dp, vertical = 10.dp))
++                        }
++                    }
++                }
++                if (textMode) Text("打开对话", color = Color(0xFF7AE8FF), fontSize = 13.sp,
++                    modifier = Modifier.padding(top = 8.dp).clickable(onClick = onOpenChat).padding(8.dp).semantics { contentDescription = "打开对话" })
++            } else Spacer(Modifier.weight(1f))
++            Row(Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 36.dp), horizontalArrangement = if (textMode) Arrangement.Center else Arrangement.SpaceBetween) {
++                when {
++                    inCall -> {
++                        CallButton(if (muted) "取消静音" else "静音", if (muted) "mic-off" else "mic", if (muted) Color(0xFFE6EEF6).copy(alpha = 0.35f) else Color(0xFF3A4656)) { a.toggleMute() }
++                        CallButton("挂断", "x", Color(0xFFE5483E), onHangUp)
++                        CallButton(if (speaker) "扬声器 开" else "扬声器 关", "volume-2", if (speaker) Color(0xFF2B7EA6) else Color(0xFF3A4656)) { a.toggleSpeaker() }
++                    }
++                    textMode -> CallButton("关闭", "x", Color(0xFF3A4656), onHangUp)
++                    else -> {
++                        CallButton("挂断", "x", Color(0xFFE5483E), onHangUp)
++                        CallButton("转文字", "messages-square", Color(0xFF3A4656), onText)
++                        CallButton("接听", "mic", Color(0xFF34B562), onAnswer)
++                    }
++                }
 +            }
 +        }
 +    }
@@ -51075,7 +51302,8 @@ index 0000000..f0b7eb3
 +    Column(horizontalAlignment = Alignment.CenterHorizontally) {
 +        Box(Modifier.size(68.dp).clip(CircleShape).background(color).clickable(onClick = onClick).semantics { contentDescription = label },
 +            contentAlignment = Alignment.Center) {
-+            MinesIcon(MinesIcons.named(icon)!!, null, tint = Color.White, modifier = Modifier.size(28.dp))
++            val ic = MinesIcons.named(icon) ?: MinesIcons.named("mic")!!
++            MinesIcon(ic, null, tint = Color.White, modifier = Modifier.size(28.dp))
 +        }
 +        Text(label, color = Color.White, fontSize = 13.sp, modifier = Modifier.padding(top = 8.dp))
 +    }
@@ -51656,10 +51884,10 @@ index 0000000..0565057
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/NexusHud.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/NexusHud.kt
 new file mode 100644
-index 0000000..32ccee7
+index 0000000..424ef54
 --- /dev/null
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/NexusHud.kt
-@@ -0,0 +1,538 @@
+@@ -0,0 +1,558 @@
 +package com.openminis.app.ui.plus
 +
 +import android.graphics.Paint
@@ -51716,6 +51944,8 @@ index 0000000..32ccee7
 +import androidx.compose.ui.graphics.nativeCanvas
 +import androidx.compose.ui.graphics.toArgb
 +import androidx.compose.ui.input.pointer.pointerInput
++import androidx.compose.ui.layout.boundsInRoot
++import androidx.compose.ui.layout.onGloballyPositioned
 +import androidx.compose.ui.platform.LocalContext
 +import androidx.compose.ui.platform.LocalDensity
 +import androidx.compose.ui.semantics.contentDescription
@@ -51790,10 +52020,10 @@ index 0000000..32ccee7
 +    val orbit = NexusCore.orbit(120)
 +    val oRot = FloatArray(orbit.size)
 +    val oProj = FloatArray(120 * 4)
-+    val dirs = NexusCore.nodeDirs(n).also { d -> for (i in d.indices) d[i] *= NexusCore.SHELL }
++    val dirs = NexusCore.orbitDirs(n).also { d -> for (i in d.indices) d[i] *= NexusCore.NODE_R }   // [38.9.12.1] out on the orbit
 +    val nRot = FloatArray(dirs.size)
 +    val nProj = FloatArray(dirs.size / 3 * 4)
-+    val subs = NexusCore.subs(NexusCore.nodeDirs(n), counts)
++    val subs = NexusCore.subs(NexusCore.orbitDirs(n), counts).also { (xyz, _) -> for (i in xyz.indices) xyz[i] *= NexusCore.NODE_R / NexusCore.SHELL }
 +    val subRot = FloatArray(subs.first.size)
 +    val subProj = FloatArray(subs.first.size / 3 * 4)
 +    val subPts = FloatArray(subs.first.size / 3 * 2)
@@ -51847,11 +52077,15 @@ index 0000000..32ccee7
 +    }
 +    val paints = remember { HudPaints() }
 +    val dp = density.density
++    // [38.9.12.1] the viz fills the space between the search field and the bottom panel (measured)
++    var vizTop by remember { mutableFloatStateOf(0f) }
++    var vizBot by remember { mutableFloatStateOf(0f) }
 +    val totalEntries = entries.size
 +    val byModel = entries.count { it.byModel }
 +    val lastAt = entries.maxOfOrNull { it.at } ?: 0L
 +
-+    Box(Modifier.fillMaxSize().background(HudBg)) {
++    var boxTop by remember { mutableFloatStateOf(0f) }
++    Box(Modifier.fillMaxSize().background(HudBg).onGloballyPositioned { boxTop = it.boundsInRoot().top }) {
 +        // ── the HUD canvas (full page; the header and panels sit on top) ──
 +        Canvas(Modifier.fillMaxSize().semantics { contentDescription = "知识库星图" }
 +            .pointerInput(geo) {
@@ -51863,7 +52097,10 @@ index 0000000..32ccee7
 +            val t = time.floatValue
 +            val z = NexusCore.ease(focus.value)
 +            val w = size.width; val h = size.height
-+            val cx = w / 2f; val cy = h * 0.43f
++            val top0 = if (vizTop > 0f) vizTop - boxTop else h * 0.20f
++            val bot0 = if (vizBot - boxTop > top0 + 100f) vizBot - boxTop else h * 0.84f
++            val (cy, scaleL, floorY) = NexusCore.layout(w, top0, bot0)
++            val cx = w / 2f
 +            drawIntoCanvas { cv ->
 +                val c = cv.nativeCanvas
 +                val P = paints
@@ -51878,7 +52115,7 @@ index 0000000..32ccee7
 +                    c.drawCircle(st[k * 4] * w, st[k * 4 + 1] * h, st[k * 4 + 2] * 0.7f * dp, P.fill)
 +                }
 +                // perspective floor grid, slowly moving toward the viewer
-+                val hor = h * 0.72f
++                val hor = floorY   // [38.9.12.1] grid floor directly under the sphere
 +                P.line.strokeWidth = 1f
 +                for (k in 0 until 14) {
 +                    val yy = Math.pow(((k + (t * 0.4f) % 1f) / 14f).toDouble(), 2.2).toFloat(); val y = hor + yy * (h - hor)
@@ -51889,8 +52126,8 @@ index 0000000..32ccee7
 +
 +                // camera
 +                val ay = 0.4f + NexusCore.ORBIT_RAD_S * t; val ax = -0.32f + 0.04f * sin(t * 0.5f)
-+                val scale0 = min(w * 0.243f, h * 0.2f)
-+                NexusCore.rotate(geo.dirs, geo.nRot, ay, ax)
++                val scale0 = scaleL
++                NexusCore.rotate(geo.dirs, geo.nRot, ay * 0.5f, ax - 0.15f)   // [38.9.12.1] same frame as the orbit: nodes ride on it
 +                var fx = 0f; var fy = 0f
 +                if (sel in 0 until n && z > 0f) {
 +                    val o = NexusCore.focusOffset(geo.nRot[sel * 3], geo.nRot[sel * 3 + 1], scale0, z); fx = o.first; fy = o.second
@@ -51927,8 +52164,16 @@ index 0000000..32ccee7
 +
 +                // radar sweep (expanding flat ring every 3.5 s)
 +                val rt = (t % 3.5f) / 3.5f; val rr = scale * (0.9f + 1.1f * rt)
-+                P.line.strokeWidth = 1.2f * dp; P.line.color = withA(HudCyan.toArgb(), 0.35f * (1 - rt) * dim)
++                P.line.strokeWidth = 1.6f * dp; P.line.color = withA(HudCyan.toArgb(), 0.6f * (1 - rt) * dim)
 +                P.rect.set(cx + fx - rr, cy + fy - rr * 0.36f, cx + fx + rr, cy + fy + rr * 0.36f); c.drawOval(P.rect, P.line)
++                // [38.9.12.1] visible radar sweep: a rotating wedge with a fading trail on the orbit plane
++                val sr = scale * 1.85f
++                P.rect.set(cx + fx - sr, cy + fy - sr * 0.36f, cx + fx + sr, cy + fy + sr * 0.36f)
++                val sa = Math.toDegrees((t * 0.9).toDouble()).toFloat() % 360f
++                for (k in 0 until 8) { P.fill.color = withA(HudCyan.toArgb(), 0.10f * (1f - k / 8f) * dim); c.drawArc(P.rect, sa - k * 5f, 5f, true, P.fill) }
++                P.line.strokeWidth = 1.4f * dp; P.line.color = withA(0xFFBFF6FF.toInt(), 0.7f * dim)
++                val sRad = Math.toRadians(sa.toDouble() + 5.0)
++                c.drawLine(cx + fx, cy + fy, cx + fx + sr * cos(sRad).toFloat(), cy + fy + sr * 0.36f * sin(sRad).toFloat(), P.line)
 +
 +                // tilted outer orbit
 +                NexusCore.rotate(geo.orbit, geo.oRot, ay * 0.5f, ax - 0.15f); NexusCore.project(geo.oRot, geo.oProj, cx, cy, scale, fx, fy)
@@ -51941,7 +52186,7 @@ index 0000000..32ccee7
 +                // nodes (back to front)
 +                NexusCore.project(geo.nRot, geo.nProj, cx, cy, scale, fx, fy)
 +                val (subXyz, subOwner) = geo.subs
-+                NexusCore.rotate(subXyz, geo.subRot, ay, ax); NexusCore.project(geo.subRot, geo.subProj, cx, cy, scale, fx, fy)
++                NexusCore.rotate(subXyz, geo.subRot, ay * 0.5f, ax - 0.15f); NexusCore.project(geo.subRot, geo.subProj, cx, cy, scale, fx, fy)
 +                for (i in 0 until n) geo.order[i] = i
 +                // insertion sort by depth (far first) — n ≤ 8
 +                for (i in 1 until n) { var j = i; while (j > 0 && geo.nProj[geo.order[j - 1] * 4 + 2] < geo.nProj[geo.order[j] * 4 + 2]) { val tmp = geo.order[j]; geo.order[j] = geo.order[j - 1]; geo.order[j - 1] = tmp; j-- } }
@@ -51953,20 +52198,21 @@ index 0000000..32ccee7
 +                    val isSel = k == sel
 +                    val dk = if (isSel) 1f else dim
 +                    val qk = if (matches == null || k in matches) 1f else 0.3f
-+                    val al = (if (nz < 0.2f) 1f else 0.35f) * dk * qk
++                    val al = (if (nz < 0.2f) 1f else 0.62f) * dk * qk
 +                    // curved link with brighter end
 +                    P.line.strokeWidth = 1.2f * dp
 +                    var px0 = coreX; var py0 = coreY
 +                    for (s in 1..16) {
 +                        val tt = s / 16f; val (bx, by) = NexusCore.arc(coreX, coreY, nx, ny, 30 * dp, tt)
-+                        P.line.color = withA(col, 0.27f * al * (0.3f + 0.7f * tt)); c.drawLine(px0, py0, bx, by, P.line); px0 = bx; py0 = by
++                        P.line.color = withA(col, 0.40f * al * (0.3f + 0.7f * tt)); c.drawLine(px0, py0, bx, by, P.line); px0 = bx; py0 = by
 +                    }
 +                    // data particles
-+                    for (qn in 0 until 2) {
-+                        val tt = (t * 0.45f + k * 0.13f + qn * 0.5f) % 1f
++                    for (qn in 0 until 3) {
++                        val tt = (t * 0.45f + k * 0.13f + qn / 3f) % 1f
 +                        val (qx, qy) = NexusCore.arc(coreX, coreY, nx, ny, 30 * dp, tt)
-+                        P.fill.color = withA(col, 0.35f * al); c.drawCircle(qx, qy, 3.2f * dp, P.fill)
-+                        P.fill.color = withA(0xFFFFFFFF.toInt(), 0.9f * al); c.drawCircle(qx, qy, 1.1f * dp, P.fill)
++                        P.fill.color = withA(col, 0.30f * al); c.drawCircle(qx, qy, 5f * dp, P.fill)
++                        P.fill.color = withA(col, 0.65f * al); c.drawCircle(qx, qy, 2.6f * dp, P.fill)
++                        P.fill.color = withA(0xFFFFFFFF.toInt(), al); c.drawCircle(qx, qy, 1.4f * dp, P.fill)
 +                    }
 +                    // sub-entry specks
 +                    var cnt = 0
@@ -51987,7 +52233,7 @@ index 0000000..32ccee7
 +                    P.line.strokeWidth = 1.2f * dp; P.line.color = withA(col, 0.67f * al); c.drawCircle(nx, ny, sz * 1.9f * pulse, P.line)
 +                    if (isSel && z > 0f) { P.line.color = withA(col, 0.86f * z); c.drawCircle(nx, ny, sz * (2.6f + 0.6f * sin(t * 3f)), P.line) }
 +                    // label tag
-+                    if (al >= 0.5f) {
++                    if (al >= 0.3f) {   // [38.9.12.1] every topic labelled (front and back), not just the front 4
 +                        val right = nx >= coreX
 +                        P.text.textSize = 12.5f * density.fontScale * dp; P.mono.textSize = 9f * density.fontScale * dp
 +                        val name = topics[k].name
@@ -52042,7 +52288,7 @@ index 0000000..32ccee7
 +                // scan beam sweeping down the page
 +                if (P.beam == null || P.beamH != 40 * dp) {
 +                    P.beamH = 40 * dp
-+                    P.beam = android.graphics.LinearGradient(0f, 0f, 0f, P.beamH, withA(HudCyan.toArgb(), 0f), withA(HudCyan.toArgb(), 0.07f), android.graphics.Shader.TileMode.CLAMP)
++                    P.beam = android.graphics.LinearGradient(0f, 0f, 0f, P.beamH, withA(HudCyan.toArgb(), 0f), withA(HudCyan.toArgb(), 0.13f), android.graphics.Shader.TileMode.CLAMP)
 +                }
 +                val by = ((t * 0.22f) % 1f) * h
 +                c.save(); c.translate(0f, by - P.beamH)
@@ -52050,7 +52296,7 @@ index 0000000..32ccee7
 +                c.restore()
 +                // HUD corner brackets around the viz
 +                P.line.strokeWidth = 1f; P.line.color = withA(HudCyan.toArgb(), 0.47f)
-+                val top = h * 0.22f; val bot = h * 0.80f; val l = 14 * dp; val r = w - 14 * dp; val L = 16 * dp
++                val top = top0 + 8 * dp; val bot = bot0 - 8 * dp; val l = 14 * dp; val r = w - 14 * dp; val L = 16 * dp
 +                c.drawLine(l, top, l + L, top, P.line); c.drawLine(l, top, l, top + L, P.line)
 +                c.drawLine(r, top, r - L, top, P.line); c.drawLine(r, top, r, top + L, P.line)
 +                c.drawLine(l, bot, l + L, bot, P.line); c.drawLine(l, bot, l, bot - L, P.line)
@@ -52061,7 +52307,8 @@ index 0000000..32ccee7
 +        }
 +
 +        // ── header, readouts, search ──
-+        Column(Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 16.dp)) {
++        Column(Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 16.dp)
++            .onGloballyPositioned { vizTop = it.boundsInRoot().bottom }) {
 +            Row(Modifier.fillMaxWidth().padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
 +                HudSquareButton("‹", "返回") { if (sel >= 0) sel = -1 else onBack() }
 +                Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -52074,11 +52321,11 @@ index 0000000..32ccee7
 +                val sync = if (lastAt > 0) java.text.SimpleDateFormat("HH:mm", java.util.Locale.US).format(java.util.Date(lastAt)) else "--:--"
 +                listOf(NexusCore.pad3(totalEntries) to "ENTRIES", NexusCore.pad2(topics.size) to "CLUSTERS", sync to "LAST SYNC",
 +                    NexusCore.indexed(totalEntries, byModel) to "INDEXED").forEach { (a, b) ->
-+                    Row(Modifier.weight(1f).height(30.dp)) {
++                    Row(Modifier.weight(1f).height(androidx.compose.foundation.layout.IntrinsicSize.Min)) {   // [38.9.12.1] captions were clipped at 30 dp
 +                        Box(Modifier.width(1.dp).fillMaxHeight().background(HudCyan.copy(alpha = 0.8f)))
 +                        Column(Modifier.padding(start = 8.dp)) {
 +                            Text(a, color = HudInk, fontSize = 14.sp, fontFamily = FontFamily.Monospace, maxLines = 1)
-+                            Text(b, color = HudMuted, fontSize = 8.sp, fontFamily = FontFamily.Monospace, maxLines = 1)
++                            Text(b, color = HudMuted, fontSize = 8.sp, lineHeight = 10.sp, fontFamily = FontFamily.Monospace, maxLines = 1, softWrap = false)
 +                        }
 +                    }
 +                }
@@ -52105,7 +52352,8 @@ index 0000000..32ccee7
 +        }
 +
 +        // ── bottom: RECENT INGEST (no focus) / topic detail (focused) ──
-+        Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().navigationBarsPadding().padding(horizontal = 12.dp, vertical = 10.dp)) {
++        Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().navigationBarsPadding().padding(horizontal = 12.dp, vertical = 10.dp)
++            .onGloballyPositioned { if (sel < 0) vizBot = it.boundsInRoot().top }) {
 +            AnimatedVisibility(sel < 0 && entries.isNotEmpty(), enter = fadeIn(tween(400)), exit = fadeOut(tween(300))) {
 +                HudPanel {
 +                    Text("RECENT INGEST", color = HudMuted, fontSize = 9.sp, fontFamily = FontFamily.Monospace)
@@ -53784,7 +54032,7 @@ index 0000000..8d21b4e
 +    }
 +}
 diff --git a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
-index 95d1b6b..27717f9 100644
+index 95d1b6b..fbe57f9 100644
 --- a/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/plus/TodayCard.kt
 @@ -1,6 +1,7 @@
@@ -53850,7 +54098,7 @@ index 95d1b6b..27717f9 100644
      val greeting = androidx.compose.runtime.remember(gTick, hour) {
          val snap = DeviceSnap.read(context)
          val charging = runCatching { context.getSystemService(android.os.BatteryManager::class.java)?.isCharging == true }.getOrDefault(false)
-@@ -143,21 +167,112 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier, onSearch:
+@@ -143,21 +167,110 @@ fun TodayCard(onOpen: (String) -> Unit, modifier: Modifier = Modifier, onSearch:
                  .clickable { switcher = true }.semantics { contentDescription = "换角色：$name" },
                  contentAlignment = Alignment.Center) { PetAvatar(size = 100.dp) }
          }
@@ -53970,15 +54218,13 @@ index 95d1b6b..27717f9 100644
 +            Spacer(Modifier.weight(1f).widthIn(min = 8.dp))
 +            HomeWeatherMini()
 +        }
-+        // [Mines-38.9.12] design v3 ① 今日概览: 服务器 online / total · 待处理 (account problems), tap → the page
-+        if (!searching) TodayOverview3912()
 +        Row(Modifier.fillMaxWidth().padding(start = 24.dp, end = 12.dp, top = 0.dp, bottom = 0.dp).offset(y = (-6).dp), verticalAlignment = Alignment.CenterVertically) {
 +            Text(if (searching && query.isNotBlank()) "找到 $resultCount 个对话 · 按最近" else "最近对话", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = m.ink2, style = fogGlow(), modifier = Modifier.weight(1f))
 +            if (!searching) ChatFilterMenu(all)
          }
      }
  }
-@@ -203,6 +318,65 @@ fun HomeAvatar(modifier: Modifier = Modifier) {
+@@ -203,6 +316,65 @@ fun HomeAvatar(modifier: Modifier = Modifier) {
      }
  }
  
@@ -54044,7 +54290,7 @@ index 95d1b6b..27717f9 100644
  /** [Mines-38.7] the home weather as the sprite / big picture / pill need it; null = no weather (nothing shown). */
  class HomeWx(val icon: String, val words: String, val temp: Int, val extra: String, val night: Boolean) {
      val spoken get() = "$words $temp 度"
-@@ -219,7 +393,8 @@ fun homeWeather(): HomeWx? {
+@@ -219,7 +391,8 @@ fun homeWeather(): HomeWx? {
      val forced = com.openminis.app.plus.HomeGreeting.override?.optInt("hour", -1)?.takeIf { it >= 0 }
      val night = if (forced != null) forced >= 19 || forced < 6 else sunNight
      val (icon, words) = com.openminis.app.plus.HomeGreeting.describe(w.code, if (night) 23 else 12)
@@ -54054,7 +54300,7 @@ index 95d1b6b..27717f9 100644
      return HomeWx(icon, words, Math.round(w.temp).toInt(), extra, night)
  }
  
-@@ -234,7 +409,7 @@ fun HomeWeatherPill() {
+@@ -234,7 +407,7 @@ fun HomeWeatherPill() {
      androidx.compose.animation.AnimatedVisibility(HomeOrbit.open,
          enter = androidx.compose.animation.fadeIn() + androidx.compose.animation.expandVertically(),
          exit = androidx.compose.animation.fadeOut() + androidx.compose.animation.shrinkVertically()) {
@@ -54063,7 +54309,7 @@ index 95d1b6b..27717f9 100644
          Row(Modifier.padding(top = 10.dp, bottom = 2.dp).heightIn(min = 36.dp)
              .clip(RoundedCornerShape(50)).background(fill).border(1.dp, m.hairline.copy(alpha = 0.18f), RoundedCornerShape(50))
              .padding(horizontal = 14.dp, vertical = 4.dp)
-@@ -242,7 +417,7 @@ fun HomeWeatherPill() {
+@@ -242,7 +415,7 @@ fun HomeWeatherPill() {
              verticalAlignment = Alignment.CenterVertically) {
              Text("${wx.temp}°", fontSize = 18.sp, lineHeight = 22.sp, fontWeight = FontWeight.Bold, color = m.ink, maxLines = 1, softWrap = false)
              Spacer(Modifier.width(6.dp))
@@ -54072,7 +54318,7 @@ index 95d1b6b..27717f9 100644
          }
      }
  }
-@@ -287,7 +462,8 @@ class WeatherOrbitState {
+@@ -287,7 +460,8 @@ class WeatherOrbitState {
   * face's upper right, a tap shows the pill.
   */
  @Composable
@@ -54082,7 +54328,7 @@ index 95d1b6b..27717f9 100644
      val ctx = LocalContext.current
      val m = mines()
      val still = remember { AnimeWeather.still(ctx) }
-@@ -297,10 +473,10 @@ private fun WeatherOrbit(st: WeatherOrbitState, wx: HomeWx, front: Boolean, onTa
+@@ -297,10 +471,10 @@ private fun WeatherOrbit(st: WeatherOrbitState, wx: HomeWx, front: Boolean, onTa
          if (!front || still || st.open) return@LaunchedEffect
          owner.lifecycle.repeatOnLifecycle(androidx.lifecycle.Lifecycle.State.RESUMED) {
              var prev = androidx.compose.runtime.withFrameMillis { it }
@@ -54095,7 +54341,7 @@ index 95d1b6b..27717f9 100644
          }
      }
      LaunchedEffect(st.open) { if (front && st.open) { kotlinx.coroutines.delay(4000); if (st.open) st.close() } }
-@@ -315,9 +491,9 @@ private fun WeatherOrbit(st: WeatherOrbitState, wx: HomeWx, front: Boolean, onTa
+@@ -315,9 +489,9 @@ private fun WeatherOrbit(st: WeatherOrbitState, wx: HomeWx, front: Boolean, onTa
      }
      val a = st.angle
      val f = st.fly.value
@@ -54108,7 +54354,7 @@ index 95d1b6b..27717f9 100644
      // faint dashed orbit line (back layer, while circling)
      if (!front && !still && f < 0.02f) {
          androidx.compose.foundation.Canvas(Modifier.size(1.dp)) {
-@@ -338,7 +514,7 @@ private fun WeatherOrbit(st: WeatherOrbitState, wx: HomeWx, front: Boolean, onTa
+@@ -338,7 +512,7 @@ private fun WeatherOrbit(st: WeatherOrbitState, wx: HomeWx, front: Boolean, onTa
      val tx = 0f; val ty = -82f
      val x = ox + (tx - ox) * f
      val y = oy + (ty - oy) * f - kotlin.math.sin(Math.PI.toFloat() * f) * 22f
@@ -54117,7 +54363,7 @@ index 95d1b6b..27717f9 100644
      val scale = sc0 + (1f - sc0) * f
      val alpha = al0 + (1f - al0) * f
      // faint trail of light dots behind the sprite while it circles
-@@ -407,7 +583,7 @@ private fun StatusTile(modifier: Modifier, icon: String, value: String, label: S
+@@ -407,7 +581,7 @@ private fun StatusTile(modifier: Modifier, icon: String, value: String, label: S
              Text(label, fontSize = MT.Meta, color = m.ink2, maxLines = 1, softWrap = false, modifier = Modifier.weight(1f))
              Box(Modifier.size(6.dp).clip(CircleShape).background(dot))
          }
@@ -54126,7 +54372,7 @@ index 95d1b6b..27717f9 100644
              overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, modifier = Modifier.padding(top = 2.dp))
      }
  }
-@@ -473,7 +649,7 @@ private fun FeedRow(item: com.openminis.app.plus.Digest.Item) {
+@@ -473,7 +647,7 @@ private fun FeedRow(item: com.openminis.app.plus.Digest.Item) {
          ToneBubble(com.openminis.app.ui.brand.MinesIcons.named(icon)!!, tone)
          Spacer(Modifier.width(14.dp))
          Column(Modifier.weight(1f)) {
@@ -54135,7 +54381,7 @@ index 95d1b6b..27717f9 100644
                  maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
              val sub = it.summary.takeIf { s -> s.isNotBlank() && s != it.headline } ?: it.source
              Text(sub, fontSize = 15.sp, lineHeight = 20.sp, color = m.ink2, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
-@@ -514,7 +690,7 @@ private fun MessagesBar(count: Int, onClick: () -> Unit) {
+@@ -514,7 +688,7 @@ private fun MessagesBar(count: Int, onClick: () -> Unit) {
      ) {
          MinesIcon(com.openminis.app.ui.brand.MinesIcons.named("mail")!!, null, tint = m.ink2, modifier = Modifier.size(20.dp))
          Spacer(Modifier.width(10.dp))
@@ -54144,7 +54390,7 @@ index 95d1b6b..27717f9 100644
          if (count > 0) {
              Box(Modifier.heightIn(min = 22.dp).clip(RoundedCornerShape(50)).background(MinesDesign.DangerFill).padding(horizontal = 7.dp),
                  contentAlignment = Alignment.Center) {
-@@ -542,10 +718,10 @@ fun HomeWeatherChip(modifier: Modifier = Modifier) {
+@@ -542,10 +716,10 @@ fun HomeWeatherChip(modifier: Modifier = Modifier) {
      val hour = (com.openminis.app.plus.HomeGreeting.override?.optInt("hour", -1)?.takeIf { it >= 0 }) ?: Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
      val (icon, words) = com.openminis.app.plus.HomeGreeting.describe(w.code, hour)
      val night = hour >= 19 || hour < 6
@@ -54157,7 +54403,7 @@ index 95d1b6b..27717f9 100644
      Row(modifier.padding(top = 4.dp, bottom = 6.dp).clip(RoundedCornerShape(50)).background(fill)
          .border(1.dp, m.hairline.copy(alpha = 0.18f), RoundedCornerShape(50))
          .padding(start = 8.dp, end = 16.dp, top = 3.dp, bottom = 3.dp)
-@@ -556,6 +732,226 @@ fun HomeWeatherChip(modifier: Modifier = Modifier) {
+@@ -556,6 +730,179 @@ fun HomeWeatherChip(modifier: Modifier = Modifier) {
          Spacer(Modifier.width(6.dp))
          Text("$t°", fontSize = 18.sp, lineHeight = 22.sp, fontWeight = FontWeight.Bold, color = m.ink, maxLines = 1)
          Spacer(Modifier.width(8.dp))
@@ -54335,53 +54581,6 @@ index 95d1b6b..27717f9 100644
 +                }
 +                MinesIcon(com.openminis.app.ui.brand.MinesIcons.named("chevron-right")!!, null, tint = m.ink3, modifier = Modifier.size(16.dp))
 +            }
-+        }
-+    }
-+}
-+
-+
-+/** [Mines-38.9.12] 今日概览 (design v3 ①): two frosted tiles + the first two 待处理 items. Hidden when there is nothing to show. */
-+@Composable
-+private fun TodayOverview3912() {
-+    val m = mines()
-+    val ctx = androidx.compose.ui.platform.LocalContext.current
-+    com.openminis.app.plus.PlusPrefs.init(ctx)
-+    val st by com.openminis.app.plus.PlusPrefs.state.collectAsState()
-+    val feed by com.openminis.app.plus.Digest.items.collectAsState()
-+    val patrol by com.openminis.app.plus.AccountPatrol.status.collectAsState()
-+    val todo = androidx.compose.runtime.remember(feed, patrol) { feed.filter { it.tab == com.openminis.app.plus.Digest.Tab.ACCOUNT && !isResolved(it, patrol) }.sortedByDescending { it.at } }
-+    val servers = st.servers.filter { it.enabled }
-+    if (servers.isEmpty() && todo.isEmpty()) return
-+    Text("今日概览", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = m.ink2, style = fogGlow(), modifier = Modifier.padding(start = 24.dp, bottom = 6.dp).offset(y = (-6).dp))
-+    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp).offset(y = (-6).dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-+        if (servers.isNotEmpty()) {
-+            val on = servers.count { it.lastLatencyMs >= 0 }
-+            OverviewTile("服务器", "$on/${servers.size}", servers.take(3).joinToString(" · ") { it.name.ifBlank { it.host }.take(8) }, Modifier.weight(1f)) { PlusNav.go(PlusRoutes.WORK) }
-+        }
-+        OverviewTile("待处理", "${todo.size}", if (todo.isEmpty()) "没有需要处理的" else "账号与密钥", Modifier.weight(1f)) { PlusNav.go(PlusRoutes.DIGEST) }
-+    }
-+    if (todo.isNotEmpty()) MinesCard(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp).offset(y = (-6).dp), onClick = { PlusNav.go(PlusRoutes.DIGEST) }) {
-+        todo.take(2).forEachIndexed { i, it ->
-+            if (i > 0) WarmDivider(16.dp)
-+            Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-+                val (fg, bg) = toneColors(Tone.WARNING)
-+                Text(it.source.take(6).ifBlank { "账号" }, fontSize = MT.Meta, color = fg, maxLines = 1,
-+                    modifier = Modifier.clip(RoundedCornerShape(6.dp)).background(bg).padding(horizontal = 6.dp, vertical = 2.dp))
-+                Text(it.title, fontSize = MT.Sub, color = m.ink, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-+                    modifier = Modifier.padding(start = 10.dp).weight(1f))
-+            }
-+        }
-+    }
-+}
-+
-+@Composable
-+private fun OverviewTile(label: String, big: String, sub: String, modifier: Modifier, onClick: () -> Unit) {
-+    val m = mines()
-+    MinesCard(modifier, onClick = onClick) {
-+        Column(Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
-+            Text(label, fontSize = MT.Meta, color = m.ink2)
-+            Text(big, fontSize = 22.sp, fontWeight = FontWeight.SemiBold, color = m.ink, modifier = Modifier.padding(top = 4.dp), maxLines = 1)
-+            Text(sub, fontSize = MT.Meta, color = m.ink2, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
 +        }
      }
  }
@@ -64389,10 +64588,10 @@ index 0000000..b47e69d
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/NexusCoreTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/NexusCoreTest.kt
 new file mode 100644
-index 0000000..9203a9d
+index 0000000..c7572d2
 --- /dev/null
 +++ b/src/android/app/src/test/java/com/openminis/app/plus/NexusCoreTest.kt
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,87 @@
 +package com.openminis.app.plus
 +
 +import org.junit.Assert.assertEquals
@@ -64467,6 +64666,17 @@ index 0000000..9203a9d
 +        val (x0, y0) = NexusCore.arc(0f, 0f, 10f, 0f, 5f, 0f); assertEquals(0f, x0, 0f); assertEquals(0f, y0, 0f)
 +        val (x1, y1) = NexusCore.arc(0f, 0f, 10f, 0f, 5f, 1f); assertEquals(10f, x1, 1e-5f); assertEquals(0f, y1, 1e-5f)
 +        val (_, ym) = NexusCore.arc(0f, 0f, 10f, 0f, 5f, 0.5f); assertTrue(ym < 0f)
++    }
++
++    @Test fun layout39121() {
++        // phone 1080 wide, search ends at 560 px, panel starts at 1980 px
++        val (cy, scale, floor) = NexusCore.layout(1080f, 560f, 1980f)
++        assertTrue(cy > 1150f && cy < 1270f)
++        assertTrue(scale > 240f && scale <= 1080f * 0.235f + 0.1f)
++        assertTrue(floor > cy + scale && floor < 1980f)
++        assertEquals(24, NexusCore.orbitDirs(12).size)
++        val d = NexusCore.orbitDirs(8)
++        for (k in 0 until 8) assertTrue(kotlin.math.abs(d[k * 3 + 1]) < 0.2f)
 +    }
 +}
 diff --git a/src/android/app/src/test/java/com/openminis/app/plus/OnceCacheTest.kt b/src/android/app/src/test/java/com/openminis/app/plus/OnceCacheTest.kt
