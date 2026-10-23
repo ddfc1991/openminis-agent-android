@@ -7119,7 +7119,7 @@ def b39121(res):
             if r2 is None or not find(r2, "挂断"): fail("call screen gone 6 s after 接听")
             if tap_text("静音", exact=True, wait=1.5):
                 o["call_muted"] = result_json("group", "i39121 callstate", timeout=15)
-                if '"muted":true' not in str(o["call_muted"]).replace(" ", ""): fail(f"静音 did not toggle: {o['call_muted']}")
+                if not (isinstance(o["call_muted"], dict) and o["call_muted"].get("muted") is True): fail(f"静音 did not toggle: {o['call_muted']}")
                 tap_text("取消静音", exact=True, wait=1)
             else: fail("静音 button missing")
             if tap_text("扬声器", wait=1.5):
@@ -7255,7 +7255,9 @@ def b39121(res):
     # a second cold start is a normal one (forceHome only once), the card stays until 知道了
     sh(f"am force-stop {PKG}"); time.sleep(2); sh(f"am start -W -n {PKG}/com.openminis.app.MainActivity", timeout=90); time.sleep(10)
     o["second_start"] = result_json("group", "i39121 safe", timeout=20)
+    healthy_home()
     if tap_text("知道了", exact=True, wait=3): o["dismissed"] = True
+    else: fail("知道了 not found on home after the second start")
     o["after_dismiss"] = result_json("group", "i39121 safe", timeout=20)
     shot("dismissed")
     result_json("group", "i39121 clean", timeout=120)
