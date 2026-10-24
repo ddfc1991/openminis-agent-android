@@ -48,6 +48,8 @@ object AgentTools {
         rosterNames: List<String> = listOf(SubAgentDefinition.BUILT_IN_NAME),
         // [Mines-kb] search_knowledge, when this chat has the knowledge base on.
         knowledgeTool: AgentToolDefinition? = null,
+        // [Mines-38.9.13 memory_v2] `memory` (ls/find/read) replaces memory_get; memory_write gains `dir`.
+        memoryV2: Boolean = false,
     ): List<AgentToolDefinition> = buildList {
         add(shellExecuteDefinition())
         add(FileReadTool.definition())
@@ -57,7 +59,10 @@ object AgentTools {
             add(ReadImageTool.definition())
         }
         if (browserEnabled) add(browserUseDefinition())
-        if (memoryEnabled) {
+        if (memoryEnabled && memoryV2) {
+            if (!isHelper) add(memoryWriteDefinition().let { it.copy(parameters = it.parameters + ("dir" to com.openminis.app.plus.MemoryV2.WRITE_DIR_PARAM), propertyOrdering = it.propertyOrdering?.plus("dir")) })
+            add(com.openminis.app.plus.MemoryV2.definition())
+        } else if (memoryEnabled) {
             if (!isHelper) add(memoryWriteDefinition())
             add(memoryGetDefinition())
         }

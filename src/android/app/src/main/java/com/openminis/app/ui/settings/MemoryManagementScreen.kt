@@ -98,6 +98,7 @@ fun MemoryManagementScreen(
             )
         }
         Spacer(modifier = Modifier.height(16.dp))
+        MemoryV2SettingsSection()  // [Mines-38.9.13 memory_v2]
 
         if (files.isEmpty()) {
             Column(

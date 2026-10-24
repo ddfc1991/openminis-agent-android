@@ -2008,6 +2008,7 @@ class ChatViewModel(
             // would reject.
             rosterNames = providerRepository.subAgents.map { it.name },
             knowledgeTool = com.openminis.app.plus.KnowledgeBase.toolDefinition(context, sessionId),
+            memoryV2 = com.openminis.app.plus.MemoryV2.isOn(context),  // [Mines-38.9.13 memory_v2]
         )
 
     /**
@@ -13661,6 +13662,10 @@ class ChatViewModel(
                     )
                 }
             "memory_get" -> executeMemoryGetTool(argsJson)
+            // [Mines-38.9.13 memory_v2] ls / find / read; refused like memory_get's sibling write when memory is off
+            com.openminis.app.plus.MemoryV2.TOOL_NAME ->
+                if (!_memoryEnabled.value) ToolExecutionResult("Memory is turned off for this session.", false)
+                else kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.MemoryV2.runTool(context, argsJson) }
             com.openminis.app.plus.MinesSelfCheckTool.TOOL_NAME ->
                 kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.MinesSelfCheckTool.run(context, argsJson) }
             com.openminis.app.plus.KnowledgeBase.TOOL_NAME ->
@@ -15015,6 +15020,7 @@ class ChatViewModel(
             return ToolExecutionResult(msg, false, toolTitle = "Memory (disabled)")
         }
         val result = MemoryTools.executeMemoryWrite(argsJson, repo)
+        if (result.success && com.openminis.app.plus.MemoryV2.isOn(context)) com.openminis.app.plus.MemoryV2.onWrite(context, argsJson)  // [Mines-38.9.13 memory_v2]
         // Record for SessionMemorySheet
         val content = try {
             JSONObject(argsJson).optString("content", "")
@@ -15615,6 +15621,7 @@ class ChatViewModel(
         // aren't reachable when the user asks. The fragment / tool dual
         // gate is symmetrical: enable both or disable both, never mismatch.
         val memoryOn = _memoryEnabled.value
+        val memV2 = memoryOn && com.openminis.app.plus.MemoryV2.isOn(context)  // [Mines-38.9.13 memory_v2] off = old prompt byte-for-byte
         val toolListMemoryBullets = if (memoryOn) {
             """
 ${com.openminis.app.agent.jobs.HelperRunner.systemPromptBullet(!isHelper && com.openminis.app.agent.jobs.AgentSettings.isEnabled(context))}${subAgentRosterPromptSection()}- memory_write: Save a memory entry to today's daily log (YYYY-MM-DD.md). Use proactively to note user preferences, project patterns, and important context.
@@ -15675,7 +15682,7 @@ Memory system (currently DISABLED):
         } else ""
         val browserPromptBullet = if (browserToolEnabled) """- browser_use: Web browsing (navigate, screenshot, click, type, get_text, scroll, scroll_and_collect, get_readable, get_backbone, fetch, etc.). Starts with a desktop Chrome user agent. Use screenshot to see the page.
   网站注册 / 登录 / 填表 / 读登录后的页面：一律用 browser_use（App 内置浏览器，带用户已登录的会话，验证码用 wait_for_otp 自动填，人机验证用 wait_for_human 交给用户）。不要在 shell_execute 里起 playwright / puppeteer / selenium / connectOverCDP / 远程或云端浏览器会话；同一个办法失败两次就换办法或直接告诉用户卡在哪。
-  当 browser_use 触达 Google 登录 / OAuth 页（accounts.google.com、signin.google.com、myaccount.google.com、oauth2.googleapis.com 等）或网页返回 "disallowed_useragent" / 403 包含 "browser is not secure" 字样时，**不要重试或尝试登录** — Google 永久禁止 in-app WebView 完成登录，重试只会浪费 turn。改为告诉用户："此页面需要在系统 Chrome 完成登录" 并给出可点击的 Markdown link [在 Chrome 中打开](https://accounts.google.com/...)。点该 link 时 app 会跳出 Custom Tab；用户在 Chrome 完成操作后，请他**把所需结果（邮件正文 / 文档摘要 / 表格数据）粘贴回 chat**，你再继续帮他处理。这是 Android 平台限制，不是 bug。${toolListMemoryBullets}""" else ""
+  当 browser_use 触达 Google 登录 / OAuth 页（accounts.google.com、signin.google.com、myaccount.google.com、oauth2.googleapis.com 等）或网页返回 "disallowed_useragent" / 403 包含 "browser is not secure" 字样时，**不要重试或尝试登录** — Google 永久禁止 in-app WebView 完成登录，重试只会浪费 turn。改为告诉用户："此页面需要在系统 Chrome 完成登录" 并给出可点击的 Markdown link [在 Chrome 中打开](https://accounts.google.com/...)。点该 link 时 app 会跳出 Custom Tab；用户在 Chrome 完成操作后，请他**把所需结果（邮件正文 / 文档摘要 / 表格数据）粘贴回 chat**，你再继续帮他处理。这是 Android 平台限制，不是 bug。${if (memV2) toolListMemoryBullets.replace("- memory_get: Recall memories with keyword search. Check memory at the start of new topics to leverage past knowledge.", com.openminis.app.plus.MemoryV2.TOOL_BULLET) else toolListMemoryBullets}""" else ""
         val minisUrlNote = if (browserToolEnabled) """IMPORTANT: minis:// URLs are app-internal — they are NOT web URLs. Do NOT pass minis:// action URLs (open_terminal, views, settings) to browser_use — those are app deep links, use Markdown links in chat instead. However, minis:// resource URLs CAN be opened in browser_use with navigate. All directories under /var/minis/ are accessible: workspace, attachments, offloads, shared, etc. The built-in browser fully supports minis:// — HTML pages and all sub-resources (JS, CSS, images, fonts, etc.) referenced via minis:// absolute URLs or relative paths resolve correctly within the current session. When building multi-file web projects, use file_write to create files in the same directory (e.g. /var/minis/workspace/myapp/), then reference sub-resources with relative paths in HTML (e.g. <link href="style.css">, <script src="app.js">, <img src="logo.png">). The browser resolves relative paths against the minis:// base URL automatically. Cross-directory references also work with absolute minis:// URLs (e.g. <img src="minis://attachments/photo.png"> from a workspace HTML page). Navigate to the entry HTML to preview, e.g. minis://workspace/myapp/index.html.""" else """IMPORTANT: minis:// URLs are app-internal — they are NOT web URLs. Do NOT treat minis:// action URLs (open_terminal, views, settings) as web links — those are app deep links, use Markdown links in chat instead."""
         // [T-prompt-file-search-rg] The "File search" bullet below is the single
         // place for finding files and searching their contents, and steers the
@@ -15768,7 +15775,7 @@ Environment variables:
 - Shell environment variables may contain sensitive API keys, tokens, or passwords. NEVER echo, print, cat, or otherwise output their values to stdout/stderr. Always reference them by variable name (e.g. ${'$'}API_KEY) inside scripts or commands — never inline the literal value.
 - When a skill or task requires an environment variable that is not set, tell the user which variable is missing and provide a tappable deep link to create it: [Set ENV_NAME](minis://settings/environments?create_key=ENV_NAME&create_value=) — the user can tap it to open the Environment Variables page with the key pre-filled.
 - Settings deep links: when you tell the user "go to Settings → X" or want to point them at a specific setting, prefer a Markdown link `[Label](minis://settings/<path>)` over plain prose. Available paths: providers (list), providers/<instanceId> (one provider), model-groups (incl. Agent Loop), model-groups/<groupId>, usage (token usage), skills, memory, storage, shared-folders (Shared Folders: /var/minis/{shared,skills,memory}), mount-external (Mount External Folders), logs, appearance, background, about, permissions, environments[?create_key=K&create_value=V[&create_note=N]], rootfs (also reachable as mirrors). Unknown paths fall back to Settings home, but prefer the exact path so users land where they want. These settings/action links are app deep links — render them as Markdown links in chat (same action-vs-resource rule as the minis:// section above: only /var/minis resource URLs may go to browser_use).
-- To check if a variable is set, use `[ -n "${'$'}VAR" ] && echo 'set' || echo 'not set'`. NEVER use echo ${'$'}VAR, printenv VAR, or any command that would output the actual value into the conversation context.${memorySystemSection}
+- To check if a variable is set, use `[ -n "${'$'}VAR" ] && echo 'set' || echo 'not set'`. NEVER use echo ${'$'}VAR, printenv VAR, or any command that would output the actual value into the conversation context.${if (memV2) memorySystemSection.replace("memory_get", "the memory tool") else memorySystemSection}
 
 Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended, so in-app scheduled scripts may not run as expected. For follow-ups and recurring prompts, run `minis-scheduled create …` via shell_execute: it fires through a system alarm, so it runs a new turn even when Minis is in the background or closed (a force-stop cancels pending tasks until the app is next opened). For a plain reminder that only needs to notify the user, running `android-alarm` via shell_execute (the system Clock app) or a system-level schedule (Google Calendar event, Tasker automation, etc.) also works. (Waiting or polling WITHIN the current turn is different — that is what shell_execute `delay` chains are for, per the shell_execute notes above.)"""
 
@@ -15797,8 +15804,9 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
         // intentionally NOT gated by this toggle: skills are part of the
         // tool surface and SOUL.md is part of identity, both orthogonal
         // to the memory feature.
-        val globalMemoryFragment = if (memoryOn) memoryRepository?.loadGlobalMemoryFragment() else null
-        val dailyMemoryFragment = if (memoryOn) memoryRepository?.loadRecentDailyMemoryFragment() else null
+        // [Mines-38.9.13 memory_v2] on: one budgeted directory summary (+ GLOBAL.md) instead of GLOBAL.md + 3 daily logs
+        val globalMemoryFragment = if (memoryOn && !memV2) memoryRepository?.loadGlobalMemoryFragment() else null
+        val dailyMemoryFragment = if (memV2) com.openminis.app.plus.MemoryV2.promptFragment(context) else if (memoryOn) memoryRepository?.loadRecentDailyMemoryFragment() else null
         // [XSessionDiag] Hypothesis 3: ties the memory-injection sizes to a
         // SESSION id. MemoryRepository itself has no session context, so its own
         // `memory/daily-inject` line (which names the source files) cannot say who
