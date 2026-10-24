@@ -60,7 +60,8 @@ object SelfMap {
         return SelfMapCore.Snapshot(version(c), features(c), providers, groups, servers, skills, wf)
     }
 
-    fun promptBlock(c: Context): String = runCatching { SelfMapCore.promptBlock(snapshot(c), System.currentTimeMillis()) }.getOrDefault("")
+    fun promptBlock(c: Context): String = runCatching { SelfMapCore.promptBlock(snapshot(c), System.currentTimeMillis()) }.getOrDefault("") +
+        VpsPlan.promptBlock(c).takeIf { it.isNotBlank() }?.let { "\n" + it }.orEmpty()   // [Mines-38.9.13 vps_page_v2] 任务分工
 
     /** Probes one server's ports now (blocking ≤ ~4 s for 12 ports in parallel). */
     fun probeNow(c: Context, serverId: String, extra: List<Int> = emptyList()): List<SelfMapCore.Port> {
@@ -92,7 +93,7 @@ object SelfMap {
             "Use it before answering anything about what Mines can do, what is configured, or whether a server port is reachable — never guess.",
         parameters = mapOf(
             "tool_title" to AgentToolParam("string", "A concise 5-10 word summary shown to the user. Use the same language as the user."),
-            "section" to AgentToolParam("string", "all | features | providers | groups | servers"),
+            "section" to AgentToolParam("string", "all | features | providers | groups | servers | routing (which machine each kind of task goes to now)"),
             "probe" to AgentToolParam("boolean", "servers: re-test the ports now from the phone"),
             "ports" to AgentToolParam("string", "servers: extra ports to test, comma separated"),
         ),
@@ -108,6 +109,8 @@ object SelfMap {
             PlusPrefs.init(c)
             PlusPrefs.state.value.servers.filter { it.enabled && it.host.isNotBlank() }.forEach { probeNow(c, it.id, extra) }
         }
-        ToolExecutionResult(SelfMapCore.detail(snapshot(c, refresh = false), section, System.currentTimeMillis()), true)
+        // [Mines-38.9.13 vps_page_v2] where each kind of task goes (VPS / 电脑 page)
+        if (section.equals("routing", true)) ToolExecutionResult(VpsPlan.promptBlock(c).ifBlank { "任务分工页没打开（设置 → 实验功能）" }, true)
+        else ToolExecutionResult(SelfMapCore.detail(snapshot(c, refresh = false), section, System.currentTimeMillis()), true)
     }.getOrElse { ToolExecutionResult("Error: ${it.message}", false) }
 }

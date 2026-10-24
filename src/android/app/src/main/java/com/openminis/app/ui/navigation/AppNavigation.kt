@@ -651,7 +651,12 @@ fun AppNavigation(
         }
 
         composable(com.openminis.app.ui.plus.PlusRoutes.WORK) {
-            com.openminis.app.ui.plus.WorkLocationScreen(
+            // [Mines-38.9.13 vps_page_v2] new VPS / 电脑 page (设置 → 实验功能 turns it off → old 工作位置)
+            if (com.openminis.app.plus.VpsPlan.flagOn(androidx.compose.ui.platform.LocalContext.current)) com.openminis.app.ui.plus.VpsPageScreen(
+                onBack = { navController.safePopBackStack() },
+                onOpenTerminal = { cmd -> navController.safeNavigate(Routes.terminal(cmd)) },
+                onOpenServer = { id -> navController.safeNavigate(com.openminis.app.ui.plus.PlusRoutes.server(id)) },
+            ) else com.openminis.app.ui.plus.WorkLocationScreen(
                 onBack = { navController.safePopBackStack() },
                 onOpenTerminal = { cmd -> navController.safeNavigate(Routes.terminal(cmd)) },
                 onOpenServer = { id -> navController.safeNavigate(com.openminis.app.ui.plus.PlusRoutes.server(id)) },
