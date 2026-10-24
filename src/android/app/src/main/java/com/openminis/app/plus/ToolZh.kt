@@ -8,7 +8,7 @@ package com.openminis.app.plus
 object ToolZh {
     private val names = mapOf(
         "shell_execute" to "执行命令", "file_read" to "读文件", "file_write" to "写文件", "file_edit" to "改文件",
-        "browser_use" to "浏览网页", "read_image" to "看图", "memory_write" to "写记忆", "memory_get" to "读记忆",
+        "browser_use" to "浏览网页", "read_image" to "看图", "memory_write" to "写记忆", "memory_get" to "读记忆", "memory" to "查记忆",
         "web_search" to "搜索网页", "web_fetch" to "读网页", "task_progress" to "任务进度", "todo_write" to "待办",
         "subagent_task" to "子任务", "delegate_task" to "交给别的 AI", "agent_status" to "子任务状态", "accounts" to "账号",
         "model_use" to "调用模型", "skill_use" to "用技能", "android_a11y" to "手机操作", "screen_tap" to "点屏幕",
