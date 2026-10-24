@@ -144,6 +144,10 @@ try:
     I39113 = "i39113" in open("hark-build/smoke/target").read().splitlines()[1:2][0]   # [38.9.11.3] provider latency + continuous fog drift + SSH cert
 except Exception:
     I39113 = False
+try:
+    I3913 = "i3913" in open("hark-build/smoke/target").read().splitlines()[1:2][0].split()   # [38.9.13] task projects / VPS page / handoff v2 / memory v2 / Mines browser
+except Exception:
+    I3913 = False
 if I39113: I39112 = True
 if I39112: I39111 = True
 if I3911: I397 = True
@@ -3302,7 +3306,7 @@ def main():
         else: fns = (b387_linkall, b387_noblack, b387_persist, b387_platforms)
         if HUB: fns = tuple(fns) + (b3891_hub,)   # [38.9.1 c] hub runs after the UI passes
         if I395: fns = (b395_i2, b395_i) if I395B else (b395_i,)   # [38.9.5 i] build-i gate only: 一键关联 / 一键重新登录, gateway, new screens light + dark
-        if I39113: fns = ((b39121,) if I39121 else ()) + ((b3912,) if I3912 else ()) + (b39113,)
+        if I39113: fns = ((b3913,) if I3913 else ()) + ((b39121,) if I39121 else ()) + ((b3912,) if I3912 else ()) + (b39113,)
         elif I39112: fns = (b39112,)
         elif I39111: fns = (b39111,)
         elif I3911: fns = (b3911,)
@@ -7263,6 +7267,203 @@ def b39121(res):
     result_json("group", "i39121 clean", timeout=120)
     o["heap_end"] = result_json("group", "i3910 heap", timeout=20)
     print("I39121 RESULT " + json.dumps(o, ensure_ascii=False)[:12000], flush=True)
+
+
+
+# ======================= [38.9.13 integ] task projects / VPS page / handoff v2 / memory v2 / Mines browser =======================
+def b3913(res):
+    """[38.9.13] integrated build: 设置 → 实验功能 (one section, every flag) + 浏览器验证 rows; VPS / 电脑 page (change a rule →
+    已改 → 恢复默认); 任务 page (项目 / 已归档); 「帮我注册 zeabur.com」 → 立项 sheet without a password field → project; Google sign-in
+    → handoff popup named after the project + glass bar + 继续接管; 项目详情; memory find (memory_v2); GeckoView engine reads a page
+    and hands it to the user (MinesBrowserActivity)."""
+    o = res.setdefault("i3913", {})
+    def shot(name):
+        r = snap("i3913-" + name)
+        subprocess.run(f"cp {OUT}/{step_no:02d}-i3913-{name}.png {OUT}/i3913-{name}.png", shell=True)
+        return r
+    def fail(m): selftest_fail.append("i3913 " + m); print("I3913 FAIL " + m, flush=True)
+    def state(): 
+        s = result_json("group", "i3913 state", timeout=20)
+        return s if isinstance(s, dict) else {}
+    def wait_for(label, secs=30):
+        t0 = time.time()
+        while time.time() - t0 < secs:
+            r = dump()
+            if r is not None and find(r, label): return r
+            time.sleep(2)
+        return None
+    def fake(trig):
+        try: return json.loads(subprocess.run("curl -s http://127.0.0.1:8088/stats", shell=True, capture_output=True, text=True, timeout=10).stdout).get("i3913", {}).get(trig, {})
+        except Exception: return {}
+    def wait_fake(trig, n, secs):
+        t0 = time.time()
+        while time.time() - t0 < secs:
+            f = fake(trig)
+            if len(f.get("results") or []) >= n: return f
+            time.sleep(2)
+        return fake(trig)
+    def step(name, f):
+        t0 = time.time()
+        try: f()
+        except Exception as e:
+            import traceback; traceback.print_exc(); fail(f"{name} error {e}")
+        print(f"I3913 STEP {name} {int(time.time() - t0)} s", flush=True)
+        if not alive(): crashed.append(f"i3913 {name}"); recover(f"i3913 {name}")
+
+    set_zh(); o["seedmodel"] = seed_model(); healthy_home()
+    try: result_json("group", "wallpaper off")
+    except Exception: pass
+    s0 = state(); o["state0"] = s0; print("I3913 STATE0 " + json.dumps(s0, ensure_ascii=False), flush=True)
+    for k, v in (s0.get("flags") or {}).items():
+        if v is not True: fail(f"flag {k} not on by default: {v}")
+    if not s0.get("flags"): fail(f"no flags in state: {s0}")
+
+    def experiments():
+        route("settings", 3); tap_text("测试与上报", wait=3)
+        seen = set()
+        for i in range(8):
+            r = dump(); seen |= set(texts(r))
+            if find(r, "实验功能", exact=True) and i < 7:
+                shot("settings-experiments"); break
+            scroll_down()
+        for _ in range(3):
+            scroll_down(); r = dump(); seen |= set(texts(r))
+        shot("settings-experiments-2")
+        want = ("新版 VPS / 电脑 页", "任务项目", "分类记忆", "交接 v2（验证/登录后自动继续）", "回到你操作的那个标签页", "打开 Mines 浏览器")
+        miss = [w for w in want if not any(w in t for t in seen)]
+        o["experiments_missing"] = miss
+        if miss: fail(f"实验功能 rows missing: {miss}")
+        back(2); time.sleep(1)
+        route("plus_verify", 3); seen = set()
+        for _ in range(6):
+            r = dump(); seen |= set(texts(r))
+            if any("打开 Mines 浏览器" in t for t in seen): break
+            scroll_down()
+        shot("verify-rows")
+        miss = [w for w in ("交接 v2（验证/登录后自动继续）", "打开 Mines 浏览器") if not any(w in t for t in seen)]
+        if miss: fail(f"浏览器验证 rows missing: {miss}")
+        back(1); time.sleep(1)
+
+    def vps():
+        route("plus_work_location", 5)
+        r = shot("vps"); o["vps_txt"] = _txt(r)[:800]
+        if r is None or not (find(r, "路由规则") or find(r, "VPS")): print("I3913 vps: 路由规则 not on first screen", flush=True)
+        if not tap_scrolled("定时 / 轻任务 交给", tries=8, wait=2): fail("vps: rule 定时 / 轻任务 not reachable"); back(1); return
+        r = dump()
+        cur = next((t for t, d, x, y, n in nodes(r) if t.startswith("✓ ")), "")
+        o["vps_current"] = cur
+        pick = None
+        # the other dropdown items share the ✓ row's left edge
+        cb = next(((x, y, n) for t, d, x, y, n in nodes(r) if t == cur), None)
+        if cb:
+            lx = int(re.findall(r"\d+", cb[2].get("bounds"))[0])
+            for t, d, x, y, n in nodes(r):
+                b = re.findall(r"\d+", n.get("bounds", ""))
+                if t and t != cur and not t.startswith("✓") and t != "删除这条规则" and len(b) == 4 and abs(int(b[0]) - lx) < 8:
+                    pick = (t, x, y); break
+        o["vps_pick"] = pick[0] if pick else None
+        if not pick: fail(f"vps: no other machine in the dropdown (current {cur!r})"); back(1); return
+        sh(f"input tap {pick[1]} {pick[2]}"); time.sleep(2)
+        r = shot("vps-changed")
+        if r is None or not find(r, "已改", exact=True): fail("vps: 已改 not shown after changing a rule")
+        for _ in range(4):
+            if find(dump(), "恢复默认", exact=True): break
+            sh(f"input swipe {SCREEN[0]//2} {int(SCREEN[1]*0.4)} {SCREEN[0]//2} {int(SCREEN[1]*0.7)} 300"); time.sleep(1)
+        if not tap_text("恢复默认", exact=True, wait=2) and not tap_scrolled("恢复默认", tries=8, wait=2): fail("vps: 恢复默认 not reachable")
+        r = shot("vps-restored")
+        if r is not None and find(r, "已改", exact=True): fail("vps: 已改 still shown after 恢复默认")
+        for _ in range(6): sh(f"input swipe {SCREEN[0]//2} {int(SCREEN[1]*0.3)} {SCREEN[0]//2} {int(SCREEN[1]*0.8)} 300"); time.sleep(0.5)
+        shot("vps-top")
+        back(1); time.sleep(1)
+
+    def tasks(tag):
+        healthy_home()
+        r = dump(); p = find(r, "任务", exact=True)
+        if p and p[1] > SCREEN[1] * 0.8: sh(f"input tap {p[0]} {p[1]}"); time.sleep(3)
+        else: route("plus_task_projects", 3)
+        r = shot(tag); t = _txt(r); o[tag] = t[:600]
+        if "项目" not in t: fail(f"{tag}: 项目 missing")
+        if "已归档" not in t and "可搜回" not in t: fail(f"{tag}: 已归档 missing")
+        return r
+
+    def register():
+        out = result_json("group", "i3913 chat 帮我注册 zeabur.com", timeout=60); o["chat"] = out
+        r = wait_for("登记并关联账号", 40)
+        r = shot("register-sheet"); t = _txt(r)
+        if r is None or not find(r, "登记并关联账号"): fail(f"立项 sheet not shown: {state()}"); return
+        if "zeabur" not in t.lower(): fail("立项 sheet: site zeabur.com not filled")
+        pw = [n.get("text") for n in r.iter("node") if n.get("password") == "true"]
+        labels = [x for x in texts(r) if x.strip() in ("密码", "Password", "输入密码")]
+        o["sheet_password_fields"] = len(pw) + len(labels)
+        if pw or labels: fail(f"立项 sheet has a password field {pw} {labels}")
+        tap_text("登记并关联账号", wait=3)
+        s = state(); o["state_after_register"] = s
+        if not any("zeabur" in (p.get("site") or "") for p in s.get("projects") or []): fail(f"no zeabur project after 登记: {s}")
+        if not s.get("taskName"): fail(f"TaskName.of empty for the project chat: {s}")
+        shot("register-chat")
+
+    def handoff():
+        result_json("group", "i3913 say OAUTHTEST open google sign-in", timeout=60)
+        r = wait_for("在 Chrome 里打开", 45)
+        r = shot("handoff-popup"); t = _txt(r)
+        s = state(); hs = [h for h in s.get("handoffs") or [] if h.get("kind") == "OAUTH_EXTERNAL"]
+        o["handoffs"] = hs
+        if not hs: fail(f"no OAUTH_EXTERNAL handoff: {s}"); return
+        lab = hs[-1].get("label") or ""
+        if "Zeabur" not in lab and "zeabur" not in lab: fail(f"handoff label not the project name: {lab!r} (taskName {s.get('taskName')!r})")
+        if r is None or not find(r, "需要你"): fail("handoff popup not seen")
+        tap_text("稍后", exact=True, wait=2.5)
+        r = shot("handoff-bar")
+        if r is None or not find(r, "继续接管"): fail("glass bar with 继续接管 not seen"); return
+        tap_text("继续接管", exact=True, wait=4)
+        s = state(); hs2 = [h for h in s.get("handoffs") or [] if h.get("id") == hs[-1].get("id")]
+        o["handoff_after"] = hs2
+        if not hs2 or hs2[0].get("state") != "DONE": fail(f"继续接管 did not finish the handoff: {hs2}")
+        shot("handoff-after")
+
+    def project():
+        tasks("tasks-project")
+        if not tap_scrolled("Zeabur", tries=4, wait=3): fail("project row Zeabur not on 任务 page"); return
+        r = shot("project-detail"); t = _txt(r)
+        if "尝试记录" not in t and "第1次" not in t: fail("项目详情 not shown")
+        back(1)
+
+    def memory():
+        result_json("group", "i3913 chat MEMFIND write then find", timeout=60)
+        f = wait_fake("MEMFIND", 2, 60); o["memfind"] = f
+        if "memory" not in (f.get("tools") or []): fail(f"memory tool (memory_v2) not offered: {f.get('tools')}")
+        rs = f.get("results") or []
+        if len(rs) < 2 or "SMOKEMEM-7731" not in rs[1]: fail(f"memory find did not return the written entry: {rs}")
+        time.sleep(3); shot("memory-chat")
+
+    def gecko():
+        result_json("group", "i3913 chat GECKOREAD read the page", timeout=60)
+        f = wait_fake("GECKOREAD", 2, 120); o["gecko"] = f
+        rs = f.get("results") or []
+        if len(rs) < 2 or "GECKO-SMOKE-OK" not in rs[1]: fail(f"gecko get_text did not read the page: {[x[:300] for x in rs]}")
+        if any("没能启动" in x for x in rs): fail("gecko fell back to the WebView (Mines 浏览器没能启动)")
+        if rs and not any("[Mines 浏览器" in x for x in rs): fail("no [Mines 浏览器 …] footer on gecko results")
+        top = ""
+        for _ in range(20):
+            top = sh("dumpsys activity activities | grep -E 'topResumedActivity|mResumedActivity' | head -2")
+            if "MinesBrowserActivity" in top: break
+            time.sleep(2)
+        o["gecko_top"] = top.strip()[-200:]
+        time.sleep(4); r = shot("mines-browser")
+        if "MinesBrowserActivity" not in top: fail("wait_for_human on gecko did not open MinesBrowserActivity")
+        elif r is not None and not find(r, "交还"): print("I3913 gecko: 交还 button not in dump (GeckoView surface)", flush=True)
+        if not tap_text("好了，交还给 Mines", wait=3): back(1)
+        f = wait_fake("GECKOREAD", 3, 60); o["gecko_after"] = (f.get("results") or [])[2:3]
+
+    step("experiments", experiments)
+    step("vps", vps)
+    step("tasks", lambda: tasks("tasks"))
+    step("register", register)
+    step("handoff", handoff)
+    step("project", project)
+    step("memory", memory)
+    step("gecko", gecko)
+    print("I3913 RESULT " + json.dumps(o, ensure_ascii=False)[:12000], flush=True)
 
 
 def b39113(res):

@@ -18,6 +18,8 @@ import org.json.JSONObject
  *   … --arg 'reset'
  */
 object GroupSelfTest {
+    /** [Mines-38.9.13 integ] the chat opened by 'i3913 chat' */
+    @Volatile private var i3913Sid: String? = null
     /** [Mines-38.9.6 i14] smoke: fake retries per chat ('i396 retryreg') */
     private val fakeRetries = java.util.concurrent.ConcurrentHashMap<String, Int>()
     private fun skyState(): String = JSONObject().put("scene", com.openminis.app.ui.plus.WeatherSky.lastScene.key)
@@ -802,6 +804,45 @@ object GroupSelfTest {
                     }
                     "callstate" -> com.openminis.app.ui.plus.CallState.json()
                     else -> "i39121 seed | slots | shots <n> | gate | oomkill | safe | clean | acrastart | killmain | webcheck | callstate"
+                }
+            }
+            // [Mines-38.9.13 integ] smoke: 'i3913 chat <text>' = new chat on smoke-model, opened, <text> sent as the user;
+            // 'i3913 say <text>' = send into that chat again; 'i3913 state' = task projects / handoffs / flags
+            "i3913" -> {
+                val sub = rest.substringBefore(' ').trim(); val text = rest.substringAfter(' ', "").trim()
+                val app = context.applicationContext as com.openminis.app.MinisApp
+                val main = kotlinx.coroutines.Dispatchers.Main
+                suspend fun sendTo(sid: String): String {
+                    var vm: com.openminis.app.ui.chat.ChatViewModel? = null
+                    repeat(40) { if (vm == null) { vm = kotlinx.coroutines.withContext(main) { com.openminis.app.ui.chat.ChatViewModelStore.existing(sid) }; if (vm == null) delay(250) } }
+                    val v = vm ?: return JSONObject().put("sid", sid).put("err", "no view model").toString()
+                    val out = kotlinx.coroutines.withContext(main) { v.submitPrompt(text) }
+                    return JSONObject().put("sid", sid).put("out", out.toString()).toString()
+                }
+                when (sub) {
+                    "chat" -> {
+                        val e = app.providerRepository.config.value.modelEntries.firstOrNull { it.baseModel.id.contains("smoke-model") && !it.isHidden }
+                            ?: app.providerRepository.config.value.modelEntries.firstOrNull { !it.isHidden }
+                        val s = app.chatRepository.createSession(e?.baseModel?.id ?: "smoke", title = null)
+                        i3913Sid = s.id
+                        kotlinx.coroutines.withContext(main) { com.openminis.app.ui.plus.PlusNav.navigate?.invoke(com.openminis.app.ui.navigation.Routes.chat(s.id)) }
+                        sendTo(s.id)
+                    }
+                    "say" -> { val sid = i3913Sid; if (sid == null) "no chat" else sendTo(sid) }
+                    "state" -> {
+                        val tp = com.openminis.app.plus.TaskProjects; tp.init(context)
+                        val pj = JSONArray(); tp.projects.value.forEach { p -> pj.put(JSONObject().put("name", p.name).put("site", p.site)
+                            .put("accounts", p.accounts.size).put("attempts", JSONArray(p.attempts.map { it.sid }))) }
+                        val hs = JSONArray(); com.openminis.app.plus.HandoffBroker.list.value.forEach { h -> hs.put(JSONObject().put("id", h.id)
+                            .put("sid", h.sessionId).put("kind", h.kind.name).put("state", h.state.name).put("label", h.taskLabel).put("host", h.host)) }
+                        JSONObject().put("sid", i3913Sid ?: "").put("taskName", com.openminis.app.plus.TaskName.of(i3913Sid) ?: "")
+                            .put("proposal", tp.proposal.value?.let { JSONObject().put("site", it.site).put("verb", it.verb).put("sid", it.sid) } ?: JSONObject.NULL)
+                            .put("projects", pj).put("handoffs", hs)
+                            .put("flags", JSONObject().put("vps_page_v2", com.openminis.app.plus.VpsPlan.flagOn(context)).put("task_projects", tp.on.value)
+                                .put("memory_v2", com.openminis.app.plus.MemoryV2.isOn(context)).put("handoff_v2", com.openminis.app.plus.HandoffBroker.resumeOn())
+                                .put("mines_browser", com.openminis.app.plus.MinesBrowser.on())).toString()
+                    }
+                    else -> "i3913 chat <text> | say <text> | state"
                 }
             }
             "i39113" -> {

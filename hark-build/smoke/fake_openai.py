@@ -84,6 +84,16 @@ print("hello mines")
 
 最后一段：如果还有问题，随时问我。"""
 
+GK = "http://10.0.2.2:8088/gecko-smoke"
+I3913_SCRIPTS = {
+    "MEMFIND": [("memory_write", {"tool_title": "记一条机器记忆", "content": "## 梦云冒烟\nSMOKEMEM-7731 梦云是冒烟测试用的机器", "dir": "机器"}),
+                ("memory", {"tool_title": "查机器记忆", "action": "find", "query": "SMOKEMEM-7731"})],
+    "GECKOREAD": [("browser_use", {"tool_title": "用 Mines 浏览器打开", "action": "navigate", "engine": "gecko", "url": GK}),
+                  ("browser_use", {"tool_title": "读页面文字", "action": "get_text", "engine": "gecko"}),
+                  ("browser_use", {"tool_title": "把页面给用户看", "action": "wait_for_human", "engine": "gecko"})],
+    "OAUTHTEST": [("browser_use", {"tool_title": "打开 Google 登录", "action": "navigate", "url": "https://accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Fzeabur.com"})],
+}
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): print("fake-openai", self.command, self.path, flush=True)
     def _html(self, html):
@@ -149,6 +159,9 @@ class H(BaseHTTPRequestHandler):
             items = "".join(f"<item><title>测试新闻 {i}：手机 AI 助手更新</title><link>https://example.com/n{i}</link><pubDate>{now}</pubDate><description>第 {i} 条测试摘要。</description></item>" for i in range(1, 4))
             b = f'<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>ok</title>{items}</channel></rss>'.encode()
             self.send_response(200); self.send_header("Content-Type", "application/rss+xml; charset=utf-8"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+        if self.path.startswith("/gecko-smoke"):   # [38.9.13] Mines' own browser (GeckoView) reads this page
+            return self._html('<html><head><meta name="viewport" content="width=device-width"><meta charset="utf-8"><title>Gecko 冒烟</title></head>'
+                              '<body style="font-family:sans-serif;padding:16px"><h2>Mines 浏览器冒烟页</h2><p id="m">GECKO-SMOKE-OK 4417</p></body></html>')
         if self.path.startswith("/stats/reset"):
             # [38.9.11.3] each vps_smoke.py run (perf "old" pass, then the full "new" pass) starts from zero counters
             STATS.clear(); STATS.update({"garbage_posts": 0, "loop_posts": 0, "saw_warning": False, "empty_tool_content": 0, "tool_msgs": 0, "tool": None})
@@ -389,6 +402,33 @@ fetch('/linkfake/send?'+k+'='+encodeURIComponent(v));document.getElementById('fc
                  "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
                  "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10}}
             self.wfile.write(b"data: " + json.dumps(d).encode() + b"\n\ndata: [DONE]\n\n"); self.wfile.flush()
+            return
+        # [38.9.13] scripted tool turns: MEMFIND (memory_write → memory find), GECKOREAD (browser_use engine=gecko), OAUTHTEST
+        # (browser_use navigate to Google sign-in → handoff). Step = tool results since the user message; results go to STATS["i3913"].
+        trig = next((k for k in I3913_SCRIPTS if k in last_user_text(msgs)), None)
+        if trig and body.get("stream"):
+            res = []
+            for m in reversed(msgs):
+                if m.get("role") == "user": break
+                if m.get("role") == "tool":
+                    c = m.get("content"); res.insert(0, c if isinstance(c, str) else json.dumps(c, ensure_ascii=False))
+            names = [t.get("function", {}).get("name") for t in body.get("tools") or []]
+            rec = STATS.setdefault("i3913", {}).setdefault(trig, {}); rec["tools"] = names; rec["results"] = [r[:1500] for r in res]
+            script = I3913_SCRIPTS[trig]
+            self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+            def emit(delta, fin=None):
+                d = {"id": "x", "object": "chat.completion.chunk", "created": int(time.time()), "model": "smoke-model",
+                     "choices": [{"index": 0, "delta": delta, "finish_reason": fin}]}
+                self.wfile.write(b"data: " + json.dumps(d, ensure_ascii=False).encode() + b"\n\n"); self.wfile.flush()
+            if len(res) < len(script) and script[len(res)][0] in names:
+                nm, a = script[len(res)]
+                emit({"role": "assistant", "content": ""})
+                emit({"tool_calls": [{"index": 0, "id": f"call_{trig}_{len(res)}", "type": "function", "function": {"name": nm, "arguments": json.dumps(a, ensure_ascii=False)}}]})
+                emit({}, "tool_calls")
+            else:
+                if len(res) < len(script): rec["missing_tool"] = script[len(res)][0]
+                emit({"role": "assistant", "content": f"{trig} 完成（{len(res)} 步）。"}); emit({}, "stop")
+            self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
             return
         # [build-35] 消息 cards: Mines asks for Chinese 介绍 / 点评 as a JSON array (non-stream)
         ut = last_user_text(msgs)
