@@ -354,10 +354,10 @@ object VpsSsh {
         val jsch = newJsch(context, withKey = password == null)
         var host = preferIpv4(ep?.host ?: s.host)
         var port = ep?.port ?: s.port
-        var proxy: Proxy? = if (ep?.viaHub == true) Tunnel.hubProxy(context) else if (ep?.ws != null) WsProxy(ep.ws) else null
+        var proxy: Proxy? = if (ep?.viaHub == true) Tunnel.hubProxy(context) else if (ep?.ws != null) WsProxy(WsLinkCore.fixScheme(ep.ws)) else null
         if (viaRelay) {
-            val r = s.relay.trim()
-            require(r.isNotEmpty()) { "没有设置中转" }
+            val r = WsLinkCore.relayFor(s.host, s.relay)   // [38.9.13] WS scheme follows the port; no WS on AWS (SSH 22 only)
+            require(r.isNotEmpty()) { if (s.relay.isBlank()) "没有设置中转" else "这台没有 WS 通道，用 SSH 22" }
             val uri = URI(r)
             when (uri.scheme?.lowercase()) {
                 "ws", "wss" -> proxy = WsProxy(r)
@@ -531,7 +531,7 @@ object VpsSsh {
         if (direct.isSuccess) { sess = direct.getOrThrow(); relay = false }
         else {
             val e = direct.exceptionOrNull()!!
-            if (e is NoKeyException || e is HostKeyChangedException || s.relay.isBlank()) throw e
+            if (e is NoKeyException || e is HostKeyChangedException || WsLinkCore.relayFor(s.host, s.relay).isBlank()) throw e
             sess = try { open(context, s, viaRelay = true) } catch (t: Throwable) {
                 throw IOException("${reason(e)}；中转：${reason(t)}", t)
             }
@@ -558,7 +558,7 @@ object VpsSsh {
         val (_, pub) = ensureKey(context)
         // [Mines-vps-31] same route list as normal logins (22 → 443 → Tailscale), then the relay.
         val sess = try { openAny(context, s, password) } catch (t: Throwable) {
-            if (s.relay.isBlank()) throw IOException(t.message ?: reason(t), t)
+            if (WsLinkCore.relayFor(s.host, s.relay).isBlank()) throw IOException(t.message ?: reason(t), t)
             try { open(context, s, true, password) } catch (t2: Throwable) { throw IOException((t.message ?: "") + "；中转：" + reason(t2), t2) }
         }
         try {

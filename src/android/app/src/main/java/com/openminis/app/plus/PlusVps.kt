@@ -229,10 +229,10 @@ object PlusVps {
         // (Cloudflare tunnel "!…|wss://" = relay only → direct port → backup port → Tailscale);
         // minis-vps already moves to the next entry when one does not connect.
         val list = orderedTargets(st).flatMap { s ->
-            val relay = s.relay.trim().takeIf { it.isNotEmpty() && !it.contains(',') && !it.contains(' ') }?.let { "|$it" } ?: ""
+            val relay = WsLinkCore.relayFor(s.host, s.relay).takeIf { it.isNotEmpty() && !it.contains(',') && !it.contains(' ') }?.let { "|$it" } ?: ""
             VpsSsh.endpoints(s).map { ep ->
                 if (ep.viaHub) Tunnel.sandboxEntry(s) ?: ""   // [Mines-38.9.13 tunnel_v1] ProxyJump via the AWS hub
-                else if (ep.ws != null) "!${s.user}@${s.host}:${s.port}|${ep.ws}"
+                else if (ep.ws != null) "!${s.user}@${s.host}:${s.port}|${WsLinkCore.fixScheme(ep.ws)}"
                 else {
                     val host = if (ep.host.contains(':')) ep.host else VpsSsh.preferIpv4(ep.host)
                     "${s.user}@$host:${ep.port}$relay"
@@ -414,7 +414,7 @@ object PlusVps {
             val (ms, why) = bannerProbe(s.host, s.port, type, u.host, u.port)
             out += RouteTry("经 ${f.source}（${u.host}:${u.port}）", "$type://${u.host}:${u.port}", ms >= 0, ms, why)
         }
-        val relay = s.relay.trim()
+        val relay = WsLinkCore.relayFor(s.host, s.relay)   // [38.9.13] no WS relay test on AWS (SSH 22 only)
         if (relay.isNotEmpty() && out.none { it.relay == relay }) {
             runCatching {
                 val t0 = System.nanoTime()

@@ -342,9 +342,11 @@ fun QuickConnectScreen(onBack: () -> Unit, go: (String) -> Unit) {
                 servers.forEachIndexed { i, s ->
                     if (i > 0) WarmDivider(16.dp)
                     val link = links[s.id]?.first
-                    val ws = s.linkToken.isNotBlank() || s.relay.startsWith("ws")
+                    val wsRelay = com.openminis.app.plus.WsLinkCore.relayFor(s.host, s.relay).takeIf { com.openminis.app.plus.WsLinkCore.isWs(it) }   // [38.9.13] none on AWS
+                    val ws = s.linkToken.isNotBlank() || wsRelay != null
                     val route = when {
                         link == com.openminis.app.plus.MinesLink.State.ONLINE -> "wss 在线"
+                        s.linkToken.isBlank() && wsRelay != null -> wsRelay.substringBefore("://") + (wsRelay.substringAfter("://").substringBefore('/').substringAfterLast(':', "").takeIf { it.isNotBlank() && it.all(Char::isDigit) }?.let { " :$it" } ?: "")
                         ws -> "wss" + (s.linkUrl.substringAfterLast(':', "").takeIf { it.isNotBlank() && it.all(Char::isDigit) }?.let { " :$it" } ?: "")
                         else -> "ssh :${s.port}"
                     }
@@ -357,7 +359,7 @@ fun QuickConnectScreen(onBack: () -> Unit, go: (String) -> Unit) {
                         }
                         Chip3912("终端") {
                             withKey {
-                                val entry = "${s.user}@${s.host}:${s.port}" + (s.relay.trim().takeIf { it.isNotEmpty() }?.let { "|$it" } ?: "")
+                                val entry = "${s.user}@${s.host}:${s.port}" + (com.openminis.app.plus.WsLinkCore.relayFor(s.host, s.relay).takeIf { it.isNotEmpty() }?.let { "|$it" } ?: "")
                                 go(com.openminis.app.ui.navigation.Routes.terminal("MINIS_VPS_SERVERS='$entry' minis-vps shell"))
                             }
                         }
