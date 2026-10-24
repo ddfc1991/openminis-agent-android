@@ -264,6 +264,11 @@ fun VerifyScreen(onBack: () -> Unit) {
             Text("各网站的登录状态（Cookie）分网站保存在手机上，验证通过后立刻存盘，重启后还在。", style = MaterialTheme.typography.bodyMedium,
                 modifier = Modifier.padding(16.dp))
         }
+        // [38.9.13 mines_browser] 实验功能 switch
+        var geckoOn by remember { mutableStateOf(com.openminis.app.plus.MinesBrowser.also { it.init(ctx) }.on()) }
+        PlusSection("Mines 自己的浏览器（实验）", footer = "火狐内核，装在 Mines 里。AI 在这里替你操作：每个任务一个无痕空间，做完就清除；走你的代理；验证码 Mines 自己收自己填。只有付款和手机上的确认才交给你。关掉后全部用原来的内置浏览器。") {
+            SwitchRow("打开 Mines 浏览器", null, geckoOn) { on -> com.openminis.app.plus.MinesBrowser.setOn(ctx, on); geckoOn = on }
+        }
     }
 }
 

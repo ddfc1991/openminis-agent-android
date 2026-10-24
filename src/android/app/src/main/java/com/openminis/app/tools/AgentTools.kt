@@ -177,7 +177,11 @@ object AgentTools {
             "Use wait_for_dom_stable to wait until the page DOM stops changing (useful after navigation or interactions that trigger async data loading — polls every 0.5s, resolves when mutation rate gradient is stable for 3+ intervals, default timeout 10s). " +
             "If a page shows a CAPTCHA / Cloudflare / slider check, do NOT try to solve it: the user is notified automatically; call wait_for_human (waits up to ~50s per call, repeat if needed) until it reports the check is cleared. " +
             "For SMS / e-mail one-time codes: after clicking the send-code button, call wait_for_otp (optionally with selector for the code input); Mines reads the code from the phone's notifications and fills it in without showing it to you. " +
-            "Use tab_id to target a specific tab (defaults to the most recently used tab).",
+            "Use tab_id to target a specific tab (defaults to the most recently used tab)." +
+            // [38.9.13 mines_browser]
+            (if (com.openminis.app.plus.MinesBrowser.on()) " engine=\"gecko\" runs the call in Mines' own browser (Firefox engine): a private session per task, wiped when the task ends, through the user's proxy, human-paced typing and taps; " +
+                "use it for sign-ups, Google/Apple sign-in and anything that must not touch the user's saved logins; follow-up calls stay on it until close_tab; on gecko, wait_for_human shows the live page to the user (only for payments, approvals on the phone, or a check Mines cannot pass) and waits until they hand it back. " +
+                "The default (engine=\"webview\") is the in-app browser with the user's saved logins." else ""),
         parameters = mapOf(
             "tool_title" to AgentToolParam("string", "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Open Wikipedia homepage', 'Take screenshot of current page'). Use the same language as the user."),
             "action" to AgentToolParam("string", "The browser action to perform",
@@ -210,10 +214,11 @@ object AgentTools {
             // mechanism differs (Android stretches the WebView's viewport
             // rather than resizing a WKWebView), the cap and the truncation
             // reporting are identical.
+            "engine" to AgentToolParam("string", "Which browser: \"webview\" (default, the user's saved logins) or \"gecko\" (Mines' own private browser; only when available).", enumValues = listOf("webview", "gecko")),   // [38.9.13 mines_browser]
             "full_page" to AgentToolParam("boolean", "For screenshot: capture the entire scrollable page by temporarily stretching the browser viewport to document.documentElement.scrollHeight. Default false captures the visible viewport only. Capped at 32768px tall; when capped, the result text includes 'Truncated: true' and the original height, so you can scroll and capture the remainder separately."),
         ),
         required = listOf("tool_title", "action"),
-        propertyOrdering = listOf("tool_title", "action", "tab_id", "url", "selector", "text", "coordinate_x", "coordinate_y", "direction", "amount", "scroll_count", "item_selector", "script", "user_agent", "max_depth", "keywords", "fuzzy", "cookies", "timeout", "viewport_width", "viewport_height", "reset", "full_page"),
+        propertyOrdering = listOf("tool_title", "action", "tab_id", "url", "selector", "text", "coordinate_x", "coordinate_y", "direction", "amount", "scroll_count", "item_selector", "script", "user_agent", "max_depth", "keywords", "fuzzy", "cookies", "timeout", "viewport_width", "viewport_height", "reset", "full_page", "engine"),
     )
 
     // Aligned with iOS AIChatViewModel.swift:5059-5067
