@@ -7418,8 +7418,10 @@ def b3913(res):
         tap_text("继续接管", exact=True, wait=4)
         s = state(); hs2 = [h for h in s.get("handoffs") or [] if h.get("id") == hs[-1].get("id")]
         o["handoff_after"] = hs2
-        if not hs2 or hs2[0].get("state") != "DONE": fail(f"继续接管 did not finish the handoff: {hs2}")
-        shot("handoff-after")
+        # [38.9.13] HandoffBroker drops a DONE handoff from its list; then the chat must carry 「交接完成 handoff_id=…」
+        r = shot("handoff-after")
+        done_msg = r is not None and find(r, "交接完成 handoff_id=" + str(hs[-1].get("id")))
+        if hs2 and hs2[0].get("state") != "DONE" or (not hs2 and not done_msg): fail(f"继续接管 did not finish the handoff: {hs2}")
 
     def project():
         tasks("tasks-project")
@@ -7493,8 +7495,9 @@ def b3913(res):
         if r is None or not find(r, "负载"): fail("monitor: panel not open on the 梦云 card"); shot("vps-monitor"); back(1); return
         got = None
         for _ in range(25):
-            r = dump(); j = " ".join(texts(r)) if r is not None else ""
-            if re.search(r"在线：\d", j): got = j; break   # uptime only comes from a reading
+            r = dump(); t = texts(r) if r is not None else []
+            i = t.index("CPU") if "CPU" in t else -1   # the CPU % only comes from a reading (「—」 before)
+            if i >= 0 and i + 1 < len(t) and re.fullmatch(r"\d+%", t[i + 1]): got = t[i + 1]; break
             time.sleep(2)
         # the gauges near the top of the screen, so gauges + tiles are in one picture
         p = find(dump(), "CPU") or find(dump(), "负载")
@@ -7502,7 +7505,8 @@ def b3913(res):
             sh(f"input swipe {SCREEN[0]//2} {p[1]} {SCREEN[0]//2} {int(SCREEN[1]*0.2)} 600"); time.sleep(2)
         r = shot("vps-monitor"); j = " ".join(texts(r)) if r is not None else ""
         o["monitor_txt"] = j[:900]
-        if not got: fail("monitor: no live reading (在线：uptime) within 50 s")
+        o["monitor_cpu"] = got
+        if not got: fail("monitor: no live reading (CPU %) within 50 s")
         time.sleep(11); r = shot("vps-monitor-10s"); j += " " + (" ".join(texts(r)) if r is not None else "")
         sh(f"input swipe {SCREEN[0]//2} {int(SCREEN[1]*0.75)} {SCREEN[0]//2} {int(SCREEN[1]*0.35)} 600"); time.sleep(2)
         r = shot("vps-monitor-carriers"); j += " " + (" ".join(texts(r)) if r is not None else "")
