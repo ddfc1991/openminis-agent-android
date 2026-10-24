@@ -17,6 +17,9 @@ def last_user_text(msgs):
 
 def pick_tool(tools):
     names = [t.get("function", {}).get("name") for t in tools or []]
+    # [38.9.13] memory_v2 replaces memory_get with `memory` (ls/find/read): ls always succeeds, so only the loop guard stops it
+    if "memory_get" not in names and "memory" in names:
+        return "memory", {"tool_title": "查记忆", "action": "ls"}
     for want in ("memory_get", "file_read", "skills_list", "list_skills"):
         if want in names:
             t = tools[names.index(want)]; break

@@ -7477,6 +7477,41 @@ def b3913(res):
         if not o["vps_tunnel_status"]: page_missing.append("i3913 vps: no 内网穿透 status on any machine card (梦云 card not bound to the seeded server?)")
         back(1); time.sleep(1)
 
+    def monitor():
+        """[38.9.13] machine monitor: 梦云 bound to the runner's sshd, the app key authorised there, its card opened → real readings"""
+        sd = result_json("group", "i3913 sshseed", timeout=30); pub = (sd or {}).get("pub", "") if isinstance(sd, dict) else ""
+        o["sshseed"] = bool(pub)
+        if not pub: fail(f"sshseed gave no public key: {sd}"); return
+        subprocess.run("sudo mkdir -p /root/.ssh && sudo chmod 700 /root/.ssh && sudo tee -a /root/.ssh/authorized_keys >/dev/null && sudo chmod 600 /root/.ssh/authorized_keys",
+                       shell=True, input=pub.strip() + "\n", text=True, timeout=20)
+        route("plus_work_location", 5)
+        r = None
+        for _ in range(8):
+            r = dump()
+            if r is not None and find(r, "负载"): break
+            scroll_down()
+        if r is None or not find(r, "负载"): fail("monitor: panel not open on the 梦云 card"); shot("vps-monitor"); back(1); return
+        got = None
+        for _ in range(25):
+            r = dump(); j = " ".join(texts(r)) if r is not None else ""
+            if re.search(r"在线：\d", j): got = j; break   # uptime only comes from a reading
+            time.sleep(2)
+        # the gauges near the top of the screen, so gauges + tiles are in one picture
+        p = find(dump(), "CPU") or find(dump(), "负载")
+        if p and p[1] > SCREEN[1] * 0.35:
+            sh(f"input swipe {SCREEN[0]//2} {p[1]} {SCREEN[0]//2} {int(SCREEN[1]*0.2)} 600"); time.sleep(2)
+        r = shot("vps-monitor"); j = " ".join(texts(r)) if r is not None else ""
+        o["monitor_txt"] = j[:900]
+        if not got: fail("monitor: no live reading (在线：uptime) within 50 s")
+        time.sleep(11); r = shot("vps-monitor-10s"); j += " " + (" ".join(texts(r)) if r is not None else "")
+        sh(f"input swipe {SCREEN[0]//2} {int(SCREEN[1]*0.75)} {SCREEN[0]//2} {int(SCREEN[1]*0.35)} 600"); time.sleep(2)
+        r = shot("vps-monitor-carriers"); j += " " + (" ".join(texts(r)) if r is not None else "")
+        miss = [w for w in ("CPU", "内存", "磁盘", "负载", "流量", "电信", "联通", "移动") if w not in j]
+        if miss: page_missing.append(f"i3913 monitor: not on screen {miss}")
+        if not re.search(r"余 \d+天", j): fail("monitor: 余 N天 not shown")
+        if "∞" not in j: fail("monitor: traffic allowance ∞ not shown")
+        back(1); time.sleep(1)
+
     step("experiments", experiments)
     step("vps", vps)
     step("tasks", lambda: tasks("tasks"))
@@ -7486,6 +7521,7 @@ def b3913(res):
     step("memory", memory)
     step("gecko", gecko)
     step("tunnel", tunnel)
+    step("monitor", monitor)
     print("I3913 RESULT " + json.dumps(o, ensure_ascii=False)[:12000], flush=True)
 
 
