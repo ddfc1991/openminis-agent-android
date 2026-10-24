@@ -754,6 +754,13 @@ fun AppNavigation(
         composable(com.openminis.app.ui.plus.Routes3912.REGISTER) {
             com.openminis.app.ui.plus.RegisterLedgerScreen(onBack = { navController.safePopBackStack() }, go = { navController.safeNavigate(it) })
         }
+        // [Mines-38.9.13 task_projects] 任务 (项目 / 小任务 / 已归档) · 项目详情
+        composable(com.openminis.app.ui.plus.TaskRoutes.TASKS) {
+            com.openminis.app.ui.plus.TasksScreen(onBack = { navController.safePopBackStack() }, go = { navController.safeNavigate(it) })
+        }
+        composable(com.openminis.app.ui.plus.TaskRoutes.PROJECT) { e ->
+            com.openminis.app.ui.plus.TaskProjectScreen(e.arguments?.getString("id") ?: "", onBack = { navController.safePopBackStack() }, go = { navController.safeNavigate(it) })
+        }
         composable(com.openminis.app.ui.plus.Routes3912.CONNECT) {
             com.openminis.app.ui.plus.QuickConnectScreen(onBack = { navController.safePopBackStack() }, go = { navController.safeNavigate(it) })
         }

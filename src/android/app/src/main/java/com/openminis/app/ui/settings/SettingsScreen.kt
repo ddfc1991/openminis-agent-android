@@ -414,6 +414,10 @@ fun SettingsScreen(
             SettingsSection(title = "远程诊断", footer = "打开后，把卡顿、内存和崩溃信息发给开发者看（密钥、密码和聊天内容都会隐去）。对方只能做几项固定检查，不能操作手机；要截图会先问你。24 小时后自动关闭。") {
                 com.openminis.app.ui.plus.DiagSettingsRow()
             }
+            // [Mines-38.9.13] 实验功能 (each 38.9.13 feature adds its own row here)
+            SettingsSection(title = "实验功能") {
+                com.openminis.app.ui.plus.TaskProjectsFlagRow()
+            }
             }
 
             if (grp == "ai") {

@@ -151,7 +151,7 @@ object Register3912 {
             val host = e.host.ifBlank { e.name }
             val note = runCatching { com.openminis.app.plus.Ledger.cands(c, host).firstOrNull { it.account.equals(e.user, true) }?.note }.getOrNull().orEmpty()
             Inbox3912Core.RegRow(host, e.user, note, Inbox3912Core.regStatus(note))
-        }
+        }.let { it + com.openminis.app.plus.TaskProjects.ledgerRows(it) }   // [Mines-38.9.13 task_projects] project accounts (no password)
     }.getOrDefault(emptyList())
 }
 
@@ -221,7 +221,7 @@ fun RegisterLedgerScreen(onBack: () -> Unit, go: (String) -> Unit) {
                             }
                             Column(Modifier.weight(1f).padding(start = 12.dp)) {
                                 Text(r.host, fontSize = MT.Body, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                Text("密码 ••••••" + (r.note.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""), fontSize = MT.Meta, color = m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text((if (r.note.contains("密码在手机")) "" else "密码 ••••••") + (r.note.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""), fontSize = MT.Meta, color = m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             }
                             StatusPill(r.st.zh, when (r.st) { Inbox3912Core.RegSt.DONE -> true; Inbox3912Core.RegSt.PENDING, Inbox3912Core.RegSt.ROTATE -> false; else -> null })
                         }

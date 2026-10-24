@@ -54,6 +54,7 @@ object ChatOrganizer {
             if (prefs != null) return
             val p = context.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
             prefs = p
+            runCatching { TaskProjects.init(context) }   // [Mines-38.9.13 task_projects]
             _settings.value = Settings(
                 autoArchive = p.getBoolean("auto", true),
                 // [Mines-38.9.6] new key: everyone starts on the 3-day rule (user 2026-10-18); a value set after this is kept
@@ -121,10 +122,13 @@ object ChatOrganizer {
 
     fun isArchived(s: ChatSessionEntity, now: Long = System.currentTimeMillis()): Boolean {
         val st = _settings.value
+        // [Mines-38.9.13 task_projects] projects never auto-archive; small tasks after at most 2 days
+        val proj = TaskProjects.isProject(s.id)
+        val days = if (TaskProjects.enabled()) TaskProjectsCore.archiveDays(proj, st.days) ?: st.days else st.days
         return ArchiveCore.isArchived(ArchiveCore.Input(
-            lastActivity = s.updatedAt, pinned = s.pinnedAt != null, draft = s.modelId.isEmpty(), busy = busy(s.id),
+            lastActivity = s.updatedAt, pinned = s.pinnedAt != null || proj, draft = s.modelId.isEmpty(), busy = busy(s.id),
             manualAt = _manual.value[s.id], restoredAt = _restored.value[s.id] ?: 0L,
-        ), now, st.autoArchive, st.days)
+        ), now, st.autoArchive, days)
     }
 
     fun topicOf(s: ChatSessionEntity): String? {

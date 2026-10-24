@@ -651,6 +651,8 @@ class MainActivity : ComponentActivity() {
                 com.openminis.app.ui.plus.DiagHost()
                 // [Mines-38.9.6 i12] 「已归档 · 撤销」 after a one-tap archive
                 com.openminis.app.ui.plus.ArchiveUndoHost()
+                // [Mines-38.9.13 task_projects] 「这个任务已变成注册 → 立项」 sheet
+                com.openminis.app.ui.plus.TaskProjectSheetHost()
                 // [Mines-38.7] blurred copy of the app under glass dialogs / sheets (replaces FLAG_BLUR_BEHIND)
                 com.openminis.app.ui.plus.GlassBackdropLayer()
             }
