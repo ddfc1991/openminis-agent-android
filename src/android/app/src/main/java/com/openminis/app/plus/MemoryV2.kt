@@ -74,13 +74,17 @@ object MemoryV2 {
 
     /** All index access goes through this lock (tool calls, prompt builds, background jobs). */
     private fun <T> withIndex(c: Context, block: (MemoryV2Core.Index) -> T): T = synchronized(this) {
-        val i = ix ?: run {
-            val f = c.applicationContext.getDatabasePath("memory_v2.db").apply { parentFile?.mkdirs() }
-            MemoryV2Core.Index(AndroidSql(SQLiteDatabase.openOrCreateDatabase(f, null)), memDir(c).apply { mkdirs() })
-                .also { ix = it; Log.i(TAG, "index open, ${it.fts}") }
-        }
-        i.sync()
-        block(i)
+        val i = ix ?: open(c)
+        val ok = runCatching { i.sync() }.onFailure { Log.w(TAG, "index broken, rebuilding: ${it.message}") }.isSuccess
+        // The index is derived: a corrupt or foreign (e.g. restored from a device with FTS5) copy is dropped and rebuilt.
+        block(if (ok) i else { db?.close(); SQLiteDatabase.deleteDatabase(dbFile(c)); open(c).also { it.sync() } })
+    }
+
+    @Volatile private var db: SQLiteDatabase? = null
+    private fun dbFile(c: Context) = c.applicationContext.getDatabasePath("memory_v2.db").apply { parentFile?.mkdirs() }
+    private fun open(c: Context): MemoryV2Core.Index {
+        val d = SQLiteDatabase.openOrCreateDatabase(dbFile(c), null).also { db = it }
+        return MemoryV2Core.Index(AndroidSql(d), memDir(c).apply { mkdirs() }).also { ix = it; Log.i(TAG, "index open, ${it.fts}") }
     }
 
     // ---------------------------------------------------------------- prompt
