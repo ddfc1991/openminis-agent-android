@@ -45,6 +45,7 @@ object PlusVps {
         // [Mines-vps-31] every route of the box (22 → 443 → Tailscale); first SSH banner wins.
         val errs = ArrayList<String>()
         for (ep in VpsSsh.endpoints(server)) {
+            if (ep.viaHub) continue   // [Mines-38.9.13 tunnel_v1] not a phone-side port; checked by the real login
             val r = if (ep.ws != null) probeWs(ep.ws, timeoutMs + 4000) else probeOne(server.copy(host = ep.host, port = ep.port), timeoutMs)
             if (r.latencyMs >= 0) return@withContext r
             errs += ep.label + "：" + r.error
@@ -220,6 +221,7 @@ object PlusVps {
     /** Publish work mode + server list into the sandbox environment. */
     fun syncToSandbox(context: Context) {
         val st = PlusPrefs.state.value
+        Tunnel.init(context)   // [Mines-38.9.13 tunnel_v1]
         // [Mines-vps-link] user@ipv4:port[|relay]: the IPv4 literal spares the
         // sandbox a DNS lookup and a possibly broken IPv6 attempt; the relay
         // lets minis-vps fall back the same way the app does.
@@ -229,12 +231,13 @@ object PlusVps {
         val list = orderedTargets(st).flatMap { s ->
             val relay = s.relay.trim().takeIf { it.isNotEmpty() && !it.contains(',') && !it.contains(' ') }?.let { "|$it" } ?: ""
             VpsSsh.endpoints(s).map { ep ->
-                if (ep.ws != null) "!${s.user}@${s.host}:${s.port}|${ep.ws}"
+                if (ep.viaHub) Tunnel.sandboxEntry(s) ?: ""   // [Mines-38.9.13 tunnel_v1] ProxyJump via the AWS hub
+                else if (ep.ws != null) "!${s.user}@${s.host}:${s.port}|${ep.ws}"
                 else {
                     val host = if (ep.host.contains(':')) ep.host else VpsSsh.preferIpv4(ep.host)
                     "${s.user}@$host:${ep.port}$relay"
                 }
-            }
+            }.filter { it.isNotEmpty() }
         }.joinToString(",")
         runCatching { VpsSsh.materializeKey(context) }
         val mode = effectiveMode(st)
@@ -398,7 +401,7 @@ object PlusVps {
             out += RouteTry("直连", "", ms >= 0, ms, why, viaTunnel = ms >= 0 && SessionStatus.viaLocalTunnel(ms, VpsSsh.vpnActive(context)))
         }.onFailure { out += RouteTry("直连", "", false, -2, VpsSsh.reason(it)) }
         // [Mines-vps-31] backup port and Tailscale name, direct
-        VpsSsh.endpoints(s).drop(1).forEach { ep ->
+        VpsSsh.endpoints(s).filterNot { it.viaHub }.drop(1).forEach { ep ->
             runCatching {
                 val (ms, why) = bannerProbe(ep.host, ep.port, null, null, 0)
                 out += RouteTry(ep.label, "", ms >= 0, ms, why)

@@ -198,6 +198,7 @@ fun WorkLocationScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onO
 
         // [Mines-38.9.5 i] cloud browsers / remote desktops the agent registered (workspace_register)
         WsOtherSection()
+        TunnelHubSection()   // [Mines-38.9.13 tunnel_v1] flag + AWS hub + 把手机端口公开
 
         PlusSection("连接", footer = "所有服务器都连不上时，自动回到本机继续，不会卡住。", footerStrong = true) {
             Row(

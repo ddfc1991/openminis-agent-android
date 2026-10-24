@@ -280,11 +280,13 @@ object VpsSsh {
      * authorisation), else the app's key.
      */
     /** [Mines-vps-31] One way to reach the box: public IP + port, backup port, Tailscale name. */
-    data class Endpoint(val label: String, val host: String, val port: Int, val ws: String? = null)
+    data class Endpoint(val label: String, val host: String, val port: Int, val ws: String? = null,
+        /** [Mines-38.9.13 tunnel_v1] reach host:port through a direct-tcpip channel of the AWS hub session */ val viaHub: Boolean = false)
 
     /** Routes tried in order: main port → backup port (443 by default when main is 22) → Tailscale → (relay). */
     fun endpoints(s: VpsServer): List<Endpoint> {
         val out = ArrayList<Endpoint>()
+        Tunnel.endpoint(s)?.let { out += it }   // [Mines-38.9.13 tunnel_v1] marked 「经 AWS 穿透」: tried first
         // Cloudflare Tunnel (cloudflared ingress ssh://localhost:22): plain WebSocket, binary frames, on 443.
         cfUrl(s)?.let { out += Endpoint("Cloudflare 隧道", s.host, s.port, it) }
         out += Endpoint("直连 ${s.port}", s.host, s.port)
@@ -324,6 +326,7 @@ object VpsSsh {
      * like); a wrong key / password or a changed host key stops at once.
      */
     fun openAny(context: Context, s: VpsServer, password: String? = null, timeoutMs: Int = 12_000): Session {
+        Tunnel.init(context)   // [Mines-38.9.13 tunnel_v1]
         val eps = endpoints(s).let { l -> val g = goodRoute[s.id]; if (g == null) l else l.sortedBy { if (it.label == g) 0 else 1 } }
         val errs = ArrayList<String>()
         var anyPreBanner = false
@@ -351,7 +354,7 @@ object VpsSsh {
         val jsch = newJsch(context, withKey = password == null)
         var host = preferIpv4(ep?.host ?: s.host)
         var port = ep?.port ?: s.port
-        var proxy: Proxy? = if (ep?.ws != null) WsProxy(ep.ws) else null
+        var proxy: Proxy? = if (ep?.viaHub == true) Tunnel.hubProxy(context) else if (ep?.ws != null) WsProxy(ep.ws) else null
         if (viaRelay) {
             val r = s.relay.trim()
             require(r.isNotEmpty()) { "没有设置中转" }

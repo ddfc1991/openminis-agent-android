@@ -147,6 +147,7 @@ fun ServerDetailScreen(serverId: String, onBack: () -> Unit, onOpenTerminal: (St
             }
         }
         LinkSection(server)
+        TunnelServerSection(server)   // [Mines-38.9.13 tunnel_v1]
         // [Mines-38.9.5 i] 在跑什么 (read-only probe: ps / ss / docker ps / systemctl, ≤ every 30 min) + 到期 / 限制 / IP 归属地
         run {
             remember { com.openminis.app.plus.WorkspaceStore.init(context); 0 }
