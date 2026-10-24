@@ -1,0 +1,43 @@
+#!/bin/sh
+# [Mines-net-26] pip with a stall guard and automatic mirror switch.
+# Same idea as the apk wrapper: a download that stops moving is stopped, an
+# SSL / proxy / timeout error re-picks the fastest pip mirror and retries once.
+REAL=
+for c in /usr/bin/pip3 /usr/bin/pip; do [ -x "$c" ] && { REAL=$c; break; }; done
+if [ -z "$REAL" ]; then
+    if command -v python3 >/dev/null 2>&1 && python3 -c 'import pip' 2>/dev/null; then
+        set -- -m pip "$@"; REAL=python3
+    else
+        echo "pip 还没装：运行 apk add py3-pip（或 设置 → 沙箱与防杀 → 开发工具包 一键装好）" >&2
+        exit 127
+    fi
+fi
+net=0
+for a in "$@"; do
+    case $a in
+        -m|pip) ;;
+        -*) ;;
+        install|download|wheel|index|search) net=1; break ;;
+        *) break ;;
+    esac
+done
+[ "$net" = 1 ] && [ "${MINIS_GUARD:-1}" != 0 ] || exec "$REAL" "$@"
+. /usr/local/lib/minis-net/common.sh
+minis_check_proxy
+minis_mirrors_once pip
+STALL=${MINIS_PIP_STALL:-120}
+log=$(mktemp)
+trap 'rm -f "$log"' EXIT
+minis_run_logged "$log" mines-guard pip "$STALL" 0 -- "$REAL" "$@"
+rc=$?
+[ "$rc" = 0 ] && exit 0
+if [ "$rc" = 124 ] || grep -qE 'SSLError|SSL:|CERTIFICATE_VERIFY_FAILED|ProxyError|ConnectTimeout|ReadTimeout|timed out|Max retries exceeded|Could not fetch URL|Temporary failure in name resolution|Name or service not known|NewConnectionError|ConnectionResetError|RemoteDisconnected|IncompleteRead|No matching distribution found' "$log"; then
+    echo "↻ pip 软件源连不上或卡住了，正在重新测速换源…" >&2
+    if mines-mirror auto pip >&2; then
+        minis_run_logged "$log" mines-guard pip "$STALL" 0 -- "$REAL" "$@"
+        rc=$?
+        [ "$rc" = 0 ] && exit 0
+    fi
+    echo "✗ pip 下载失败（退出码 $rc）。运行 mines-doctor 看是网络、代理、证书还是软件源的问题。" >&2
+fi
+exit "$rc"

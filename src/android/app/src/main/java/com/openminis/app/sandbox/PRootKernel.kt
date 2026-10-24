@@ -194,6 +194,8 @@ object PRootKernel {
         // sources. Reported as openminis/openminis#7.
         // Mirrored in default_mount/etc/profile.d/minis.sh for login shells.
         customEnvironment.putIfAbsent("UV_LINK_MODE", "symlink")
+        // [Mines-38.9.7] no GitHub SSH key in the sandbox: GitHub ssh urls → https for every git (npm / pip / agent), never prompt
+        com.openminis.app.plus.MarketGitCore.GIT_ENV.forEach { (k, v) -> customEnvironment.putIfAbsent(k, v) }
 
         // Inject device timezone so Alpine userspace sees local time.
         // Mirrors iOS ISHShellExecutor.m:335-353 — uses POSIX TZ format with a
@@ -208,6 +210,19 @@ object PRootKernel {
         // PROXY_CHANGE_ACTION is wired up in MinisApp so live shells pick up
         // proxy toggles without a restart.
         customEnvironment.putAll(systemProxyEnv(context))
+
+        // [Mines-net-26] CA bundle + timeouts (etc/minis/net.env), phone network facts
+        // for mines-doctor, and a background mirror pick from inside the sandbox.
+        runCatching { customEnvironment.putAll(com.openminis.app.plus.SandboxNet.prepareRootfs(context, rootfsManager.rootfsDir)) }
+            .onFailure { Log.w(TAG, "SandboxNet.prepareRootfs failed: ${it.message}") }
+        runCatching { com.openminis.app.plus.SandboxNet.kickMirrors(context, 8_000) }
+
+        // [T-android-fake-netlink-real-ifaces] Let proot's fake netlink report
+        // the phone's real interfaces instead of loopback only.
+        NetIfacePublisher.start(context)
+
+        // [T-android-phantom-budget] Size the shell throttle to the device.
+        PhantomProcessGuard.refresh(context)
 
         // Register global bind mounts so direct file I/O tools (file_read, file_edit)
         // can resolve /var/minis/{memory,skills,shared}/... (idempotent).
@@ -608,6 +623,7 @@ object PRootKernel {
     private val PROXY_KEYS = listOf(
         "http_proxy", "https_proxy",
         "HTTP_PROXY", "HTTPS_PROXY",
+        "all_proxy", "ALL_PROXY",
         "no_proxy", "NO_PROXY",
     )
 
@@ -624,6 +640,9 @@ object PRootKernel {
      *   proxy unset → values are empty, tools fall back to direct connection
      */
     fun systemProxyEnv(context: Context): Map<String, String> {
+        // [Mines-net-26] SandboxNet decides: 分流代理 (only while it listens), the
+        // system proxy (only after a TCP health check), or direct; plus the
+        // user's 沙箱代理 toggle. CN mirrors are always in no_proxy.
         val proxyUri = try {
             val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
             val info = cm?.defaultProxy
@@ -637,14 +656,17 @@ object PRootKernel {
             ""
         }
 
-        val out = linkedMapOf<String, String>()
-        for (key in PROXY_KEYS) {
-            out[key] = when (key) {
-                "no_proxy", "NO_PROXY" -> if (proxyUri.isNotEmpty()) PROXY_NO_PROXY else ""
-                else -> proxyUri
+        return runCatching { com.openminis.app.plus.SandboxNet.proxyEnv(context, proxyUri) }.getOrElse {
+            Log.w(TAG, "SandboxNet.proxyEnv failed: ${it.message}")
+            val out = linkedMapOf<String, String>()
+            for (key in PROXY_KEYS) {
+                out[key] = when (key) {
+                    "no_proxy", "NO_PROXY" -> if (proxyUri.isNotEmpty()) PROXY_NO_PROXY else ""
+                    else -> proxyUri
+                }
             }
+            out
         }
-        return out
     }
 
     /**

@@ -1,5 +1,7 @@
 package com.openminis.app.ui.settings
 
+import androidx.compose.material.icons.filled.Refresh
+
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -15,6 +17,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Code
+import androidx.compose.material.icons.outlined.Gavel
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -99,6 +102,15 @@ fun AboutScreen(onBack: () -> Unit) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
                 )
             }
+            // Mines: attribution — this app continues OpenMinis development.
+            Text(
+                stringResource(R.string.about_mines_attribution),
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.primary,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(horizontal = 24.dp),
+            )
             Text(
                 stringResource(R.string.about_minis_tagline),
                 style = MaterialTheme.typography.bodyMedium,
@@ -112,13 +124,24 @@ fun AboutScreen(onBack: () -> Unit) {
             SettingsRow(
                 icon = Icons.Outlined.Code,
                 iconColor = tileBlue,
-                title = stringResource(R.string.about_github_repository),
+                title = stringResource(R.string.about_openminis_source),
+                subtitle = OPENMINIS_REPO_URL.removePrefix("https://"),
                 // Settings → ABOUT siblings (Privacy Policy / Submit GitHub
                 // Issues) all use openExternalUrl directly. The
                 // LocalInAppBrowserLauncher ambient defaults to a no-op when
                 // no InAppBrowserHost is in the tree above this screen — and
                 // nothing wraps Settings, so the row used to be a dead tap.
-                onClick = { openExternalUrl(context, "https://github.com/OpenMinis/OpenMinis") },
+                onClick = { openExternalUrl(context, OPENMINIS_REPO_URL) },
+                trailing = { ExternalLinkIcon() },
+            )
+            // Mines keeps the original OpenMinis GPL-3.0 LICENSE and
+            // copyright notices unchanged.
+            SettingsRow(
+                icon = Icons.Outlined.Gavel,
+                iconColor = tileBlue,
+                title = stringResource(R.string.about_license_title),
+                subtitle = stringResource(R.string.about_license_subtitle),
+                onClick = { openExternalUrl(context, "$OPENMINIS_REPO_URL/blob/main/LICENSE") },
                 trailing = { ExternalLinkIcon() },
                 showDivider = false,
             )
@@ -127,11 +150,23 @@ fun AboutScreen(onBack: () -> Unit) {
         // T122: surface the existing UpdateChecker entry on the About screen.
         // The composable was already implemented but never wired anywhere, so
         // users had no way to trigger a check.
-        CheckUpdateSection()
+        // [Mines] Updates come from the Mines releases, not upstream OpenMinis.
+        com.openminis.app.ui.plus.PlusSection(null) {
+            com.openminis.app.ui.plus.ActionRow(
+                androidx.compose.material.icons.Icons.Default.Refresh,
+                "检查 Mines 更新",
+            ) { com.openminis.app.ui.plus.PlusNav.go(com.openminis.app.ui.plus.PlusRoutes.UPDATE) }
+        }
+
+        // [Mines-crash-28] last crash, copyable
+        com.openminis.app.ui.plus.LastCrashSection()
 
         Spacer(Modifier.height(24.dp))
     }
 }
+
+/** Upstream project Mines continues. */
+private const val OPENMINIS_REPO_URL = "https://github.com/OpenMinis/OpenMinis"
 
 @Composable
 private fun ExternalLinkIcon() {

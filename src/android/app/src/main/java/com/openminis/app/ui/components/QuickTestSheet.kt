@@ -3,6 +3,7 @@ package com.openminis.app.ui.components
 import android.graphics.BitmapFactory
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -32,7 +33,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
+import com.openminis.app.ui.glass.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
@@ -63,6 +64,7 @@ import com.openminis.app.provider.ProviderFactory
 import com.openminis.app.provider.openai.OpenAIProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.async
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.CoroutineScope
 import androidx.compose.runtime.rememberCoroutineScope
@@ -147,6 +149,8 @@ fun QuickTestSheet(
     entry: ModelEntry,
     providerRepository: ProviderRepository,
     onDismiss: () -> Unit,
+    /** [Mines-38.9.9 i26] the name the picker row shows (「Mines-Test · 1908」 when two models share a name) */
+    titleName: String? = null,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -221,7 +225,7 @@ fun QuickTestSheet(
                 Spacer(Modifier.width(10.dp))
                 Column {
                     Text(
-                        entry.model.displayName,
+                        titleName ?: entry.model.displayName,
                         style = MaterialTheme.typography.titleMedium,
                     )
                     Text(
@@ -247,10 +251,9 @@ private fun TestCard(run: QuickTestRun) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .background(
-                MaterialTheme.colorScheme.surfaceContainerLow,
-                RoundedCornerShape(12.dp),
-            )
+            // [Mines-38.9.6 i14] a quiet tint on the sheet's own glass (was surfaceContainerLow: another translucent layer)
+            .background(com.openminis.app.ui.plus.mines().ink.copy(alpha = 0.05f), RoundedCornerShape(12.dp))
+            .border(1.dp, com.openminis.app.ui.plus.mines().glassBorder, RoundedCornerShape(12.dp))
             .padding(12.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -309,11 +312,15 @@ private fun StatusBadge(run: QuickTestRun) {
 @Composable
 private fun TestContent(run: QuickTestRun) {
     when (val s = run.state) {
-        is QuickTestState.Running -> Text(
-            stringResource(R.string.quicktest_testing),
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        is QuickTestState.Running -> {
+            // [Mines-38.9.8] seconds so far — a stuck test is visible, and it stops at the limit with a reason
+            val secs by androidx.compose.runtime.produceState(0) { while (true) { kotlinx.coroutines.delay(1000); value += 1 } }
+            Text(
+                stringResource(R.string.quicktest_testing) + if (secs >= 3) " ${secs} 秒（最多 ${quickTestLimitMs(run.kind) / 1000} 秒）" else "",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
         is QuickTestState.TextReply -> Text(
             s.text,
             style = MaterialTheme.typography.bodyMedium,
@@ -421,7 +428,13 @@ private fun runAll(
         AppLogger.info(TAG, "[QuickTest] start model=${entry.model.id} kind=${run.kind}")
         scope.launch {
             val start = System.currentTimeMillis()
-            val result = performTest(run.kind, entry, providerRepository, context)
+            // [Mines-38.9.8] real phone: 「测试中…」 forever (a 免登录 web route never answered) — every test has a limit now and
+            // says why it stopped (for the 免登录 gateway: that route's own last reason)
+            val limit = quickTestLimitMs(run.kind)
+            // detached so a blocking socket read can not hold the timeout back (await is cancellable, the call is not)
+            val call = CoroutineScope(Dispatchers.IO).async { performTest(run.kind, entry, providerRepository, context) }
+            val result = kotlinx.coroutines.withTimeoutOrNull(limit) { call.await() }
+                ?: QuickTestState.Failure(quickTestTimeoutText(limit, entry, providerRepository)).also { call.cancel() }
             run.elapsedMs = System.currentTimeMillis() - start
             run.state = result
             when (result) {
@@ -434,6 +447,24 @@ private fun runAll(
     }
 }
 
+internal fun quickTestLimitMs(kind: QuickTestKind): Long = when (kind) {
+    QuickTestKind.IMAGE_GEN -> 120_000L
+    QuickTestKind.TEXT -> 60_000L
+    else -> 90_000L
+}
+
+private fun quickTestTimeoutText(limit: Long, entry: ModelEntry, repo: ProviderRepository): String {
+    val base = "${limit / 1000} 秒没有回复，已停止。"
+    val inst = runCatching { repo.instance(entry.providerInstanceId) }.getOrNull()
+    val gw = inst?.customBaseURL?.contains("127.0.0.1:${com.openminis.app.plus.PartnerGateway.PORT}") == true
+    if (gw) {
+        val why = com.openminis.app.plus.PartnerGateway.statusOf(entry.model.id)?.reason?.takeIf { it.isNotBlank() }
+        return base + (why ?: "这是免登录 AI（网页版 / 扣子）路线：网页没打开或要重新登录，在模型组顶部「免登录 AI」里看状态")
+    }
+    val host = runCatching { java.net.URI(inst?.effectiveBaseURL ?: "").host }.getOrNull().orEmpty()
+    return base + if (host.isNotBlank()) "$host 没响应：检查网络 / 代理，或换一个模型" else "检查网络 / 代理，或换一个模型"
+}
+
 /** Run one smoke test against a real provider (no mocks). */
 internal suspend fun performTest(
     kind: QuickTestKind,
@@ -444,7 +475,7 @@ internal suspend fun performTest(
     fun failure(msg: String) = QuickTestState.Failure(msg)
 
     val instance = providerRepository.instance(entry.providerInstanceId)
-        ?: return@withContext failure("Provider instance not found.")
+        ?: return@withContext failure("找不到这个服务商")
     // [T-android-keyless-provider-selection] usableApiKey, NOT loadApiKey.
     //
     // A self-hosted OpenAI/Anthropic-compatible endpoint (ollama, LM Studio,
@@ -459,8 +490,12 @@ internal suspend fun performTest(
     // configuration (`ProviderInstance.allowsEmptyAPIKey`) and still returns
     // null for an official endpoint with no key, so providers that genuinely
     // require one keep failing fast with the same message.
+    // [Mines-38.9.9] user (GitHub Copilot signed in, 「该服务商还没配置 API Key」): an OAuth provider (Copilot, Kimi Code,
+    // Google 账号) has no API-key slot — the factory reads its token itself, so "" is the right argument (same as chat).
     val apiKey = providerRepository.usableApiKey(instance)
-        ?: return@withContext failure("No API key configured for this provider.")
+        ?: (if (providerRepository.hasAnyCredential(instance)) "" else null)
+        ?: return@withContext failure(if (instance.credentialType == com.openminis.app.data.model.ProviderCredential.apiKey)
+            "该服务商还没配置 API Key" else "还没登录这个服务商：到服务商页面点「登录」")
 
     // [T-android-provider-voice] Speech tests route through the VoiceProvider
     // stack (vendor adapters + endpoints), NOT the chat provider — mirrors iOS
@@ -480,7 +515,7 @@ internal suspend fun performTest(
                         // speaks in THAT voice, not the vendor default.
                         val data = voice.synthesize(
                             com.openminis.app.provider.voice.VoiceOutputRequest(
-                                input = "Hi! This is Minis testing text to speech.",
+                                input = "Hi! This is Mines testing text to speech.",
                                 model = entry.model.id,
                                 voice = entry.model.id,
                                 resolvedModel = entry.model,
@@ -491,14 +526,14 @@ internal suspend fun performTest(
                         } else {
                             QuickTestState.AudioReply(data)
                         }
-                    }.getOrElse { failure(it.message ?: "Speech request failed.") }
+                    }.getOrElse { failure(zhTestError(it.message, "语音合成请求失败")) }
                 }
             }
             else -> { // TRANSCRIPTION
                 if (!voice.supportsVoiceInput) {
                     failure(context.getString(R.string.quicktest_voice_unsupported))
                 } else {
-                    val spoken = "Hello from Minis, testing speech to text."
+                    val spoken = "Hello from Mines, testing speech to text."
                     val clip = synthesizeTestClip(context, spoken)
                         ?: return@withContext failure(context.getString(R.string.quicktest_clip_failed))
                     runCatching {
@@ -514,7 +549,7 @@ internal suspend fun performTest(
                         QuickTestState.TextReply(
                             context.getString(R.string.quicktest_transcript_result, spoken, heard),
                         )
-                    }.getOrElse { failure(it.message ?: "Transcription request failed.") }
+                    }.getOrElse { failure(zhTestError(it.message, "语音转写请求失败")) }
                 }
             }
         }
@@ -522,7 +557,7 @@ internal suspend fun performTest(
 
     val provider = runCatching {
         ProviderFactory.create(instance, apiKey, entry.model, context, overrides = entry.overrides)
-    }.getOrElse { return@withContext failure(it.message ?: "Couldn't create provider.") }
+    }.getOrElse { return@withContext failure(zhTestError(it.message, "无法创建服务商连接")) }
 
     when (kind) {
         QuickTestKind.TEXT -> {
@@ -531,7 +566,7 @@ internal suspend fun performTest(
                     messages = listOf(
                         LLMMessage(
                             role = LLMMessage.Role.USER,
-                            content = "Hi! I'm setting you up in Minis. Say hello back in one short, friendly sentence.",
+                            content = "Hi! I'm setting you up in Mines. Say hello back in one short, friendly sentence.",
                         ),
                     ),
                     systemPrompt = null,
@@ -542,7 +577,7 @@ internal suspend fun performTest(
                 QuickTestState.TextReply(
                     text.ifEmpty { context.getString(R.string.quicktest_empty_reply) },
                 )
-            }.getOrElse { failure(it.message ?: "Request failed.") }
+            }.getOrElse { failure(zhTestError(it.message, "请求失败")) }
         }
 
         QuickTestKind.IMAGE_GEN -> {
@@ -550,7 +585,7 @@ internal suspend fun performTest(
                 ?: return@withContext failure(context.getString(R.string.quicktest_image_unsupported))
             runCatching {
                 val resp = openAI.generateImage(
-                    prompt = "A friendly cute mascot logo for an app called Minis, minimalist, centered, soft colors",
+                    prompt = "A friendly cute mascot logo for an app called Mines, minimalist, centered, soft colors",
                     n = 1,
                     size = "1024x1024",
                     quality = null,
@@ -559,7 +594,7 @@ internal suspend fun performTest(
                     it.type == LLMMediaAttachment.MediaType.IMAGE
                 } ?: return@runCatching failure(context.getString(R.string.quicktest_no_image))
                 QuickTestState.ImageReply(img.data)
-            }.getOrElse { failure(it.message ?: "Image request failed.") }
+            }.getOrElse { failure(zhTestError(it.message, "图片请求失败")) }
         }
 
         // Handled above.
@@ -613,4 +648,36 @@ private suspend fun synthesizeTestClip(context: android.content.Context, text: S
     } finally {
         runCatching { file.delete() }
     }
+}
+
+/** [Mines-38.9.6 i14] quick-test errors in Chinese (user: no English in this sheet); unknown text kept after a Chinese lead. */
+internal fun zhTestError(msg: String?, lead: String): String {
+    val m0 = msg?.trim().orEmpty()
+    if (m0.isEmpty()) return lead
+    // [Mines-38.9.11 i32] the provider already said why in Chinese (Copilot / GitHub Models / Cloudflare reasons ride inside
+    // 「Invalid API key: …」) — keep that sentence instead of collapsing it to 「API Key 无效（401）」
+    val m = m0.replace(Regex("^(Invalid API key|Provider error|Transient error|Rate limited): "), "")
+    if (m != m0 && m.any { it.code in 0x4E00..0x9FFF }) return "$lead：$m"
+    val low = m.lowercase()
+    return when {
+        "401" in low || "unauthorized" in low || "invalid api key" in low || "incorrect api key" in low -> "$lead：API Key 无效（401）"
+        "403" in low || "forbidden" in low -> "$lead：没有权限（403）"
+        "404" in low || "not found" in low -> "$lead：模型或地址不存在（404）"
+        "429" in low || "rate limit" in low || "too many requests" in low -> "$lead：请求太频繁或额度用完（429）"
+        com.openminis.app.provider.openai.ConnRetry.isDroppedText(m) && m.none { it.code in 0x4E00..0x9FFF } -> "$lead：" + com.openminis.app.provider.openai.ConnRetry.zhText(m)
+        "timeout" in low || "timed out" in low -> "$lead：连接超时"
+        "unable to resolve host" in low || "unknownhost" in low -> "$lead：连不上服务器（域名解析失败）"
+        "failed to connect" in low || "connection refused" in low || "connect" in low && "fail" in low -> "$lead：连不上服务器"
+        m.any { it.code in 0x4E00..0x9FFF } -> m
+        else -> "$lead：$m"
+    }
+}
+
+/** [Mines-38.9.6 i14] smoke: the next model detail page opens its 快速测试 sheet at once */
+object QuickTestAuto {
+    @Volatile var armed: Boolean = false
+    /** [Mines-38.9.8] smoke: open the chat's model picker once, and (optionally) the 快速测试 of this model id over it */
+    @Volatile var pickerArmed: Boolean = false
+    @Volatile var pickerQuickModel: String? = null
+    fun consume(): Boolean = armed.also { armed = false }
 }

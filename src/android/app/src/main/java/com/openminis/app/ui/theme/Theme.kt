@@ -9,7 +9,9 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -143,9 +145,9 @@ fun minisFabColor(): Color = LocalChatPalette.current.fabAccent
 // App-wide shape system — larger corners for a modern, friendly feel
 // DropdownMenu uses extraSmall, Dialog uses extraLarge, BottomSheet uses extraLarge
 private val MinisShapes = Shapes(
-    extraSmall = RoundedCornerShape(12.dp),   // DropdownMenu, Tooltip, OutlinedTextField default
-    small = RoundedCornerShape(12.dp),        // Chip, TextField
-    medium = RoundedCornerShape(20.dp),       // Card, Snackbar
+    extraSmall = RoundedCornerShape(14.dp),   // DropdownMenu, Tooltip, OutlinedTextField default
+    small = RoundedCornerShape(14.dp),        // Chip, TextField
+    medium = RoundedCornerShape(20.dp),       // Card, Snackbar  [Mines-38.1] radii 20 / 14
     large = RoundedCornerShape(24.dp),        // NavigationDrawer
     extraLarge = RoundedCornerShape(28.dp),   // Dialog, BottomSheet
 )
@@ -154,26 +156,119 @@ private val MinisShapes = Shapes(
 fun MinisTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
     fontScale: Float = 1f,
+    /** [Mines-38.7] 0 = day … 1 = night while the sunrise/sunset mode animates; null = plain light / dark */
+    nightFraction: Float? = null,
     content: @Composable () -> Unit,
 ) {
-    val colorScheme = if (darkTheme) DarkColorScheme else LightColorScheme
-    val typography = scaledTypography(fontScale)
+    // [Mines-design-34] 「暖瓷 · 毛玻璃」 palette; the accent follows the desk-pet character.
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    com.openminis.app.plus.PlusPrefs.init(ctx)
+    val plusSt = com.openminis.app.plus.PlusPrefs.state.collectAsState().value
+    // [Mines-38.1] single accent: terracotta #B5532F everywhere, whatever character is chosen (user 16:03)
+    @Suppress("UNUSED_VARIABLE") val style = plusSt.petStyle
+    // [Mines-38.9] 外观调节: loaded once; reading MinesLook.look here recomposes the theme when a slider moves
+    androidx.compose.runtime.remember { com.openminis.app.ui.plus.MinesLook.init(ctx); 0 }
+    @Suppress("UNUSED_VARIABLE") val lookNow = com.openminis.app.ui.plus.MinesLook.look
+    val mc = if (nightFraction != null && nightFraction > 0f && nightFraction < 1f)
+        com.openminis.app.ui.plus.lerpMines(com.openminis.app.ui.plus.minesColors("claude", false), com.openminis.app.ui.plus.minesColors("claude", true), nightFraction)
+    else com.openminis.app.ui.plus.minesColors("claude", if (nightFraction != null) nightFraction >= 0.5f else darkTheme)
+    val colorScheme = porcelainScheme(if (darkTheme) DarkColorScheme else LightColorScheme, mc)
+    // [Mines-38.9.5 i] user 2026-10-17 「不要大字」 (38.9.4 on the phone: text too big, loose letter-spacing): the in-app
+    // scale never goes above 1.0 and the system 「大字体」 setting is ignored for layout (fontScale clamped to ≤ 1.0).
+    val typography = scaledTypography(fontScale.coerceAtMost(1f))
     val chatPalette = if (darkTheme) DarkChatPalette else LightChatPalette
+    // [Mines-38.8 v3] the window behind Compose is the Mines backdrop colour, not the theme's plain white/black: a frame
+    // the window shows before Compose has drawn (first WebView draw on a slow GPU) is never a white flash.
+    val winBg = mc.bg.toArgb()
+    androidx.compose.runtime.DisposableEffect(winBg) {
+        var c: android.content.Context? = ctx
+        while (c is android.content.ContextWrapper && c !is android.app.Activity) c = c.baseContext
+        (c as? android.app.Activity)?.window?.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(winBg))
+        onDispose { }
+    }
 
     MaterialTheme(
         colorScheme = colorScheme,
         shapes = MinisShapes,
         typography = typography,
     ) {
-        CompositionLocalProvider(LocalChatPalette provides chatPalette, content = content)
+        val dens = androidx.compose.ui.platform.LocalDensity.current
+        // [Mines-38.9.7] user 21:15 「不要大字」 (realme 480 dpi): the design is drawn at ~427 dp across (405 dpi); a phone at
+        // 480 dpi made every row ~18 % bigger. Keep ≥ 400 dp across the short edge (HomeFixCore.density); never enlarge.
+        val conf = androidx.compose.ui.platform.LocalConfiguration.current
+        val shortPx = (minOf(conf.screenWidthDp, conf.screenHeightDp) * dens.density).toInt()
+        val d2 = com.openminis.app.plus.HomeFixCore.density(dens.density, shortPx)
+        MinesDensity.applied = d2; MinesDensity.system = dens.density
+        CompositionLocalProvider(
+            androidx.compose.ui.platform.LocalDensity provides androidx.compose.ui.unit.Density(d2, dens.fontScale.coerceAtMost(1f)),
+            LocalChatPalette provides chatPalette,
+            com.openminis.app.ui.plus.LocalMinesColors provides mc,
+            content = content,
+        )
     }
 }
 
+/** [Mines-design-34] Material scheme from the porcelain tokens + character accent. */
+private fun porcelainScheme(base: androidx.compose.material3.ColorScheme, m: com.openminis.app.ui.plus.MinesColors) = base.copy(
+    // [Mines-warm-36] Material text buttons/links in dark mode keep the light accent (≥4.5:1 on dark);
+    // Mines' own primary pills use mines().primary (#B5532F + white) in both modes.
+    primary = if (m.dark) m.primaryText else m.primary,
+    onPrimary = if (m.dark) Color(0xFF2A1206) else m.onPrimary,
+    primaryContainer = m.container,
+    onPrimaryContainer = m.onContainer,
+    secondary = m.primaryText,
+    onSecondary = m.onPrimary,
+    secondaryContainer = m.container,
+    onSecondaryContainer = m.onContainer,
+    tertiary = m.primaryText,
+    // [Mines-38.1] pages are transparent: AppNavigation draws the porcelain backdrop (blurred + masked
+    // wallpaper) once behind every screen, so pages never restyled one by one still sit on 暖瓷.
+    background = Color.Transparent,
+    onBackground = m.ink,
+    surface = Color.Transparent,
+    onSurface = m.ink,
+    surfaceVariant = m.surface2,
+    onSurfaceVariant = m.ink2,
+    surfaceContainerLowest = m.bg,
+    // [Mines-38.9.5 i] user 22:24 「一个全局玻璃」: every Material card / sheet / menu / dialog surface is Mines glass (warm tint,
+    // translucent) instead of a solid porcelain or dark panel. Floating surfaces over text (menus, toolbars, dialogs) use the
+    // strong glass raised to ≥ 88 % so what is under them never fights the text on them.
+    surfaceContainerLow = m.glass,
+    surfaceContainer = m.glass,
+    surfaceBright = m.glass,
+    surfaceDim = m.bg,
+    inverseSurface = if (m.dark) Color(0xFFF5F0EA) else Color(0xFF2A2420),
+    inverseOnSurface = if (m.dark) Color(0xFF2A2420) else Color(0xFFF5F0EA),
+    inversePrimary = Color(0xFFF0A285),
+    surfaceTint = Color.Transparent,
+    scrim = Color(0x6B14100C),
+    surfaceContainerHigh = m.glassStrong.copy(alpha = maxOf(m.glassStrong.alpha, 0.72f)),   // [Mines-38.9.6] menus/sheets/dialogs now go through the glass wrappers
+    surfaceContainerHighest = m.glassStrong.copy(alpha = maxOf(m.glassStrong.alpha, 0.72f)),
+    outline = if (m.dark) Color(0xFF6A615A) else Color(0xFF8F857A),
+    outlineVariant = if (m.dark) Color(0xFF3A342F) else Color(0xFFE2DAD0),
+)
+
+// [Mines-38.9.5 i] no extra tracking: M3's 0.1–0.5 sp letter-spacing spreads CJK glyphs apart (user: 字间距松)
 private fun TextStyle.scale(factor: Float): TextStyle =
-    if (factor == 1f) this else copy(fontSize = fontSize * factor)
+    if (factor == 1f) copy(letterSpacing = 0.sp) else copy(fontSize = fontSize * factor, letterSpacing = 0.sp)
 
 private fun scaledTypography(factor: Float): Typography {
-    val base = Typography()
+    // [Mines-38.1] one size smaller, per the approved board (user 16:03 「字体是不是太大了」): page title 20,
+    // card title 15–16 SemiBold, body 14, secondary 13, meta 12. Readability comes from ≥ 4.5:1 contrast and
+    // weight, not size; the system font scale still multiplies everything.
+    val m3 = Typography()
+    val base = m3.copy(
+        headlineSmall = m3.headlineSmall.copy(fontSize = 20.sp, lineHeight = 28.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold),
+        titleLarge = m3.titleLarge.copy(fontSize = 18.sp, lineHeight = 24.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold),
+        bodyLarge = m3.bodyLarge.copy(fontSize = 15.sp, lineHeight = 22.sp),
+        bodyMedium = m3.bodyMedium.copy(fontSize = 14.sp, lineHeight = 20.sp),
+        bodySmall = m3.bodySmall.copy(fontSize = 12.sp, lineHeight = 17.sp),
+        titleMedium = m3.titleMedium.copy(fontSize = 15.sp, lineHeight = 21.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold),
+        titleSmall = m3.titleSmall.copy(fontSize = 14.sp, lineHeight = 20.sp),
+        labelLarge = m3.labelLarge.copy(fontSize = 14.sp, lineHeight = 20.sp),
+        labelMedium = m3.labelMedium.copy(fontSize = 12.sp, lineHeight = 16.sp),
+        labelSmall = m3.labelSmall.copy(fontSize = 12.sp, lineHeight = 16.sp),
+    )
     return Typography(
         displayLarge = base.displayLarge.scale(factor),
         displayMedium = base.displayMedium.scale(factor),
@@ -192,3 +287,6 @@ private fun scaledTypography(factor: Float): Typography {
         labelSmall = base.labelSmall.scale(factor),
     )
 }
+
+/** [Mines-38.9.7] what MinisTheme applied (自检). */
+object MinesDensity { @Volatile var applied = 0f; @Volatile var system = 0f }

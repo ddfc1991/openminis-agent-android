@@ -6,6 +6,7 @@ import android.view.ViewGroup
 import android.webkit.WebView
 import android.widget.FrameLayout
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
 
@@ -39,6 +40,8 @@ fun BrowserWebView(
             val mounted = container.getChildAt(0)
             if (mounted !== webView) {
                 container.removeAllViews()
+                // [Mines-webpaint-38.4] the tab we leave goes back to its off-screen hardware layer
+                (mounted as? WebView)?.let { runCatching { it.setLayerType(android.view.View.LAYER_TYPE_HARDWARE, null) } }
                 // The WebView may still be parented to a previous container
                 // (sheet re-open racing the old node's disposal) — detach
                 // first or addView throws "child already has a parent".
@@ -55,6 +58,13 @@ fun BrowserWebView(
                     }
                     false
                 }
+                // [Mines-webfit-38.3] the page the user is looking at, for the fit-to-screen self-test
+                com.openminis.app.browser.WebFit.shown = java.lang.ref.WeakReference(webView)
+                // [Mines-webpaint-38.4] on screen the page draws directly (no hardware layer): smoke 44 showed
+                // coze.cn's background only — the layer never got the content tiles. WebPaintCheck.heal switches
+                // back to a layer if this device draws nothing without one. Restored on release (headless capture).
+                if (webView.layerType != android.view.View.LAYER_TYPE_NONE) webView.setLayerType(android.view.View.LAYER_TYPE_NONE, null)
+                webView.onResume()
                 container.addView(
                     webView,
                     FrameLayout.LayoutParams(
@@ -67,8 +77,13 @@ fun BrowserWebView(
         onRelease = { container ->
             // Free the WebView so a later mount (same or different sheet)
             // can re-parent it without hitting the has-a-parent guard.
+            val mounted = container.getChildAt(0) as? WebView
             container.removeAllViews()
+            // [Mines-webpaint-38.4] off screen it goes back to the hardware layer BrowserUseManager configured
+            mounted?.let { runCatching { it.setLayerType(android.view.View.LAYER_TYPE_HARDWARE, null) } }
         },
         modifier = modifier,
     )
+    // [Mines-webpaint-38.4] page loaded but nothing drawn on screen → switch the layer type until it shows
+    LaunchedEffect(webView) { com.openminis.app.browser.WebPaintCheck.heal(webView) }
 }

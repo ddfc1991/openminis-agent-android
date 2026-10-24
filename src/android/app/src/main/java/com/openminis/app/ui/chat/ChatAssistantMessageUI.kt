@@ -132,7 +132,7 @@ import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.RadioButtonChecked
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material3.DropdownMenu
+import com.openminis.app.ui.glass.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import com.openminis.app.BuildConfig
 import com.openminis.app.R
@@ -145,7 +145,7 @@ import com.openminis.app.ui.components.MinisMenuDivider
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.ModalBottomSheet
+import com.openminis.app.ui.glass.ModalBottomSheet
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -157,7 +157,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
+import com.openminis.app.ui.theme.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -304,15 +304,42 @@ internal fun AssistantHeader() {
         val sparkleGradient = Brush.linearGradient(
             colors = listOf(SparkleColor1, SparkleColor2),
         )
-        // 18.dp, matching the previous Icon exactly: the row height feeds a
-        // measured-height estimate in the message list, so the icon stays
-        // square and same-sized whichever branch renders.
-        com.openminis.app.ui.settings.SoulIconGlyph(
-            icon = soulMeta.icon,
-            sizeDp = 18.dp,
-            emojiSp = 15.sp,
-            sparkleTint = sparkleGradient,
-        )
+        // [Mines-qq-avatar] 44.dp, the QQ group-chat avatar size the user
+        // asked for — at 18.dp the icon is a bullet beside the name, while an
+        // avatar reads at roughly 44.dp on a phone. The row height is
+        // intrinsic (nothing in the message list fixes a height for it), so
+        // nothing else needs to move; the icon still stays square and
+        // same-sized whichever branch renders, which is what the
+        // measured-height estimate in the message list depends on.
+        //
+        // Circular, like QQ: the rounded rectangle was chosen because "at 18dp
+        // a circle eats the corners of a small avatar" — at 44dp that concern
+        // is gone, and a circle is what a chat avatar reads as.
+        //
+        // [Mines-builtin-avatar-in-chat] When no custom `soul.icon` is set,
+        // fall back to the built-in character the user picked in 换个形象
+        // (PlusPrefs.petStyle) instead of the sparkle. Those two settings were
+        // completely separate: petStyle drove the Today card, the desk pet, the
+        // voice screen and the web-login screen, while the chat header only
+        // ever read soulMeta.icon — so picking 鲸鱼娘 changed nothing here and
+        // the chat kept showing the default sparkle. PetAvatar already
+        // circle-crops and renders the same drawables the desk pet uses, so
+        // the character now appears in chat at the same 44.dp.
+        if (soulMeta.icon.isBlank()) {
+            com.openminis.app.ui.plus.PetAvatar(
+                size = 44.dp,
+                animated = false,
+                face = true,
+            )
+        } else {
+            com.openminis.app.ui.settings.SoulIconGlyph(
+                icon = soulMeta.icon,
+                sizeDp = 44.dp,
+                emojiSp = 30.sp,
+                sparkleTint = sparkleGradient,
+                shape = androidx.compose.foundation.shape.CircleShape,
+            )
+        }
         Spacer(modifier = Modifier.width(6.dp))
         Text(
             text = displayName,
@@ -890,7 +917,7 @@ internal fun ToolCallPill(
                     // names the RUN it acted on, so using it would label a
                     // status check, a steer and a resume on the same sub agent
                     // identically.
-                    text = controlSummary ?: block.toolTitle.ifEmpty { block.toolName },
+                    text = controlSummary ?: com.openminis.app.plus.ToolZh.title(block.toolTitle, block.toolName),  // [38.9.11 i32] Chinese
                     fontSize = 13.sp,
                     fontWeight = FontWeight.Medium,
                     color = MaterialTheme.colorScheme.onSurface,
@@ -1048,7 +1075,10 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
     // where the same UserDefaults gate sits at the one-shot auto-expand site.
     val context = LocalContext.current
     val autoExpandThinking = remember { autoExpandThinkingEnabled(context) }
-    var expanded by remember(block.id) { mutableStateOf(autoExpandThinking && isLast && isStreaming) }
+    // [Mines-degen-34] Collapsed by default (user, 2026-10-13: a 23K-char garbage thinking block filled the
+    // chat): one summary line + token estimate; tap to read. The old auto-expand setting is ignored.
+    @Suppress("UNUSED_VARIABLE") val autoExpandUnused = autoExpandThinking
+    var expanded by remember(block.id) { mutableStateOf(false) }
     // [T-android-thinking-collapse-latch] What the user last chose, or null if
     // they have not touched THIS block. Deliberately tri-state rather than the
     // old `userTouched: Boolean`.
@@ -1072,8 +1102,17 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
         // One-shot auto-collapse when streaming for this block ends.
         if (shouldAutoCollapseThinking(isStreaming, userIntent)) expanded = false
     }
-    val thinkingBlue = Color(0xFF007AFF)
+    // [Mines-design-34] porcelain glass backing, opaque enough over any wallpaper; ink text ≥ 4.5:1
+    val mc = com.openminis.app.ui.plus.mines()
+    val thinkingBlue = mc.primaryText
     val charCount = block.content.length
+    val tokenEstimate = remember(charCount / 200) {
+        var cjk = 0; for (ch in block.content) if (ch.code >= 0x2E80) cjk++
+        cjk + (charCount - cjk) / 4
+    }
+    val summaryLine = remember(charCount / 120) {
+        block.content.trim().lineSequence().map { it.trim() }.lastOrNull { it.length >= 4 }?.take(80).orEmpty()
+    }
     val charLabel = when {
         charCount >= 1000 -> "${charCount / 1000}K"
         else -> "$charCount"
@@ -1096,9 +1135,9 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 4.dp)
-            .background(thinkingBlue.copy(alpha = 0.06f), RoundedCornerShape(12.dp))
-            .border(0.5.dp, thinkingBlue.copy(alpha = 0.15f), RoundedCornerShape(12.dp))
-            .clip(RoundedCornerShape(12.dp))
+            .background(com.openminis.app.ui.plus.minesGlassFill(strong = true), RoundedCornerShape(16.dp))
+            .border(1.dp, mc.hairline, RoundedCornerShape(16.dp))
+            .clip(RoundedCornerShape(16.dp))
             .padding(horizontal = 12.dp, vertical = 8.dp),
     ) {
         // Header row — only the header reacts to taps. Mirrors iOS, where
@@ -1142,19 +1181,19 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
                 Spacer(modifier = Modifier.width(6.dp))
             }
             Text(
-                text = "Deep Thinking",
-                fontSize = 13.sp,
+                text = "深度思考",
+                fontSize = 15.sp,
                 fontWeight = FontWeight.SemiBold,
                 color = thinkingBlue,
             )
             Spacer(modifier = Modifier.weight(1f))
             if (charCount > 0) {
+                @Suppress("UNUSED_EXPRESSION") charLabel
                 Text(
-                    text = charLabel,
-                    fontSize = 11.sp,
+                    text = "约 ${if (tokenEstimate >= 1000) "${tokenEstimate / 1000}K" else tokenEstimate.toString()} tokens",
+                    fontSize = 14.sp,
                     fontWeight = FontWeight.Medium,
-                    fontFamily = FontFamily.Monospace,
-                    color = thinkingBlue.copy(alpha = 0.6f),
+                    color = mc.ink2,
                 )
                 Spacer(modifier = Modifier.width(4.dp))
             }
@@ -1183,6 +1222,10 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
         // block is streaming, manual drag at any time, and pause-on-user-scroll
         // so a user reading earlier reasoning isn't yanked back to the tail by
         // the next token.
+        if (!expanded && summaryLine.isNotEmpty()) {
+            Text(summaryLine, fontSize = 15.sp, lineHeight = 20.sp, color = mc.ink2, maxLines = 1,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, modifier = Modifier.padding(top = 4.dp))
+        }
         AnimatedVisibility(visible = expanded && !overHardCap) {
             val scrollState = rememberScrollState()
             // [T-thinking-render-perf-android] Render only the tail window so
@@ -1263,9 +1306,9 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
                 }
                 Text(
                     text = displayContent,
-                    fontSize = 13.sp,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f),
-                    lineHeight = 19.sp,
+                    fontSize = 15.sp,
+                    color = mc.ink2,
+                    lineHeight = 21.sp,
                 )
             }
         }
@@ -1295,7 +1338,8 @@ private fun ThinkingFullContentDialog(content: String, onDismiss: () -> Unit) {
         onDismissRequest = onDismiss,
         properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false),
     ) {
-        Surface(modifier = Modifier.fillMaxSize()) {
+        // [Mines-38.9.6 i13] full-screen reader: opaque (the theme surface is transparent → chat showed through the text)
+        Surface(modifier = Modifier.fillMaxSize(), color = com.openminis.app.ui.plus.mines().bg) {
             Column(modifier = Modifier.fillMaxSize()) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
@@ -1304,7 +1348,7 @@ private fun ThinkingFullContentDialog(content: String, onDismiss: () -> Unit) {
                         .padding(horizontal = 12.dp, vertical = 8.dp),
                 ) {
                     Text(
-                        text = "Deep Thinking",
+                        text = "深度思考",
                         fontSize = 15.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = Color(0xFF007AFF),

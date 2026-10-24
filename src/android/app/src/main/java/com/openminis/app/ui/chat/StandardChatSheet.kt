@@ -18,7 +18,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.ModalBottomSheet
+import com.openminis.app.ui.glass.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
@@ -55,6 +55,11 @@ fun StandardChatSheet(
     onDismiss: () -> Unit,
     leadingAction: (@Composable () -> Unit)? = null,
     heightFraction: Float = 0.9f,
+    // [Mines-webfit-38.3] the in-app browser passes Dp.Unspecified: full screen width in landscape too
+    // (Material's default caps a sheet at 640 dp, which left the page in a narrow centred column)
+    sheetMaxWidth: androidx.compose.ui.unit.Dp = androidx.compose.material3.BottomSheetDefaults.SheetMaxWidth,
+    // [Mines-webpaint-38.4] the in-app browser: a long page title stays on one line (…) so the close X is always there
+    singleLineTitle: Boolean = false,
     content: @Composable () -> Unit,
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -64,6 +69,7 @@ fun StandardChatSheet(
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
+        sheetMaxWidth = sheetMaxWidth,
         containerColor = ChatColors.background,
         dragHandle = { CompactDragHandle() },
     ) {
@@ -76,6 +82,7 @@ fun StandardChatSheet(
                 title = title,
                 onDismiss = onDismiss,
                 leadingAction = leadingAction,
+                singleLineTitle = singleLineTitle,
             )
             HorizontalDivider(thickness = 0.5.dp, color = ChatColors.separator)
             Box(modifier = Modifier.fillMaxSize()) {
@@ -120,6 +127,7 @@ fun StandardChatSheetHeader(
     title: String,
     onDismiss: () -> Unit,
     leadingAction: (@Composable () -> Unit)? = null,
+    singleLineTitle: Boolean = false,
 ) {
     Row(
         modifier = Modifier
@@ -132,14 +140,29 @@ fun StandardChatSheetHeader(
         } else {
             Spacer(modifier = Modifier.size(48.dp))
         }
-        Spacer(modifier = Modifier.weight(1f))
-        Text(
-            text = title,
-            fontSize = 16.sp,
-            fontWeight = FontWeight.SemiBold,
-            color = ChatColors.primaryText,
-        )
-        Spacer(modifier = Modifier.weight(1f))
+        if (singleLineTitle) {
+            // [Mines-webpaint-38.4] smoke 44: coze.cn's 80-character title wrapped to 4 lines and pushed the X off
+            // the sheet. One line, ellipsis, centred between the two 48 dp slots; the X is measured first.
+            Text(
+                text = title,
+                fontSize = 16.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = ChatColors.primaryText,
+                maxLines = 1,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                modifier = Modifier.weight(1f).padding(horizontal = 4.dp),
+            )
+        } else {
+            Spacer(modifier = Modifier.weight(1f))
+            Text(
+                text = title,
+                fontSize = 16.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = ChatColors.primaryText,
+            )
+            Spacer(modifier = Modifier.weight(1f))
+        }
         IconButton(onClick = onDismiss) {
             Icon(
                 imageVector = Icons.Default.Close,

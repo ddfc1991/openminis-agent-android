@@ -55,7 +55,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
+import com.openminis.app.ui.theme.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -194,7 +194,7 @@ private fun helperModelStrategyLabel(f: HelperPhase.Finished): String? {
  *
  * Deliberately NOT [toolDisplayName] from ChatToolFormatting: that is a
  * different vocabulary ("browser", "terminal", "file reader") built for the
- * "Minis is using X" sentence, and reusing it here would rename the tool the
+ * "Mines is using X" sentence, and reusing it here would rename the tool the
  * card is reporting.
  */
 internal fun helperToolLabel(name: String): String {
@@ -246,7 +246,7 @@ private fun parseJson(content: String): JSONObject? {
  * "interrupted", not "running forever".
  */
 internal fun parseHelperBlock(block: AssistantBlock): HelperBlockInfo {
-    val title = block.toolTitle.ifEmpty { block.toolName }
+    val title = com.openminis.app.plus.ToolZh.title(block.toolTitle, block.toolName)
     val o = parseJson(block.content) ?: return HelperBlockInfo(title, HelperPhase.Starting, null, null, null)
     val childId = o.optString("child_session_id", "").ifEmpty { null }
     val summaryLine = o.optString("summary", "").ifEmpty { null }?.removePrefix("Summary: ")

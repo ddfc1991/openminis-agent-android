@@ -1,5 +1,7 @@
 package com.openminis.app.ui.settings
 
+import com.openminis.app.ui.plus.MT
+
 import android.graphics.BitmapFactory
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -25,13 +27,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.DropdownMenu
+import com.openminis.app.ui.glass.AlertDialog
+import com.openminis.app.ui.glass.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
+import com.openminis.app.ui.glass.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -304,15 +306,15 @@ fun SoulSettingsScreen(onBack: () -> Unit) {
                 }
                 Column(modifier = Modifier.padding(start = 4.dp)) {
                     Text(
-                        text = name.ifBlank { "Minis" },
-                        fontSize = 17.sp,
+                        text = name.ifBlank { "Mines" },
+                        fontSize = MT.Body,
                         fontWeight = FontWeight.SemiBold,
                         color = MaterialTheme.colorScheme.onSurface,
                     )
                     if (style.isNotBlank()) {
                         Text(
                             text = style,
-                            fontSize = 13.sp,
+                            fontSize = MT.Caption,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
@@ -383,7 +385,7 @@ fun SoulSettingsScreen(onBack: () -> Unit) {
                 }
                 Text(
                     text = indicatorText,
-                    fontSize = 12.sp,
+                    fontSize = MT.Caption,
                     color = warnColor,
                 )
             }
@@ -511,6 +513,13 @@ internal fun SoulIconGlyph(
     sizeDp: Dp,
     emojiSp: TextUnit,
     sparkleTint: Brush? = null,
+    // [Mines-qq-avatar] Optional clip shape. Defaults to the platform
+    // app-icon rounded rectangle every other surface uses; the chat header
+    // passes CircleShape now that it renders a 44.dp avatar, where a circle
+    // reads correctly instead of eating its own corners.
+    shape: androidx.compose.ui.graphics.Shape = RoundedCornerShape(
+        sizeDp * SoulIcon.CORNER_RADIUS_FRACTION,
+    ),
 ) {
     val bitmap = remember(icon) { SoulIcon.decode(icon) }
     when {
@@ -524,7 +533,7 @@ internal fun SoulIconGlyph(
             contentDescription = null,
             modifier = Modifier
                 .size(sizeDp)
-                .clip(RoundedCornerShape(sizeDp * SoulIcon.CORNER_RADIUS_FRACTION)),
+                .clip(shape),
         )
         icon.isNotEmpty() -> Text(text = icon, fontSize = emojiSp)
         // Unset: byte-for-byte the previous sparkle, so a user who never
@@ -568,7 +577,7 @@ private fun SoulIconMenu(
                     // accepted and the rounded clip is what makes them look right.)
                     Text(
                         text = stringResource(R.string.soul_icon_image_hint),
-                        fontSize = 12.sp,
+                        fontSize = MT.Caption,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
@@ -606,7 +615,7 @@ private fun SoulEmojiPickerSheet(
         ) {
             Text(
                 text = stringResource(R.string.soul_icon_emoji_title),
-                fontSize = 17.sp,
+                fontSize = MT.Body,
                 fontWeight = FontWeight.SemiBold,
                 color = MaterialTheme.colorScheme.onSurface,
             )
@@ -726,7 +735,7 @@ private fun LangPicker(lang: String, onLangChange: (String) -> Unit) {
     Column(modifier = Modifier.fillMaxWidth()) {
         Text(
             text = stringResource(R.string.soul_field_lang),
-            fontSize = 13.sp,
+            fontSize = MT.Caption,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(start = 4.dp, bottom = 4.dp),
         )

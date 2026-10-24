@@ -1,5 +1,7 @@
 package com.openminis.app.ui.settings
 
+import com.openminis.app.ui.plus.MT
+
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -17,7 +19,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.Warning
-import androidx.compose.material3.AlertDialog
+import com.openminis.app.ui.glass.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Switch
@@ -123,7 +125,7 @@ private fun ConfigConfirmDialog(change: PendingConfigChange) {
         },
         dismissButton = {
             MinisTextButton(onClick = { ConfigConfirmationGate.userReject() }) {
-                Text("Cancel")
+                Text("取消")
             }
         },
     )
@@ -217,7 +219,7 @@ private fun VerbBadge(verb: String) {
         Text(
             text = verb.uppercase(),
             style = MaterialTheme.typography.bodySmall.copy(
-                fontSize = 10.sp,
+                fontSize = MT.Tiny,
                 fontFamily = FontFamily.Monospace,
             ),
             color = Color.White,

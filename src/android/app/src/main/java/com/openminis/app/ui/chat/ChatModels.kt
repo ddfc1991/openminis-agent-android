@@ -116,6 +116,8 @@ data class ChatTokenUsage(
     val cacheCreationTokens: Int,
     val cacheReadTokens: Int,
     val latestContextTokens: Int,
+    /** [Mines-38.9.1] who answered: 「model · account」 (user 2026-10-17 「我都不知道用的哪个」) */
+    val servedBy: String = "",
 ) {
     companion object {
         fun parse(json: String?): ChatTokenUsage? {
@@ -128,6 +130,7 @@ data class ChatTokenUsage(
                     cacheCreationTokens = o.optInt("cacheCreationTokens", 0),
                     cacheReadTokens = o.optInt("cacheReadTokens", 0),
                     latestContextTokens = o.optInt("latestContextTokens", 0),
+                    servedBy = o.optString("servedBy", ""),
                 )
                 // An all-zero row carries nothing worth a capsule.
                 if (u.inputTokens == 0 && u.outputTokens == 0 &&

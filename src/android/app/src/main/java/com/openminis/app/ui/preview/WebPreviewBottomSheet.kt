@@ -40,7 +40,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
+import com.openminis.app.ui.glass.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
@@ -162,7 +162,7 @@ fun WebPreviewBottomSheet(
         },
         sheetState = sheetState,
         dragHandle = null,
-        containerColor = MaterialTheme.colorScheme.surface,
+        containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
         // Sheet is full-height so the scrim region above the sheet collapses
         // to nothing — avoids the grey scrim band above the sheet top.
         // Zero content insets so the sheet's surface paints all the way under
@@ -308,7 +308,7 @@ internal fun WebPreviewToolbar(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .background(MaterialTheme.colorScheme.surface)
+            .background(MaterialTheme.colorScheme.surfaceContainerLow)
             .let { if (topInsetPadding) it.windowInsetsPadding(WindowInsets.statusBars) else it }
             .padding(start = 4.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
         verticalAlignment = Alignment.CenterVertically,

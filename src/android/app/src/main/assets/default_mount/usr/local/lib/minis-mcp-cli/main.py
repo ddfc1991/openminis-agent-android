@@ -36,7 +36,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from transport.http import MCPError  # noqa: E402
+from transport.errors import MCPError  # noqa: E402
 from utils import config  # noqa: E402
 
 LOG_PATH = "/var/minis/mcp-servers/mcp-cli.log"
@@ -45,7 +45,10 @@ PID_FILE = "/tmp/minis-mcp-daemon.pid"
 PORT_FILE = "/tmp/minis-mcp-daemon.port"  # daemon publishes its 127.0.0.1 port here
 LOCK_FILE = "/tmp/minis-mcp-daemon.lock"  # cold-start fork guard (one winner forks)
 CONN_TIMEOUT = 310.0  # socket recv timeout, slightly above the 300s RPC timeout
-LOCK_STALE_SECONDS = 12.0  # reclaim a cold-start lock older than this (crashed start)
+LOCK_STALE_SECONDS = 40.0
+# [Mines-mcp-29] was a fixed 8 s: python + imports under PRoot on a phone can
+# take longer than that, and then every call failed with "daemon not running".
+DAEMON_START_WAIT = float(os.environ.get("MINIS_MCP_DAEMON_WAIT", "30"))  # reclaim a cold-start lock older than this (crashed start)
 
 
 def _log(msg):
@@ -101,15 +104,49 @@ def daemon_alive():
         return False
 
 
-def _wait_for_port(deadline):
+def _wait_for_port(deadline, child=None):
     """Block until the daemon publishes its port file, or the deadline passes.
-    Returns True if the port appeared."""
+    Returns True if the port appeared. With `child`, stop early when that
+    forked child already died (its reason is in the daemon log)."""
     while time.time() < deadline:
         if os.path.exists(PORT_FILE):
             time.sleep(0.05)  # let bind()+listen()+port publish settle
             return True
+        if child is not None:
+            try:
+                done, _ = os.waitpid(child, os.WNOHANG)
+            except OSError:
+                done = 0
+            if done:
+                # The forking child exits right after setsid() only on error.
+                time.sleep(0.2)
+                if os.path.exists(PORT_FILE):
+                    return True
+                if not daemon_alive_pid():
+                    return False
         time.sleep(0.1)
     return False
+
+
+def daemon_alive_pid():
+    try:
+        with open(PID_FILE, "r", encoding="utf-8") as f:
+            os.kill(int(f.read().strip()), 0)
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def _daemon_log_tail():
+    out = []
+    for p in (LOG_PATH, "/var/minis/mcp-servers/mcp-daemon.log"):
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                rows = [r.strip() for r in f.read()[-3000:].splitlines() if r.strip()]
+            out += rows[-2:]
+        except OSError:
+            pass
+    return " | ".join(out)[-500:] or "no log"
 
 
 def _acquire_cold_start_lock():
@@ -156,16 +193,16 @@ def maybe_start_daemon():
     lock_fd = _acquire_cold_start_lock()
     if lock_fd is None:
         # Another caller is forking the daemon; just wait for its port file.
-        if not _wait_for_port(time.time() + 8):
-            _log("waited for peer-started daemon but no port within 8s")
+        if not _wait_for_port(time.time() + DAEMON_START_WAIT):
+            _log("waited for peer-started daemon but no port within %ss" % DAEMON_START_WAIT)
         return
 
     pid = os.fork()
     if pid > 0:
         # Winner parent: wait for our child's daemon to publish, then release the
         # lock so future cold-starts (after this daemon exits) can fork again.
-        if not _wait_for_port(time.time() + 8):
-            _log("daemon did not start within 8s; running without daemon")
+        if not _wait_for_port(time.time() + DAEMON_START_WAIT, child=pid):
+            _log("daemon did not start within %ss: %s" % (DAEMON_START_WAIT, _daemon_log_tail()))
         os.close(lock_fd)
         try:
             os.unlink(LOCK_FILE)
@@ -262,6 +299,9 @@ def call_daemon(request, pretty):
     if not resp.get("ok") and resp.get("code") == "NO_DAEMON":
         time.sleep(0.5)
         resp = send_to_daemon(request)
+    if not resp.get("ok") and resp.get("code") == "NO_DAEMON":
+        resp["error"] = ("MCP 后台进程没起来（等了 %ss）。原因线索：%s。运行 `minis-mcp-cli doctor` 逐个检查。"
+                         % (int(DAEMON_START_WAIT), _daemon_log_tail()))
     if not resp.get("ok"):
         _fail(resp.get("error", "daemon error"), resp.get("code", "MCP_ERROR"),
               request.get("server"), pretty)
@@ -582,6 +622,12 @@ Commands:
   enable <server>                       Enable a server.
   disable <server>                      Disable a server.
   shutdown                              Stop the background daemon.
+  doctor [server...] [--timeout N]      Start every enabled server in parallel (own
+                                        process, not the daemon), time its
+                                        initialize and say why one fails
+                                        (missing command, npm download, crash +
+                                        stderr, timeout). Always returns within
+                                        N+5 s (default 60).
 
 Global flags:
   --pretty                              Pretty-print JSON output.
@@ -663,6 +709,9 @@ def main():
             cmd_set_enabled(rest, pretty, False)
         elif cmd == "shutdown":
             cmd_shutdown(rest, pretty)
+        elif cmd in ("doctor", "check"):
+            from utils import doctor
+            doctor.run(rest, pretty, _emit)
         else:
             # Keep the JSON error on stdout for programmatic callers; add a
             # human hint on stderr pointing at --help.

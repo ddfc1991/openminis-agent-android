@@ -15,7 +15,7 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Search
-import androidx.compose.material3.AlertDialog
+import com.openminis.app.ui.glass.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
@@ -238,7 +238,7 @@ private fun SectionHeader(text: String) {
         text = text.uppercaseForDisplay(),
         fontSize = 11.sp,
         fontWeight = FontWeight.Medium,
-        letterSpacing = 0.5.sp,
+        letterSpacing = 0.sp,
         color = ChatColors.secondaryText,
     )
 }

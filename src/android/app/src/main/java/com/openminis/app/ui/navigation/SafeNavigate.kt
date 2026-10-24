@@ -33,6 +33,7 @@ fun NavController.safeNavigate(
     builder: (NavOptionsBuilder.() -> Unit)? = null,
 ) {
     if (currentBackStackEntry?.lifecycle?.currentState != Lifecycle.State.RESUMED) return
+    runCatching { com.openminis.app.ui.plus.WeatherSky.busy(900L) }   // [38.9.11.3] the page transition gets the frame budget
     if (builder != null) navigate(route, builder) else navigate(route)
 }
 

@@ -165,12 +165,32 @@ class MCPRepository(private val context: Context) {
         return sorted
     }
 
-    /** Write [list] (defaults to current [servers]) to servers.json in mcpServers format. */
+    /** [Mines-dsh-35] ids the app itself deleted (so the disk merge below doesn't resurrect them). */
+    private val deletedIds = java.util.Collections.synchronizedSet(HashSet<String>())
+
+    /**
+     * Write [list] (defaults to current [servers]) to servers.json in mcpServers format.
+     *
+     * [Mines-dsh-35] Root cause of 「DSH 插件装了又掉」 (user, 2026-10-14): `minis-dsh add` registers the
+     * plugin socket as server "dsh" by editing servers.json inside the sandbox, but the app kept its own
+     * in-memory copy and every later save (toggling any MCP server, an import, the createdAt
+     * normalisation on the next read) wrote that stale copy back — silently deleting "dsh", so the
+     * plugins' tools vanished. Now entries on disk that the app doesn't know (and didn't delete) are
+     * kept, and the in-memory list adopts them.
+     */
     private fun save(list: List<MCPServerConfig> = _servers.value) {
         mcpDir.mkdirs()
         val mcpServers = JSONObject()
         for (s in list) {
             mcpServers.put(s.id, entryToJson(s))
+        }
+        runCatching {
+            if (serversFile.exists()) {
+                val disk = JSONObject(serversFile.readText()).optJSONObject("mcpServers")
+                if (disk != null) for (k in disk.keys()) {
+                    if (!mcpServers.has(k) && k !in deletedIds) disk.optJSONObject(k)?.let { mcpServers.put(k, it) }
+                }
+            }
         }
         val root = JSONObject().put("mcpServers", mcpServers)
         try {
@@ -277,6 +297,7 @@ class MCPRepository(private val context: Context) {
     /** Add or overwrite a server (rename/overwrite is last-write-wins by id). */
     fun add(server: MCPServerConfig): Boolean {
         if (server.id.isBlank()) return false
+        deletedIds.remove(server.id)
         _servers.value = _servers.value.filter { it.id != server.id } + server
         save()
         Log.i(TAG, "Added MCP server: ${server.id}")
@@ -291,6 +312,7 @@ class MCPRepository(private val context: Context) {
     }
 
     fun delete(id: String) {
+        deletedIds.add(id)
         db.execSQL("DELETE FROM mcp_session_overrides WHERE mcp_id=?", arrayOf(id))
         _servers.value = _servers.value.filter { it.id != id }
         save()

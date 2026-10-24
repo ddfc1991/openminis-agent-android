@@ -51,8 +51,14 @@ import kotlinx.coroutines.withTimeoutOrNull
 object GlobalShellThrottle {
     private const val TAG = "GlobalShellThrottle"
 
-    /** Live Minis child processes the gate admits up to. */
-    const val PROCESS_BUDGET = 16
+    /** Budget on a device that enforces the 32-process phantom limit. */
+    const val DEFAULT_PROCESS_BUDGET = 16
+
+    /**
+     * Live Minis child processes the gate admits up to. Raised by
+     * [PhantomProcessGuard] when the phantom-process killer is off.
+     */
+    val PROCESS_BUDGET: Int get() = PhantomProcessGuard.budget
 
     /**
      * What a command is assumed to cost before its processes show up in

@@ -66,7 +66,10 @@ object ProviderFactory {
                 else AnthropicProvider(apiKey, model, isOAuth = isOAuth)
             }
             ProviderType.gemini -> {
-                if (basePath != null) GeminiProvider(apiKey, model, basePath)
+                // [Mines-38.9.11 b] Google-account sign-in (Gemini CLI / Code Assist pool), not an API key
+                if (instance.credentialType == ProviderCredential.oauth && context != null)
+                    GeminiProvider(apiKey, model, codeAssist = com.openminis.app.plus.GeminiAccounts.transport(context))
+                else if (basePath != null) GeminiProvider(apiKey, model, basePath)
                 else GeminiProvider(apiKey, model)
             }
             // [T-android-provider-type-parity] openAIResponses shares this
@@ -240,15 +243,21 @@ object ProviderFactory {
                 OpenAIProvider.oauthOpenAICompat(
                     oauthTokenProvider = {
                         oauthManager.validAccessToken()
-                            ?: throw com.openminis.app.data.model.LLMError.InvalidApiKey()
+                            ?: throw com.openminis.app.data.model.LLMError.InvalidApiKey(
+                                com.openminis.app.auth.CopilotOAuthManager.lastError[instance.id]
+                                    ?: "还没有登录 GitHub Copilot，或登录已失效：请在服务商详情里重新登录")
                     },
                     model = model,
-                    basePath = basePath ?: com.openminis.app.auth.CopilotDeviceFlow.API_BASE,
+                    // [Mines-38.9.11 i32] the host GitHub assigned to this account (endpoints.api from the token exchange,
+                    // e.g. api.individual.githubcopilot.com for Copilot Free/Pro) unless the user set a custom base
+                    basePath = basePath?.takeIf { it.trimEnd('/') != com.openminis.app.auth.CopilotDeviceFlow.API_BASE }
+                        ?: oauthManager.apiBase() ?: com.openminis.app.auth.CopilotDeviceFlow.API_BASE,
                     extraHeaders = com.openminis.app.auth.CopilotDeviceFlow.staticChatHeaders(),
                 ).also { p ->
                     p.perRequestHeaders = { body ->
                         com.openminis.app.auth.CopilotDeviceFlow.perRequestHeaders(body)
                     }
+                    p.onAuthRejected = { oauthManager.invalidateSession() }
                 }
             }
             // [T-android-provider-type-parity] Types this build can decode and

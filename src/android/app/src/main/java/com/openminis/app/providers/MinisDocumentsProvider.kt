@@ -42,9 +42,11 @@ import java.io.FileNotFoundException
 class MinisDocumentsProvider : DocumentsProvider() {
 
     companion object {
-        const val AUTHORITY = "com.openminis.minis.documents"
+        // [Mines-38.9.11 c] registered in the manifest as ${applicationId}.documents (the old authority clashed with other
+        // installs); the root document id is "root" (an empty id breaks DocumentsUI tree URIs).
+        const val AUTHORITY = "com.openminis.mines.plus.documents"
         private const val ROOT_ID = "minis-root"
-        private const val ROOT_DOC_ID = ""        // empty = providerRoot
+        private const val ROOT_DOC_ID = "root"
         private val TOP_LEVEL = listOf("memory", "skills", "shared")
         private val READ_ONLY_TOP = setOf("memory", "skills")
         /** Never expose internal metadata that happens to sit in filesDir. */
@@ -62,6 +64,7 @@ class MinisDocumentsProvider : DocumentsProvider() {
             Root.COLUMN_TITLE,
             Root.COLUMN_DOCUMENT_ID,
             Root.COLUMN_MIME_TYPES,
+            Root.COLUMN_SUMMARY,
         )
 
         private val DOCUMENT_PROJECTION = arrayOf(
@@ -84,7 +87,7 @@ class MinisDocumentsProvider : DocumentsProvider() {
     private fun resolveDoc(documentId: String): File {
         val root = providerRoot()
         val clean = documentId.trim().trim('/')
-        if (clean.isEmpty()) return root
+        if (clean.isEmpty() || clean == ROOT_DOC_ID) return root
         if (clean.contains("..")) throw FileNotFoundException("Invalid path: $documentId")
         return File(root, clean)
     }
@@ -98,7 +101,7 @@ class MinisDocumentsProvider : DocumentsProvider() {
     }
 
     private fun flagsFor(documentId: String, file: File): Int {
-        if (documentId.isEmpty()) return 0 // root is immutable through SAF
+        if (documentId.isEmpty() || documentId == ROOT_DOC_ID) return 0 // root is immutable through SAF
         val topLevel = documentId.substringBefore('/')
         val isTop = documentId.indexOf('/') < 0
         if (topLevel in READ_ONLY_TOP) {
@@ -108,7 +111,8 @@ class MinisDocumentsProvider : DocumentsProvider() {
         var flags = 0
         if (file.isDirectory) flags = flags or Document.FLAG_DIR_SUPPORTS_CREATE
         else flags = flags or Document.FLAG_SUPPORTS_WRITE
-        flags = flags or Document.FLAG_SUPPORTS_DELETE or Document.FLAG_SUPPORTS_RENAME
+        // [3911c] the top-level shared/ folder itself can be written into but not deleted / renamed
+        if (!isTop) flags = flags or Document.FLAG_SUPPORTS_DELETE or Document.FLAG_SUPPORTS_RENAME
         return flags
     }
 
@@ -123,17 +127,18 @@ class MinisDocumentsProvider : DocumentsProvider() {
         cursor.newRow()
             .add(Root.COLUMN_ROOT_ID, ROOT_ID)
             .add(Root.COLUMN_FLAGS, Root.FLAG_LOCAL_ONLY or Root.FLAG_SUPPORTS_IS_CHILD)
-            .add(Root.COLUMN_TITLE, "Minis")
+            .add(Root.COLUMN_SUMMARY, "共享文件 · 记忆 · 技能")
+            .add(Root.COLUMN_TITLE, "Mines")
             .add(Root.COLUMN_DOCUMENT_ID, ROOT_DOC_ID)
             .add(Root.COLUMN_MIME_TYPES, "*/*")
-            .add(Root.COLUMN_ICON, 0)
+            .add(Root.COLUMN_ICON, com.openminis.app.R.mipmap.ic_launcher)
         return cursor
     }
 
     override fun queryDocument(documentId: String, projection: Array<String>?): Cursor {
         val cursor = MatrixCursor(projection ?: DOCUMENT_PROJECTION)
         val file = resolveDoc(documentId)
-        val displayName = if (documentId.isEmpty()) "Minis" else file.name
+        val displayName = if (documentId.isEmpty() || documentId == ROOT_DOC_ID) "Mines" else file.name
         cursor.newRow()
             .add(Document.COLUMN_DOCUMENT_ID, documentId)
             .add(Document.COLUMN_DISPLAY_NAME, displayName)
@@ -151,14 +156,14 @@ class MinisDocumentsProvider : DocumentsProvider() {
     ): Cursor {
         val cursor = MatrixCursor(projection ?: DOCUMENT_PROJECTION)
         val parent = resolveDoc(parentDocumentId)
-        val isRoot = parentDocumentId.isEmpty()
+        val isRoot = parentDocumentId.isEmpty() || parentDocumentId == ROOT_DOC_ID
         val children = parent.listFiles()?.toList() ?: emptyList()
         for (child in children) {
             val name = child.name
             if (name.startsWith(".")) continue
             if (name in METADATA_BLACKLIST) continue
             if (isRoot && name !in TOP_LEVEL) continue
-            val docId = if (parentDocumentId.isEmpty()) name else "$parentDocumentId/$name"
+            val docId = if (isRoot) name else "$parentDocumentId/$name"
             cursor.newRow()
                 .add(Document.COLUMN_DOCUMENT_ID, docId)
                 .add(Document.COLUMN_DISPLAY_NAME, name)
@@ -198,6 +203,7 @@ class MinisDocumentsProvider : DocumentsProvider() {
         val parent = resolveDoc(parentDocumentId)
         val top = parentDocumentId.substringBefore('/').ifEmpty { parentDocumentId }
         if (top in READ_ONLY_TOP) throw UnsupportedOperationException("$top is read-only")
+        if (top.isEmpty() || top == ROOT_DOC_ID) throw UnsupportedOperationException("create inside shared/")
         val safeName = displayName.replace("/", "_").replace("..", "_")
         val created = File(parent, safeName)
         val ok = if (mimeType == Document.MIME_TYPE_DIR) created.mkdirs() else created.createNewFile()
@@ -209,6 +215,7 @@ class MinisDocumentsProvider : DocumentsProvider() {
         val file = resolveDoc(documentId)
         val top = documentId.substringBefore('/')
         if (top in READ_ONLY_TOP) throw UnsupportedOperationException("$top is read-only")
+        if (documentId.indexOf('/') < 0) throw UnsupportedOperationException("top-level folder")
         if (!file.deleteRecursively()) throw FileNotFoundException("Failed to delete $documentId")
     }
 
@@ -216,6 +223,7 @@ class MinisDocumentsProvider : DocumentsProvider() {
         val file = resolveDoc(documentId)
         val top = documentId.substringBefore('/')
         if (top in READ_ONLY_TOP) throw UnsupportedOperationException("$top is read-only")
+        if (documentId.indexOf('/') < 0) throw UnsupportedOperationException("top-level folder")
         val safe = displayName.replace("/", "_").replace("..", "_")
         val target = File(file.parentFile, safe)
         if (!file.renameTo(target)) throw FileNotFoundException("Failed to rename $documentId")

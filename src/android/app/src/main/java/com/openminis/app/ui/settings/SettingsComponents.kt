@@ -1,5 +1,7 @@
 package com.openminis.app.ui.settings
 
+import com.openminis.app.ui.plus.MT
+
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -11,6 +13,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
@@ -32,8 +35,8 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
-import androidx.compose.material3.CenterAlignedTopAppBar
-import androidx.compose.material3.TopAppBar
+import com.openminis.app.ui.theme.CenterAlignedTopAppBar
+import com.openminis.app.ui.theme.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.Composable
@@ -134,14 +137,19 @@ fun SettingsScaffold(
         // keyboard" rect to scroll a focused TextField into. Without it,
         // adjustResize + edge-to-edge leaves the scrollable column at
         // full height behind the IME and bringIntoView is a no-op.
+        // [Mines-38.9.8] real phone (模型详情): the last footer line was cut by the gesture bar. A scrolling page now runs
+        // under the navigation bar and ends with nav-bar inset + 24 dp of room, so its last line clears the bar.
+        val edge = scrollable && bottomBar == null
         val baseMod = Modifier
             .fillMaxSize()
-            .padding(padding)
+            .then(if (edge) Modifier.padding(top = padding.calculateTopPadding()) else Modifier.padding(padding))
             .imePadding()
         Column(
             modifier = if (scrollable) baseMod.verticalScroll(rememberScrollState()) else baseMod,
-            content = content,
-        )
+        ) {
+            content()
+            if (edge) androidx.compose.foundation.layout.Spacer(Modifier.navigationBarsPadding().height(24.dp))
+        }
     }
 }
 
@@ -228,7 +236,7 @@ fun SettingsSection(
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontWeight = FontWeight.Medium,
-                letterSpacing = 0.5.sp,
+                letterSpacing = 0.sp,
                 // [T-android-settings-ui-md3] #5 header→card gap = 8dp (was 6dp,
                 // off-grid). Horizontal stays 32dp to align the header text with
                 // the inset card's content.
@@ -264,7 +272,7 @@ fun SettingsSection(
                 // already provides separation, so keep the footer's own bottom
                 // tight at 4dp).
                 modifier = Modifier.padding(start = 32.dp, end = 32.dp, top = 8.dp, bottom = 4.dp),
-                lineHeight = 16.sp,
+                lineHeight = MT.CaptionLH,
             )
         }
     }

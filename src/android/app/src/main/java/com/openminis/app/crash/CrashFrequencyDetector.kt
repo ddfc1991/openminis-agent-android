@@ -474,7 +474,7 @@ object CrashFrequencyDetector {
             addView(column)
         }
 
-        val dialog = AlertDialog.Builder(activity)
+        val dialog = com.openminis.app.ui.plus.GlassViewDialog.builder(activity)
             .setTitle(R.string.crash_freq_pick_files_title)
             .setView(scroll)
             .setPositiveButton(R.string.crash_freq_pick_continue) { _, _ ->
@@ -497,31 +497,10 @@ object CrashFrequencyDetector {
      * com.google.android.material:material (one new dependency for one
      * dialog).
      */
+    @Suppress("UNUSED_PARAMETER")
     private fun applyRoundedBackground(activity: Activity, dialog: AlertDialog) {
-        try {
-            val density = activity.resources.displayMetrics.density
-            // Light / dark adaptive: pull the colorBackground attribute
-            // from the activity theme so we don't have to hard-code
-            // colors for night mode.
-            val bgColor = run {
-                val tv = android.util.TypedValue()
-                if (activity.theme.resolveAttribute(android.R.attr.colorBackground, tv, true)) {
-                    tv.data
-                } else {
-                    0xFFFFFFFF.toInt()
-                }
-            }
-            val bg = android.graphics.drawable.GradientDrawable().apply {
-                shape = android.graphics.drawable.GradientDrawable.RECTANGLE
-                cornerRadius = 24f * density
-                setColor(bgColor)
-            }
-            dialog.setOnShowListener {
-                dialog.window?.setBackgroundDrawable(bg)
-            }
-        } catch (t: Throwable) {
-            android.util.Log.w(TAG, "applyRoundedBackground failed: ${t.message}")
-        }
+        // [Mines-38.9.6 i14] the glass window background comes from GlassViewDialog.builder (was a solid colorBackground card
+        // set in its own show listener, which replaced the glass one)
     }
 
     /**
@@ -575,7 +554,7 @@ object CrashFrequencyDetector {
             }
         }
 
-        val dlg = AlertDialog.Builder(activity)
+        val dlg = com.openminis.app.ui.plus.GlassViewDialog.builder(activity)
             .setTitle(activity.getString(R.string.crash_freq_method_title, files.size))
             .setView(column)
             .setNegativeButton(R.string.crash_freq_dialog_dismiss) { _, _ ->

@@ -74,6 +74,8 @@ object SessionDeleter {
             //    a ViewModelStore.
             withContext(Dispatchers.Main) { ChatViewModelStore.release(id) }
             HeadlessChatRunner.forget(id)
+            // [Mines-38.9.11 c] automatic deletes + chat-list / folder deletes keep the chat's files: shared/已归档/ (SharedFilesCore.keepsFiles)
+            com.openminis.app.plus.SharedFiles.beforeDelete(context, repo, id, reason)
             // 3. DB rows. deleteSessionOnly is the non-cascading primitive; the
             //    cascade is this loop, which already walked the subtree.
             repo.deleteSessionOnly(id)

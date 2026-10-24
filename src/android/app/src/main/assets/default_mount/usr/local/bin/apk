@@ -1,0 +1,86 @@
+#!/bin/sh
+# [Mines-net-26] apk with a stall guard and automatic mirror switch.
+#
+# Downloads that stop moving for $MINIS_APK_STALL seconds (default 60) are
+# stopped instead of hanging forever (apk itself has no network timeout). On a
+# stall or a network error the fastest working mirror is picked again
+# (mines-mirror auto apk) and the command is retried once. Everything that does
+# not touch the network goes straight to the real apk.
+REAL=/sbin/apk
+net=0
+for a in "$@"; do
+    case $a in
+        -*) ;;
+        add|update|upgrade|fix|fetch|cache) net=1; break ;;
+        *) break ;;
+    esac
+done
+[ "$net" = 1 ] && [ "${MINIS_GUARD:-1}" != 0 ] || exec "$REAL" "$@"
+. /usr/local/lib/minis-net/common.sh
+minis_check_proxy
+# [Mines-apk-29] huaweicloud's Alpine mirror stalls for minutes on many
+# networks (tuna/aliyun are ~40x faster): never keep it.
+grep -q huaweicloud /etc/apk/repositories 2>/dev/null && mines-mirror auto apk >&2
+minis_mirrors_once apk pip npm
+
+# [Mines-apk-29] Self-heal helpers.
+#  - a name that failed to install can stay in /etc/apk/world and then every
+#    later apk add/upgrade fails with "unable to select packages": drop it;
+#  - after `apk cache clean` a stale index makes apk read missing files:
+#    retry once with --no-cache;
+#  - `apk info` can say INSTALLED while the files are gone (interrupted
+#    extraction): after add, check the files and reinstall when missing.
+heal_world() {
+    local names n
+    names=$(sed -n 's/^ *\([A-Za-z0-9._+-][A-Za-z0-9._+-]*\) (no such package).*/\1/p; s/^ *\([A-Za-z0-9._+-][A-Za-z0-9._+-]*\)[<>=~].*(no such package).*/\1/p' "$1" | sort -u)
+    [ -n "$names" ] || return 1
+    cp /etc/apk/world /etc/apk/world.minis-bak 2>/dev/null
+    for n in $names; do
+        grep -qx "$n" /etc/apk/world 2>/dev/null || continue
+        sed -i "/^$n\$/d" /etc/apk/world
+        echo "↻ 从 /etc/apk/world 删掉装不上的「$n」（它让 apk 每次都失败）" >&2
+    done
+    return 0
+}
+verify_added() {
+    local a f miss
+    for a in "$@"; do
+        case $a in -*|add|*=*|*'>'*|*'<'*|*~*) continue ;; esac
+        miss=0
+        for f in $("$REAL" info -L -q "$a" 2>/dev/null | head -40); do
+            [ -e "/$f" ] || { miss=1; break; }
+        done
+        if [ "$miss" = 1 ]; then
+            echo "↻ $a 显示已安装但文件缺失，正在重装…" >&2
+            "$REAL" fix -r "$a" >&2 || "$REAL" add --no-cache --force-overwrite "$a" >&2
+        fi
+    done
+}
+STALL=${MINIS_APK_STALL:-60}
+log=$(mktemp)
+trap 'rm -f "$log"' EXIT
+minis_run_logged "$log" mines-guard apk "$STALL" "${MINIS_APK_TOTAL:-0}" -- "$REAL" "$@"
+rc=$?
+[ "$rc" = 0 ] && { [ "$1" = add ] && verify_added "$@"; exit 0; }
+if grep -q "unable to select packages" "$log" && heal_world "$log"; then
+    minis_run_logged "$log" mines-guard apk "$STALL" "${MINIS_APK_TOTAL:-0}" -- "$REAL" "$@"
+    rc=$?
+    [ "$rc" = 0 ] && { [ "$1" = add ] && verify_added "$@"; exit 0; }
+fi
+if grep -qiE 'No such file or directory|unable to read database|BAD signature|UNTRUSTED signature|bad archive' "$log" && ! echo " $* " | grep -q -- ' --no-cache '; then
+    echo "↻ 本地缓存的索引坏了，用 --no-cache 重试…" >&2
+    minis_run_logged "$log" mines-guard apk "$STALL" "${MINIS_APK_TOTAL:-0}" -- "$REAL" --no-cache "$@"
+    rc=$?
+    [ "$rc" = 0 ] && { [ "$1" = add ] && verify_added "$@"; exit 0; }
+fi
+if [ "$rc" = 124 ] || grep -qiE 'network error|temporary error|timed out|timeout|unable to (fetch|connect)|connection (refused|reset)|could not resolve|DNS lookup|Permission denied|certificate|SSL|No such host|Broken pipe|bad gateway|I/O error' "$log"; then
+    echo "↻ 软件源连不上或卡住了，正在重新测速换源…" >&2
+    if mines-mirror auto apk >&2; then
+        [ "$1" = update ] || "$REAL" update -q >/dev/null 2>&1
+        minis_run_logged "$log" mines-guard apk "$STALL" "${MINIS_APK_TOTAL:-0}" -- "$REAL" "$@"
+        rc=$?
+        [ "$rc" = 0 ] && exit 0
+    fi
+    echo "✗ apk 下载失败（退出码 $rc）。运行 mines-doctor 看是网络、代理还是软件源的问题。" >&2
+fi
+exit "$rc"

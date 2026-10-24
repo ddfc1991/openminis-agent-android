@@ -16,7 +16,7 @@ sealed class LLMError(message: String, cause: Throwable? = null) : Exception(mes
     class ProviderError(val detail: String, val httpStatus: Int? = null) :
         LLMError("Provider error: $detail")
     class DecodingError(cause: Throwable) : LLMError("Decoding error: ${cause.message}", cause)
-    class RateLimited : LLMError("Rate limited — please try again later")
+    class RateLimited(val detail: String = "") : LLMError(if (detail.isBlank()) "Rate limited — please try again later" else "Rate limited: $detail")
     /**
      * [T-android-503-fallback] Retry-worthy failure. [httpStatus] carries the
      * response code ONLY when the failure was a real HTTP response from the

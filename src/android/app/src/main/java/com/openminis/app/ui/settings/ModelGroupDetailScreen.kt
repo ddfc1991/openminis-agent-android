@@ -1,5 +1,7 @@
 package com.openminis.app.ui.settings
 
+import com.openminis.app.ui.plus.MT
+
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -21,9 +23,9 @@ import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Warning
-import androidx.compose.material3.AlertDialog
+import com.openminis.app.ui.glass.AlertDialog
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.DropdownMenu
+import com.openminis.app.ui.glass.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -38,7 +40,7 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
+import com.openminis.app.ui.theme.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -139,7 +141,7 @@ fun ModelGroupDetailScreen(
     }
 
     Scaffold(
-        snackbarHost = { SnackbarHost(snackbarHostState) },
+        snackbarHost = { SnackbarHost(snackbarHostState) { com.openminis.app.ui.plus.GlassSnackbar(it) } },
         topBar = {
             TopAppBar(
                 title = { Text(group.name, fontWeight = FontWeight.SemiBold) },
@@ -178,7 +180,7 @@ fun ModelGroupDetailScreen(
                                 if (!focusState.isFocused && name.isNotBlank() && name != group.name) {
                                     providerRepository.updateGroup(group.copy(name = name))
                                     coroutineScope.launch {
-                                        snackbarHostState.showSnackbar("Name saved")
+                                        snackbarHostState.showSnackbar("名称已保存")
                                     }
                                 }
                             },
@@ -192,8 +194,8 @@ fun ModelGroupDetailScreen(
                 SettingsSection(
                     header = stringResource(R.string.model_group_detail_routing_strategy),
                     footer = when (strategy) {
-                        RoutingStrategy.fallback -> "Try models in order. If one fails, advance to the next."
-                        RoutingStrategy.loadBalance -> "Distribute sessions across models in the group."
+                        RoutingStrategy.fallback -> "按顺序用模型，一个失败就换下一个。"
+                        RoutingStrategy.loadBalance -> "把对话分摊到组里的各个模型。"
                     },
                 ) {
                     SettingsChoiceRow(
@@ -222,8 +224,8 @@ fun ModelGroupDetailScreen(
                     SettingsSection(
                         header = stringResource(R.string.model_group_detail_fallback_trigger),
                         footer = when (fallbackStrategy) {
-                            FallbackStrategy.default -> "Fall back on rate limits (429) and server errors (5xx) only."
-                            FallbackStrategy.always -> "Fall back on any error, including network and auth failures."
+                            FallbackStrategy.default -> "只在限流（429）和服务器出错（5xx）时换下一个。"
+                            FallbackStrategy.always -> "出任何错都换下一个，包括网络和密钥/登录失败。"
                         },
                     ) {
                         SettingsChoiceRow(
@@ -267,7 +269,7 @@ fun ModelGroupDetailScreen(
                             .padding(horizontal = 16.dp),
                     ) {
                         Text(
-                            "No models in this group.",
+                            "这个组里还没有模型。",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.padding(vertical = 12.dp),
@@ -511,8 +513,8 @@ fun ModelGroupDetailScreen(
                                             // One size below labelSmall: six segments on a phone leave
                                     // ~55dp each, and labelSmall's 11sp still made
                                     // "Medium" the widest thing in the row.
-                                    fontSize = 10.sp,
-                                    lineHeight = 12.sp,
+                                    fontSize = MT.Tiny,
+                                    lineHeight = MT.CaptionLH,
                                             maxLines = 1,
                                             softWrap = false,
                                         )

@@ -135,7 +135,7 @@ import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.RadioButtonChecked
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material3.DropdownMenu
+import com.openminis.app.ui.glass.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import com.openminis.app.BuildConfig
 import com.openminis.app.R
@@ -147,7 +147,7 @@ import com.openminis.app.ui.components.MinisMenuDivider
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.ModalBottomSheet
+import com.openminis.app.ui.glass.ModalBottomSheet
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -159,7 +159,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
+import com.openminis.app.ui.theme.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -308,7 +308,7 @@ internal fun ToolDetailSheet(
                 .fillMaxHeight(0.85f)
                 .background(ChatColors.secondaryBg),
         ) {
-            // ── Top Nav Bar (iOS: X button + "Minis Computer" + action button) ──
+            // ── Top Nav Bar (iOS: X button + "Mines Computer" + action button) ──
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -328,7 +328,7 @@ internal fun ToolDetailSheet(
                 ) {
                     Icon(
                         Icons.Default.Close,
-                        contentDescription = "Close",
+                        contentDescription = "关闭",
                         tint = ChatColors.primaryText,
                         modifier = Modifier.size(16.dp),
                     )
@@ -342,7 +342,7 @@ internal fun ToolDetailSheet(
                 // the elapsed-duration text) so it sits next to where the
                 // user is already scanning timing info.
                 Text(
-                    text = "Minis Computer",
+                    text = "Mines Computer",
                     fontSize = 15.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = ChatColors.primaryText,
@@ -946,7 +946,7 @@ internal fun ToolDetailSheet(
                                     screenshotBitmap.height.coerceAtLeast(1)
                                 Image(
                                     bitmap = screenshotBitmap.asImageBitmap(),
-                                    contentDescription = "Browser screenshot",
+                                    contentDescription = "浏览器截图",
                                     contentScale = ContentScale.Fit,
                                     modifier = Modifier
                                         .fillMaxWidth()
@@ -1210,7 +1210,7 @@ internal fun ToolDetailSheet(
                             overflow = TextOverflow.Ellipsis,
                         )
                         Text(
-                            text = block.toolTitle.ifEmpty { block.toolName },
+                            text = com.openminis.app.plus.ToolZh.title(block.toolTitle, block.toolName),
                             fontSize = 12.sp,
                             lineHeight = 14.sp,
                             color = ChatColors.secondaryText,
@@ -1273,7 +1273,7 @@ internal fun ToolDetailSheet(
                     ) {
                         Icon(
                             Icons.Default.SkipPrevious,
-                            contentDescription = "Previous",
+                            contentDescription = "上一张",
                             tint = if (currentIdx > 0) ChatColors.primaryText else ChatColors.disabledText,
                             modifier = Modifier.size(22.dp),
                         )
@@ -1319,7 +1319,7 @@ internal fun ToolDetailSheet(
                     ) {
                         Icon(
                             Icons.Default.SkipNext,
-                            contentDescription = "Next",
+                            contentDescription = "下一张",
                             tint = if (currentIdx < toolBlocks.lastIndex) ChatColors.primaryText else ChatColors.disabledText,
                             modifier = Modifier.size(22.dp),
                         )

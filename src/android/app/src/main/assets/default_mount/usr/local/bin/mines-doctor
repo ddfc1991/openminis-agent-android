@@ -1,0 +1,200 @@
+#!/bin/sh
+# [Mines-net-26] mines-doctor — why can't the sandbox install anything?
+#
+#   mines-doctor           full check, ends with what to fix. [Mines-29] Every
+#                          section runs in parallel with its own timeout, and
+#                          the whole run returns within MINES_DOCTOR_DEADLINE
+#                          (default 20 s) with whatever finished, marking the
+#                          rest 「超时未完成」 — it used to run each probe one
+#                          after another (minutes on a bad network).
+#   mines-doctor --short   only the summary lines
+#
+# Checks: clock, proxy env (and whether the proxy answers), DNS (incl. Clash
+# fake-ip answers), IPv4 / IPv6 reachability, every package mirror, TLS to
+# pypi.org and files.pythonhosted.org (direct and through the proxy), CA
+# bundle, disk space, and what the phone reports (VPN covering Mines or not).
+. /usr/local/lib/minis-net/common.sh
+T=${MINIS_DOCTOR_TIMEOUT:-5}
+DEADLINE=${MINES_DOCTOR_DEADLINE:-20}
+MDIR=$(mktemp -d)
+trap 'rm -rf "$MDIR"' EXIT
+SEC=0
+SHORT=0; [ "$1" = "--short" ] && SHORT=1
+# Each section writes its lines to $MDIR/<n>.out and its problems/fixes to
+# $MDIR/<n>.bad / $MDIR/<n>.fix ($SEC is the section number inside the subshell).
+bad() { echo "✗ $1" >> "$MDIR/$SEC.bad"; [ -n "$2" ] && echo "→ $2" >> "$MDIR/$SEC.fix"; say "  ✗ $1"; }
+ok() { say "  ✓ $1"; }
+say() { [ "$SHORT" = 1 ] || echo "$@"; }
+hdr() { say ""; say "【$1】"; }
+
+get() {   # get <url> [noproxy] → 0 when an HTTP answer came back; error text in $GET_ERR
+    local out
+    if [ "$2" = noproxy ]; then
+        out=$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY timeout $((T + 2)) wget -q -T "$T" -O /dev/null "$1" 2>&1)
+    else
+        out=$(timeout $((T + 2)) wget -q -T "$T" -O /dev/null "$1" 2>&1)
+    fi
+    local rc=$?
+    GET_ERR=$(echo "$out" | grep -v '^$' | tail -1 | cut -c1-120)
+    [ $rc = 143 ] || [ $rc = 124 ] && GET_ERR="${T} 秒没有响应（卡住）"
+    case $out in *"404"*|*"403"*|*"302"*|*"301"*) return 0;; esac
+    return $rc
+}
+
+say "Mines 沙箱网络体检  $(date '+%Y-%m-%d %H:%M:%S %Z')"
+[ -f /etc/alpine-release ] && say "Alpine $(cat /etc/alpine-release)，$(uname -m)"
+
+sec1() {
+    hdr "手机网络"
+    if [ -f /etc/minis/net.state ]; then
+        vpn=$(sed -n 's/^vpn=//p' /etc/minis/net.state); tr_=$(sed -n 's/^transport=//p' /etc/minis/net.state)
+        dns=$(sed -n 's/^dns=//p' /etc/minis/net.state); src=$(sed -n 's/^proxy_source=//p' /etc/minis/net.state)
+        say "  网络：${tr_:-未知}；VPN 是否覆盖 Mines：$( [ "$vpn" = 1 ] && echo 是 || echo 否)；系统 DNS：${dns:-未知}"
+        [ -n "$src" ] && say "  沙箱代理来源：$src"
+    else
+        say "  （没有手机网络信息，App 还没写入）"
+    fi
+}
+
+sec2() {
+    hdr "时间"
+    now=$(date +%s)
+    hd=$(timeout $((T + 2)) wget -S -q -T "$T" -O /dev/null http://mirrors.aliyun.com/ 2>&1 | sed -n 's/^ *[Dd]ate: //p' | head -1)
+    if [ -n "$hd" ]; then
+        srv=$(date -d "$hd" +%s 2>/dev/null || date -D '%a, %d %b %Y %H:%M:%S GMT' -d "$hd" +%s 2>/dev/null)
+        # busybox parses the GMT string as local time; correct by the TZ offset.
+        off=$(date +%z); sign=${off%????}; hh=${off#?}; hh=${hh%??}; mm=${off#???}
+        [ -n "$srv" ] && [ -n "$hh" ] && { hh=${hh#0}; mm=${mm#0}; corr=$(( ${hh:-0} * 3600 + ${mm:-0} * 60 )); [ "$sign" = "-" ] && corr=$((-corr)); srv=$((srv + corr)); }
+        if [ -n "$srv" ]; then
+            d=$((now - srv)); [ $d -lt 0 ] && d=$((-d))
+            if [ $d -gt 300 ]; then bad "时钟差了 ${d} 秒（证书校验会失败）" "在手机 设置 → 日期和时间 打开「自动设置」"; else ok "时钟准确（误差 ${d} 秒）"; fi
+        else say "  · 无法解析服务器时间：$hd"; fi
+    else
+        say "  · 拿不到服务器时间（网络不通时正常）"
+    fi
+}
+
+sec3() {
+    hdr "代理"
+    p=$(minis_proxy_url)
+    if [ -n "$p" ]; then
+        hp=$(minis_hostport "$p"); h=${hp%:*}; port=${hp##*:}; [ "$port" = "$hp" ] && port=80
+        say "  http(s)_proxy = $(echo "$p" | sed 's#//[^@/]*@#//***@#')   no_proxy = ${no_proxy:-${NO_PROXY:-（无）}}"
+        if minis_tcp_ok "$h" "$port"; then ok "代理 $hp 能连上"; PROXY_UP=1
+        else bad "代理 $hp 连不上——所有走代理的下载都会失败" "设置 → 模型路由与分流 里修好或关掉代理；或 设置 → 沙箱与防杀 → 沙箱代理 选「不用代理」"; PROXY_UP=0; fi
+    else
+        say "  · 沙箱没设代理（直连）"; PROXY_UP=0
+    fi
+}
+
+sec4() {
+    hdr "DNS"
+    say "  resolv.conf：$(grep '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ' ')"
+    v6any=0
+    for h in mirrors.aliyun.com dl-cdn.alpinelinux.org pypi.org files.pythonhosted.org; do
+        r=$(timeout $((T + 2)) nslookup "$h" 2>&1)
+        a=$(echo "$r" | sed -n '/^Name:/,$ s/^Address[^:]*: *//p' | grep -v ':' | head -2 | tr '\n' ' ')
+        aaaa=$(echo "$r" | sed -n '/^Name:/,$ s/^Address[^:]*: *//p' | grep ':' | head -1)
+        [ -n "$aaaa" ] && v6any=1
+        if [ -z "$a$aaaa" ]; then bad "解析不了 $h" "DNS 不通：设置 → 沙箱（Rootfs）→ 容器 DNS 改成 223.5.5.5 / 119.29.29.29"
+        else
+            case $a in 198.18.*|198.19.*) bad "$h 解析到 $a（Clash/代理软件的 fake-ip）" "VPN 没有接管 Mines 的流量却用了它的 DNS：在代理软件的「分应用代理」里加上 Mines，或把容器 DNS 改成 223.5.5.5";;
+                *) ok "$h → ${a}${aaaa:+ / $aaaa}";; esac
+        fi
+    done
+}
+
+sec5() {
+    hdr "IPv4 / IPv6"
+    if minis_tcp_ok 223.5.5.5 53 || minis_tcp_ok 114.114.114.114 53; then ok "IPv4 能出网"; else bad "IPv4 连不上外网" "检查手机网络/飞行模式"; fi
+    if ip -6 addr 2>/dev/null | grep -q 'scope global'; then
+        if minis_tcp_ok 2400:3200::1 53 || minis_tcp_ok 2402:4e00:: 53; then ok "IPv6 可用"
+        else bad "手机有 IPv6 地址但连不出去" "部分程序会先试 IPv6 而卡住；在 设置 → 沙箱 把容器 DNS 设为只返回 IPv4 的服务器，或关掉手机的 IPv6"; fi
+    else say "  · 没有 IPv6 地址（只用 IPv4，正常）"; fi
+}
+
+sec6() {
+    hdr "软件源"
+    mines-mirror show apk 2>/dev/null | sed 's/^/  现在用：/'
+    mines-mirror show pip 2>/dev/null | sed 's/^/  现在用：/'
+    pr=$(MINIS_PROBE_TIMEOUT=$T mines-mirror probe apk 2>/dev/null; MINIS_PROBE_TIMEOUT=$T mines-mirror probe pip 2>/dev/null; MINIS_PROBE_TIMEOUT=$T mines-mirror probe npm 2>/dev/null)
+    say "$pr" | sed 's/^/  /'
+    for k in apk pip npm; do
+        echo "$pr" | grep "^$k " | grep -qv '✗' || bad "$k：所有软件源都连不上" "先修上面的网络/代理问题，再运行 mines-mirror auto"
+    done
+    cur=$(mines-mirror show apk | awk '{print $3}')
+    if [ -n "$cur" ] && echo "$pr" | grep "^apk " | grep '✗' | grep -qF "$cur"; then
+        bad "正在用的 apk 软件源连不上：$cur" "运行 mines-mirror auto（apk 失败时也会自动换）"
+    fi
+}
+
+sec7() {
+    hdr "证书 / TLS"
+    if [ -s /etc/ssl/minis-ca.pem ]; then ok "CA 证书库：/etc/ssl/minis-ca.pem（$(grep -c 'BEGIN CERT' /etc/ssl/minis-ca.pem) 个根证书）"
+    else say "  · 用系统自带证书库 /etc/ssl/certs/ca-certificates.crt（$(grep -c 'BEGIN CERT' /etc/ssl/certs/ca-certificates.crt 2>/dev/null) 个）"; fi
+    k=0
+    for u in https://pypi.org/simple/pip/ https://files.pythonhosted.org/packages/py2.py3/s/six/six-1.16.0-py2.py3-none-any.whl https://mirrors.aliyun.com/pypi/simple/pip/; do
+      k=$((k + 1))
+      ( h=$(host_of() { echo "$1" | sed -e 's#^[a-z]*://##' -e 's#/.*##'; }; host_of "$u")
+        if get "$u" noproxy; then ok "直连 $h：TLS 正常"; D=1; else say "  · 直连 $h：$GET_ERR"; D=0; fi
+        if [ -n "$p" ] && [ "${PROXY_UP:-0}" = 1 ]; then
+            if get "$u"; then ok "经代理 $h：TLS 正常"; X=1; else say "  · 经代理 $h：$GET_ERR"; X=0; fi
+        else X=$D; fi
+        if [ $D = 0 ] && [ $X = 0 ]; then
+            case $h in *aliyun*) bad "连不上 $h（国内源）" "网络本身有问题，看上面的 DNS / IPv4";;
+                *) bad "$h 直连和代理都不通（境外源，国内常见：被重置或限速）" "用国内镜像：mines-mirror auto pip（已自动做）；需要官方源就在 模型路由与分流 填一个能用的代理";; esac
+        fi ) > "$MDIR/tls.$k" 2>&1 &
+    done
+    wait
+    cat "$MDIR"/tls.* 2>/dev/null
+}
+
+sec8() {
+    hdr "磁盘"
+    free=$(df -k / 2>/dev/null | tail -1 | awk '{print $(NF-2)}')
+    if [ -n "$free" ]; then
+        if [ "$free" -lt 1048576 ]; then bad "沙箱剩余空间只有 $((free / 1024)) MB" "清理手机存储；开发工具包需要约 1 GB"; else ok "剩余 $((free / 1024 / 1024)) GB"; fi
+    fi
+}
+
+# The proxy answer is needed by the TLS section: measure it first (≤ 4 s).
+p=$(minis_proxy_url); PROXY_UP=0
+if [ -n "$p" ]; then hp=$(minis_hostport "$p"); h=${hp%:*}; port=${hp##*:}; [ "$port" = "$hp" ] && port=80
+    minis_tcp_ok "$h" "$port" && PROXY_UP=1; fi
+NSEC=8
+i=1; pids=""
+while [ $i -le $NSEC ]; do
+    ( SEC=$i; sec$i > "$MDIR/$i.out" 2>&1; : > "$MDIR/$i.done" ) &
+    pids="$pids $!"
+    i=$((i + 1))
+done
+start=$(date +%s)
+while :; do
+    n=$(ls "$MDIR"/*.done 2>/dev/null | wc -l)
+    [ "$n" -ge $NSEC ] && break
+    [ $(( $(date +%s) - start )) -ge "$DEADLINE" ] && break
+    sleep 1
+done
+for pid in $pids; do pkill -P "$pid" 2>/dev/null; kill "$pid" 2>/dev/null; done
+problems=""; fixes=""
+i=1
+while [ $i -le $NSEC ]; do
+    cat "$MDIR/$i.out" 2>/dev/null
+    [ -f "$MDIR/$i.done" ] || { say "  … 这一项 ${DEADLINE} 秒内没做完（网络很慢或卡住），已跳过"; echo "✗ 第 $i 项检查超时（网络卡住）" >> "$MDIR/$i.bad"; }
+    [ -f "$MDIR/$i.bad" ] && problems="$problems
+$(cat "$MDIR/$i.bad")"
+    [ -f "$MDIR/$i.fix" ] && fixes="$fixes
+$(cat "$MDIR/$i.fix")"
+    i=$((i + 1))
+done
+echo ""
+if [ -z "$problems" ]; then
+    echo "结论：没发现网络问题。apk / pip 失败时会自动换源重试；还不行把上面的输出发给我。"
+    echo "MINES_DOCTOR_OK"
+else
+    echo "结论：发现这些问题：$problems"
+    echo ""
+    echo "怎么修：$(echo "$fixes" | awk '!seen[$0]++')"
+    echo "MINES_DOCTOR_PROBLEMS"
+fi
+exit 0

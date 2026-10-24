@@ -1,5 +1,7 @@
 package com.openminis.app.ui.settings
 
+import com.openminis.app.ui.plus.MT
+
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -18,7 +20,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.History
-import androidx.compose.material3.AlertDialog
+import com.openminis.app.ui.glass.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Icon
@@ -279,7 +281,7 @@ private fun AuditRow(entry: ConfigAuditEntry, onRevert: () -> Unit) {
                     onClick = onRevert,
                     label = { Text(stringResource(R.string.logs_config_revert_chip)) },
                     colors = AssistChipDefaults.assistChipColors(
-                        containerColor = MaterialTheme.colorScheme.surface,
+                        containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
                     ),
                 )
             }
@@ -331,7 +333,7 @@ private fun StatusBadge(status: ConfigAuditStatus) {
         Text(
             text = label,
             style = MaterialTheme.typography.bodySmall.copy(
-                fontSize = 10.sp,
+                fontSize = MT.Tiny,
                 fontFamily = FontFamily.Monospace,
             ),
             color = Color.White,

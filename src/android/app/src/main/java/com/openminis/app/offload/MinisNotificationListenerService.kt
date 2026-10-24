@@ -40,6 +40,8 @@ class MinisNotificationListenerService : NotificationListenerService() {
         // until the listener has actually observed its own post.
         val key = postKey(sbn.packageName, sbn.id)
         postedLatches.remove(key)?.countDown()
+        // [Mines] One-time codes for the agent's browser (memory only, never logged).
+        runCatching { com.openminis.app.plus.HumanVerify.onNotification(applicationContext, sbn) }
     }
 
     override fun onNotificationRemoved(sbn: StatusBarNotification) {}

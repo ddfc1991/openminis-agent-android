@@ -1,5 +1,7 @@
 package com.openminis.app.ui.onboarding
 
+import com.openminis.app.ui.plus.MT
+
 import com.openminis.app.R
 import androidx.compose.ui.res.stringResource
 import com.openminis.app.ui.components.MinisButton
@@ -33,7 +35,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
+import com.openminis.app.ui.theme.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -44,7 +46,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
-import androidx.compose.material3.DropdownMenu
+import com.openminis.app.ui.glass.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.ui.text.style.TextAlign
 import kotlinx.coroutines.withContext
@@ -268,7 +270,7 @@ fun OnboardingModelSelectionScreen(
                                         Text(
                                             "${selectionIndex + 1}",
                                             color = MaterialTheme.colorScheme.onPrimary,
-                                            fontSize = 12.sp,
+                                            fontSize = MT.Caption,
                                             fontWeight = FontWeight.SemiBold,
                                         )
                                     }
@@ -297,7 +299,7 @@ fun OnboardingModelSelectionScreen(
             MinisButton(
                 onClick = {
                     if (selected.isNotEmpty()) {
-                        val group = ModelGroup(name = "Default Models")
+                        val group = ModelGroup(name = "默认模型")
                         group.memberEntryIds.addAll(selected)
                         providerRepository.addGroup(group)
                         if (config.defaultPrimaryGroupId == null) {

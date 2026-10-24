@@ -29,7 +29,7 @@ object AutoCompactPrefs {
     private var appContext: Context? = null
 
     @Volatile
-    private var cachedEnabled: Boolean = false
+    private var cachedEnabled: Boolean = true
 
     private fun prefs(context: Context): SharedPreferences =
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -41,7 +41,8 @@ object AutoCompactPrefs {
      */
     fun prime(context: Context) {
         appContext = context.applicationContext
-        cachedEnabled = prefs(context).getBoolean(KEY_ENABLED, false)
+        // [Mines-compact-32] Mines default: compact silently (the chat shows a small 已压缩 marker)
+        cachedEnabled = prefs(context).getBoolean(KEY_ENABLED, true)
     }
 
     /** Context-free read. False before [prime] runs, matching a fresh install. */

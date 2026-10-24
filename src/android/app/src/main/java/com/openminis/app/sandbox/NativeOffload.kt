@@ -52,7 +52,31 @@ fun interface NativeOffloadHandler {
 
 object NativeOffloadServer {
     private const val TAG = "NativeOffloadServer"
-    private const val SOCKET_NAME = "native-offload"
+    private const val BASE_SOCKET_NAME = "native-offload"
+    private const val UPSTREAM_PACKAGE = "com.openminis.app"
+
+    /**
+     * [Mines] Abstract unix sockets live in ONE namespace shared by every app
+     * on the device. Upstream used the fixed name "native-offload", so when
+     * two builds of the app are installed side by side (Mines beside the
+     * earlier Mines / official Minis) the second one to start found the name
+     * already bound by the other app's live process, failed every bind retry
+     * and threw from Application.onCreate: an endless crash loop at launch.
+     * Suffix the name with the package so each install owns its own socket.
+     * The upstream package keeps the original name.
+     */
+    @Volatile
+    private var SOCKET_NAME: String = BASE_SOCKET_NAME
+
+    /** Call once from Application.onCreate, before [start] and before any shell launches. */
+    fun configure(packageName: String) {
+        if (serverSocket != null) return
+        SOCKET_NAME = if (packageName.isBlank() || packageName == UPSTREAM_PACKAGE) {
+            BASE_SOCKET_NAME
+        } else {
+            "$BASE_SOCKET_NAME.$packageName"
+        }
+    }
     private const val MAGIC_REQ = 0x46464F4E  // 'N' 'O' 'F' 'F' little-endian
     private const val MAGIC_RSP = 0x52464F4E  // 'N' 'O' 'F' 'R'
     private const val VERSION = 1
@@ -72,7 +96,7 @@ object NativeOffloadServer {
     /** Run the opportunistic sweep every N replies, not on every single one. */
     private const val SWEEP_EVERY_N_REPLIES = 50L
 
-    const val socketName: String = SOCKET_NAME
+    val socketName: String get() = SOCKET_NAME
 
     private val handlers = ConcurrentHashMap<String, NativeOffloadHandler>()
     private val counter = AtomicLong(0)
@@ -83,6 +107,9 @@ object NativeOffloadServer {
     private var rootfsTmpDir: File? = null
 
     val registeredHandlers: Set<String> get() = handlers.keys.toSet()
+
+    /** [Mines-selftest-29] Same dispatch as the guest socket, for the shell-only self-test provider. */
+    fun handlerFor(name: String): NativeOffloadHandler? = handlers[name]
 
     fun register(name: String, handler: NativeOffloadHandler) {
         require(name.isNotEmpty())
@@ -106,10 +133,35 @@ object NativeOffloadServer {
         // overwhelming majority of cases the socket frees within the first
         // 100-300ms window.
         val s = bindWithRetry()
-            ?: throw java.io.IOException(
-                "failed to bind abstract socket '$SOCKET_NAME' after retries — " +
-                "previous process holding the namespace?",
-            )
+        if (s == null) {
+            // [Mines] Never crash Application.onCreate over this: the app
+            // must still open (chat, settings, backup) even if the sandbox's
+            // device tools are briefly unreachable. Keep retrying quietly.
+            Log.e(TAG, "failed to bind abstract socket '$SOCKET_NAME' after retries; retrying in background")
+            if (bindRetryThread == null) {
+                bindRetryThread = thread(name = "native-offload-rebind", isDaemon = true) {
+                    repeat(60) {
+                        Thread.sleep(2_000L)
+                        synchronized(this) { if (serverSocket != null) return@thread }
+                        val ok = runCatching { LocalServerSocket(SOCKET_NAME) }.getOrNull()
+                        if (ok != null) {
+                            synchronized(this) {
+                                if (serverSocket == null) adopt(ok) else runCatching { ok.close() }
+                            }
+                            return@thread
+                        }
+                    }
+                }
+            }
+            return
+        }
+        adopt(s)
+    }
+
+    @Volatile
+    private var bindRetryThread: Thread? = null
+
+    private fun adopt(s: LocalServerSocket) {
         serverSocket = s
         acceptThread = thread(name = "native-offload-accept", isDaemon = true) {
             runAcceptLoop(s)

@@ -1,0 +1,687 @@
+// [Mines-38.9.10 i28] living sky v7 — AGSL port of the user-approved prototype mock-mood/video2 (sky.py + yu2.py).
+// GENERATED from r3910/sky/sky.agsl.in by r3910/sky/gen.py (H(#rrggbb) → half3). Segments (split by WeatherSkyCore.sources):
+//   //#SHARED  uniforms, textures, camera, cloud noise, rain/aurora timing, theme grade + text guard
+//   //#SKY <key>  one function `half3 skyColor(float2 p, float BH, float t)` per scene (pass 1, quarter res, p in 270-wide px)
+//   //#MAIN   pass-1 entry (grade + guard)
+//   //#STARS / //#SNOW  pass 2 at full res, drawn over the sky (premultiplied)
+//   //#GLASS  pass 2 for 雨: wet glass over the sky (RenderEffect runtime shader, input `sky`), outputs the final colour
+// Textures (assets/skybg/tex0..3.webp, 512² RGB, REPEAT + linear): tileable FFT fractal noise, value = (c - 0.5) * 9.
+// No sun / moon / trees / icons: only defocused cloud masses on 2–4 parallax layers, light, mist, stars, glass.
+//#SHARED
+uniform float2 iResolution;
+uniform float iTime;
+// [38.9.11 i32] cloud / fog / light clock: integrated on the phone at a rate that follows the real wind (WindDriftCore, eased)
+uniform float cloudT;
+// [38.9.11.1] 天空动画: calm 1 = 流畅 (subtler fog, gentler contrast), 0.5 = 精美; hq 1 = full fog layers + shafts, 0 = three layers + soft glow
+uniform float calm;
+uniform float hq;
+// [38.9.11.2] 晴 「闪光」 fix (user: gentle light, never glare / flashes): 1 = the light-breathing term follows a slow smooth curve
+// (was 4 point samples of the cloud mask that stepped by 0.25 as a cloud edge crossed one → the glow pulsed between key frames),
+// shafts 30 %, glare core and lit cloud rims softened, in 流畅 and 精美. 0 = 38.9.11.1 (smoke before / after only).
+uniform float sunFix;
+uniform float dark;
+uniform float3 liftTint;
+uniform float lift;
+uniform float3 mulc;
+uniform float gLo;
+uniform float gHi;
+uniform shader tex0;
+uniform shader tex1;
+uniform shader tex2;
+uniform shader tex3;
+
+const float TAU = 6.2831853;
+const float SPAN = 9.0;
+const float GAIN = 1.0;
+
+float ss(float a, float b, float x) { float t = clamp((x - a) / (b - a), 0.0, 1.0); return t * t * (3.0 - 2.0 * t); }
+float bump(float t, float t0, float t1, float fade) { return ss(t0, t0 + fade, t) * (1.0 - ss(t1 - fade, t1, t)); }
+/** a soft window [t0, t1] that comes back every [period] seconds */
+float ev(float t, float period, float t0, float t1, float fade) { return bump(mod(t, period), t0, t1, fade); }
+half3 mixc(half3 a, half3 b, float w) { return mix(a, b, half(clamp(w, 0.0, 1.0))); }
+half3 screen(half3 a, half3 c, float w) { return 1.0 - (1.0 - a) * (1.0 - c * half(clamp(w, 0.0, 1.0))); }
+float h12(float2 p) { float3 q = fract(float3(p.xyx) * 0.1031); q += dot(q, q.yzx + 33.33); return fract((q.x + q.y) * q.z); }
+float2 h22(float2 p) { float3 q = fract(float3(p.xyx) * float3(0.1031, 0.1030, 0.0973)); q += dot(q, q.yzx + 33.33); return fract((q.xx + q.yz) * q.zy); }
+
+float T0r(float2 u) { return (float(tex0.eval(u).r) - 0.5) * SPAN; }
+float T0g(float2 u) { return (float(tex0.eval(u).g) - 0.5) * SPAN; }
+float T0b(float2 u) { return (float(tex0.eval(u).b) - 0.5) * SPAN; }
+float W1(float2 u) { return (float(tex1.eval(u).r) - 0.5) * SPAN; }
+float W2(float2 u) { return (float(tex1.eval(u).g) - 0.5) * SPAN; }
+float T1b(float2 u) { return (float(tex1.eval(u).b) - 0.5) * SPAN; }
+float T2r(float2 u) { return (float(tex2.eval(u).r) - 0.5) * SPAN; }
+float T2g(float2 u) { return (float(tex2.eval(u).g) - 0.5) * SPAN; }
+float T2b(float2 u) { return (float(tex2.eval(u).b) - 0.5) * SPAN; }
+float T3r(float2 u) { return (float(tex3.eval(u).r) - 0.5) * SPAN; }
+float T3g(float2 u) { return (float(tex3.eval(u).g) - 0.5) * SPAN; }
+float T3b(float2 u) { return (float(tex3.eval(u).b) - 0.5) * SPAN; }
+float TX(int ch, float2 u) {
+    if (ch == 0) return T0r(u); if (ch == 1) return T0g(u); if (ch == 2) return T0b(u); if (ch == 5) return T1b(u);
+    if (ch == 6) return T2r(u); if (ch == 7) return T2g(u); if (ch == 8) return T2b(u);
+    if (ch == 9) return T3r(u); if (ch == 10) return T3g(u); return T3b(u);
+}
+
+// camera: the gaze wanders on slow, never-repeating paths (pan, roll, dolly, perspective tilt: the top recedes)
+// A = (px, py, roll rad, zoom), B = (tilt k, kx)
+void cam(float t, float2 pan, float rotDeg, float zoom, float2 tilt, float ph, out float4 A, out float2 B) {
+    float w = TAU * t / 61.0, w2 = TAU * t / 37.0, w3 = TAU * t / 23.0;
+    float px = pan.x * (sin(w + ph) + 0.45 * sin(w2 + 1.3 + ph));
+    float py = pan.y * (sin(w + 2.1 + ph) * 0.8 + 0.5 * sin(w3 + 0.4 + ph));
+    float r = radians(rotDeg) * (sin(w + 0.7 + ph) + 0.3 * sin(w2 + 2.4));
+    float z = 1.0 + zoom * sin(w + 4.0 + ph);
+    A = float4(px, py, r, z);
+    B = float2(tilt.x + tilt.y * sin(w + 1.9 + ph), 0.12 * sin(w + 3.3 + ph));
+}
+/** world texture coords of a layer: depth 0 far .. 1 near (parallax + dolly), scale = texels per px */
+float2 camUV(float2 c, float BH, float4 A, float2 B, float depth, float scale) {
+    float zz = 1.0 + (A.w - 1.0) * (0.4 + 1.2 * depth);
+    float kk = B.x * (0.5 + 0.8 * depth);
+    float D = max(1.0 + kk * (c.y / BH) + B.y * (c.x / 270.0), 0.25);
+    float2 q = c / D;
+    float cs = cos(A.z), sn = sin(A.z);
+    float2 uv = float2(cs * q.x - sn * q.y, sn * q.x + cs * q.y) / zz;
+    return (uv + A.xy * (0.35 + 1.3 * depth)) * scale;
+}
+/** domain-warped cloud noise advected by the wind (sky.py cloud_noise) */
+float cnoise(int ch, float2 uv, float2 wind, float warp, float wspd, float aniso, float t) {
+    float uu = uv.x + wind.x * t; float vv = (uv.y + wind.y * t) * aniso;
+    float wu = W1(float2(uu * 0.6 + wspd * t, vv * 0.6));
+    float wv = W2(float2(uu * 0.6 - wspd * 0.7 * t, vv * 0.6 + wspd * 0.5 * t));
+    return TX(ch, float2(uu + warp * wu, vv + warp * wv)) * GAIN;
+}
+/** cheap version (no warp) for ray marching */
+float cfast(int ch, float2 uv, float2 wind, float aniso, float t) {
+    return TX(ch, float2(uv.x + wind.x * t, (uv.y + wind.y * t) * aniso)) * GAIN;
+}
+
+// ── 雨 timing (shared by the sky pass and the glass pass) ──
+/** 1 = steady rain; eases to a lighter gap and thickens again (never the same rhythm: incommensurate periods) */
+float rainDensity(float t) { return 1.0 - 0.72 * ev(t, 53.0, 18.0, 33.0, 5.0); }
+float flash1(float x) { // a few quick decaying pulses after x = 0
+    float e = 0.0;
+    if (x >= 0.0 && x < 2.2) {
+        e += 1.0 * exp(-x / 0.07) * min(1.0, x / 0.03 + 0.0001);
+        float y = x - 0.16; if (y >= 0.0) e += 0.55 * exp(-y / 0.05) * min(1.0, y / 0.03);
+        y = x - 0.42; if (y >= 0.0) e += 0.85 * exp(-y / 0.12) * min(1.0, y / 0.03);
+        y = x - 1.0; if (y >= 0.0) e += 0.35 * exp(-y / 0.18) * min(1.0, y / 0.03);
+    }
+    return e;
+}
+/** soft in-cloud lightning: every ~37 s / ~59 s, a few flickers */
+float rainFlash(float t) { return flash1(mod(t, 37.0) - 11.0) + 0.6 * flash1(mod(t, 59.0) - 40.0); }
+float2 rainFlashPos(float t, float BH) { return mod(floor(t / 37.0), 2.0) < 1.0 ? float2(270.0 * 0.22, BH * 0.20) : float2(270.0 * 0.78, BH * 0.33); }
+/** late amber glow breaking low */
+float rainAmber(float t) { return ev(t, 71.0, 30.0, 52.0, 7.0); }
+
+// ── theme grade + text guard (WCAG luminance, linear space) ──
+uniform float desat;
+/** theme grade: dark = contrast (lift) + desaturate a little + multiply; light = lift toward the page tint */
+half3 themeGrade(half3 c) {
+    // [i29] dark: lift = contrast, c^(1 + 2*lift) before the multiply, so pale day skies keep their cloud structure
+    if (dark > 0.5) { half3 k = half3(pow(max(float3(c), float3(0.0)), float3(1.0 + 2.0 * lift))); float g = dot(float3(k), float3(0.3, 0.59, 0.11)); return mix(k, half3(g), half(desat)) * half3(mulc); }
+    return mix(c, half3(liftTint), half(lift));
+}
+/** text guard: light theme lifts the dark parts into [gLo, knee] (dark ink ≥ 4.5:1); dark theme pulls the bright parts into
+ *  [knee, gHi] (light ink ≥ 4.5:1). Soft knee, in linear light, so the sky keeps its structure above / below the knee. */
+half3 guard(half3 c) {
+    float3 lin = pow(max(float3(c), float3(0.0)), float3(2.2));
+    float L = dot(lin, float3(0.2126, 0.7152, 0.0722));
+    if (gLo > 0.0) {
+        float knee = min(gLo * 1.5, 0.95);
+        if (L < knee) {
+            float target = gLo + L * (knee - gLo) / knee;
+            float3 tl = pow(float3(liftTint), float3(2.2)); float Lt = dot(tl, float3(0.2126, 0.7152, 0.0722));
+            lin = mix(lin, tl, clamp((target - L) / max(Lt - L, 1e-3), 0.0, 1.0));
+        }
+    }
+    if (gHi < 1.0) {
+        float knee = gHi * 0.6;
+        if (L > knee) { float target = knee + (L - knee) * (gHi - knee) / max(1.0 - knee, 1e-3); lin *= target / L; }
+    }
+    return half3(pow(lin, float3(1.0 / 2.2)));
+}
+
+// ── 夜 cloud deck (shared: the sky pass draws it, the stars pass hides stars behind it) ──
+float yeCloud(float2 c, float BH, float t, float4 A, float2 B) {
+    float2 uv = camUV(c, BH, A, B, 1.0, 0.35);
+    return cnoise(5, uv, float2(9.0, 2.0), 9.0, 0.8, 1.0, t);
+}
+void yeCam(float t, out float4 A, out float2 B) { cam(t, float2(40.0, 30.0), 7.0, 0.05, float2(0.30, 0.10), 2.0, A, B); }
+//#SKY sunny
+// 晴: real blue top → warm cream / peach bottom, huge out-of-focus cloud masses, warm light breaking through, sweeping shafts
+float qOcc(float2 c, float BH, float t, float4 A, float2 B) {
+    float th1 = 0.65 - 0.5 * (0.5 + 0.5 * sin(TAU * t / 27.0 + 1.35));
+    float th2 = 0.80 - 0.5 * (0.5 + 0.5 * sin(TAU * t / 45.0 + 3.0));
+    float n1 = cfast(1, camUV(c, BH, A, B, 0.45, 0.30), float2(6.0, 1.2), 1.0, t);
+    float n2 = cfast(0, camUV(c, BH, A, B, 1.0, 0.19), float2(10.0, 2.0), 1.0, t);
+    return max(ss(th1, th1 + 1.25, n1), ss(th2, th2 + 1.25, n2));
+}
+half3 skyColor(float2 p, float BH, float t) {
+    half3 top = half3(0.4235, 0.5765, 0.7216), mid = half3(0.6588, 0.7529, 0.8275), low = half3(0.9333, 0.8745, 0.7961);
+    half3 cloud = half3(0.9647, 0.9529, 0.9333), cshad = half3(0.6549, 0.7137, 0.7765), lit = half3(1.0000, 0.9137, 0.7843), warm = half3(1.0000, 0.8667, 0.6902);
+    float2 c = p - float2(135.0, BH * 0.5); float xn = p.x / 270.0, yn = p.y / BH;
+    float4 A; float2 B; cam(t, float2(80.0, 55.0), 6.0, 0.09, float2(0.45, 0.15), 0.0, A, B);
+    float2 L = float2(270.0 * (0.92 + 0.10 * sin(TAU * t / 67.0 + 0.5)), BH * (-0.06 + 0.05 * sin(TAU * t / 41.0 + 1.0)));
+    float g = clamp(yn + 0.08 * sin(xn * 3.0 + 1.0), 0.0, 1.0);
+    half3 img = mixc(top, mid, ss(0.0, 0.62, g));
+    img = mixc(img, low, pow(ss(0.45, 1.0, g), 1.2));
+    float dist = length((p - L) / 270.0);
+    img = mixc(img, warm, 0.70 * exp(-pow(dist / 0.42, 1.5)));
+    img = screen(img, lit, (0.5 - 0.25 * sunFix) * exp(-(dist / 0.22) * (dist / 0.22)));   // glare core softened
+    // far: thin high veil, slow; it thickens and thins
+    float n = cnoise(2, camUV(c, BH, A, B, 0.0, 0.55), float2(4.0, 0.6), 6.0, 0.5, 1.0, t);
+    float cov = -0.05 + 0.25 * sin(TAU * t / 47.0 + 1.2);
+    float d = ss(0.4 - cov, 1.9 - cov, n) * 0.45;
+    img = mixc(img, cloud * 0.98 + warm * 0.02, d);
+    float2 dir = normalize(L - p + float2(1e-3, 0.0));
+    // mid + near: huge soft masses, near drifts faster (parallax); gaps open and close
+    for (int k = 0; k < 2; k++) {
+        float depth = k == 0 ? 0.45 : 1.0; float sc = k == 0 ? 0.30 : 0.19;
+        float2 wind = k == 0 ? float2(6.0, 1.2) : float2(10.0, 2.0); float wp = k == 0 ? 9.0 : 12.0;
+        float base = k == 0 ? 0.65 : 0.80; float alpha = k == 0 ? 0.80 : 0.90; int ch = k == 0 ? 1 : 0;
+        n = cnoise(ch, camUV(c, BH, A, B, depth, sc), wind, wp, 0.9, 1.0, t);
+        float th = base - 0.5 * (0.5 + 0.5 * sin(TAU * t / (k == 0 ? 27.0 : 45.0) + depth * 3.0));
+        d = ss(th, th + 1.25, n);
+        float nl = cnoise(ch, camUV(c + dir * 9.0, BH, A, B, depth, sc), wind, wp, 0.9, 1.0, t);
+        float litv = clamp(n - nl, 0.0, 1.0) * exp(-dist * 0.8) * d;
+        float shade = ss(0.2, 1.9, n) * (1.0 - 0.5 * exp(-dist * 1.5)) * 1.3;
+        half3 col = cloud * half(1.0 - shade * 0.55) + cshad * half(shade * 0.55);
+        col = col + (lit - col) * half(litv * (0.9 - 0.5 * sunFix));   // lit cloud rims calmer
+        img = mixc(img, col, alpha * d);
+    }
+    // god rays: transmission gathered toward the light, sweeping as clouds pass
+    float acc = 0.0;
+    for (int i = 1; i <= 8; i++) {
+        float f = float(i) / 9.0; float2 q = mix(p, L, f);
+        acc += pow(1.0 - qOcc(q - float2(135.0, BH * 0.5), BH, t, A, B), 1.5);
+    }
+    float rays = clamp((acc / 8.0 * exp(-dist * 0.9) - 0.2) * 1.8, 0.0, 1.0);
+    img = screen(img, lit, 0.75 * rays * (1.0 - 0.7 * sunFix));   // [38.9.11.2] gentle: shafts at 30 %
+    // light breathing through: how open the sky is near the light
+    float near = 0.0;
+    for (int i = 0; i < 4; i++) {
+        float a = float(i) * 1.5708 + 0.4; float2 q = L + float2(cos(a), sin(a)) * 40.0 + float2(-30.0, 30.0);
+        near += 1.0 - qOcc(q - float2(135.0, BH * 0.5), BH, t, A, B);
+    }
+    near *= 0.25;
+    float nearS = 0.5 + 0.16 * sin(TAU * t / 53.0 + 0.7) + 0.06 * sin(TAU * t / 89.0 + 2.0);
+    near = mix(near, nearS, sunFix);
+    img = mixc(img, warm, (0.22 + 0.30 * near) * exp(-pow(dist / 0.55, 1.5)));
+    img = screen(img, lit, (0.15 + 0.35 * near) * (1.0 - 0.4 * sunFix) * exp(-(dist / 0.25) * (dist / 0.25)));
+    return img;
+}
+//#SKY sunset
+// 日落: the 晴 sky at golden hour — dusk blue top, rose middle, amber low; light low on the right, warm-lit cloud edges
+float qOcc(float2 c, float BH, float t, float4 A, float2 B) {
+    float th1 = 0.55 - 0.5 * (0.5 + 0.5 * sin(TAU * t / 29.0 + 1.35));
+    float th2 = 0.70 - 0.5 * (0.5 + 0.5 * sin(TAU * t / 47.0 + 3.0));
+    float n1 = cfast(1, camUV(c, BH, A, B, 0.45, 0.30), float2(5.0, 0.6), 1.3, t);
+    float n2 = cfast(0, camUV(c, BH, A, B, 1.0, 0.19), float2(8.0, 1.0), 1.3, t);
+    return max(ss(th1, th1 + 1.25, n1), ss(th2, th2 + 1.25, n2));
+}
+half3 skyColor(float2 p, float BH, float t) {
+    half3 top = half3(0.3059, 0.3647, 0.4941), mid = half3(0.7059, 0.5412, 0.5569), low = half3(0.9294, 0.7137, 0.5490);
+    half3 cloud = half3(0.9216, 0.8275, 0.7765), cshad = half3(0.5608, 0.5020, 0.5647), lit = half3(1.0000, 0.8275, 0.6353), warm = half3(1.0000, 0.6902, 0.4784);
+    float2 c = p - float2(135.0, BH * 0.5); float xn = p.x / 270.0, yn = p.y / BH;
+    float4 A; float2 B; cam(t, float2(70.0, 40.0), 5.0, 0.08, float2(0.45, 0.12), 1.4, A, B);
+    float2 L = float2(270.0 * (0.80 + 0.08 * sin(TAU * t / 71.0 + 0.5)), BH * (0.74 + 0.03 * sin(TAU * t / 43.0 + 1.0)));
+    float g = clamp(yn + 0.06 * sin(xn * 3.0 + 1.0), 0.0, 1.0);
+    half3 img = mixc(top, mid, ss(0.05, 0.62, g));
+    img = mixc(img, low, pow(ss(0.45, 1.0, g), 1.1));
+    float dist = length((p - L) / 270.0);
+    img = mixc(img, warm, 0.55 * exp(-pow(dist / 0.55, 1.5)));
+    img = screen(img, lit, 0.45 * exp(-(dist / 0.25) * (dist / 0.25)));
+    float n = cnoise(2, camUV(c, BH, A, B, 0.0, 0.55), float2(3.0, 0.4), 6.0, 0.5, 1.4, t);
+    float d = ss(0.3, 1.8, n) * 0.40;
+    img = mixc(img, mixc(cloud, warm, 0.25), d);
+    float2 dir = normalize(L - p + float2(1e-3, 0.0));
+    for (int k = 0; k < 2; k++) {
+        float depth = k == 0 ? 0.45 : 1.0; float sc = k == 0 ? 0.30 : 0.19;
+        float2 wind = k == 0 ? float2(5.0, 0.6) : float2(8.0, 1.0); float wp = k == 0 ? 9.0 : 12.0;
+        float base = k == 0 ? 0.55 : 0.70; float alpha = k == 0 ? 0.75 : 0.85; int ch = k == 0 ? 1 : 0;
+        n = cnoise(ch, camUV(c, BH, A, B, depth, sc), wind, wp, 0.8, 1.3, t);
+        float th = base - 0.5 * (0.5 + 0.5 * sin(TAU * t / (k == 0 ? 29.0 : 47.0) + depth * 3.0));
+        d = ss(th, th + 1.25, n);
+        float nl = cnoise(ch, camUV(c + dir * 9.0, BH, A, B, depth, sc), wind, wp, 0.8, 1.3, t);
+        float litv = clamp(n - nl, 0.0, 1.0) * exp(-dist * 0.6) * d;
+        float shade = ss(0.2, 1.9, n) * (1.0 - 0.4 * exp(-dist * 1.5)) * 1.3;
+        half3 col = cloud * half(1.0 - shade * 0.6) + cshad * half(shade * 0.6);
+        col = col + (lit - col) * half(litv * 1.1);
+        img = mixc(img, col, alpha * d);
+    }
+    float acc = 0.0;
+    for (int i = 1; i <= 8; i++) {
+        float f = float(i) / 9.0; float2 q = mix(p, L, f);
+        acc += pow(1.0 - qOcc(q - float2(135.0, BH * 0.5), BH, t, A, B), 1.5);
+    }
+    float rays = clamp((acc / 8.0 * exp(-dist * 0.8) - 0.2) * 1.8, 0.0, 1.0);
+    img = screen(img, lit, 0.6 * rays * (1.0 - 0.6 * sunFix));   // [38.9.11.2] 晚霞 shafts gentler too
+    img = mixc(img, warm, 0.25 * exp(-pow(dist / 0.6, 1.5)));
+    return img;
+}
+//#SKY cloudy
+// 多云: greyer blue, dense big soft masses at three depths moving at three speeds; a brighter patch passes (sun behind the deck)
+half3 skyColor(float2 p, float BH, float t) {
+    half3 top = half3(0.4706, 0.5647, 0.6431), mid = half3(0.6235, 0.6902, 0.7451), low = half3(0.8275, 0.8275, 0.8118);
+    half3 cloud = half3(0.8549, 0.8667, 0.8706), under = half3(0.4980, 0.5412, 0.5843), rim = half3(0.9451, 0.9333, 0.9098), warm = half3(0.9529, 0.8902, 0.8000);
+    float2 c = p - float2(135.0, BH * 0.5); float yn = p.y / BH;
+    float4 A; float2 B; cam(t, float2(90.0, 45.0), 5.0, 0.08, float2(0.5, 0.12), 1.0, A, B);
+    half3 img = mixc(top, mid, ss(0.0, 0.7, yn));
+    img = mixc(img, low, ss(0.5, 1.0, yn));
+    float f = fract(t / 70.0); float w = TAU * t / 61.0;
+    float bx = 270.0 * (1.25 - 1.5 * ss(0.0, 1.0, f)), by = BH * (0.30 + 0.12 * sin(w));
+    float bright = exp(-(((p.x - bx) / 148.5) * ((p.x - bx) / 148.5) + ((p.y - by) / 189.0) * ((p.y - by) / 189.0))) * bump(f, 0.05, 0.95, 0.2);
+    for (int k = 0; k < 3; k++) {
+        float depth = k == 0 ? 0.0 : (k == 1 ? 0.5 : 1.0); int ch = k == 0 ? 5 : (k == 1 ? 1 : 0);
+        float sc = k == 0 ? 0.45 : (k == 1 ? 0.30 : 0.20);
+        float2 wind = k == 0 ? float2(5.0, 0.6) : (k == 1 ? float2(10.0, 1.5) : float2(17.0, 2.6));
+        float wp = k == 0 ? 7.0 : (k == 1 ? 9.0 : 11.0); float base = k == 0 ? 0.0 : (k == 1 ? 0.1 : 0.25);
+        float alpha = k == 0 ? 0.75 : (k == 1 ? 0.85 : 0.92);
+        float2 uv = camUV(c, BH, A, B, depth, sc);
+        float n = cnoise(ch, uv, wind, wp, 1.0, 1.0, t);
+        float th = base - 0.35 * sin(TAU * t / (k == 1 ? 29.0 : 47.0) + float(k) * 2.2);
+        float d = ss(th - 0.7, th + 1.1, n);
+        float nUp = cnoise(ch, camUV(c - float2(0.0, 14.0), BH, A, B, depth, sc), wind, wp, 1.0, 1.0, t);
+        float belly = ss(-0.1, 0.9, nUp - n + 0.3 * n);
+        float tone = 0.35 + 0.25 * depth;
+        half3 col = mixc(cloud, under, clamp(belly * 0.8 + ss(0.5, 2.4, n) * tone, 0.0, 0.85) * (1.0 - 0.25 * calm));
+        float nRim = cnoise(ch, camUV(c - float2(0.0, 8.0), BH, A, B, depth, sc), wind, wp, 1.0, 1.0, t);
+        col = screen(col, rim, clamp(nRim * -0.6 + 0.4, 0.0, 1.0) * d * 0.4);
+        img = mixc(img, col, alpha * d);
+    }
+    img = screen(img, warm, 0.42 * bright);
+    return img;
+}
+//#SKY overcast
+// 阴: a cool grey stratus deck — layered sheets with darker bellies, slow; no sun patch, only a faint diffuse brightening.
+// (Clearly not 雾: structure and grey-blue shade instead of milky, luminous, warm-lit mist.)
+half3 skyColor(float2 p, float BH, float t) {
+    half3 top = half3(0.5490, 0.5804, 0.6118), mid = half3(0.6627, 0.6863, 0.7059), low = half3(0.7765, 0.7843, 0.7804);
+    half3 cloud = half3(0.7686, 0.7843, 0.7961), under = half3(0.4706, 0.5059, 0.5412), rim = half3(0.8549, 0.8627, 0.8627), soft = half3(0.8941, 0.8902, 0.8745);
+    float2 c = p - float2(135.0, BH * 0.5); float yn = p.y / BH;
+    float4 A; float2 B; cam(t, float2(70.0, 30.0), 3.0, 0.06, float2(0.55, 0.10), 2.6, A, B);
+    half3 img = mixc(top, mid, ss(0.0, 0.7, yn));
+    img = mixc(img, low, ss(0.55, 1.0, yn));
+    float w = TAU * t / 89.0;
+    float2 Lb = float2(270.0 * (0.5 + 0.3 * sin(w)), BH * (0.25 + 0.08 * sin(TAU * t / 53.0)));
+    float glow = exp(-pow(length((p - Lb) / 270.0) / 0.6, 2.0));
+    for (int k = 0; k < 3; k++) {
+        float depth = k == 0 ? 0.0 : (k == 1 ? 0.5 : 1.0); int ch = k == 0 ? 6 : (k == 1 ? 5 : 1);
+        float sc = k == 0 ? 0.45 : (k == 1 ? 0.32 : 0.22);
+        float2 wind = k == 0 ? float2(3.0, 0.3) : (k == 1 ? float2(5.5, 0.6) : float2(9.0, 1.0));
+        float alpha = k == 0 ? 0.85 : (k == 1 ? 0.85 : 0.80);
+        float n = cnoise(ch, camUV(c, BH, A, B, depth, sc), wind, 8.0, 0.6, 1.7, t);
+        float th = -0.6 + 0.3 * float(k) - 0.25 * sin(TAU * t / (k == 1 ? 43.0 : 67.0) + float(k) * 1.9);
+        float d = ss(th - 0.8, th + 1.0, n);
+        float nUp = cnoise(ch, camUV(c - float2(0.0, 12.0), BH, A, B, depth, sc), wind, 8.0, 0.6, 1.7, t);
+        float belly = ss(-0.2, 0.8, nUp - n + 0.25 * n);
+        half3 col = mixc(cloud, under, clamp(belly * 0.65 + ss(0.4, 2.4, n) * (0.30 + 0.2 * depth), 0.0, 0.8) * (1.0 - 0.25 * calm));
+        col = screen(col, rim, clamp(-0.5 * nUp + 0.3, 0.0, 1.0) * d * 0.25);
+        img = mixc(img, col, alpha * d);
+    }
+    img = screen(img, soft, 0.22 * glow);
+    return img;
+}
+//#SKY fog
+// 雾: deep layered milky mist; a hidden warm light glows through and wanders; now and then the mist thins to pale blue + soft shafts
+half3 skyColor(float2 p, float BH, float t) {
+    half3 base = half3(0.8392, 0.8431, 0.8314), milk = half3(0.9490, 0.9412, 0.9216), deep = half3(0.6667, 0.6941, 0.7098), skyb = half3(0.6235, 0.7176, 0.7882), warm = half3(0.9373, 0.8275, 0.6667), lit = half3(1.0000, 0.9490, 0.8627);
+    float2 c = p - float2(135.0, BH * 0.5); float yn = p.y / BH;
+    float4 A; float2 B; cam(t, float2(70.0, 40.0), 4.0, 0.07, float2(0.35, 0.12), 3.0, A, B);
+    float w = TAU * t / 63.0;
+    float2 L = float2(270.0 * (0.5 + 0.35 * sin(w + 0.8)), BH * (0.25 + 0.12 * sin(TAU * t / 39.0 + 0.3)));
+    float dist = length((p - L) / 270.0);
+    float gap = ev(t, 67.0, 20.0, 46.0, 8.0) * (1.0 - 0.2 * calm);
+    half3 img = mixc(base, milk, ss(0.0, 1.0, yn) * 0.5);
+    half3 behind = mixc(skyb, warm, exp(-(dist / 0.5) * (dist / 0.5)) * 0.9);
+    img = mixc(img, behind, 0.85 * exp(-pow(dist / (0.30 + 0.15 * gap), 2.0)) * gap);
+    img = mixc(img, warm, 0.55 * exp(-(dist / 0.40) * (dist / 0.40)) * (0.6 + 0.4 * (1.0 - 0.6 * calm) * sin(TAU * t / 31.0 + 1.0)));
+    half3 glowc = warm * 0.5 + lit * 0.5;
+    float occ = 0.0;
+    for (int k = 0; k < 4; k++) {
+      // [38.9.11.1] 流畅: three mist layers (the second far layer dropped), calmer
+      if (hq > 0.5 || k != 1) {
+        float depth = float(k) * 0.333; int ch = k == 0 ? 6 : (k == 1 ? 7 : (k == 2 ? 5 : 0));
+        float sc = k == 0 ? 0.55 : (k == 1 ? 0.45 : (k == 2 ? 0.36 : 0.28));
+        float2 wind = k == 0 ? float2(3.0, 0.4) : (k == 1 ? float2(5.5, 0.9) : (k == 2 ? float2(8.5, 1.3) : float2(13.0, 2.0)));
+        float alpha = ((k == 0 || k == 3) ? 0.55 : 0.6) * (1.0 - 0.1 * calm);
+        half3 col = (k == 0 || k == 2) ? mixc(deep, milk, 0.15 * calm) : milk;
+        float n = cnoise(ch, camUV(c, BH, A, B, depth, sc), wind, 8.0, 0.6, 1.9, t);
+        float th = -0.2 + 0.55 * (1.0 - 0.3 * calm) * sin(TAU * t / (k == 1 || k == 3 ? 29.0 : 53.0) + float(k) * 1.7) + 0.9 * gap * exp(-(dist / 0.45) * (dist / 0.45));
+        float d = ss(th - 0.9, th + 1.3, n);
+        col = mixc(col, glowc, exp(-(dist / 0.45) * (dist / 0.45)) * 0.6);
+        img = mixc(img, col, alpha * d);
+        occ = max(occ, d);
+      }
+    }
+    if (gap > 0.01 && hq < 0.5) {
+        // 流畅: a soft glow where the mist thins instead of marched shafts
+        img = screen(img, lit, 0.30 * gap * exp(-dist * 1.4));
+    } else if (gap > 0.01) {
+        float acc = 0.0;
+        for (int i = 1; i <= 6; i++) {
+            float f = float(i) / 7.0; float2 q = mix(p, L, f); float2 cq = q - float2(135.0, BH * 0.5);
+            float th = -0.2 + 0.55 * sin(TAU * t / 29.0 + 1.7) + 0.9 * gap * exp(-pow(length((q - L) / 270.0) / 0.45, 2.0));
+            float n1 = cfast(7, camUV(cq, BH, A, B, 0.333, 0.45), float2(5.5, 0.9), 1.9, t);
+            acc += 1.0 - ss(th - 0.9, th + 1.3, n1);
+        }
+        img = screen(img, lit, 0.45 * gap * clamp(acc / 6.0 - 0.2, 0.0, 1.0) * exp(-dist * 1.4));
+    }
+    return img;
+}
+//#SKY snow
+// 雪: pale cool-white overcast, soft slow masses; the flakes are pass 2
+half3 skyColor(float2 p, float BH, float t) {
+    half3 top = half3(0.6392, 0.6824, 0.7216), mid = half3(0.7647, 0.7882, 0.8078), low = half3(0.8706, 0.8745, 0.8627), cloud = half3(0.9020, 0.9098, 0.9098), under = half3(0.6039, 0.6392, 0.6706), soft = half3(0.9569, 0.9490, 0.9333);
+    float2 c = p - float2(135.0, BH * 0.5); float yn = p.y / BH;
+    float4 A; float2 B; cam(t, float2(60.0, 30.0), 3.0, 0.06, float2(0.45, 0.10), 0.8, A, B);
+    half3 img = mixc(top, mid, ss(0.0, 0.7, yn));
+    img = mixc(img, low, ss(0.5, 1.0, yn));
+    for (int k = 0; k < 2; k++) {
+        float depth = k == 0 ? 0.2 : 0.9; int ch = k == 0 ? 6 : 1; float sc = k == 0 ? 0.42 : 0.26;
+        float2 wind = k == 0 ? float2(2.5, 0.5) : float2(5.0, 1.0);
+        float n = cnoise(ch, camUV(c, BH, A, B, depth, sc), wind, 8.0, 0.5, 1.3, t);
+        float th = -0.3 + 0.4 * float(k) - 0.25 * sin(TAU * t / 59.0 + float(k) * 2.0);
+        float d = ss(th - 0.9, th + 1.2, n);
+        half3 col = mixc(cloud, under, clamp(ss(0.4, 2.4, n) * 0.45, 0.0, 0.6));
+        img = mixc(img, col, 0.75 * d);
+    }
+    float2 Lb = float2(270.0 * (0.6 + 0.25 * sin(TAU * t / 83.0)), BH * 0.22);
+    img = screen(img, soft, 0.25 * exp(-pow(length((p - Lb) / 270.0) / 0.55, 2.0)));
+    return img;
+}
+//#SKY night
+// 夜: deep blue-black, a milky haze band wheeling with the stars (pass 2), a faint dark cloud drift, now and then a soft aurora
+half3 skyColor(float2 p, float BH, float t) {
+    half3 top = half3(0.0235, 0.0392, 0.0745), low = half3(0.0706, 0.1098, 0.1882), glowc = half3(0.1412, 0.1882, 0.2980), haze = half3(0.2000, 0.2510, 0.3686), cloudc = half3(0.0431, 0.0627, 0.0980);
+    half3 au1 = half3(0.3725, 0.8157, 0.6353), au2 = half3(0.5412, 0.4235, 0.7843);
+    float2 c = p - float2(135.0, BH * 0.5); float xn = p.x / 270.0, yn = p.y / BH;
+    float4 A; float2 B; yeCam(t, A, B);
+    float w = TAU * t / 61.0;
+    half3 img = mixc(top, low, pow(ss(0.25, 1.0, yn), 1.3));
+    img = screen(img, glowc, 0.5 * ss(0.65, 1.05, yn + 0.1 * sin(xn * 2.0 + w)));
+    // milky haze band: rotates with the stars (sampled in a rotating frame)
+    float2 uv = camUV(c, BH, A, B, 0.0, 0.5);
+    float a = radians(0.42) * t; float cs = cos(a), sn = sin(a);
+    float2 r = float2(cs * uv.x - sn * uv.y, sn * uv.x + cs * uv.y);
+    float hn = T2b(float2(r.x + 0.6 * W1(r * 0.5) * 10.0, r.y)) * GAIN;
+    float band = exp(-pow(((c.x * 0.8 + c.y * 0.45) / 270.0 - 0.15 * sin(w)) / 0.55, 2.0));
+    img = screen(img, haze, 0.60 * band * ss(-0.8, 1.6, hn));
+    // aurora: now and then, upper left, a faint curtain that ripples then fades
+    float e = ev(t, 97.0, 20.0, 55.0, 9.0);
+    if (e > 0.002) {
+        float2 u2 = camUV(c, BH, A, B, 0.2, 1.0);
+        float by = -150.0 + 45.0 * sin(u2.x / 70.0 + 0.3 * t) + 18.0 * sin(u2.x / 23.0 - t * 0.9);
+        float h = by - u2.y;
+        float fold = T3r(float2(u2.x * 1.6 + 6.0 * sin(u2.y / 40.0 + t * 0.7) + t * 9.0, u2.y * 0.2)) * GAIN;
+        float side = exp(-pow((u2.x + 40.0) / 170.0, 2.0));
+        float curt = ss(-28.0, 18.0, h) * exp(-max(h, 0.0) / 85.0) * (0.35 + 0.65 * ss(-1.2, 2.2, fold)) * side;
+        img = screen(img, au1, 0.42 * e * curt);
+        img = screen(img, au2, 0.20 * e * ss(-28.0, 18.0, h) * ss(30.0, 130.0, h) * exp(-max(h, 0.0) / 160.0) * side);
+    }
+    // faint dark cloud drift (parallax, hides stars in pass 2)
+    float cn = yeCloud(c, BH, t, A, B);
+    float cd = ss(0.7, 2.3, cn) * 0.8;
+    img = mixc(img, cloudc, cd * 0.45);
+    float cn2 = yeCloud(c + float2(0.0, 6.0), BH, t, A, B);
+    img = screen(img, glowc, 0.15 * clamp(cn - cn2, 0.0, 1.0) * cd);
+    return img;
+}
+//#SKY rain
+// 雨 (sky behind the wet glass): low slate sky, three parallax layers of defocused cloud, a breathing warm patch, a lighter gap
+// in the lull, soft violet lightning glow inside the clouds, amber glow breaking low, low rolling mist, fine mist gusts — no streaks
+half3 skyColor(float2 p, float BH, float t) {
+    half3 top, lowc, cloud, core, lit, behind, warm, amber, violet, pink, mist;
+    if (dark > 0.5) { top = half3(0.0549, 0.0863, 0.1294); lowc = half3(0.1412, 0.1961, 0.2902); cloud = half3(0.3529, 0.4196, 0.4902); core = half3(0.0588, 0.0824, 0.1176); lit = half3(0.6667, 0.7137, 0.7529); behind = half3(0.4863, 0.5765, 0.6549);
+        warm = half3(0.7255, 0.5843, 0.4471); amber = half3(0.8510, 0.5765, 0.3098); violet = half3(0.5569, 0.4863, 0.8784); pink = half3(0.7765, 0.6078, 0.8784); mist = half3(0.2980, 0.3569, 0.4157); }
+    else { top = half3(0.4353, 0.5176, 0.6039); lowc = half3(0.6392, 0.6902, 0.7373); cloud = half3(0.7647, 0.7961, 0.8235); core = half3(0.3922, 0.4588, 0.5412); lit = half3(0.9451, 0.9373, 0.9176); behind = half3(0.8627, 0.8941, 0.9176);
+        warm = half3(0.9451, 0.8627, 0.7529); amber = half3(0.9412, 0.7451, 0.5216); violet = half3(0.6745, 0.6235, 0.9020); pink = half3(0.8431, 0.7216, 0.9020); mist = half3(0.7647, 0.8000, 0.8275); }
+    float kLight = dark > 0.5 ? 1.0 : 0.45, kAmber = dark > 0.5 ? 0.7 : 0.5, kMist = dark > 0.5 ? 0.55 : 0.38;
+    float2 c = p - float2(135.0, BH * 0.5); float xn = p.x / 270.0, yn = p.y / BH;
+    float4 A; float2 B; cam(t, float2(70.0, 40.0), 4.5, 0.07, float2(0.45, 0.12), dark > 0.5 ? 0.5 : 2.4, A, B);
+    float w = TAU * t / 61.0;
+    float dens = rainDensity(t); float gap = 1.0 - (dens - 0.28) / 0.72;
+    float2 L = float2(270.0 * (0.72 + 0.10 * sin(w + 0.4)), BH * (0.16 + 0.05 * sin(TAU * t / 37.0 + 1.1)));
+    float dist = length((p - L) / 270.0);
+    float breathe = 0.5 + 0.5 * sin(TAU * t / 31.0 + 0.6);
+    half3 img = mixc(top, lowc, pow(ss(0.0, 1.0, yn), 1.1));
+    half3 bh = mixc(behind, warm, 0.55 * exp(-pow(dist / 0.45, 1.6)));
+    img = mixc(img, bh, (0.28 + 0.22 * breathe + 0.55 * gap) * exp(-pow(dist / (0.55 + 0.25 * gap), 1.6)));
+    float am = rainAmber(t);
+    float ax = 270.0 * (0.32 + 0.12 * sin(w + 2.0));
+    float amask = ss(0.55, 1.08, yn) * exp(-pow((p.x - ax) / (270.0 * 0.75), 2.0));
+    img = screen(img, amber, kAmber * 0.75 * am * amask);
+    float fl = rainFlash(t) * kLight;
+    float2 fp = rainFlashPos(t, BH);
+    float fd = length((p - fp) / 270.0);
+    float occ = 0.0;
+    float2 dir = normalize(L - p + float2(1e-3, 0.0));
+    for (int k = 0; k < 3; k++) {
+        float depth = float(k) * 0.5; int ch = k == 0 ? 0 : (k == 1 ? 1 : 5);
+        float sc = k == 0 ? 0.42 : (k == 1 ? 0.30 : 0.21);
+        float2 wind = k == 0 ? float2(5.0, 0.9) : (k == 1 ? float2(10.0, 1.8) : float2(17.0, 3.0));
+        float wp = k == 0 ? 8.0 : (k == 1 ? 10.0 : 12.0); float alpha = k == 0 ? 0.70 : (k == 1 ? 0.85 : 0.88);
+        float2 uv = camUV(c, BH, A, B, depth, sc);
+        float n = cnoise(ch, uv, wind, wp, 1.1, 1.0, t);
+        float th = -0.35 + 0.15 * float(k) + 0.25 * sin(TAU * t / (k == 1 ? 29.0 : 47.0) + float(k) * 2.1)
+            + (0.9 + 0.3 * float(k)) * gap * exp(-(dist / 0.55) * (dist / 0.55)) + 0.35 * am * amask;
+        float d = ss(th - 0.9, th + 1.2, n);
+        float nl = cnoise(ch, camUV(c + dir * 8.0, BH, A, B, depth, sc), wind, wp, 1.1, 1.0, t);
+        float litv = clamp(n - nl, 0.0, 1.0) * exp(-dist * 1.1) * (0.5 + 0.8 * gap + 0.3 * breathe);
+        float nUp = cnoise(ch, camUV(c - float2(0.0, 10.0), BH, A, B, depth, sc), wind, wp, 1.1, 1.0, t);
+        float belly = clamp(nUp - n + 0.2, 0.0, 1.0);
+        float shade = clamp(ss(0.1, 2.0, n) * (0.5 + 0.2 * depth) + belly * 0.35, 0.0, 0.85);
+        half3 col = mixc(cloud, core, shade);
+        col = mixc(col, lit, litv * 0.9);
+        if (fl > 0.004) {
+            float g = fl * exp(-pow(fd / (0.32 + 0.12 * depth), 2.0)) * (1.0 - 0.35 * depth);
+            col = screen(col, violet, 1.25 * g * ss(-0.2, 1.6, n));
+            col = screen(col, pink, 0.7 * g * clamp(n - nUp, 0.0, 1.0) * 3.0);
+        }
+        img = mixc(img, col, alpha * d);
+        occ = max(occ, d);
+    }
+    if (fl > 0.004) img = screen(img, violet, 0.16 * fl * (0.4 + 0.6 * exp(-(fd / 0.8) * (fd / 0.8))));
+    img = screen(img, amber, kAmber * 0.55 * am * amask * (1.0 - 0.5 * occ));
+    // low mist rolling sideways
+    float2 uvm = camUV(c, BH, A, B, 0.8, 0.30);
+    float mn = T3g(float2(uvm.x - 14.0 * t + 3.0 * W1(uvm * 0.4 + float2(0.0, t)), uvm.y + 1.5 * t)) * GAIN;
+    float lowm = ss(0.45, 1.0, yn + 0.06 * sin(xn * 4.0 + w));
+    half3 mcol = mixc(mist, amber, 0.35 * am * amask);
+    img = mixc(img, mcol, kMist * lowm * ss(-0.8, 1.4, mn) * (0.75 + 0.25 * dens));
+    // fine mist gusts sweeping across (no streaks)
+    for (int gI = 0; gI < 2; gI++) {
+        float per = gI == 0 ? 41.0 : 67.0; float tg = gI == 0 ? 6.0 : 30.0; float dur = gI == 0 ? 3.2 : 3.0; float dirn = gI == 0 ? 1.0 : -1.0;
+        float q = (mod(t, per) - tg) / dur;
+        if (q > 0.0 && q < 1.0) {
+            float xf = dirn > 0.0 ? (-0.6 + 2.2 * q) : (1.6 - 2.2 * q);
+            float front = exp(-pow((xn - xf + 0.25 * (yn - 0.5)) / 0.38, 2.0)) * sin(3.14159 * q);
+            float gn = T3b(float2((p.x - dirn * 90.0 * t) * 0.9, p.y * 0.9 + 25.0 * t)) * GAIN;
+            img = mixc(img, mist * 0.6 + lit * 0.4, 0.42 * front * ss(-0.6, 1.5, gn) * dens);
+        }
+    }
+    return img;
+}
+//#MAIN
+half4 main(float2 fragCoord) {
+    float s = 270.0 / iResolution.x;
+    float2 p = fragCoord * s; float BH = iResolution.y * s;
+    return half4(guard(themeGrade(skyColor(p, BH, cloudT))), 1.0);
+}
+//#STARS
+// 夜 pass 2 (full res): soft stars wheeling around a pole above the top right, twinkling, hidden by the cloud drift
+uniform float starK;
+float starCell(float2 sp, float cell, float t, float scale) {
+    float2 id = floor(sp / cell); float acc = 0.0;
+    for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+        float2 g = id + float2(float(i), float(j));
+        float2 r = h22(g);
+        float2 pos = (g + 0.15 + 0.7 * r) * cell;
+        float hb = h12(g + 17.3);
+        float b = 0.02 + 0.06 / max(1.0 - hb, 0.03);                         // heavy-tailed brightness (pareto-like)
+        b = min(b, 1.6) * (0.78 + 0.22 * sin(hb * 40.0 + (0.8 + 1.6 * r.x) * t));
+        float d2 = dot(sp - pos, sp - pos) / (scale * scale);
+        acc += b * (5.0 * 0.14 * exp(-d2 / 0.9) + 9.0 * 0.012 * exp(-d2 / 9.0));
+    }
+    return acc;
+}
+half4 main(float2 fragCoord) {
+    float scale = iResolution.x / 720.0;
+    float2 pole = float2(iResolution.x * 1.35, -iResolution.y * 0.30);
+    float4 A; float2 B; yeCam(cloudT, A, B);
+    // stars are at infinity: they follow the camera roll + a little pan
+    float2 cc = iResolution * 0.5; float2 q = fragCoord - cc;
+    float cs = cos(-A.z), sn = sin(-A.z);
+    q = float2(cs * q.x - sn * q.y, sn * q.x + cs * q.y) / (1.0 + (A.w - 1.0) * 0.3) + cc + A.xy * 0.8 * scale;
+    float a = -radians(0.42) * iTime;
+    float2 d = q - pole; float ca = cos(a), sa = sin(a);
+    float2 sp = float2(ca * d.x - sa * d.y, sa * d.x + ca * d.y);
+    float st = starCell(sp, 22.0 * scale, iTime, scale);
+    // hidden by the dark cloud drift (same field as the sky pass)
+    float s = 270.0 / iResolution.x; float2 p = fragCoord * s; float BH = iResolution.y * s;
+    float cd = ss(0.7, 2.3, yeCloud(p - float2(135.0, BH * 0.5), BH, cloudT, A, B)) * 0.8;
+    st *= (1.0 - cd * 0.92) * starK;
+    half3 col = clamp(half3(st) * half3(0.8471, 0.8784, 0.9412), 0.0, 1.0);
+    return half4(col, max(col.r, max(col.g, col.b)));
+}
+//#SNOW
+// 雪 pass 2: soft defocused flakes on three depths, drifting down with a slow sway
+uniform float starK;
+half4 main(float2 fragCoord) {
+    float scale = iResolution.x / 720.0; float a = 0.0;
+    for (int k = 0; k < 3; k++) {
+        float cell = (k == 0 ? 34.0 : (k == 1 ? 58.0 : 96.0)) * scale; float spd = (k == 0 ? 22.0 : (k == 1 ? 38.0 : 64.0)) * scale;
+        float rad = (k == 0 ? 1.4 : (k == 1 ? 2.6 : 5.0)) * scale; float op = k == 0 ? 0.45 : (k == 1 ? 0.6 : 0.4);
+        float2 q = fragCoord + float2(sin(iTime * 0.21 + float(k)) * 20.0 * scale, -spd * iTime);
+        float2 id = floor(q / cell);
+        float2 r = h22(id + float(k) * 7.1);
+        float2 pos = (id + 0.2 + 0.6 * r) * cell + float2(sin(iTime * (0.5 + r.y) + r.x * 6.28) * 6.0 * scale, 0.0);
+        float d = length(q - pos) / rad;
+        a += op * exp(-d * d) * step(0.35, h12(id + 3.3 + float(k)));
+    }
+    a = clamp(a * starK, 0.0, 1.0);
+    return half4(half3(0.9686, 0.9647, 0.9529) * half(a), half(a));
+}
+//#GLASS
+// 雨 pass 2 (half res): rain-wet glass. Input `sky` = the sky pass at this size. Condensation haze, water drops that refract an
+// inverted, minified view of the sky, a dark refraction edge, light rims / speculars / caustics tinted by the light (violet flash,
+// amber), sliding drops that leave beads and a cleared trail. Output = the final colour (graded sky in, guard re-applied).
+uniform shader sky;
+uniform float gk;   // 1 dark set, 0 light set of strengths
+void addDrop(inout float Hs, inout float2 G, inout float M, inout float RIM, inout float EDGE, inout float BODY, inout float SPEC, inout float CAU,
+             float2 p, float2 ctr, float R, float ax, float av) {
+    float2 d = p - ctr;
+    float r2 = ((d.x / ax) * (d.x / ax) + (d.y * ax) * (d.y * ax)) / (R * R);
+    if (r2 > 1.69 || av <= 0.0) return;
+    float r = sqrt(r2);
+    float dome = max(1.0 - r2, 0.0);
+    Hs += av * R * R * dome;
+    if (r2 < 1.0) G += av * -2.0 * float2(d.x / (ax * ax), d.y * ax * ax);
+    M = max(M, av * ss(0.0, 0.3, dome));
+    RIM = max(RIM, av * exp(-pow((r - 0.9) / 0.11, 2.0)));
+    EDGE = max(EDGE, av * ss(0.55, 0.85, r) * (1.0 - ss(0.88, 1.0, r)) * (0.45 + clamp(0.5 - d.y / R, 0.0, 1.2)));
+    BODY = max(BODY, av * ss(0.0, 0.25, dome) * clamp(0.35 + 0.65 * d.y / R, 0.0, 1.0));
+    SPEC = max(SPEC, av * exp(-(((d.x + 0.32 * R) * (d.x + 0.32 * R) + (d.y + 0.42 * R) * (d.y + 0.42 * R)) / ((0.2 * R) * (0.2 * R)))));
+    CAU = max(CAU, av * ss(0.35, 0.8, r) * (1.0 - ss(0.8, 1.0, r)) * clamp(d.y / R + 0.1, 0.0, 1.0));
+}
+half4 main(float2 fragCoord) {
+    float sc = iResolution.x / 360.0;             // glass maps designed at 360 px wide (yu2.py DW)
+    float2 p = fragCoord / sc;                    // glass px
+    float DH = iResolution.y / sc;
+    float t = iTime;
+    // rain rhythm / flash / amber follow the sky pass clock so glass and clouds agree; drops keep real time
+    float dens = rainDensity(cloudT); float gap = 1.0 - (dens - 0.28) / 0.72;
+    float fl = min(rainFlash(cloudT) * (gk > 0.5 ? 1.0 : 0.45), 1.0); float am = rainAmber(cloudT);
+    float Hs = 0.0; float2 G = float2(0.0); float M = 0.0, RIM = 0.0, EDGE = 0.0, BODY = 0.0, SPEC = 0.0, CAU = 0.0;
+    // static drops: three sizes; each cell holds one drop that lands, lives 6–16 s, shrinks and evaporates, then lands elsewhere
+    for (int k = 0; k < 3; k++) {
+        float cell = k == 0 ? 21.0 : (k == 1 ? 34.0 : 74.0);
+        float Rlo = k == 0 ? 1.0 : (k == 1 ? 2.6 : 6.0); float Rhi = k == 0 ? 2.6 : (k == 1 ? 6.0 : 13.0);
+        float2 id = floor(p / cell);
+        for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+            if (k < 2 && (i != 0 || j != 0)) continue;
+            float2 g = id + float2(float(i), float(j));
+            float ph = h12(g + float(k) * 13.7) * 40.0;
+            float life = 6.0 + 10.0 * h12(g + 5.1 + float(k));
+            float per = life + 1.0 + 6.0 * h12(g + 9.9);
+            float cyc = floor((t + ph) / per); float age = mod(t + ph, per);
+            float2 r = h22(g + cyc * 3.17 + float(k) * 1.3);
+            float R = mix(Rlo, Rhi, h12(g + cyc * 1.91));
+            float margin = k < 2 ? R * 1.3 / cell : 0.0;
+            float2 ctr = (g + margin + (1.0 - 2.0 * margin) * r) * cell;
+            float ok = step(h12(g + cyc * 7.7 + 2.0), dens * 0.95 + 0.05);   // fewer impacts while the rain eases
+            float shr = 1.6;
+            float av = ss(0.0, 0.25, age) * (1.0 - pow(clamp((age - (life - shr)) / shr, 0.0, 1.0), 1.5)) * step(age, life) * ok;
+            addDrop(Hs, G, M, RIM, EDGE, BODY, SPEC, CAU, p, ctr, R, 0.86 + 0.28 * h12(g + cyc), av);
+        }
+    }
+    // sliding drops: per column a drop now and then breaks loose, slides down stick-slip with a wobble, leaves beads + a clear trail
+    float clr = 0.0;
+    float colW = 60.0; float cx = floor(p.x / colW);
+    for (int i = -1; i <= 1; i++) {
+        float col = cx + float(i);
+        float per = 11.0 + 9.0 * h12(float2(col, 3.0));
+        float cyc = floor((t + h12(float2(col, 7.0)) * per) / per); float st = mod(t + h12(float2(col, 7.0)) * per, per);
+        float hs = h12(float2(col, cyc));
+        if (hs < 0.25) continue;                                         // not every column every time
+        float Rs = 5.0 + 3.5 * h12(float2(col, cyc + 0.5)); float dur = 3.5 + 2.5 * h12(float2(col, cyc + 1.5));
+        float y0 = (-0.05 + 0.5 * h12(float2(col, cyc + 2.5))) * DH; float ln = (0.45 + 0.45 * h12(float2(col, cyc + 3.5))) * DH;
+        float x0 = (col + 0.2 + 0.6 * h12(float2(col, cyc + 4.5))) * colW;
+        float wa = 4.0 + 5.0 * h12(float2(col, cyc + 5.5)), wl = 40.0 + 50.0 * h12(float2(col, cyc + 6.5)), wph = 6.28 * h12(float2(col, cyc + 7.5));
+        float q = min(st / dur, 1.0);
+        float hy = ln * clamp(q + sin(TAU * q * 4.0) / (TAU * 4.0) * 0.9, 0.0, 1.0);
+        float fadeIn = ss(0.0, 0.6, st); float fadeOut = 1.0 - ss(dur + 6.0, dur + 9.0, st);
+        float yy = p.y - y0;
+        float xPath = x0 + wa * sin(yy / wl + wph) + 2.0 * sin(yy / 22.0);
+        if (st < dur + 0.6) {
+            float aH = fadeIn * (1.0 - ss(dur, dur + 0.6, st));
+            float hx = x0 + wa * sin(hy / wl + wph) + 2.0 * sin(hy / 22.0);
+            addDrop(Hs, G, M, RIM, EDGE, BODY, SPEC, CAU, p, float2(hx, y0 + hy), Rs, 0.82, aH);
+            addDrop(Hs, G, M, RIM, EDGE, BODY, SPEC, CAU, p, float2(hx, y0 + hy - Rs * 0.95), Rs * 0.55, 0.9, aH * 0.8);
+        }
+        if (yy > 0.0 && yy < hy) {
+            float since = st - (yy / ln) * dur;
+            float w = Rs * (0.75 + 0.2 * sin(yy * 0.23));
+            clr = max(clr, exp(-since / 4.5) * fadeIn * fadeOut * (1.0 - ss(w * 0.8, w, abs(p.x - xPath))));
+            // beads left behind
+            float sp = 15.0 + 12.0 * h12(float2(col, cyc + 8.5));
+            float kb = floor(yy / sp + 0.5); float by = kb * sp;
+            if (by > 6.0 && by < hy) {
+                float bx = x0 + wa * sin(by / wl + wph) + 2.0 * sin(by / 22.0);
+                float br = (0.18 + 0.24 * h12(float2(col * 3.1 + kb, cyc))) * Rs;
+                float sb = st - (by / ln) * dur;
+                float vb = (1.0 - ss(5.0, 8.5, sb)) * fadeOut;
+                addDrop(Hs, G, M, RIM, EDGE, BODY, SPEC, CAU, p, float2(bx, y0 + by), br, 0.95, vb);
+            }
+        }
+    }
+    // static drops on the cleared path are gone
+    M *= 1.0 - 0.8 * clr;
+    // compose (yu2.py overlay)
+    float kfog = gk > 0.5 ? 0.30 : 0.22, kedge = gk > 0.5 ? 0.50 : 0.30, kbody = 0.22, krim = gk > 0.5 ? 0.42 : 0.40;
+    float kspec = gk > 0.5 ? 0.55 : 0.45, kcau = gk > 0.5 ? 0.48 : 0.32, kclr = gk > 0.5 ? 0.85 : 0.55;
+    half3 fog = gk > 0.5 ? half3(0.1569, 0.2118, 0.2745) : half3(0.7059, 0.7490, 0.7882);
+    half3 rimc = gk > 0.5 ? half3(0.7647, 0.8118, 0.8549) : half3(0.9804, 0.9882, 0.9922); half3 specc = gk > 0.5 ? half3(0.9098, 0.9333, 0.9529) : half3(1.0000, 1.0000, 1.0000);
+    half3 pink = gk > 0.5 ? half3(0.7765, 0.6078, 0.8784) : half3(0.8431, 0.7216, 0.9020); half3 amber = gk > 0.5 ? half3(0.8510, 0.5765, 0.3098) : half3(0.9412, 0.7451, 0.5216);
+    half3 up = sky.eval(fragCoord).rgb;
+    half lum = (up.r + up.g + up.b) / 3.0;
+    float speck = clamp(0.5 + 0.35 * T3b(fragCoord * 2.3 / sc) / 1.6, 0.0, 1.0);
+    half3 haze = up * 0.45 + (half3(lum * 0.45) + fog * 0.55);
+    float fa = kfog * (0.55 + 0.45 * dens) * (0.85 + 0.3 * speck) * (1.0 - kclr * clr) * (1.0 - M);
+    half3 o = mixc(up, haze, fa);
+    o = o + (up - lum) * half(0.25 * clr);
+    float2 off = G * 6.0 * sc;                       // drop = inverted, minified view of the sky behind
+    half3 refr = sky.eval(clamp(fragCoord + off, float2(0.5), iResolution - 0.5)).rgb;
+    refr = (refr - lum) * 1.25 + lum + 0.04;
+    o = mixc(o, refr, M);
+    half3 lt = rimc * half(1.0 - 0.6 * fl) + pink * half(0.6 * fl);
+    lt = lt * half(1.0 - 0.35 * am) + amber * half(0.35 * am);
+    o = o * half(1.0 - kedge * EDGE);
+    o = screen(o, lt, krim * RIM * (0.8 + 0.4 * gap));
+    o = screen(o, specc, kspec * SPEC * (0.7 + 0.5 * gap + 0.8 * fl));
+    o = screen(o, lt, kbody * BODY * (0.8 + 0.4 * gap + 0.8 * fl));
+    float rip = 0.85 + 0.15 * sin(p.y * 0.18 + t * 5.0 + p.x * 0.04);
+    o = screen(o, lt, kcau * CAU * rip * (0.6 + 0.5 * gap + 1.2 * fl + 0.6 * am));
+    // the sky came in graded; re-apply only the text guard (lift / mul = neutral here)
+    return half4(guard(clamp(o, 0.0, 1.0)), 1.0);
+}

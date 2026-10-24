@@ -61,22 +61,29 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
         // OffloadGate for the sync→suspend rationale (handler interface
         // is sync, manager API is suspend).
         if (!OffloadGate.allow("shizuku_cli", "android-shizuku-cli", request)) {
-            return errEnvelope(
-                "PERMISSION_DENIED",
+            return PermDenied.result(args, "PERMISSION_DENIED",
                 "Agent is not allowed to use android-shizuku-cli. Open Settings → Permissions → Integrations to change.",
-                args,
-            )
+                PermDenied.MINES_PERMISSIONS, exit = 1)
         }
 
         // Every other group needs binder + permission.
         ShizukuManager.refresh()
         when (val st = ShizukuManager.snapshot.value.state) {
             ShizukuManager.State.NOT_INSTALLED ->
-                return errEnvelope("SERVICE_NOT_RUNNING", "Shizuku is not installed. Open Settings → Permissions → Shizuku.", args)
+                return PermDenied.result(args, "SERVICE_NOT_RUNNING", "Shizuku is not installed. Open Settings → Permissions → Shizuku.", PermDenied.MINES_PERMISSIONS, exit = 1)
             ShizukuManager.State.NOT_RUNNING ->
-                return errEnvelope("SERVICE_NOT_RUNNING", "Shizuku service is not running. Start it via adb or root, then retry.", args)
-            ShizukuManager.State.NEED_PERMISSION ->
-                return errEnvelope("PERMISSION_DENIED", "Minis is not authorized for Shizuku. Grant permission in Settings → Permissions → Shizuku.", args)
+                return PermDenied.result(args, "SERVICE_NOT_RUNNING", "Shizuku 已安装但没启动：打开 Shizuku 用无线调试启动后重试。(Shizuku service is not running.)", PermDenied.SHIZUKU, exit = 1)
+            ShizukuManager.State.NEED_PERMISSION -> {
+                // [Mines-shizuku-29] Ask right here (Shizuku's own one-tap dialog)
+                // and continue when the user allows, instead of failing.
+                if (!com.openminis.app.plus.ShizukuAsk.requestAndWait(context, 30_000)) {
+                    return PermDenied.result(args, "PERMISSION_DENIED",
+                        (if (com.openminis.app.plus.ShizukuAsk.permanentlyDenied())
+                            "Mines 在 Shizuku 里被设成了拒绝：已打开 Shizuku，请在「授权应用」里打开 Mines，然后重试。"
+                        else "已弹出 Shizuku 授权框，但 30 秒内没有点「允许」。点允许后重试。") +
+                            " 不用 Shizuku 的替代：android-a11y-cli（无障碍）可以点屏幕、打开应用。", PermDenied.SHIZUKU, exit = 1)
+                }
+            }
             ShizukuManager.State.READY -> { /* fall through */ }
         }
 
@@ -94,6 +101,13 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
                 "file" -> handleFile(rest, args)
                 "device" -> handleDevice(rest, args)
                 "exec" -> handleExec(rest, args)
+                // [Mines-shizuku-29] Plain output for the /usr/local/bin/{pm,am,…}
+                // shims, so `pm list packages` in the sandbox just works.
+                "rawexec" -> {
+                    if (rest.isEmpty()) return NativeOffloadResult(2, "usage: rawexec <cmd> [args]\n")
+                    val r = ShizukuManager.runProcess(rest.toTypedArray(), timeoutMs = 60_000)
+                    NativeOffloadResult(r.exitCode, r.combined.let { if (it.endsWith("\n") || it.isEmpty()) it else it + "\n" })
+                }
                 else -> NativeOffloadResult(
                     2,
                     "android-shizuku-cli: unknown subcommand '$group'.\n" +

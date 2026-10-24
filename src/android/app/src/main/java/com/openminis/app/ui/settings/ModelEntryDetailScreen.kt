@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.outlined.Bolt
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -77,6 +78,8 @@ fun ModelEntryDetailScreen(
     var thinkingTouched by remember { mutableStateOf(false) }
     var isHidden by remember { mutableStateOf(entry.isHidden) }
     var showQuickTest by remember { mutableStateOf(false) }
+    // [Mines-38.9.6 i14] smoke: open 快速测试 right away for this entry ('i396 quicktest')
+    androidx.compose.runtime.LaunchedEffect(Unit) { if (com.openminis.app.ui.components.QuickTestAuto.consume()) showQuickTest = true }
 
     // Modality state — derive from override-or-base so the toggles reflect
     // what the model actually supports today, then let the user flip from
@@ -123,14 +126,13 @@ fun ModelEntryDetailScreen(
         // discard + pop.
         onBack = null,
         centerTitle = true,
+        // [Mines-38.9.8] real phone 01:17: the theme's top bar puts the navigation slot in a 40 dp round button, so the
+        // 「取消」 text was clipped to a garbled 「耳」 — a back arrow (= cancel: discards and pops) fits the circle
         navigation = {
-            MinisTextButton(
-                onClick = onBack,
-                modifier = Modifier.padding(start = 8.dp),
-                colors = ButtonDefaults.textButtonColors(
-                    contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                ),
-            ) { Text(stringResource(R.string.common_cancel)) }
+            androidx.compose.material3.IconButton(onClick = onBack) {
+                androidx.compose.material3.Icon(androidx.compose.material.icons.Icons.AutoMirrored.Filled.ArrowBack,
+                    contentDescription = stringResource(R.string.common_cancel))
+            }
         },
         actions = {
             MinisButton(

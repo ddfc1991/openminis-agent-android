@@ -62,6 +62,15 @@ Usage:
   android-a11y-cli <group> <subcommand> [flags]
 
 Groups:
+  FAST (use these first — one call does many steps, no screenshots):
+  ui list               numbered list of what is on screen
+  tap <n> | type <n> <text> | key back|home|enter
+  do "tap 3; type 5 你好; key enter; wait 500; list"
+  do --task "名字" "…"  remember a path that worked; replay "名字" reruns it (checked step by step)
+  ui elements           JSON element list (text/desc/id/role/clickable/center/bounds)
+  Reading tiers: 1·回放 → 2·无障碍树 (default) → 3·OCR (auto when the tree has no text) → 4·云端视觉 (ui screenshot + read_image)
+  (works through Shizuku too when accessibility is off)
+
   ui        dump | find | info | node | screenshot
   tap       node | xy | text | id
   input     text | clear | key
@@ -73,11 +82,13 @@ Groups:
   dialog    detect | dismiss
   extract   text | list | form
   service   status | ping
+  foreground            current package + activity
+  perm open <action>    open the settings page a PERM_DENIED error names
 
 Output: JSON envelope { ok, data | error: { code, message } }.
 Use --compact to emit on a single line; --quiet to strip the envelope.
 
-First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
+First-run: enable "Mines" under Settings → Accessibility, then `service ping`.
 """
         private const val SERVICE_HELP = "service status | ping\n"
         private const val UI_HELP = """ui dump | find | info | node | screenshot
@@ -115,25 +126,39 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
                 "annotate", "compact", "inline", "b",
                 "clickable", "editable", "scrollable", "checked", "enabled",
                 "visible-only", "auto-scroll", "auto-dismiss", "auto-confirm",
-                "confirm", "deny", "children", "ancestors",
+                "confirm", "deny", "children", "ancestors", "all",
             ),
         )
         if (args.hasFlag("h", "help") || args.positional.isEmpty()) {
             return NativeOffloadResult(if (args.positional.isEmpty()) 2 else 0, TOP_HELP)
         }
         val sub = args.positional[0]
+        // [Mines-30] `perm open <action>` opens the settings page a PERM_DENIED named.
+        if (sub == "perm") {
+            if (args.positional.getOrNull(1) != "open" || args.positional.getOrNull(2).isNullOrBlank())
+                return NativeOffloadResult(2, "用法：android-a11y-cli perm open <action>（action 来自 PERM_DENIED 的 action 字段）\n")
+            val (okOpen, msg) = PermDenied.open(context, args.positional[2])
+            return NativeOffloadResult(if (okOpen) 0 else 1, msg + "\n")
+        }
         // T330: tri-state agent gate via OffloadPermissionManager. `service`
         // and `--version` are diagnostic and pass through so the agent (or
         // a curious developer) can still verify the service runs even when
         // the agent surface is blocked.
         if (sub != "service" && sub != "--version") {
             if (!OffloadGate.allow("a11y_cli", "android-a11y-cli", request)) {
-                return err(
-                    args,
-                    "PERMISSION_DENIED",
+                return PermDenied.result(args, "PERMISSION_DENIED",
                     "Agent is not allowed to use android-a11y-cli. Open Settings → Permissions → Integrations to change.",
-                )
+                    PermDenied.MINES_PERMISSIONS, exit = 1)
             }
+        }
+        // [Mines-fast-ui] Numbered list / tap <n> / type / key / do batches.
+        // Served by the accessibility service when it runs, otherwise by
+        // Shizuku (uiautomator + input) — so phone control works even when
+        // Android greys out the accessibility toggle for a sideloaded APK.
+        if (FastUi.handles(args) && (MinisAccessibilityService.getInstance() != null || FastUi.shizukuReady() ||
+                args.positional.firstOrNull() in setOf("open", "launch", "shade"))) {
+            com.openminis.app.service.SessionActivityTracker.updateToolStatus("a11y_cli: ${args.positional.joinToString(" ").take(60)}")
+            return FastUi(context).handle(args)
         }
         // [T-android-a11y-force-stop-recovery] A force-stop (system Settings'
         // "Force stop", or an OEM "clear" button) makes the framework strip our
@@ -154,7 +179,7 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
         // `handle` is not a suspend fun. The prompt self-cancels after
         // AccessibilityRecoveryManager.PROMPT_TIMEOUT_MS so this can never
         // block the worker indefinitely.
-        if (sub != "service" && sub != "--version") {
+        if (sub != "service" && sub != "--version" && sub != "foreground" && sub != "fg") {
             val usable = kotlinx.coroutines.runBlocking {
                 AccessibilityRecoveryManager.ensureGrantOrPrompt(context)
             }
@@ -166,21 +191,22 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
                 // toggle that is greyed out and cannot be moved — the actual
                 // blocker is the restricted-settings gate, so name it.
                 val restricted = RestrictedSettingsManager.isRestricted(context)
-                return err(
+                return PermDenied.result(
                     args,
                     "SERVICE_NOT_RUNNING",
                     if (restricted) {
                         "Android is blocking the accessibility toggle for this install " +
                             "(\"Restricted setting\" — applies to apps installed from a " +
                             "downloaded APK). Allow it via App info → ⋮ → Allow restricted " +
-                            "settings, then enable Minis under Settings → Accessibility. " +
+                            "settings, then enable Mines under Settings → Accessibility. " +
                             "Settings → Permissions → System Permissions has a one-tap fix " +
                             "when Shizuku is available."
                     } else {
                         "Accessibility permission was revoked (this happens after a force-stop). " +
-                            "Re-enable Minis under Settings → Accessibility, or use Settings → " +
+                            "Re-enable Mines under Settings → Accessibility, or use Settings → " +
                             "Permissions → Integrations to repair it with Shizuku."
                     },
+                    if (restricted) PermDenied.APP_DETAILS else PermDenied.ACCESSIBILITY,
                     exit = 77,
                 )
             }
@@ -221,17 +247,57 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
                 "dialog"    -> dialogSub(args)
                 "extract"   -> extractSub(args)
                 "service"   -> serviceSub(args)
+                "foreground", "fg" -> foreground(args)
                 "--version" -> NativeOffloadResult(0, "android-a11y-cli 0.1\n")
                 else        -> NativeOffloadResult(2, "$TOOL: unknown subcommand '$sub'\n$TOP_HELP")
             }
         } catch (e: NotRunning) {
-            err(args, "SERVICE_NOT_RUNNING",
-                e.message ?: "Accessibility service is not running. Enable Minis under Settings → Accessibility.",
-                exit = 77)
+            PermDenied.result(args, "SERVICE_NOT_RUNNING",
+                e.message ?: "Accessibility service is not running. Enable Mines under Settings → Accessibility.",
+                PermDenied.ACCESSIBILITY, exit = 77)
         } catch (e: Throwable) {
             AppLogger.warning(TAG, "uncaught: ${e.javaClass.simpleName} ${e.message}")
             err(args, "INTERNAL", "${e.javaClass.simpleName}: ${e.message ?: ""}")
         }
+    }
+
+    // ── foreground ([Mines-30]) ─────────────────────────────────────────
+
+    /**
+     * Current foreground package + activity. Activity: Shizuku `dumpsys
+     * activity activities` (exact) when ready, else the last window-state
+     * event of the accessibility service for that package (best effort).
+     */
+    private fun foreground(args: OffloadArgs): NativeOffloadResult {
+        val svc = MinisAccessibilityService.getInstance()
+        var pkg: String? = svc?.foregroundPackage()?.first
+        var activity: String? = null
+        var source = "accessibility"
+        if (FastUi.shizukuReady()) runCatching {
+            val out = com.openminis.app.offload.ShizukuManager.runProcess(arrayOf("sh", "-c",
+                "dumpsys activity activities | grep -E 'topResumedActivity|mResumedActivity|ResumedActivity:' | head -3"),
+                timeoutMs = 6_000L).stdout
+            val m = Regex("""([A-Za-z0-9_.]+)/([A-Za-z0-9_.$]+)""").find(out)
+            if (m != null) {
+                pkg = m.groupValues[1]
+                val a = m.groupValues[2]
+                activity = if (a.startsWith(".")) pkg + a else a
+                source = "shizuku"
+            }
+        }
+        if (activity == null && svc != null && pkg != null) {
+            activity = svc.snapshotEvents().lastOrNull {
+                it.type == "TYPE_WINDOW_STATE_CHANGED" && it.packageName == pkg &&
+                    !it.className.isNullOrBlank() && !it.className.startsWith("android.widget.") &&
+                    !it.className.startsWith("android.view.")
+            }?.className
+        }
+        if (pkg == null) {
+            return PermDenied.result(args, "SERVICE_NOT_RUNNING",
+                "Can't read the foreground app: accessibility is off and Shizuku is not ready. Enable Mines under Settings → Accessibility.",
+                PermDenied.ACCESSIBILITY)
+        }
+        return ok(args, JSONObject().put("package", pkg).put("activity", activity ?: JSONObject.NULL).put("source", source))
     }
 
     // ── service ──────────────────────────────────────────────────────────
@@ -243,7 +309,7 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
                 val svc = MinisAccessibilityService.getInstance()
                 val data = JSONObject()
                     .put("running", svc != null)
-                    .put("serviceName", MinisAccessibilityService.SERVICE_ID)
+                    .put("serviceName", MinisAccessibilityService.serviceId(context))
                     .put("capabilities", JSONArray().apply {
                         put("retrieveWindowContent"); put("performGestures"); put("watchEvents")
                     })
@@ -267,7 +333,7 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
                             "Allow it via App info → ⋮ → Allow restricted settings first.\n",
                     )
                 else
-                    NativeOffloadResult(77, "✗ Accessibility service is not running — go to Settings → Accessibility → Minis to enable\n")
+                    NativeOffloadResult(77, "✗ Accessibility service is not running — go to Settings → Accessibility → Mines to enable\n")
             }
             else -> NativeOffloadResult(2, "$TOOL service: unknown action\n$SERVICE_HELP")
         }
@@ -480,6 +546,8 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
             .put("scaledHeight", outH)
             .put("scale", scale.toDouble())
             .put("sizeBytes", pngBytes.size)
+            // [Mines-38.8 v5d] the screenshot path is reading tier 4 (cloud vision via read_image), the last resort
+            .put("tier", ScreenTiers.TIER_CLOUD)
 
         if (inline) {
             data.put("encoding", "png+base64")
@@ -574,6 +642,17 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
             ?: return NativeOffloadResult(2, "$TOOL tap xy: missing <x>\n")
         val y = args.positional.getOrNull(3)?.toIntOrNull()
             ?: return NativeOffloadResult(2, "$TOOL tap xy: missing <y>\n")
+        // [Mines-shade-29] Status-bar icons are not buttons: a tap there does
+        // nothing on Android. What the agent wants is the shade.
+        val sbH = context.resources.getIdentifier("status_bar_height", "dimen", "android")
+            .takeIf { it > 0 }?.let { context.resources.getDimensionPixelSize(it) } ?: 80
+        val shadeOpen = runCatching { svc.windows.any { w -> w.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_SYSTEM &&
+            android.graphics.Rect().also { r -> w.getBoundsInScreen(r) }.height() > sbH * 4 } }.getOrDefault(false)
+        if (y in 0..sbH && !shadeOpen && !args.hasFlag("raw")) {
+            if (svc.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS))
+                return ok(args, JSONObject().put("x", x).put("y", y).put("action", "open_notification_shade")
+                    .put("note", "tap on the status bar → opened the notification shade (use --raw to really tap)"))
+        }
         return tapXYRaw(svc, x, y, args)
     }
 
@@ -820,6 +899,19 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
         val x2 = args.positional.getOrNull(4)?.toIntOrNull() ?: return NativeOffloadResult(2, "$TOOL gesture swipe: missing <x2>\n")
         val y2 = args.positional.getOrNull(5)?.toIntOrNull() ?: return NativeOffloadResult(2, "$TOOL gesture swipe: missing <y2>\n")
         val duration = args.getLong("duration") ?: 300L
+        // [Mines-shade-29] A downward swipe that starts in the status bar is
+        // the "pull down the shade" gesture; injected gestures from the very
+        // top edge are not delivered to SystemUI on some ROMs (realme), so do
+        // what the user meant with the global action.
+        val sbH = context.resources.getIdentifier("status_bar_height", "dimen", "android")
+            .takeIf { it > 0 }?.let { context.resources.getDimensionPixelSize(it) } ?: 80
+        if (y1 <= sbH * 2 && y2 - y1 > sbH * 2) {
+            val qs = y1 <= sbH * 2 && args.hasFlag("qs")
+            if (svc.performGlobalAction(if (qs) android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_QUICK_SETTINGS
+                    else android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS))
+                return ok(args, JSONObject().put("shade", if (qs) "quick_settings" else "notifications")
+                    .put("note", "swipe from the status bar mapped to the notification shade"))
+        }
         val path = Path().apply { moveTo(x1.toFloat(), y1.toFloat()); lineTo(x2.toFloat(), y2.toFloat()) }
         return if (svc.dispatchSimpleGesture(path, 0L, duration))
             ok(args, JSONObject().put("from", JSONArray().put(x1).put(y1)).put("to", JSONArray().put(x2).put(y2)))
@@ -1198,7 +1290,7 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
 
     private fun svcOrThrow(): MinisAccessibilityService =
         MinisAccessibilityService.getInstance()
-            ?: throw NotRunning("Accessibility service is not running. Enable Minis under Settings → Accessibility.")
+            ?: throw NotRunning("Accessibility service is not running. Enable Mines under Settings → Accessibility.")
 
     private fun ok(args: OffloadArgs, data: Any): NativeOffloadResult {
         val body = JSONObject().put("ok", true).put("data", data).toString()

@@ -1,5 +1,7 @@
 package com.openminis.app.ui.settings
 
+import com.openminis.app.ui.plus.MT
+
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
@@ -464,8 +466,8 @@ fun SubAgentDetailScreen(agentId: String, onBack: () -> Unit) {
                                     // One size below labelSmall: six segments on a phone leave
                                     // ~55dp each, and labelSmall's 11sp still made
                                     // "Medium" the widest thing in the row.
-                                    fontSize = 10.sp,
-                                    lineHeight = 12.sp,
+                                    fontSize = MT.Tiny,
+                                    lineHeight = MT.CaptionLH,
                                     maxLines = 1,
                                     softWrap = false,
                                 )
@@ -578,14 +580,14 @@ private fun SubAgentRosterRow(
                 Spacer(Modifier.width(6.dp))
                 Text(
                     stringResource(R.string.sub_agent_builtin_badge),
-                    fontSize = 10.sp,
+                    fontSize = MT.Tiny,
                     // [T-android-settings-chip-height] A chip should hug its
                     // text. `vertical = 1.dp` already said so, but a Compose
                     // Text carries includeFontPadding plus the font's own line
                     // spacing, so a 10sp label occupied noticeably more than
                     // 10sp and the pill read as a button. lineHeight pins the
                     // box to the glyph; the padding is what remains visible.
-                    lineHeight = 11.sp,
+                    lineHeight = MT.CaptionLH,
                     style = LocalTextStyle.current.copy(
                         platformStyle = PlatformTextStyle(includeFontPadding = false),
                     ),
@@ -611,7 +613,7 @@ private fun SubAgentRosterRow(
         }
         Text(
             modelLabel,
-            fontSize = 11.sp,
+            fontSize = MT.Caption,
             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
             maxLines = 1,
             modifier = Modifier.padding(start = 32.dp, top = 2.dp),

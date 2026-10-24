@@ -37,7 +37,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.DropdownMenu
+import com.openminis.app.ui.glass.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.SegmentedButton
@@ -215,13 +215,18 @@ fun ProviderDetailScreen(
         SettingsSection(
             header = if (isOAuthProvider) stringResource(R.string.add_provider_credential) else stringResource(R.string.provider_list_api_key),
             footer = if (isOAuthProvider) {
-                "OAuth tokens are stored securely in encrypted storage."
+                "OAuth 登录凭证已加密保存在本机。"
             } else {
                 null
             },
         ) {
             SettingsCardBlock {
-                if (isOAuthProvider) {
+                if (isOAuthProvider && instance.providerType == ProviderType.gemini) {
+                    // [Mines-38.9.11 int] Gemini 谷歌账号 = the multi-account pool (GeminiAccountsActivity). The old single-account
+                    // OAuth block here had no Gemini branch in startSignIn (登录 did nothing) and its 退出登录 cleared the
+                    // legacy GeminiOAuthManager store the pool never reads → route everything to the pool page instead.
+                    GeminiPoolCredentialBlock()
+                } else if (isOAuthProvider) {
                     OAuthCredentialBlock(
                         instance = instance,
                         storedKey = storedKey,
@@ -271,7 +276,7 @@ fun ProviderDetailScreen(
             SettingsSection(
                 header = stringResource(R.string.provider_detail_manual_bearer_token),
                 footer = stringResource(R.string.provider_detail_use_a_static_bearer_token_instead_of_the) +
-                    "Useful with custom proxy endpoints.",
+                    "适合配合自定义代理地址使用。",
             ) {
                 SettingsCardBlock {
                     ManualBearerTokenSection(
@@ -488,7 +493,7 @@ fun ProviderDetailScreen(
                                 }
                             },
                             shape = SegmentedButtonDefaults.itemShape(index = 0, count = 3),
-                        ) { Text("Auto") }
+                        ) { Text("自动") }
                         SegmentedButton(
                             selected = mode == com.openminis.app.data.model.ImageEndpointMode.imagesGenerations,
                             onClick = {
@@ -503,7 +508,7 @@ fun ProviderDetailScreen(
                                 }
                             },
                             shape = SegmentedButtonDefaults.itemShape(index = 1, count = 3),
-                        ) { Text("Images API") }
+                        ) { Text("图片接口") }
                         SegmentedButton(
                             selected = mode == com.openminis.app.data.model.ImageEndpointMode.chatCompletions,
                             onClick = {
@@ -517,7 +522,7 @@ fun ProviderDetailScreen(
                                 }
                             },
                             shape = SegmentedButtonDefaults.itemShape(index = 2, count = 3),
-                        ) { Text("Chat") }
+                        ) { Text("对话") }
                     }
                 }
             }
@@ -855,6 +860,43 @@ fun ProviderDetailScreen(
  */
 private const val OAUTH_CONNECTED_PLACEHOLDER = "oauth"
 
+/** [Mines-38.9.11 int] Gemini via Google accounts: live pool summary + one button to the 谷歌账号 page (add / sign in / check). */
+@Composable
+private fun GeminiPoolCredentialBlock() {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    remember { com.openminis.app.plus.GeminiAccounts.init(context); 0 }
+    val accts by com.openminis.app.plus.GeminiAccounts.accounts.collectAsState()
+    val signed = accts.count { it.signedIn && !it.disabled }
+    val waiting = accts.count { !it.signedIn || it.needsLogin }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text("谷歌账号", style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
+        Spacer(modifier = Modifier.weight(1f))
+        Text(
+            when {
+                signed > 0 && waiting > 0 -> "已登录 $signed 个 · 待登录 $waiting 个"
+                signed > 0 -> "已登录 $signed 个"
+                else -> "还没有登录"
+            },
+            color = if (signed > 0) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error,
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Box(
+            modifier = Modifier.padding(start = 8.dp).size(8.dp)
+                .background(if (signed > 0) Color(0xFF34C759) else MaterialTheme.colorScheme.error, CircleShape),
+        )
+    }
+    Spacer(modifier = Modifier.height(4.dp))
+    Text(
+        "用谷歌账号的 Gemini 额度，不用 API Key。每个账号单独登录、互不串号，用完一个自动换下一个。",
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        style = MaterialTheme.typography.bodySmall,
+    )
+    Spacer(modifier = Modifier.height(8.dp))
+    MinisSmallButton(onClick = { com.openminis.app.plus.GeminiAccounts.open(context, addNew = accts.isEmpty()) }) {
+        Text(if (accts.isEmpty()) "登录谷歌账号" else "管理谷歌账号")
+    }
+}
+
 @Composable
 private fun OAuthCredentialBlock(
     instance: com.openminis.app.data.model.ProviderInstance,
@@ -898,6 +940,30 @@ private fun OAuthCredentialBlock(
         )
     }
 
+    // [Mines-38.9.11 i32] Copilot device-code dialog. The detail screen had NO Copilot branch in startSignIn (`else -> null`),
+    // so 「登录 / 重新登录」 did nothing for a Copilot provider and 「退出登录」 kept the GitHub token (base logout only):
+    // once its token went bad the only way out was deleting the provider. Now: real re-login, real sign-out, and the
+    // last failure (CopilotOAuthManager.lastError) in Chinese with a one-tap 重新登录.
+    var copilotDeviceAuth by remember(instance.id) {
+        mutableStateOf<com.openminis.app.auth.CopilotDeviceFlow.DeviceAuthorization?>(null)
+    }
+    copilotDeviceAuth?.let { auth ->
+        KimiDeviceLoginDialog(
+            userCode = auth.userCode,
+            verificationUrl = auth.verificationUri,
+            onCancel = {
+                kimiLoginJob?.cancel()
+                copilotDeviceAuth = null
+            },
+            title = stringResource(R.string.copilot_login_title),
+            instructions = stringResource(R.string.copilot_login_instructions),
+        )
+    }
+    val isCopilot = instance.providerType == ProviderType.githubCopilot
+    var copilotError by remember(instance.id) {
+        mutableStateOf(if (isCopilot) com.openminis.app.auth.CopilotOAuthManager.lastError[instance.id].orEmpty() else "")
+    }
+
     // [T-oauth-keep-credentials] Refresh rejected: the credential is kept (never
     // auto-deleted) but unusable until the user signs in again.
     var needsReauth by remember(instance.id) {
@@ -934,13 +1000,23 @@ private fun OAuthCredentialBlock(
                         com.openminis.app.auth.XAIOAuthManager.login(
                             context, instance.id, providerRepository,
                         )
+                    ProviderType.githubCopilot ->
+                        com.openminis.app.auth.CopilotOAuthManager.login(
+                            context, instance.id,
+                            onDeviceCode = { auth -> copilotDeviceAuth = auth },
+                        ).also {
+                            copilotDeviceAuth = null
+                            com.openminis.app.auth.CopilotOAuthManager.lastError.remove(instance.id)
+                            copilotError = ""
+                            com.openminis.app.plus.ProviderHealth.forget(context, instance.id)
+                        }
                     else -> null
                 }
                 // login() persists the token via providerRepository.saveApiKey;
                 // reflect it locally so the UI flips to the connected state
                 // without needing the parent to recompose.
                 if (token != null) {
-                    displayedKey = providerRepository.loadApiKey(instance.id) ?: token
+                    displayedKey = if (isCopilot) OAUTH_CONNECTED_PLACEHOLDER else providerRepository.loadApiKey(instance.id) ?: token
                     needsReauth = false
                     AppLogger.info(TAG, "OAuth signed in for ${instance.id}")
                     // [T-provider-refresh-outlives-screen] (GH#265) A fresh
@@ -957,6 +1033,7 @@ private fun OAuthCredentialBlock(
                 // an error to show.
                 if (e is kotlinx.coroutines.CancellationException) throw e
                 AppLogger.warning(TAG, "OAuth sign-in failed for ${instance.id}: ${e.message}")
+                if (isCopilot) copilotError = com.openminis.app.auth.CopilotOAuthManager.lastError[instance.id].orEmpty()
                 authError = if (e is com.openminis.app.auth.OAuthNetworkUnreachableException) {
                     context.getString(R.string.add_provider_oauth_network_unreachable)
                 } else {
@@ -968,9 +1045,14 @@ private fun OAuthCredentialBlock(
             } finally {
                 isAuthenticating = false
                 kimiDeviceAuth = null
+                copilotDeviceAuth = null
                 com.openminis.app.auth.OAuthForegroundGate.end()
             }
         }
+    }
+    // [Mines-38.9.11 i32] AI 服务商 「一键修复」 → this page opens and the re-login starts at once
+    androidx.compose.runtime.LaunchedEffect(instance.id) {
+        if (com.openminis.app.plus.ProviderHealth.consumeAutoLogin(instance.id)) startSignIn()
     }
 
     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -999,7 +1081,7 @@ private fun OAuthCredentialBlock(
         } else {
             Spacer(modifier = Modifier.weight(1f))
             Text(
-                if (isAuthenticating) stringResource(R.string.oauth_status_signing_in) else "Not connected",
+                if (isAuthenticating) stringResource(R.string.oauth_status_signing_in) else "未连接",
                 color = if (isAuthenticating) MaterialTheme.colorScheme.onSurfaceVariant
                 else MaterialTheme.colorScheme.error,
                 style = MaterialTheme.typography.bodySmall,
@@ -1023,9 +1105,21 @@ private fun OAuthCredentialBlock(
         OAuthProgressLine(isAuthenticating = isAuthenticating, phase = oauthPhase, error = authError)
         Spacer(modifier = Modifier.height(8.dp))
     }
+    // [Mines-38.9.11 i32] Copilot signed in but its last call failed: the reason in plain Chinese + one-tap 重新登录
+    if (isCopilot && displayedKey.isNotEmpty() && copilotError.isNotBlank()) {
+        Text(copilotError, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+        Spacer(modifier = Modifier.height(8.dp))
+        MinisSmallButton(enabled = !isAuthenticating, onClick = { startSignIn() }) { Text("重新登录 GitHub") }
+        OAuthProgressLine(isAuthenticating = isAuthenticating, phase = oauthPhase, error = authError)
+        Spacer(modifier = Modifier.height(8.dp))
+    }
     if (displayedKey.isNotEmpty()) {
         MinisSmallButton(
             onClick = {
+                if (isCopilot) {
+                    com.openminis.app.auth.CopilotOAuthManager(context, instance.id).logoutCopilot()
+                    com.openminis.app.auth.CopilotOAuthManager.lastError.remove(instance.id); copilotError = ""
+                }
                 // [T-android-openai-oauth-signout-signin-stuck] A real sign-out
                 // must clear BOTH credential stores: (1) the persisted OAuth
                 // token blob (access + refresh_token + expire_at, plus any manual

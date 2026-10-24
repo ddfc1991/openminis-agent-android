@@ -1133,6 +1133,9 @@ class ProviderRepository(private val context: Context) {
         // just as it skipped the deleted bundle before. (needsReauth is already
         // false when a manual bearer is stored — that credential still works.)
         if (com.openminis.app.auth.OAuthManager.needsReauth(context, instance.id)) return false
+        // [Mines-38.9.11 b] Gemini via Google accounts: the credential is the account pool, not an oauth_tokens blob
+        if (instance.providerType == ProviderType.gemini && instance.credentialType == ProviderCredential.oauth &&
+            runCatching { com.openminis.app.plus.GeminiAccounts.hasSignedIn(context) }.getOrDefault(false)) return true
         val mgr = com.openminis.app.auth.OAuthManager.forInstance(context, instance)
         if (mgr != null && mgr.isAuthenticated()) return true
         return com.openminis.app.auth.OAuthManager.hasStoredCredential(context, instance.id)
@@ -2050,7 +2053,7 @@ class ProviderRepository(private val context: Context) {
             isOpenRouter = base.contains("openrouter.ai"),
             usesUnifiedReasoningEffort = base.contains("volces") || base.contains("ark.") || base.contains("venice.ai"),
             isMistral = base.contains("mistral.ai"),
-            isDashScope = base.contains("dashscope"),
+            isDashScope = com.openminis.app.plus.RouteStatusCore.isDashScopeHost(base),
             offEffort = null,
         )
         val modelIds = config.modelEntries.filter { it.providerInstanceId == instanceId }.map { it.model.id }
@@ -3060,7 +3063,103 @@ class ProviderRepository(private val context: Context) {
      * instances without a token, which must stay unauthenticated).
      */
     fun usableApiKey(instance: ProviderInstance): String? =
-        loadApiKey(instance.id) ?: if (instance.allowsEmptyAPIKey) "" else null
+        // [Mines-38.9.11.2] a merged provider's key pool rotates per request (round-robin)
+        // [38.9.11.3] keys that answered 401 / invalid are skipped (BadKeys, by fingerprint) until they work again
+        com.openminis.app.plus.ProviderMergeCore.pickGood(keyPool(instance.id), keyPoolCounter.getAndIncrement()) { com.openminis.app.plus.BadKeys.isBad(it) }
+            ?: loadApiKey(instance.id) ?: if (instance.allowsEmptyAPIKey) "" else null
+
+    // ── [Mines-38.9.11.2] key pools + 合并重复供应商 (preview → the user's tap → backup → merge; 撤销 restores) ──
+    private val keyPoolCounter = java.util.concurrent.atomic.AtomicLong()
+
+    fun keyPool(instanceId: String): List<String> = runCatching {
+        val a = JSONArray(encryptedPrefs.getString("apikeys_$instanceId", null) ?: return emptyList())
+        (0 until a.length()).map { a.getString(it) }.filter { it.isNotBlank() }
+    }.getOrDefault(emptyList())
+
+    fun setKeyPool(instanceId: String, keys: List<String>) {
+        val e = encryptedPrefs.edit()
+        if (keys.size <= 1) e.remove("apikeys_$instanceId") else e.putString("apikeys_$instanceId", JSONArray(keys).toString())
+        e.apply()
+    }
+
+    fun mergePlan(): List<com.openminis.app.plus.ProviderMergeCore.Group> {
+        ensureConfigLoaded()
+        val cfg = _config.value
+        val ps = cfg.instances.filter { it.credentialType == ProviderCredential.apiKey }.map { i ->
+            com.openminis.app.plus.ProviderMergeCore.P(i.id, i.label, i.customBaseURL ?: i.effectiveBaseURL,
+                keyPool(i.id).ifEmpty { listOfNotNull(loadApiKey(i.id)) },
+                cfg.modelEntries.filter { it.providerInstanceId == i.id }.map { it.baseModel.id }, i.createdAt)
+        }
+        return com.openminis.app.plus.ProviderMergeCore.plan(ps)
+    }
+
+    fun hasMergeBackup(): Boolean = encryptedPrefs.contains("merge_backup_config")
+
+    /** merges the [groups] the user confirmed; the old config + keys are backed up first (one backup, replaced each time) */
+    fun applyMerge(groups: List<com.openminis.app.plus.ProviderMergeCore.Group>): Int = synchronized(configLock) {
+        ensureConfigLoaded()
+        if (groups.isEmpty()) return@synchronized 0
+        val live = _config.value
+        val keys = JSONObject()
+        for (i in live.instances) {
+            loadApiKey(i.id)?.let { keys.put("k:" + i.id, it) }
+            keyPool(i.id).takeIf { it.isNotEmpty() }?.let { keys.put("p:" + i.id, JSONArray(it)) }
+        }
+        encryptedPrefs.edit().putString("merge_backup_config", json.encodeToString(ProviderConfig.serializer(), live))
+            .putString("merge_backup_keys", keys.toString()).commit()
+        val config = workingCopy()
+        var merged = 0
+        for (g in groups) {
+            val keeper = config.instances.firstOrNull { it.id == g.keeper } ?: continue
+            val others = g.members.filter { it != keeper.id && config.instances.any { i -> i.id == it } }
+            if (others.isEmpty()) continue
+            val keeperModels = config.modelEntries.filter { it.providerInstanceId == keeper.id }.map { it.baseModel.id }.toMutableSet()
+            val remap = HashMap<String, String>()
+            val moved = ArrayList<ModelEntry>()
+            for (e in config.modelEntries.filter { it.providerInstanceId in others }) {
+                val newId = compositeEntryKey(keeper.id, e.baseModel.id)
+                remap[e.id] = newId
+                if (keeperModels.add(e.baseModel.id)) moved += e.copy(providerInstanceId = keeper.id, uuid = newId)
+            }
+            config.modelEntries.removeAll { it.providerInstanceId in others }
+            config.modelEntries.addAll(moved)
+            for (grp in config.modelGroups) {
+                val m = grp.memberEntryIds.map { remap[it] ?: it }.distinct()
+                grp.memberEntryIds.clear(); grp.memberEntryIds.addAll(m)
+            }
+            val al = config.agentLoopModelEntryIds.map { remap[it] ?: it }.distinct()
+            config.agentLoopModelEntryIds.clear(); config.agentLoopModelEntryIds.addAll(al)
+            config.instances.removeAll { it.id in others }
+            if (g.keys.isNotEmpty()) { saveApiKey(keeper.id, g.keys.first()); setKeyPool(keeper.id, g.keys) }
+            others.forEach { deleteApiKey(it); setKeyPool(it, emptyList()); invalidateModelCache(it) }
+            invalidateModelCache(keeper.id)
+            merged++
+        }
+        saveConfig(config)
+        merged
+    }
+
+    /** 撤销: the config and keys exactly as before the last merge */
+    fun undoMerge(): Boolean = synchronized(configLock) {
+        val raw = encryptedPrefs.getString("merge_backup_config", null) ?: return@synchronized false
+        val cfg = runCatching { json.decodeFromString(ProviderConfig.serializer(), raw) }.getOrNull() ?: return@synchronized false
+        val keys = runCatching { JSONObject(encryptedPrefs.getString("merge_backup_keys", "{}")!!) }.getOrDefault(JSONObject())
+        val now = _config.value
+        now.instances.forEach { setKeyPool(it.id, emptyList()) }
+        for (k in keys.keys()) {
+            when {
+                k.startsWith("k:") -> saveApiKey(k.removePrefix("k:"), keys.getString(k))
+                k.startsWith("p:") -> keys.optJSONArray(k)?.let { a -> setKeyPool(k.removePrefix("p:"), (0 until a.length()).map { a.getString(it) }) }
+            }
+        }
+        cfg.instances.forEach { invalidateModelCache(it.id) }
+        saveConfig(cfg.copy(instances = cfg.instances.toMutableList(), modelEntries = cfg.modelEntries.toMutableList(),
+            modelGroups = cfg.modelGroups.toMutableList()))
+        encryptedPrefs.edit().remove("merge_backup_config").remove("merge_backup_keys").apply()
+        true
+    }
+
+    fun dropMergeBackup() { encryptedPrefs.edit().remove("merge_backup_config").remove("merge_backup_keys").apply() }
 
     fun deleteApiKey(instanceId: String) {
         encryptedPrefs.edit().remove("apikey_$instanceId").apply()

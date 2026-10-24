@@ -21,6 +21,8 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.consumeWindowInsets
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -37,7 +39,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
+import com.openminis.app.ui.theme.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -136,7 +138,9 @@ fun MinisSkillsBrowserScreen(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(padding),
+                .padding(padding)
+                .consumeWindowInsets(padding)
+                .imePadding(),  // [Mines-webfit-38.3]
         ) {
             // WebView
             AndroidView(
@@ -145,6 +149,8 @@ fun MinisSkillsBrowserScreen(
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
                         settings.userAgentString = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Mobile Safari/537.36"
+                        // [Mines-webfit-38.3] fit the screen width, zoomable, text follows the font size
+                        com.openminis.app.browser.WebFit.apply(this)
 
                         webViewClient = object : WebViewClient() {
                             // [T-android-webview-render-process-gone] (GH#341)

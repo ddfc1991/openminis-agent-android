@@ -134,7 +134,7 @@ import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.RadioButtonChecked
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material3.DropdownMenu
+import com.openminis.app.ui.glass.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import com.openminis.app.BuildConfig
 import com.openminis.app.R
@@ -146,7 +146,7 @@ import com.openminis.app.ui.components.MinisMenuDivider
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.ModalBottomSheet
+import com.openminis.app.ui.glass.ModalBottomSheet
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -158,7 +158,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
+import com.openminis.app.ui.theme.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -612,7 +612,7 @@ internal fun FallbackInfoBlock(block: AssistantBlock, onRevert: (() -> Unit)? = 
                 if (hasDetail) {
                     Icon(
                         imageVector = Icons.Default.Info,
-                        contentDescription = "Show full summary",
+                        contentDescription = "展开完整摘要",
                         tint = fg,
                         modifier = Modifier
                             .size(14.dp)
@@ -678,7 +678,7 @@ private fun CompactSummarySheet(
     val scope = rememberCoroutineScope()
 
     StandardChatSheet(
-        title = "Compact Summary",
+        title = "压缩摘要",
         onDismiss = onDismiss,
         leadingAction = {
             IconButton(onClick = {
@@ -691,7 +691,7 @@ private fun CompactSummarySheet(
             }) {
                 Icon(
                     imageVector = if (copied) Icons.Default.Check else Icons.Default.ContentCopy,
-                    contentDescription = "Copy",
+                    contentDescription = "复制",
                     tint = if (copied) Color(0xFF34C759) else ChatColors.secondaryText,
                 )
             }
@@ -920,6 +920,26 @@ internal fun rememberBrowserLiveSnapshot(
  * a single mid value, since it sits over a low-alpha tint and reads
  * the same on both themes).
  */
+/** [Mines-loop-30] Shown when the agent was paused for repeating itself or hitting the per-run tool cap. */
+@Composable
+internal fun LoopPauseBanner(text: String, onContinue: () -> Unit, onStop: () -> Unit) {
+    val orange = Color(0xFFFF9500)
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 2.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(orange.copy(alpha = 0.10f))
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+    ) {
+        androidx.compose.material3.Text(text = text, style = androidx.compose.material3.MaterialTheme.typography.bodyMedium, color = androidx.compose.material3.MaterialTheme.colorScheme.onSurface)
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+            androidx.compose.material3.TextButton(onClick = onStop) { androidx.compose.material3.Text("停止") }
+            androidx.compose.material3.TextButton(onClick = onContinue) { androidx.compose.material3.Text("继续") }
+        }
+    }
+}
+
 @Composable
 internal fun ResumeBanner(onResume: () -> Unit) {
     val orange = Color(0xFFFF9500)

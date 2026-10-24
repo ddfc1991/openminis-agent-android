@@ -34,7 +34,10 @@ import time
 import sys
 sys.path.insert(0, "/usr/local/lib/minis-mcp-cli")
 
-from transport.http import HTTPTransport, MCPError, expand_env  # noqa: E402
+# [Mines-mcp-29] no httpx at import time: HTTPTransport is imported lazily by
+# MCPHTTPSession, so a daemon serving only STDIO servers starts fast.
+from transport.errors import MCPError, expand_env  # noqa: E402
+from utils import launch  # noqa: E402
 from utils import config  # noqa: E402
 from utils import deps  # noqa: E402
 
@@ -72,22 +75,26 @@ class MCPServerProcess:
         for k, v in (self.cfg.get("env") or {}).items():
             env[k] = expand_env(v)
         deps.ensure_command(command)
+        # [Mines-mcp-29] npx → installed global bin when present; stderr kept.
+        self._installed = launch.installed(command, args)
+        command, args = launch.resolve(command, args)
+        self._errf = launch.open_stderr(self.name)
         try:
             self.proc = subprocess.Popen(
                 [command] + list(args),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=self._errf,
                 env=env,
                 text=True,
                 bufsize=1,
                 start_new_session=True,  # detach from the daemon's process group
             )
         except FileNotFoundError:
-            raise MCPError("CONNECTION_ERROR", "command not found: %s" % command)
+            raise MCPError("CONNECTION_ERROR", "command not found: %s (自动安装也没装上，看 /var/minis/mcp-servers/mcp-cli.log)" % command)
         except OSError as exc:
             raise MCPError("CONNECTION_ERROR", str(exc))
-        log.info("[%s] spawned pid=%s", self.name, self.proc.pid)
+        log.info("[%s] spawned pid=%s: %s %s", self.name, self.proc.pid, command, " ".join(args)[:200])
         self._handshake()
         log.info("[%s] initialized", self.name)
 
@@ -130,7 +137,9 @@ class MCPServerProcess:
         if t.is_alive():
             raise MCPError("TIMEOUT", "[%s] no reply after %ss" % (self.name, timeout))
         if "msg" not in result_box:
-            raise MCPError("STDIO_CRASH", "[%s] process exited before replying" % self.name)
+            rc = self.proc.poll() if self.proc else None
+            raise MCPError("STDIO_CRASH", "[%s] process exited before replying (rc=%s): %s"
+                           % (self.name, rc, launch.explain(self.name, self.cfg)))
         return result_box["msg"]
 
     def _rpc(self, method, params=None, timeout=RPC_TIMEOUT):
@@ -147,6 +156,9 @@ class MCPServerProcess:
         # seconds plus a warning for any invalid value (which we log rather
         # than silently swallow). Default is DEFAULT_STARTUP_TIMEOUT.
         timeout, warning = config.resolve_startup_timeout(self.cfg)
+        if not any(k in self.cfg for k in config.STARTUP_TIMEOUT_KEYS):
+            # [Mines-mcp-29] cold npx/uvx needs to download first.
+            timeout = max(timeout, 60 if getattr(self, "_installed", True) else 180)
         if warning:
             log.warning("[%s] %s", self.name, warning)
         try:
@@ -158,10 +170,11 @@ class MCPServerProcess:
         except MCPError as exc:
             if exc.code == "TIMEOUT":
                 raise MCPError("TIMEOUT", (
-                    "[%s] initialization timed out after %ss. This server may "
+                    "[%s] initialization timed out after %ss. Reason: %s. This server may "
                     "still be starting. Set mcpServers.%s.startupTimeoutSeconds "
-                    "to e.g. %d for slow-starting servers."
-                    % (self.name, timeout, self.name, max(timeout * 2, 120)))
+                    "to e.g. %d for slow-starting servers, or run `minis-mcp-cli doctor %s`."
+                    % (self.name, timeout, launch.explain(self.name, self.cfg), self.name,
+                       max(timeout * 2, 120), self.name))
                 )
             raise
         self._send("notifications/initialized", notify=True)
@@ -202,6 +215,11 @@ class MCPServerProcess:
                 self.proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+        try:
+            if getattr(self, "_errf", None) not in (None, subprocess.DEVNULL):
+                self._errf.close()
+        except OSError:
+            pass
         log.info("[%s] stopped", self.name)
 
 
@@ -213,6 +231,7 @@ class MCPHTTPSession:
 
     def __init__(self, name, cfg):
         self.name = name
+        from transport.http import HTTPTransport  # lazy: pulls in httpx
         self._transport = HTTPTransport(cfg, name)
         self._lock = threading.Lock()
         self.last_activity = time.time()
@@ -261,6 +280,7 @@ class MCPPool:
         # evicted. Starts True because a fresh pool has never been populated,
         # so its emptiness is not a transition worth reporting.
         self._was_empty = True
+        self._creating = {}
 
     def _make_session(self, name, cfg):
         if config.is_stdio(cfg):
@@ -290,13 +310,28 @@ class MCPPool:
             return session
         return MCPHTTPSession(name, cfg)
 
-    def get(self, name):
+    def _name_lock(self, name):
         with self._lock:
-            session = self._pool.get(name)
-            if session is not None and not session.is_alive():
+            lk = self._creating.get(name)
+            if lk is None:
+                lk = self._creating[name] = threading.Lock()
+            return lk
+
+    def get(self, name):
+        # [Mines-mcp-29] The pool lock used to be held across _make_session(),
+        # i.e. across a whole cold start (npx download + node boot + initialize,
+        # up to the startup timeout). Every other server's request queued
+        # behind it, so asking six servers at once timed all six out. Now only
+        # the server being started waits for its own start.
+        with self._name_lock(name):
+            with self._lock:
+                session = self._pool.get(name)
+                dead = session is not None and not session.is_alive()
+                if dead:
+                    del self._pool[name]
+            if dead:
                 log.warning("[%s] process died, evicting", name)
                 session.stop()
-                del self._pool[name]
                 session = None
             if session is None:
                 cfg = config.get_server(name)
@@ -306,7 +341,9 @@ class MCPPool:
                     raise MCPError("DISABLED", "server '%s' is disabled" % name)
                 log.info("[%s] creating new session", name)
                 session = self._make_session(name, cfg)
-                self._pool[name] = session
+                with self._lock:
+                    self._pool[name] = session
+        with self._lock:
             self._was_empty = False
         # [T-mcp-daemon-idle-selfkill] Outside the lock: the pool now holds a
         # live session, so cancel any pending exit grace. This is THE fix — the
@@ -320,7 +357,8 @@ class MCPPool:
             try:
                 return fn(session)
             except MCPError as exc:
-                if exc.code in ("STDIO_CRASH", "TIMEOUT") and attempt == 0:
+                if exc.code in ("STDIO_CRASH", "TIMEOUT") and attempt == 0 \
+                        and "initialization timed out" not in (exc.message or ""):
                     log.warning("[%s] %s, retrying", name, exc.code)
                     self.evict(name)
                     continue

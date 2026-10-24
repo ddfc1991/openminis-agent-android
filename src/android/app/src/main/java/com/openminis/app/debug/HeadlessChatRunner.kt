@@ -142,7 +142,7 @@ internal object HeadlessChatRunner {
         withContext(Dispatchers.IO) {
             val app = app(context)
             val resolvedModel = modelId
-                ?: app.providerRepository.allVisibleEntries().firstOrNull()?.baseModel?.id
+                ?: app.providerRepository.allVisibleEntries().firstOrNull { com.openminis.app.plus.ErrZhCore.chatCapable(it.baseModel.id) }?.baseModel?.id
                 ?: "unknown"
             val s = app.chatRepository.createSession(modelId = resolvedModel, title = null)
             // Mark source so the UI session list shows it came from RPC.

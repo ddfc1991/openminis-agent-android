@@ -1,5 +1,7 @@
 package com.openminis.app.ui.browser
 
+import com.openminis.app.ui.plus.MT
+
 import com.openminis.app.R
 import androidx.compose.ui.res.stringResource
 import androidx.compose.foundation.clickable
@@ -19,12 +21,12 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Language
-import androidx.compose.material3.AlertDialog
+import com.openminis.app.ui.glass.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
+import com.openminis.app.ui.glass.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
@@ -178,7 +180,7 @@ fun BrowserHistorySheet(
                                 }
                                 Text(
                                     SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(entry.timestamp)),
-                                    fontSize = 11.sp,
+                                    fontSize = MT.Caption,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
                                 )
                             }

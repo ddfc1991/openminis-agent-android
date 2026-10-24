@@ -155,10 +155,16 @@ object ExitInfoCollector {
                 appendLine("--- Tombstone (truncated to ${MAX_TRACE_BYTES / 1024} kB) ---")
                 appendLine(readTrace(info) ?: "(no trace available)")
             }
+            // [Mines-38.9.11.3] an ANR record carries the main-thread stacks at the moment of the freeze
+            if (info.reason == ApplicationExitInfo.REASON_ANR) {
+                appendLine()
+                appendLine("--- ANR traces (truncated to ${MAX_TRACE_BYTES / 1024} kB) ---")
+                appendLine(readTrace(info) ?: "(no trace available)")
+            }
         }
 
         return try {
-            out.writeText(body)
+            out.writeText(CrashRedactCore.redact(body))   // [Mines-38.9.11.3] secrets never reach a crash file
             true
         } catch (t: Throwable) {
             Log.w(TAG, "write failed for ${out.name}: ${t.message}")

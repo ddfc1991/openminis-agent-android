@@ -1,5 +1,7 @@
 package com.openminis.app.ui.onboarding
 
+import com.openminis.app.ui.plus.MT
+
 import com.openminis.app.R
 import androidx.compose.ui.res.stringResource
 import androidx.compose.foundation.background
@@ -144,7 +146,7 @@ private fun ApiKeyStep(
                         Text(
                             type.displayName,
                             modifier = Modifier.padding(8.dp),
-                            fontSize = 12.sp,
+                            fontSize = MT.Caption,
                             fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
                             color = if (isSelected) MaterialTheme.colorScheme.primary
                             else MaterialTheme.colorScheme.onSurface,
@@ -302,7 +304,7 @@ private fun ModelSelectionStep(
                                     Text(
                                         "${selectionIndex + 1}",
                                         color = MaterialTheme.colorScheme.onPrimary,
-                                        fontSize = 12.sp,
+                                        fontSize = MT.Caption,
                                         fontWeight = FontWeight.Bold,
                                     )
                                 }
@@ -342,7 +344,7 @@ private fun ModelSelectionStep(
                     onClick = {
                         // Create default model group from selections
                         if (selected.isNotEmpty()) {
-                            val group = ModelGroup(name = "Default Models")
+                            val group = ModelGroup(name = "默认模型")
                             group.memberEntryIds.addAll(selected)
                             providerRepository.addGroup(group)
                             if (config.defaultPrimaryGroupId == null) {

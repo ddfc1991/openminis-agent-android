@@ -71,7 +71,7 @@ fun MinisMenu(
     // in dark, a subtle shade in light) so the menu pops out — same fix already
     // validated on the text-selection toolbar (T-android-text-toolbar-dark-
     // visibility). The dark-mode `border` below adds the extra edge definition.
-    containerColor: Color = if (ChatColors.isDark) MaterialTheme.colorScheme.surfaceContainerHigh else Color.White,
+    containerColor: Color = MaterialTheme.colorScheme.surfaceContainerHigh,  // [Mines-38.9.5 i] glass in both modes (was solid white in light)
     tonalElevation: Dp = 3.dp,
     // [T-android-menu-launcher-shadow] Analyzed against the Pixel Launcher
     // long-press popup (screenshot sample): its shadow is a WIDE, very
@@ -113,10 +113,12 @@ fun MinisMenu(
     val density = LocalDensity.current
     val offsetXPx = with(density) { offset.x.roundToPx() }
     val offsetYPx = with(density) { offset.y.roundToPx() }
+    // [Mines-38.9.6 i12] room for the outside-only halo inside the popup window; the position provider cancels it out
+    val haloPx = with(density) { MENU_HALO.roundToPx() }
     Popup(
         onDismissRequest = onDismissRequest,
         properties = properties,
-        popupPositionProvider = remember(offsetXPx, offsetYPx, alignEnd) {
+        popupPositionProvider = remember(offsetXPx, offsetYPx, alignEnd, haloPx) {
             object : PopupPositionProvider {
                 override fun calculatePosition(
                     anchorBounds: IntRect,
@@ -128,14 +130,14 @@ fun MinisMenu(
                     // Default: left edge of popup = left edge of anchor (the
                     // Material3 DropdownMenu default we're replacing).
                     val x = if (alignEnd) {
-                        (anchorBounds.right - popupContentSize.width + offsetXPx)
+                        (anchorBounds.right - popupContentSize.width + offsetXPx + haloPx)
                     } else {
-                        (anchorBounds.left + offsetXPx)
+                        (anchorBounds.left + offsetXPx - haloPx)
                     }.coerceIn(0, (windowSize.width - popupContentSize.width).coerceAtLeast(0))
                     // Below the anchor; auto-flip above when there's no room.
                     // Mirrors DropdownMenu's auto-flip semantics.
-                    val belowY = anchorBounds.bottom + offsetYPx
-                    val aboveY = anchorBounds.top - popupContentSize.height - offsetYPx
+                    val belowY = anchorBounds.bottom + offsetYPx - haloPx
+                    val aboveY = anchorBounds.top - popupContentSize.height - offsetYPx + haloPx
                     val fitsBelow = belowY + popupContentSize.height <= windowSize.height
                     val y = if (fitsBelow || aboveY < 0) belowY else aboveY
                     return IntOffset(
@@ -165,43 +167,28 @@ fun MinisMenu(
             ) + fadeIn(animationSpec = tween(200)),
             exit = scaleOut(animationSpec = tween(120)) + fadeOut(animationSpec = tween(120)),
         ) {
-            Surface(
-                // [T-android-minis-menu-width] Size to the CONTENT's intrinsic
-                // width (the widest menu item), then clamp to [minWidth, 280dp].
-                // This restores Material3 DropdownMenu's "hug the content" sizing
-                // that the unified-Popup rewrite lost: without IntrinsicSize.Max,
-                // DropdownMenuItem's internal fillMaxWidth expanded the Column to
-                // the 280dp cap, making short menus (the top-bar tools menu) look
-                // far too wide (T252's "blows out" symptom). 280dp stays as the
-                // upper bound so a very long localised item can't span the screen.
-                modifier = modifier
+            // [Mines-38.9.6 i12] ONE rounded glass surface (GlassSurface: 暖瓷 tint at the global glass alpha over the blurred
+            // page copy, sheen, hairline, halo drawn outside the outline only). The old Surface + Modifier.shadow(24 dp) under a
+            // translucent fill showed the shadow's square umbra through the glass as a near-white inner block (user shot
+            // 1000129911). containerColor / tonalElevation / border / shadowElevation are kept in the signature but unused.
+            com.openminis.app.ui.plus.GlassWindowEffect()
+            com.openminis.app.ui.plus.GlassSurface(
+                // [T-android-minis-menu-width] hug the widest item, clamp to [minWidth, 280dp]
+                modifier = Modifier.padding(MENU_HALO).then(modifier)
                     .width(IntrinsicSize.Max)
-                    .widthIn(min = minWidth, max = 280.dp)
-                    // Launcher-style soft halo — see the shadowElevation note.
-                    .shadow(
-                        elevation = shadowElevation,
-                        shape = shape,
-                        clip = false,
-                        ambientColor = Color.Black.copy(alpha = 0.35f),
-                        spotColor = Color.Black.copy(alpha = 0.35f),
-                    ),
+                    .widthIn(min = minWidth, max = 280.dp),
                 shape = shape,
-                color = containerColor,
-                tonalElevation = tonalElevation,
-                shadowElevation = 0.dp,
-                border = border,
             ) {
-                // Mirrors DropdownMenu's content layout: a vertically-scrollable
-                // Column inside the surface (scrollState preserved from the old
-                // DropdownMenu branch so long menus still scroll).
                 Column(
-                    modifier = Modifier.verticalScroll(scrollState),
+                    modifier = Modifier.verticalScroll(scrollState).padding(vertical = 6.dp),
                     content = content,
                 )
             }
         }
     }
 }
+
+private val MENU_HALO = 14.dp
 
 /**
  * Subtle inset divider for grouping items inside a [MinisMenu]. T289:

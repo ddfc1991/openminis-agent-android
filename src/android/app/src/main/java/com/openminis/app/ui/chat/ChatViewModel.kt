@@ -89,6 +89,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.produceIn
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -111,6 +112,8 @@ class ChatViewModel(
 ) : ViewModel() {
 
     companion object {
+        /** [Mines-38.9.10 i28] max chars of one tool block's text kept in memory (see minesClipBlock) */
+        const val MINES_BLOCK_CAP = 64_000
         /**
          * [T-fallback-respects-user-switch] Whether a mid-turn group fallback may
          * adopt its new member as the SESSION binding: only while the class-level
@@ -959,6 +962,11 @@ class ChatViewModel(
         _inputText.value = joined
     }
 
+    // [Mines-38.9.5 i] 「引用回复」: quoted text waits above the input and goes out as a Markdown quote with the next send
+    private val _quoteDraft = MutableStateFlow<String?>(null)
+    val quoteDraft: StateFlow<String?> = _quoteDraft.asStateFlow()
+    fun setQuoteDraft(text: String?) { _quoteDraft.value = text?.trim()?.takeIf { it.isNotEmpty() } }
+
     private val _isStreaming = MutableStateFlow(false)
     val isStreaming: StateFlow<Boolean> = _isStreaming.asStateFlow()
 
@@ -987,6 +995,22 @@ class ChatViewModel(
      */
     private val _canResume = MutableStateFlow(false)
     val canResume: StateFlow<Boolean> = _canResume.asStateFlow()
+
+    /** [Mines-loop-30] Non-null while a run is paused by the loop guard: the reason, shown with 继续 / 停止. */
+    private val _loopPause = MutableStateFlow<String?>(null)
+    val loopPause: StateFlow<String?> = _loopPause.asStateFlow()
+
+    /** [Mines-loop-30] 继续: resume the paused run (a fresh run, so the guard starts over). */
+    fun loopPauseContinue() {
+        _loopPause.value = null
+        resume()
+    }
+
+    /** [Mines-loop-30] 停止: leave the run paused for good; the user can type a new message. */
+    fun loopPauseStop() {
+        _loopPause.value = null
+        _canResume.value = false
+    }
 
     /**
      * [T-android-group-pause-badge-restamp] Marks the ONE `_canResume = true`
@@ -1604,10 +1628,17 @@ class ChatViewModel(
     }
 
     /** `"estimatedRequestTokens":…,"estimatedFixedTokens":…` for the usage row, or "". Same keys as iOS StoredTokenUsage. */
-    private fun calibrationJsonFields(): String = lastCalibratedPair?.let { (est, fixed, model) ->
+    private fun calibrationJsonFields(): String = (lastCalibratedPair?.let { (est, fixed, model) ->
         val modelField = model?.let { ""","calibrationModelId":${JSONObject.quote(it)}""" } ?: ""
         ""","estimatedRequestTokens":$est,"estimatedFixedTokens":$fixed$modelField"""
-    } ?: ""
+    } ?: "") + servedByJsonField()
+
+    /** [Mines-38.9.1] the model + account that actually answered this turn (after any 429 rotation), shown as a small tag */
+    private fun servedByJsonField(): String {
+        val m = _modelName.value; val a = _providerName.value
+        val label = listOf(m, a).filter { it.isNotBlank() }.distinct().joinToString(" · ")
+        return if (label.isBlank()) "" else ""","servedBy":${JSONObject.quote(label)}"""
+    }
 
     // ---- [T-android-context-usage-hint] Context-window pressure surface ----
     //
@@ -1930,6 +1961,20 @@ class ChatViewModel(
     }
 
     /** Structured agent history for the agent loop (contentParts-based). */
+    /**
+     * [Mines-38.9.10 i28] memory cap for one tool block's text in the chat list (user's OOM after hours of use): above
+     * [MINES_BLOCK_CAP] chars the block keeps the head and the tail; the full text is spilled to cache/tool-out/<id>.txt.
+     */
+    private fun minesClipBlock(id: String, text: String): String {
+        if (text.length <= MINES_BLOCK_CAP) return text
+        runCatching {
+            val dir = java.io.File(context.cacheDir, "tool-out").apply { mkdirs() }
+            java.io.File(dir, id.replace(Regex("[^A-Za-z0-9_-]"), "_").take(80) + ".txt").writeText(text)
+            dir.listFiles()?.sortedBy { it.lastModified() }?.dropLast(200)?.forEach { it.delete() }
+        }
+        return com.openminis.app.plus.MemGuardCore.clip(text, MINES_BLOCK_CAP) + "\n（输出共 ${text.length} 字，中间部分已省略以节省内存）"
+    }
+
     private val agentHistory = mutableListOf<LLMMessage>()
 
     /**
@@ -1962,6 +2007,7 @@ class ChatViewModel(
             // request and the enum can never advertise a name the resolver
             // would reject.
             rosterNames = providerRepository.subAgents.map { it.name },
+            knowledgeTool = com.openminis.app.plus.KnowledgeBase.toolDefinition(context, sessionId),
         )
 
     /**
@@ -4346,6 +4392,43 @@ class ChatViewModel(
         return true
     }
 
+    /**
+     * [Mines-38.9.12.1] user's OOM 2026-10-23: a long browser task (275 messages) kept the bytes of EVERY screenshot in
+     * [agentHistory] for the life of the run, in each of 5 concurrent sessions. Only the newest
+     * [com.openminis.app.plus.SafeStartCore.KEEP_IMAGES] tool images keep their bytes now; older ones are already on disk
+     * (or are written there once) and the part keeps a read_image path instead. User-attached images are not touched.
+     */
+    private fun releaseOldHistoryImages() {
+        try {
+            val sid = activeSessionId
+            val pos = ArrayList<Pair<Int, Int>>()
+            for ((mi, m) in agentHistory.withIndex()) for ((pi, p) in m.contentParts.withIndex()) {
+                if (p is AgentContentPart.ToolResult && p.imageData != null) pos.add(mi to pi)
+            }
+            val n = com.openminis.app.plus.SafeStartCore.imagesToRelease(pos.size)
+            if (n <= 0) return
+            var freed = 0L
+            for ((mi, pi) in pos.take(n)) {
+                val msg = agentHistory[mi]
+                val parts = msg.contentParts.toMutableList()
+                val p = parts[pi] as? AgentContentPart.ToolResult ?: continue
+                val data = p.imageData ?: continue
+                val path = p.imageLinuxPath ?: if (sid.isNotEmpty()) runCatching {
+                    ContextOffload.offloadImage(context, sid, data, toolId = p.id.ifEmpty { "img_${mi}_$pi" }, mimeType = p.imageMimeType ?: "image/jpeg")
+                }.getOrNull()?.takeIf { it.isNotEmpty() } else null
+                parts[pi] = p.copy(
+                    imageData = null, imageMimeType = null,
+                    content = p.content + (if (p.content.isEmpty()) "" else "\n") + com.openminis.app.plus.SafeStartCore.releasedImageNote(path),
+                )
+                agentHistory[mi] = msg.copy(contentParts = parts)
+                freed += data.size
+            }
+            AppLogger.info(TAG, "[MemImages] released $n of ${pos.size} tool images from memory (${freed / 1024} KB)")
+        } catch (e: Throwable) {
+            AppLogger.warning(TAG, "[MemImages] release failed: ${e.javaClass.simpleName}")
+        }
+    }
+
     /** Base64 expands 3 bytes to 4; the wire size is what the audit cares about. */
     private fun base64Size(rawBytes: Int): Int = if (rawBytes <= 0) 0 else (rawBytes + 2) / 3 * 4
 
@@ -5544,7 +5627,7 @@ class ChatViewModel(
      * Bounds compact-thrash within a single turn; the MAX_AGENT_TURNS ceiling is
      * never reset by compaction, so this is a second, tighter backstop.
      */
-    private val maxInLoopCompactions = 3
+    private val maxInLoopCompactions = 6 // [Mines-ctx-34] long runs (1000+ steps) need more than 3
 
     /**
      * [T-android-auto-compact-inloop] Re-evaluate [ContextPolicy] between agent
@@ -5780,8 +5863,68 @@ class ChatViewModel(
      */
     private val recentlyFailedEntryIds = java.util.Collections.synchronizedSet(mutableSetOf<String>())
 
+    // [Mines-38.9.5 i] the id the home list uses for this conversation + the card's 重试 / 停止
+    private fun minesSid(): String = realSessionId.ifEmpty { sessionId }
+    private val minesProgressActions = com.openminis.app.plus.TaskProgress.Actions(retry = { minesProgressRetry() }, stop = { cancelStream() })
+    /**
+     * [Mines-38.9.6 i14] the card's 重试 (user: 「点了不能继续重试」): works in every state, any number of times. A running turn is
+     * stopped first (waits ≤ 3 s for the stream to unwind), then the last turn runs again (retryLast; a turn that never got
+     * an assistant reply is resumed or its question re-sent).
+     */
+    private fun minesProgressRetry() {
+        val sid = minesSid()
+        viewModelScope.launch {
+            if (_isStreaming.value) {
+                cancelStream()
+                var w = 0
+                while (_isStreaming.value && w < 30) { kotlinx.coroutines.delay(100); w++ }
+                kotlinx.coroutines.delay(250)
+            }
+            com.openminis.app.plus.TaskProgress.onManualRetry(sid)
+            when {
+                _messages.value.any { it.role == "assistant" } -> retryLast()
+                _canResume.value -> resume()
+                else -> _messages.value.lastOrNull { it.role == "user" && !it.isQueued }?.content?.takeIf { it.isNotBlank() }?.let { sendMessage(it) }
+            }
+        }
+    }
+    @Volatile private var minesProgressStartSid: String = ""
+    /** [Mines-38.9.5 i11] a new chat gets its real id during its first turn: move the row there (no phantom 进行中). */
+    private fun minesProgressFollowSid() {
+        val now = minesSid(); val was = minesProgressStartSid
+        if (was.isNotBlank() && now.isNotBlank() && was != now) {
+            com.openminis.app.plus.TaskProgress.move(was, now)
+            com.openminis.app.plus.TaskProgress.register(now, minesProgressActions)
+            minesProgressStartSid = now
+        }
+    }
+    private fun minesProgressTurnStart() {
+        com.openminis.app.plus.TaskProgress.init(context)
+        minesProgressStartSid = minesSid()
+        com.openminis.app.plus.TaskProgress.register(minesSid(), minesProgressActions)
+        // [Mines-38.9.6 i12] every turn gets an automatic 「问：…」 step (the agent's own plan, if any, is kept)
+        val q = _messages.value.lastOrNull { it.role == "user" && !it.isQueued }?.content
+        com.openminis.app.plus.TaskProgress.onTurnStart(minesSid(), q)
+    }
+    /** [Mines-38.9.6 i12] the newest assistant text of this turn (the 「答：…」 step + summary). */
+    private fun minesLastAnswer(): String? {
+        val msgs = _messages.value
+        val ui = msgs.indexOfLast { it.role == "user" && !it.isQueued }
+        return msgs.drop(ui + 1).lastOrNull { it.role == "assistant" && !it.isInternalBridge && it.content.isNotBlank() }?.content
+    }
+
     init {
         loadSession()
+        // [Mines-38.9.6 i14] the card's 重试 / 停止 work as soon as the chat is open (not only after a turn started here), and a
+        // 重试 tapped on the home card for a chat that was not open runs now
+        viewModelScope.launch {
+            kotlinx.coroutines.delay(1200)
+            val sid = minesSid()
+            if (sid.isNotBlank()) {
+                com.openminis.app.plus.TaskProgress.register(sid, minesProgressActions)
+                if (com.openminis.app.plus.TaskProgress.consumePendingRetry(sid)) minesProgressRetry()
+            }
+        }
         // [T-android-context-usage-hint] Loop-END path for the usage line.
         //
         // Driven off the isStreaming EDGE rather than hooked into each
@@ -5797,9 +5940,12 @@ class ChatViewModel(
         viewModelScope.launch {
             var wasStreaming = false
             isStreaming.collect { streaming ->
+                // [Mines-38.9.5 i] conversation progress: turn start / end (stopped by the user or finished)
+                if (streaming && !wasStreaming) runCatching { minesProgressTurnStart() }
                 val justFinished = wasStreaming && !streaming
                 wasStreaming = streaming
                 if (!justFinished) return@collect
+                runCatching { minesProgressFollowSid(); com.openminis.app.plus.TaskProgress.onTurnEnd(minesSid(), lastTurnWasCancelled, minesLastAnswer()) }
                 if (lastTurnWasCancelled) {
                     lastTurnWasCancelled = false
                     return@collect
@@ -6070,7 +6216,7 @@ class ChatViewModel(
             // instantiated against the draft key (e.g. user opened the browser
             // sheet before sending a message). Without this, cookies and
             // downloads keep flowing into the draft directory.
-            if (helperConfig == null) _browserTabPoolRef?.setSession(session.id)
+            if (helperConfig == null) { runCatching { com.openminis.app.browser.ConvProfiles.rename(sessionId, session.id) }; _browserTabPoolRef?.setSession(session.id) }
         }
         // Persist the current model binding so it survives re-entry
         val groupId = _selectedGroupId.value
@@ -6509,6 +6655,13 @@ class ChatViewModel(
             // one; only a crossing that happens while the user is here counts.
             // The glow still paints from `contextUsage`, so a heavy session
             // looks heavy on open — it just does not interrupt.
+            // [38.9.11.3.1] the fixed share needs the tool list, whose vision check reads stored credentials (Android
+            // Keystore — seconds on some phones, and Tink serialises it behind one lock): work it out off the main thread
+            // so the publish below only does arithmetic. (ANR on realme RMX5062, 2026-10-21.)
+            if (contextFixedTokens == 0) runCatching {
+                val fixed = withContext(Dispatchers.IO) { ContextSizeMeter.estimateFixedTokens(buildSystemPrompt(), agentTools) }
+                if (contextFixedTokens == 0) contextFixedTokens = fixed
+            }
             withContext(Dispatchers.Main) {
                 _contextUsageHint.value = null
                 // [T-ctx-measure-outbound] The glow's source was never reset on
@@ -7034,9 +7187,12 @@ class ChatViewModel(
                 // just failed. Falls back to `first()` when every candidate is
                 // marked, so a fully-degraded group still resolves rather than
                 // refusing to pick at all.
-                RoutingStrategy.fallback ->
-                    available.firstOrNull { it.id !in recentlyFailedEntryIds }
-                        ?: available.first()
+                RoutingStrategy.fallback -> {
+                    // [Mines] 智能路由: fastest healthy member first when on.
+                    val ordered = com.openminis.app.plus.SmartRouter.order(available)
+                    ordered.firstOrNull { it.id !in recentlyFailedEntryIds }
+                        ?: ordered.first()
+                }
             }
 
         val instance = providerRepository.instance(targetEntry.providerInstanceId) ?: return false
@@ -7194,7 +7350,9 @@ class ChatViewModel(
      * The rest of the prompt is not model-specific on Android.
      */
     private fun systemPromptFor(provider: LLMProvider, prompt: String?): String? {
-        val prefix = com.openminis.app.auth.ClaudeOAuthManager.ANTHROPIC_OAUTH_IDENTIFIER_PROMPT
+        val oauthProvider = (provider as? com.openminis.app.provider.anthropic.AnthropicProvider)?.isOAuth == true
+        val prefix = if (oauthProvider) com.openminis.app.auth.ClaudeOAuthManager.ANTHROPIC_OAUTH_IDENTIFIER_PROMPT
+            else com.openminis.app.auth.ClaudeOAuthManager.identifierPromptOrEmpty
         if (prompt == null || prefix.isEmpty()) return prompt
         val bare = if (prompt.startsWith(prefix)) prompt.removePrefix(prefix).trimStart('\n') else prompt
         val oauth = (provider as? com.openminis.app.provider.anthropic.AnthropicProvider)?.isOAuth == true
@@ -7448,6 +7606,7 @@ class ChatViewModel(
             val idx = if (currentIdx >= 0) (currentIdx + offset) % members.size else offset
             val entryId = members[idx]
             val entry = config.modelEntries.find { it.id == entryId } ?: continue
+            if (!com.openminis.app.plus.ErrZhCore.chatCapable(entry.model.id)) continue   // [38.9.11.3] never fall back to TTS / embedding / image models
             val instance = config.instances.find { it.id == entry.providerInstanceId } ?: continue
             if (!instance.isEnabled) continue
             // [T-android-group-resolve-skip-uncredentialed] Credential test via
@@ -7461,7 +7620,10 @@ class ChatViewModel(
             } catch (_: Exception) { continue }
             result.add(FallbackCandidate(provider = p, entryId = entry.id))
         }
-        return result
+        // [Mines] 智能路由: walk the fallback chain fastest-healthy first.
+        return com.openminis.app.plus.SmartRouter.sortByHealth(result) { c ->
+            config.modelEntries.find { it.id == c.entryId }?.providerInstanceId
+        }
     }
 
     /**
@@ -7521,6 +7683,7 @@ class ChatViewModel(
             if (entryId == activeEntry) continue
             val entry = config.modelEntries.find { it.id == entryId } ?: continue
             if (entry.isHidden) continue
+            if (!com.openminis.app.plus.ErrZhCore.chatCapable(entry.model.id)) continue   // [38.9.11.3] never fall back to TTS / embedding / image models
             // Skip an entry that is merely the same model we just failed on.
             if (entry.model.id == primaryProvider.model.id &&
                 entry.providerInstanceId ==
@@ -9029,10 +9192,13 @@ class ChatViewModel(
     }
 
     fun sendMessage(text: String) {
+        _loopPause.value = null // [Mines-loop-30] a new message ends a guard pause
         // [T-android-stop-sibling-subagent] New work in this session lifts the
         // stop: delegations from here on may drive the turn again.
         com.openminis.app.agent.jobs.AgentJobRegistry.clearDelegationMute(activeSessionId)
-        sendMessage(text, skipContextCheck = false, headless = false)
+        val q = _quoteDraft.value
+        val out = if (q != null) { _quoteDraft.value = null; com.openminis.app.plus.QuoteReply.compose(q, text) } else text
+        sendMessage(out, skipContextCheck = false, headless = false)
     }
 
     /**
@@ -9093,6 +9259,8 @@ class ChatViewModel(
         // scheduled fire into an idle chat) reach this funnel without the
         // public sendMessage, and are new work too.
         com.openminis.app.agent.jobs.AgentJobRegistry.clearDelegationMute(activeSessionId)
+        // [38.9.11.3] 台账: an account / e-mail the user names in this conversation is the one filled on sign-in pages
+        runCatching { com.openminis.app.plus.Ledger.noteText(minesSid(), text); if (activeSessionId != minesSid()) com.openminis.app.plus.Ledger.noteText(activeSessionId, text) }
         // [T-android-paste-mediaref] `[Pasted#N]` markers are NOT expanded here
         // any more.
         //
@@ -9485,9 +9653,30 @@ class ChatViewModel(
      *
      *  Also clears [ChatMessage.isAwaitingModelResponse] — without this, an
      *  exception thrown after a tool turn (which sets isAwaitingModelResponse=
-     *  true at runAgentLoop ~4015) leaves the "Minis is thinking" indicator
+     *  true at runAgentLoop ~4015) leaves the "Mines is thinking" indicator
      *  on screen even though streaming is over. The flag is per-message and
      *  is not implicitly cleared by isStreaming=false. */
+    /** [Mines-38.9.11.3] the provider (服务商) label behind a provider object, for short Chinese error lines */
+    private fun providerLabelOf(p: com.openminis.app.provider.LLMProvider): String = runCatching {
+        val cfg = providerRepository.config.value
+        val e = cfg.modelEntries.firstOrNull { it.id == _activeEntryId.value && it.model.id == p.model.id }
+            ?: cfg.modelEntries.firstOrNull { it.model.id == p.model.id }
+        e?.let { providerRepository.instance(it.providerInstanceId)?.label }?.ifBlank { null }
+    }.getOrNull() ?: _providerName.value
+
+    /** [Mines-38.9.11.3] a 401 on a provider with a key pool → the same model with the next good key (null = none left) */
+    private fun rotateKeyFor(p: com.openminis.app.provider.LLMProvider): Pair<com.openminis.app.provider.LLMProvider, String>? {
+        val cfg = providerRepository.config.value
+        val entry = cfg.modelEntries.firstOrNull { it.id == _activeEntryId.value && it.model.id == p.model.id }
+            ?: cfg.modelEntries.firstOrNull { it.model.id == p.model.id && providerRepository.keyPool(it.providerInstanceId).size > 1 } ?: return null
+        val inst = providerRepository.instance(entry.providerInstanceId) ?: return null
+        val pool = providerRepository.keyPool(inst.id)
+        if (pool.size < 2 || pool.none { !com.openminis.app.plus.BadKeys.isBad(it) }) return null
+        val key = providerRepository.usableApiKey(inst) ?: return null
+        if (com.openminis.app.plus.BadKeys.isBad(key)) return null
+        return ProviderFactory.create(inst, key, entry.model, context, sessionId = activeSessionId, overrides = entry.overrides) to inst.label.ifEmpty { entry.model.provider }
+    }
+
     private fun setInlineError(errorText: String) {
         // [T-error-persist-android] Never let an empty/blank error string reach
         // the banner. The UI gate is `message.error?.let { … }` — a non-null ""
@@ -9495,7 +9684,15 @@ class ChatViewModel(
         // would stick across reloads. An exception with a blank `message`
         // (`e.message ?: "Unknown error"` only guards null, not "") is the
         // realistic source. Coalesce to a generic non-empty message.
+        // [38.9.11.3] known English errors (invalid key, cut stream, 429, timeouts) → one short Chinese line naming the provider
         val safeError = errorText.ifBlank { context.getString(R.string.error_empty_response_generic) }
+            .let { e -> runCatching { com.openminis.app.plus.ProviderRouteCore.zhError(e, _providerName.value) }.getOrNull() ?: e }
+            // [Mines-38.1b] the banner showed 「Provider error: 模型输出变成了乱码…」 — drop the English
+            // exception prefix when the reason itself is already a Chinese sentence
+            .replace(Regex("^(Provider error|Transient error|Invalid API key|Rate limited): (?=[^\\n]*[\\u4e00-\\u9fff])"), "")
+            // [Mines-38.9.5 i] a 502 / 503 / 504 / time-out / cut stream gets one plain Chinese reason in front
+            .let { e -> com.openminis.app.plus.TaskProgressCore.errorReason(e)?.takeIf { r -> !e.contains(r) }?.let { r -> "$r\n$e" } ?: e }
+        runCatching { minesProgressFollowSid(); com.openminis.app.plus.TaskProgress.onFailed(minesSid(), safeError) }
         // T-streaming-side-channel: before mutating the canonical message,
         // drain any in-flight streaming delta so the error frame carries
         // the actual accumulated content (otherwise the user sees content
@@ -9542,6 +9739,7 @@ class ChatViewModel(
      * Mirrors iOS streamWithAutoRetry: `chatMessage?.error = desc` without dropping the loop.
      */
     private fun setTransientInlineError(errorText: String) {
+        runCatching { minesProgressFollowSid(); com.openminis.app.plus.TaskProgress.onRetrying(minesSid(), errorText) }  // [Mines-38.9.5 i] counts the auto-retry
         val msgs = _messages.value.toMutableList()
         val lastAssistantIdx = msgs.indexOfLast { it.role == "assistant" }
         if (lastAssistantIdx < 0) return
@@ -9552,6 +9750,7 @@ class ChatViewModel(
 
     /** Clear any inline error on the last assistant message (used after successful retry). */
     private fun clearInlineError() {
+        runCatching { com.openminis.app.plus.TaskProgress.onRecovered(minesSid()) }  // [Mines-38.9.5 i]
         val msgs = _messages.value.toMutableList()
         val lastAssistantIdx = msgs.indexOfLast { it.role == "assistant" }
         if (lastAssistantIdx < 0) return
@@ -10660,7 +10859,7 @@ class ChatViewModel(
         val allToolInputs = mutableMapOf<String, String>()
 
         // Add placeholder assistant message (once). Mark as awaiting so the
-        // "Minis is thinking" indicator shows during the initial request gap
+        // "Mines is thinking" indicator shows during the initial request gap
         // before the first stream chunk arrives. Mirrors iOS isAwaitingModelResponse.
         // T300: snapshot the user's current thinking level at message
         // creation so the renderer can hide Deep Thinking blocks for
@@ -10727,7 +10926,20 @@ class ChatViewModel(
         // loop or survive a cancel. A mid-loop injection that carries its own
         // prefill re-arms it (see the injectQueuedPromptsAsNewTurn call site).
         var pendingScriptedTurn: com.openminis.app.scheduled.ScriptedToolTurn? = scriptedTurnFor(prefill)
-        for (turn in 0 until turnCap) {
+        // [Mines-loop-30] Repeat detection + per-run tool-call cap (see RunLoopGuard).
+        val runGuard = com.openminis.app.agent.RunLoopGuard(com.openminis.app.agent.RunLoopGuard.maxToolCalls(context))
+        // [Mines-degen-34] per-turn thinking length cap (characters), configurable in 设置 → 沙箱与防杀
+        val degenThinkCap = com.openminis.app.agent.RunLoopGuard.thinkingCap(context)
+        // [Mines-loop-34] same failing tool + same error 3× → stop; weak-model hint once per run
+        val failGuard = com.openminis.app.agent.FailurePatternGuard()
+        var weakModelHinted = false
+        var escalatedFrom: LLMProvider? = null   // [Mines-38.9.9] 自动调度: model this run escalated from
+        // [Mines-38.9] 经验库: what this run did (for the self-check + record at the end) and the request it serves
+        val expCalls = ArrayList<com.openminis.app.agent.ExperienceCore.Call>()
+        val expTask = agentHistory.lastOrNull { it.role == LLMMessage.Role.USER && it.content.isNotBlank() }?.content.orEmpty()
+        val wfStartedAt = System.currentTimeMillis()   // [Mines-38.9.8] 工作流记录
+        var expLessonDone = false
+        turnLoop@ for (turn in 0 until turnCap) {
             // [T-android-switch-model-next-request] The user picked another
             // model while this turn ran. Apply it HERE, before the next
             // request: the request or tool call that was in flight when they
@@ -11046,7 +11258,7 @@ class ChatViewModel(
                     // placeholder, while `loopExitedNormally = true` below
                     // deliberately skips finalizeAtTurnLimit at the loop tail.
                     //
-                    // Without this the bubble stays on "Minis is thinking"
+                    // Without this the bubble stays on "Mines is thinking"
                     // forever — the streamJob's finally only clears the GLOBAL
                     // _isStreaming, not the per-message flags. Reachable with no
                     // failure at all: ContextPolicy gives every model with a
@@ -11202,6 +11414,12 @@ class ChatViewModel(
             // so we catch at collect level and unwrap.
             var collectDone = false
             var retryAttempt = 0  // per-turn auto-retry counter (resets on each new turn)
+            // [Mines-degen-34] garbage / runaway-thinking guard for this turn
+            val degen = com.openminis.app.agent.DegenerationDetector()
+            var degenRetries = 0
+            var degenForceFallback = false
+            var badKeyRotations = 0   // [38.9.11.3] same-provider key swaps after a 401 this turn
+            var turnThinkingOverride: ThinkingLevel? = null
             while (!collectDone) {
                 try {
                     // [T-android-enhanced-cache] Stamp the per-turn Enhanced
@@ -11288,6 +11506,7 @@ class ChatViewModel(
                         // [T-ctx-measure-outbound] Record our estimate of THIS request
                         // (pre-budget, like every measurement) so the provider's count
                         // for it calibrates the meter, and size max_tokens from it.
+                        releaseOldHistoryImages()   // [Mines-38.9.12.1] only the newest tool images keep bytes in memory
                         val outboundHistory = effectiveAgentHistory()
                         val dispatchInputTokens = recordContextDispatch(outboundHistory, currentProvider.model)
                         AppLogger.info(
@@ -11312,13 +11531,20 @@ class ChatViewModel(
                             // currentModel mid-turn while the turn keeps its local
                             // provider, so reading the class-level model would send the
                             // NEW model's reasoning decision to the OLD model.
-                            thinkingLevel = if (currentProvider.model.supportsReasoning == true) _thinkingLevel.value else ThinkingLevel.OFF,
+                            thinkingLevel = if (currentProvider.model.supportsReasoning == true) (turnThinkingOverride ?: _thinkingLevel.value) else ThinkingLevel.OFF,
                         )
                     }
-                    turnChunks.collect { chunk ->
+                    // [Mines-38.9.1] user 2026-10-17: after a 429 the next member never answered and the turn sat on
+                    // 「正在思考…」 forever. No first chunk within MINES_FIRST_CHUNK_MS = this member is dead for now →
+                    // fallbackable ProviderError, so the group moves on (or the turn ends with the reason) instead of hanging.
+                    // [Mines-38.9.11.3] the provider now bounds connect (10 s per route) and first token (45 s / 90 s reasoning) itself and
+                    // moves on at once; this deadline is only the backstop = both routes' connects + probe + first token.
+                    (if (scriptedTurn != null) turnChunks else turnChunks.minesFirstChunkDeadline(
+                        com.openminis.app.plus.ProviderRouteCore.silentBudgetMs(currentProvider.model.supportsReasoning == true))).collect { chunk ->
                 // [T-STALL-DIAG] Mark first byte back from the provider and log
                 // the time-to-first-chunk once per turn.
                 if (firstChunkSeen.compareAndSet(false, true)) {
+                    com.openminis.app.plus.ProviderRoutes.idle()   // [38.9.11.3] 「正在连接 / 正在思考」 ends with the first token
                     // [T-switch-model-retry-counter-reset] The retried attempt is
                     // producing output, so the ladder is done. isBoundToAbandonedModel()
                     // reads these counters; left set until the stream COMPLETES, a
@@ -11335,6 +11561,15 @@ class ChatViewModel(
                 when (chunk) {
                     is LLMStreamChunk.ThinkingDelta -> {
                         turnThinking.append(chunk.text)
+                        // [Mines-degen-34] abort garbage / endless thinking; let a queued user message cut in
+                        degen.feed(chunk.text)?.let { throw com.openminis.app.agent.DegenerateOutputException(it) }
+                        if (turnThinking.length > degenThinkCap) {
+                            throw com.openminis.app.agent.DegenerateOutputException("超过 $degenThinkCap 字", thinkingCap = true)
+                        }
+                        if (turnThinking.length > 3000 && helperConfig == null && turnThinking.length % 50 < chunk.text.length.coerceAtLeast(1) &&
+                            QueuedPromptBatching.nextInsertBatch(_promptQueue.value).any { it.origin == QueuedPromptOrigin.USER }) {
+                            throw com.openminis.app.agent.QueuedInterruptException()
+                        }
                         // [T-android-live-update-content] Surface the
                         // thinking phase to the FGS notification / overlay.
                         // Deduped inside the tracker, so per-token cost is
@@ -11379,6 +11614,7 @@ class ChatViewModel(
                         // T307: append-only on the StringBuilder; .toString()
                         // is taken once below at flush time, not per delta.
                         turnTextSb.append(chunk.text)
+                        degen.feed(chunk.text)?.let { throw com.openminis.app.agent.DegenerateOutputException(it) }
                         // Append to the trailing text block — or open a new one if the last
                         // block isn't a text block (i.e. a tool call or thinking was in between).
                         // This preserves the chronological interleaving of text and tool calls
@@ -11752,6 +11988,7 @@ class ChatViewModel(
                         // success, error, or cancellation — so it can never
                         // outlive its turn and spam the log.
                         firstChunkWatchdog.cancel()
+                        com.openminis.app.plus.ProviderRoutes.idle()
                         if (!firstChunkSeen.get()) {
                             println(
                                 "[T-STALL-DIAG] stream ENDED-WITHOUT-CHUNK sid=$diagSid turn=$turn " +
@@ -11768,6 +12005,73 @@ class ChatViewModel(
                 } catch (e: Exception) {
                     if (e is CancellationException && e.cause == null) throw e  // real job cancellation
                     val actual = unwrapFlowException(e)
+                    // [Mines-degen-34] Our own aborts: degenerated output / runaway thinking / queued user message.
+                    val qInt = (e as? com.openminis.app.agent.QueuedInterruptException) ?: (actual as? com.openminis.app.agent.QueuedInterruptException)
+                    val dgn = (e as? com.openminis.app.agent.DegenerateOutputException) ?: (actual as? com.openminis.app.agent.DegenerateOutputException)
+                    if (qInt != null || dgn != null) {
+                        AppLogger.warning(TAG_STREAM, "[Degen] turn=$turn model=${currentProvider.model.displayName} " +
+                            (dgn?.message ?: "queued user message cuts in") + " thinking=${turnThinking.length} retries=$degenRetries")
+                        // Roll back this attempt's partial blocks (garbage is not kept on screen or in history).
+                        while (allToolBlocks.size > turnStartBlockIndex) allToolBlocks.removeAt(allToolBlocks.size - 1)
+                        turnTextSb.setLength(0)
+                        currentTextBlockSb = null
+                        turnTextBlockIdx = -1
+                        turnThinking.clear()
+                        toolCalls.clear()
+                        toolCallSignatures.clear()
+                        pendingChunkSb.setLength(0)
+                        lastUiUpdateMs = 0L
+                        lastFlushedLen = 0
+                        lastFileToolInputMs = 0L
+                        lastOtherToolInputMs = 0L
+                        degen.reset()
+                        withContext(Dispatchers.Main) { updateAssistantMessage(assistantId, accumulatedText, true, allToolBlocks) }
+                    }
+                    if (qInt != null) {
+                        val qBatch = QueuedPromptBatching.nextInsertBatch(_promptQueue.value)
+                        val handledQ = try {
+                            injectQueuedPromptsAsNewTurn(
+                                finishedAssistantId = assistantId,
+                                finishedAccumulatedText = accumulatedText,
+                                finishedAllToolBlocks = allToolBlocks,
+                                batch = qBatch,
+                            )
+                        } catch (ie: Exception) { Log.e(TAG, "inject on thinking interrupt failed", ie); null }
+                        if (handledQ != null) {
+                            assistantId = handledQ.newAssistantId
+                            scriptedTurnFor(handledQ.prefill)?.let { pendingScriptedTurn = it }
+                            accumulatedText = ""
+                            allToolBlocks.clear()
+                            allToolInputs.clear()
+                            toolInputChunkRings.clear()
+                            _canResume.value = false
+                            continue@turnLoop
+                        }
+                        continue // nothing to inject after all: retry the same request
+                    }
+                    if (dgn != null) {
+                        if (degenRetries == 0) {
+                            // Retry once with a lower thinking level.
+                            degenRetries = 1
+                            turnThinkingOverride = when (_thinkingLevel.value) {
+                                ThinkingLevel.OFF, ThinkingLevel.LOW -> ThinkingLevel.OFF
+                                else -> ThinkingLevel.LOW
+                            }
+                            allToolBlocks.add(AssistantBlock(
+                                id = "degen_info_${turn}_${System.currentTimeMillis()}",
+                                kind = "info",
+                                content = "⚠️ ${dgn.message}。已降低思考强度，重试一次。",
+                                toolTitle = "已打断",
+                                toolStatus = ToolBlockStatus.SUCCESS,
+                            ))
+                            withContext(Dispatchers.Main) { updateAssistantMessage(assistantId, accumulatedText, true, allToolBlocks) }
+                            continue
+                        }
+                        // Repeated: mark the model 不稳定 (shown in 模型路由) and move to the next model in the group.
+                        com.openminis.app.plus.ModelHealth.markUnstable(context, currentProvider.model.id,
+                            currentProvider.model.displayName, dgn.why)
+                        degenForceFallback = true
+                    }
                     val isRateLimit = actual is com.openminis.app.data.model.LLMError.RateLimited
                     // [T-android-503-fallback] A confirmed HTTP 5xx, taken from
                     // the structured status the provider mappers now attach.
@@ -11975,6 +12279,27 @@ class ChatViewModel(
                         )
                         // Fall through: the user still gets the real reason.
                     }
+                    // [Mines-38.9.11.3] user: 「出错 · Invalid API key」 (商汤). The key is already marked bad (BadKeys); a provider
+                    // with more keys gets the next good one right away (same model, no waiting), with one Chinese line.
+                    if (actual is com.openminis.app.data.model.LLMError.InvalidApiKey && badKeyRotations < 4) {
+                        val swapped = runCatching { rotateKeyFor(currentProvider) }.getOrNull()
+                        if (swapped != null) {
+                            badKeyRotations++
+                            currentProvider = swapped.first
+                            allToolBlocks.add(AssistantBlock(
+                                id = "badkey_info_${turn}_${System.currentTimeMillis()}",
+                                kind = "info",
+                                content = "${swapped.second} 的密钥无效，已换同一服务商的下一个密钥",
+                                toolTitle = "已换密钥",
+                                toolStatus = ToolBlockStatus.SUCCESS,
+                            ))
+                            withContext(Dispatchers.Main) { updateAssistantMessage(assistantId, accumulatedText, true, allToolBlocks) }
+                            turnTextSb.setLength(0); currentTextBlockSb = null; turnTextBlockIdx = -1
+                            turnThinking.clear(); toolCalls.clear(); toolCallSignatures.clear()
+                            pendingChunkSb.setLength(0); lastUiUpdateMs = 0L; lastFlushedLen = 0
+                            continue
+                        }
+                    }
                     val isFallbackableError =
                         (actual as? com.openminis.app.data.model.LLMError)?.isFallbackable == true
                     // [T-ctx-overflow-no-cross-fallback] A context-length rejection
@@ -11990,8 +12315,8 @@ class ChatViewModel(
                     // group, as on iOS; other errors are unaffected.
                     val isDirectEntryOverflow = _selectedGroupId.value == null &&
                         ContextOverflowGuard.isContextOverflow(overflowErr?.httpStatus, overflowErr?.detail)
-                    val shouldFallback = !isDirectEntryOverflow && (isRateLimit || is5xx || isFallbackableError ||
-                        loopFallbackStrategy == com.openminis.app.data.model.FallbackStrategy.always)
+                    val shouldFallback = degenForceFallback || (!isDirectEntryOverflow && (isRateLimit || is5xx || isFallbackableError ||
+                        loopFallbackStrategy == com.openminis.app.data.model.FallbackStrategy.always))
                     // [T-android-fallback-chain-refill] Rebuild from the live
                     // group, excluding everything already tried in this streak,
                     // instead of popping a queue that can only shrink. The
@@ -12004,7 +12329,17 @@ class ChatViewModel(
                         null
                     } else {
                         _activeEntryId.value?.let { triedEntryIds.add(it) }
-                        remainingFallbacks.removeFirstOrNull()
+                        // [Mines-38.9.9] 自动调度: remember the failure; on 429 / 5xx try the same model on another account first
+                        // (AMD × 14), skip members that failed in the last 10 min, never send bulk steps to a web member
+                        runCatching { com.openminis.app.agent.ModelScore.fail(context, currentProvider.model,
+                            (actual as? com.openminis.app.data.model.LLMError.TransientError)?.httpStatus
+                                ?: (actual as? com.openminis.app.data.model.LLMError.ProviderError)?.httpStatus ?: if (isRateLimit) 429 else 0,
+                            (actual.message ?: "").contains("TTFB") || (actual.message ?: "").lowercase().contains("timeout")) }
+                        (if (com.openminis.app.agent.ModelScore.enabled(context))
+                            com.openminis.app.agent.ModelScoreCore.nextFallback(remainingFallbacks, currentProvider.model.id, { it.provider.model.id },
+                                { com.openminis.app.agent.ModelScore.key(it.provider.model) }, { com.openminis.app.agent.ModelScore.stats(context, it) },
+                                System.currentTimeMillis())?.also { remainingFallbacks.remove(it) }
+                        else remainingFallbacks.removeFirstOrNull())
                             ?.also { triedEntryIds.add(it.entryId) }
                             ?: buildFallbackProviders(currentProvider)
                                 .firstOrNull { it.entryId !in triedEntryIds }
@@ -12020,10 +12355,10 @@ class ChatViewModel(
                     val next = nextCandidate?.provider
                     if (next != null && nextCandidate != null) {
                         val reason = when {
-                            isRateLimit -> "Rate limited"
+                            isRateLimit -> "限流（429）"
                             actual is com.openminis.app.data.model.LLMError.ProviderError -> actual.detail
                             else -> actual.message ?: "Error"
-                        }
+                        }.let { r -> com.openminis.app.plus.ProviderRouteCore.zhError(r, providerLabelOf(currentProvider), switched = true) ?: r }   // [38.9.11.3]
                         // [T-android-model-indicator-flash-on-endpoint-retry]
                         // Same-model recovery is a TRANSPARENT retry, not a real
                         // model switch. A model group can hold several entries
@@ -12038,7 +12373,10 @@ class ChatViewModel(
                         val isRealModelChange = next.model.id != currentProvider.model.id
                         fallbackReasons.add("⚠️ ${currentProvider.model.displayName}: $reason")
                         Log.i(TAG, "🔀 $reason on ${currentProvider.model.displayName}, switching to ${next.model.displayName} (realModelChange=$isRealModelChange)")
+                        if (degenForceFallback) fallbackReasons.add("（${currentProvider.model.displayName} 已在 模型路由 标记为「不稳定」）")
                         currentProvider = next
+                        // [Mines-degen-34] the next model gets its own retry and the user's thinking level
+                        degenRetries = 0; degenForceFallback = false; turnThinkingOverride = null; degen.reset()
                         // [T-fallback-5xx-status] Fresh same-model budget for the
                         // member we just switched to. The counter is per-turn, so
                         // without this reset every member after the first got
@@ -12106,7 +12444,8 @@ class ChatViewModel(
                                 persistBinding("""{"type":"entry","entryId":"${newEntry.id}"}""")
                             }
                         }
-                        val infoText = fallbackReasons.joinToString("\n") + "\n🔄 Switched to ${currentProvider.model.displayName}"
+                        val infoText = fallbackReasons.joinToString("\n") + "\n🔄 已换到 ${currentProvider.model.displayName}" +
+                            (_providerName.value.takeIf { it.isNotBlank() }?.let { " · $it" } ?: "")
                         allToolBlocks.removeAll { it.kind == "info" }
                         allToolBlocks.add(0, AssistantBlock(
                             id = "fallback_info_$turn",
@@ -12156,6 +12495,8 @@ class ChatViewModel(
                                 throw com.openminis.app.data.model.LLMError.ProviderError("$trail\n$finalDesc")
                             }
                         }
+                        if (degenForceFallback) throw com.openminis.app.data.model.LLMError.ProviderError(
+                            "${actual.message}。这个模型已在 模型路由 标记为「不稳定」，换一个模型再试（模型路由里能选）。")
                         throw actual  // re-throw unwrapped, all fallbacks exhausted
                     }
                 }
@@ -12220,6 +12561,23 @@ class ChatViewModel(
                 val turnParts = buildTurnParts(allToolBlocks, turnStartBlockIndex, toolInputMap)
                 val blockMeta = allToolBlocks.filter { it.kind == "tool_use" }.associateBy { it.id }
                 persistAssistantTurn(turnParts, lastUsage, turnReasoningContent, blockMeta, uiAssistantId = assistantId, streamMs = turnStreamMs)
+                runCatching { com.openminis.app.agent.ModelScore.ok(context, currentProvider.model, turnStreamMs, done = accumulatedText.isNotBlank()) }
+                if (escalatedFrom != null && com.openminis.app.agent.ModelScoreCore.webMember(currentProvider.model.id)) com.openminis.app.agent.ModelScore.webBusy = false
+                // [Mines-38.9] plan → execute → self-check → record: a run that went well becomes a 做法 (no question asked)
+                if (helperConfig == null && expCalls.size >= 3 && accumulatedText.isNotBlank()) {
+                    val calls = expCalls.toList(); val fin = accumulatedText
+                    kotlinx.coroutines.withContext(Dispatchers.IO) { com.openminis.app.plus.Experience.recordRun(context, expTask, calls, fin) }
+                }
+                // [Mines-38.9.8] 工作流记录: every run that used a tool is kept (task, steps, result, time); one tap makes it a skill
+                if (helperConfig == null && expCalls.isNotEmpty()) {
+                    val calls = expCalls.toList(); val fin = accumulatedText; val sidW = minesSid()
+                    kotlinx.coroutines.withContext(Dispatchers.IO) {
+                        com.openminis.app.plus.WorkflowLog.record(context, com.openminis.app.plus.WorkflowLogCore.build(
+                            "w" + java.lang.Long.toString(System.currentTimeMillis(), 36), sidW, expTask,
+                            calls.map { com.openminis.app.plus.WorkflowLogCore.Step(it.tool, it.brief, !it.failed, it.error) },
+                            fin, false, wfStartedAt, System.currentTimeMillis()))
+                    }
+                }
                 // [T-error-persist-android] Empty-response hint: the model ended a
                 // turn (finish=stop/end_turn) with no visible text anywhere in the
                 // reply and no tool blocks — the user just sees a blank bubble.
@@ -12689,7 +13047,12 @@ class ChatViewModel(
                         }
 
                         android.util.Log.d("ToolChain[VM]", "[turn=$turn] executeTool START name=$name args=${argsStr.take(200)}")
+                        // [Mines-38.9.6 i12] each tool = one short step on the conversation's progress card (auto tables only)
+                        val minesToolTitle = if (name == com.openminis.app.plus.TaskProgress.TOOL_NAME) null
+                            else runCatching { JSONObject(argsStr).optString("tool_title") }.getOrNull()?.ifBlank { null } ?: name
+                        if (minesToolTitle != null) runCatching { minesProgressFollowSid(); com.openminis.app.plus.TaskProgress.onToolStart(minesSid(), minesToolTitle) }
                         val result = executeTool(name, argsStr, id, allToolBlocks, assistantId, accumulatedText)
+                        if (minesToolTitle != null) runCatching { com.openminis.app.plus.TaskProgress.onToolEnd(minesSid(), minesToolTitle, result.success) }
                         android.util.Log.d("ToolChain[VM]", "[turn=$turn] executeTool END name=$name success=${result.success} title=${result.toolTitle} outputLen=${result.output.length} output=${result.output.take(200)}")
 
                         // Record post-execution. WARNING text is appended to the tool
@@ -12730,7 +13093,7 @@ class ChatViewModel(
                             } else {
                                 result.output
                             }
-                            val finalContent = if (existingContent.length > resultContent.length) existingContent else resultContent
+                            val finalContent = minesClipBlock(id, if (existingContent.length > resultContent.length) existingContent else resultContent)
                             // [T-truncated-args-visibility #119] A call built from
                             // truncated args must not render as a clean success — that
                             // silence is the reported bug. Show it with the same weight
@@ -12807,8 +13170,95 @@ class ChatViewModel(
             // Flatten in tool_use order, never completion order.
             for (parts in slotResults) parts?.let { resultParts.addAll(it) }
 
+            // [Mines-loop-30] Same call / same text again and again → tell the
+            // model (note on the last tool result, so tool pairing stays
+            // valid); if it still repeats, or the per-run cap is hit, pause.
+            val guardCalls = toolCalls.filterNot { com.openminis.app.scheduled.ScriptedToolTurn.isScriptedId(it.first) }
+                .map { it.second to it.third.toString() }
+            val guardVerdict = if (guardCalls.isEmpty()) com.openminis.app.agent.RunLoopGuard.Verdict.OK
+                else runGuard.onTurn(turnText, guardCalls)
+            if (guardVerdict != com.openminis.app.agent.RunLoopGuard.Verdict.OK) {
+                AppLogger.warning(TAG_STREAM, "[LoopGuard] turn=$turn verdict=$guardVerdict calls=${runGuard.toolCalls}/${runGuard.maxToolCalls} repeat=${runGuard.lastRepeat}")
+            }
+            // [Mines-loop-34] failure pattern (tool + normalized error) seen 3 times in this run
+            val failStop: String? = if (helperConfig != null) null else resultParts
+                .filterIsInstance<AgentContentPart.ToolResult>()
+                .firstNotNullOfOrNull { failGuard.onResult(it.name, it.isError, it.content) }
+            if (failStop != null) AppLogger.warning(TAG_STREAM, "[FailGuard] turn=$turn $failStop")
+            // [Mines-38.9] log the calls for the 经验库; the 2nd identical failure → consult the library, change approach
+            runCatching {
+                val argsById = toolCalls.associate { it.first to it.third.toString() }
+                resultParts.filterIsInstance<AgentContentPart.ToolResult>().forEach { r ->
+                    val sig = if (r.isError) com.openminis.app.agent.FailurePatternGuard.signature(r.content, true, r.name).orEmpty() else
+                        com.openminis.app.agent.FailurePatternGuard.signature(r.content, false, r.name).orEmpty()
+                    expCalls += com.openminis.app.agent.ExperienceCore.Call(r.name, com.openminis.app.plus.Experience.brief(argsById[r.id] ?: ""), sig.isNotEmpty(), sig)
+                }
+            }
+            // [Mines-38.9.9] 自动调度: the same step failed twice / several errors → the strongest model the group has for the rest
+            // of this run, with a compact hand-over; the session's own model is untouched (next message starts cheap again)
+            if (helperConfig == null && escalatedFrom == null && com.openminis.app.agent.ModelScore.enabled(context)) runCatching {
+                val calls = expCalls.map { com.openminis.app.agent.ModelScoreCore.Call(it.tool, it.failed, it.error) }
+                val why = com.openminis.app.agent.ModelScoreCore.escalation(calls, com.openminis.app.agent.ModelScoreCore.classify(expTask), accumulatedText)
+                if (why != null) {
+                    val pool = withContext(Dispatchers.Main) { buildFallbackProviders(currentProvider) }
+                    val now = System.currentTimeMillis()
+                    val curKey = com.openminis.app.agent.ModelScore.key(currentProvider.model)
+                    val cands = pool.map { com.openminis.app.agent.ModelScoreCore.Cand(com.openminis.app.agent.ModelScore.key(it.provider.model), it.provider.model.id) }
+                    val best = com.openminis.app.agent.ModelScoreCore.strongest(cands, curKey, { com.openminis.app.agent.ModelScore.stats(context, it) }, now,
+                        com.openminis.app.agent.ModelScore.webBusy)
+                    val pick = best?.let { b -> pool.firstOrNull { com.openminis.app.agent.ModelScore.key(it.provider.model) == b.key } }
+                    if (pick != null) {
+                        escalatedFrom = currentProvider
+                        val from = currentProvider.model.displayName
+                        currentProvider = pick.provider
+                        triedEntryIds.add(pick.entryId)
+                        if (com.openminis.app.agent.ModelScoreCore.webMember(pick.provider.model.id)) com.openminis.app.agent.ModelScore.webBusy = true
+                        val li = resultParts.indexOfLast { it is AgentContentPart.ToolResult }
+                        if (li >= 0) {
+                            val tr = resultParts[li] as AgentContentPart.ToolResult
+                            resultParts[li] = tr.copy(content = tr.content + "\n\n" + com.openminis.app.agent.ModelScoreCore.summary(expTask, calls, expCalls.map { it.brief }))
+                        }
+                        val line = "$why：$from → ${pick.provider.model.displayName}"
+                        AppLogger.warning(TAG_STREAM, "[AutoSched] $line")
+                        com.openminis.app.plus.TaskProgress.onToolStart(minesSid(), line)
+                        com.openminis.app.plus.TaskProgress.onToolEnd(minesSid(), line, true)
+                        withContext(Dispatchers.Main) { appendSystemInfo("已换难题模型 · $line", "info") }
+                    }
+                }
+            }
+            if (failStop == null && helperConfig == null && failGuard.consult.isNotEmpty()) {
+                val (ct, cs) = failGuard.consult.first(); failGuard.consult.clear()
+                val li = resultParts.indexOfLast { it is AgentContentPart.ToolResult }
+                if (li >= 0) runCatching {
+                    val hits = com.openminis.app.plus.Experience.relevant(context, expTask + " " + ct + " " + cs)
+                    val tr = resultParts[li] as AgentContentPart.ToolResult
+                    resultParts[li] = tr.copy(content = tr.content + "\n\n" + com.openminis.app.agent.ExperienceCore.consultNote(ct, cs, hits))
+                    AppLogger.warning(TAG_STREAM, "[FailGuard] consult at 2nd repeat: $ct | $cs | hits=${hits.size}")
+                }
+            }
+            if (failStop != null && !expLessonDone && helperConfig == null) {
+                expLessonDone = true
+                com.openminis.app.plus.Experience.recordLesson(context, expTask, failGuard.lastTool, failGuard.lastSignature,
+                    "别再用同样的方法重试；" + failGuard.nextStep().removeSuffix("吗？").removeSuffix("？"))
+            }
+            // [Mines-loop-34] weak / flash model on a long tool run → one gentle hint to switch in 模型路由
+            if (!weakModelHinted && helperConfig == null && runGuard.toolCalls >= 15 &&
+                com.openminis.app.plus.ModelHealth.isWeak(currentProvider.model.id, currentProvider.model.displayName)) {
+                weakModelHinted = true
+                withContext(Dispatchers.Main) {
+                    appendSystemInfo("当前模型「${currentProvider.model.displayName}」偏轻量，长任务容易绕圈。复杂的事建议在 设置 → 模型路由 换成更强的模型（如 DeepSeek、GLM、Claude）。", "info")
+                }
+            }
+            if (guardVerdict == com.openminis.app.agent.RunLoopGuard.Verdict.WARN) {
+                val li = resultParts.indexOfLast { it is AgentContentPart.ToolResult }
+                if (li >= 0) {
+                    val tr = resultParts[li] as AgentContentPart.ToolResult
+                    resultParts[li] = tr.copy(content = tr.content + "\n\n" + runGuard.warningNote())
+                }
+            }
+
             // Update UI with tool statuses. Mark as awaiting the next model
-            // response so "Minis is thinking" shows during the network gap
+            // response so "Mines is thinking" shows during the network gap
             // between tool results being sent and the next turn's first chunk.
             // Mirrors iOS isAwaitingModelResponse.
             withContext(Dispatchers.Main) {
@@ -12841,6 +13291,33 @@ class ChatViewModel(
                 contentParts = resultParts,
                 dbMessageId = toolResultDbId,
             ))
+
+            // [Mines-loop-30] Pause (results are already in history, every call stays paired).
+            if (failStop != null || guardVerdict == com.openminis.app.agent.RunLoopGuard.Verdict.PAUSE_REPEAT ||
+                guardVerdict == com.openminis.app.agent.RunLoopGuard.Verdict.PAUSE_CAP) {
+                if (helperConfig != null) break // helper: ends like the turn cap (finalizeAtTurnLimit below)
+                val why = when {
+                    failStop != null -> failStop + failGuard.nextStep()
+                    guardVerdict == com.openminis.app.agent.RunLoopGuard.Verdict.PAUSE_REPEAT ->
+                        "检测到重复循环，已暂停（${runGuard.lastRepeat}）"
+                    else -> "这次任务已调用 ${runGuard.toolCalls} 次工具（上限 ${runGuard.maxToolCalls}），先停下问问你：要继续吗？"
+                }
+                withContext(Dispatchers.Main) {
+                    updateAssistantMessage(
+                        assistantId, accumulatedText, false, allToolBlocks,
+                        isAwaitingModelResponse = false,
+                    )
+                    clearStreamFlushState(assistantId)
+                    if (_streamingById.value.containsKey(assistantId)) {
+                        _streamingById.value = _streamingById.value - assistantId
+                    }
+                    markLiveInterruption()
+                    _loopPause.value = why
+                    _canResume.value = true
+                }
+                loopExitedNormally = true
+                break
+            }
 
             // Auto-title after first exchange (mirrors iOS generateSessionTitleIfNeeded)
             if (turn == 0) {
@@ -13063,12 +13540,19 @@ class ChatViewModel(
 
     private suspend fun executeTool(
         name: String,
-        argsJson: String,
+        argsJsonRaw: String,
         toolId: String,
         toolBlocks: MutableList<AssistantBlock>,
         assistantId: String,
         currentText: String,
     ): ToolExecutionResult {
+        // [Mines-38.9.6 i17] {"arguments":{…}} / JSON-string arguments are unwrapped before dispatch; a call still missing
+        // a required field gets one precise error (field + expected top-level shape) instead of a generic refusal
+        val (argsJson, unwrapped) = com.openminis.app.agent.ToolArgsCore.normalize(argsJsonRaw)
+        if (unwrapped > 0) AppLogger.info(TAG, "[ToolArgs] $name: unwrapped $unwrapped wrapper level(s)")
+        com.openminis.app.agent.ToolArgsCore.missing(name, argsJson).takeIf { it.isNotEmpty() }?.let { miss ->
+            return ToolExecutionResult(com.openminis.app.agent.ToolArgsCore.error(name, miss, argsJson), success = false, toolTitle = name)
+        }
         // T330: tri-state permission gating moved into the offload IPC
         // handler (OffloadGate). The CLIs land there whether the LLM
         // emitted a named tool call or a raw shell command, so the gate
@@ -13113,6 +13597,13 @@ class ChatViewModel(
                 // skill. The repository compares a directory signature in the
                 // background and only reloads when /var/minis/skills changed.
                 skillRepository?.requestReload("shell_execute")
+            }.let { r ->
+                // [Mines-38.9.9] bare ssh / scp to a 工作位置 server → hint to use the taught `minis-vps run`
+                val h = runCatching {
+                    com.openminis.app.agent.VpsSshHint.hint(JSONObject(argsJson).optString("command"),
+                        (context.applicationContext as? com.openminis.app.MinisApp)?.envVarRepository?.getValue("MINIS_VPS_SERVERS"))
+                }.getOrNull()
+                if (h == null) r else r.copy(output = r.output + "\n\n" + h)
             }
             // [T-tools-granular-switches] Refuse a switched-off tool at the
             // dispatcher too, not only by omitting it from the schema: a model
@@ -13170,6 +13661,23 @@ class ChatViewModel(
                     )
                 }
             "memory_get" -> executeMemoryGetTool(argsJson)
+            com.openminis.app.plus.MinesSelfCheckTool.TOOL_NAME ->
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.MinesSelfCheckTool.run(context, argsJson) }
+            com.openminis.app.plus.KnowledgeBase.TOOL_NAME ->
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.KnowledgeBase.runTool(context, argsJson) }
+            // [Mines-38.9] where-is-X in Mines' own settings; hand a task to an enabled app agent
+            com.openminis.app.plus.AppSettingsMap.TOOL_NAME ->
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.AppSettingsMap.runTool(context, argsJson) }
+            com.openminis.app.plus.SelfMap.TOOL_NAME ->
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.SelfMap.runTool(context, argsJson) }
+            com.openminis.app.plus.AppAgents.TOOL_NAME ->
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.AppAgents.runTool(context, argsJson) }
+            // [Mines-38.9.5 i] progress card, linked accounts, 工作位置 registration
+            com.openminis.app.plus.TaskProgress.TOOL_NAME -> { com.openminis.app.plus.TaskProgress.init(context); com.openminis.app.plus.TaskProgress.runTool(minesSid(), argsJson) }
+            com.openminis.app.plus.AccountsTool.TOOL_NAME ->
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.AccountsTool.runTool(context, minesSid(), argsJson) }
+            com.openminis.app.plus.WorkspaceStore.TOOL_NAME ->
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.WorkspaceStore.runTool(context, argsJson) }
             else -> ToolExecutionResult("Unknown tool: $name", false)
         }
     }
@@ -14089,7 +14597,7 @@ class ChatViewModel(
             // [T-vision-group-attribution / GH#182] iOS rewrites the tool block's
             // live content here so the card names the model as it works. Android
             // has no equivalent channel — no tool streams partial output to its
-            // card, and the progress label ("Minis is reading Image",
+            // card, and the progress label ("Mines is reading Image",
             // ChatToolFormatting.kt:102) is a static per-tool string. Building
             // that plumbing is a separate change, so for now the per-attempt
             // signal goes to the log, where a fallback is still traceable. The
@@ -14439,6 +14947,10 @@ class ChatViewModel(
             )
         } catch (e: Exception) {
             ToolExecutionResult("Error: ${e.message}", false)
+        } catch (e: OutOfMemoryError) {
+            // [Mines-38.9.12.1] a browser action that runs out of memory is a tool error, not an app crash
+            runCatching { com.openminis.app.plus.MemGuard.trim("浏览器操作内存不足") }
+            ToolExecutionResult("Error: the phone ran low on memory during this browser action. Use get_text / get_readable instead of screenshots for now.", false)
         }
     }
 
@@ -15162,6 +15674,7 @@ Memory system (currently DISABLED):
             " For delegating a whole task that needs tools and multiple rounds, use the subagent_task tool instead."
         } else ""
         val browserPromptBullet = if (browserToolEnabled) """- browser_use: Web browsing (navigate, screenshot, click, type, get_text, scroll, scroll_and_collect, get_readable, get_backbone, fetch, etc.). Starts with a desktop Chrome user agent. Use screenshot to see the page.
+  网站注册 / 登录 / 填表 / 读登录后的页面：一律用 browser_use（App 内置浏览器，带用户已登录的会话，验证码用 wait_for_otp 自动填，人机验证用 wait_for_human 交给用户）。不要在 shell_execute 里起 playwright / puppeteer / selenium / connectOverCDP / 远程或云端浏览器会话；同一个办法失败两次就换办法或直接告诉用户卡在哪。
   当 browser_use 触达 Google 登录 / OAuth 页（accounts.google.com、signin.google.com、myaccount.google.com、oauth2.googleapis.com 等）或网页返回 "disallowed_useragent" / 403 包含 "browser is not secure" 字样时，**不要重试或尝试登录** — Google 永久禁止 in-app WebView 完成登录，重试只会浪费 turn。改为告诉用户："此页面需要在系统 Chrome 完成登录" 并给出可点击的 Markdown link [在 Chrome 中打开](https://accounts.google.com/...)。点该 link 时 app 会跳出 Custom Tab；用户在 Chrome 完成操作后，请他**把所需结果（邮件正文 / 文档摘要 / 表格数据）粘贴回 chat**，你再继续帮他处理。这是 Android 平台限制，不是 bug。${toolListMemoryBullets}""" else ""
         val minisUrlNote = if (browserToolEnabled) """IMPORTANT: minis:// URLs are app-internal — they are NOT web URLs. Do NOT pass minis:// action URLs (open_terminal, views, settings) to browser_use — those are app deep links, use Markdown links in chat instead. However, minis:// resource URLs CAN be opened in browser_use with navigate. All directories under /var/minis/ are accessible: workspace, attachments, offloads, shared, etc. The built-in browser fully supports minis:// — HTML pages and all sub-resources (JS, CSS, images, fonts, etc.) referenced via minis:// absolute URLs or relative paths resolve correctly within the current session. When building multi-file web projects, use file_write to create files in the same directory (e.g. /var/minis/workspace/myapp/), then reference sub-resources with relative paths in HTML (e.g. <link href="style.css">, <script src="app.js">, <img src="logo.png">). The browser resolves relative paths against the minis:// base URL automatically. Cross-directory references also work with absolute minis:// URLs (e.g. <img src="minis://attachments/photo.png"> from a workspace HTML page). Navigate to the entry HTML to preview, e.g. minis://workspace/myapp/index.html.""" else """IMPORTANT: minis:// URLs are app-internal — they are NOT web URLs. Do NOT treat minis:// action URLs (open_terminal, views, settings) as web links — those are app deep links, use Markdown links in chat instead."""
         // [T-prompt-file-search-rg] The "File search" bullet below is the single
@@ -15243,7 +15756,7 @@ CLI tools at /usr/local/bin with the `android-` prefix give you access to Androi
 - android-speech — microphone transcription (`listen [--language BCP47] [--max N] [--timeout SEC]`; `status`). Requires RECORD_AUDIO.
 - android-weather <latitude> <longitude> — Open-Meteo forecast (current + hourly + daily). No API key needed.
 - android-shizuku-cli — invoke privileged Android system APIs (package management, settings, system commands) via Shizuku when granted. Curated subcommands return structured JSON; for anything not covered, fall back to `android-shizuku-cli exec <any shell command>` which runs the command via `sh -c` with Shizuku privilege (same surface as `adb shell`). Run with no args (or --help) for the subcommand list.
-- android-a11y-cli — drive system UI (read screen, tap, type, swipe, scroll) via the Android AccessibilityService when enabled. Run with no args (or --help) for the subcommand list.
+- android-a11y-cli — drive the phone UI. FAST PATH, use it first: `android-a11y-cli ui list` prints a numbered list of what is on screen; then batch steps in ONE call: `android-a11y-cli do "tap 3; type 5 你好; key enter; wait 500; list"` (steps: tap N | tap "文本" | tap X,Y | longpress N | swipe X1 Y1 X2 Y2 | type N 文本 | key back/home/enter | scroll down/up [N] | wait MS | open <package> | list; a fresh list is printed at the end). For a task you may repeat, add `--task "名字"`: a path that worked is saved and replayed first next time (tier 1, falls back on mismatch). The list says which reading tier it used; OCR (tier 3) kicks in by itself when the tree has no text. Avoid screenshots and `ui dump` unless the list is not enough. Works via the AccessibilityService, or via Shizuku when accessibility is off. Run with --help for everything else.
 - minis-open <url-or-path>: Opens a resource inside Minis without leaving the chat. Accepts http/https URLs (→ built-in WebKit preview) and chat-resource file paths under /var/minis/** (→ built-in file preview, routed by extension: images to the image viewer, .md to markdown preview, .html to HTML preview, .pdf/office docs to QuickLook, audio/video to the media player, else share sheet). Examples: minis-open https://example.com, minis-open /var/minis/workspace/report.md, minis-open /var/minis/attachments/chart.png. Prefer this over android-open for anything that can be previewed in-app so the user doesn't lose conversation context. Run android-open via shell_execute for non-web schemes (tel:, mailto:, geo:, intent:, etc.) or when the user explicitly wants the system handler.
 - minis-sessions-cli: Read chat history. `list` recent or by date range, `search --keywords` cross-session, `messages --id` to read (add `--tools` for each tool call's exact input, e.g. the shell command, and its output). Run --help for full options.
 - minis-model-use: Invoke other LLM models pre-configured by the user. Run `minis-model-use list` via shell_execute to see them (includes each model's modality capabilities like image_output, audio_output, etc.), `minis-model-use search <query>` to filter by name/provider. `minis-model-use run --model <id_or_name>` sends an OpenAI-compatible messages request; pass input via --input <json_file> or stdin, output goes to stdout or --output <path>. The OpenAI shape is the PRIMARY input for every model and modality; standard params are auto-converted to the underlying provider, so do not hand-write provider-native bodies as the primary input. For provider-specific extras the standard schema doesn't model (web-search plugins, image-to-image fields, TTS/video or other custom endpoints), escape hatches exist for OpenAI-compatible providers (they error or are ignored on Anthropic/Gemini models): `extra_body` (object merged verbatim into the request body), a custom `endpoint` path, and a top-level `passthrough` envelope for fully verbatim requests with RAW (unparsed) responses. Results may carry `warnings` (fields that were ignored/downgraded and why) and `applied_extras` (which extras actually took effect) — read them to self-correct. Run --help for the full contract before using these. Models may support multimodal output (image generation, TTS/audio, video) — check the modalities field in list output. For image_output models, pass generation params in the input JSON: top-level `n`/`size`/`quality`/`prompt` (OpenAI /images/generations style) or `generation_config.{aspect_ratio,image_size,number_of_images,person_generation}` (Gemini). Run with --help for full usage.${modelUseDelegateNote}
@@ -15301,9 +15814,31 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
 
         return buildString {
             append(base)
+            // [Mines-38.9.11 c] where files the user should keep go (shared/<主题>/, downloads shared/下载/); fixed text
+            append("\n\n")
+            append(com.openminis.app.plus.SharedFilesCore.PROMPT_NOTE)
             if (skillFragment != null) {
                 append("\n\n")
                 append(skillFragment)
+            }
+            // [Mines-38.9.6 i17] 技能优先 (Settings › Agent Tools, default on); byte-stable text → prompt cache unaffected
+            if (!isHelper && com.openminis.app.tools.AgentToolSwitch.SKILL_FIRST.isEnabled(context)) {
+                append("\n\n")
+                append(com.openminis.app.agent.SkillFirst.PROMPT)
+            }
+            // [Mines-38.9.7] 高级工程模式 (Settings › Agent Tools, default on); fixed text
+            if (!isHelper && com.openminis.app.tools.AgentToolSwitch.ENGINEER.isEnabled(context)) {
+                append("\n\n")
+                append(com.openminis.app.agent.EngineerMode.PROMPT)
+            }
+            // [Mines-38.9.9] 内置提示词 (排障纪律 / 解决后归档 / 高级工程师 / 自动化 / 红蓝队仅限授权), editable in 设置 › Agent 工具
+            if (!isHelper) com.openminis.app.agent.BuiltinPrompts.prompt(context).takeIf { it.isNotBlank() }?.let {
+                append("\n\n")
+                append(it)
+            }
+            // [Mines-38.9.9] user 10:02: 深度思考 showed English — think in the UI language
+            if (!isHelper && java.util.Locale.getDefault().language == "zh") {
+                append("\n\n思考过程（reasoning / thinking）也用中文写；代码、命令、报错原文保持原样。")
             }
             if (mcpFragment != null) {
                 append("\n\n")
@@ -15317,6 +15852,26 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                 append("\n\n")
                 append(dailyMemoryFragment)
             }
+            // [Mines-38.9] 经验库 (top entries for the latest request) + where Mines' own settings live — any model gets them
+            runCatching {
+                val q = agentHistory.lastOrNull { it.role == LLMMessage.Role.USER && it.content.isNotBlank() }?.content.orEmpty()
+                val exp = com.openminis.app.plus.Experience.promptFragment(context, q)
+                if (exp.isNotBlank()) { append("\n\n"); append(exp) }
+                // [Mines-38.9.8] 技能优先 run by the app: the matching skill / saved workflow is picked here and shown in the chat
+                if (!isHelper && com.openminis.app.tools.AgentToolSwitch.SKILL_FIRST.isEnabled(context)) {
+                    val sm = com.openminis.app.plus.SkillMatch.promptLine(context, activeSessionId, q)
+                    if (sm.isNotBlank()) { append("\n\n"); append(sm) }
+                }
+                append("\n\n"); append(com.openminis.app.plus.AppSettingsMap.promptBlock(context))
+                // [Mines-38.9.8] 自我地图: providers / 模型组 / 工作位置 ports as seen from this phone (cached, refreshed in background)
+                com.openminis.app.plus.SelfMap.promptBlock(context).takeIf { it.isNotBlank() }?.let { append("\n"); append(it) }
+                com.openminis.app.plus.AppAgents.promptLine(context)?.let { append("\n"); append(it) }
+                // [Mines-38.9.5 i] progress card + linked accounts + 工作位置 self-registration
+                append("\n"); append(com.openminis.app.plus.TaskProgress.PROMPT)
+                append("\n"); append(com.openminis.app.plus.WorkspaceStore.PROMPT)
+            }
+            // [38.9.11.3] the 台账 / accounts rule: always in the built-in prompt (outside the runCatching above, helpers too)
+            append("\n\n"); append(com.openminis.app.plus.AccountsTool.PROMPT)
             // Runtime context goes last so the prefix above stays byte-stable
             // across requests within the same day. Keep ordering deterministic
             // (date → tz → lang → model count) — any reorder defeats the cache.
@@ -15324,6 +15879,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
             append("- Current date: ").append(dateStr).append(" (").append(tzId).append(")\n")
             append("- Device language: ").append(lang).append("\n")
             append("- minis-model-use models available: ").append(modelUseCount)
+            append(com.openminis.app.plus.PlusConnect.promptLine())
         }
     }
 
@@ -15382,6 +15938,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
             )
         } catch (e: Exception) {
             BrowserToolResult(text = "Error: ${e.message}", success = false)
+        } catch (e: OutOfMemoryError) {
+            BrowserToolResult(text = "Error: the phone ran low on memory during this browser action.", success = false)   // [Mines-38.9.12.1]
         }
     }
 
@@ -15667,11 +16225,69 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
             }
         }
 
+        // [Mines-38.9.6 i17] images like Hark: an image that landed in the uploads dir is NOT inlined (no base64 in this
+        // or any later turn). A model copy (long edge ≤ 1568, JPEG q85) is written next to the original and the message
+        // carries one short marker line; the model reads it with read_image when it needs to. Images whose upload failed
+        // stay inline as before.
+        val onDemandMarkers = mutableListOf<String>()
+        if (imageParts.isNotEmpty()) {
+            val readable = currentModelHasNativeVision || runCatching {
+                com.openminis.app.tools.VisionGroupResolver.isConfigured(providerRepository, context)
+            }.getOrDefault(false)
+            val keep = mutableListOf<Int>()
+            val inlinedNow = HashSet<String>()
+            imageParts.forEachIndexed { idx, part ->
+                val path: String = part.linuxPath ?: run { keep.add(idx); return@forEachIndexed }
+                val name = path.substringAfterLast('/')
+                val orig = java.io.File(uploadsHostDir, name)
+                var viewPath: String = path; var w = 0; var h = 0
+                runCatching {
+                    val o = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                    android.graphics.BitmapFactory.decodeFile(orig.path, o); w = o.outWidth; h = o.outHeight
+                    val t = com.openminis.app.plus.ImageOnDemandCore.fit(w, h)
+                    if (t != null) {
+                        var sample = 1
+                        while (maxOf(w, h) / (sample * 2) >= com.openminis.app.plus.ImageOnDemandCore.MAX_EDGE) sample *= 2
+                        val bm = android.graphics.BitmapFactory.decodeFile(orig.path, android.graphics.BitmapFactory.Options().apply { inSampleSize = sample })
+                        if (bm != null) {
+                            val sc = android.graphics.Bitmap.createScaledBitmap(bm, t.first, t.second, true)
+                            val vf = java.io.File(uploadsHostDir, com.openminis.app.plus.ImageOnDemandCore.viewName(name))
+                            vf.outputStream().use { sc.compress(android.graphics.Bitmap.CompressFormat.JPEG, com.openminis.app.plus.ImageOnDemandCore.QUALITY, it) }
+                            if (sc !== bm) sc.recycle(); bm.recycle()
+                            viewPath = "/var/minis/attachments/uploads/" + vf.name
+                        }
+                    }
+                }.onFailure { Log.w(TAG, "model copy failed for $name: ${it.message}") }
+                val mime = ImageBudget.sniffFormat(runCatching { ByteArray(64).also { b -> orig.inputStream().use { it.read(b) } } }.getOrDefault(ByteArray(0))).mimeType ?: part.mimeType
+                // [Mines-38.9.11 b] 「图片看不见」: a vision model gets the model copy inline in THIS turn (it sees it at once,
+                // no read_image round trip it may skip); history replays still use the marker (onDemand below).
+                val inlineNow = com.openminis.app.plus.ImageOnDemandCore.inlineNow(currentModelHasNativeVision)
+                if (inlineNow) runCatching {
+                    val vf = java.io.File(uploadsHostDir, viewPath.substringAfterLast('/'))
+                    val bytes = (if (vf.exists()) vf else orig).readBytes()
+                    imageParts[idx] = LLMMessage.ImagePart(bytes, if (vf.exists() && vf != orig) "image/jpeg" else mime, linuxPath = part.linuxPath)
+                    keep.add(idx); inlinedNow.add(path)
+                }
+                onDemandMarkers.add(com.openminis.app.plus.ImageOnDemandCore.marker(name, path, viewPath, mime, orig.length(), w, h, readable, inlined = path in inlinedNow))
+            }
+            val kept = keep.map { imageParts[it] }; val keptNotes = keep.map { imageModelNotes.getOrNull(it) }
+            val keptPaths = kept.mapNotNull { it.linuxPath }.filter { it !in inlinedNow }
+            imageParts.clear(); imageParts.addAll(kept)
+            imageModelNotes.clear(); imageModelNotes.addAll(keptNotes)
+            imageUploadPaths.retainAll((keptPaths + inlinedNow).toSet())
+            // the bubble keeps every picture; restore must not re-inline the on-demand ones
+            for (i in imageMediaRefPartsJson.indices) runCatching {
+                val o = JSONObject(imageMediaRefPartsJson[i]); val v = o.getJSONObject("value")
+                val lp = v.optString("linuxPath", "")
+                if (lp.isNotEmpty() && lp !in keptPaths) { v.put("onDemand", true); imageMediaRefPartsJson[i] = o.toString() }
+            }
+        }
+
         // Build the <user-attached-files> XML block (iOS parity). One <file>
         // per attachment (image and non-image) that successfully landed in
         // the iSH uploads dir — gives the model a metadata-only inventory
         // it can resolve via shell tools when content is needed.
-        val xml = if (metas.isEmpty()) null else buildString {
+        val xml0 = if (metas.isEmpty()) null else buildString {
             append("<user-attached-files>\n")
             for (m in metas) {
                 val urlPath = m.linuxPath.removePrefix("/var/minis/")
@@ -15687,6 +16303,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
             }
             append("</user-attached-files>")
         }
+        val xml = if (onDemandMarkers.isEmpty()) xml0 else listOfNotNull(onDemandMarkers.joinToString("\n"), xml0).joinToString("\n")
 
         // Order matches UserAttachmentList convention: images first, then files.
         return PreparedAttachments(
@@ -16613,7 +17230,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
         if (lastIdx < 0) return
         var last = msgs[lastIdx]
 
-        // T73: clear "Minis is thinking…" the moment the user taps Stop.
+        // T73: clear "Mines is thinking…" the moment the user taps Stop.
         // isAwaitingModelResponse is set true at runAgentLoop entry (≈ line
         // 2785) so the typing indicator shows during the initial request
         // gap before the first stream chunk. The cancel paths below didn't
@@ -16681,7 +17298,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
         // Stop fired while still in the pre-first-chunk thinking gap (no
         // partial text, no tool_use emitted, no committed history for this
         // turn). The placeholder ChatMessage runAgentLoop pushed at L5248 is
-        // not in the DB and would otherwise render as an empty "Minis" header
+        // not in the DB and would otherwise render as an empty "Mines" header
         // bubble with no body. Drop it so the UI snaps back to idle the
         // instant the user taps Stop. Mirrors the iOS #566/#569 boundary:
         // a candidate WITH real text or any emitted tool_use is kept (handled
@@ -16885,6 +17502,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
     }
 
     override fun onCleared() {
+        // [Mines-38.9.6 i14] a cleared ViewModel can't retry: the card falls back to opening the chat
+        runCatching { com.openminis.app.plus.TaskProgress.unregister(minesSid(), minesProgressActions) }
         // [T-sub-agents-queue] Nothing can re-enter a queued delegation once
         // this view model is gone; leaving the starter installed would let the
         // registry call into a cleared VM.
@@ -16936,6 +17555,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
             try {
                 val count = chatRepository.messageCount(sid)
                 if (count > 0) return@launch
+                // [Mines-38.9.11 c] a chat with files (terminal / agent output never persisted as messages) is not "empty"
+                if (com.openminis.app.plus.SharedFiles.hasWorkspaceFiles(context, sid)) return@launch
                 AppLogger.info(
                     TAG,
                     "cleanupIfEmptyOnExit: deleting empty session $sid (no persisted messages)",
@@ -17415,6 +18036,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                             continue
                         }
                         if (!mime.startsWith("image/")) continue
+                        // [Mines-38.9.6 i17] on-demand image: its marker line is in the persisted text, no pixels replayed
+                        if (v.optBoolean("onDemand", false)) continue
                         val file = java.io.File(mediaStore.mediaBaseDir, rel)
                         if (!file.exists()) continue
                         val original = try { file.readBytes() } catch (_: Exception) { continue }
@@ -17506,16 +18129,9 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
      * e.g. `file_write` → "Write File", `shell_execute` → "Execute Shell".
      */
     private fun friendlyToolTitle(toolName: String): String = when (toolName) {
-        "shell_execute" -> "Execute Shell"
-        "file_read" -> "Read File"
-        "file_write" -> "Write File"
-        "file_edit" -> "Edit File"
-        "browser_use" -> "Browse Web"
-        "read_image" -> "Read Image"
-        "memory_write" -> "Write Memory"
-        "memory_get" -> "Read Memory"
-        "web_search" -> "Search Web"
-        else -> toolName
+        "shell_execute", "file_read", "file_write", "file_edit", "browser_use", "read_image", "memory_write", "memory_get", "web_search", "task_progress" ->
+            com.openminis.app.plus.ToolZh.name(toolName)!!   // [38.9.11 i32] Chinese
+        else -> com.openminis.app.plus.ToolZh.name(toolName) ?: toolName
             .split('_')
             .filter { it.isNotEmpty() }
             .joinToString(" ") { it.replaceFirstChar { ch -> ch.uppercase() } }
@@ -17568,4 +18184,29 @@ internal fun warmUpBudget(window: Int?, compactThreshold: Int?, ratio: Double, f
     if (fixedTokens <= 0) return null
     val line = if (threshold > 0) threshold else w
     return (line / ratio).toInt() - fixedTokens
+}
+
+/** [Mines-38.9.1] how long a model may stay completely silent (not even message_start) before the group moves on */
+internal const val MINES_FIRST_CHUNK_MS = 60_000L
+
+/** [Mines-38.9.1] fails with a fallbackable [com.openminis.app.data.model.LLMError.ProviderError] when the FIRST element
+ *  does not arrive within [ms]; later elements are passed through untouched (long answers are not cut). */
+internal fun <T> kotlinx.coroutines.flow.Flow<T>.minesFirstChunkDeadline(ms: Long): kotlinx.coroutines.flow.Flow<T> {
+    val upstream = this
+    return kotlinx.coroutines.flow.flow {
+        kotlinx.coroutines.coroutineScope {
+            val ch = upstream.produceIn(this)
+            val first = kotlinx.coroutines.withTimeoutOrNull(ms) { ch.receiveCatching() }
+            if (first == null) {
+                ch.cancel()
+                throw com.openminis.app.data.model.LLMError.ProviderError("${ms / 1000} 秒没有任何回应")
+            }
+            if (first.isClosed) {
+                first.exceptionOrNull()?.let { throw it }
+                return@coroutineScope
+            }
+            emit(first.getOrThrow())
+            for (x in ch) emit(x)
+        }
+    }
 }

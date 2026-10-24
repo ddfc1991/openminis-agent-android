@@ -1,0 +1,102 @@
+#!/bin/sh
+# [Mines-net-26] mines-guard — run a command and stop it when it stalls.
+#
+#   mines-guard <label> <stall-seconds> <total-seconds|0> -- command [args...]
+#
+# "Stalled" means: neither the command nor any of its child processes used CPU
+# or read/wrote a single byte (files or sockets) for <stall-seconds>. That is
+# what a hung download looks like (apk/pip/npm waiting on a mirror that stopped
+# sending), while a slow-but-moving download or a long compile keeps going.
+# Exit code 124 = stopped because it stalled or ran past <total-seconds>.
+# Set MINIS_GUARD=0 to turn the guard off.
+
+label=$1; stall=$2; total=$3
+shift 3 2>/dev/null || { echo "usage: mines-guard <label> <stall> <total> -- cmd..." >&2; exit 2; }
+[ "$1" = "--" ] && shift
+[ $# -gt 0 ] || exit 2
+if [ "${MINIS_GUARD:-1}" = "0" ]; then exec "$@"; fi
+# Without /proc the guard can't see progress; never kill blind.
+[ -r /proc/self/stat ] || exec "$@"
+
+# Children of $1 (direct), read from /proc without forking.
+children() {
+    for d in /proc/[0-9]*; do
+        read -r s < "$d/stat" 2>/dev/null || continue
+        rest=${s##*) }
+        set -- $rest
+        echo "$2 ${d#/proc/}"
+    done
+}
+
+# All descendants of $1 (including $1).
+tree() {
+    want=" $1 "
+    all=$(children)
+    changed=1
+    while [ $changed = 1 ]; do
+        changed=0
+        while read -r pp p; do
+            case "$want" in *" $pp "*) case "$want" in *" $p "*) ;; *) want="$want$p "; changed=1;; esac;; esac
+        done <<EOF
+$all
+EOF
+    done
+    echo $want
+}
+
+# A number that grows whenever the process tree does anything.
+progress() {
+    sum=0
+    for p in $(tree "$1"); do
+        if read -r s < "/proc/$p/stat" 2>/dev/null; then
+            rest=${s##*) }
+            set -- $rest
+            # after "comm)": $1=state … $12=utime $13=stime
+            eval "sum=\$((sum + \${12:-0} + \${13:-0}))"
+        fi
+        if [ -r "/proc/$p/io" ]; then
+            while read -r k v; do
+                case $k in rchar:|wchar:) sum=$((sum + v));; esac
+            done < "/proc/$p/io"
+        fi
+    done
+    echo $sum
+}
+
+kill_tree() {
+    pids=$(tree "$1")
+    kill -TERM $pids 2>/dev/null
+    sleep 1
+    kill -KILL $pids 2>/dev/null
+}
+
+# Keep the caller's stdin (a background job would otherwise get /dev/null).
+exec 3<&0
+"$@" <&3 &
+pid=$!
+exec 3<&-
+trap 'kill_tree $pid; exit 130' INT TERM HUP
+
+last=""; idle=0; elapsed=0; why=""
+while kill -0 "$pid" 2>/dev/null; do
+    sleep 3
+    elapsed=$((elapsed + 3))
+    kill -0 "$pid" 2>/dev/null || break
+    cur=$(progress "$pid")
+    if [ "$cur" = "$last" ]; then idle=$((idle + 3)); else idle=0; last=$cur; fi
+    if [ "$idle" -ge "$stall" ]; then why="stall"; break; fi
+    if [ "$total" -gt 0 ] && [ "$elapsed" -ge "$total" ]; then why="total"; break; fi
+done
+
+if [ -n "$why" ]; then
+    kill_tree "$pid"
+    wait "$pid" 2>/dev/null
+    if [ "$why" = stall ]; then
+        echo "mines-guard: $label 已经 ${stall} 秒没有任何进展（下载卡住），已停止" >&2
+    else
+        echo "mines-guard: $label 超过 ${total} 秒没完成，已停止" >&2
+    fi
+    exit 124
+fi
+wait "$pid"
+exit $?

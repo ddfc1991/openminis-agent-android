@@ -3,6 +3,10 @@ package com.openminis.app.speech
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -173,6 +177,10 @@ object SpeechRecognitionManager {
         engines.clear()
         engines.add(SystemSpeechRecognitionEngine(appContext))
         engines.add(ProviderSpeechRecognitionEngine(appContext))
+        // [Mines-offline-asr] Registered last but it is what makes the mic
+        // work at all on a ROM that ships no recognition service — see the
+        // KDoc on OfflineAsrEngine. Its model is fetched on demand below.
+        engines.add(OfflineAsrEngine(appContext))
 
         _selectedEngineId.value = prefs.getString(KEY_ENGINE_ID, null) ?: pickDefaultEngineId()
         prefs.getString(KEY_LOCALE, null)?.let { tag ->
@@ -181,6 +189,10 @@ object SpeechRecognitionManager {
         refreshAvailability()
         refreshSupportedLocales()
         observeAppLifecycle()
+        // [Mines-offline-asr] Last: only does anything when the two engines
+        // above are both unavailable, which is the state the voice panel
+        // reported as "当前没有可用的语音识别".
+        ensureOfflineModelAsync()
     }
 
     /**
@@ -343,6 +355,45 @@ object SpeechRecognitionManager {
     fun refreshAvailability() {
         _isAvailable.value = engines.any { it.isAvailable }
     }
+
+    /**
+     * [Mines-offline-asr] Fetch the free offline model in the background when
+     * nothing else can recognise speech, so the mic button stops being dead.
+     *
+     * This is the whole point of the offline engine: a Chinese ROM with no
+     * Google app has no recognition service, and the provider engine needs a
+     * paid cloud model, so without this the voice panel would say
+     * "当前没有可用的语音识别" forever. Once the ~40 MB model lands,
+     * [refreshAvailability] flips true and the offline engine becomes the
+     * selection — no user action required beyond the one-time download.
+     *
+     * Safe to call on every init: it returns immediately when the model is
+     * already there or a fetch is already running.
+     */
+    fun ensureOfflineModelAsync() {
+        if (!::appContext.isInitialized) return
+        val offline = engines.filterIsInstance<OfflineAsrEngine>().firstOrNull() ?: return
+        if (engines.any { it.isAvailable }) return
+        if (OfflineAsrEngine.modelReady(appContext, OfflineAsrEngine.MODEL_ZH) ||
+            OfflineAsrEngine.modelReady(appContext, OfflineAsrEngine.MODEL_EN)
+        ) return
+        if (offlineFetching) return
+        offlineFetching = true
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            try {
+                val ok = OfflineAsrEngine.ensureModel(appContext, OfflineAsrEngine.MODEL_ZH)
+                Log.i(TAG, "offline model fetch ok=$ok")
+                if (ok) {
+                    _selectedEngineId.value = offline.id
+                    refreshAvailability()
+                }
+            } finally {
+                offlineFetching = false
+            }
+        }
+    }
+
+    @Volatile private var offlineFetching = false
 
     private fun currentEngine(): SpeechRecognitionEngine? {
         val byId = engines.firstOrNull { it.id == _selectedEngineId.value }

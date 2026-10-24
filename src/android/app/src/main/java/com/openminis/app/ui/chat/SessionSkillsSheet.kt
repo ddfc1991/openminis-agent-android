@@ -124,7 +124,7 @@ fun SessionSkillsSheet(
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         fontWeight = FontWeight.Medium,
-                        letterSpacing = 0.5.sp,
+                        letterSpacing = 0.sp,
                     )
                     Spacer(modifier = Modifier.weight(1f))
                     // Enable/Disable All operate on the FILTERED subset so a

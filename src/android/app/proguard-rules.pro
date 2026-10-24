@@ -26,3 +26,38 @@
 # NOTE FOR VERIFICATION: debug builds don't minify, so this bug is invisible
 # there. Any change here must be checked against an assembleRelease APK.
 -keep class io.codeconcept.realtimecutvadlibrary.** { *; }
+
+# [Mines-offline-asr] Vosk talks to libvosk through JNA, which finds Java
+# methods and Structure fields by name at runtime; R8 renaming either breaks
+# recognition with an UnsatisfiedLinkError / NoSuchMethodError in release only.
+-keep class org.vosk.** { *; }
+-keep class com.sun.jna.** { *; }
+-keep class * implements com.sun.jna.** { *; }
+-dontwarn java.awt.**
+-dontwarn com.sun.jna.**
+
+# [Mines-vps-ssh] JSch instantiates ciphers, KEX, MACs and key types by class
+# name from its config table (Class.forName), so nothing in it may be renamed
+# or stripped. Optional integrations (BouncyCastle, JNA unix sockets, log4j,
+# slf4j, Java 16 unix-domain sockets) are absent on Android.
+-keep class com.jcraft.jsch.** { *; }
+-dontwarn com.jcraft.jsch.**
+-dontwarn org.bouncycastle.**
+-dontwarn org.apache.logging.log4j.**
+-dontwarn org.slf4j.**
+-dontwarn org.newsclub.net.unix.**
+-dontwarn com.sun.jna.platform.**
+
+# [Mines-voiceprint-34] sherpa-onnx JNI looks up Kotlin classes/fields by name
+-keep class com.k2fsa.sherpa.onnx.** { *; }
+
+# [Mines-38.9.11 d] apksig (file manager re-sign): pure JCA, no reflection into the app; silence optional references
+-dontwarn com.android.apksig.**
+# [Mines-38.9.11.2] JSch loads its Bouncy Castle signature / XDH classes by name; keep what they use
+-keep class org.bouncycastle.crypto.signers.Ed25519Signer { *; }
+-keep class org.bouncycastle.crypto.signers.Ed448Signer { *; }
+-keep class org.bouncycastle.crypto.params.Ed25519PublicKeyParameters { *; }
+-keep class org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters { *; }
+-keep class org.bouncycastle.math.ec.rfc7748.** { *; }
+-keep class org.bouncycastle.math.ec.rfc8032.** { *; }
+-dontwarn org.bouncycastle.**

@@ -17,6 +17,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.openminis.app.R
@@ -54,15 +55,17 @@ fun MinisAlertDialog(
         onDismissRequest = onDismissRequest,
         properties = DialogProperties(dismissOnBackPress = true, dismissOnClickOutside = true),
     ) {
-        Surface(
-            shape = RoundedCornerShape(16.dp),
-            color = MaterialTheme.colorScheme.surface,
-            tonalElevation = 6.dp,
+        // [Mines-38.5] frosted glass like every Mines dialog (blur behind on Android 12+, solid otherwise)
+        com.openminis.app.ui.plus.GlassWindowEffect()
+        // [Mines-38.9.6 i12] the shared glass container (same tint / alpha / rim as every sheet, menu and dialog)
+        com.openminis.app.ui.plus.GlassSurface(
+            shape = RoundedCornerShape(24.dp),
+            halo = false,
         ) {
             Column(modifier = Modifier.fillMaxWidth()) {
                 Text(
                     text = title,
-                    style = MaterialTheme.typography.titleLarge,
+                    style = MaterialTheme.typography.titleLarge.copy(fontSize = 18.sp),
                     color = MaterialTheme.colorScheme.onSurface,
                     modifier = Modifier.padding(start = 24.dp, end = 24.dp, top = 24.dp),
                 )
@@ -70,7 +73,7 @@ fun MinisAlertDialog(
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
                         text = text,
-                        style = MaterialTheme.typography.bodyMedium,
+                        style = MaterialTheme.typography.bodyMedium.copy(fontSize = com.openminis.app.ui.plus.MT.Body, lineHeight = com.openminis.app.ui.plus.MT.BodyLH),
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(horizontal = 24.dp),
                     )

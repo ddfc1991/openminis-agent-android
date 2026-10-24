@@ -232,7 +232,7 @@ private fun CodeBlockView(block: MarkdownParser.Block.CodeBlock) {
             ) {
                 Icon(
                     Icons.Default.ContentCopy,
-                    contentDescription = "Copy code",
+                    contentDescription = "复制代码",
                     modifier = Modifier.height(16.dp),
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

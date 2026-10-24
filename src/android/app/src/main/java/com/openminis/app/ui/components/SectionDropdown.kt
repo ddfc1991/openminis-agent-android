@@ -1,5 +1,7 @@
 package com.openminis.app.ui.components
 
+import com.openminis.app.ui.glass.GlassExposedDropdownMenu
+
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -120,7 +122,7 @@ fun <T> SectionDropdown(
                     )
                 },
             )
-            ExposedDropdownMenu(
+            GlassExposedDropdownMenu(
                 expanded = expanded,
                 onDismissRequest = { expanded = false },
             ) {

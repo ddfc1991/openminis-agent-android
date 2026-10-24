@@ -134,7 +134,7 @@ import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.RadioButtonChecked
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material3.DropdownMenu
+import com.openminis.app.ui.glass.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import com.openminis.app.BuildConfig
 import com.openminis.app.R
@@ -146,7 +146,7 @@ import com.openminis.app.ui.components.MinisMenuDivider
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.ModalBottomSheet
+import com.openminis.app.ui.glass.ModalBottomSheet
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -158,7 +158,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
+import com.openminis.app.ui.theme.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -231,6 +231,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.FormatQuote
 import androidx.compose.material.icons.outlined.Public
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
@@ -300,6 +301,8 @@ internal fun UserMessageBubble(
     onCompactAbove: (() -> Unit)? = null,
     onWithdraw: (() -> Unit)? = null,
     onPreviewFile: (Uri, String) -> Unit = { _, _ -> },
+    /** [Mines-38.9.5 i] 「引用回复」 the whole message. */
+    onQuote: (() -> Unit)? = null,
 ) {
     var showMenu by remember { mutableStateOf(false) }
     val isQueued = message.isQueued
@@ -453,7 +456,7 @@ internal fun UserMessageBubble(
                             ) {
                                 Icon(
                                     imageVector = Icons.Filled.Cancel,
-                                    contentDescription = "Withdraw queued message",
+                                    contentDescription = "撤回排队的消息",
                                     tint = Color(0xFFFF3B30),
                                     modifier = Modifier.size(24.dp),
                                 )
@@ -494,6 +497,13 @@ internal fun UserMessageBubble(
                     onClick = { showMenu = false; onCopy() },
                     leadingIcon = { Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(18.dp)) },
                 )
+                if (onQuote != null) {
+                    DropdownMenuItem(
+                        text = { Text("引用回复") },
+                        onClick = { showMenu = false; onQuote() },
+                        leadingIcon = { Icon(Icons.Default.FormatQuote, contentDescription = null, modifier = Modifier.size(18.dp)) },
+                    )
+                }
                 // T119: while the model is generating, hide every action that
                 // would mutate the in-flight turn. Retry truncates history and
                 // restarts the stream, which corrupts state if it races a live
@@ -596,25 +606,18 @@ internal fun UserAttachmentList(
 
     val tileSize = 64.dp
 
-    FlowRow(
+    // [Mines-38.9.11.1] images = Hark-style grid (1 larger · 2–4 two columns · 5+ three columns with +N; tap → full-screen
+    // viewer); files keep the 64dp tiles below. (38.9.11's fanned stack was not what the user meant.)
+    if (imageUris.isNotEmpty()) {
+        Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
+            com.openminis.app.ui.plus.ImageGrid(models = imageUris, onOpen = { previewImageIndex = it })
+        }
+    }
+    if (fileNames.isNotEmpty()) FlowRow(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.End),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        imageUris.forEachIndexed { idx, uri ->
-            AsyncImage(
-                model = uri,
-                contentDescription = "Image attachment",
-                contentScale = ContentScale.Crop,
-                modifier = Modifier
-                    .size(tileSize)
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(ChatColors.secondaryBg)
-                    .border(0.5.dp, ChatColors.thumbnailBorder, RoundedCornerShape(8.dp))
-                    .clickable { previewImageIndex = idx },
-            )
-        }
-
         fileNames.forEachIndexed { idx, name ->
             val uri = nonImageUris.getOrNull(idx)
             FileAttachmentTile(
@@ -746,7 +749,7 @@ private fun ImageGalleryDialog(
             ) {
                 Icon(
                     androidx.compose.material.icons.Icons.Default.Close,
-                    contentDescription = "Close",
+                    contentDescription = "关闭",
                     tint = Color.White,
                 )
             }
@@ -766,7 +769,7 @@ private fun ImageGalleryDialog(
     }
 }
 
-// ─── Assistant Message (left-aligned, no bubble, with "Minis" header like iOS) ─
+// ─── Assistant Message (left-aligned, no bubble, with "Mines" header like iOS) ─
 
 // ─── Flattened chat items ────────────────────────────────────────────────────
 // Each message is expanded into a sequence of independent LazyColumn items (header,

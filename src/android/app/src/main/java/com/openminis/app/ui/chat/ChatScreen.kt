@@ -138,7 +138,7 @@ import androidx.compose.material.icons.filled.RadioButtonChecked
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.ripple
-import androidx.compose.material3.DropdownMenu
+import com.openminis.app.ui.glass.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Switch
 import com.openminis.app.ui.settings.SettingsSwitch
@@ -158,6 +158,7 @@ import androidx.compose.material.icons.outlined.Handyman
 import androidx.compose.material.icons.outlined.Extension
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.Language
+import androidx.compose.material.icons.outlined.Book
 import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material.icons.outlined.Delete
 import com.openminis.app.ui.components.MinisIcons
@@ -166,7 +167,7 @@ import com.openminis.app.ui.components.MinisMenuDivider
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.ModalBottomSheet
+import com.openminis.app.ui.glass.ModalBottomSheet
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -201,6 +202,7 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import com.openminis.app.ui.plus.glassInput
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
@@ -569,6 +571,10 @@ fun ChatScreen(
     onEditProviderClick: (instanceId: String) -> Unit = {},
 ) {
     val context = LocalContext.current
+    // [Mines-38.7] leaving this chat window = the conversation ended for now → organise it into 知识库 (3 s later)
+    androidx.compose.runtime.DisposableEffect(sessionId) {
+        onDispose { com.openminis.app.plus.ChatKnowledge.touch(context, if (sessionId.startsWith("__new__")) "chat:recent" else "chat:" + sessionId) }
+    }
     val keyboardController = LocalSoftwareKeyboardController.current
     val focusManager = LocalFocusManager.current
     // Scoped to a process-level per-session ViewModelStore (ChatViewModelStore)
@@ -602,6 +608,7 @@ fun ChatScreen(
     val hasOlderMessages by viewModel.hasOlderMessages.collectAsState()
     val isStreaming by viewModel.isStreaming.collectAsState()
     val canResume by viewModel.canResume.collectAsState()
+    val loopPause by viewModel.loopPause.collectAsState()
     // [T-android-context-usage-hint] Context-window pressure. `contextUsage`
     // is live (drives the glow on every usage chunk); `contextUsageHint` is
     // the discrete, generation-keyed placeholder line.
@@ -897,6 +904,8 @@ fun ChatScreen(
     val coroutineScope = rememberCoroutineScope()
 
     var showModelPicker by remember { mutableStateOf(false) }
+    // [Mines-38.9.8] smoke hook 'i398 picker': open the picker once on entering the chat
+    LaunchedEffect(Unit) { if (com.openminis.app.ui.components.QuickTestAuto.pickerArmed) { com.openminis.app.ui.components.QuickTestAuto.pickerArmed = false; showModelPicker = true } }
     // [T-android-picker-provider-edit] Reopen the picker after a hand-off to
     // a provider's settings or Model Groups (iOS shows those over the picker).
     val reopenModelPickerOnResume = com.openminis.app.ui.components.rememberReopenOnResume {
@@ -939,6 +948,7 @@ fun ChatScreen(
     var showThinkingLevelSheet by remember { mutableStateOf(false) }
     var showAttachMenu by remember { mutableStateOf(false) }
     var showChatMenu by remember { mutableStateOf(false) }
+    var minesProgressOpen by remember { mutableStateOf(false) }   // [Mines-38.9.6 i12] ⋯ › 进度与步骤
     var showSkillsSheet by remember { mutableStateOf(false) }
     // [T-mcp-integration-android] MCPs-in-Session sheet visibility.
     var showMcpsSheet by remember { mutableStateOf(false) }
@@ -1080,7 +1090,7 @@ fun ChatScreen(
         // [T-android-overlay-hide-camera] Suppress the floating bg-overlay
         // BEFORE handing off to the system camera. The camera Activity
         // takes foreground, which by #451's rule would otherwise satisfy
-        // "Minis backgrounded → show overlay" and the capsule would draw
+        // "Mines backgrounded → show overlay" and the capsule would draw
         // on top of the viewfinder. Cleared in the ActivityResult callback.
         com.openminis.app.service.SessionActivityTracker.setCameraSuppressActive(true)
         runCatching { cameraLauncher.launch(intent) }
@@ -2775,7 +2785,13 @@ fun ChatScreen(
         }
     }
 
+    // [Mines] Full-screen chat wallpaper: bars and composer go translucent so it shows through.
+    val minesWallpaper = com.openminis.app.ui.plus.wallpaperOn()
+    val minesChatSky = com.openminis.app.ui.plus.chatSkyOn()
+    val minesBasePalette = com.openminis.app.ui.theme.LocalChatPalette.current
+    val minesPalette = if (minesWallpaper) minesBasePalette.copy(inputBg = minesBasePalette.inputBg.copy(alpha = 0.82f)) else minesBasePalette
     CompositionLocalProvider(
+        com.openminis.app.ui.theme.LocalChatPalette provides minesPalette,
         LocalBrowserTabPool provides viewModel.browserTabPool,
         LocalMarkdownFontScale provides markdownFontScale,
         LocalToolPreviewEnabled provides toolPreviewEnabled,
@@ -2793,12 +2809,12 @@ fun ChatScreen(
         LocalMarkdownSessionId provides sessionId,
     ) {
     Scaffold(
-        containerColor = ChatColors.background,
+        containerColor = if (minesChatSky) androidx.compose.ui.graphics.Color.Transparent else ChatColors.background,
         contentWindowInsets = WindowInsets(0),
         topBar = {
             TopAppBar(
                 title = {
-                    // iOS-style centered layout: "Minis" + group row + provider·model row
+                    // iOS-style centered layout: "Mines" + group row + provider·model row
                     Box(
                         modifier = Modifier.fillMaxWidth(),
                         contentAlignment = Alignment.Center,
@@ -2857,11 +2873,13 @@ fun ChatScreen(
                                 // the longest title.
                                 .padding(horizontal = 32.dp, vertical = 2.dp),
                         ) {
+                            // [Mines-38.5] design36warm 06: the character's face heads the bar (was text only: model name first)
+                            com.openminis.app.ui.plus.PetAvatar(size = 34.dp, animated = false, face = true)
                             // Nav title: current session title when one
                             // exists and the toggle is on, else fall back to
                             // the Soul name (matches the input placeholder
                             // "Message <SoulName>"), then to app_name
-                            // ("Minis") as the terminal fallback.
+                            // ("Mines") as the terminal fallback.
                             // Tap opens the same SessionEditSheet used from
                             // the session list — drafts return null from
                             // loadSessionEntity so the sheet stays closed.
@@ -3062,6 +3080,9 @@ fun ChatScreen(
                                 // navbar is narrow; the badge has no weight, so it
                                 // keeps its intrinsic width and always renders in
                                 // full — the level label never gets clipped.
+                                // [Mines-38.5] had hidden this line (`if (false && …)`) when the character's face moved into the bar.
+                                // [Mines-38.9.1] user 2026-10-17 「模型都不出现了」「我都不知道用的哪个」: back — 「账号 · 模型 💡思考」 under the
+                                // group, updated live by the 429 rotation (it writes _providerName / _modelName).
                                 if (providerName.isNotEmpty() || modelName.isNotEmpty()) {
                                     val thinkingLevelBadgeState by viewModel.thinkingLevel.collectAsState()
                                     Row(
@@ -3140,7 +3161,7 @@ fun ChatScreen(
                     // [T-android-tablet-split] See `isTwoPane`.
                     if (!isTwoPane) {
                         IconButton(onClick = onBack) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
                         }
                     } else if (onToggleSidebar != null) {
                         // [T-android-tablet-sidebar-collapse] The slot the back
@@ -3218,7 +3239,7 @@ fun ChatScreen(
                     // iOS: "..." circle button → dropdown menu
                     Box {
                         IconButton(onClick = { showChatMenu = true }) {
-                            Icon(Icons.Default.MoreVert, contentDescription = "More")
+                            Icon(Icons.Default.MoreVert, contentDescription = "更多")
                         }
                         MinisMenu(
                             expanded = showChatMenu,
@@ -3253,6 +3274,25 @@ fun ChatScreen(
                                     MenuItemIcon(MinisIcons.SquareAndPencil)
                                 },
                             )
+                            // [Mines-38.9.6 i12] every chat: its goal / steps / summary card, and one-tap archive (撤销 toast)
+                            val minesSidMenu = viewModel.realSessionId.ifEmpty { viewModel.sessionId }
+                            if (minesSidMenu.isNotBlank()) {
+                                val minesCtxMenu = androidx.compose.ui.platform.LocalContext.current
+                                DropdownMenuItem(
+                                    text = { Text("进度与步骤") },
+                                    onClick = { showChatMenu = false; minesProgressOpen = true },
+                                    leadingIcon = { MenuItemIcon(com.openminis.app.ui.plus.WarmIcons.of("list-checks") ?: com.openminis.app.ui.plus.WarmIcons.of("check")!!) },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text(if (com.openminis.app.plus.ChatOrganizer.isManual(minesSidMenu)) "取消归档" else "归档") },
+                                    onClick = {
+                                        showChatMenu = false
+                                        if (com.openminis.app.plus.ChatOrganizer.isManual(minesSidMenu)) com.openminis.app.plus.ChatOrganizer.restore(minesCtxMenu, minesSidMenu)
+                                        else com.openminis.app.plus.ChatOrganizer.archive(minesCtxMenu, minesSidMenu)
+                                    },
+                                    leadingIcon = { MenuItemIcon(com.openminis.app.ui.plus.WarmIcons.of("archive")!!) },
+                                )
+                            }
                             MinisMenuDivider()
                             // Clear Chat (iOS parity, red)
                             DropdownMenuItem(
@@ -3288,6 +3328,21 @@ fun ChatScreen(
                                     MenuItemIcon(Icons.Outlined.Language)
                                 },
                             )
+                            // [Mines-kb] Per-chat knowledge-base switch (search_knowledge tool).
+                            if (com.openminis.app.plus.KnowledgeBase.hasContent(context)) {
+                                var kbOn by remember(viewModel.sessionId) {
+                                    mutableStateOf(com.openminis.app.plus.KnowledgeBase.isOnFor(context, viewModel.sessionId))
+                                }
+                                DropdownMenuItem(
+                                    text = { Text(if (kbOn) "知识库：本对话已开 ✓" else "知识库：本对话已关") },
+                                    onClick = {
+                                        kbOn = !kbOn
+                                        com.openminis.app.plus.KnowledgeBase.setOnFor(context, viewModel.sessionId, kbOn)
+                                        showChatMenu = false
+                                    },
+                                    leadingIcon = { MenuItemIcon(Icons.Outlined.Book) },
+                                )
+                            }
                             // Browse Chat Files (iOS parity) — opens file browser at /var/minis
                             DropdownMenuItem(
                                 text = { Text(stringResource(R.string.chat_menu_browse_chat_files)) },
@@ -3472,8 +3527,8 @@ fun ChatScreen(
                 },
                 windowInsets = WindowInsets.statusBars,
                 colors = androidx.compose.material3.TopAppBarDefaults.topAppBarColors(
-                    containerColor = ChatColors.background.copy(alpha = 0.92f),
-                    scrolledContainerColor = ChatColors.background.copy(alpha = 0.92f),
+                    containerColor = ChatColors.background.copy(alpha = if (minesWallpaper) 0.55f else 0.92f),
+                    scrolledContainerColor = ChatColors.background.copy(alpha = if (minesWallpaper) 0.55f else 0.92f),
                 ),
                 // [T-android-topbar-shrink] 76dp → 68dp. The earlier
                 // T-topbar-model-row-clip fix bumped 60dp → 76dp to give the
@@ -3488,11 +3543,17 @@ fun ChatScreen(
                 // user-configured font scale on xhdpi/xxhdpi without
                 // re-clipping (T-topbar-model-row-clip regression check).
                 // Font sizes + lineHeights stay untouched per spec.
-                expandedHeight = 68.dp,
+                // [Mines-38.5] avatar (34 dp, fixed) + title + model row (both sp): grow with font scale, so at the user's
+                // 1.18 the model row is no longer clipped by the bar's bottom edge (82 dp fitted only scale 1.0).
+                expandedHeight = androidx.compose.ui.unit.Dp(
+                    (46f + 52f * androidx.compose.ui.platform.LocalDensity.current.fontScale.coerceIn(1f, 2f))),
             )
         },
-        snackbarHost = { SnackbarHost(snackbarHostState) },
+        snackbarHost = { SnackbarHost(snackbarHostState) { com.openminis.app.ui.plus.GlassSnackbar(it) } },
     ) { padding ->
+        // [Mines] Drawn behind the top bar, the messages and the composer (edge-to-edge).
+        if (minesChatSky) com.openminis.app.ui.plus.WeatherSkyBackdrop(Modifier.fillMaxSize(), chat = true)
+        com.openminis.app.ui.plus.ChatWallpaperLayer(Modifier.fillMaxSize())
         // [T-android-scroll-fab-content-inset] The chat pane's own width, used
         // below to inset the scroll buttons to the capped content column.
         var chatPaneWidthPx by remember { mutableStateOf(0) }
@@ -3580,7 +3641,7 @@ fun ChatScreen(
                 // in-flight tool is invisible to this predicate → reserve
                 // collapsed to 20dp while a 65dp+6dp floating bar covered
                 // the bottom of the LazyColumn. The new arrivals (status
-                // pill, "Minis is thinking" indicator, inline retry banner) landed
+                // pill, "Mines is thinking" indicator, inline retry banner) landed
                 // behind the bar with no way to scroll them into view.
                 //
                 // Fix: also subscribe to streamingById so the predicate
@@ -4271,13 +4332,24 @@ fun ChatScreen(
                             )
                         }
                     }
-                    if (canResume && !isStreaming && error == null && !lastAssistantHasError) {
+                    // [Mines-loop-30] Loop-guard pause: reason + 继续 / 停止.
+                    val pauseText = loopPause
+                    if (pauseText != null && !isStreaming) {
+                        item(key = "__loop_pause__", contentType = "loop_pause") {
+                            LoopPauseBanner(
+                                text = pauseText,
+                                onContinue = { viewModel.loopPauseContinue() },
+                                onStop = { viewModel.loopPauseStop() },
+                            )
+                        }
+                    }
+                    if (loopPause == null && canResume && !isStreaming && error == null && !lastAssistantHasError) {
                         item(key = "__resume_banner__", contentType = "resume_banner") {
                             ResumeBanner(onResume = {
                                 viewModel.resume()
                                 // T282: same dual-scroll trick as the regular
                                 // send paths (T281). Resume kicks off a fresh
-                                // stream, so the "Minis is thinking" indicator
+                                // stream, so the "Mines is thinking" indicator
                                 // mounts a frame or two later — pin once now,
                                 // then again after 100ms so the indicator
                                 // doesn't land below the fold.
@@ -4289,6 +4361,16 @@ fun ChatScreen(
                                 }
                             })
                         }
+                    }
+                    // [Mines-38.6] item E: one AI reply = one design card. The reply is split into one list item per
+                    // markdown block; each block draws its own slice of the card (first = rounded top, last = rounded
+                    // bottom, middle = straight edges) so selection and per-item measuring are untouched.
+                    val minesCardSeg = HashMap<String, Int>()
+                    for (ci in flatItems.indices) {
+                        val cur = flatItems[ci] as? FlatChatItem.AssistantMarkdownBlock ?: continue
+                        val prev = (flatItems.getOrNull(ci - 1) as? FlatChatItem.AssistantMarkdownBlock)?.takeIf { it.rawText.isNotBlank() }
+                        val next = (flatItems.getOrNull(ci + 1) as? FlatChatItem.AssistantMarkdownBlock)?.takeIf { it.rawText.isNotBlank() }
+                        minesCardSeg[cur.key] = (if (prev?.messageId == cur.messageId) 0 else 1) or (if (next?.messageId == cur.messageId) 0 else 2)
                     }
                     items(
                         items = flatItems.asReversed(),
@@ -4408,6 +4490,7 @@ fun ChatScreen(
                                 // bubble shows its own action menu (Copy /
                                 // Retry / Edit) instead of starting text
                                 // selection, matching iOS UX.
+                                androidx.compose.foundation.layout.Column(Modifier.fillMaxWidth()) {
                                 UserMessageBubble(
                                 message = item.message,
                                 // [T-android-candidate-bubble-gap] extra top
@@ -4417,6 +4500,10 @@ fun ChatScreen(
                                 onCopy = {
                                     val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
                                     clipboard.setPrimaryClip(android.content.ClipData.newPlainText("message", item.message.content))
+                                },
+                                onQuote = {
+                                    viewModel.setQuoteDraft(item.message.content)
+                                    try { inputFocusRequester.requestFocus() } catch (_: IllegalStateException) {}
                                 },
                                 // T119: pass null while a turn is in flight so
                                 // the long-press menu hides Retry; once the
@@ -4486,6 +4573,8 @@ fun ChatScreen(
                                     }
                                 },
                             )
+                            if (!item.message.isQueued) com.openminis.app.ui.plus.ValueChipRow(item.message.content, alignEnd = true)
+                            }
                             } // close UserBubble SideEffect + UserMessageBubble block
                             is FlatChatItem.AssistantHeader -> AssistantHeader()
                             is FlatChatItem.AssistantText -> BoundsTrackedBlock(
@@ -4496,6 +4585,7 @@ fun ChatScreen(
                                 // T-android-gc-storm-issue17: collapse oversized frozen
                                 // assistant text before feeding the markdown parser, which
                                 // is the GC-storm hotspot for legacy sessions.
+                                androidx.compose.foundation.layout.Column(Modifier.fillMaxWidth()) {
                                 LargeContentGuard(
                                     content = item.block.content,
                                     isStreaming = item.isStreaming,
@@ -4513,12 +4603,17 @@ fun ChatScreen(
                                         ),
                                     )
                                 }
+                                // [Mines-38.9.5 i] copy chips (links, emails, IP:port, codes, paths…); secrets masked
+                                if (!item.isStreaming) com.openminis.app.ui.plus.ValueChipRow(item.block.content)
+                                }
                             }
-                            is FlatChatItem.AssistantMarkdownBlock -> BoundsTrackedBlock(
+                            // [38.9.11 i32] a blank block (whitespace between tool calls) drew an empty card with ‹ › edges
+                            is FlatChatItem.AssistantMarkdownBlock -> if (item.rawText.isBlank()) androidx.compose.foundation.layout.Spacer(Modifier.height(0.dp)) else com.openminis.app.ui.plus.ReplyCardSlice(minesCardSeg[item.key] ?: 3) { BoundsTrackedBlock(
                                 messageId = item.messageId,
                                 slotKey = "mdblock:${item.parentBlockId}:${item.blockIndex}",
                                 markdown = item.messageMarkdown,
                             ) {
+                                androidx.compose.foundation.layout.Column(Modifier.fillMaxWidth()) {
                                 LargeContentGuard(
                                     content = item.rawText,
                                     isStreaming = item.isStreaming,
@@ -4536,7 +4631,9 @@ fun ChatScreen(
                                         ),
                                     )
                                 }
-                            }
+                                if (!item.isStreaming) com.openminis.app.ui.plus.ValueChipRow(item.rawText)
+                                }
+                            } }
                             is FlatChatItem.AssistantThinking -> {
                                 // T300: hide Deep Thinking block when the user
                                 // currently has thinking turned off — even if
@@ -4755,6 +4852,23 @@ fun ChatScreen(
                                     ) {
                                         UsageCapsule(usage = item.usage, completedAt = item.completedAt)
                                     }
+                                    // [Mines-38.9.1] small 「model · account」 tag under every finished reply (hidden while the capsule shows)
+                                    // [Mines-38.9.9] footer row: 「model · account」 + a one-tap 复制 (whole reply, plain text)
+                                    if (!shown) Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        Text(
+                                            text = item.usage.servedBy,
+                                            fontSize = 11.sp,
+                                            lineHeight = 13.sp,
+                                            color = ChatColors.tertiaryText,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f).padding(start = 16.dp, top = 2.dp, bottom = 2.dp),
+                                        )
+                                        ReplyCopyButton(markdown = { ReplyCopy.markdownOf(messages, item.messageId) }, modifier = Modifier.padding(end = 8.dp))
+                                    }
                                 }
                             }
                             is FlatChatItem.AssistantError -> InlineErrorBanner(
@@ -4871,6 +4985,11 @@ fun ChatScreen(
                         },
                         onAddToInput = { snippet ->
                             viewModel.appendToInputText(snippet)
+                            try { inputFocusRequester.requestFocus() } catch (_: IllegalStateException) {}
+                            keyboardController?.show()
+                        },
+                        onQuote = { snippet ->
+                            viewModel.setQuoteDraft(snippet)
                             try { inputFocusRequester.requestFocus() } catch (_: IllegalStateException) {}
                             keyboardController?.show()
                         },
@@ -5137,7 +5256,7 @@ fun ChatScreen(
                             // anchor" for the turn-walk, and keeps this button visually
                             // distinct from the down button's plain chevron.
                             imageVector = Icons.Default.VerticalAlignTop,
-                            contentDescription = "Scroll to previous message",
+                            contentDescription = "上一条消息",
                             modifier = Modifier.size(20.dp),
                         )
                     }
@@ -5185,7 +5304,7 @@ fun ChatScreen(
                     ) {
                         Icon(
                             imageVector = Icons.Default.KeyboardArrowDown,
-                            contentDescription = "Scroll to bottom",
+                            contentDescription = "回到底部",
                             modifier = Modifier.size(20.dp),
                         )
                     }
@@ -5342,8 +5461,7 @@ fun ChatScreen(
                                 .padding(horizontal = 12.dp)
                                 // T240: keep a thin visible border instead of the
                                 // diffuse 8dp halo that bled out past the panel edge.
-                                .shadow(elevation = 3.dp, shape = RoundedCornerShape(10.dp))
-                                .background(ChatColors.inputBg, RoundedCornerShape(10.dp))
+                                .glassInput(RoundedCornerShape(10.dp), com.openminis.app.ui.plus.glassInputFill(field = true), ChatColors.isDark)   // [Mines-38.9.6] slash / @ panel = shared glass
                                 .border(0.5.dp, ChatColors.toolBorder, RoundedCornerShape(10.dp)),
                         ) {
                             androidx.compose.foundation.lazy.LazyColumn(
@@ -5533,8 +5651,7 @@ fun ChatScreen(
                                     },
                                 )
                                 .padding(horizontal = 12.dp)
-                                .shadow(elevation = 8.dp, shape = RoundedCornerShape(10.dp))
-                                .background(ChatColors.inputBg, RoundedCornerShape(10.dp))
+                                .glassInput(RoundedCornerShape(10.dp), com.openminis.app.ui.plus.glassInputFill(field = true), ChatColors.isDark)   // [Mines-38.9.6] @ panel = shared glass
                                 .border(0.5.dp, ChatColors.toolBorder, RoundedCornerShape(10.dp)),
                         ) {
                             if (mentionEntries.isEmpty()) {
@@ -5789,30 +5906,9 @@ fun ChatScreen(
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .drawBehind {
-                            val radiusPx = 20.dp.toPx()
-                            val canvas = drawContext.canvas.nativeCanvas
-                            // Pass 1: symmetric ambient halo — small blur, low alpha.
-                            shadowPaint.setShadowLayer(
-                                6.dp.toPx(), 0f, 0f,
-                                android.graphics.Color.argb(22, 0, 0, 0),
-                            )
-                            canvas.drawRoundRect(
-                                0f, 0f, size.width, size.height,
-                                radiusPx, radiusPx,
-                                shadowPaint,
-                            )
-                            // Pass 2: soft downward shadow (spot light).
-                            shadowPaint.setShadowLayer(
-                                10.dp.toPx(), 0f, 3.dp.toPx(),
-                                android.graphics.Color.argb(24, 0, 0, 0),
-                            )
-                            canvas.drawRoundRect(
-                                0f, 0f, size.width, size.height,
-                                radiusPx, radiusPx,
-                                shadowPaint,
-                            )
-                        }
+                        // [Mines-38.9.6 i12] the composer is the shared input glass (was an opaque card with no rim: 「看不清」):
+                        // dense tint (≥ 90 %, it sits over sharp chat text with no blur), soft visible rim, halo outside only
+                        .glassInput(RoundedCornerShape(20.dp), com.openminis.app.ui.plus.glassInputFill(field = true), ChatColors.isDark)
                         // [T-android-context-usage-hint] Ambient inner glow
                         // along the card's inside edge once the context window
                         // is under pressure. Applied to the composer CARD (not
@@ -5915,7 +6011,7 @@ fun ChatScreen(
                                     }
                                     Spacer(Modifier.width(6.dp))
                                     Text(
-                                        "Move to…",
+                                        stringResource(R.string.move_to_sheet_title),  // [38.9.11 int] was hard-coded English
                                         fontSize = 11.sp,
                                         fontWeight = FontWeight.Medium,
                                         color = ChatColors.secondaryText,
@@ -5968,7 +6064,23 @@ fun ChatScreen(
                             }
                         }
                     }
-                    if (attachments.isNotEmpty()) {
+                    // [Mines-38.9.11 b] images waiting to be sent = Hark-style fanned stack (tap → full-screen pager,
+                    // × drops the last one); other files keep their chips in the row below.
+                    val stackImages = attachments.filter { it.isImage }
+                    if (stackImages.isNotEmpty()) {
+                        // [Mines-38.9.11.1] Hark-style row of small rounded thumbnails, each with its own ×
+                        com.openminis.app.ui.plus.ComposerImageRow(
+                            models = stackImages.map { it.uri },
+                            onOpen = { idx ->
+                                previewImageGallery = stackImages.map { ic ->
+                                    com.openminis.app.ui.components.ImageGalleryItem(model = ic.uri, caption = ic.fileName)
+                                } to idx
+                            },
+                            onRemove = { idx -> stackImages.getOrNull(idx)?.let { viewModel.removeAttachment(it.id) } },
+                            modifier = Modifier.padding(start = 14.dp, top = 6.dp, bottom = 2.dp),
+                        )
+                    }
+                    if (attachments.any { !it.isImage }) {
                         LazyRow(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -5981,7 +6093,7 @@ fun ChatScreen(
                             // past the top-right; no extra spacedBy needed.
                             horizontalArrangement = Arrangement.spacedBy(0.dp),
                         ) {
-                            items(attachments, key = { it.id }) { attachment ->
+                            items(attachments.filter { !it.isImage }, key = { it.id }) { attachment ->
                                 // T-pwa-2: long-press menu only appears for
                                 // .html / .htm attachments. The menu lives in
                                 // a Box that anchors to the chip; the sheet
@@ -6121,6 +6233,17 @@ fun ChatScreen(
                     // text is already delta-appended into `inputText` by the
                     // mic button's callback, so when recording ends the field
                     // shows the full recognized string automatically.
+                    // [Mines-38.9.5 i] 「— 已停止 · 原因 · 时间 —」 + one status line right above the input when the agent stopped / failed / waits
+                    run {
+                        val minesStreaming by viewModel.isStreaming.collectAsState()
+                        com.openminis.app.ui.plus.ChatProgressStatus(viewModel.realSessionId.ifEmpty { viewModel.sessionId }, minesStreaming)
+                        if (minesProgressOpen) com.openminis.app.ui.plus.ProgressSheet(viewModel.realSessionId.ifEmpty { viewModel.sessionId }, sessionTitle ?: "",
+                            onDismiss = { minesProgressOpen = false }, onOpenChat = {})
+                    }
+                    run {
+                        val minesQuote by viewModel.quoteDraft.collectAsState()
+                        minesQuote?.let { q -> com.openminis.app.ui.plus.QuoteDraftBlock(q) { viewModel.setQuoteDraft(null) } }
+                    }
                     val recSttState by com.openminis.app.speech.SpeechRecognitionManager
                         .state.collectAsState()
                     val recIsRecording = recSttState == com.openminis.app.speech.RecognitionState.RECORDING ||
@@ -6188,7 +6311,7 @@ fun ChatScreen(
                             }
                         }
                     } else
-                    // Text field (iOS: placeholder "Message Minis", no border)
+                    // Text field (iOS: placeholder "Message Mines", no border)
                     run {
                         val interactionSource = remember { MutableInteractionSource() }
                         // [T-android-composer-placeholder-rotation] Which entry
@@ -6752,7 +6875,7 @@ fun ChatScreen(
                             ) {
                                 Icon(
                                     Icons.Default.Add,
-                                    contentDescription = "Attach",
+                                    contentDescription = "附件",
                                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.size(20.dp),
                                 )
@@ -7313,7 +7436,7 @@ fun ChatScreen(
                             ) {
                                 Icon(
                                     Icons.Default.Stop,
-                                    contentDescription = "Stop",
+                                    contentDescription = "停止",
                                     tint = Color.White,
                                     modifier = Modifier.size(20.dp),
                                 )
@@ -7527,6 +7650,33 @@ fun ChatScreen(
                     )
                 )
         )
+        }
+    }
+
+    // [Mines] A captcha is waiting for the user: one big, simple prompt.
+    val minesVerify by com.openminis.app.plus.HumanVerify.pending.collectAsState()
+    var minesVerifyShownFor by remember { mutableStateOf(0L) }
+    minesVerify?.let { pv ->
+        if (minesVerifyShownFor != pv.since && !showBrowserSheet) {
+            com.openminis.app.ui.glass.AlertDialog(
+                onDismissRequest = { minesVerifyShownFor = pv.since },
+                title = { Text("需要你点一下验证") },
+                text = {
+                    Text(
+                        "${pv.host.ifBlank { "网页" }} 弹出了${pv.kind}。点「去验证」打开这个网页，按提示点一下或拖一下滑块；完成后 Mines 会自动继续。",
+                        style = MaterialTheme.typography.bodyLarge,
+                    )
+                },
+                confirmButton = {
+                    androidx.compose.material3.Button(onClick = {
+                        minesVerifyShownFor = pv.since
+                        viewModel.openBrowserSheetForUrl(pv.url)
+                    }) { Text("去验证") }
+                },
+                dismissButton = {
+                    androidx.compose.material3.TextButton(onClick = { minesVerifyShownFor = pv.since }) { Text("稍后") }
+                },
+            )
         }
     }
 

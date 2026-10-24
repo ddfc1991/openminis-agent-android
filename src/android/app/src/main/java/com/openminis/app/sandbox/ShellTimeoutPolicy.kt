@@ -50,7 +50,8 @@ object ShellTimeoutPolicy {
     private val networkPrefixes = setOf(
         "ping", "dig", "nslookup", "host", "traceroute",
         "curl", "wget", "http",
-        "ssh", "scp", "rsync",
+        // [Mines] `minis-connect check` can wait up to 2 min for the user's approval card.
+        "minis-connect",
     )
 
     /** Install commands — any of these (possibly with subcommand) triggers. */
@@ -75,6 +76,10 @@ object ShellTimeoutPolicy {
     /** Long-running / daemon drivers. */
     private val longRunningPrefixes = setOf(
         "watch",
+        // [T-android-ssh-timeout] Remote sessions: a deploy or a tail over ssh
+        // routinely outlives the 3-minute network bucket it used to share
+        // with curl, and being SIGKILLed mid-transfer is worse than waiting.
+        "ssh ", "scp ", "sftp ", "rsync ", "sshpass ", "autossh ", "mosh ", "minis-muse ",
         "node --watch", "npm run dev", "npm run start", "npm start",
         "python -m http.server",
         "serve", "http-server",

@@ -290,6 +290,68 @@ object CopilotDeviceFlow {
     }
 
     /**
+     * [Mines-38.9.11 i32] The session token's deadline on the PHONE's clock. `expires_at` is GitHub's clock: a phone whose
+     * clock runs behind kept using a dead token (every chat 401 until the clock caught up) and one running ahead refreshed
+     * on every request. `refresh_in` is relative, so it is skew-proof: deadline = now + refresh_in (refresh happens a minute
+     * before, see [SessionToken.needsRefresh]). Only `expires_at` → its distance from now, clamped to 60 s … 30 min.
+     */
+    fun parseSessionTokenLocal(json: JSONObject, nowLocalEpochSeconds: Long): SessionToken? {
+        val token = json.optString("token", "").ifEmpty { return null }
+        val refreshIn = json.optLong("refresh_in", 0)
+        if (refreshIn > 0) return SessionToken(token, nowLocalEpochSeconds + refreshIn.coerceAtMost(3600))
+        val expiresAt = json.optLong("expires_at", 0)
+        if (expiresAt > 0) return SessionToken(token, nowLocalEpochSeconds + (expiresAt - nowLocalEpochSeconds).coerceIn(120, 1800))
+        return null
+    }
+
+    /**
+     * [Mines-38.9.11 i32] The chat host GitHub assigns to this account. The token response (and copilot_internal/user) carry
+     * `endpoints.api` — for the user's Copilot Free account it is https://api.individual.githubcopilot.com (checked
+     * 2026-10-20); business / enterprise accounts get their own hosts. Mines always dialled api.githubcopilot.com.
+     * Falls back to the `proxy-ep=proxy.<x>.githubcopilot.com` field inside the token. Only https *.githubcopilot.com
+     * is accepted (the token is a bearer secret — never send it elsewhere). Null = keep the default [API_BASE].
+     */
+    fun parseApiEndpoint(json: JSONObject): String? {
+        fun ok(u: String): String? {
+            val t = u.trim().trimEnd('/')
+            val host = runCatching { java.net.URI(t).host }.getOrNull()?.lowercase() ?: return null
+            return if (t.startsWith("https://") && (host == "githubcopilot.com" || host.endsWith(".githubcopilot.com"))) t else null
+        }
+        json.optJSONObject("endpoints")?.optString("api", "")?.takeIf { it.isNotBlank() }?.let { u -> ok(u)?.let { return it } }
+        val tok = json.optString("token", "")
+        Regex("(?:^|;)proxy-ep=([a-z0-9.\\-]+)").find(tok)?.groupValues?.get(1)?.let { ep ->
+            val api = if (ep.startsWith("proxy.")) "api." + ep.removePrefix("proxy.") else ep
+            ok("https://$api")?.let { return it }
+        }
+        return null
+    }
+
+    /**
+     * [Mines-38.9.11 i32] Plain-Chinese reason for a failed Copilot CHAT request (status + body), pure. Distinguishes the
+     * cases a Free account actually hits: a model the plan does not include, a model that only speaks /responses, the
+     * monthly quota, a rejected session token (Mines throws it away and gets a new one on the next try).
+     */
+    fun chatErrorZh(status: Int, body: String): String {
+        val low = body.lowercase()
+        val head = when {
+            low.contains("unsupported_api_for_model") || (low.contains("/chat/completions") && low.contains("not support")) ->
+                "这个 Copilot 模型只能用新接口（responses），Mines 现在用不了：换一个模型（比如 gpt-4.1 / gpt-5-mini）"
+            low.contains("model_not_supported") || low.contains("model is not supported") || low.contains("requested model is not supported") ->
+                "你的 Copilot 套餐（免费版）不能用这个模型：换一个模型，或到 github.com/settings/copilot 打开这个模型"
+            status == 402 || low.contains("quota") || low.contains("exceeded") && low.contains("limit") ->
+                "这个月的 Copilot 免费额度用完了，下个月自动恢复，或换别的服务商"
+            status == 401 -> "Copilot 临时令牌失效：Mines 已作废它，再试一次会自动换新的；还不行就点「重新登录」"
+            status == 403 && (low.contains("policy") || low.contains("disabled")) -> "这个模型被 Copilot 设置关掉了：到 github.com/settings/copilot 打开，或换一个模型"
+            status == 403 -> "Copilot 拒绝了这次请求（403）：点「重新登录」重新授权"
+            status == 400 && low.contains("tools") && (low.contains("too long") || low.contains("maximum")) -> "Copilot 一次最多接受 128 个工具，Mines 发多了"
+            status == 429 -> "Copilot 请求太频繁，稍后再试"
+            status in 500..599 -> "GitHub Copilot 服务出错（$status）"
+            else -> "Copilot 请求失败（HTTP $status）"
+        }
+        return head
+    }
+
+    /**
      * Model ids the picker should offer, from `GET /models`.
      *
      * Filters on `model_picker_enabled`: the endpoint also returns embedding
@@ -367,6 +429,13 @@ object CopilotDeviceFlow {
             if (!m.optBoolean("model_picker_enabled", true)) {
                 hidden.add(id)
                 continue
+            }
+            // [Mines-38.9.11 i32] a model Mines cannot drive must not be offered: chat goes to /chat/completions only, so a
+            // model whose supported_endpoints lacks it (responses-only codex models) fails on every send. policy.state is
+            // deliberately NOT a gate (see CopilotModelFilterTest).
+            val eps = m.optJSONArray("supported_endpoints")
+            if (eps != null && eps.length() > 0 && (0 until eps.length()).none { eps.optString(it) == "/chat/completions" }) {
+                dropped.add("$id:endpoints"); continue
             }
             val caps = m.optJSONObject("capabilities")
             val type = caps?.optString("type", "").orEmpty()

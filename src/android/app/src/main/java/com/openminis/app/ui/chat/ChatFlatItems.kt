@@ -132,7 +132,7 @@ import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.RadioButtonChecked
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material3.DropdownMenu
+import com.openminis.app.ui.glass.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import com.openminis.app.BuildConfig
 import com.openminis.app.R
@@ -144,7 +144,7 @@ import com.openminis.app.ui.components.MinisMenuDivider
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.ModalBottomSheet
+import com.openminis.app.ui.glass.ModalBottomSheet
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -156,7 +156,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
+import com.openminis.app.ui.theme.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -734,7 +734,7 @@ internal fun buildFlatChatItems(
             continue
         }
         // System messages (slash-command notices, compact divider, etc.) render
-        // as horizontal-divider rows — no "Minis" attribution, no card. Skip
+        // as horizontal-divider rows — no "Mines" attribution, no card. Skip
         // the assistant header so each info block stands on its own. Mirrors
         // iOS systemDividerRow / compactDividerRow.
         val isSystem = message.role == "system"
@@ -747,7 +747,7 @@ internal fun buildFlatChatItems(
         // T83: when Resume creates a fresh assistant bubble after the user
         // stopped a streaming turn, the previous (cancelled) assistant
         // message is right before this one in the list. Visually they should
-        // read as one continuous turn — suppress the duplicate "Minis"
+        // read as one continuous turn — suppress the duplicate "Mines"
         // header. Skip system rows when looking back since they render as
         // dividers, not as separate speaker turns. iOS achieves this by
         // reusing the existing ChatMessage in runAgentLoop(resumingAt:);

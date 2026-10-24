@@ -46,6 +46,8 @@ object AgentTools {
         // would fail to resolve. Empty falls back to the built-in's name so the
         // enum is never an empty list (which some providers reject).
         rosterNames: List<String> = listOf(SubAgentDefinition.BUILT_IN_NAME),
+        // [Mines-kb] search_knowledge, when this chat has the knowledge base on.
+        knowledgeTool: AgentToolDefinition? = null,
     ): List<AgentToolDefinition> = buildList {
         add(shellExecuteDefinition())
         add(FileReadTool.definition())
@@ -62,6 +64,17 @@ object AgentTools {
         if (!isHelper && delegateEnabled) {
             add(subAgentTaskDefinition(rosterNames))
         }
+        knowledgeTool?.let { add(it) }
+        // [Mines-report-31] self-check / report-to-developer tool
+        if (!isHelper) add(com.openminis.app.plus.MinesSelfCheckTool.definition())
+        // [Mines-38.9] Mines knows its own settings pages; app agents only when the user enabled one
+        add(com.openminis.app.plus.AppSettingsMap.definition())
+        add(com.openminis.app.plus.SelfMap.definition())   // [Mines-38.9.8] 自我地图
+        if (!isHelper && com.openminis.app.plus.AppAgents.anyEnabled()) add(com.openminis.app.plus.AppAgents.definition())
+        // [Mines-38.9.5 i] progress card, linked accounts (never secrets), 工作位置 self-registration
+        if (!isHelper) add(com.openminis.app.plus.TaskProgress.definition())
+        add(com.openminis.app.plus.AccountsTool.definition())
+        if (!isHelper) add(com.openminis.app.plus.WorkspaceStore.definition())
     }
 
     /**
@@ -115,7 +128,16 @@ object AgentTools {
         description = "Execute a command in an isolated Linux process (Alpine Linux via PRoot). " +
             "The command runs via /bin/sh -c with stdout and stderr merged. " +
             "Each invocation spawns a fresh process — there is no shared terminal session. " +
-            "Default timeout is 15 minutes.",
+            "Default timeout is 15 minutes. " +
+            // [Mines-net-26]
+            "Package installs: apk and pip are wrapped (stalled downloads are stopped, the fastest mirror is re-picked and the command retried once). " +
+            "If an install still fails (hangs, SSL/certificate errors, proxy errors, 'unable to fetch'), run `mines-doctor` FIRST and follow its 怎么修 lines instead of guessing; " +
+            "`mines-mirror auto` re-picks mirrors (apk/pip/npm), `mines-devkit install` installs gcc/g++/make, python3+pip, nodejs/npm, git and openjdk17 in one go. " +
+            "Never set http_proxy/https_proxy yourself; Mines exports a working proxy (or none). " +
+            // [Mines-agent-34] user report: a sign-up task spun up remote/headless browsers over CDP from the shell for minutes
+            "Do NOT start headless/remote browsers from the shell (playwright/puppeteer/selenium, connectOverCDP, browserless or cloud browser sessions) " +
+            "to sign up, log in, fill forms or read logged-in pages: use the browser_use tool instead (the app's own in-app browser, with the user's saved logins, " +
+            "automatic SMS/e-mail code fill via wait_for_otp and human-check hand-off via wait_for_human). If the same command fails the same way twice, change approach or tell the user.",
         parameters = mapOf(
             "tool_title" to AgentToolParam("string", "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Install Python data analysis packages', 'List files in home directory'). Use the same language as the user."),
             "command" to AgentToolParam("string", "The shell command to execute. Supports multi-line commands directly — no special escaping needed. Keep under 1000 chars; for longer scripts, write to a file with file_write first, then run it."),
@@ -135,7 +157,10 @@ object AgentTools {
         // the ceiling became dynamic (3 alone, +2 per active agent, capped at
         // 6), and an agent sees only its own tabs anyway — so the honest thing
         // to tell it is which tabs it may use, not a number that is now wrong.
-        description = "Control a web browser with a few tabs (list_tabs shows the ones you may use). " +
+        description = "Control the app's built-in in-app browser with a few tabs (list_tabs shows the ones you may use). " +
+            // [Mines-agent-34]
+            "This is THE tool for any website task: registering an account, logging in, filling forms, reading pages behind a login — " +
+            "prefer it over any shell-based browser automation (no playwright/puppeteer/CDP in shell_execute). " +
             "Do NOT use this tool for minis:// action URLs (open_terminal, views, settings) — those are app deep links, use Markdown links in chat instead. " +
             "The browser supports both web URLs and minis:// resource URLs. Use minis:// URLs to preview session files (e.g. navigate to minis://workspace/index.html). " +
             "Sub-resources (JS, CSS, images, fonts) referenced via minis:// absolute paths or relative paths within HTML pages resolve correctly. " +
@@ -150,6 +175,8 @@ object AgentTools {
             "Use get_cookies to retrieve cookies for the current page URL / current site root domain only (including HttpOnly cookies). get_cookies supports optional 'keywords' (filter by cookie name) and 'fuzzy' (true=contains match, false=exact match, default true). It returns only a summary and an offload env file path — raw cookie values are NOT included in the tool response. To reuse cookies in shell commands: `. /var/minis/offloads/env_cookies_xxx.sh && command`. You may define alias variables when needed. " +
             "Use set_cookies to write cookies into the current page's cookie store via the native cookie store (so even HttpOnly cookies, which JS cannot set, land). Pass a 'cookies' array of objects, each with name + value (required) and optional domain (defaults to the current page host), path (defaults to '/'), secure, http_only, and expires (Unix timestamp in seconds; omit for a session cookie). " +
             "Use wait_for_dom_stable to wait until the page DOM stops changing (useful after navigation or interactions that trigger async data loading — polls every 0.5s, resolves when mutation rate gradient is stable for 3+ intervals, default timeout 10s). " +
+            "If a page shows a CAPTCHA / Cloudflare / slider check, do NOT try to solve it: the user is notified automatically; call wait_for_human (waits up to ~50s per call, repeat if needed) until it reports the check is cleared. " +
+            "For SMS / e-mail one-time codes: after clicking the send-code button, call wait_for_otp (optionally with selector for the code input); Mines reads the code from the phone's notifications and fills it in without showing it to you. " +
             "Use tab_id to target a specific tab (defaults to the most recently used tab).",
         parameters = mapOf(
             "tool_title" to AgentToolParam("string", "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Open Wikipedia homepage', 'Take screenshot of current page'). Use the same language as the user."),

@@ -82,6 +82,7 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.compositeOver
 import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.layer.drawLayer
@@ -198,6 +199,8 @@ private data class MdColors(
     val divider: Color,
     val tableBorder: Color,
     val tableHeaderBg: Color,
+    /** [Mines-38.9.1] solid body-cell fill: tables are content, so they never let the chat / wallpaper through. */
+    val tableCellBg: Color,
 )
 
 @Composable
@@ -213,8 +216,12 @@ private fun currentMdColors(): MdColors {
         link = c.link,
         blockquote = c.secondaryText,
         divider = c.separator,
-        tableBorder = c.tableBorder,
-        tableHeaderBg = c.secondaryBg,
+        // [Mines-38.9.1] solid cells + clearly visible borders (the old 14 % hairline vanished on
+        // glass / wallpaper). All three are opaque and derived from the active palette, so light,
+        // dark and custom themes each get their own.
+        tableBorder = c.primaryText.copy(alpha = 0.22f).compositeOver(c.background.copy(alpha = 1f)),
+        tableHeaderBg = c.secondaryBg.copy(alpha = 1f).compositeOver(c.background.copy(alpha = 1f)),
+        tableCellBg = c.background.copy(alpha = 1f),
     )
 }
 
@@ -556,7 +563,7 @@ private fun MdText(
                         clipboardManager.setText(AnnotatedString(snippet))
                         haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                         val preview = if (snippet.length > 40) snippet.take(37) + "…" else snippet
-                        Toast.makeText(context, "Copied: $preview", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "已复制：$preview", Toast.LENGTH_SHORT).show()
                     }
                 }
             }
@@ -2390,17 +2397,29 @@ private fun RenderBlock(block: MdBlock) {
                         color = MdCodeLangColor,
                         modifier = Modifier.weight(1f),
                     )
-                    Icon(
-                        imageVector = if (copied) Icons.Default.Check else Icons.Default.ContentCopy,
-                        contentDescription = if (copied) "Copied" else "Copy code",
-                        tint = if (copied) Color(0xFF34C759) else Color.White.copy(alpha = 0.4f),
+                    // [Mines-38.9.9] user: copying was painful — a visible 「复制」 pill (icon + word, 32 dp target) per code block
+                    val tint = if (copied) Color(0xFF34C759) else Color.White.copy(alpha = 0.78f)
+                    val ctx = androidx.compose.ui.platform.LocalContext.current
+                    Row(
                         modifier = Modifier
-                            .size(16.dp)
+                            .clip(RoundedCornerShape(8.dp))
                             .clickable {
                                 clipboardManager.setText(androidx.compose.ui.text.AnnotatedString(block.code))
                                 copied = true
-                            },
-                    )
+                                android.widget.Toast.makeText(ctx, "已复制", android.widget.Toast.LENGTH_SHORT).show()
+                            }
+                            .heightIn(min = 32.dp)
+                            .padding(horizontal = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            imageVector = if (copied) Icons.Default.Check else Icons.Default.ContentCopy,
+                            contentDescription = "复制代码",
+                            tint = tint,
+                            modifier = Modifier.size(16.dp),
+                        )
+                        Text(if (copied) "已复制" else "复制", fontSize = 12.sp, color = tint, modifier = Modifier.padding(start = 4.dp))
+                    }
                 }
                 // iOS parity (SelectableMarkdownView.swift L971): cap visual
                 // code-block height at ~400 pt and let an internal scroll
@@ -3151,7 +3170,7 @@ private fun RenderMdVideo(block: MdBlock.Video) {
             }
             Icon(
                 imageVector = Icons.Filled.PlayCircleFilled,
-                contentDescription = "Play video",
+                contentDescription = "播放视频",
                 tint = Color.White.copy(alpha = 0.9f),
                 modifier = Modifier.size(56.dp),
             )
@@ -3427,6 +3446,7 @@ private fun RenderTable(block: MdBlock.Table) {
             modifier = Modifier
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(6.dp))
+                .background(colors.tableCellBg)
                 .border(1.dp, colors.tableBorder, RoundedCornerShape(6.dp))
                 // Record this draw pass into the GraphicsLayer so Copy Table
                 // Image can materialise the styled table (cells, borders, header
@@ -3506,7 +3526,7 @@ private fun RenderTable(block: MdBlock.Table) {
                         val columnAlign = block.alignments.getOrElse(colIndex) { MdTableAlign.START }
                         Box(
                             modifier = Modifier
-                                .then(if (isHeader) Modifier.background(colors.tableHeaderBg) else Modifier)
+                                .background(if (isHeader) colors.tableHeaderBg else colors.tableCellBg)
                                 .drawBehind {
                                     // Right divider between columns
                                     if (!isLastCol) {

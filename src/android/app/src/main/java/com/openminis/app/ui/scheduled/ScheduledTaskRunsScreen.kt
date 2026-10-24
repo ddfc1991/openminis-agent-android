@@ -1,5 +1,7 @@
 package com.openminis.app.ui.scheduled
 
+import com.openminis.app.ui.plus.MT
+
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -27,7 +29,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
+import com.openminis.app.ui.theme.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -74,12 +76,12 @@ fun ScheduledTaskRunsScreen(
                         Text(
                             stringResource(R.string.scheduled_task_runs_title),
                             fontWeight = FontWeight.Bold,
-                            fontSize = 18.sp,
+                            fontSize = MT.PageTitle,
                         )
                         if (task != null && task.label.isNotBlank()) {
                             Text(
                                 task.label,
-                                fontSize = 12.sp,
+                                fontSize = MT.Caption,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
@@ -157,14 +159,14 @@ private fun RunRow(run: ScheduledRun, onOpenSession: (String) -> Unit) {
             Text(
                 text = formatRunTime(run.firedAt),
                 fontWeight = FontWeight.Medium,
-                fontSize = 14.sp,
+                fontSize = MT.Body,
             )
             val preview = run.preview
             if (!preview.isNullOrBlank()) {
                 Text(
                     text = preview,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    fontSize = 12.sp,
+                    fontSize = MT.Caption,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                 )

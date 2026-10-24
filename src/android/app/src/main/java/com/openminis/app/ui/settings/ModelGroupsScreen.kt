@@ -1,5 +1,9 @@
 package com.openminis.app.ui.settings
 
+import com.openminis.app.ui.glass.GlassExposedDropdownMenu
+
+import com.openminis.app.ui.plus.MT
+
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -38,7 +42,7 @@ import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MovieCreation
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.VolumeUp
-import androidx.compose.material3.AlertDialog
+import com.openminis.app.ui.glass.AlertDialog
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
@@ -52,7 +56,7 @@ import androidx.compose.material3.MenuAnchorType
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
+import com.openminis.app.ui.theme.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -185,6 +189,9 @@ fun ModelGroupsScreen(
                 .background(SectionDesign.screenBackgroundColor()),
         ) {
             item("top_gap") { Spacer(modifier = Modifier.height(SectionDesign.FirstSectionTopGap)) }
+            // [Mines-38.9.5 i] per-route status of the login-based routes served by 免登录 AI（Mines）
+            // [Mines-38.9.9] the 免登录 AI block moved to its own page (home ☰ › 免登录 AI); here only a link
+            item("mines_route_status") { com.openminis.app.ui.plus.FreeAiLink() }
 
             if (groups.isEmpty()) {
                 item("empty_state") {
@@ -293,19 +300,19 @@ fun ModelGroupsScreen(
                     Spacer(modifier = Modifier.height(SectionDesign.SectionTopGap))
                 }
                 item("defaults_section_header") {
-                    SectionHeader(text = "Defaults")
+                    SectionHeader(text = "默认")
                 }
                 item("defaults_section_card") {
                     SectionCard {
                         GroupDropdown(
-                            label = "Default Primary",
+                            label = "默认主力",
                             groups = groups,
                             selectedId = config.defaultPrimaryGroupId,
                             onSelect = { providerRepository.defaultPrimaryGroupId = it },
                         )
                         SectionDivider()
                         GroupDropdown(
-                            label = "Default Sub",
+                            label = "默认辅助",
                             groups = groups,
                             selectedId = config.defaultSubGroupId,
                             onSelect = { providerRepository.defaultSubGroupId = it },
@@ -472,7 +479,7 @@ private fun BadgeLabel(text: String, color: androidx.compose.ui.graphics.Color) 
             style = MaterialTheme.typography.labelSmall,
             color = color,
             fontWeight = FontWeight.SemiBold,
-            fontSize = 11.sp,
+            fontSize = MT.Caption,
         )
     }
 }
@@ -503,7 +510,7 @@ private fun GroupDropdown(
                 .menuAnchor(MenuAnchorType.PrimaryNotEditable)
                 .fillMaxWidth(),
         )
-        ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+        GlassExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
             DropdownMenuItem(
                 text = { Text(stringResource(R.string.model_groups_none)) },
                 onClick = {
@@ -991,8 +998,8 @@ private fun GroupRow(
                 groupTopModalities(group, config).forEach { marker ->
                     GroupModalityIcon(marker)
                 }
-                if (isPrimary) BadgeLabel("Primary", MaterialTheme.colorScheme.primary)
-                if (isSub) BadgeLabel("Sub", MaterialTheme.colorScheme.tertiary)
+                if (isPrimary) BadgeLabel("主力", MaterialTheme.colorScheme.primary)
+                if (isSub) BadgeLabel("辅助", MaterialTheme.colorScheme.tertiary)
                 if (allDisabled) {
                     BadgeLabel(
                         stringResource(R.string.model_group_no_usable_models_badge),
@@ -1008,9 +1015,9 @@ private fun GroupRow(
             // group; the parenthetical reports disabled count.
             val disabledCount = totalMembers - enabledMembers
             val subtitleText = if (disabledCount > 0) {
-                "$strategyLabel · $totalMembers models ($disabledCount disabled)"
+                "$strategyLabel · $totalMembers 个模型（$disabledCount 个已停用）"
             } else {
-                "$strategyLabel · $totalMembers models"
+                "$strategyLabel · $totalMembers 个模型"
             }
             Text(
                 text = subtitleText,

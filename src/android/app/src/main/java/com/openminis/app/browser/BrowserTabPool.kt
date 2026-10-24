@@ -27,7 +27,17 @@ import java.util.concurrent.ConcurrentHashMap
  * Manages up to 3 browser tabs for the agent, mirroring iOS BrowserTabPool.
  * All tabs share the same cookie store by default on Android.
  */
-class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.RegistryPool {
+class BrowserTabPool(
+    private val context: Context,
+    /** [Mines-38.9.7] 无痕标签: own WebView profile, never saved / handed over / fed to account memory. */
+    val incognito: Boolean = false,
+    /** [Mines-38.9.11.2] the fresh WebView profile of this 无痕 session (PROFILE path); deleted when the session closes */
+    val incognitoProfile: String? = null,
+) : BrowserTabPoolRegistry.RegistryPool {
+    /** [Mines-38.9.11.2] 每个对话的隔离: this conversation's own WebView profile (fixed at the first tab; null = default) */
+    @Volatile var convProfile: String? = null; private set
+    /** [Mines-38.9.11.2] for Incognito.close (marker bookkeeping) */
+    fun contextForIncognito(): Context = context.applicationContext
 
     companion object {
         private const val TAG = "BrowserTabPool"
@@ -379,6 +389,12 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
     // -- Session --
 
     fun setSession(sessionId: String) {
+        // [Mines-38.9.11.2] another conversation: its tabs must not keep this profile
+        val cur = convProfile
+        if (cur != null && this.sessionId != null && this.sessionId != sessionId) {
+            val mapped = ConvProfiles.profiles()[sessionId]
+            if (mapped != cur) { if (_tabs.value.isNotEmpty()) destroyAllTabs(); convProfile = null }
+        }
         this.sessionId = sessionId
         loadSavedState()
     }
@@ -499,9 +515,9 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
     /** The session's /var/minis/workspace/ host directory — downloads land here
      *  so the agent can read and operate on them in follow-up turns. */
     private fun sessionWorkspaceDir(): File? {
-        val sid = sessionId ?: return null
-        return File(File(File(context.filesDir, "minis-sessions"), sid), "workspace")
-            .apply { mkdirs() }
+        // [Mines-38.9.11 c] downloads → /var/minis/shared/下载/ (survives chat deletes, visible in the system file picker;
+        // the per-chat workspace was wiped with the chat). Works for the home browser too (no chat bound).
+        return com.openminis.app.plus.SharedFiles.downloadsDir(context)
     }
 
     /** name.ext → name-1.ext → name-2.ext … until unused. */
@@ -1036,7 +1052,12 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
             // [T-android-browser-tab-ownership] "Free" means free AND mine (or
             // unowned when privileged): grabbing a sibling's idle tab is the
             // trampling this exists to stop.
-            var picked = currentTabs.firstOrNull { !it.inUse && mayUse(it.id, owner) }
+            // [Mines-38.9.7] takeover keeps the login: the user's selected tab first (BrowserHandoffCore.pickAgentTab);
+            // an empty agent pool opens the user's last page (other pool, ≤ 20 min) with its UA + sessionStorage
+            val lite = currentTabs.map { BrowserHandoffCore.TabLite(it.id, it.inUse, mayUse(it.id, owner)) }
+            val pref = if (isPrivileged(owner)) BrowserHandoffCore.pickAgentTab(_selectedTabId.value, lite) else BrowserHandoffCore.pickAgentTab(null, lite)
+            var picked = currentTabs.firstOrNull { it.id == pref }
+                ?: adoptUserPage(currentTabs, owner)
                 ?: createTab(currentTabs, owner = owner)
             if (picked == null) {
                 val waitDeadline = IMPLICIT_TAB_WAIT_MS
@@ -1149,13 +1170,26 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
                     (url?.let { "; page reloaded from $it" } ?: "; it had no page to reload") +
                     ". Earlier element references and page state are gone — re-locate " +
                     "elements before interacting, and use tab_id ${fresh.id} from now on."
-            Log.i(TAG, "acquireTab: rebuilt tab ${dead.id} as ${fresh.id} (url=${url ?: "none"})")
+            Log.i(TAG, "acquireTab: rebuilt tab ${dead.id} as ${fresh.id} (url=${BrowserLogMask.mask(url ?: "none")})")
         }
         if (survivors.isNotEmpty() && survivors.none { it.id == _selectedTabId.value }) {
             _selectedTabId.value = survivors.first().id
         }
         saveState()
         return replacementForRequested
+    }
+
+    /** [Mines-38.9.7] First agent tab of an empty pool = the page the user was just on (BrowserHandoff). Main thread. */
+    private fun adoptUserPage(tabs: MutableList<Tab>, owner: String?): Tab? {
+        val page = BrowserHandoff.adoptFor(this, tabs.isNotEmpty()) ?: return null
+        val wantUa = if (page.desktop) UserAgentProfile.DESKTOP_CHROME else UserAgentProfile.MOBILE_CHROME
+        val t = createTab(tabs, owner = owner) ?: return null
+        if (userAgentProfile != UserAgentProfile.CUSTOM && userAgentProfile != wantUa) t.manager.setUserAgent(wantUa, null)
+        BrowserHandoff.prepare(t.manager.webView, page)
+        t.needsInitialBlankPage = false
+        t.manager.loadURL(page.url)
+        Log.i(TAG, "adopted the user's page into a new agent tab ${t.id}")
+        return t
     }
 
     private fun createTab(
@@ -1184,6 +1218,24 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
 
         val id = nextTabId++
         val webView = WebView(context)
+        if (incognito && !Incognito.attach(webView, incognitoProfile)) {
+            // never fall back to the shared jar for an incognito tab
+            runCatching { webView.destroy() }
+            Log.w(TAG, "incognito tab refused: no WebView profile support")
+            return null
+        }
+        // [Mines-38.9.11.2] a conversation's agent browser: its own profile (cookies / logins / storage never seen by another
+        // conversation or the home browser). Never falls back to the default jar once a profile was chosen.
+        if (!incognito) {
+            val cp = convProfile ?: runCatching { ConvProfiles.profileFor(context, sessionId) }.getOrNull()?.also { convProfile = it }
+            if (cp != null && !Incognito.attach(webView, cp)) {
+                runCatching { webView.destroy() }
+                Log.w(TAG, "conversation tab refused: profile could not be set")
+                return null
+            }
+        }
+        com.openminis.app.plus.PayCards.install(webView)  // [Mines-cards-35.1] 填卡 into payment iframes
+        if (com.openminis.app.plus.SandboxNet.strict) com.openminis.app.plus.WebProxy.guardWebRtc(webView)   // [38.9.11.3] 严格代理: no WebRTC IP leak
         // [T-android-minis-url-session-scope] Hand the manager a LIVE reader of
         // this pool's session id (set later via setSession) plus a context, so
         // `minis://workspace/...` resolves against this chat's sandbox instead
@@ -1206,6 +1258,9 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
         manager.onCloseWindow = { handleCloseWindow(manager) }
         wireDownloadHandlers(manager)
 
+        manager.incognito = incognito
+        // [Mines-38.9.11.2] 无痕 policy last (the manager's setup turned third-party cookies / caching on)
+        if (incognito) Incognito.harden(webView, incognitoProfile)
         val tab = Tab(id = id, manager = manager)
         tabs.add(tab)
         _tabs.value = tabs.toList()
@@ -1363,6 +1418,7 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
         }
         val id = nextTabId++
         val newWebView = WebView(context)
+        com.openminis.app.plus.PayCards.install(newWebView)
         val manager = BrowserUseManager(
             newWebView,
             userAgentProfile,
@@ -1541,7 +1597,7 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
      * user WITHOUT destroying anything.
      *
      * This is the "Takeover" action: the user is watching a page the agent is
-     * driving (AgentBrowsingOverlay, "Minis is browsing · Takeover") and wants
+     * driving (AgentBrowsingOverlay, "Mines is browsing · Takeover") and wants
      * the wheel. Dropping `inUse` is the whole job — the page they are looking
      * at must survive, so this deliberately does NOT release WebView
      * resources. Destroying here would blank the screen at the exact moment
@@ -1668,6 +1724,7 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
             webView.stopLoading()
             (webView.parent as? android.view.ViewGroup)?.removeView(webView)
             webView.loadUrl("about:blank")
+            if (incognito) { webView.clearHistory(); webView.clearFormData(); webView.removeAllViews() }
             webView.destroy()
         } catch (t: Throwable) {
             Log.w(TAG, "Tab ${tab.id} teardown failed: ${t.message}")
@@ -1703,7 +1760,7 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
         releaseTabResources(tab)
         forgetTab(id, currentTabs)
         saveState()
-        Log.i(TAG, "Evicted tab $id at registry request (url=${url.take(60)})")
+        Log.i(TAG, "Evicted tab $id at registry request (url=${BrowserLogMask.mask(url).take(60)})")
     }
 
     override fun preemptTabForRegistry(id: Int) {
@@ -1719,7 +1776,7 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
         preemptedTabIds.add(id)
         forgetTab(id, currentTabs)
         saveState()
-        Log.i(TAG, "Preempted in-use tab $id at registry request (url=${url.take(60)})")
+        Log.i(TAG, "Preempted in-use tab $id at registry request (url=${BrowserLogMask.mask(url).take(60)})")
     }
 
     override fun evictAllIdleForMemoryPressure(): Int {
@@ -1850,6 +1907,7 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
     // -- Disk Persistence --
 
     private fun saveState() {
+        if (!IncognitoCore.persistsTabs(incognito)) return
         val sid = sessionId ?: return
         try {
             val dir = File(context.filesDir, "browser_tabs")

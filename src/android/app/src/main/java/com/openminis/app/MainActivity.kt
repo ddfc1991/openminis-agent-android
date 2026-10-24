@@ -1,5 +1,7 @@
 package com.openminis.app
 
+import androidx.compose.foundation.layout.fillMaxSize
+import com.openminis.app.ui.plus.glassRootBlur
 import android.app.LocaleManager
 import android.content.Intent
 import android.content.SharedPreferences
@@ -19,6 +21,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import android.app.AlertDialog
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -158,6 +162,13 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        handleMinesRoute(intent)
+        // [Mines-38.9.3] put back sign-in cookies the WebView store lost since the last run (session cookies die with the process)
+        runCatching { com.openminis.app.plus.SessionKeeper.restore(this) }
+        // [Mines-38.8] warm the WebView engine once the app is idle (first 一键关联 page had one blank frame)
+        runCatching { com.openminis.app.browser.WebPrewarm.warmWhenIdle(this) }
+        // [Mines-voiceprint-35.3] a voiceprint recorded while its model was still missing finishes in the background
+        runCatching { if (com.openminis.app.plus.Voiceprint.hasPending(this)) com.openminis.app.plus.Voiceprint.finishInBackground(this) }
 
         // Register the crash-share "Save to..." launcher BEFORE the
         // safe-mode early-return below — ActivityResultLauncher must be
@@ -263,7 +274,7 @@ class MainActivity : ComponentActivity() {
                 // onClosed immediately when pendingShareFiles is null, which
                 // is exactly the state after the user dismissed the dialog on
                 // the previous launch — the app would close the instant it was
-                // tapped, reading as "Minis won't open at all". The process
+                // tapped, reading as "Mines won't open at all". The process
                 // still holds a permanently uninitialized Application, so the
                 // only real recovery is a fresh process: tell the user, then
                 // exit hard so the next tap gets a clean init.
@@ -305,7 +316,8 @@ class MainActivity : ComponentActivity() {
         // launch-mode dispatch entirely.
         restoredChatSessionId = savedInstanceState?.getString(KEY_CURRENT_CHAT_SESSION_ID)
             ?.takeUnless {
-                com.openminis.app.crash.CrashFrequencyDetector.shouldForceHomeOnLaunch(this)
+                com.openminis.app.crash.CrashFrequencyDetector.shouldForceHomeOnLaunch(this) ||
+                    com.openminis.app.plus.SafeStart.forceHome   // [Mines-38.9.12.1]
             }
 
         permissionLauncher = registerForActivityResult(
@@ -354,7 +366,7 @@ class MainActivity : ComponentActivity() {
             OffloadPermissionManager.pendingSettingsGate
                 .filterNotNull()
                 .collect { gate ->
-                    AlertDialog.Builder(this@MainActivity)
+                    com.openminis.app.ui.plus.GlassViewDialog.builder(this@MainActivity)
                         .setTitle(gate.title)
                         .setMessage(gate.message)
                         .setCancelable(false)
@@ -401,7 +413,7 @@ class MainActivity : ComponentActivity() {
             AccessibilityRecoveryManager.pendingPrompt
                 .filterNotNull()
                 .collect { prompt ->
-                    val b = AlertDialog.Builder(this@MainActivity)
+                    val b = com.openminis.app.ui.plus.GlassViewDialog.builder(this@MainActivity)
                         .setTitle(getString(R.string.a11y_repair_dialog_title))
                         .setCancelable(true)
                         .setOnCancelListener {
@@ -510,13 +522,13 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             val prefs = remember { getAppearancePrefs(this) }
-            var themeMode by remember { mutableIntStateOf(prefs.getInt(KEY_THEME_MODE, 0)) }
+            var themeMode by remember { mutableIntStateOf(prefs.getInt(KEY_THEME_MODE, 3)) } // [Mines-38.7] default 3 = 随日出日落
             var appBaseLevel by remember { mutableIntStateOf(prefs.getInt(KEY_FONT_APP_BASE, 0)) }
 
             DisposableEffect(prefs) {
                 val listener = SharedPreferences.OnSharedPreferenceChangeListener { sp, key ->
                     when (key) {
-                        KEY_THEME_MODE -> themeMode = sp.getInt(KEY_THEME_MODE, 0)
+                        KEY_THEME_MODE -> themeMode = sp.getInt(KEY_THEME_MODE, 3)
                         KEY_FONT_APP_BASE -> appBaseLevel = sp.getInt(KEY_FONT_APP_BASE, 0)
                         KEY_KEEP_SCREEN_AWAKE -> applyKeepScreenAwakeFlag(
                             SessionActivityTracker.activeSessions.value.isNotEmpty()
@@ -527,11 +539,25 @@ class MainActivity : ComponentActivity() {
                 onDispose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
             }
 
+            // [Mines-38.7] 3 = day / night by the real sunrise / sunset, animated (~2.6 s) while the app is open
+            val sunNight by com.openminis.app.plus.DayNight.night.collectAsState()
+            LaunchedEffect(themeMode) {
+                if (themeMode != 3) return@LaunchedEffect
+                while (true) {
+                    com.openminis.app.plus.DayNight.tick(this@MainActivity)
+                    kotlinx.coroutines.delay(1000L) // a clock compare only; a simulated sunset (smoke) is seen within 1 s
+                }
+            }
             val darkTheme = when (themeMode) {
                 1 -> false
                 2 -> true
+                3 -> sunNight
                 else -> isSystemInDarkTheme()
             }
+            LaunchedEffect(Unit) { runCatching { com.openminis.app.plus.SmartRouter.dropAutoGroups(this@MainActivity) } }
+            val dnStill = remember { com.openminis.app.ui.plus.AnimeWeather.still(this@MainActivity) }
+            val nightF by androidx.compose.animation.core.animateFloatAsState(if (darkTheme) 1f else 0f,
+                androidx.compose.animation.core.tween(if (dnStill) 0 else 2600, easing = androidx.compose.animation.core.FastOutSlowInEasing), label = "daynight")
             val fontScale = fontScaleForLevel(appBaseLevel)
 
             SideEffect {
@@ -554,7 +580,7 @@ class MainActivity : ComponentActivity() {
                 enableEdgeToEdge(statusBarStyle = barStyle, navigationBarStyle = barStyle)
             }
 
-            MinisTheme(darkTheme = darkTheme, fontScale = fontScale) {
+            MinisTheme(darkTheme = darkTheme, fontScale = fontScale, nightFraction = if (themeMode == 3) nightF else null) {
                 val navController = rememberNavController().also { this.navController = it }
 
                 // T166: drive `SessionActivityTracker.setPresent` /
@@ -571,6 +597,7 @@ class MainActivity : ComponentActivity() {
                             // [T-android-hang-caller-attribution] Let a stall
                             // sample name the screen it happened on.
                             com.openminis.app.diagnostics.HangDetector.noteScreen(entry.destination.route)
+                            com.openminis.app.plus.Diag.notePage(entry.destination.route)   // [Mines-38.9.11.3] 远程诊断 per-page jank
                             val isChatRoute = entry.destination.route == Routes.CHAT
                             val sid = entry.arguments?.getString("sessionId").takeIf { isChatRoute }
                             val previous = currentChatSessionId
@@ -588,6 +615,8 @@ class MainActivity : ComponentActivity() {
                     onDispose { job.cancel() }
                 }
 
+                // [Mines-38.9.6 i12] the page behind any open popup / menu / sheet / dialog is blurred here, once (RenderEffect, API 31+)
+                androidx.compose.foundation.layout.Box(androidx.compose.ui.Modifier.fillMaxSize().glassRootBlur()) {
                 AppNavigation(
                     chatRepository = app.chatRepository,
                     providerRepository = app.providerRepository,
@@ -598,6 +627,7 @@ class MainActivity : ComponentActivity() {
                     navController = navController,
                     initialDeepLink = launchDeepLink,
                 )
+                }
 
                 // T-config: root-level minis-config confirm dialog.
                 // Bound to ConfigConfirmationGate.pending — the gate
@@ -607,6 +637,22 @@ class MainActivity : ComponentActivity() {
                 // agent triggers a change. Mirrors iOS MinisApp.swift
                 // root-level `.sheet(item: gate.pending)`.
                 com.openminis.app.ui.settings.ConfigConfirmDialogHost()
+                // [Mines-jobs-25] Background install / check progress + result popups.
+                com.openminis.app.ui.plus.MinesJobsHost()
+                // [Mines-38.9] 账号关联: new-device sign-in sheet (是我 / 不是我) + 「已记下 X 账号」 glass toast
+                com.openminis.app.ui.plus.KeychainHost()
+                // [Mines-38.9.5 i] secure login card (first sign-in / refused password / code that never came)
+                com.openminis.app.ui.plus.LoginCardHost()
+                // [Mines-38.9.11.3] 「已用 台账：邮箱」 · 换一个 · 设为默认 (non-blocking)
+                com.openminis.app.ui.plus.LedgerChipHost()
+                // [Mines-38.9.11.3] 「复制崩溃日志」 after a crash / ANR (redacted)
+                com.openminis.app.ui.plus.CrashCardHost()
+                // [Mines-38.9.11.3] 远程诊断: 「来自诊断：…」 banner + 「允许发送截图？」
+                com.openminis.app.ui.plus.DiagHost()
+                // [Mines-38.9.6 i12] 「已归档 · 撤销」 after a one-tap archive
+                com.openminis.app.ui.plus.ArchiveUndoHost()
+                // [Mines-38.7] blurred copy of the app under glass dialogs / sheets (replaces FLAG_BLUR_BEHIND)
+                com.openminis.app.ui.plus.GlassBackdropLayer()
             }
         }
     }
@@ -642,8 +688,63 @@ class MainActivity : ComponentActivity() {
      * activation (cold or warm) — that's exactly the user expectation
      * the issue is reporting on.
      */
+    // [Mines-login-32] keep web logins: write the WebView cookie store to disk whenever Mines leaves the screen
+    /** [Mines-apps-32] notification deep link: route + optional service detail. */
+    private fun handleMinesRoute(i: Intent?) {
+        // [Mines-38.9.8] clash://install-config?url=… → offered on 分流代理 › 内置 Clash (imported on one tap there)
+        runCatching {
+            val d = i?.data
+            if (d != null && (d.scheme.equals("clash", true) || d.scheme.equals("clashmeta", true))) {
+                com.openminis.app.plus.ClashSubCore.findLink(d.toString())?.let { link ->
+                    com.openminis.app.plus.ClashCore.pendingLink = link; com.openminis.app.plus.ClashCore.pendingFrom = "导入链接"
+                }
+                i.data = null
+                com.openminis.app.ui.plus.PlusNav.go(com.openminis.app.ui.plus.PlusRoutes.ROUTING)
+                return
+            }
+        }
+        val route = i?.getStringExtra("mines_route") ?: return
+        if (i.getBooleanExtra("mines_link_retry", false)) { i.removeExtra("mines_link_retry"); com.openminis.app.plus.LinkCodeReader.retryRequested = true }
+        i.getStringExtra("mines_open_kind")?.let { com.openminis.app.ui.plus.PlusNav.openKind = it }
+        i.removeExtra("mines_route")
+        com.openminis.app.ui.plus.PlusNav.go(route)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        com.openminis.app.plus.Diag.attach(this)   // [Mines-38.9.11.3] 远程诊断 frame metrics on this window (only while it is on)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        com.openminis.app.plus.Diag.detach(this)
+        com.openminis.app.plus.LoginWeb.flush()
+        runCatching { com.openminis.app.plus.SessionKeeper.snapshot(this, 0L) }
+    }
+
+    // [Mines-38.9.11.2] the sky holds still for 1 s after any input, while another window is on top or split screen is on
+    override fun dispatchTouchEvent(ev: android.view.MotionEvent): Boolean { com.openminis.app.ui.plus.SkyFreeze.input(); return super.dispatchTouchEvent(ev) }
+    override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean { com.openminis.app.ui.plus.SkyFreeze.input(); return super.dispatchKeyEvent(event) }
+    override fun onWindowFocusChanged(hasFocus: Boolean) { super.onWindowFocusChanged(hasFocus); com.openminis.app.ui.plus.SkyFreeze.focus(hasFocus) }
+    override fun onMultiWindowModeChanged(isInMultiWindowMode: Boolean, newConfig: android.content.res.Configuration) {
+        super.onMultiWindowModeChanged(isInMultiWindowMode, newConfig); com.openminis.app.ui.plus.SkyFreeze.multiWindow(isInMultiWindowMode)
+    }
+
+    override fun onStop() {
+        runCatching { com.openminis.app.ui.plus.SkyFreeze.uninstall(this) }   // [38.9.11.2]
+        super.onStop()
+        com.openminis.app.plus.LoginWeb.flush()   // [Mines-38.9.1] keep login state when the app is killed in background
+        // [Mines-38.7] leaving the app ends the conversation: organise what changed into 知识库 now (no idle wait)
+        runCatching { com.openminis.app.plus.ChatKnowledge.onAppStop(this) }
+        // [Mines-38.7] last time the app was used (home greeting 「好久不见」)
+        runCatching { com.openminis.app.plus.HomeGreeting.markOpened(this) }
+    }
+
     override fun onStart() {
+        runCatching { com.openminis.app.ui.plus.SkyFreeze.install(this) }   // [38.9.11.2]
         super.onStart()
+        // [Mines-sources-33] every saved login / key becomes a data source automatically (toast on a new build)
+        runCatching { com.openminis.app.plus.AutoSources.onForeground(this) }
         if (!hasResumedFromBackground) {
             hasResumedFromBackground = true
             return
@@ -702,9 +803,18 @@ class MainActivity : ComponentActivity() {
 
     private fun applySavedLanguage() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
-        val code = getSharedPreferences(PREF_APPEARANCE, MODE_PRIVATE).getString(KEY_LANGUAGE, "") ?: ""
         val localeManager = getSystemService(LocaleManager::class.java) ?: return
-        val desired = if (code.isEmpty()) LocaleList.getEmptyLocaleList() else LocaleList.forLanguageTags(code)
+        // [Mines-38.8] Mines is a Chinese app: a phone/emulator in English showed 「Welcome to Mines / Add a Provider」.
+        // First run with no language ever picked (key absent) → 简体中文, unless Android's per-app language already has one.
+        val prefs = getSharedPreferences(PREF_APPEARANCE, MODE_PRIVATE)
+        if (!prefs.contains(KEY_LANGUAGE)) {
+            prefs.edit().putString(KEY_LANGUAGE, if (localeManager.applicationLocales.isEmpty) "zh" else "").apply()
+        }
+        val code = prefs.getString(KEY_LANGUAGE, "") ?: ""
+        // [Mines-38.1b] 「跟随系统」 (empty) must not wipe a language picked for Mines in Android's own per-app
+        // language settings (it did: every launch reset it, so system Settings → Apps → Mines → 语言 never stuck)
+        if (code.isEmpty()) return
+        val desired = LocaleList.forLanguageTags(code)
         if (localeManager.applicationLocales.toLanguageTags() != desired.toLanguageTags()) {
             localeManager.applicationLocales = desired
         }
@@ -712,6 +822,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        handleMinesRoute(intent)
         // T51: warm-start share — ShareReceiverActivity re-launches with
         // FLAG_ACTIVITY_CLEAR_TOP, which delivers the new intent here when
         // MainActivity is already alive. Process the buffered share before

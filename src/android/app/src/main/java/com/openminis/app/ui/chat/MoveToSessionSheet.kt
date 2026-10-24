@@ -34,7 +34,7 @@ import androidx.compose.material.icons.outlined.Translate
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
+import com.openminis.app.ui.glass.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
@@ -198,7 +198,7 @@ fun MoveToSessionSheet(
                         // row is what keeps the MIDDLE rows square-edged: per-row
                         // rounding would carve notches between adjacent rows.
                         .clip(RoundedCornerShape(16.dp))
-                        .background(color = MaterialTheme.colorScheme.surface),
+                        .background(color = MaterialTheme.colorScheme.surfaceContainerLow),
                 ) {
                     items(sessions, key = { it.id }) { session ->
                         MoveToPickerRow(
@@ -236,7 +236,7 @@ private fun NewChatRow(onClick: () -> Unit) {
             // clip first, so this row's own click indication stays inside its
             // rounded shape instead of squaring off the corners.
             .clip(RoundedCornerShape(16.dp))
-            .background(color = MaterialTheme.colorScheme.surface)
+            .background(color = MaterialTheme.colorScheme.surfaceContainerLow)
             .clickable(onClick = onClick)
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,

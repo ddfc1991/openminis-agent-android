@@ -34,7 +34,7 @@ import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.UnfoldMore
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.DropdownMenu
+import com.openminis.app.ui.glass.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -619,7 +619,7 @@ internal fun InlineVoiceInputPanel(
             // correction runs regardless: consent governs whether we STORE the
             // learning data, not whether the feature works.
             if (showCorrectionConsent) {
-                androidx.compose.material3.AlertDialog(
+                com.openminis.app.ui.glass.AlertDialog(
                     onDismissRequest = {
                         // Dismissing without choosing is not an answer; leave
                         // hasPrompted unset so the question can be asked again.
@@ -775,7 +775,7 @@ internal fun InlineVoiceInputPanel(
         } else {
             failed.message?.takeIf { it.isNotBlank() } ?: failed.error.name
         }
-        androidx.compose.material3.AlertDialog(
+        com.openminis.app.ui.glass.AlertDialog(
             onDismissRequest = {},
             title = { Text(stringResource(R.string.voice_asr_failed_title)) },
             text = {

@@ -61,11 +61,9 @@ internal object OffloadGate {
         request: NativeOffloadRequest? = null,
     ): NativeOffloadResult? {
         if (allow(toolName, displayName, request?.sessionId)) return null
-        val body = JSONObject()
-            .put("error", "permission_denied")
-            .put("message",
-                "Agent is not allowed to use $displayName. Open Settings → Permissions to change.")
-            .toString()
-        return NativeOffloadResult(126, OffloadOutput.formatBody(body, args) + "\n")
+        // [Mines-perm-30] Same PERM_DENIED shape as the phone CLIs.
+        return PermDenied.result(args, "permission_denied",
+            "Agent is not allowed to use $displayName. Open Settings → Permissions to change.",
+            PermDenied.MINES_PERMISSIONS, exit = 126)
     }
 }

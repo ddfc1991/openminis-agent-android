@@ -1,0 +1,364 @@
+#!/bin/sh
+# minis-vps: use a server as Mines' back-end processor, over ssh.
+#
+#   minis-vps run  <command...>        run a command on the server and stream its output.
+#                                      The command runs server-side as a job, so a dropped
+#                                      connection never kills it: minis-vps reconnects with
+#                                      backoff and continues the output from where it broke.
+#   minis-vps run --direct <cmd...>    old behaviour: plain ssh, needs the link to stay up
+#   minis-vps bg   <name> <command...> start a long job that survives disconnects
+#   minis-vps attach <name>            follow a job live; reconnects by itself
+#   minis-vps logs <name> [n]          last lines of a job's log
+#   minis-vps jobs                     background jobs and whether they still run
+#   minis-vps put  <local> [remote]    copy a file/dir to the server
+#   minis-vps get  <remote> [local]    copy a file/dir back
+#   minis-vps shell                    interactive login
+#   minis-vps status                   uptime, memory, disk, public IP
+#   minis-vps servers                  servers in the order they are tried
+#   minis-vps probe [host[:port]…]     is it the server or the phone's network? direct + via proxy + outside nodes
+#                                      (default: every server). Only 「服务器挂了」 here means the server is down.
+#   minis-vps setup user@host [port]   make a key in the sandbox and install it (asks the password once)
+#   minis-vps relay-setup [port]       on the server: install a WebSocket→sshd bridge (default port 8022)
+#
+# Servers come from 设置 → 工作位置 as MINIS_VPS_SERVERS: user@host:port[|relay],…
+# ordered by latency. relay is optional, one of
+#   ws://host:port/  wss://host/path   WebSocket bridge to sshd (see relay-setup)
+#   ssh://user@jump:port               jump through another ssh server
+#   http://[user:pass@]host:port       HTTP CONNECT proxy
+#   socks5://host:port                 SOCKS5 proxy
+# Every connection first tries the server directly, then through its relay.
+#
+# Mines writes the key it installed on first password login to
+# ~/.ssh/minis_vps_app_key (the canonical copy is encrypted in the app).
+#
+# Env knobs: MINIS_VPS_RESUME_SECS (reconnect budget for a running job, default 900),
+#            MINIS_VPS_CONNECT_SECS (budget to reach a server at all, default 90).
+set -e
+CONF="$HOME/.config/minis-vps"
+JOBS="$HOME/.config/minis-vps-jobs"
+KEY="$HOME/.ssh/minis_vps_app_key"
+[ -f "$KEY" ] || KEY="$HOME/.ssh/minis_vps_ed25519"
+mkdir -p "$HOME/.ssh" "$(dirname "$CONF")" "$JOBS" "$HOME/.cache/minis-vps"; chmod 700 "$HOME/.ssh"
+[ -f "$KEY" ] && chmod 600 "$KEY" 2>/dev/null || true
+
+need_ssh() {
+    command -v ssh >/dev/null 2>&1 && return
+    echo "minis-vps: installing openssh-client…" >&2
+    apk add --no-cache openssh-client rsync >/dev/null
+}
+need_tool() { # need_tool <binary> <apk package>
+    command -v "$1" >/dev/null 2>&1 && return 0
+    apk add --no-cache "$2" >/dev/null 2>&1 && return 0
+    if [ "$1" = websocat ]; then
+        curl -fsSL --max-time 60 -o /usr/local/bin/websocat \
+            "https://github.com/vi/websocat/releases/download/v1.14.1/websocat.$(uname -m)-unknown-linux-musl" \
+            && chmod +x /usr/local/bin/websocat && return 0
+    fi
+    echo "minis-vps: could not install $1" >&2; return 1
+}
+
+# A server entry is user@host:port[|relay]
+set_target() {
+    ent="$1"; RELAY=""; RELAY_ONLY=""
+    # [Mines-vps-31] "!entry|wss://…" = reach it only through the relay (Cloudflare tunnel)
+    case "$ent" in '!'*) RELAY_ONLY=1; ent="${ent#!}";; esac
+    case "$ent" in *"|"*) RELAY="${ent#*|}"; ent="${ent%%|*}";; esac
+    VPS_TARGET="${ent%:*}"; VPS_PORT="${ent##*:}"
+    [ "$VPS_PORT" = "$ent" ] && VPS_PORT=22
+    return 0
+}
+load() {
+    SERVERS=""
+    if [ -n "$MINIS_VPS_SERVERS" ] && [ "$MINIS_VPS_SERVERS" != none ]; then
+        SERVERS=$(printf '%s' "$MINIS_VPS_SERVERS" | tr ',' ' ')
+    elif [ -f "$CONF" ]; then
+        . "$CONF"; SERVERS="$VPS_TARGET:$VPS_PORT"
+    else
+        echo "minis-vps: no server. Add one in 设置 → 工作位置, or run: minis-vps setup user@host [port]" >&2; exit 2
+    fi
+    set_target "${SERVERS%% *}"
+}
+
+BASE_OPTS="-o BatchMode=yes -o ConnectTimeout=12 -o ConnectionAttempts=2 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o TCPKeepAlive=yes -o IPQoS=none -o StrictHostKeyChecking=accept-new"
+# One shared connection per server (ControlMaster): later commands skip the
+# TCP + key exchange round trips entirely, which is most of the latency on a
+# mobile link and far fewer handshakes for middleboxes to interfere with.
+MUX_OPTS="-o ControlMaster=auto -o ControlPath=$HOME/.ssh/cm-%C -o ControlPersist=600"
+
+# proxy_opts <relay> → ssh options that route through it (prints nothing for none)
+proxy_opts() {
+    case "$1" in
+        "") ;;
+        ssh://*)  j="${1#ssh://}"; j="${j%/}"; printf '%s' "-o ProxyJump=$j" ;;
+        ws://*|wss://*) need_tool websocat websocat >/dev/null && printf '%s' "-o ProxyCommand=websocat\ --binary\ -E\ $1" ;;
+        http://*) need_tool ncat nmap-ncat >/dev/null
+                  p="${1#http://}"; p="${p%/}"; auth=""
+                  case "$p" in *@*) auth="--proxy-auth ${p%@*}"; p="${p#*@}";; esac
+                  printf '%s' "-o ProxyCommand=ncat\ --proxy\ $p\ --proxy-type\ http\ $(printf '%s' "$auth" | sed 's/ /\\ /g')\ %h\ %p" ;;
+        socks5://*) need_tool ncat nmap-ncat >/dev/null
+                  p="${1#socks5://}"; p="${p%/}"
+                  printf '%s' "-o ProxyCommand=ncat\ --proxy\ $p\ --proxy-type\ socks5\ %h\ %p" ;;
+    esac
+}
+
+# ssh1 <how> <args…>: one ssh to the current target. how = direct | relay | nomux
+ssh1() {
+    how="$1"; shift
+    case "$how" in
+        direct) eval "ssh $BASE_OPTS $MUX_OPTS -i \"\$KEY\" -p \"\$VPS_PORT\" \"\$VPS_TARGET\" \"\$@\"" ;;
+        nomux)  eval "ssh $BASE_OPTS -o ControlPath=none -i \"\$KEY\" -p \"\$VPS_PORT\" \"\$VPS_TARGET\" \"\$@\"" ;;
+        relay)  po=$(proxy_opts "$RELAY"); [ -n "$po" ] || return 255
+                eval "ssh $BASE_OPTS -o ControlPath=none $po -i \"\$KEY\" -p \"\$VPS_PORT\" \"\$VPS_TARGET\" \"\$@\"" ;;
+    esac
+}
+
+# s1 <args…>: run on the current target trying direct (shared connection),
+# a fresh direct connection (a stale shared one after a network change), then
+# the relay. Sets HOW to what worked. Exit 255 only when nothing connected.
+s1() {
+    for how in direct nomux relay; do
+        [ "$how" = relay ] && [ -z "$RELAY" ] && continue
+        [ -n "$RELAY_ONLY" ] && [ "$how" != relay ] && continue
+        [ "$how" = nomux ] && ssh -o ControlPath="$HOME/.ssh/cm-%C" -p "$VPS_PORT" -O exit "$VPS_TARGET" >/dev/null 2>&1
+        if ssh1 "$how" "$@"; then HOW=$how; return 0; else rc=$?; fi
+        [ "$rc" -ne 255 ] && { HOW=$how; return "$rc"; }
+    done
+    return 255
+}
+
+# pick: choose the first server that answers, retrying with backoff until
+# MINIS_VPS_CONNECT_SECS runs out. Sets VPS_TARGET/VPS_PORT/RELAY/CUR.
+pick() {
+    budget="${MINIS_VPS_CONNECT_SECS:-90}"; t0=$(date +%s); delay=2; round=0
+    while :; do
+        for srv in $SERVERS; do
+            set_target "$srv"
+            if s1 true 2>/dev/null; then CUR="$srv"; return 0; fi
+            echo "minis-vps: $VPS_TARGET:$VPS_PORT 连不上${RELAY:+（直连和中转都试过）}" >&2
+        done
+        round=$((round + 1))
+        now=$(date +%s); [ $((now - t0 + delay)) -gt "$budget" ] && break
+        echo "minis-vps: 所有服务器暂时连不上，${delay} 秒后重试（第 $round 轮）…" >&2
+        sleep "$delay"; delay=$((delay * 2)); [ "$delay" -gt 20 ] && delay=20
+    done
+    echo "minis-vps: 手机这边连不上任何服务器（这不等于服务器挂了）。三条路的检测：" >&2
+    set_target "${SERVERS%% *}"; probe1 "${VPS_TARGET#*@}" "$VPS_PORT" >&2 || true
+    return 255
+}
+
+# s <args…>: pick a server and run once on it (short commands).
+s() { pick || return 255; s1 "$@"; }
+
+b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
+script() {
+    if [ $# -eq 1 ]; then printf '%s' "$1"; return; fi
+    for w; do printf "'%s' " "$(printf '%s' "$w" | sed "s/'/'\\\\''/g")"; done
+}
+# [Mines-38.9.6 i17] remote jobs: rg falls back to grep where ripgrep is missing (a job printed 'rg: not found')
+RG_SHIM='command -v rg >/dev/null 2>&1 || rg() { [ $# -le 1 ] && set -- "$@" .; grep -rnE --color=never --exclude-dir=.git --exclude-dir=node_modules "$@"; }
+'
+rscript() { printf '%s' "$RG_SHIM"; script "$@"; }
+
+# [Mines-38.9.6 i17] probe <host> <port>: one line per path + a verdict. Never calls a server down from one path.
+probe1() {
+    h="$1"; p="${2:-22}"; d=0; x=""; dw=""; xw=""
+    # curl telnet:// = raw TCP; time_connect > 0 = the TCP connect worked; SSH ports must also send the "SSH-" banner
+    # (a TUN / fake-ip VPN on the phone answers the connect itself)
+    o=$(timeout 10 curl -sS --noproxy '*' --max-time 6 -w '\n__C=%{time_connect}' "telnet://$h:$p" </dev/null 2>&1)
+    c=$(printf '%s' "$o" | sed -n 's/^__C=//p' | tail -n 1); b=$(printf '%s' "$o" | grep -m1 '^SSH-')
+    if [ -n "$b" ]; then d=1
+    elif [ "$p" != 22 ] && [ -n "$c" ] && [ "$c" != 0 ] && [ "$c" != 0.000000 ]; then d=1
+    else dw=$(printf '%s' "$o" | grep -v '^__C=' | grep -m1 'curl:' | sed 's/^curl: ([0-9]*) //' | head -c 60); [ -n "$c" ] && [ "$c" != 0.000000 ] && [ -z "$dw" -o "$p" = 22 ] && dw="端口通了但没有 SSH 回应"; fi
+    px="${HTTPS_PROXY:-${https_proxy:-${ALL_PROXY:-${all_proxy:-}}}}"
+    if [ "$d" = 0 ] && [ -n "$px" ]; then
+        o=$(timeout 14 curl -sS --max-time 10 -p -x "$px" -w '\n__H=%{http_connect}' "telnet://$h:$p" </dev/null 2>&1)
+        if printf '%s' "$o" | grep -q '^SSH-'; then x=1
+        elif [ "$p" != 22 ] && printf '%s' "$o" | grep -q '^__H=200'; then x=1
+        else x=0; xw=$(printf '%s' "$o" | grep -m1 'curl:' | sed 's/^curl: ([0-9]*) //' | head -c 60); fi
+    fi
+    ok=0; tot=0
+    if [ "$d" = 0 ] && [ "$x" != 1 ]; then
+        id=$(curl -sS --max-time 10 -H 'Accept: application/json' "https://check-host.net/check-tcp?host=$h:$p&max_nodes=3" 2>/dev/null | sed -n 's/.*"request_id" *: *"\([^"]*\)".*/\1/p')
+        if [ -n "$id" ]; then
+            i=0; while [ $i -lt 6 ]; do sleep 2; i=$((i + 1))
+                r=$(curl -sS --max-time 8 -H 'Accept: application/json' "https://check-host.net/check-result/$id" 2>/dev/null)
+                pend=$(printf '%s' "$r" | grep -o ': *null' | wc -l)
+                tot=$(printf '%s' "$r" | grep -o '"[a-z0-9.-]*\.node\.check-host\.net": *\[' | wc -l)
+                ok=$(printf '%s' "$r" | grep -o '"time"' | wc -l)
+                [ "$tot" -gt 0 ] && [ "$pend" -eq 0 ] && break
+            done
+        fi
+    fi
+    echo "$h:$p"
+    [ "$d" = 1 ] && echo "  直连：通" || echo "  直连：不通（${dw:-连不上}）"
+    if [ -z "$px" ]; then echo "  走代理：没设代理"; elif [ "$d" = 1 ]; then echo "  走代理：不用测"; elif [ "$x" = 1 ]; then echo "  走代理：通（$px）"; else echo "  走代理：不通（${xw:-没有回应}）"; fi
+    [ "$d" = 0 ] && [ "$x" != 1 ] && { [ "$tot" -gt 0 ] && echo "  外部节点：$ok/$tot 个连得上" || echo "  外部节点：没结果（check-host.net 连不上）"; }
+    if [ "$d" = 1 ]; then echo "结论：在线（直连通）"
+    elif [ "$x" = 1 ]; then echo "结论：在线（直连不通，走代理通）——是手机网络的问题，服务器没挂"
+    elif [ "$ok" -gt 0 ]; then echo "结论：手机网络到不了，服务器本身在线（外部 $ok/$tot 个节点连得上）——不要说服务器挂了"
+    elif [ "$tot" -ge 2 ]; then echo "结论：服务器挂了或端口关了（直连、代理、外部节点都连不上）"
+    else echo "结论：暂时没法判断（只有手机这边的路不通），不能说服务器挂了"; fi
+}
+
+valid_name() { case "$1" in ''|*[!A-Za-z0-9._-]*) echo "minis-vps: job name must be letters, digits, . _ -" >&2; exit 2;; esac; }
+
+# Remote snippets. start_job is idempotent (a retry after a drop never starts
+# the job twice); follow_job streams the log from byte OFF until the job ends
+# and exits with the job's status (255 mapped to 254 so 255 always means
+# "the connection broke").
+start_job() { # <name> <b64 body>
+    printf '%s' "J=~/minis-jobs/$1; mkdir -p ~/minis-jobs; if [ ! -f \$J.pid ]; then echo $2 | base64 -d > \$J.sh; : > \$J.log; nohup sh -c \"cd ~; sh \$J.sh > \$J.log 2>&1 < /dev/null; echo \\\$? > \$J.rc\" > /dev/null 2>&1 < /dev/null & echo \$! > \$J.pid; fi; "
+}
+follow_job() { # <name> <offset>
+    printf '%s' "J=~/minis-jobs/$1; [ -f \$J.pid ] || { echo 'minis-vps: no such job' >&2; exit 3; }; touch \$J.log; off=$2; \
+while :; do sz=\$(wc -c < \$J.log); if [ \$sz -gt \$off ]; then tail -c +\$((off+1)) \$J.log | head -c \$((sz-off)); off=\$sz; fi; \
+if [ -f \$J.rc ]; then sz=\$(wc -c < \$J.log); [ \$sz -gt \$off ] && tail -c +\$((off+1)) \$J.log | head -c \$((sz-off)); break; fi; \
+kill -0 \$(cat \$J.pid) 2>/dev/null || { sleep 0.5; [ -f \$J.rc ] || echo 1 > \$J.rc; }; sleep 0.3; done; \
+rc=\$(cat \$J.rc 2>/dev/null || echo 1); [ \"\$rc\" = 255 ] && rc=254; exit \$rc"
+}
+
+# run_job <name> <start-snippet-or-empty>: stream a job, reconnecting with
+# backoff on drops, resuming at the exact byte where the output broke.
+run_job() {
+    name="$1"; pre="$2"
+    cache="$HOME/.cache/minis-vps/$name.out"; : > "$cache"
+    budget="${MINIS_VPS_RESUME_SECS:-900}"; t0=$(date +%s); delay=1; tries=0
+    set +e; set -o pipefail 2>/dev/null
+    while :; do
+        off=$(wc -c < "$cache")
+        s1 "$pre$(follow_job "$name" "$off")" | tee -a "$cache"
+        rc=$?
+        pre=""   # the job exists now (start_job is idempotent anyway)
+        if [ "$rc" -ne 255 ]; then
+            [ "$tries" -gt 0 ] && echo "minis-vps: 已续上并完成（重连 $tries 次）" >&2
+            rm -f "$cache"; return "$rc"
+        fi
+        tries=$((tries + 1)); now=$(date +%s)
+        if [ $((now - t0)) -ge "$budget" ]; then
+            echo "minis-vps: 连接断了 ${budget} 秒还没恢复。任务还在 $VPS_TARGET 上继续跑；网络好了运行  minis-vps attach $name  接着看结果。" >&2
+            return 75
+        fi
+        # [38.9] transient drops reconnect silently; only say something from the 3rd try on
+        if [ "$tries" -ge 3 ]; then echo "minis-vps: 还在重连（第 $tries 次），任务在服务器上继续跑…" >&2; fi
+        sleep "$delay"; delay=$((delay * 2)); [ "$delay" -gt 30 ] && delay=30
+    done
+}
+remember_job() { printf '%s\n' "$CUR" > "$JOBS/$1"; }
+job_server() { [ -f "$JOBS/$1" ] && SERVERS=$(cat "$JOBS/$1"); set_target "${SERVERS%% *}"; CUR="$SERVERS"; }
+
+# [Mines-link-31] The app's HTTPS link (mines-link worker on the server, wss on 443/8443):
+# preferred over ssh when it is up. The app reconnects and resumes the output by
+# itself, so one local stream here survives network drops and VPN switches.
+LP="http://127.0.0.1:${MINIS_LINK_PORT:-8792}"
+link_ok() {
+    [ -n "$MINIS_LINK_TOKEN" ] && [ "${MINIS_VPS_NO_LINK:-}" != 1 ] || return 1
+    curl -s --max-time 4 -H "X-Mines: $MINIS_LINK_TOKEN" "$LP/ping" 2>/dev/null | grep -q '^pong '
+}
+lcurl() { curl -sN -H "X-Mines: $MINIS_LINK_TOKEN" "$@"; }
+# link_stream <url>: body on stdin; prints output, exits with the job's code
+link_stream() {
+    lcurl -X POST --data-binary @- "$1" | awk '/^__MINES_RC=/{rc=substr($0,12)+0; next} {print; fflush()} END{exit rc}'
+}
+
+cmd="${1:-help}"; [ $# -gt 0 ] && shift
+# [Mines-38.9.9] user-taught rule: plain `minis-vps run` (direct, then the configured ws relay). A command that overrides
+# MINIS_VPS_SERVERS without the relay, or uses --direct on a server that has one, hit datacenter rate limits on the phone.
+# Warn once and fall back to the configured routing unless --force.
+FORCE=""; [ "$1" = "--force" ] && { FORCE=1; shift; }
+relay_guard() {
+    app="$MINIS_VPS_SERVERS_APP"; [ -n "$app" ] && [ "$app" != none ] || return 0
+    case "$app" in *"|"*) ;; *) return 0 ;; esac
+    warn=""
+    if [ -n "$MINIS_VPS_SERVERS" ] && [ "$MINIS_VPS_SERVERS" != "$app" ]; then
+        for e in $(printf '%s' "$MINIS_VPS_SERVERS" | tr ',' ' '); do
+            case "$e" in *"|"*) continue ;; esac
+            h="${e#!}"; h="${h%%:*}"; h="${h#*@}"
+            printf '%s' "$app" | tr ',' '\n' | grep -q "@$h:.*|" && warn=1
+        done
+    fi
+    [ "$1" = "--direct" ] && warn=1
+    [ -n "$warn" ] || return 0
+    echo "minis-vps: 已配置中转，建议直接用 minis-vps run（会先直连，不通再走中转）" >&2
+    [ -n "$FORCE" ] && return 0
+    MINIS_VPS_SERVERS="$app"; export MINIS_VPS_SERVERS
+    return 1
+}
+case "$cmd" in run|bg|status|shell|attach|jobs|logs)
+    if ! relay_guard "$1" && [ "$1" = "--direct" ]; then shift; fi ;;
+esac
+case "$cmd" in
+run|bg|attach|jobs|logs|status)
+    if [ "$1" != "--direct" ] && link_ok; then
+        case "$cmd" in
+        run)    name="run-$(date +%s)-$$"; rscript "$@" | link_stream "$LP/run?name=$name"; exit $? ;;
+        bg)     name="$1"; shift; valid_name "$name"; rscript "$@" | lcurl -X POST --data-binary @- "$LP/start?name=$name"; exit 0 ;;
+        attach) valid_name "$1"; printf '' | lcurl "$LP/attach?name=$1&since=${2:-0}" | awk '/^__MINES_RC=/{rc=substr($0,12)+0; next} {print; fflush()} END{exit rc}'; exit $? ;;
+        jobs)   lcurl "$LP/jobs"; exit 0 ;;
+        logs)   valid_name "$1"; printf 'tail -n %s ~/.mines-link/jobs/%s/out 2>/dev/null || tail -n %s ~/minis-jobs/%s.log' "${2:-100}" "$1" "${2:-100}" "$1" | link_stream "$LP/exec?t=30"; exit $? ;;
+        status) printf '%s' 'uptime; free -m | sed -n 2p; df -h / | tail -1; curl -s --max-time 5 https://ipinfo.io/ip; echo' | link_stream "$LP/exec?t=30"; exit $? ;;
+        esac
+    fi
+    ;;
+esac
+case "$cmd" in
+setup)
+    need_ssh
+    [ -n "$1" ] || { echo "usage: minis-vps setup user@host [port]" >&2; exit 2; }
+    printf 'VPS_TARGET=%s\nVPS_PORT=%s\n' "$1" "${2:-22}" > "$CONF"
+    . "$CONF"; SERVERS="$VPS_TARGET:$VPS_PORT"; set_target "$SERVERS"
+    K="$HOME/.ssh/minis_vps_ed25519"; [ -f "$K" ] || ssh-keygen -q -t ed25519 -N '' -C "minis@phone" -f "$K"
+    echo "Installing the key on $VPS_TARGET (enter the server password once)…"
+    echo "Tip: 设置 → 工作位置 → 服务器 → 授权 does this without a terminal." >&2
+    # [Mines-38.9.11 b] password from the secure input card: MINES_SSH_PASSWORD={{secret:ID}} minis-vps setup user@host
+    # (Mines turns the placeholder into an env var of this command; the askpass helper reads the env, holds no password)
+    if [ -n "${MINES_SSH_PASSWORD:-}" ]; then
+        AP="$HOME/.ssh/.mines_askpass"; mkdir -p "$HOME/.ssh"
+        printf '#!/bin/sh\nprintf "%%s\\n" "$MINES_SSH_PASSWORD"\n' > "$AP"; chmod 700 "$AP"
+        export SSH_ASKPASS="$AP" SSH_ASKPASS_REQUIRE=force DISPLAY="${DISPLAY:-:0}"
+        trap 'rm -f "$AP"' EXIT
+    fi
+    ssh -o StrictHostKeyChecking=accept-new -p "$VPS_PORT" "$VPS_TARGET" \
+        'umask 077; mkdir -p ~/.ssh ~/minis-jobs; k=$(cat); touch ~/.ssh/authorized_keys; grep -qxF "$k" ~/.ssh/authorized_keys || printf "%s\n" "$k" >> ~/.ssh/authorized_keys' < "$K.pub"
+    KEY="$K"; s1 'echo ok: $(hostname)'
+    ;;
+run)
+    need_ssh; load
+    if [ "$1" = "--direct" ]; then shift; s "sh -c \"\$(echo $(b64 "$(rscript "$@")") | base64 -d)\""; exit $?; fi
+    name="run-$(date +%s)-$$"
+    pick || exit 255; remember_job "$name"
+    run_job "$name" "$(start_job "$name" "$(b64 "$(rscript "$@")")")"; rc=$?
+    [ "$rc" -ne 75 ] && rm -f "$JOBS/$name"
+    exit "$rc"
+    ;;
+bg)
+    need_ssh; load
+    name="$1"; shift; valid_name "$name"
+    pick || exit 255; remember_job "$name"
+    s1 "$(start_job "$name" "$(b64 "$(rscript "$@")")") echo started $name pid \$(cat ~/minis-jobs/$name.pid) on \$(hostname)"
+    ;;
+attach)
+    need_ssh; load; valid_name "$1"; job_server "$1"
+    run_job "$1" ""; rc=$?; echo "minis-vps: $1 已结束（退出码 $rc）" >&2; exit "$rc"
+    ;;
+logs)   need_ssh; load; valid_name "$1"; job_server "$1"; s1 "tail -n ${2:-100} ~/minis-jobs/$1.log" ;;
+put)    need_ssh; load; pick; rsync -az --partial -e "ssh $BASE_OPTS $MUX_OPTS -i $KEY -p $VPS_PORT" "$1" "$VPS_TARGET:${2:-~/}" ;;
+get)    need_ssh; load; pick; rsync -az --partial -e "ssh $BASE_OPTS $MUX_OPTS -i $KEY -p $VPS_PORT" "$VPS_TARGET:$1" "${2:-.}" ;;
+shell)  need_ssh; load; pick; eval "ssh -t $BASE_OPTS -o BatchMode=no $MUX_OPTS $( [ "$HOW" = relay ] && proxy_opts "$RELAY") -i \"\$KEY\" -p \"\$VPS_PORT\" \"\$VPS_TARGET\"" ;;
+status) need_ssh; load; MINIS_VPS_CONNECT_SECS=${MINIS_VPS_CONNECT_SECS:-20} s 'uptime; free -m | sed -n 2p; df -h / | tail -1; curl -s --max-time 5 https://ipinfo.io/ip; echo' ;;
+jobs)   need_ssh; load; MINIS_VPS_CONNECT_SECS=${MINIS_VPS_CONNECT_SECS:-20} s 'cd ~/minis-jobs 2>/dev/null || exit 0; for p in *.pid; do [ -f "$p" ] || continue; n=${p%.pid}; if [ -f "$n.rc" ]; then st="done($(cat $n.rc))"; elif kill -0 $(cat "$p") 2>/dev/null; then st=running; else st=done; fi; echo "$n $st"; done' ;;
+servers) load; for srv in $SERVERS; do echo "$srv"; done ;;
+probe)
+    command -v curl >/dev/null 2>&1 || apk add --no-cache curl >/dev/null 2>&1 || true
+    if [ $# -gt 0 ]; then for a; do a="${a#*@}"; case "$a" in *:*) probe1 "${a%:*}" "${a##*:}" ;; *) probe1 "$a" 22 ;; esac; done
+    else load; seen=""; for srv in $SERVERS; do set_target "$srv"; [ -n "$RELAY_ONLY" ] && continue; hp="${VPS_TARGET#*@}:$VPS_PORT"
+        case " $seen " in *" $hp "*) continue ;; esac; seen="$seen $hp"; probe1 "${VPS_TARGET#*@}" "$VPS_PORT"; done; fi
+    ;;
+relay-setup)
+    need_ssh; load; port="${1:-8022}"
+    s "set -e; a=\$(uname -m); command -v websocat >/dev/null || { curl -fsSL -o /usr/local/bin/websocat https://github.com/vi/websocat/releases/download/v1.14.1/websocat.\$a-unknown-linux-musl; chmod +x /usr/local/bin/websocat; }; \
+printf '[Unit]\nDescription=Mines WebSocket bridge to sshd\nAfter=network.target\n[Service]\nExecStart=/usr/local/bin/websocat --binary -E ws-l:0.0.0.0:$port tcp:127.0.0.1:22\nRestart=always\nMemoryMax=40M\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/minis-ws-ssh.service; \
+systemctl daemon-reload; systemctl enable --now minis-ws-ssh >/dev/null 2>&1; systemctl is-active minis-ws-ssh; \
+echo \"中转地址：ws://\$(curl -s --max-time 5 https://api.ipify.org):$port/   （云服务器安全组要放行 TCP $port）\""
+    ;;
+*)      sed -n '2,32p' "$0" ;;
+esac

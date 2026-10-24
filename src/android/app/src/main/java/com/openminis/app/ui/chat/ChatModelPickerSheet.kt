@@ -135,7 +135,7 @@ import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.RadioButtonChecked
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material3.DropdownMenu
+import com.openminis.app.ui.glass.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import com.openminis.app.BuildConfig
 import com.openminis.app.R
@@ -150,7 +150,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import com.openminis.app.ui.components.rememberSheetScrollGuard
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.material3.ModalBottomSheet
+import com.openminis.app.ui.glass.ModalBottomSheet
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -162,7 +162,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
+import com.openminis.app.ui.theme.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -318,8 +318,13 @@ internal fun ModelPickerSheet(
     val allInstanceIds = remember(config) {
         config.instances.filter { it.isEnabled }.map { it.id }.toSet()
     }
-    var collapsedInstanceIds by remember(allInstanceIds) {
-        mutableStateOf(allInstanceIds)
+    // [Mines-38.9.1] user 「模型都不出现了」: every provider started collapsed, so the picker showed headers only.
+    // The provider serving the chat now starts open, and with ≤ 3 providers all of them do.
+    val activeInstanceId = remember(config, activeEntryId) {
+        config.modelEntries.firstOrNull { it.id == activeEntryId }?.providerInstanceId
+    }
+    var collapsedInstanceIds by remember(allInstanceIds, activeInstanceId) {
+        mutableStateOf(if (allInstanceIds.size <= 3) emptySet() else allInstanceIds - setOfNotNull(activeInstanceId))
     }
 
     /**
@@ -331,6 +336,14 @@ internal fun ModelPickerSheet(
      * and another from the picker would be worse than no button at all.
      */
     var quickTestEntry by remember { mutableStateOf<ModelEntry?>(null) }
+    // [Mines-38.9.8] smoke hook: 快速测试 of one model stacked over this sheet
+    LaunchedEffect(Unit) {
+        com.openminis.app.ui.components.QuickTestAuto.pickerQuickModel?.let { mid ->
+            com.openminis.app.ui.components.QuickTestAuto.pickerQuickModel = null
+            kotlinx.coroutines.delay(1500)
+            quickTestEntry = config.modelEntries.firstOrNull { it.model.id == mid && !it.isHidden }
+        }
+    }
 
     // [T-picker-search-debounce] Filter on the DEBOUNCED, normalized query,
     // not on every keystroke (iOS GH#271). `searchText` still drives the field
@@ -415,7 +428,8 @@ internal fun ModelPickerSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .fillMaxHeight(0.9f)
+                // [Mines-38.9.8] real phone: the sheet stopped at 90 % and its bottom edge read as a hard line across the list
+                .fillMaxHeight()
                 // [T-android-model-picker-polish] navigationBarsPadding ALONE.
                 //
                 // This also carried a fixed `padding(bottom = 32.dp)`, so the
@@ -503,7 +517,7 @@ internal fun ModelPickerSheet(
                         enabled = true,
                         isError = false,
                         interactionSource = searchInteraction,
-                        colors = OutlinedTextFieldDefaults.colors(),
+                        colors = com.openminis.app.ui.plus.glassFieldColors(),   // [Mines-38.9.6] filled glass search field
                         // Zero vertical: the 42dp frame plus the icons already
                         // give the text room; any inset here re-clips it.
                         contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
@@ -512,7 +526,7 @@ internal fun ModelPickerSheet(
                                 enabled = true,
                                 isError = false,
                                 interactionSource = searchInteraction,
-                                colors = OutlinedTextFieldDefaults.colors(),
+                                colors = com.openminis.app.ui.plus.glassFieldColors(),   // [Mines-38.9.6] filled glass search field
                                 shape = RoundedCornerShape(50),
                             )
                         },
@@ -523,6 +537,83 @@ internal fun ModelPickerSheet(
             // [T-android-picker-scroll-guard] Swallow fling momentum at the top
             // of the list so it cannot dismiss the sheet, while leaving a
             // deliberate finger drag free to close it.
+            // [Mines-38.9.8] one model row (shared by the inline card and the lazy list of a very large provider)
+            // [Mines-38.9.8] real phone: two bots both called 「Mines-Test」 — same names in one provider get the end of their id
+            val pickerNames = remember(allInstancesWithEntries) {
+                allInstancesWithEntries.associate { (inst, es) -> inst.id to com.openminis.app.plus.FreeRouteCore.distinctNames(es.map { it.model.id to it.model.displayName }) }
+            }
+            val pickerEntryRow: @Composable (com.openminis.app.data.model.ProviderInstance, ModelEntry, Int, Int) -> Unit = { instance, entry, index, rowCount ->
+                                                val isSelected = activeEntryId == entry.id && selectedGroupId == null
+                                                val dotColor = providerDotColor(instance.providerType)
+                                                // Last row clips its own bottom so the
+                                                // ripple respects the card corners.
+                                                val rowShape = if (index == rowCount - 1) {
+                                                    RoundedCornerShape(bottomStart = 14.dp, bottomEnd = 14.dp)
+                                                } else {
+                                                    RoundedCornerShape(0.dp)
+                                                }
+                                                Row(
+                                                    // T236: expanded entry row —
+                                                    // vertical 14→8 + heightIn(min=48dp)
+                                                    // for accessible tap target.
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .heightIn(min = 48.dp)
+                                                        .clip(rowShape)
+                                                        .clickable { onSelectEntry(entry.id) }
+                                                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                ) {
+                                                    Icon(
+                                                        if (isSelected) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
+                                                        contentDescription = null,
+                                                        tint = if (isSelected) Color(0xFF007AFF)
+                                                        else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f),
+                                                        modifier = Modifier.size(20.dp),
+                                                    )
+                                                    Spacer(Modifier.width(10.dp))
+                                                    Box(
+                                                        modifier = Modifier
+                                                            .size(6.dp)
+                                                            .background(dotColor, CircleShape),
+                                                    )
+                                                    Spacer(Modifier.width(10.dp))
+                                                    Column(modifier = Modifier.weight(1f)) {
+                                                        ModelNameWithActiveBadge(
+                                                            pickerNames[instance.id]?.get(entry.model.id) ?: entry.model.displayName,
+                                                            showActiveBadge = selectedGroupId != null && activeEntryId == entry.id,
+                                                        )
+                                                        // [T-android-provider-voice] Modality
+                                                        // chips (iOS entryRow badges). FlowRow so
+                                                        // an overflow wraps whole chips to the
+                                                        // next line instead of squeezing each
+                                                        // Text into a vertical letter column.
+                                                        FlowRow(
+                                                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                                            itemVerticalAlignment = Alignment.CenterVertically,
+                                                        ) {
+                                                            Text(
+                                                                entry.model.id,
+                                                                style = MaterialTheme.typography.labelSmall,
+                                                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+                                                            )
+                                                            com.openminis.app.ui.components.modalityBadges(entry.model).forEach { badge ->
+                                                                com.openminis.app.ui.components.ModalityBadge(badge)
+                                                            }
+                                                        }
+                                                    }
+                                                    QuickTestButton(onClick = { quickTestEntry = entry })
+                                                }
+                                                // Inset hairline between entries.
+                                                if (index < rowCount - 1) {
+                                                    HorizontalDivider(
+                                                        modifier = Modifier.padding(start = 52.dp, end = 16.dp),
+                                                        thickness = 0.5.dp,
+                                                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f),
+                                                    )
+                                                }
+            }
+        
             val pickerScrollGuard = rememberSheetScrollGuard()
 
             LazyColumn(
@@ -531,6 +622,32 @@ internal fun ModelPickerSheet(
                     .weight(1f, fill = false)
                     .nestedScroll(pickerScrollGuard),
             ) {
+                // [Mines-38.9.1] 「自动（推荐）」 on top: the default group, explained in one line
+                val autoGroup = groups.firstOrNull { it.id == defaultPrimaryGroupId } ?: groups.firstOrNull()
+                if (autoGroup != null && searchText.isEmpty()) {
+                    item(key = "__mines_auto__") {
+                        val on = selectedGroupId == autoGroup.id
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .padding(horizontal = 16.dp, vertical = 6.dp)
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                                .clickable { onSelectGroup(autoGroup.id) }
+                                .padding(horizontal = 16.dp, vertical = 12.dp),
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text("自动（推荐）", style = MaterialTheme.typography.titleSmall, maxLines = 1)
+                                Text("在「${autoGroup.name}」里按顺序用，限流或没回应就自动换下一个账号 / 模型",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2)
+                            }
+                            if (on) Icon(Icons.Default.Check, contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
+                        }
+                    }
+                }
                 // ── Model Groups (grouped section card with embedded header) ──
                 if (filteredGroups.isNotEmpty()) {
                     // Section card: header + rows live in the same surface so
@@ -649,7 +766,7 @@ internal fun ModelPickerSheet(
                                     Column(modifier = Modifier.weight(1f)) {
                                         Row(verticalAlignment = Alignment.CenterVertically) {
                                             Text(
-                                                group.name,
+                                                com.openminis.app.ui.chat.groupLabel(group.name),
                                                 style = MaterialTheme.typography.bodyMedium,
                                                 fontWeight = FontWeight.SemiBold,
                                             )
@@ -917,12 +1034,9 @@ internal fun ModelPickerSheet(
                         item(key = "section_${instance.id}") {
                             Column(
                                 modifier = Modifier
-                                    .padding(start = 16.dp, end = 16.dp, top = 6.dp, bottom = if (isCollapsed) 6.dp else 0.dp)
-                                    .background(
-                                        MaterialTheme.colorScheme.surfaceContainerHigh,
-                                        if (isCollapsed) RoundedCornerShape(14.dp)
-                                        else RoundedCornerShape(topStart = 14.dp, topEnd = 14.dp),
-                                    ),
+                                    .padding(start = 16.dp, end = 16.dp, top = 6.dp, bottom = if (isCollapsed || entries.size <= PICKER_INLINE_MAX) 6.dp else 0.dp)
+                                    .clip(if (isCollapsed || entries.size <= PICKER_INLINE_MAX) RoundedCornerShape(14.dp) else RoundedCornerShape(topStart = 14.dp, topEnd = 14.dp))
+                                    .background(MaterialTheme.colorScheme.surfaceContainerHigh),
                             ) {
                                 // Header row, embedded in the card.
                                 Row(
@@ -1141,10 +1255,15 @@ internal fun ModelPickerSheet(
                                         }
                                         }
                                     }
+                                } else if (entries.size <= PICKER_INLINE_MAX) {
+                                    // [Mines-38.9.8] real phone: the card ended before the last row (Hark sat outside it below a hard
+                                    // edge) — each row was its own lazy item painting its own slice of the card. A normal-sized
+                                    // provider now draws all its rows inside this one card.
+                                    entries.forEachIndexed { i, e -> pickerEntryRow(instance, e, i, entries.size) }
                                 }
                             }
                         }
-                        if (!isCollapsed) {
+                        if (!isCollapsed && entries.size > PICKER_INLINE_MAX) {
                             itemsIndexed(entries, key = { _, e -> "entry_${instance.id}_${e.id}" }) { index, entry ->
                                 val isLastRow = index == entries.size - 1
                                 Column(
@@ -1156,75 +1275,7 @@ internal fun ModelPickerSheet(
                                             else androidx.compose.ui.graphics.RectangleShape,
                                         ),
                                 ) {
-                                        val isSelected = activeEntryId == entry.id && selectedGroupId == null
-                                        val dotColor = providerDotColor(instance.providerType)
-                                        // Last row clips its own bottom so the
-                                        // ripple respects the card corners.
-                                        val rowShape = if (index == entries.size - 1) {
-                                            RoundedCornerShape(bottomStart = 14.dp, bottomEnd = 14.dp)
-                                        } else {
-                                            RoundedCornerShape(0.dp)
-                                        }
-                                        Row(
-                                            // T236: expanded entry row —
-                                            // vertical 14→8 + heightIn(min=48dp)
-                                            // for accessible tap target.
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .heightIn(min = 48.dp)
-                                                .clip(rowShape)
-                                                .clickable { onSelectEntry(entry.id) }
-                                                .padding(horizontal = 16.dp, vertical = 8.dp),
-                                            verticalAlignment = Alignment.CenterVertically,
-                                        ) {
-                                            Icon(
-                                                if (isSelected) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
-                                                contentDescription = null,
-                                                tint = if (isSelected) Color(0xFF007AFF)
-                                                else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f),
-                                                modifier = Modifier.size(20.dp),
-                                            )
-                                            Spacer(Modifier.width(10.dp))
-                                            Box(
-                                                modifier = Modifier
-                                                    .size(6.dp)
-                                                    .background(dotColor, CircleShape),
-                                            )
-                                            Spacer(Modifier.width(10.dp))
-                                            Column(modifier = Modifier.weight(1f)) {
-                                                ModelNameWithActiveBadge(
-                                                    entry.model.displayName,
-                                                    showActiveBadge = selectedGroupId != null && activeEntryId == entry.id,
-                                                )
-                                                // [T-android-provider-voice] Modality
-                                                // chips (iOS entryRow badges). FlowRow so
-                                                // an overflow wraps whole chips to the
-                                                // next line instead of squeezing each
-                                                // Text into a vertical letter column.
-                                                FlowRow(
-                                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                                    itemVerticalAlignment = Alignment.CenterVertically,
-                                                ) {
-                                                    Text(
-                                                        entry.model.id,
-                                                        style = MaterialTheme.typography.labelSmall,
-                                                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
-                                                    )
-                                                    com.openminis.app.ui.components.modalityBadges(entry.model).forEach { badge ->
-                                                        com.openminis.app.ui.components.ModalityBadge(badge)
-                                                    }
-                                                }
-                                            }
-                                            QuickTestButton(onClick = { quickTestEntry = entry })
-                                        }
-                                        // Inset hairline between entries.
-                                        if (index < entries.size - 1) {
-                                            HorizontalDivider(
-                                                modifier = Modifier.padding(start = 52.dp, end = 16.dp),
-                                                thickness = 0.5.dp,
-                                                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f),
-                                            )
-                                        }
+                                    pickerEntryRow(instance, entry, index, entries.size)
                                 }
                             }
                         }
@@ -1297,10 +1348,17 @@ internal fun ModelPickerSheet(
     // at UnifiedModelPicker.swift:524.
     quickTestEntry?.let { entry ->
         key(entry.id) {
+            // [Mines-38.9.9 i26] smoke 39190432130: the stacked sheet said 「Mines-Test」 while the row said 「Mines-Test · 1908」
+            val shownName = remember(allInstancesWithEntries, entry.id) {
+                allInstancesWithEntries.firstOrNull { (inst, _) -> inst.id == entry.providerInstanceId }?.let { (_, es) ->
+                    com.openminis.app.plus.FreeRouteCore.distinctNames(es.map { it.model.id to it.model.displayName })[entry.model.id]
+                }
+            }
             com.openminis.app.ui.components.QuickTestSheet(
                 entry = entry,
                 providerRepository = providerRepository,
                 onDismiss = { quickTestEntry = null },
+                titleName = shownName,
             )
         }
     }
@@ -1389,3 +1447,6 @@ private fun providerDotColor(providerType: ProviderType?): Color = when (provide
     ProviderType.unsupported -> Color(0xFF8E8E93)
     null -> Color(0xFF8E8E93)                    // gray
 }
+
+/** [Mines-38.9.8] providers with at most this many models draw their rows inside one card (bigger ones stay lazy). */
+private const val PICKER_INLINE_MAX = 80

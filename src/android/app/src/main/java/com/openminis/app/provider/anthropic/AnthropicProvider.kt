@@ -74,7 +74,10 @@ class AnthropicProvider(
     private val isCustomEndpoint: Boolean = basePath != "https://api.anthropic.com"
 
     private val client = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
+        // [38.9.11.3] per-host route (China direct / foreign via proxy, the other as fallback), 10 s connect, DNS ≤ 5 s
+        .connectTimeout(com.openminis.app.plus.ProviderRouteCore.CONNECT_MS, TimeUnit.MILLISECONDS)
+        .proxySelector(com.openminis.app.plus.ProviderRoutes.selector)
+        .dns(com.openminis.app.plus.ProviderRoutes.TimedDns)
         .readTimeout(10, TimeUnit.MINUTES)
         .writeTimeout(30, TimeUnit.SECONDS)
         // [T-android-stale-conn-retry-hang] Shared pool — see NetworkMonitor.
@@ -339,7 +342,8 @@ class AnthropicProvider(
      *   Returns null when the prompt is null/empty (iOS parity — no empty `system` field).
      */
     internal fun resolveSystemPrompt(userPrompt: String?): JSONArray? {
-        val claudeCodePrefix = com.openminis.app.auth.ClaudeOAuthManager.ANTHROPIC_OAUTH_IDENTIFIER_PROMPT
+        val claudeCodePrefix = if (isOAuth) com.openminis.app.auth.ClaudeOAuthManager.ANTHROPIC_OAUTH_IDENTIFIER_PROMPT
+            else com.openminis.app.auth.ClaudeOAuthManager.identifierPromptOrEmpty
         if (isOAuth) {
             // Strip the prefix if the caller already prepended it; the tail is the real user prompt.
             val tail = when {

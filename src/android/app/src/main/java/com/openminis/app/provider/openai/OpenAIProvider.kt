@@ -320,6 +320,9 @@ class OpenAIProvider private constructor(
         )
     }
 
+    /** [Mines-38.9.11 i32] called when the server answers 401 (Copilot: drop the session token so the next call re-exchanges) */
+    var onAuthRejected: (() -> Unit)? = null
+
     private val isOAuth: Boolean get() = oauthTokenProvider != null
 
     // MARK: - Image passthrough [T-android-model-use-image-passthrough GH#62]
@@ -574,7 +577,9 @@ class OpenAIProvider private constructor(
     // through AppLogger.info at the OkHttpEvents tag with the call's
     // identity hash so concurrent streams can be disambiguated.
     private val client = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
+        // [38.9.11.3] 10 s per route (was 30 s); DNS capped at 5 s (a blocked getaddrinfo ignores call.cancel())
+        .connectTimeout(com.openminis.app.plus.ProviderRouteCore.CONNECT_MS, TimeUnit.MILLISECONDS)
+        .dns(com.openminis.app.plus.ProviderRoutes.TimedDns)
         .readTimeout(600, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
         // [T-android-stale-conn-retry-hang] Shared pool so NetworkMonitor's
@@ -615,7 +620,7 @@ class OpenAIProvider private constructor(
         get() = isOpenRouter && model.id.lowercase().startsWith("anthropic/")
 
     /** Detect DashScope (Alibaba Qwen) base URL. */
-    private val isDashScope: Boolean = basePath.contains("dashscope")
+    private val isDashScope: Boolean = com.openminis.app.plus.RouteStatusCore.isDashScopeHost(basePath)  // [Mines-38.9.5 i] + 百炼 MaaS
 
     /**
      * [T-android-mistral-reasoning-422] (GH OpenMinis#87, iOS 29065ca0)
@@ -844,6 +849,12 @@ class OpenAIProvider private constructor(
         // this body kill us?" could not be answered from the log. We measure
         // around the call and report the realised length, so an OOM thrown here
         // now arrives with an attributed stack instead of anonymously.
+        // [Mines-38.9.4] endpoint known to reject `thinking` → send reasoning_effort only
+        if (ThinkingParamFallback.known(basePath)) ThinkingParamFallback.strip(body)
+        // [Mines-38.9.9] Cloudflare Workers AI / GitHub Models request shape (prefix @cf/, max_tokens, no OpenAI-only extras)
+        CompatQuirks.sanitize(body, basePath).takeIf { it.isNotEmpty() }?.let {
+            com.openminis.app.logging.AppLogger.info("OpenAIProvider", "[compat] ${'$'}{java.net.URI(basePath).host} body ${'$'}it")
+        }
         val memBefore = com.openminis.app.diagnostics.MemorySnapshot.capture()
         val serStartNs = System.nanoTime()
         val bodyStr = try {
@@ -900,26 +911,48 @@ class OpenAIProvider private constructor(
         // listener fills in (upload-done timestamp + physical connection) so the
         // watchdog below can (a) start the TTFB clock only after upload and
         // (b) evict THIS ONE connection on timeout.
+        // [Mines-38.9.11.3] user: 「AI 回复很慢，几乎每个供应商都经常 60 秒超时」. Each request now picks a ROUTE for its host
+        // (ProviderRoutes / ProviderRouteCore): China / directly reachable providers direct first, foreign API hosts through the
+        // proxy first, the other route as an automatic fallback, the route that worked remembered. Connect (DNS + TCP + proxy
+        // tunnel + TLS) has its own 10 s budget per route — before, the tunnel / handshake ran under readTimeout (600 s) and a
+        // dead proxy path was only cut by the 60 s first-chunk deadline. Both routes failed → fallbackable ProviderError at
+        // once (next key / provider, no same-model 1/2/4 s retries). Connected but silent → first-token budget
+        // (45 s, 90 s for reasoning models), then the next provider. Flowing streams keep no total cap.
+        val rHost = request.url.host
+        val rPort = request.url.port
+        val legacyNet = com.openminis.app.plus.ProviderRoutes.legacy   // smoke before-measurement: 38.9.11.2 behaviour
+        val firstTokenMs = if (legacyNet) STREAM_TTFB_TIMEOUT_MS else com.openminis.app.plus.ProviderRouteCore.firstTokenMs(model.supportsReasoning == true)
+        val connectCapMs = if (legacyNet) STREAM_UPLOAD_CAP_MS else com.openminis.app.plus.ProviderRouteCore.CONNECT_MS
+        if (!legacyNet && com.openminis.app.plus.ProviderRoutes.bothDown(rHost)) {
+            com.openminis.app.plus.ProviderRoutes.idle()
+            throw LLMError.ProviderError("连不上 $rHost：1 分钟内直连和代理都没通，先换下一个")
+        }
+        val routes = kotlinx.coroutines.runInterruptible(Dispatchers.IO) { com.openminis.app.plus.ProviderRoutes.plan(rHost, rPort) }
+        var lastWhy: String? = null
+        var directWhy: String? = null
+        var proxyWhy: String? = null
+        var resp0: okhttp3.Response? = null
+        var routedClient: OkHttpClient = client
+        var liveCall: Call? = null
+        for ((ri, route) in routes.withIndex()) {
+        com.openminis.app.plus.ProviderRoutes.status(com.openminis.app.plus.ProviderRouteCore.Phase.CONNECTING, rHost, route)
+        val rClient = if (legacyNet) client.newBuilder().proxy(com.openminis.app.plus.ProviderRoutes.proxy() ?: java.net.Proxy.NO_PROXY).connectTimeout(30, TimeUnit.SECONDS).build()
+            else client.newBuilder().proxy(com.openminis.app.plus.ProviderRoutes.proxyFor(route)).build()
         val watchState = CallWatchState()
-        val call = client.newCall(request.newBuilder().tag(CallWatchState::class.java, watchState).build())
+        // [Mines-38.9.9] a host whose HTTP/2 / pooled connection was dropped before answering uses a fresh HTTP/1.1 client
+        val call = (if (ConnRetry.useH1(rHost)) ConnRetry.h1(rClient) else rClient).newCall(request.newBuilder().tag(CallWatchState::class.java, watchState).build())
         // [T-android-stale-conn-retry-hang] Time-to-first-byte watchdog. A
         // request written into a dead pooled h2 tunnel (local proxy socket
         // survives a network flap) produces NO further events — no headers,
         // no failure — until the 600s read timeout, so the UI showed
         // "thinking" forever.
         //
-        // [T-android-ttfb-upload-split / #188] The window is split in two so
-        // slow-but-healthy uploads aren't mistaken for a dead connection:
-        //   1. UPLOAD phase (call start → requestBodyEnd): bounded loosely by
-        //      STREAM_UPLOAD_CAP_MS. writeTimeout(30s) already catches a fully
-        //      stalled socket; this only catches slow-trickle-forever.
-        //   2. TTFB phase (requestBodyEnd → response headers): the tight
-        //      STREAM_TTFB_TIMEOUT_MS budget, measured FROM upload completion.
-        // On timeout we cancel the call AND evict just this connection so the
-        // auto-retry gets a fresh one (a sibling session's connection is never
-        // touched — no evictAll). Once headers arrive the watchdog stops and a
-        // flowing SSE stream has NO total-duration limit, as before.
+        // [T-android-ttfb-upload-split / #188] The window is split so slow-but-healthy uploads aren't mistaken for a dead
+        // connection: CONNECT (call start → connection acquired, [38.9.11.3] 10 s), UPLOAD (→ requestBodyEnd, loose cap),
+        // FIRST TOKEN (requestBodyEnd → response headers, [38.9.11.3] firstTokenMs). On timeout we cancel the call AND evict
+        // just this connection (never evictAll). Once headers arrive the watchdog stops; a flowing SSE stream has no total cap.
         val ttfbTimedOut = java.util.concurrent.atomic.AtomicBoolean(false)
+        var timedOutPhaseSeen: String? = null
         val headersArrived = java.util.concurrent.atomic.AtomicBoolean(false)
         val callStartNanos = System.nanoTime()
         val ttfbWatchdog = launch {
@@ -928,28 +961,31 @@ class OpenAIProvider private constructor(
             while (!headersArrived.get()) {
                 val uploadDoneAt = watchState.uploadDoneAtNanos.get()
                 val nowNanos = System.nanoTime()
-                if (uploadDoneAt == 0L) {
-                    // Still uploading (or connecting) — loose upload-phase cap.
-                    val elapsedMs = (nowNanos - callStartNanos) / 1_000_000L
+                val elapsedMs = (nowNanos - callStartNanos) / 1_000_000L
+                if (watchState.acquiredAtNanos.get() == 0L) {
+                    if (elapsedMs >= connectCapMs) { timedOutPhase = "connect"; break }
+                } else if (uploadDoneAt == 0L) {
+                    if (com.openminis.app.plus.ProviderRoutes.status.value.phase != com.openminis.app.plus.ProviderRouteCore.Phase.THINKING)
+                        com.openminis.app.plus.ProviderRoutes.status(com.openminis.app.plus.ProviderRouteCore.Phase.THINKING, rHost, route)
+                    // Still uploading — loose upload-phase cap.
                     if (elapsedMs >= STREAM_UPLOAD_CAP_MS) { timedOutPhase = "upload"; break }
                 } else {
-                    // Upload finished — tight TTFB budget measured from that point.
+                    if (com.openminis.app.plus.ProviderRoutes.status.value.phase != com.openminis.app.plus.ProviderRouteCore.Phase.THINKING)
+                        com.openminis.app.plus.ProviderRoutes.status(com.openminis.app.plus.ProviderRouteCore.Phase.THINKING, rHost, route)
+                    // Upload finished — first-token budget measured from that point.
                     val sinceUploadMs = (nowNanos - uploadDoneAt) / 1_000_000L
-                    if (sinceUploadMs >= STREAM_TTFB_TIMEOUT_MS) { timedOutPhase = "ttfb"; break }
+                    if (sinceUploadMs >= firstTokenMs) { timedOutPhase = "ttfb"; break }
                 }
                 delay(pollMs)
             }
             if (timedOutPhase != null && !headersArrived.get()) {
+                timedOutPhaseSeen = timedOutPhase
                 ttfbTimedOut.set(true)
-                val budgetS = if (timedOutPhase == "ttfb") STREAM_TTFB_TIMEOUT_MS / 1000 else STREAM_UPLOAD_CAP_MS / 1000
                 com.openminis.app.logging.AppLogger.warning(
                     "OpenAIProvider",
-                    "[T-android-ttfb-upload-split] no response headers ($timedOutPhase phase, ${budgetS}s) — cancelling call + evicting connection (stale pooled connection?)",
+                    "[38.9.11.3] $rHost via ${route.name}: no progress in the $timedOutPhase phase — cancelling call + evicting connection",
                 )
                 call.cancel()
-                // Targeted eviction: close ONLY this call's physical connection so
-                // the retry can't reuse it. Never evictAll — concurrent sessions
-                // may hold healthy connections in the shared pool.
                 try {
                     watchState.connection.get()?.socket()?.close()
                 } catch (_: Throwable) {
@@ -957,19 +993,69 @@ class OpenAIProvider private constructor(
                 }
             }
         }
-        val response = try {
-            call.execute()
-        } catch (e: IOException) {
-            if (ttfbTimedOut.get()) {
-                throw LLMError.TransientError(
-                    "no response from server (${STREAM_TTFB_TIMEOUT_MS / 1000}s TTFB) — check network/proxy",
-                )
+        try {
+            resp0 = try {
+                call.execute()
+            } catch (e: IOException) {
+                val connected = watchState.acquiredAtNanos.get() != 0L
+                if (ttfbTimedOut.get() && timedOutPhaseSeen == "ttfb") {
+                    com.openminis.app.plus.ProviderRoutes.ok(rHost, route, 0L)   // the path works; the server is silent
+                    throw LLMError.ProviderError("连上了 $rHost，但 ${firstTokenMs / 1000} 秒没有回应（首字超时），先换下一个")
+                }
+                if (ttfbTimedOut.get() && timedOutPhaseSeen == "upload") {
+                    throw LLMError.TransientError("请求发了 ${STREAM_UPLOAD_CAP_MS / 1000} 秒还没发完（网络太慢）")
+                }
+                if (!connected || (ttfbTimedOut.get() && timedOutPhaseSeen == "connect")) {
+                    // connect-phase failure on this route → remember, switch route at once
+                    val why = if (timedOutPhaseSeen == "connect") "${com.openminis.app.plus.ProviderRouteCore.CONNECT_MS / 1000} 秒没连上" else (e.message ?: e.javaClass.simpleName).take(60)
+                    if (route == com.openminis.app.plus.ProviderRouteCore.Route.DIRECT) directWhy = why else proxyWhy = why
+                    lastWhy = why
+                    com.openminis.app.plus.ProviderRoutes.fail(rHost, route)
+                    com.openminis.app.logging.AppLogger.warning("OpenAIProvider", "[38.9.11.3] $rHost ${route.name} connect failed ($why) — ${if (ri < routes.size - 1) "trying the other route" else "no route left"}")
+                    null
+                } else if (ConnRetry.isDropped(e) && !ConnRetry.useH1(rHost)) {
+                    headersArrived.set(true)
+                    com.openminis.app.logging.AppLogger.warning("OpenAIProvider", "[conn-retry] $rHost ${e.javaClass.simpleName}: ${e.message} — retrying once on a fresh HTTP/1.1 connection")
+                    try { watchState.connection.get()?.socket()?.close() } catch (_: Throwable) {}
+                    // [38.9.11.3] user: 「unexpected end of stream on https://api.lixil…」 (AWS中转) → one retry on a fresh
+                    // connection, then the other route (direct ↔ proxy), then the next key / provider (fallbackable error)
+                    val r2 = try { ConnRetry.h1(rClient).newCall(request).execute() } catch (e2: IOException) {
+                        val why = "中途断开（已换新连接重试 1 次）"
+                        if (route == com.openminis.app.plus.ProviderRouteCore.Route.DIRECT) directWhy = why else proxyWhy = why
+                        lastWhy = why
+                        com.openminis.app.logging.AppLogger.warning("OpenAIProvider", "[38.9.11.3] $rHost ${route.name} dropped twice (${e2.javaClass.simpleName}) — ${if (ri < routes.size - 1) "trying the other route" else "next provider"}")
+                        null
+                    }
+                    if (r2 != null) ConnRetry.rememberH1(rHost)
+                    r2
+                } else if (ConnRetry.isDropped(e)) {
+                    // already on a fresh HTTP/1.1 connection: other route, then next provider
+                    val why = "中途断开（${ConnRetry.zh(e).take(40)}）"
+                    if (route == com.openminis.app.plus.ProviderRouteCore.Route.DIRECT) directWhy = why else proxyWhy = why
+                    lastWhy = why
+                    null
+                }
+                else throw e
             }
-            throw e
         } finally {
             headersArrived.set(true)
             ttfbWatchdog.cancel()
         }
+        if (resp0 != null) {
+            routedClient = rClient
+            liveCall = call
+            val acq = watchState.acquiredAtNanos.get()
+            com.openminis.app.plus.ProviderRoutes.ok(rHost, route, if (acq != 0L) (acq - callStartNanos) / 1_000_000L else 0L)
+            break
+        }
+        }
+        if (resp0 == null) {
+            com.openminis.app.plus.ProviderRoutes.idle()
+            throw LLMError.ProviderError(com.openminis.app.plus.ProviderRouteCore.bothFailedText(rHost, directWhy, proxyWhy,
+                routes.contains(com.openminis.app.plus.ProviderRouteCore.Route.PROXY)).let { if (directWhy?.startsWith("中途断开") != false && proxyWhy?.startsWith("中途断开") != false && lastWhy?.startsWith("中途断开") == true) "$rHost 中途断开，已自动重试（${routes.size} 条线路），换下一个"
+                    else if (routes.size == 1 && lastWhy != null) "连不上 $rHost（$lastWhy），已换下一个" else it })
+        }
+        var response: okhttp3.Response = resp0!!
         // T321: response-side diagnostic log (status + select header values).
         run {
             val rh = response.headers
@@ -991,6 +1077,19 @@ class OpenAIProvider private constructor(
                 "[T321] ← HTTP ${response.code} error body: $errorBody"
             )
             response.close()
+            // [Mines-38.9.4] `thinking` unsupported here: drop it, remember the endpoint, retry once
+            if (ThinkingParamFallback.shouldRetry(response.code, errorBody, body)) {
+                ThinkingParamFallback.remember(basePath)
+                ThinkingParamFallback.strip(body)
+                com.openminis.app.logging.AppLogger.warning("OpenAIProvider", "[thinking-fallback] ${request.url.host} rejects \"thinking\" — retrying with reasoning_effort only")
+                val retry = routedClient.newCall(buildRequest(body.toString())).execute()
+                if (retry.isSuccessful) response = retry
+                else {
+                    val eb = retry.body?.string() ?: ""
+                    retry.close()
+                    throw markIfBadKey(mapHttpError(retry.code, eb), retry.code)
+                }
+            } else {
             // T302: skip the LLMRequestLog write entirely on release builds —
             // not just to avoid the (already-truncated) retention cost, but to
             // dodge constructing the Entry / headerMap copies that go with it.
@@ -1007,7 +1106,8 @@ class OpenAIProvider private constructor(
                     )
                 )
             }
-            throw mapHttpError(response.code, errorBody)
+            throw markIfBadKey(mapHttpError(response.code, errorBody), response.code)
+            }
         }
         if (com.openminis.app.BuildConfig.DEBUG) {
             com.openminis.app.debug.LLMRequestLog.add(
@@ -1043,7 +1143,7 @@ class OpenAIProvider private constructor(
             }
             channel.close()
             awaitClose {
-                try { call.cancel() } catch (_: Exception) {}
+                try { liveCall?.cancel() } catch (_: Exception) {}
                 try { response.close() } catch (_: Exception) {}
             }
             return@callbackFlow
@@ -1117,6 +1217,8 @@ class OpenAIProvider private constructor(
                 val payload = l.removePrefix("data:").let {
                     if (it.startsWith(" ")) it.removePrefix(" ") else it
                 }
+                // [Mines-38.9.9] keepalive / empty-delta chunks (Memoh new-api, Cloudflare) carry nothing: skip silently
+                if (payload != "[DONE]" && CompatQuirks.isEmptyPayload(payload)) continue
                 if (payload == "[DONE]") {
                     // [T-android-think-prefix-stream] Flush whatever the parser
                     // still holds (a cross-chunk tag tail, or an unterminated
@@ -1753,7 +1855,7 @@ class OpenAIProvider private constructor(
         // is also explicit so connection-pool leaks are impossible if cancel
         // races with the finally block.
         awaitClose {
-            try { call.cancel() } catch (_: Exception) {}
+            try { liveCall?.cancel() } catch (_: Exception) {}
             try { response.close() } catch (_: Exception) {}
         }
     }
@@ -1948,7 +2050,7 @@ class OpenAIProvider private constructor(
                     "OpenAIProvider",
                     "[ModelUseRoute] images/generations HTTP $statusCode body=${responseBody.take(300)}",
                 )
-                throw mapHttpError(statusCode, responseBody)
+                throw markIfBadKey(mapHttpError(statusCode, responseBody), statusCode)
             }
 
             val json = try {
@@ -2072,7 +2174,7 @@ class OpenAIProvider private constructor(
                     "OpenAIProvider",
                     "[ModelUseRoute] images/edits HTTP $statusCode body=${responseBody.take(300)}",
                 )
-                throw mapHttpError(statusCode, responseBody)
+                throw markIfBadKey(mapHttpError(statusCode, responseBody), statusCode)
             }
 
             val json = try {
@@ -2383,7 +2485,12 @@ class OpenAIProvider private constructor(
                             messagesArray.put(JSONObject().apply {
                                 put("role", "tool")
                                 put("tool_call_id", capChatToolCallId(tr.id))
-                                put("content", tr.content)
+                                // [Mines-loop-30] Never send an empty tool reply: some
+                                // OpenAI-compatible backends (DeepSeek via relays) treat
+                                // "" as no result and the model re-issues the same call.
+                                put("content", tr.content.ifBlank {
+                                    if (tr.isError) "(tool failed with no output)" else "(command finished with no output)"
+                                })
                             })
                             // [T-android-toolresult-image-dropped] THE reported bug.
                             // read_image hands its pixels back on the ToolResult
@@ -3912,18 +4019,27 @@ class OpenAIProvider private constructor(
         )
     }
 
-    private fun mapHttpError(statusCode: Int, body: String): LLMError {
-        if (statusCode == 401 || statusCode == 403) return LLMError.InvalidApiKey()
-        if (statusCode == 429) return LLMError.RateLimited()
+    /** [38.9.11.3] a 401 / invalid key: remember it (fingerprint only) so the key pool skips it and the turn moves on */
+    private fun markIfBadKey(e: LLMError, code: Int): LLMError {
+        // only a 401 marks the key: relays answer 403 for quota / region / model permission, which is not a dead key
+        if (code == 401 && e is LLMError.InvalidApiKey && oauthTokenProvider == null) runCatching { com.openminis.app.plus.BadKeys.mark(apiKey) }
+        return e
+    }
 
-        val message = try {
-            val json = JSONObject(body)
-            val error = json.optJSONObject("error")
-            val errorMessage = error?.safeOptString("message", "") ?: body
-            "[$statusCode] $errorMessage"
-        } catch (_: Exception) {
-            "HTTP $statusCode: ${body.take(500)}"
-        }
+    private fun mapHttpError(statusCode: Int, body: String): LLMError {
+        // [Mines-38.9.9] keep the server's words (GitHub Models 403 = daily quota, not a bad key)
+        val upText = CompatQuirks.errorText(statusCode, body, basePath).orEmpty()
+        if (statusCode == 403 && CompatQuirks.isGitHubModels(basePath) && upText.contains("额度")) return LLMError.RateLimited(upText)
+        // [Mines-38.9.11 i32] Copilot: a 401 means the short-lived session token is dead whatever its stored deadline says →
+        // the factory's hook drops it so the next request re-exchanges (it used to be replayed until it "expired")
+        if (statusCode == 401) runCatching { onAuthRejected?.invoke() }
+        if (CompatQuirks.isCopilot(basePath) && statusCode == 400 && upText.isNotBlank()) return LLMError.ProviderError(upText, httpStatus = statusCode)
+        if (statusCode == 401 || statusCode == 403) return LLMError.InvalidApiKey(upText)
+        if (statusCode == 429) return LLMError.RateLimited(upText)
+
+        // [Mines-38.9.9] the server's own words always reach the UI (Cloudflare errors[], GitHub Models quota / permission,
+        // HTML gateway pages), prefixed with one short Chinese reason
+        val message = "[$statusCode] " + (CompatQuirks.errorText(statusCode, body, basePath) ?: "HTTP $statusCode")
 
         val transientCodes = setOf(500, 502, 503, 504, 529)
         if (statusCode in transientCodes) {
@@ -3971,6 +4087,8 @@ private class CallWatchState {
     val uploadDoneAtNanos = java.util.concurrent.atomic.AtomicLong(0L)
     /** Physical connection serving this call, captured at connectionAcquired. */
     val connection = java.util.concurrent.atomic.AtomicReference<okhttp3.Connection?>(null)
+    /** [38.9.11.3] when the connection was acquired (monotonic nanos; 0 = still connecting) — the connect-phase budget */
+    val acquiredAtNanos = java.util.concurrent.atomic.AtomicLong(0L)
 }
 
 /**
@@ -4097,6 +4215,7 @@ private class OkHttpNetTraceListener : EventListener() {
         // [T-android-ttfb-upload-split / #188] Capture the physical connection so
         // the TTFB watchdog can evict THIS ONE on timeout (targeted, never the pool).
         call.request().tag(CallWatchState::class.java)?.connection?.set(connection)
+        call.request().tag(CallWatchState::class.java)?.acquiredAtNanos?.compareAndSet(0L, System.nanoTime())
         com.openminis.app.logging.AppLogger.info(
             tag,
             "[${callTag(call)}] +${ms()}ms connectionAcquired conn#$conn route=${connection.route()} proto=${connection.protocol()}"

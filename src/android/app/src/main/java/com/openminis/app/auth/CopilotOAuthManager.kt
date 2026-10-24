@@ -41,10 +41,19 @@ class CopilotOAuthManager(
         private const val KEY_GITHUB_TOKEN = "copilot_github_token"
         private const val KEY_SESSION_TOKEN = "copilot_session_token"
         private const val KEY_SESSION_EXPIRES = "copilot_session_expires_at"
+        /** [Mines-38.9.11 i32] the account's chat host from the exchange (`endpoints.api`) */
+        private const val KEY_API_BASE = "copilot_api_base"
 
         /** Single-flight per instance: a fan-out of agent requests would
          *  otherwise all miss the cache at once and each burn an exchange. */
         private val refreshMutexes = java.util.concurrent.ConcurrentHashMap<String, Mutex>()
+        /**
+         * [Mines-38.9.9] user: Copilot fails after the OAuth login with no reason. The last failure per instance, in plain
+         * Chinese with the server's own words (token exchange / model list), so the provider can show it instead of a
+         * bare 「Invalid API key」.
+         */
+        val lastError = java.util.concurrent.ConcurrentHashMap<String, String>()
+
         private fun mutexFor(instanceId: String): Mutex =
             refreshMutexes.getOrPut(instanceId) { Mutex() }
 
@@ -80,8 +89,7 @@ class CopilotOAuthManager(
                 Log.e(TAG, "[Copilot] signed in, but the session-token exchange failed", e)
                 throw Exception(
                     e.message
-                        ?: "Signed in to GitHub, but could not obtain a Copilot token " +
-                        "(${e.javaClass.simpleName}).",
+                        ?: "GitHub 已登录，但没换到 Copilot 令牌（${e.javaClass.simpleName}）",
                     e,
                 )
             }
@@ -202,10 +210,10 @@ class CopilotOAuthManager(
                 val desc = json.optString("error_description", "")
                     .ifEmpty { json.optString("error", "device authorization failed") }
                 Log.e(TAG, "device/code failed: $desc")
-                throw Exception("GitHub device authorization failed: $desc")
+                throw Exception("GitHub 设备授权失败：$desc")
             }
             CopilotDeviceFlow.parseDeviceAuthorization(json)
-                ?: throw Exception("GitHub device authorization response missing required fields")
+                ?: throw Exception("GitHub 设备授权的回复缺少必要字段")
         }
 
     /** Poll until approval or terminal failure, honouring RFC 8628 backoff. */
@@ -259,18 +267,18 @@ class CopilotOAuthManager(
                     }
                     is CopilotDeviceFlow.PollResult.Denied -> {
                         Log.e(TAG, "[Copilot] device flow DENIED: ${r.description}")
-                        throw Exception("GitHub sign-in was denied: ${r.description}")
+                        throw Exception("GitHub 登录被拒绝：${r.description}")
                     }
                     is CopilotDeviceFlow.PollResult.Expired -> {
                         Log.e(TAG, "[Copilot] device flow EXPIRED")
-                        throw Exception("The device code expired — please try again.")
+                        throw Exception("验证码过期了，请重新登录")
                     }
                     is CopilotDeviceFlow.PollResult.Fatal -> {
                         // The classifier's catch-all: an unrecognised `error`
                         // code lands here, and that is exactly what a stuck flow
                         // would be caused by.
                         Log.e(TAG, "[Copilot] device flow FATAL: ${r.description}")
-                        throw Exception("GitHub sign-in failed: ${r.description}")
+                        throw Exception("GitHub 登录失败：${r.description}")
                     }
                 }
             }
@@ -279,7 +287,7 @@ class CopilotOAuthManager(
                 "[Copilot] device flow timed out after ${auth.expiresInSeconds}s " +
                     "without a terminal answer",
             )
-            throw Exception("The device code expired — please try again.")
+            throw Exception("验证码过期了，请重新登录")
         }
 
     // ── Stage 2: session token ───────────────────────────────────────────
@@ -319,23 +327,45 @@ class CopilotOAuthManager(
         if (status !in 200..299) {
             // 401/403 here usually means the account has no Copilot
             // subscription — distinct from a bad token, and worth saying so.
-            Log.e(TAG, "Copilot token exchange failed: HTTP $status")
-            throw Exception(
-                if (status == 401 || status == 403) {
-                    "This GitHub account does not have Copilot access (HTTP $status)."
-                } else {
-                    "Copilot token exchange failed (HTTP $status)."
-                }
-            )
+            Log.e(TAG, "Copilot token exchange failed: HTTP $status ${body.take(300)}")
+            // [Mines-38.9.11 i32] 403 is NOT always "no Copilot": GitHub answers a token it will not exchange (wrong client,
+            // revoked grant) with a plain-text 403 «For more on scraping GitHub…». Ask copilot_internal/user with the same
+            // token what the account really has, and say that instead of guessing.
+            val diag = if (status == 401 || status == 403 || status == 404) runCatching { copilotUser(githubToken) }.getOrNull() else null
+            val zh = com.openminis.app.provider.openai.CompatQuirks.copilotExchangeError(status, body, diag)
+            lastError[instanceId] = zh
+            throw Exception(zh)
         }
         val json = try { JSONObject(body) } catch (_: Exception) { JSONObject() }
         val now = System.currentTimeMillis() / 1000
-        val session = CopilotDeviceFlow.parseSessionToken(json, now)
-            ?: throw Exception("Copilot token exchange returned no usable token.")
+        // [Mines-38.9.11 i32] deadline on the phone's own clock (refresh_in), not GitHub's expires_at — see parseSessionTokenLocal
+        val session = CopilotDeviceFlow.parseSessionTokenLocal(json, now)
+            ?: throw Exception("换取 Copilot 令牌时服务器没给出可用的令牌：" + body.take(160)).also { lastError[instanceId] = it.message.orEmpty() }
+        lastError.remove(instanceId)
+        CopilotDeviceFlow.parseApiEndpoint(json)?.let { if (it != loadOAuthString(KEY_API_BASE)) { saveOAuthString(KEY_API_BASE, it); Log.i(TAG, "Copilot chat host: $it") } }
         saveOAuthString(KEY_SESSION_TOKEN, session.token)
         saveOAuthString(KEY_SESSION_EXPIRES, session.expiresAtEpochSeconds.toString())
         Log.i(TAG, "Copilot session token refreshed (expires_at=${session.expiresAtEpochSeconds})")
         return session.token
+    }
+
+    /** [Mines-38.9.11 i32] the account's chat host (e.g. https://api.individual.githubcopilot.com), null until the first exchange */
+    fun apiBase(): String? = loadOAuthString(KEY_API_BASE)?.takeIf { it.startsWith("https://") }
+
+    /** [Mines-38.9.11 i32] chat answered 401: the session token is dead whatever its deadline says — the next request re-exchanges */
+    fun invalidateSession() {
+        saveOAuthString(KEY_SESSION_TOKEN, ""); saveOAuthString(KEY_SESSION_EXPIRES, "")
+        Log.w(TAG, "Copilot session token rejected by chat → dropped (instance ${instanceId.take(8)})")
+    }
+
+    /** GET api.github.com/copilot_internal/user with the account token (diagnosis only; never throws to the caller's flow) */
+    private fun copilotUser(githubToken: String): JSONObject? {
+        val b = Request.Builder().url("https://api.github.com/copilot_internal/user").get()
+        CopilotDeviceFlow.tokenExchangeHeaders(githubToken).forEach { (k, v) -> b.header(k, v) }
+        httpClient.newCall(b.build()).execute().use { r ->
+            if (!r.isSuccessful) return JSONObject().put("_status", r.code)
+            return runCatching { JSONObject(r.body?.string().orEmpty()) }.getOrNull()
+        }
     }
 
     /**
@@ -370,7 +400,8 @@ class CopilotOAuthManager(
                 return@withLock freshToken
             }
             runCatching { exchangeSessionToken(githubToken) }
-                .onFailure { Log.e(TAG, "Session refresh failed: ${it.message}") }
+                .onFailure { Log.e(TAG, "Session refresh failed: ${it.message}")
+                    if (lastError[instanceId].isNullOrBlank()) lastError[instanceId] = "连不上 GitHub 换取 Copilot 令牌：" + com.openminis.app.provider.openai.ConnRetry.zh(it) }
                 .getOrNull()
         }
     }
@@ -381,6 +412,7 @@ class CopilotOAuthManager(
      * behind would silently re-authenticate a user who just signed out.
      */
     fun logoutCopilot() {
+        saveOAuthString(KEY_API_BASE, "")
         saveOAuthString(KEY_GITHUB_TOKEN, "")
         saveOAuthString(KEY_SESSION_TOKEN, "")
         saveOAuthString(KEY_SESSION_EXPIRES, "")
@@ -418,7 +450,7 @@ class CopilotOAuthManager(
                 return@withContext emptyList()
             }
             val builder = Request.Builder()
-                .url("${CopilotDeviceFlow.API_BASE}/models")
+                .url("${apiBase() ?: CopilotDeviceFlow.API_BASE}/models")
                 .get()
                 .header("Authorization", "Bearer $session")
             CopilotDeviceFlow.staticChatHeaders().forEach { (k, v) -> builder.header(k, v) }
@@ -431,7 +463,9 @@ class CopilotOAuthManager(
                 val body = response.body?.string().orEmpty()
                 response.close()
                 if (!ok) {
-                    Log.e(TAG, "[Copilot] /models returned HTTP $code")
+                    Log.e(TAG, "[Copilot] /models returned HTTP $code ${body.take(300)}")
+                    lastError[instanceId] = "Copilot 模型列表读取失败（HTTP $code" +
+                        com.openminis.app.provider.openai.CompatQuirks.upstreamMessage(body).takeIf { it.isNotBlank() }?.let { "：" + it.take(160) }.orEmpty() + "）"
                     return@runCatching emptyList<CopilotDeviceFlow.CopilotModel>()
                 }
                 val parsed = CopilotDeviceFlow.parseModelsDetailed(JSONObject(body))

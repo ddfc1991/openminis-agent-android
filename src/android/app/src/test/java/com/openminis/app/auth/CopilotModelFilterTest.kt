@@ -260,13 +260,15 @@ class CopilotModelFilterTest {
             loop.contains("""!m.optBoolean("model_picker_enabled", true)"""))
         assertTrue("gate 2 must only fire on a PRESENT non-chat type",
             loop.contains("""type.isNotEmpty() && type != "chat""""))
-        // Five `continue`s exactly: non-object row, empty id, gate 1, gate 2,
-        // duplicate id. Only two of them are policy decisions; the other three
-        // are shape guards, and none of the five may grow a sixth sibling.
+        // Six `continue`s exactly: non-object row, empty id, gate 1, gate 2,
+        // duplicate id, and [Mines-38.9.11 i32] gate 3 = supported_endpoints
+        // present without /chat/completions (Mines can only send chat
+        // completions to Copilot; such a model fails on every send). None of
+        // the six may grow a seventh sibling.
         val continues = Regex("\\bcontinue\\b").findAll(loop).count()
         assertEquals(
             "a new `continue` in the filter loop is a new way to lose a model",
-            5,
+            6,
             continues,
         )
         assertFalse(

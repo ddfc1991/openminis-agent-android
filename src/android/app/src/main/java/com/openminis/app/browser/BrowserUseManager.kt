@@ -48,9 +48,14 @@ class BrowserUseManager(
     /** App context for the session-scoped path resolver. Null disables it. */
     private val appContext: android.content.Context? = null,
 ) {
+    /** [Mines-38.9.7] 无痕标签: no history, no account recording. Set by the pool right after construction. */
+    @Volatile var incognito: Boolean = false
+
     companion object {
         private const val TAG = "BrowserUseManager"
         private const val NAVIGATION_TIMEOUT_MS = 30_000L
+        /** [Mines-render-34] Max wait after onPageFinished for an SPA to put something on screen. */
+        private const val CONTENT_WAIT_MS = 6_000L
         private const val SCREENSHOT_QUALITY = 80        // Explicit screenshot action (iOS: 0.8)
         private const val SNAPSHOT_QUALITY = 70          // Auto-snapshot after visual-change actions (iOS: 0.7)
         private const val DEFAULT_DOM_STABLE_TIMEOUT_MS = 5_000
@@ -119,12 +124,19 @@ class BrowserUseManager(
                 databaseEnabled = true
                 loadWithOverviewMode = true
                 useWideViewPort = true
-                builtInZoomControls = false
                 setSupportMultipleWindows(true)
                 mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                 val ua = customUA ?: profile.userAgentString
                 if (ua != null) userAgentString = ua
+                // [Mines-38.9.9] user: agmail.ai / console.agentmail.to (Clerk SPA) stayed a blank dark page — auth SPAs refuse
+                // the WebView marker. The default UA loses "; wv" and the "Version/4.0" token, so it reads as plain Chrome.
+                else userAgentString = WebUaCore.chromeLike(userAgentString)
+                javaScriptCanOpenWindowsAutomatically = true
             }
+            // [Mines-38.9.11 b] Sec-CH-UA brands match the Chrome UA (GPT / Grok behind Cloudflare)
+            if (customUA == null && profile.userAgentString == null) com.openminis.app.plus.LoginWeb.applyChromeHints(webView)
+            // [Mines-zoom-34] pinch / double-tap zoom + per-site 文字大小 in 手机 and 电脑 modes
+            BrowserZoom.configure(webView)
             // T-android-webview-v3-port: enable first- + third-party cookies.
             // WebView ships with third-party cookies disabled by default; that
             // breaks hCaptcha / Turnstile / reCAPTCHA flows where the
@@ -139,6 +151,8 @@ class BrowserUseManager(
                 setAcceptCookie(true)
                 setAcceptThirdPartyCookies(webView, true)
             }
+            // [Mines-38.9.11.2] page contents are remotely debuggable only in debug builds
+            Incognito.debugging()
         }
     }
 
@@ -189,6 +203,9 @@ class BrowserUseManager(
 
     /** Deferred for awaiting navigation completion. */
     private var navigationDeferred: CompletableDeferred<Unit>? = null
+
+    /** [Mines-render-34] URL the pending [navigate] asked for (null when none / not a navigate). */
+    @Volatile private var navigationTarget: String? = null
 
     /** Screenshots directory. */
     private val screenshotsDir: File by lazy {
@@ -255,7 +272,7 @@ class BrowserUseManager(
         // <a download>, unrenderable MIME types). Without a listener, WebView
         // silently drops these — the user taps "download" and nothing happens.
         webView.setDownloadListener { url, userAgent, contentDisposition, mimetype, contentLength ->
-            Log.i(TAG, "onDownloadStart: ${url.take(120)} mime=$mimetype len=$contentLength")
+            Log.i(TAG, "onDownloadStart: ${BrowserLogMask.mask(url).take(120)} mime=$mimetype len=$contentLength")
             when {
                 // blob: object URLs only exist inside the page — read via JS.
                 url.startsWith("blob:") -> fetchBlobDownload(url, contentDisposition, mimetype)
@@ -454,16 +471,27 @@ class BrowserUseManager(
 
             override fun onPageFinished(view: WebView, url: String?) {
                 _isLoading.value = false
+                if (IncognitoCore.feedsAccounts(incognito)) runCatching { com.openminis.app.plus.AutoAccounts.onPage(view, url) }   // [Mines-38.8] auto-record sign-ups / sign-ins
                 _currentURL.value = url ?: ""
                 _pageTitle.value = view.title ?: ""
                 _canGoBack.value = view.canGoBack()
                 _canGoForward.value = view.canGoForward()
-                navigationDeferred?.complete(Unit)
-                navigationDeferred = null
+                // [Mines-render-34] A finish of the blank placeholder page (initial tab page, or the reload a
+                // set_user_agent just issued) must not end a navigate to a real site: it used to, and the
+                // agent got "Navigated to about:blank" + an empty page while the site was still loading.
+                val target = navigationTarget
+                val stray = target != null && !target.startsWith("about:") && !target.startsWith("data:") &&
+                    (url.isNullOrEmpty() || url == "about:blank" || url.startsWith("data:"))
+                if (!stray) {
+                    navigationDeferred?.complete(Unit)
+                    navigationDeferred = null
+                    navigationTarget = null
+                } else Log.i(TAG, "ignoring onPageFinished(${BrowserLogMask.mask(url)}) while navigating to ${BrowserLogMask.mask(target)}")
+                BrowserZoom.onPage(view, url, finished = true)
                 // Record in browser history
                 val histUrl = url ?: ""
                 val histTitle = view.title ?: ""
-                if (histUrl.isNotEmpty() && histUrl != "about:blank") {
+                if (histUrl.isNotEmpty() && histUrl != "about:blank" && IncognitoCore.recordsHistory(incognito)) {
                     BrowserHistoryStore.getInstance(view.context).record(histUrl, histTitle)
                 }
                 // T-webview-popup-d3c6e10f (Issue 1): after the pool WebView's
@@ -715,7 +743,7 @@ class BrowserUseManager(
             pageURL = url.ifEmpty { null },
             defaultResponse = defaultResponse,
         )
-        Log.i(TAG, "[JSDialog] intercepted $kind on $url — answered $defaultResponse")
+        Log.i(TAG, "[JSDialog] intercepted $kind on ${BrowserLogMask.mask(url)} — answered ${BrowserLogMask.mask(defaultResponse.toString())}")
     }
 
     /**
@@ -738,6 +766,12 @@ class BrowserUseManager(
             )
         }
         val prevUrl = withContext(Dispatchers.Main) { webView.url }
+        // [Mines-cards-35.1] after 「填卡」 the agent may not read / screenshot / script that page (the card number
+        // must never reach a model); navigating away (or back) is still allowed.
+        if (com.openminis.app.plus.PayCards.lockedFor(webView, prevUrl) && input.action != BrowserAction.NAVIGATE &&
+            input.action.name !in setOf("GO_BACK", "GO_FORWARD", "RELOAD")) {
+            return BrowserActionResult.error("这个页面上填了用户的银行卡。为了保护卡号，Mines 在离开这页之前不读取、不截图、不操作这页；请让用户自己检查并点付款。")
+        }
         var result: BrowserActionResult = when (input.action) {
             BrowserAction.NAVIGATE -> navigate(input.url)
             BrowserAction.SCREENSHOT -> return screenshot(fullPage = input.fullPage)
@@ -761,6 +795,8 @@ class BrowserUseManager(
                 input.scrollCount, input.itemSelector, input.keywords,
             )
             BrowserAction.WAIT_FOR_DOM_STABLE -> return waitForDomStable(input.timeoutMs)
+            BrowserAction.WAIT_FOR_HUMAN -> return minesWaitForHuman()
+            BrowserAction.WAIT_FOR_OTP -> return minesWaitForOtp(input.selector)
             BrowserAction.NEW_TAB, BrowserAction.CLOSE_TAB, BrowserAction.LIST_TABS ->
                 return BrowserActionResult.error("Tab management actions must be routed through BrowserTabPool")
         }
@@ -784,7 +820,91 @@ class BrowserUseManager(
             }
         }
 
+        // [Mines] Human verification + one-time-code autofill.
+        if (result.success && BrowserAction.visualChangeActions.contains(input.action) && input.action != BrowserAction.SCROLL && input.action != BrowserAction.HOVER) {
+            result = minesAfterAction(result)
+        }
+
         return result
+    }
+
+    // -- [Mines] Human verification --
+
+    private suspend fun minesScan(): com.openminis.app.plus.HumanVerify.Scan =
+        com.openminis.app.plus.HumanVerify.parseScan(
+            runCatching { evaluateJavascript(com.openminis.app.plus.HumanVerify.DETECT_JS) }.getOrNull()
+        )
+
+    private suspend fun minesUrl(): String = withContext(Dispatchers.Main) { webView.url } ?: ""
+
+    private suspend fun minesAfterAction(result: BrowserActionResult): BrowserActionResult {
+        val ctx = appContext ?: return result
+        val hv = com.openminis.app.plus.HumanVerify
+        hv.init(ctx)
+        val st = hv.settings.value
+        if (!st.challenges && !st.otpAutofill) return result
+        val scan = minesScan()
+        var text = result.text
+        var snap = false
+        if (st.challenges) {
+            hv.handle(ctx, scan, minesUrl(), rescan = { minesScan() }, currentUrl = { minesUrl() })?.let { text += "\n" + it; snap = true }
+        }
+        if (st.otpAutofill && scan.otpField) {
+            hv.armOtp()
+            if (scan.otpEmpty) {
+                val code = hv.takeCode()
+                if (code != null) {
+                    val r = runCatching { evaluateJavascript(hv.fillJs(code, null)) }.getOrNull()
+                    if (r == "ok") text += "\n[验证码] 已自动填入刚收到的短信/邮件验证码（${code.length} 位）。" else hv.putBack(code)
+                } else if (runCatching { com.openminis.app.plus.MailSources.available(ctx) }.getOrDefault(false)) {
+                    // [Mines-sources-33] mailboxes the user is signed in to are being read in the background
+                    text += "\n[验证码] Mines 正在自动读取用户已登录的邮箱和通知里的验证码。点完「发送验证码」后调用 browser 的 wait_for_otp，收到会自动填入，不要让用户手动输入。"
+                }
+            }
+        }
+        // [38.9.11.1] sign-in page without a saved login (or a refused one) → the secure login card; values go into the page
+        runCatching {
+            com.openminis.app.plus.AgentLogin.handle(ctx, minesUrl(), sessionIdProvider()) { js -> runCatching { evaluateJavascript(js) }.getOrNull() }
+        }.getOrNull()?.let { text += "\n" + it; snap = true }
+        val out = result.copy(text = text)
+        return if (snap) attachSnapshot(out) else out
+    }
+
+    private suspend fun minesWaitForHuman(): BrowserActionResult {
+        val ctx = appContext ?: return BrowserActionResult.error("no app context")
+        val hv = com.openminis.app.plus.HumanVerify
+        hv.init(ctx)
+        val scan = minesScan()
+        if (scan.kind.isBlank()) {
+            hv.clearPending(ctx)
+            return attachSnapshot(BrowserActionResult(text = "当前页面没有人机验证，可以继续。", pageURL = minesUrl()))
+        }
+        val note = hv.waitForHuman(ctx, scan.kind, minesUrl(), rescan = { minesScan() }, currentUrl = { minesUrl() })
+        return attachSnapshot(BrowserActionResult(text = note, pageURL = minesUrl()))
+    }
+
+    private suspend fun minesWaitForOtp(selector: String?): BrowserActionResult {
+        val ctx = appContext ?: return BrowserActionResult.error("no app context")
+        val hv = com.openminis.app.plus.HumanVerify
+        hv.init(ctx)
+        if (!hv.settings.value.otpAutofill) {
+            return BrowserActionResult.error("验证码自动填写已在设置里关闭，请让用户把验证码告诉你")
+        }
+        val mailOk = runCatching { com.openminis.app.plus.MailSources.available(ctx) }.getOrDefault(false)
+        if (!com.openminis.app.offload.MinisNotificationListenerService.isConnected() && !mailOk) {
+            return BrowserActionResult.error("Mines 没有通知使用权，也没有已登录的邮箱，收不到验证码。请让用户在 设置 → 浏览器验证 里打开通知使用权，或把验证码直接告诉你")
+        }
+        // [Mines-38.9.5 i] mail codes only from the site this page belongs to
+        hv.expectSite = runCatching { com.openminis.app.plus.AccountsCore.accountSite(minesUrl()) }.getOrDefault("")
+        val code = hv.awaitCode(com.openminis.app.plus.HumanVerify.WAIT_SLICE_MS)
+            ?: return BrowserActionResult(text = "约 50 秒内没收到验证码短信/邮件通知。确认已经点了发送验证码后，可以再调用一次 wait_for_otp。", success = true)
+        val r = runCatching { evaluateJavascript(hv.fillJs(code, selector)) }.getOrNull()
+        return if (r == "ok") {
+            attachSnapshot(BrowserActionResult(text = "已收到验证码并填入（${code.length} 位，内容不显示）。接下来点击提交/登录按钮。", pageURL = minesUrl()))
+        } else {
+            hv.putBack(code)
+            BrowserActionResult(text = "收到了验证码，但页面上找不到验证码输入框。请用 selector 指定输入框再调用 wait_for_otp（验证码会保留 2 分钟）。", success = true)
+        }
     }
 
     private suspend fun attachSnapshot(result: BrowserActionResult): BrowserActionResult {
@@ -810,6 +930,7 @@ class BrowserUseManager(
 
         val deferred = CompletableDeferred<Unit>()
         navigationDeferred = deferred
+        navigationTarget = normalized
         _isLoading.value = true
 
         withContext(Dispatchers.Main) {
@@ -826,10 +947,11 @@ class BrowserUseManager(
         val handler = Handler(Looper.getMainLooper())
         val timeoutRunnable = Runnable {
             if (navigationDeferred === deferred) {
-                Log.w(TAG, "Navigation timed out for $normalized")
+                Log.w(TAG, "Navigation timed out for ${BrowserLogMask.mask(normalized)}")
                 _isLoading.value = false
                 deferred.complete(Unit)
                 navigationDeferred = null
+                navigationTarget = null
             }
         }
         handler.postDelayed(timeoutRunnable, NAVIGATION_TIMEOUT_MS)
@@ -843,8 +965,29 @@ class BrowserUseManager(
         _currentURL.value = _currentURL.value.ifEmpty { normalized }
         _isLoading.value = false
 
+        // [Mines-render-34] SPA pages (vulbox.com: an empty <div id=app> until JS runs)
+        // finish loading before anything is in the DOM; wait (bounded) for visible content.
+        val content = awaitVisibleContent(CONTENT_WAIT_MS)
         val meta = navigationMetadata()
-        return BrowserActionResult(text = meta)
+        val note = if (content != null && content.optInt("t") == 0 && content.optInt("img") == 0 && content.optInt("m") == 0)
+            "\n  Note: the page shows nothing yet (no text or images after ${CONTENT_WAIT_MS / 1000}s). It may still be loading, " +
+                "need a login, or block this browser — try wait_for_dom_stable, then get_text or screenshot."
+            else ""
+        return BrowserActionResult(text = meta + note)
+    }
+
+    /** [Mines-render-34] Polls [BrowserRenderCheck.CONTENT_PROBE_JS] until the page has text / media, or [maxMs]. */
+    private suspend fun awaitVisibleContent(maxMs: Long): JSONObject? {
+        val start = System.currentTimeMillis()
+        var last: JSONObject? = null
+        while (true) {
+            if (isRendererDead) return last
+            last = evalSoft(BrowserRenderCheck.CONTENT_PROBE_JS, 3_000L)?.let { runCatching { JSONObject(it) }.getOrNull() } ?: last
+            val o = last
+            if (o != null && (o.optInt("t") > 0 || o.optInt("img") > 0 || o.optInt("m") > 0)) return o
+            if (System.currentTimeMillis() - start >= maxMs) return o
+            delay(300)
+        }
     }
 
     private suspend fun navigationMetadata(): String {
@@ -957,14 +1100,17 @@ class BrowserUseManager(
 
         val bitmap = try {
             // A stretched full page is far taller than a display can be.
-            captureWebViewBitmap(gpu = !didStretch)
+            lastShotOom = false
+            captureWebViewBitmap(gpu = !didStretch, fullPage = didStretch)
         } finally {
             if (didStretch) {
                 withContext(Dispatchers.Main) {
                     applyViewport(savedW, savedH)
                 }
             }
-        } ?: return BrowserActionResult.error("Failed to capture screenshot")
+        } ?: return BrowserActionResult.error(
+            if (lastShotOom) "Screenshot skipped: the phone is low on memory. Read the page with get_text / get_readable instead, or try again later."
+            else "Failed to capture screenshot")
 
         val out = ByteArrayOutputStream()
         bitmap.compress(Bitmap.CompressFormat.JPEG, SCREENSHOT_QUALITY, out)
@@ -987,10 +1133,23 @@ class BrowserUseManager(
             originalHeightPx = originalHeightPx,
         )
 
+        // [Mines-render-34] Text-only models never see the pixels (the provider swaps them for a
+        // placeholder), so every screenshot also carries the viewport's visible text + controls.
+        val blank = shotBlankness?.blank == true
+        val viewText = BrowserRenderCheck.formatViewportText(evalSoft(BrowserRenderCheck.VIEWPORT_TEXT_JS, 4_000L))
+        val extra = buildString {
+            if (viewText != null) append("\n").append(viewText)
+            if (blank) append("\n  Note: this screenshot came out as one flat colour (${shotBlankness?.describe()}). ")
+                .append("If the visible text above is not empty the page IS loaded — read it with get_text / get_readable instead of retrying screenshots.")
+        }
+        shotBlankness = null
         return BrowserActionResult(
-            text = meta, base64Image = base64, imageFilePath = file.absolutePath
+            text = meta + extra, base64Image = base64, imageFilePath = file.absolutePath
         )
     }
+
+    /** [Mines-render-34] Blankness of the last agent capture (set by [captureWebViewBitmap]). */
+    @Volatile private var shotBlankness: BrowserRenderCheck.Blankness? = null
 
     /** Collect viewport + page metadata for screenshot results. Mirrors iOS viewportMetadata. */
     private suspend fun viewportMetadata(
@@ -1091,7 +1250,7 @@ class BrowserUseManager(
      * live-preview thumbnail and the stretched full-page capture keep the
      * cheaper software draw. Any GPU-path miss falls through to that draw.
      */
-    private suspend fun captureWebViewBitmap(gpu: Boolean = false): Bitmap? = withContext(Dispatchers.Main) {
+    private suspend fun captureWebViewBitmap(gpu: Boolean = false, fullPage: Boolean = false): Bitmap? = withContext(Dispatchers.Main) {
         try {
             // WebView may be detached (pool-owned, never added to a window), so
             // width/height can be 0. Ensure it has a layout box matching the
@@ -1112,9 +1271,23 @@ class BrowserUseManager(
                 webView.layout(0, 0, targetW, targetH)
                 w = targetW; h = targetH
             }
-            if (gpu) HeadlessRenderHost.capture(webView, w, h)?.let { return@withContext it }
-            val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            // [Mines-render-34] The GPU path can return the host window's white background before the
+            // WebView's first real frame (slow GPUs): check it, and fall back to the software draw.
+            var gpuShot: Bitmap? = null
+            var gpuBlank: BrowserRenderCheck.Blankness? = null
+            if (gpu) HeadlessRenderHost.capture(webView, w, h)?.let { g ->
+                val b = BrowserRenderCheck.blankness(g)
+                if (!b.blank) { shotBlankness = b; return@withContext g }
+                Log.w(TAG, "gpu capture is blank (${b.describe()}); trying the software draw")
+                gpuShot = g; gpuBlank = b
+            }
+            // [Mines-38.9.12.1] draw straight into a small bitmap (long edge ≤ 1280; full page ≤ 6 Mpx) — a full-res
+            // w×h ARGB bitmap per capture (and per action snapshot) is what the user's 512 MB heap could not afford.
+            val shotS = com.openminis.app.plus.SafeStartCore.shotScale(w, h, fullPage)
+            val (bw, bh) = com.openminis.app.plus.SafeStartCore.scaled(w, h, shotS)
+            val bitmap = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
             val canvas = Canvas(bitmap)
+            if (shotS < 1.0) canvas.scale(bw.toFloat() / w, bh.toFloat() / h)
             // [T-android-browser-screenshot-scroll-offset] Undo the scroll
             // before drawing, or the capture is the scrolled-away region.
             //
@@ -1158,12 +1331,31 @@ class BrowserUseManager(
             webView.draw(canvas)
             Log.d(TAG, "captureWebViewBitmap ${w}x$h offset=(${offsetX},${offsetY}) " +
                 "css=(${cssScroll.first},${cssScroll.second}) view=(${webView.scrollX},${webView.scrollY})")
+            if (gpu) {
+                val sb = BrowserRenderCheck.blankness(bitmap)
+                val g = gpuShot; val gb = gpuBlank
+                if (g != null && gb != null && sb.blank && gb.colors > sb.colors) {
+                    bitmap.recycle(); shotBlankness = gb; return@withContext g
+                }
+                g?.recycle()
+                shotBlankness = sb
+                if (sb.blank) Log.w(TAG, "software capture is blank too (${sb.describe()})")
+            }
             bitmap
         } catch (e: Exception) {
             Log.e(TAG, "captureWebViewBitmap failed: ${e.message}")
             null
+        } catch (e: OutOfMemoryError) {
+            // [Mines-38.9.12.1] a screenshot never takes the app down: the action reports an error instead
+            Log.e(TAG, "captureWebViewBitmap out of memory: ${e.message}")
+            lastShotOom = true
+            runCatching { com.openminis.app.plus.MemGuard.trim("截图内存不足") }
+            null
         }
     }
+
+    /** [Mines-38.9.12.1] the last capture failed for lack of memory (the screenshot action says so) */
+    @Volatile private var lastShotOom = false
 
     private fun saveBitmapToFile(bitmap: Bitmap, prefix: String, quality: Int = SCREENSHOT_QUALITY): File {
         val filename = "${prefix}_${System.currentTimeMillis()}.jpg"
@@ -1190,7 +1382,11 @@ class BrowserUseManager(
     private suspend fun type(selector: String?, text: String?): BrowserActionResult {
         if (selector == null) return BrowserActionResult.error("type requires 'selector'")
         if (text == null) return BrowserActionResult.error("type requires 'text'")
-        return evaluateAndReturn(BrowserUseJS.type(selector, text))
+        // [38.9.11.3] {{secret:ID}} / {{user:ID}} (台账 / 多号注册) become the real values only inside the page
+        val real = runCatching { com.openminis.app.plus.SecretRefs.fill(text) }.getOrDefault(text)
+        if (real == text) return evaluateAndReturn(BrowserUseJS.type(selector, text))
+        val r = evaluateAndReturn(BrowserUseJS.type(selector, real))
+        return runCatching { r.copy(text = com.openminis.app.plus.SecretRefs.scrub(r.text)) }.getOrDefault(r)
     }
 
     // -- Get Text --
@@ -1473,7 +1669,9 @@ class BrowserUseManager(
             applyViewport()
             val oldUrl = _currentURL.value
             if (oldUrl.isNotEmpty()) {
-                webView.reload()
+                // [Mines-render-34] wait for the reload: a navigate issued right after used to be ended
+                // by this reload's onPageFinished and report the OLD page (about:blank) as loaded.
+                reloadAndWait()
             }
         }
         val vp = newProfile.viewportSize
@@ -1503,6 +1701,7 @@ class BrowserUseManager(
     suspend fun reloadAndWait() {
         val deferred = CompletableDeferred<Unit>()
         navigationDeferred = deferred
+        navigationTarget = null
         _isLoading.value = true
         val url = _currentURL.value
         if (url.isEmpty() || url == "about:blank") {
@@ -1543,6 +1742,7 @@ class BrowserUseManager(
     suspend fun loadBlankPage() {
         val deferred = CompletableDeferred<Unit>()
         navigationDeferred = deferred
+        navigationTarget = null
         _isLoading.value = true
         webView.loadDataWithBaseURL(null, BLANK_PAGE_HTML, "text/html", "utf-8", null)
         val handler = Handler(Looper.getMainLooper())
@@ -1604,6 +1804,25 @@ class BrowserUseManager(
                 "browser tab stopped responding (JS evaluation timed out after ${timeoutMs / 1000}s)",
             )
         }
+    }
+
+    /**
+     * [Mines-render-34] Best-effort evaluation for optional extras (content probe, viewport text):
+     * null on timeout / dead renderer and, unlike [evaluateJavascript], never marks the tab wedged.
+     */
+    private suspend fun evalSoft(js: String, timeoutMs: Long): String? {
+        if (isRendererDead) return null
+        val d = CompletableDeferred<String?>()
+        withContext(Dispatchers.Main) {
+            runCatching {
+                webView.evaluateJavascript(js) { r ->
+                    val v = if (r != null && r.startsWith("\"") && r.endsWith("\""))
+                        runCatching { JSONObject("{\"v\":$r}").getString("v") }.getOrDefault(r) else r
+                    d.complete(v)
+                }
+            }.onFailure { d.complete(null) }
+        }
+        return withTimeoutOrNull(timeoutMs) { d.await() }
     }
 
     private suspend fun evaluateAndReturn(js: String): BrowserActionResult {

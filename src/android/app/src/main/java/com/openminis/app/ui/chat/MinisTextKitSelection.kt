@@ -218,6 +218,8 @@ class SelectionController {
      * shards scroll into view and the selection extends to them).
      */
     val dragIntent = mutableStateOf<DragIntent?>(null)
+    /** [Mines-38.9.9 i26] the long-press action sheet is up: no selection handles behind it (smoke 39190432130 showed two) */
+    val actionSheetOpen = mutableStateOf(false)
 
     data class DragIntent(val point: Offset, val handle: Handle)
 
@@ -382,6 +384,17 @@ class SelectionController {
             }
         }
         return best
+    }
+
+    /** [Mines-38.9.9] 选择文字: select every registered shard of [messageId] (start of the first … end of the last). */
+    fun selectAllInMessage(messageId: String): Boolean {
+        val ids = currentShards().filter { it.key.messageId == messageId }.values.toList()
+        if (ids.isEmpty()) return false
+        val sorted = ids.sortedWith { a, b -> compareShards(a.id, b.id) ?: 0 }
+        val first = sorted.first(); val last = sorted.last()
+        retired.clear()
+        selection.value = TextSelection(TextPosition(first.id, 0), TextPosition(last.id, last.plainText.length))
+        return true
     }
 
     /** Begin a fresh selection collapsed at [pos] (long-press start). */

@@ -33,11 +33,13 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.openminis.app"
+        // Mines: own package so it installs beside the official Minis
+        // (different signing key can never update it in place).
+        applicationId = "com.openminis.mines.plus"
         minSdk = 26
         targetSdk = 35
-        versionCode = 28
-        versionName = "1.14"
+        versionCode = 54
+        versionName = "1.23.12.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -47,6 +49,10 @@ android {
         // `release`. Kept separate from BuildConfig.DEBUG so a non-debuggable
         // build can still carry the tooling.
         buildConfigField("boolean", "DEV_TOOLS", "false")
+        // Mines: the GitHub Actions run number (build-<n>), for the in-app update check.
+        // [Mines-38.1] display label of a point release ("38.1"); MINES_BUILD stays the integer build for update checks
+        buildConfigField("String", "MINES_LABEL", "\"" + (System.getenv("MINES_BUILD_LABEL") ?: System.getenv("MINES_BUILD_NUMBER") ?: "0") + "\"")
+        buildConfigField("int", "MINES_BUILD", (System.getenv("MINES_BUILD_NUMBER")?.toIntOrNull() ?: System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 0).toString())
 
         // System prompt prefix required by Anthropic for Claude Code OAuth
         // credentials. Empty in the public mirror (see provider-customization.properties).
@@ -72,6 +78,26 @@ android {
         cmake {
             path = file("src/main/cpp/CMakeLists.txt")
             version = "3.22.1"
+        }
+    }
+
+    // Mines: sign with the fixed key when the build provides it
+    // (MINES_KEYSTORE, set by the GitHub workflow), so every build installs
+    // in place over the last one. Without it AGP falls back to the machine's
+    // own debug key, which differs per CI runner.
+    signingConfigs {
+        getByName("debug") {
+            System.getenv("MINES_KEYSTORE")?.takeIf { it.isNotBlank() && file(it).isFile }?.let { ks ->
+                storeFile = file(ks)
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+            // [Mines-38.6] minSdk 26 makes AGP drop the v1 (JAR) scheme by default; sign v1 + v2 + v3 so
+            // every installer / checker sees a signature it knows.
+            enableV1Signing = true
+            enableV2Signing = true
+            enableV3Signing = true
         }
     }
 
@@ -117,6 +143,14 @@ android {
                 "proguard-rules.pro"
             )
             signingConfig = signingConfigs.getByName("debug")
+        }
+    }
+
+    // [Mines-vps-ssh] jsch and jspecify both ship this OSGi manifest; it is not
+    // needed at runtime.
+    packaging {
+        resources {
+            excludes += setOf("META-INF/versions/9/OSGI-INF/MANIFEST.MF", "META-INF/versions/9/module-info.class", "META-INF/versions/*/OSGI-INF/MANIFEST.MF", "META-INF/BCKEY.DSA", "META-INF/BCKEY.SF")
         }
     }
 
@@ -317,9 +351,31 @@ dependencies {
     // app/libs/, not a checked-in binary. Backends are decided by
     // deps/rclone-mobile/backends/backends.go, shared with the iOS build.
     implementation(group = "", name = "rclone", ext = "aar")
+    // [Mines-voiceprint-34] sherpa-onnx 1.13.8 (static ONNX Runtime, so no clash with the VAD's libonnxruntime);
+    // CI downloads sherpa-onnx-static-link-onnxruntime-1.13.8.aar into app/libs/sherpa-onnx.aar and checks its SHA-256.
+    implementation(group = "", name = "sherpa-onnx", ext = "aar")
 
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.squareup.okhttp3:okhttp-sse:4.12.0")
+
+    // [Mines-offline-asr] Free on-device speech recognition. The System engine
+    // needs a recognition service the ROM ships (Chinese ROMs without the
+    // Google app have none) and the Provider engine needs a paid cloud model,
+    // so the mic button was dead on such a device. Vosk ships prebuilt .so for
+    // every ABI in the AAR, so this adds no NDK work on our side; the model is
+    // Apache-2.0 and downloaded once on first use (see OfflineAsrEngine).
+    implementation("com.alphacephei:vosk-android:0.3.47")
+
+    // [Mines-vps-ssh] In-app SSH: first-login key install, health checks with
+    // real authentication, server stats, relay/jump fallback. Maintained fork
+    // of JSch (BSD) with modern algorithms (rsa-sha2, ecdsa, curve25519).
+    implementation("com.github.mwiede:jsch:2.28.8")   // [38.9.11.3] OpenSSH host certificates (InstaBox offers only ssh-ed25519-cert-v01)
+    // [Mines-38.9.11.2] Bouncy Castle: JSch's ssh-ed25519 / curve25519 on Android (no Java 15 EdDSA / XDH) — InstaBox 2222 host key
+    implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
+
+    // [Mines-38.9.11 d] built-in file / APK manager: re-sign the user's own / authorised APKs (v1 + v2 + v3) and verify,
+    // the same library apksigner is built on (pure Java, Apache-2.0)
+    implementation("com.android.tools.build:apksig:8.7.3")
 
     // Kotlinx Serialization
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
@@ -339,6 +395,10 @@ dependencies {
     // sibling CSS/JS resolve against the file's parent dir without
     // granting WebView raw file:// access.
     implementation("androidx.webkit:webkit:1.12.1")
+    // [Mines-cards-35.1] on-device card OCR (bundled Latin model, works offline, image never leaves the phone)
+    implementation("com.google.mlkit:text-recognition:16.0.1")
+    // [Mines-38.7] SMS User Consent API (one-message consent; phones without Play services use RECEIVE_SMS instead)
+    implementation("com.google.android.gms:play-services-auth-api-phone:18.1.0")
 
     // Drag-to-reorder for LazyColumn
     implementation("sh.calvin.reorderable:reorderable:2.4.0")

@@ -36,7 +36,33 @@ import java.security.KeyStore
 object EncryptedPrefsFactory {
     private const val TAG = "EncryptedPrefsFactory"
 
+    // [38.9.11.3.1] one open store per file for the life of the process. Opening one decrypts its Tink keysets through
+    // the Android Keystore (seconds on some phones) under Tink's single global lock, and callers like
+    // ProviderRepository.hasAnyCredential / OAuthManager.needsReauth used to re-open it on every check — on the main
+    // thread too, which waited behind another thread's open and hit an ANR (realme RMX5062, 2026-10-21).
+    private val cache = com.openminis.app.plus.OnceCache<SharedPreferences>()
+
+    /** [38.9.11.3.1] the stores the chat screen / provider routing read; opened in the background at app start */
+    val UI_STORES = arrayOf("oauth_prefs", "provider_secrets", "mines_gemini_accounts")
+
     fun safeCreate(context: Context, fileName: String): SharedPreferences {
+        cache.peek(fileName)?.let { return it }
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper())
+            Log.w(TAG, "first open of $fileName on the main thread (Keystore; may block)")
+        return cache.get(fileName) { createUncached(context.applicationContext ?: context, fileName) }
+    }
+
+    /** [38.9.11.3.1] true once every named store is open (a read is then a map lookup, no Keystore, no Tink lock) */
+    fun isOpen(vararg fileNames: String): Boolean = fileNames.all { cache.peek(it) != null }
+
+    /** [38.9.11.3.1] open the stores the UI checks most, on a background thread, so the first check finds them open. */
+    fun prewarm(context: Context, vararg fileNames: String) {
+        val app = context.applicationContext ?: context
+        Thread({ fileNames.forEach { n -> runCatching { safeCreate(app, n) } } }, "mines-prefs-warm")
+            .apply { isDaemon = true }.start()
+    }
+
+    private fun createUncached(context: Context, fileName: String): SharedPreferences {
         runCatching { return build(context, fileName) }
             .onFailure { Log.w(TAG, "first create($fileName) failed: ${it.message}") }
 

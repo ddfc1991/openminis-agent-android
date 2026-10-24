@@ -1,5 +1,7 @@
 package com.openminis.app.ui.browser
 
+import com.openminis.app.ui.plus.MT
+
 import com.openminis.app.R
 import androidx.compose.ui.res.stringResource
 import androidx.compose.animation.AnimatedVisibility
@@ -18,6 +20,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -39,7 +42,10 @@ import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Language
+import androidx.compose.material.icons.filled.Translate
+import androidx.compose.material.icons.filled.CreditCard
 import androidx.compose.material.icons.filled.PhoneAndroid
+import androidx.compose.material.icons.filled.FormatSize
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -116,7 +122,60 @@ fun BrowserSheet(
     var showSettings by remember { mutableStateOf(false) }
     // [T-android-browser-download-ux] Downloads panel + badge state.
     var showDownloads by remember { mutableStateOf(false) }
+    var showTextSize by remember { mutableStateOf(false) }
+    // [Mines-translate-35] 网页翻译: toolbar 「译」 + a one-time hint on foreign pages
+    var translating by remember { mutableStateOf(false) }
+    var translatedUrl by remember { mutableStateOf<String?>(null) }
+    // [Mines-cards-35.1] 「填卡」: shown only on a payment form; fills after fingerprint / screen lock, never submits
+    var payForm by remember { mutableStateOf(false) }
+    var cardPick by remember { mutableStateOf(false) }
+    val curTabState = androidx.compose.runtime.rememberUpdatedState(selectedTab)
+    androidx.compose.runtime.LaunchedEffect(selectedTabId) {
+        while (true) {
+            val wv = curTabState.value?.manager?.webView
+            payForm = if (wv == null) false else kotlinx.coroutines.suspendCancellableCoroutine<Boolean> { c ->
+                runCatching { wv.evaluateJavascript(com.openminis.app.plus.PayCards.DETECT_JS) { r -> if (c.isActive) c.resumeWith(Result.success(r?.contains("1") == true)) } }
+                    .onFailure { if (c.isActive) c.resumeWith(Result.success(false)) }
+            }
+            kotlinx.coroutines.delay(3000)
+        }
+    }
+    fun fillWith(card: com.openminis.app.plus.PayCards.Card) {
+        val wv = selectedTab?.manager?.webView ?: return
+        com.openminis.app.plus.PayCards.unlock(context, "填写 ${card.masked}") { ok, msg ->
+            if (!ok) { android.widget.Toast.makeText(context, msg ?: "没有通过验证", android.widget.Toast.LENGTH_SHORT).show(); return@unlock }
+            com.openminis.app.plus.PayCards.fill(wv, card) { _ ->
+                android.widget.Toast.makeText(context, "已填好 ${card.masked}。请你自己检查，然后自己点付款/保存", android.widget.Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+    if (cardPick) com.openminis.app.ui.glass.AlertDialog(onDismissRequest = { cardPick = false },
+        title = { androidx.compose.material3.Text("用哪张卡？") },
+        text = { androidx.compose.foundation.layout.Column {
+            com.openminis.app.plus.PayCards.cards.value.forEach { cd ->
+                androidx.compose.material3.TextButton(onClick = { cardPick = false; fillWith(cd) }) {
+                    androidx.compose.material3.Text(cd.label.ifBlank { cd.masked } + " · " + cd.expMonth + "/" + cd.expYear, fontSize = MT.Body)
+                }
+            }
+        } },
+        confirmButton = { androidx.compose.material3.TextButton(onClick = { cardPick = false }) { androidx.compose.material3.Text("取消") } })
+    val hinted = remember { mutableSetOf<String>() }
     val downloadEntries by tabPool.downloads.collectAsState()
+    // [Mines-38.9.7] remember the page the user is on (and its sessionStorage) so an agent taking over keeps the login.
+    // 无痕 pools are never recorded (BrowserHandoff.noteUser ignores them).
+    androidx.compose.runtime.LaunchedEffect(selectedTabId, currentURL, isLoading) {
+        val wv = curTabState.value?.manager?.webView ?: return@LaunchedEffect
+        if (!isLoading && currentURL.startsWith("http"))
+            com.openminis.app.browser.BrowserHandoff.noteUser(tabPool, wv, currentURL, userAgentProfile == UserAgentProfile.DESKTOP_CHROME, tabPool.incognito)
+    }
+    androidx.compose.runtime.DisposableEffect(Unit) {
+        onDispose {
+            val t = curTabState.value
+            val u = t?.manager?.currentURL?.value.orEmpty()
+            if (t != null && u.startsWith("http"))
+                runCatching { com.openminis.app.browser.BrowserHandoff.noteUser(tabPool, t.manager.webView, u, tabPool.currentUserAgentProfile.value == UserAgentProfile.DESKTOP_CHROME, tabPool.incognito) }
+        }
+    }
 
     val accent = MaterialTheme.colorScheme.primary
     val secondaryBg = MaterialTheme.colorScheme.surfaceContainer
@@ -141,8 +200,10 @@ fun BrowserSheet(
     }
 
     StandardChatSheet(
-        title = pageTitle.ifEmpty { stringResource(R.string.browser_title) },
+        title = com.openminis.app.browser.IncognitoCore.title(pageTitle.ifEmpty { stringResource(R.string.browser_title) }, tabPool.incognito),
         onDismiss = onDismiss,
+        sheetMaxWidth = androidx.compose.ui.unit.Dp.Unspecified,  // [Mines-webfit-38.3] full width in landscape
+        singleLineTitle = true,  // [Mines-webpaint-38.4] long titles: one line + …, close X always visible
         leadingAction = {
             // UA-profile icon doubles as the entry point to settings, matching
             // the prior centered-title-with-icon affordance.
@@ -159,7 +220,45 @@ fun BrowserSheet(
             }
         },
     ) {
-        Column(modifier = Modifier.fillMaxSize()) {
+        // [Mines-webfit-38.3] the page shrinks above the keyboard (no-op when the sheet already consumed it)
+        Column(modifier = Modifier.fillMaxSize().imePadding()) {
+            // [Mines-38.9.11.2] 无痕 bar: a small indicator (normal text size) + 保存到密码库 (the only way a 无痕 login is saved)
+            // + 清除并关闭 (wipes this session's profile and closes)
+            if (tabPool.incognito) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().background(tertiaryBg).padding(start = 12.dp, end = 4.dp, top = 4.dp, bottom = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        com.openminis.app.browser.IncognitoCore.INDICATOR,
+                        fontSize = MT.Meta, color = Color.White,
+                        modifier = Modifier.background(Color(0xFF3C3C43), RoundedCornerShape(10.dp)).padding(horizontal = 8.dp, vertical = 3.dp),
+                    )
+                    Spacer(Modifier.weight(1f))
+                    Text(
+                        com.openminis.app.browser.IncognitoCore.SAVE_ACTION, fontSize = MT.Sub,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.clickable {
+                            val wv = selectedTab?.manager?.webView ?: return@clickable
+                            wv.evaluateJavascript(com.openminis.app.browser.IncognitoCore.SAVE_JS) { raw ->
+                                val r = com.openminis.app.browser.IncognitoCore.parseSaveResult(raw)
+                                if (r == null || !com.openminis.app.browser.IncognitoCore.savesLogin(true, userTapped = true)) {
+                                    android.widget.Toast.makeText(context, com.openminis.app.browser.IncognitoCore.NOTHING_TO_SAVE_MSG, android.widget.Toast.LENGTH_SHORT).show()
+                                } else {
+                                    val host = runCatching { android.net.Uri.parse(r.first).host.orEmpty() }.getOrDefault("")
+                                    runCatching { com.openminis.app.plus.SavedLogins.put(context, com.openminis.app.plus.SavedLogins.Entry(
+                                        com.openminis.app.plus.AutoAccounts.siteOf(host).ifBlank { host }, r.first, r.second, r.third)) }
+                                    android.widget.Toast.makeText(context, com.openminis.app.browser.IncognitoCore.SAVED_MSG, android.widget.Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        }.padding(horizontal = 8.dp, vertical = 6.dp),
+                    )
+                    Text(
+                        com.openminis.app.browser.IncognitoCore.CLEAR_ACTION, fontSize = MT.Sub, color = accent, fontWeight = FontWeight.Medium,
+                        modifier = Modifier.clickable { onDismiss() }.padding(horizontal = 8.dp, vertical = 6.dp),
+                    )
+                }
+            }
             // ── Tab Bar with leading "+" and trailing History icon ──
             // (Add/History flank the tabs row so all tab-related controls
             // sit on one line, leaving the URL bar uncluttered below.)
@@ -204,7 +303,7 @@ fun BrowserSheet(
                     item {
                         Text(
                             "${tabs.size}/3",
-                            fontSize = 10.sp,
+                            fontSize = MT.Tiny,
                             fontWeight = FontWeight.Medium,
                             fontFamily = FontFamily.Monospace,
                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
@@ -212,7 +311,7 @@ fun BrowserSheet(
                         )
                     }
                 }
-                IconButton(
+                if (!tabPool.incognito) IconButton(
                     onClick = { showHistory = true },
                     enabled = !isAgentBusy,
                     modifier = Modifier.size(36.dp),
@@ -253,7 +352,7 @@ fun BrowserSheet(
                             singleLine = true,
                             enabled = !isAgentBusy,
                             textStyle = LocalTextStyle.current.copy(
-                                fontSize = 13.sp,
+                                fontSize = MT.Caption,
                                 fontFamily = FontFamily.Monospace,
                                 color = MaterialTheme.colorScheme.onSurface,
                             ),
@@ -274,7 +373,7 @@ fun BrowserSheet(
                         if (urlInput.isEmpty()) {
                             Text(
                                 stringResource(R.string.browser_search_placeholder),
-                                fontSize = 13.sp,
+                                fontSize = MT.Caption,
                                 fontFamily = FontFamily.Monospace,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -302,6 +401,34 @@ fun BrowserSheet(
                         .fillMaxWidth()
                         .height(2.dp),
                 )
+            }
+
+            // [Mines-38.9.1] per-site 手机版 / 电脑版 (remembered per domain, like the key WebView) + 用系统浏览器打开
+            val uaHost = remember(currentURL) { runCatching { java.net.URI(currentURL).host?.removePrefix("www.") }.getOrNull() }
+            val uaPrefs = remember { context.getSharedPreferences("mines_browser_ua", android.content.Context.MODE_PRIVATE) }
+            LaunchedEffect(uaHost) {
+                val want = uaHost?.let { uaPrefs.getString(it, null) } ?: return@LaunchedEffect
+                val p = if (want == "d") UserAgentProfile.DESKTOP_CHROME else UserAgentProfile.MOBILE_CHROME
+                if (!isAgentBusy && p != userAgentProfile && userAgentProfile != UserAgentProfile.CUSTOM) tabPool.setUserAgentFromUI(p)
+            }
+            if (uaHost != null) Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 2.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically,
+            ) {
+                val desktop = userAgentProfile == UserAgentProfile.DESKTOP_CHROME
+                androidx.compose.material3.FilterChip(selected = desktop, enabled = !isAgentBusy, onClick = {
+                    val p = if (desktop) UserAgentProfile.MOBILE_CHROME else UserAgentProfile.DESKTOP_CHROME
+                    uaPrefs.edit().putString(uaHost, if (p == UserAgentProfile.DESKTOP_CHROME) "d" else "m").apply()
+                    tabPool.setUserAgentFromUI(p)
+                }, label = { Text(if (desktop) "电脑版" else "手机版", fontSize = MT.Caption) },
+                    leadingIcon = { Icon(if (desktop) Icons.Default.Computer else Icons.Default.PhoneAndroid, null, Modifier.size(16.dp)) },
+                    modifier = Modifier.height(30.dp))
+                androidx.compose.material3.AssistChip(onClick = {
+                    runCatching { context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(currentURL))
+                        .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)) }
+                }, label = { Text("用系统浏览器打开", fontSize = MT.Caption) }, modifier = Modifier.height(30.dp))
+                Text(uaHost, fontSize = MT.Caption, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
             }
 
             // ── WebView + overlays ──
@@ -337,7 +464,9 @@ fun BrowserSheet(
                     }
                 }
 
-                if (isAgentBusy) {
+                // [Mines] While a captcha waits for the user, hand the page over.
+                val minesVerifyPending by com.openminis.app.plus.HumanVerify.pending.collectAsState()
+                if (isAgentBusy && minesVerifyPending == null) {
                     AgentBrowsingOverlay(
                         accent = accent,
                         // [T-android-browser-release-all-semantics] Takeover
@@ -406,6 +535,55 @@ fun BrowserSheet(
                     enabled = canGoForward && !isAgentBusy,
                     onClick = { selectedTab?.manager?.goForward() },
                 )
+                // [Mines-zoom-34] 文字大小 (per site, 100–200 %); pinch zoom always works too
+                ToolbarIcon(
+                    icon = Icons.Default.FormatSize,
+                    contentDesc = "文字大小",
+                    enabled = selectedTab != null,
+                    onClick = { showTextSize = true },
+                )
+                if (payForm) ToolbarIcon(
+                    icon = Icons.Default.CreditCard,
+                    contentDesc = "填卡（只填写，不会替你付款）",
+                    enabled = selectedTab != null && !isAgentBusy,
+                    onClick = {
+                        com.openminis.app.plus.PayCards.load(context)
+                        val cs = com.openminis.app.plus.PayCards.cards.value
+                        when {
+                            cs.isEmpty() -> { android.widget.Toast.makeText(context, "还没有保存卡。去 设置 → 支付卡 添加", android.widget.Toast.LENGTH_LONG).show()
+                                com.openminis.app.ui.plus.PlusNav.go(com.openminis.app.ui.plus.PlusRoutes.CARDS) }
+                            cs.size == 1 -> fillWith(cs.first())
+                            else -> cardPick = true
+                        }
+                    },
+                )
+                // [Mines-translate-35] 翻译成中文 / 显示原文
+                ToolbarIcon(
+                    icon = Icons.Default.Translate,
+                    contentDesc = if (translatedUrl != null) "显示原文" else if (translating) "正在翻译" else "翻译成中文",
+                    enabled = selectedTab != null && !translating,
+                    tint = if (translatedUrl != null) accent else null,
+                    onClick = {
+                        val wv = selectedTab?.manager?.webView ?: return@ToolbarIcon
+                        if (translatedUrl != null && translatedUrl == wv.url) {
+                            scope.launch { com.openminis.app.browser.WebTranslate.restore(wv); translatedUrl = null }
+                        } else {
+                            translating = true
+                            android.widget.Toast.makeText(context, "正在翻译成中文…", android.widget.Toast.LENGTH_SHORT).show()
+                            scope.launch {
+                                runCatching { com.openminis.app.browser.WebTranslate.translate(context, wv) }
+                                    .onSuccess { n ->
+                                        translatedUrl = wv.url
+                                        android.widget.Toast.makeText(context, if (n > 0) "已翻译成中文（再点一次看原文）" else "这页没有需要翻译的外文", android.widget.Toast.LENGTH_SHORT).show()
+                                    }
+                                    .onFailure { e ->
+                                        android.widget.Toast.makeText(context, "翻译失败：${e.message?.take(60)}。再点「译」重试", android.widget.Toast.LENGTH_LONG).show()
+                                    }
+                                translating = false
+                            }
+                        }
+                    },
+                )
                 // [T-android-browser-download-ux] Downloads entry: shows while
                 // the session has ANY download records, disappears when the
                 // user clears the last one; the badge counts in-flight +
@@ -447,6 +625,24 @@ fun BrowserSheet(
                 }
             }
         }
+    }
+
+    // [Mines-translate-35] foreign page finished loading → one quiet hint per site
+    androidx.compose.runtime.LaunchedEffect(isLoading, selectedTab) {
+        if (isLoading) { translatedUrl = null; return@LaunchedEffect }
+        val wv = selectedTab?.manager?.webView ?: return@LaunchedEffect
+        kotlinx.coroutines.delay(1200)
+        val host = runCatching { android.net.Uri.parse(wv.url ?: "").host }.getOrNull() ?: return@LaunchedEffect
+        if (host in hinted) return@LaunchedEffect
+        if (com.openminis.app.browser.WebTranslate.detectForeign(wv)) {
+            hinted += host
+            android.widget.Toast.makeText(context, "这页是外文，点工具栏的「译」可以翻译成中文", android.widget.Toast.LENGTH_LONG).show()
+        }
+    }
+
+    if (showTextSize) {
+        selectedTab?.manager?.let { mgr -> BrowserTextSizeDialog(mgr.webView, onDismiss = { showTextSize = false }) }
+            ?: run { showTextSize = false }
     }
 
     if (showDownloads) {
@@ -505,7 +701,7 @@ private fun TabChip(
     ) {
         Text(
             text = title,
-            fontSize = 12.sp,
+            fontSize = MT.Caption,
             fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
             color = textColor,
             maxLines = 1,
@@ -614,7 +810,7 @@ private fun AgentBrowsingOverlay(accent: Color, onTakeover: () -> Unit) {
             Text(
                 stringResource(R.string.browser_minis_browsing),
                 color = Color.White.copy(alpha = 0.9f),
-                fontSize = 13.sp,
+                fontSize = MT.Caption,
                 fontWeight = FontWeight.Medium,
             )
             Spacer(Modifier.width(12.dp))
@@ -628,7 +824,7 @@ private fun AgentBrowsingOverlay(accent: Color, onTakeover: () -> Unit) {
             Text(
                 stringResource(R.string.browser_takeover),
                 color = accent,
-                fontSize = 13.sp,
+                fontSize = MT.Caption,
                 fontWeight = FontWeight.SemiBold,
                 modifier = Modifier.clickable(onClick = onTakeover),
             )

@@ -25,7 +25,11 @@ enum class BrowserAction(val value: String) {
     GET_COOKIES("get_cookies"),
     SET_COOKIES("set_cookies"),
     SCROLL_AND_COLLECT("scroll_and_collect"),
-    WAIT_FOR_DOM_STABLE("wait_for_dom_stable");
+    WAIT_FOR_DOM_STABLE("wait_for_dom_stable"),
+    // [Mines] Human verification: wait (≤50 s per call) for the user to clear a captcha.
+    WAIT_FOR_HUMAN("wait_for_human"),
+    // [Mines] Wait for an SMS / e-mail one-time code and fill it in (code never shown).
+    WAIT_FOR_OTP("wait_for_otp");
 
     /**
      * [T-browser-readaction-follow-tab-and-yolo-android] True when this action

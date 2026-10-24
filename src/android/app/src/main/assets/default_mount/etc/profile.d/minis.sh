@@ -44,3 +44,8 @@ export UV_LINK_MODE=symlink
 #
 # Only affects NEW operations -- it cannot repair already-stuck files.
 git config --system core.createObject copy 2>/dev/null || true
+
+# [Mines-38.9.7] no GitHub SSH key in the sandbox: GitHub ssh urls → https, git never prompts (mirrors PRootKernel env)
+export GIT_TERMINAL_PROMPT=0
+git config --system url."https://github.com/".insteadOf "ssh://git@github.com/" 2>/dev/null || true
+git config --system --add url."https://github.com/".insteadOf "git@github.com:" 2>/dev/null || true

@@ -1,5 +1,7 @@
 package com.openminis.app.ui.sandbox
 
+import com.openminis.app.ui.plus.MT
+
 import com.openminis.app.R
 import androidx.compose.ui.res.stringResource
 import android.content.ContentValues
@@ -22,6 +24,7 @@ import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -47,6 +50,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Android
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Print
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -57,7 +61,7 @@ import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
+import com.openminis.app.ui.theme.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -93,6 +97,9 @@ import java.io.OutputStream
 import com.openminis.app.ui.components.MinisTextButton
 
 private const val MAX_TEXT_PREVIEW_BYTES = 512_000 // 500 KB
+
+/** [Mines-38.9.1] self-test only: true = draw the pre-38.9.1 transparent viewer, for the before/after sheet. */
+internal object FilePreviewSelfTest { @Volatile var legacy: Boolean = false }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -186,9 +193,19 @@ fun FilePreviewScreen(
         }
         onDispose { }
     }
+    // [Mines-38.9.1] reading surface rule (see minesReadingSurface): this viewer runs in its own
+    // dialog window above the chat, and the porcelain theme's background/surface are Transparent, so
+    // the chat (and its title bar) showed through and two titles stacked. The page and its top bar
+    // are now opaque in the current theme's colour; only this viewer's own title is visible.
+    val legacyLook = FilePreviewSelfTest.legacy   // smoke before-shot only
+    val readingBg = if (legacyLook) androidx.compose.ui.graphics.Color.Transparent else com.openminis.app.ui.plus.minesReadingSurface()
+    val readingBar = if (legacyLook) null else com.openminis.app.ui.plus.minesReadingBar()
     Scaffold(
+        containerColor = readingBg,
+        contentColor = com.openminis.app.ui.plus.mines().ink,
         topBar = {
             TopAppBar(
+                solid = readingBar,
                 title = {
                     Text(
                         text = if (showFullPath) item.file.absolutePath else item.name,
@@ -204,6 +221,10 @@ fun FilePreviewScreen(
                     }
                 },
                 actions = {
+                    // [Mines-38.9.11 d] open this file in the built-in file / APK manager (hex, APK info, unzip, MT)
+                    IconButton(onClick = { com.openminis.app.files.FileManagerActivity.open(context, item.file) }) {
+                        Icon(Icons.Default.FolderOpen, contentDescription = "在文件管理中打开")
+                    }
                     // T142: Share works for any file — FileProvider URI +
                     // ACTION_SEND + FLAG_GRANT_READ_URI_PERMISSION. iOS parity.
                     IconButton(onClick = { shareFile(context, item) }) {
@@ -248,6 +269,7 @@ fun FilePreviewScreen(
         Box(
             modifier = Modifier
                 .fillMaxSize()
+                .background(readingBg)
                 .padding(padding),
         ) {
             // Order matters: markdown / html before generic text — both are
@@ -415,8 +437,8 @@ private fun TextPreview(item: FileItem) {
                             text = content!!,
                             style = MaterialTheme.typography.bodySmall.copy(
                                 fontFamily = FontFamily.Monospace,
-                                fontSize = 12.sp,
-                                lineHeight = 18.sp,
+                                fontSize = MT.Caption,
+                                lineHeight = MT.CaptionLH,
                             ),
                             softWrap = false,
                             modifier = Modifier.padding(12.dp),
@@ -502,6 +524,8 @@ private fun HtmlPreview(item: FileItem) {
                 // viewport units.
                 settings.useWideViewPort = true
                 settings.loadWithOverviewMode = true
+                // [Mines-webfit-38.3] zoomable + text follows the font size, fits the screen width
+                com.openminis.app.browser.WebFit.apply(this)
                 // [T-android-webview-render-process-gone] (GH#341) Was a bare
                 // `WebViewClient()`; it has to be a subclass to override the
                 // callback at all.
@@ -718,7 +742,7 @@ private fun CsvPreview(item: FileItem) {
                                     text = cell,
                                     style = MaterialTheme.typography.bodySmall.copy(
                                         fontFamily = FontFamily.Monospace,
-                                        fontSize = 12.sp,
+                                        fontSize = MT.Caption,
                                         fontWeight = if (rowIdx == 0) FontWeight.Bold else FontWeight.Normal,
                                     ),
                                     modifier = Modifier.padding(end = 16.dp).width(140.dp),
@@ -813,8 +837,8 @@ private fun JsonPreview(item: FileItem) {
                         text = pretty!!,
                         style = MaterialTheme.typography.bodySmall.copy(
                             fontFamily = FontFamily.Monospace,
-                            fontSize = 12.sp,
-                            lineHeight = 18.sp,
+                            fontSize = MT.Caption,
+                            lineHeight = MT.CaptionLH,
                         ),
                         softWrap = false,
                         modifier = Modifier.padding(12.dp),
@@ -1041,7 +1065,7 @@ private fun ArchivePreview(item: FileItem) {
                                     e.name,
                                     style = MaterialTheme.typography.bodySmall.copy(
                                         fontFamily = FontFamily.Monospace,
-                                        fontSize = 12.sp,
+                                        fontSize = MT.Caption,
                                     ),
                                     maxLines = 1,
                                 )
@@ -1134,7 +1158,7 @@ private fun openExternally(context: Context, item: FileItem, mime: String) {
         context.startActivity(Intent.createChooser(intent, "Open with…"))
     } catch (e: android.content.ActivityNotFoundException) {
         AppLogger.warning("FilePreview", "openExternally failed: ${e.message}")
-        Toast.makeText(context, "No app available to open this file.", Toast.LENGTH_SHORT).show()
+        Toast.makeText(context, "没有能打开这个文件的应用", Toast.LENGTH_SHORT).show()
     } catch (e: Exception) {
         // [T-android-mount-fileprovider-root] Everything else is OUR failure —
         // typically getUriForFile rejecting a path no provider root covers.
@@ -1352,7 +1376,7 @@ private suspend fun saveImageToGallery(context: Context, src: File): Boolean =
                     put(MediaStore.Images.Media.MIME_TYPE, mime)
                     put(
                         MediaStore.Images.Media.RELATIVE_PATH,
-                        Environment.DIRECTORY_PICTURES + "/Minis",
+                        Environment.DIRECTORY_PICTURES + "/Mines",
                     )
                     put(MediaStore.Images.Media.IS_PENDING, 1)
                 }
@@ -1370,7 +1394,7 @@ private suspend fun saveImageToGallery(context: Context, src: File): Boolean =
                 val dir = Environment.getExternalStoragePublicDirectory(
                     Environment.DIRECTORY_PICTURES,
                 )
-                val minisDir = File(dir, "Minis").also { it.mkdirs() }
+                val minisDir = File(dir, "Mines").also { it.mkdirs() }
                 val dest = File(minisDir, filename)
                 src.inputStream().use { input ->
                     dest.outputStream().use { input.copyTo(it) }

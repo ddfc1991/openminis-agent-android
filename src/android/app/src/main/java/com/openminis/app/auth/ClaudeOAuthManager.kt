@@ -53,13 +53,21 @@ class ClaudeOAuthManager(context: Context, instanceId: String) : OAuthManager(co
          */
         val ANTHROPIC_OAUTH_IDENTIFIER_PROMPT: String
             get() = BuildConfig.ANTHROPIC_OAUTH_IDENTIFIER_PROMPT.ifEmpty {
+                // [Mines-30] Only reached on the Claude Code OAuth path; plain words for the user.
                 throw IllegalStateException(
-                    "ANTHROPIC_OAUTH_IDENTIFIER_PROMPT is not configured. Copy "
-                        + "app/provider-customization.properties.example to "
-                        + "app/provider-customization.properties and set "
-                        + "ANTHROPIC_OAUTH_IDENTIFIER_PROMPT before using Claude Code OAuth."
+                    "这个 Mines 版本不支持用 Claude Code 账号登录 Anthropic（缺少官方客户端标识）。"
+                        + "请在 账号连接 → Anthropic 改用 API Key，或换一个供应商。"
                 )
             }
+
+        /**
+         * [Mines-30] The prefix, or "" when this build has none. For code that
+         * only strips/compares it on non-OAuth paths: those must never throw
+         * (build-29 showed "ANTHROPIC_OAUTH_IDENTIFIER_PROMPT is not configured"
+         * on a 商汤/DeepSeek chat because systemPromptFor() read the throwing getter).
+         */
+        val identifierPromptOrEmpty: String
+            get() = BuildConfig.ANTHROPIC_OAUTH_IDENTIFIER_PROMPT
 
         /**
          * How long before expiry we proactively refresh. Mirrors iOS

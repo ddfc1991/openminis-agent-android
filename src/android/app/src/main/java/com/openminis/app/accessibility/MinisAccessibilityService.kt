@@ -29,7 +29,8 @@ class MinisAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val TAG = "MinisA11y"
-        const val SERVICE_ID = "com.openminis.app/.accessibility.MinisAccessibilityService"
+        fun serviceId(context: android.content.Context): String =
+            "${context.packageName}/com.openminis.app.accessibility.MinisAccessibilityService"
         private const val EVENT_RING_CAP = 1024
 
         @Volatile
@@ -129,6 +130,21 @@ class MinisAccessibilityService : AccessibilityService() {
             try { rootInActiveWindow?.let { out.add(it) } } catch (_: Throwable) {}
         }
         return out
+    }
+
+    /**
+     * [Mines-38.9] package of the app the user is looking at: the ACTIVE application window (not the status bar /
+     * systemui window, which windows lists first), then rootInActiveWindow, then the first non-systemui root.
+     */
+    fun activeAppPackage(): String {
+        val ws = try { windows ?: emptyList() } catch (_: Throwable) { emptyList() }
+        val app = android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION
+        fun pk(w: android.view.accessibility.AccessibilityWindowInfo?) = try { w?.root?.packageName?.toString().orEmpty() } catch (_: Throwable) { "" }
+        pk(ws.firstOrNull { it.type == app && it.isActive }).takeIf { it.isNotBlank() }?.let { return it }
+        pk(ws.firstOrNull { it.type == app && it.isFocused }).takeIf { it.isNotBlank() }?.let { return it }
+        (try { rootInActiveWindow?.packageName?.toString() } catch (_: Throwable) { null })?.takeIf { it.isNotBlank() && it != "com.android.systemui" }?.let { return it }
+        pk(ws.firstOrNull { it.type == app }).takeIf { it.isNotBlank() }?.let { return it }
+        return ws.map { pk(it) }.firstOrNull { it.isNotBlank() && it != "com.android.systemui" } ?: ws.map { pk(it) }.firstOrNull { it.isNotBlank() }.orEmpty()
     }
 
     fun windowInfos(): List<Map<String, Any?>> {

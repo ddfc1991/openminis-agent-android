@@ -40,10 +40,10 @@ object LocaleWrap {
      */
     fun wrap(base: Context): Context {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) return base
-        val code = base
-            .getSharedPreferences(PREF_APPEARANCE, Context.MODE_PRIVATE)
-            .getString(KEY_LANGUAGE, "")
-            .orEmpty()
+        val prefs = base.getSharedPreferences(PREF_APPEARANCE, Context.MODE_PRIVATE)
+        // [Mines-38.8] first run with no language ever picked → 简体中文 (Mines is a Chinese app)
+        if (!prefs.contains(KEY_LANGUAGE)) prefs.edit().putString(KEY_LANGUAGE, "zh").apply()
+        val code = prefs.getString(KEY_LANGUAGE, "").orEmpty()
         if (code.isEmpty()) return base
         val locale = parseLocale(code) ?: return base
         val config = Configuration(base.resources.configuration)

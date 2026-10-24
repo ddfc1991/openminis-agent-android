@@ -24,6 +24,13 @@ enum class AgentToolSwitch(val key: String, val defaultValue: Boolean) {
      *  (see [migrateLegacyIfNeeded]); flipping the default would silently
      *  disable a feature existing users have. */
     AGENTS("agent.tools.agents.enabled", true),
+
+    /** [Mines-38.9.6 i17] 技能优先: read a matching SKILL.md before a multi-step task, save a new skill after a new one.
+     *  Prompt-only (no tool is governed by it). */
+    SKILL_FIRST("mines.agent.skillfirst.enabled", true),
+
+    /** [Mines-38.9.7] 高级工程模式: plan → read → minimal change → verify; no blind retries. Prompt-only. */
+    ENGINEER("mines.agent.engineer.enabled", true),
     ;
 
     fun isEnabled(context: Context): Boolean =

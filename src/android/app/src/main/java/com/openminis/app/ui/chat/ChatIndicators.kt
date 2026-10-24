@@ -162,14 +162,24 @@ internal fun TypingIndicator() {
     // (MinisApp.onCreate via refreshCache); collectAsState makes Compose
     // recompose the indicator immediately when it changes.
     val soulMeta by com.openminis.app.agent.SoulStore.cachedMetadata.collectAsState()
-    val soulName = soulMeta.name.trim().ifEmpty { "Minis" }
+    val soulName = soulMeta.name.trim().ifEmpty { "Mines" }
+
+    // [Mines-38.9.11.3] what the request is doing: 「正在连接 api.xxx（直连）… 3 秒」 then 「正在思考… 12 秒」 (user: replies felt
+    // stuck — now the wait says whether it is the network or the model)
+    val net by com.openminis.app.plus.ProviderRoutes.status.collectAsState()
+    var secTick by remember { mutableStateOf(0) }
+    LaunchedEffect(net.phase, net.host) { while (net.phase != com.openminis.app.plus.ProviderRouteCore.Phase.IDLE) { kotlinx.coroutines.delay(1000); secTick++ } }
+    val netLine = remember(net, secTick) {
+        if (net.phase == com.openminis.app.plus.ProviderRouteCore.Phase.IDLE) ""
+        else com.openminis.app.plus.ProviderRouteCore.statusText(net.phase, net.host, net.route, System.currentTimeMillis() - net.since)
+    }
 
     Row(
         modifier = Modifier.padding(top = 2.dp, bottom = 8.dp),
         verticalAlignment = Alignment.Bottom,
     ) {
         Text(
-            text = stringResource(R.string.chat_typing_indicator, soulName),
+            text = netLine.ifEmpty { stringResource(R.string.chat_typing_indicator, soulName) },
             fontSize = 15.sp,
             color = ChatColors.tertiaryText,
         )

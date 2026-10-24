@@ -307,7 +307,7 @@ object ScheduledAgentRunner {
                                 // the auth error.
                                 ?.let { g -> app.providerRepository.availableMemberEntries(g).firstOrNull()?.model?.id }
                     }
-                    ?: app.providerRepository.allVisibleEntries().firstOrNull()?.baseModel?.id
+                    ?: app.providerRepository.allVisibleEntries().firstOrNull { com.openminis.app.plus.ErrZhCore.chatCapable(it.baseModel.id) }?.baseModel?.id
                     ?: run {
                         AppLogger.warning(TAG, "task ${task.id}: no provider — abort")
                         return null
@@ -457,7 +457,7 @@ object ScheduledAgentRunner {
             openIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
-        val title = "Minis: ${task.label.ifBlank { "Scheduled task" }}"
+        val title = "Mines: ${task.label.ifBlank { "Scheduled task" }}"
         val notification = NotificationCompat.Builder(context, ScheduledTaskManager.CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_menu_recent_history)
             .setContentTitle(title)

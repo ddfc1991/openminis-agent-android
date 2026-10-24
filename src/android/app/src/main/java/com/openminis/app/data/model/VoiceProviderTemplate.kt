@@ -60,6 +60,13 @@ data class VoiceProviderTemplate(
             inputModalities = listOf("audio"),
         )
 
+        /** [Mines-38.9.9] not a voice vendor: the 「GitHub Models」 add-preset (prefills base, no /v1). Not in [all]. */
+        val githubModels = VoiceProviderTemplate(
+            id = "github-models", name = "GitHub Models", providerType = ProviderType.openAI,
+            baseURL = "https://models.github.ai/inference", appendV1 = false, capability = Capability.BOTH,
+            baseURLMarkers = emptyList(), mockModels = emptyList(),
+        )
+
         val all: List<VoiceProviderTemplate> = listOf(
             VoiceProviderTemplate(
                 id = "elevenlabs",

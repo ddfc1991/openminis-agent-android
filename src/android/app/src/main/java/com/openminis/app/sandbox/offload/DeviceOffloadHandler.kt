@@ -33,11 +33,11 @@ class DeviceOffloadHandler(private val context: Context) : NativeOffloadHandler 
             val out = when (sub) {
                 "info" -> deviceInfo().toString(2)
                 "battery" -> batteryInfo().toString(2)
-                "storage" -> storageInfo().toString(2)
+                "storage" -> bounded { storageInfo() }.toString(2)
                 "all" -> JSONObject()
                     .put("device", deviceInfo())
                     .put("battery", batteryInfo())
-                    .put("storage", storageInfo())
+                    .put("storage", bounded { storageInfo() })
                     .toString(2)
                 else -> return NativeOffloadResult(2, "android-device: unknown subcommand '$sub'\n$HELP")
             }
@@ -47,6 +47,16 @@ class DeviceOffloadHandler(private val context: Context) : NativeOffloadHandler 
                 .put("message", e.message ?: "unknown").toString()
             NativeOffloadResult(1, OffloadOutput.formatBody(body, args) + "\n")
         }
+    }
+
+    /** [Mines-storage-29] Never hang: give up after 6 s with what is known. */
+    private fun bounded(f: () -> JSONObject): JSONObject {
+        val ex = java.util.concurrent.Executors.newSingleThreadExecutor()
+        return try {
+            ex.submit(java.util.concurrent.Callable { f() }).get(6, java.util.concurrent.TimeUnit.SECONDS)
+        } catch (e: java.util.concurrent.TimeoutException) {
+            JSONObject().put("error", "timeout").put("message", "storage stats took longer than 6 s")
+        } finally { ex.shutdownNow() }
     }
 
     private fun String?.orFallback(alt: String): String =
@@ -131,8 +141,29 @@ class DeviceOffloadHandler(private val context: Context) : NativeOffloadHandler 
         } catch (e: Throwable) {
             json.put("error", e.message ?: "StatFs unavailable")
         }
-        json.put("app_data_mb", String.format("%.1f", dirSize(context.filesDir) / 1e6))
-            .put("app_cache_mb", String.format("%.1f", dirSize(context.cacheDir) / 1e6))
+        // [Mines-storage-29] `android-device storage` hung on the phone: it
+        // walked context.filesDir file by file, and filesDir holds the whole
+        // Alpine sandbox (node_modules, dev tools: hundreds of thousands of
+        // files) — minutes under load. Ask the system for the app's own sizes
+        // instead (StorageStatsManager, answered from installd quotas in
+        // milliseconds, no permission needed for our own package), and keep
+        // the walk only as a time-boxed fallback.
+        val stats = runCatching {
+            val ssm = context.getSystemService(android.app.usage.StorageStatsManager::class.java)
+            val st = ssm.queryStatsForPackage(android.os.storage.StorageManager.UUID_DEFAULT, context.packageName, android.os.Process.myUserHandle())
+            st
+        }.getOrNull()
+        if (stats != null) {
+            json.put("app_data_mb", String.format("%.1f", stats.dataBytes / 1e6))
+                .put("app_cache_mb", String.format("%.1f", stats.cacheBytes / 1e6))
+                .put("app_code_mb", String.format("%.1f", stats.appBytes / 1e6))
+        } else {
+            val budget = System.currentTimeMillis() + 3000
+            val data = boundedSize(context.filesDir, budget)
+            val cache = boundedSize(context.cacheDir, budget)
+            json.put("app_data_mb", if (data < 0) "unknown (sandbox too large to count in 3 s)" else String.format("%.1f", data / 1e6))
+                .put("app_cache_mb", if (cache < 0) "unknown" else String.format("%.1f", cache / 1e6))
+        }
         return json
     }
 
@@ -147,6 +178,21 @@ class DeviceOffloadHandler(private val context: Context) : NativeOffloadHandler 
      * space from a figure several times the truth is worse than one with no
      * figure at all.
      */
+    /** Size without following links; -1 when [deadline] passes first. */
+    private fun boundedSize(dir: File, deadline: Long): Long {
+        var total = 0L
+        val stack = ArrayDeque<File>(); stack.add(dir)
+        while (stack.isNotEmpty()) {
+            if (System.currentTimeMillis() > deadline) return -1
+            val f = stack.removeLast()
+            val p = f.toPath()
+            if (java.nio.file.Files.isSymbolicLink(p)) continue
+            if (f.isDirectory) f.listFiles()?.let { stack.addAll(it) } else total += f.length()
+        }
+        return total
+    }
+
+    @Suppress("unused")
     private fun dirSize(dir: File): Long =
         com.openminis.app.data.session.SessionStorage.directorySize(dir)
 

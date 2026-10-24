@@ -43,8 +43,10 @@ class NetworkMonitor {
          * handing the dead h2 tunnel to every retry — requests wrote into it
          * and hung forever waiting for response headers.
          */
+        // [38.9.11.3] keep-alive 30 s (was 5 min): relays / proxies drop idle connections and the next request then died
+        // with 「unexpected end of stream」 on the stale one
         val sharedLLMConnectionPool = okhttp3.ConnectionPool(
-            5, 5, java.util.concurrent.TimeUnit.MINUTES,
+            5, 30, java.util.concurrent.TimeUnit.SECONDS,
         )
     }
 

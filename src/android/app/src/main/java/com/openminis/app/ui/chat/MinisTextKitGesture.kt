@@ -614,6 +614,7 @@ fun MinisSelectionHandlesHost(
     // [T-android-mouse-text-selection] No handle dots for a mouse selection —
     // see SelectionController.selectionFromMouse.
     if (controller.selectionFromMouse.value) return
+    if (controller.actionSheetOpen.value) return
     // Recompute handle anchors every frame so the Popups follow the
     // underlying shards as the LazyColumn scrolls. The shards' positions
     // change inside their parent's layout pass, which doesn't invalidate
@@ -863,6 +864,8 @@ data class SelectionToolbarActions(
     val resolveSelectionMarkdown: () -> String?,
     /** Append the currently-selected plain text to the chat composer. Null hides the button. */
     val onAddToInput: ((String) -> Unit)? = null,
+    /** [Mines-38.9.5 i] 「引用回复」: quote the selection (or, from the overflow, the whole message) above the input. */
+    val onQuote: ((String) -> Unit)? = null,
     /**
      * [T-android-selection-readaloud] Speak the currently-selected plain text
      * through Minis TTS. Null hides the button. Mirrors iOS's "Read Selection".
@@ -902,6 +905,23 @@ fun MinisSelectionToolbarHost(
 ) {
     val sel by controller.selection
     if (sel == null) return
+    // [Mines-38.9.9] user 10:02: long-press used to select 2 characters and open two stacked floating menus with 复制全文
+    // hidden in a submenu. Now a long-press on one message opens ONE sheet; 「选择文字」 selects the whole message with
+    // handles and only then shows the normal floating bar for the partial copy.
+    val sheetDone = remember { androidx.compose.runtime.mutableStateOf(false) }
+    val sheetMsg = controller.singleMessageId()
+    if (!sheetDone.value && sheetMsg != null && actions != null && controller.dragIntent.value == null) {
+        val md = actions.resolveSelectionMarkdown() ?: controller.selectedPlainText()
+        androidx.compose.runtime.DisposableEffect(Unit) { controller.actionSheetOpen.value = true; onDispose { controller.actionSheetOpen.value = false } }
+        ReplyActionSheet(
+            markdown = md,
+            onDismiss = { controller.clearSelection() },
+            onSelectText = { controller.selectAllInMessage(sheetMsg); sheetDone.value = true },
+            onQuote = actions.onQuote,
+            onRead = actions.onReadFromStart ?: actions.onReadAloud,
+        )
+        return
+    }
     // Anchor the toolbar above the VISIBLE portion of the selection — the
     // union of every shard's drawn rectangle in window coords (computed by
     // visibleSelectionWindowRect). This way the menu tracks the highlight
@@ -1120,6 +1140,13 @@ fun MinisSelectionToolbarHost(
                     // read-aloud and so was folded into the "⋯" overflow; the
                     // bar now keeps up to four actions inline when they fit,
                     // so read-aloud stays visible too (see inlineCount below).
+                    if (actions?.onQuote != null) {
+                        add(SelectionAction("引用回复") {
+                            val text = controller.selectedPlainText()
+                            if (text.isNotEmpty()) actions.onQuote.invoke(text)
+                            controller.clearSelection()
+                        })
+                    }
                     if (actions?.onAddToInput != null) {
                         add(SelectionAction(labelAddToInput) {
                             val text = controller.selectedPlainText()
@@ -1238,6 +1265,13 @@ fun MinisSelectionToolbarHost(
                                 SelectionAction(labelReadAloud, children = readChildren),
                             )
                         }
+                    }
+                    if (actions?.onQuote != null) {
+                        add(SelectionAction("引用整条消息") {
+                            val whole = actions.resolveSelectionMarkdown.invoke() ?: controller.selectedPlainText()
+                            if (whole.isNotEmpty()) actions.onQuote.invoke(whole)
+                            controller.clearSelection()
+                        })
                     }
                     if (tableActions != null) {
                         add(SelectionAction(labelCopyTable) {

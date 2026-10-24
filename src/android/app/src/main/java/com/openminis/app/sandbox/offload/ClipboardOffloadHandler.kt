@@ -82,10 +82,16 @@ class ClipboardOffloadHandler(private val context: Context) : NativeOffloadHandl
     // ── Subcommands ──────────────────────────────────────────────────────────
 
     private fun doGet(cm: ClipboardManager, args: OffloadArgs): NativeOffloadResult {
+        var clip: android.content.ClipData? = null
         if (!isAppForeground() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            return backgroundError(args)
-        }
-        val clip = cm.primaryClip
+            // [Mines-clip-29] Android 10+ only lets the app whose window has
+            // input focus (or the keyboard) read the clipboard. With 悬浮窗
+            // permission Mines briefly adds a 1-px focusable overlay window,
+            // reads while it holds focus, and removes it (≈0.3 s; the current
+            // app's keyboard may blink).
+            clip = readViaFocusWindow(cm)
+            if (clip == null) return backgroundError(args)
+        } else clip = cm.primaryClip
         if (clip == null || clip.itemCount == 0) {
             return NativeOffloadResult(0, "")
         }
@@ -112,7 +118,7 @@ class ClipboardOffloadHandler(private val context: Context) : NativeOffloadHandl
         if (!isAppForeground() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             return backgroundError(args)
         }
-        val label = args.get("label") ?: "Minis"
+        val label = args.get("label") ?: "Mines"
         cm.setPrimaryClip(ClipData.newPlainText(label, text))
         return NativeOffloadResult(
             0,
@@ -143,10 +149,16 @@ class ClipboardOffloadHandler(private val context: Context) : NativeOffloadHandl
      *     so prompts can detect platform difference)
      */
     private fun doStatus(cm: ClipboardManager, args: OffloadArgs): NativeOffloadResult {
+        var clip: android.content.ClipData? = null
         if (!isAppForeground() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            return backgroundError(args)
-        }
-        val clip = cm.primaryClip
+            // [Mines-clip-29] Android 10+ only lets the app whose window has
+            // input focus (or the keyboard) read the clipboard. With 悬浮窗
+            // permission Mines briefly adds a 1-px focusable overlay window,
+            // reads while it holds focus, and removes it (≈0.3 s; the current
+            // app's keyboard may blink).
+            clip = readViaFocusWindow(cm)
+            if (clip == null) return backgroundError(args)
+        } else clip = cm.primaryClip
         val description = cm.primaryClipDescription
         val itemCount = clip?.itemCount ?: 0
         val mimeTypes = JSONArray()
@@ -195,11 +207,32 @@ class ClipboardOffloadHandler(private val context: Context) : NativeOffloadHandl
         }
     }
 
+    private fun readViaFocusWindow(cm: ClipboardManager): android.content.ClipData? {
+        if (!android.provider.Settings.canDrawOverlays(context)) return null
+        val main = android.os.Handler(android.os.Looper.getMainLooper())
+        val got = java.util.concurrent.atomic.AtomicReference<android.content.ClipData?>(null)
+        val done = java.util.concurrent.CountDownLatch(1)
+        com.openminis.app.plus.AppLauncher.withVisibleWindow(context, focusable = true, holdMs = 900) { v ->
+            fun attempt(n: Int) {
+                if (v.hasWindowFocus() || n >= 10) {
+                    runCatching { got.set(cm.primaryClip) }
+                    done.countDown()
+                } else main.postDelayed({ attempt(n + 1) }, 60)
+            }
+            attempt(0)
+        }
+        done.await(1500, java.util.concurrent.TimeUnit.MILLISECONDS)
+        return got.get()
+    }
+
     private fun backgroundError(args: OffloadArgs) = NativeOffloadResult(
         1,
         OffloadOutput.formatBody(
             JSONObject().put("error", "clipboard_requires_foreground")
-                .put("message", "Android 10+ blocks clipboard access when the app is not in the foreground. Ask the user to bring Minis to the foreground and retry.")
+                .put("message", "Android 10+ blocks clipboard access when the app is not in the foreground. " +
+                    (if (android.provider.Settings.canDrawOverlays(context)) "The focus-window workaround did not get focus this time (a full-screen app or the lock screen may hold it); retry, or bring Mines to the front."
+                    else "Grant Mines 悬浮窗 (display over other apps) so it can read the clipboard from the background, or bring Mines to the front.") +
+                    " 安卓 10 起只有前台应用能读剪贴板。")
                 .toString(),
             args,
         ) + "\n",

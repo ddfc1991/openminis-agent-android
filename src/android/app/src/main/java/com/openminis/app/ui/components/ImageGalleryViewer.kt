@@ -220,7 +220,7 @@ fun ImageGalleryViewer(
                 ) {
                     Icon(
                         Icons.Default.Close,
-                        contentDescription = "Close",
+                        contentDescription = "关闭",
                         tint = Color.White,
                         modifier = Modifier.size(28.dp),
                     )

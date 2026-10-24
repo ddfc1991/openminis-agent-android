@@ -160,7 +160,7 @@ object SessionActivityTracker {
      * [T-android-overlay-reply-status-34599] Truncated excerpt of the
      * most recent assistant reply for the currently-tracked session.
      * Published by ChatViewModel via [publishLastReply] right before
-     * [setInactive] so the overlay can show "what did Minis just say".
+     * [setInactive] so the overlay can show "what did Mines just say".
      * Null when no reply has been observed yet this session-cycle;
      * cleared when a fresh session goes active (so the previous
      * session's reply doesn't bleed into a newly-started turn).
@@ -893,6 +893,7 @@ object SessionActivityTracker {
                 return
             }
             serviceWanted = true
+            cancelPendingStop()
             AgentForegroundService.startService(
                 context,
                 sessionCountForNotification(),
@@ -912,6 +913,7 @@ object SessionActivityTracker {
                 return
             }
             serviceWanted = true
+            cancelPendingStop()
             AgentForegroundService.startService(
                 context,
                 sessionCountForNotification(),
@@ -968,15 +970,36 @@ object SessionActivityTracker {
         }
     }
 
+    /**
+     * [Mines-38.1b] Stops are debounced. Smoke run 36 (API 34): the chat route was left and re-entered three times
+     * within 100 ms, so startForegroundService() was followed by stopService() before the new instance reached
+     * startForeground() → "Bringing down service while still waiting for start foreground" →
+     * ForegroundServiceDidNotStartInTimeException killed the process. Now a stop waits [STOP_DEBOUNCE_MS]; any
+     * start/update in between cancels it, and the delayed stop re-checks under the lock.
+     */
+    private val stopHandler by lazy { android.os.Handler(android.os.Looper.getMainLooper()) }
+    private const val STOP_DEBOUNCE_MS = 1500L
+    private val pendingStop = Runnable {
+        val context = appContext ?: return@Runnable
+        synchronized(serviceLock) {
+            if (shouldRunService()) return@Runnable
+            serviceWanted = false
+            AgentForegroundService.stopService(context)
+            Log.d(TAG, "All sessions complete, service stopped")
+        }
+    }
+
+    private fun cancelPendingStop() { runCatching { stopHandler.removeCallbacks(pendingStop) } }
+
     private fun stopService() {
-        val context = appContext ?: run {
+        if (appContext == null) {
             Log.w(TAG, "Context not initialized, cannot stop service")
             return
         }
         synchronized(serviceLock) {
             serviceWanted = false
-            AgentForegroundService.stopService(context)
-            Log.d(TAG, "All sessions complete, service stopped")
+            stopHandler.removeCallbacks(pendingStop)
+            stopHandler.postDelayed(pendingStop, STOP_DEBOUNCE_MS)
         }
     }
 }

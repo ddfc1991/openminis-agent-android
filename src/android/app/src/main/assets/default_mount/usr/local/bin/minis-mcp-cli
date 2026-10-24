@@ -31,11 +31,24 @@ if ! command -v python3 > /dev/null 2>&1; then
   apk add --quiet python3 py3-pip >> "$LOG" 2>&1
 fi
 
-# Ensure httpx is importable (used by the HTTP transport).
-if ! python3 -c "import httpx" 2>/dev/null; then
-  _log "Installing httpx..."
-  pip install --quiet httpx >> "$LOG" 2>&1 || \
-    pip install --quiet --break-system-packages httpx >> "$LOG" 2>&1
+# [Mines-mcp-29] The lib dir is read-only, so python could never cache its
+# bytecode and recompiled every module on every call (slow under PRoot). Keep
+# the cache under /root instead.
+export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-/root/.cache/minis-mcp-pyc}"
+
+# httpx is only needed for HTTP servers and is imported lazily now. Check it
+# once (stamp file) instead of starting a second python on every call; prefer
+# Alpine's py3-httpx (no pip / PyPI needed).
+STAMP=/root/.cache/minis-mcp-httpx.ok
+if [ ! -f "$STAMP" ]; then
+  if python3 -c "import httpx" 2>/dev/null; then
+    mkdir -p /root/.cache 2>/dev/null; : > "$STAMP" 2>/dev/null
+  else
+    _log "Installing httpx..."
+    apk add --quiet py3-httpx >> "$LOG" 2>&1 || pip install --quiet httpx >> "$LOG" 2>&1 || \
+        pip install --quiet --break-system-packages httpx >> "$LOG" 2>&1
+    python3 -c "import httpx" 2>/dev/null && { mkdir -p /root/.cache; : > "$STAMP"; }
+  fi
 fi
 
 exec python3 /usr/local/lib/minis-mcp-cli/main.py "$@"

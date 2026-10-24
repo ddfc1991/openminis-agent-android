@@ -115,7 +115,7 @@ class OAuthCallbackServer(
                             // back in Minis (background network is blocked). Say so, so the
                             // user returns rather than waiting on a tab that already "succeeded".
                             // ASCII only: Content-Length below is computed from String.length.
-                            val html = "<html><body><h1>Authorization received</h1><p>Return to Minis to finish signing in.</p><script>window.close()</script></body></html>"
+                            val html = "<html><body><h1>Authorization received</h1><p>Return to Mines to finish signing in.</p><script>window.close()</script></body></html>"
                             val response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: ${html.length}\r\nConnection: close\r\n\r\n$html"
                             socket.getOutputStream().write(response.toByteArray())
                             socket.close()

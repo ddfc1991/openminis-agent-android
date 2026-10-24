@@ -35,6 +35,9 @@ object GoogleAuthRouter {
         "myaccount.google.com",
         "oauth2.googleapis.com",
         "accounts.youtube.com",
+        // [Mines-login-32] Apple also refuses "Sign in with Apple" inside embedded WebViews.
+        "appleid.apple.com",
+        "idmsa.apple.com",
     )
 
     /** Returns true if [url] should be opened externally (Custom Tab). */

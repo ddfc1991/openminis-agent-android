@@ -141,6 +141,7 @@ class ChatRepository(internal val dao: ChatDao) {
     suspend fun deleteSessionOnly(id: String) {
         dao.deleteMessages(id)
         dao.deleteSession(id)
+        runCatching { com.openminis.app.browser.ConvProfiles.forget(id) }   // [38.9.11.2] its browser profile + account bindings
     }
 
     // ─── Session groups ("folders") ────────────────────────────────────────

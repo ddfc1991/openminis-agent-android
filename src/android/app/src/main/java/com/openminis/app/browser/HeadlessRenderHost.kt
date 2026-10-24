@@ -17,7 +17,6 @@ import android.util.Log
 import android.view.WindowManager
 import android.webkit.WebView
 import android.widget.FrameLayout
-import java.nio.ByteBuffer
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -199,6 +198,10 @@ internal object HeadlessRenderHost {
         } catch (e: Exception) {
             Log.w(TAG, "gpu capture failed: ${e.javaClass.simpleName}: ${e.message}")
             return null
+        } catch (e: OutOfMemoryError) {
+            // [Mines-38.9.12.1] never let a screenshot take the app down
+            Log.w(TAG, "gpu capture out of memory: ${e.message}")
+            return null
         } finally {
             image?.close()
             scrollbars?.let { (v, hz) ->
@@ -316,24 +319,68 @@ internal object HeadlessRenderHost {
     }
 
     /**
-     * Copy an RGBA_8888 [image] into a [w]×[h] ARGB_8888 bitmap. The plane's
-     * rows may be padded (rowStride > w*4), and the last row is not padded, so
-     * the buffer is re-packed row by row rather than bulk-copied.
+     * [Mines-38.9.12.1] Copy an RGBA_8888 [image] into a bitmap no larger than SafeStartCore.SHOT_MAX_EDGE on its long
+     * edge. The old copy re-packed every row into `ByteBuffer.allocateDirect(w*h*4)` — on Android that is a non-movable
+     * Java-heap array, and on the user's phone (agent viewport ≈ 9 Mpx) it asked for 36 MB with the heap at 93 % → the
+     * OutOfMemoryError that killed 1.23.11.3.1 on 2026-10-23. Now nothing w*h-sized touches the Java heap:
+     *  - the plane buffer is wrapped straight into a native-memory bitmap (rows padded → a bitmap rowStride/4 wide, one
+     *    row shorter, cropped), then scaled down with filtering;
+     *  - if even that native bitmap cannot be had, rows are sampled into the small output with one reused row buffer;
+     *  - an OutOfMemoryError returns null (the caller falls back / reports a tool error), never a crash.
      */
-    private fun toBitmap(image: Image, w: Int, h: Int): Bitmap {
+    private fun toBitmap(image: Image, w: Int, h: Int): Bitmap? {
         val plane = image.planes[0]
-        val src = plane.buffer.duplicate().apply { rewind() }
         val rowStride = plane.rowStride
         val pixelStride = plane.pixelStride
-        val rowBytes = w * pixelStride
-        val packed = ByteBuffer.allocateDirect(rowBytes * h)
-        val row = ByteArray(rowBytes)
-        for (y in 0 until h) {
-            src.position(y * rowStride)
-            src.get(row, 0, rowBytes)
-            packed.put(row)
+        val s = com.openminis.app.plus.SafeStartCore.shotScale(w, h)
+        val (ow, oh) = com.openminis.app.plus.SafeStartCore.scaled(w, h, s)
+        if (pixelStride == 4 && rowStride % 4 == 0) {
+            try {
+                val src = plane.buffer.duplicate().apply { rewind() }
+                val wide = rowStride / 4
+                val rows = if (rowStride == w * 4) h else h - 1   // a padded plane's last row is not padded
+                if (rows > 0) {
+                    val full = Bitmap.createBitmap(wide, rows, Bitmap.Config.ARGB_8888)
+                    try {
+                        src.limit(minOf(src.capacity(), rowStride * rows))
+                        full.copyPixelsFromBuffer(src)
+                        val m = android.graphics.Matrix().apply { setScale(ow.toFloat() / w, oh.toFloat() / h) }
+                        val out = Bitmap.createBitmap(full, 0, 0, minOf(w, wide), rows, m, true)
+                        if (out !== full) full.recycle()
+                        return out
+                    } catch (e: Throwable) {
+                        full.recycle(); if (e !is OutOfMemoryError && e !is RuntimeException) throw e
+                        Log.w(TAG, "native copy failed (${e.javaClass.simpleName}); sampling rows")
+                    }
+                }
+            } catch (e: OutOfMemoryError) {
+                Log.w(TAG, "no memory for a ${w}x$h native frame; sampling rows")
+            }
         }
-        packed.rewind()
-        return Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).apply { copyPixelsFromBuffer(packed) }
+        return try { sampleRows(plane, w, h, ow, oh) } catch (e: OutOfMemoryError) {
+            Log.w(TAG, "gpu capture copy out of memory (${w}x$h → ${ow}x$oh)"); null
+        }
+    }
+
+    /** nearest-neighbour fallback: one source row (w*4 bytes) and one output row (ow ints) reused for the whole image */
+    private fun sampleRows(plane: Image.Plane, w: Int, h: Int, ow: Int, oh: Int): Bitmap {
+        val src = plane.buffer.duplicate().apply { rewind() }
+        val ps = plane.pixelStride.coerceAtLeast(1)
+        val row = ByteArray(w * ps)
+        val px = IntArray(ow)
+        val out = Bitmap.createBitmap(ow, oh, Bitmap.Config.ARGB_8888)
+        for (y in 0 until oh) {
+            val sy = minOf(h - 1, (y.toLong() * h / oh).toInt())
+            src.position(sy * plane.rowStride)
+            src.get(row, 0, minOf(row.size, src.remaining()))
+            for (x in 0 until ow) {
+                val o = minOf(w - 1, (x.toLong() * w / ow).toInt()) * ps
+                val r = row[o].toInt() and 0xFF; val g = row[o + 1].toInt() and 0xFF
+                val b = row[o + 2].toInt() and 0xFF; val a = row[o + 3].toInt() and 0xFF
+                px[x] = (a shl 24) or (r shl 16) or (g shl 8) or b
+            }
+            out.setPixels(px, 0, ow, 0, y, ow, 1)
+        }
+        return out
     }
 }

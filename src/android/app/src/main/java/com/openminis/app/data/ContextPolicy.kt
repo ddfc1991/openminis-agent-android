@@ -149,17 +149,23 @@ data class ContextPolicy(
                 exhaustedOnly = true,
                 manualCompactAllowed = true,
             )
+            // [Mines-compact-32] user (2026-10-13): compact silently at ~70 % of the window
+            // (upstream compacted at window-10k/-20k and prompted first). The summary keeps
+            // the system prefix untouched (cache hits) and the latest turns verbatim — that
+            // part is upstream's compaction pass; Mines only moves the trigger earlier.
+            // [Mines-ctx-34] user report (Gemma 4 31B, 71 % of 131k, thinking degenerated): older
+            // tool output is offloaded from 60 % (down to 45 %) so compaction at 70 % rarely has to run.
             contextWindow < 128_000 -> ContextPolicy(
-                offloadThreshold = contextWindow - 20_000,
-                offloadTarget = contextWindow - 30_000,
-                compactThreshold = contextWindow - 10_000,
+                offloadThreshold = minOf(contextWindow - 20_000, (contextWindow * 0.60).toInt()),
+                offloadTarget = minOf(contextWindow - 30_000, (contextWindow * 0.45).toInt()),
+                compactThreshold = (contextWindow * 0.70).toInt(),
                 exhaustedOnly = false,
                 manualCompactAllowed = true,
             )
             else -> ContextPolicy(
-                offloadThreshold = contextWindow - 40_000,
-                offloadTarget = contextWindow - 60_000,
-                compactThreshold = contextWindow - 20_000,
+                offloadThreshold = minOf(contextWindow - 40_000, (contextWindow * 0.60).toInt()),
+                offloadTarget = minOf(contextWindow - 60_000, (contextWindow * 0.45).toInt()),
+                compactThreshold = (contextWindow * 0.70).toInt(),
                 exhaustedOnly = false,
                 manualCompactAllowed = true,
             )

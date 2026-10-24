@@ -1,0 +1,304 @@
+#!/bin/sh
+# [Mines-net-26] mines-mirror — pick the fastest package mirrors for the sandbox.
+#
+#   mines-mirror auto [apk|pip|npm|go|cargo|all] [--quiet]   test and switch to the fastest
+#   mines-mirror auto-if-changed [kinds…]                    same, only when never probed, the
+#                                                            network changed or the last probe is
+#                                                            older than $MINIS_MIRROR_MAX_AGE s (6 h)
+#   mines-mirror probe [kind|all]                            test only, print the table
+#   mines-mirror set <kind> <url>                            use this mirror
+#   mines-mirror add <kind> <url>                            add your own mirror to the candidates
+#   mines-mirror show [kind]                                 what is in use now
+#
+# Writes /etc/apk/repositories (for this Alpine version), /etc/pip.conf (the
+# file pip actually reads), /root/.npmrc, ~/.config/go/env and
+# ~/.cargo/config.toml. Each candidate is fetched with a short timeout (64 KB,
+# through the same proxy settings apk/pip/npm will use); the fastest that
+# answered correctly wins.
+
+STATE_DIR=/etc/minis
+STATE=$STATE_DIR/mirrors.state
+CUSTOM=$STATE_DIR/mirrors.custom
+PROBE_TIMEOUT=${MINIS_PROBE_TIMEOUT:-6}
+QUIET=0
+mkdir -p "$STATE_DIR" 2>/dev/null
+
+alpine_ver() {
+    v=$(cut -d. -f1,2 /etc/alpine-release 2>/dev/null)
+    echo "v${v:-3.21}"
+}
+alpine_arch() { /sbin/apk --print-arch 2>/dev/null || uname -m; }
+
+candidates() {
+    case $1 in
+        apk) printf '%s\n' https://dl-cdn.alpinelinux.org/alpine/ https://mirrors.aliyun.com/alpine/ \
+                 https://mirrors.tuna.tsinghua.edu.cn/alpine/ https://mirrors.ustc.edu.cn/alpine/ ;;
+        pip) printf '%s\n' https://pypi.org/simple/ https://mirrors.aliyun.com/pypi/simple/ \
+                 https://pypi.tuna.tsinghua.edu.cn/simple/ https://mirrors.ustc.edu.cn/pypi/simple/ ;;
+        npm) printf '%s\n' https://registry.npmjs.org/ https://registry.npmmirror.com/ ;;
+        go) printf '%s\n' https://proxy.golang.org https://goproxy.cn ;;
+        cargo) printf '%s\n' https://index.crates.io/ https://rsproxy.cn/index/ ;;
+    esac
+    [ -f "$CUSTOM" ] && sed -n "s/^$1[[:space:]]\{1,\}//p" "$CUSTOM"
+}
+
+name_of() {
+    case $1 in
+        "") echo "未设置" ;;
+        *dl-cdn.alpinelinux.org*|*pypi.org*|*registry.npmjs.org*|*proxy.golang.org*|*index.crates.io*) echo "官方" ;;
+        *aliyun*) echo "阿里云" ;;
+        *tuna.tsinghua*) echo "清华 TUNA" ;;
+        *ustc.edu.cn*) echo "中科大 USTC" ;;
+        *npmmirror*) echo "npmmirror（淘宝）" ;;
+        *goproxy.cn*) echo "goproxy.cn（七牛）" ;;
+        *rsproxy.cn*) echo "rsproxy（字节）" ;;
+        *) echo "自定义" ;;
+    esac
+}
+
+# URL fetched to test a candidate.
+probe_url() {
+    case $1 in
+        apk) echo "${2%/}/$(alpine_ver)/main/$(alpine_arch)/APKINDEX.tar.gz" ;;
+        pip) echo "${2%/}/pip/" ;;
+        npm) echo "${2%/}/is-number/latest" ;;
+        go) echo "${2%/}/github.com/google/uuid/@v/list" ;;
+        cargo) echo "${2%/}/config.json" ;;
+    esac
+}
+
+now_cs() {
+    if [ -r /proc/uptime ] && read -r up _ < /proc/uptime; then up=${up%.*}${up#*.}; echo "$up" | sed 's/^0*//;s/^$/0/'
+    else echo $(( $(date +%s) * 100 )); fi
+}
+
+# fetch <url> <outfile>: 64 KB at most, short timeout, through the proxy env.
+fetch() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsS -L --connect-timeout 4 -m "$PROBE_TIMEOUT" -r 0-65535 -o "$2" "$1" 2>/dev/null
+    else
+        # busybox wget treats "206 Partial Content" as an error, so cut the stream instead of asking for a range.
+        timeout "$PROBE_TIMEOUT" wget -q -T 4 -O - "$1" 2>/dev/null | head -c 65536 > "$2"
+        [ -s "$2" ]
+    fi
+}
+
+# probe_one <kind> <base> → "<ms> <base>" or "- <base>"
+probe_one() {
+    local tmp t0 t1 ms
+    tmp=$(mktemp)
+    t0=$(now_cs)
+    if fetch "$(probe_url "$1" "$2")" "$tmp" && [ -s "$tmp" ] && valid "$1" "$tmp"; then
+        t1=$(now_cs)
+        ms=$(( (t1 - t0) * 10 ))
+        [ "$ms" -lt 1 ] && ms=1
+        # PyPI downloads come from a second host; it has to work too.
+        if [ "$1" = pip ] && case $2 in *pypi.org*) true;; *) false;; esac; then
+            fetch https://files.pythonhosted.org/packages/py2.py3/s/six/six-1.16.0-py2.py3-none-any.whl "$tmp" || { rm -f "$tmp"; echo "- $2"; return; }
+        fi
+        echo "$ms $2"
+    else
+        echo "- $2"
+    fi
+    rm -f "$tmp"
+}
+
+valid() {
+    case $1 in
+        apk) head -c 2 "$2" | od -An -tx1 | grep -q '1f 8b' ;;          # gzip
+        pip) grep -qi '<a ' "$2" ;;
+        npm) grep -q '"version"' "$2" ;;
+        go) grep -q '^v[0-9]' "$2" ;;
+        cargo) grep -q '"dl"' "$2" ;;
+        *) true ;;
+    esac
+}
+
+# probe <kind> → sorted lines "<ms> <url>" (fastest first, failures last as "- url")
+probe() {
+    local dir i b
+    dir=$(mktemp -d)
+    i=0
+    for b in $(candidates "$1"); do
+        i=$((i + 1))
+        probe_one "$1" "$b" > "$dir/$i" &
+    done
+    wait
+    cat "$dir"/* 2>/dev/null | grep -v '^-' | sort -n
+    cat "$dir"/* 2>/dev/null | grep '^-'
+    rm -rf "$dir"
+}
+
+host_of() { echo "$1" | sed -e 's#^[a-z+]*://##' -e 's#[/:].*##'; }
+
+write_apk() {
+    local f=/etc/apk/repositories ver base
+    [ -f "$f" ] && [ ! -f "$f.minis-bak" ] && cp "$f" "$f.minis-bak"
+    ver=$(alpine_ver)
+    base=${1%/}
+    {
+        echo "$base/$ver/main"
+        echo "$base/$ver/community"
+        # keep the user's own extra lines (edge/testing, local repos…)
+        [ -f "$f" ] && grep -v -E '/v[0-9]+\.[0-9]+/(main|community)/?$' "$f" | grep -v '^[[:space:]]*$'
+        true
+    } > "$f.new" && mv "$f.new" "$f"
+}
+
+write_pip() {
+    local host=$(host_of "$1") fb=$2 fbhost
+    {
+        echo "# written by mines-mirror ($(name_of "$1"))"
+        echo "[global]"
+        echo "index-url = $1"
+        if [ -n "$fb" ] && [ "$fb" != "$1" ]; then
+            fbhost=$(host_of "$fb")
+            echo "# fallback index (second fastest when this was written; pip asks it too)"
+            echo "extra-index-url = $fb"
+        fi
+        echo "timeout = 20"
+        echo "retries = 3"
+        echo "break-system-packages = true"
+        [ -s /etc/ssl/minis-ca.pem ] && echo "cert = /etc/ssl/minis-ca.pem"
+    } > /etc/pip.conf.new && mv /etc/pip.conf.new /etc/pip.conf
+    # Old builds wrote here, which pip never reads; keep it identical so nothing disagrees.
+    mkdir -p /etc/pip && cp /etc/pip.conf /etc/pip/pip.conf 2>/dev/null
+}
+
+set_kv() {   # set_kv <file> <key> <value> <sep>
+    local f=$1 k=$2 v=$3 sep=$4
+    mkdir -p "$(dirname "$f")"; touch "$f"
+    grep -v "^$k$sep" "$f" > "$f.new"; echo "$k$sep$v" >> "$f.new"; mv "$f.new" "$f"
+}
+
+write_npm() {
+    local f=/root/.npmrc
+    set_kv "$f" registry "$1" =
+    grep -q '^fetch-timeout=' "$f" 2>/dev/null || echo "fetch-timeout=60000" >> "$f"
+    grep -q '^fetch-retries=' "$f" 2>/dev/null || echo "fetch-retries=3" >> "$f"
+    grep -q '^fetch-retry-maxtimeout=' "$f" 2>/dev/null || echo "fetch-retry-maxtimeout=60000" >> "$f"
+}
+
+write_go() { set_kv /root/.config/go/env GOPROXY "${1%/},direct" =; }
+
+write_cargo() {
+    local f=/root/.cargo/config.toml
+    mkdir -p /root/.cargo
+    if [ -f "$f" ] && ! grep -q 'mines-mirror' "$f"; then
+        echo "  cargo: ~/.cargo/config.toml 是你自己写的，没有改动" >&2; return 0
+    fi
+    case $1 in
+        *index.crates.io*) rm -f "$f" ;;
+        *) printf '# written by mines-mirror\n[source.crates-io]\nreplace-with = "mines-mirror"\n\n[source.mines-mirror]\nregistry = "sparse+%s"\n\n[net]\nretry = 3\n' "$1" > "$f" ;;
+    esac
+}
+
+current() {
+    case $1 in
+        apk) sed -n 's#/v[0-9.]*/main/*$#/#p' /etc/apk/repositories 2>/dev/null | head -1 ;;
+        pip) sed -n 's/^index-url *= *//p' /etc/pip.conf 2>/dev/null | head -1 ;;
+        npm) sed -n 's/^registry=//p' /root/.npmrc 2>/dev/null | head -1 ;;
+        go) sed -n 's/^GOPROXY=\([^,]*\).*/\1/p' /root/.config/go/env 2>/dev/null | head -1 ;;
+        cargo) sed -n 's/^registry = "sparse+\(.*\)"/\1/p' /root/.cargo/config.toml 2>/dev/null | head -1 ;;
+    esac
+}
+
+save_state() {
+    touch "$STATE"; grep -v "^$1=" "$STATE" > "$STATE.new"; echo "$1=$2 $3 $(date +%s)" >> "$STATE.new"; mv "$STATE.new" "$STATE"
+}
+
+say() { [ "$QUIET" = 1 ] || echo "$@"; }
+
+auto_one() {
+    local k=$1 res best ms url second
+    case " ${MINIS_MIRROR_SKIP:-} " in *" $k "*) echo "· $k：你在 设置 → 镜像 里固定了软件源，不改动"; return 0;; esac
+    res=$(probe "$k")
+    best=$(echo "$res" | grep -v '^-' | head -1)
+    second=$(echo "$res" | grep -v '^-' | sed -n 2p); second=${second#* }
+    if [ "${MINIS_MIRROR_VERBOSE:-0}" = 1 ] || [ "$QUIET" = 0 ]; then
+        echo "$res" | while read -r ms u; do
+            [ -z "$u" ] && continue
+            if [ "$ms" = "-" ]; then say "  $k  ✗ $(name_of "$u")  $u  （连不上/超时）"; else say "  $k  ${ms}ms  $(name_of "$u")  $u"; fi
+        done
+    fi
+    if [ -z "$best" ]; then
+        echo "✗ $k：所有软件源都连不上（${PROBE_TIMEOUT} 秒超时）。保留原来的：$(current "$k")。运行 mines-doctor 看原因。" >&2
+        return 1
+    fi
+    ms=${best%% *}; url=${best#* }
+    case $k in
+        apk) write_apk "$url" ;;
+        pip) write_pip "$url" "$second" ;;
+        npm) write_npm "$url" ;;
+        go) write_go "$url" ;;
+        cargo) write_cargo "$url" ;;
+    esac
+    save_state "$k" "$url" "$ms"
+    [ -n "$NET_SIG" ] && { touch "$STATE"; grep -v '^netsig=' "$STATE" > "$STATE.new"; echo "netsig=$NET_SIG" >> "$STATE.new"; mv "$STATE.new" "$STATE"; }
+    echo "✓ $k → $(name_of "$url")（${ms}ms）$url"
+}
+
+kinds_of() {
+    case ${1:-all} in
+        all) echo "apk pip npm go cargo" ;;
+        apk|pip|npm|go|cargo) echo "$1" ;;
+        *) echo "未知类型：$1（apk / pip / npm / go / cargo / all）" >&2; exit 2 ;;
+    esac
+}
+
+# Network signature the app writes on every network change (Wi-Fi ↔ mobile, VPN on/off).
+NET_SIG=$(sed -n 's/^sig=//p' /etc/minis/net.state 2>/dev/null | head -1)
+
+cmd=${1:-show}; shift 2>/dev/null
+for a in "$@"; do [ "$a" = "--quiet" ] && QUIET=1; done
+arg=$(for a in "$@"; do case $a in --*) ;; *) echo "$a"; break;; esac; done)
+
+case $cmd in
+    auto)
+        fails=0
+        for k in $(kinds_of "$arg"); do auto_one "$k" || fails=$((fails + 1)); done
+        echo "MINES_MIRROR apk=$(name_of "$(current apk)") pip=$(name_of "$(current pip)") npm=$(name_of "$(current npm)")"
+        [ "$fails" = 0 ] ;;
+    auto-if-changed)
+        kinds=$(for a in "$@"; do case $a in --*) ;; *) echo "$a";; esac; done)
+        [ -n "$kinds" ] || kinds="apk pip npm"
+        need=0
+        [ -s "$STATE" ] || need=1
+        old=$(sed -n 's/^netsig=//p' "$STATE" 2>/dev/null | tail -1)
+        [ -n "$NET_SIG" ] && [ "$old" != "$NET_SIG" ] && need=1
+        now=$(date +%s)
+        for k in $kinds; do
+            t=$(sed -n "s/^$k=.* \([0-9]*\)\$/\1/p" "$STATE" 2>/dev/null | tail -1)
+            if [ -z "$t" ] || [ $(( now - t )) -gt "${MINIS_MIRROR_MAX_AGE:-21600}" ]; then need=1; fi
+        done
+        if [ "$need" = 0 ]; then echo "软件源不用重测（网络没变，上次测速还新）"; exit 0; fi
+        fails=0
+        for k in $kinds; do kinds_of "$k" >/dev/null; auto_one "$k" || fails=$((fails + 1)); done
+        [ "$fails" = 0 ] ;;
+    probe)
+        for k in $(kinds_of "$arg"); do
+            probe "$k" | while read -r ms u; do
+                [ -z "$u" ] && continue
+                if [ "$ms" = "-" ]; then echo "$k  ✗      $(name_of "$u")  $u"; else echo "$k  ${ms}ms  $(name_of "$u")  $u"; fi
+            done
+        done ;;
+    set)
+        k=$1; url=$2
+        [ -n "$url" ] || { echo "用法：mines-mirror set <apk|pip|npm|go|cargo> <url>" >&2; exit 2; }
+        case $k in apk) write_apk "$url";; pip) write_pip "$url";; npm) write_npm "$url";; go) write_go "$url";; cargo) write_cargo "$url";; *) kinds_of "$k" >/dev/null;; esac
+        save_state "$k" "$url" "-"
+        echo "✓ $k → $(name_of "$url") $url" ;;
+    add)
+        k=$1; url=$2
+        [ -n "$url" ] || { echo "用法：mines-mirror add <apk|pip|npm|go|cargo> <url>" >&2; exit 2; }
+        kinds_of "$k" >/dev/null
+        touch "$CUSTOM"; grep -v "^$k[[:space:]]*$url\$" "$CUSTOM" > "$CUSTOM.new"; echo "$k $url" >> "$CUSTOM.new"; mv "$CUSTOM.new" "$CUSTOM"
+        echo "已加入候选：$k $url（运行 mines-mirror auto $k 测速）" ;;
+    show)
+        for k in $(kinds_of "$arg"); do
+            u=$(current "$k")
+            if [ -n "$u" ]; then echo "$k  $(name_of "$u")  $u"; else echo "$k  （默认/未设置）"; fi
+        done ;;
+    -h|--help|help) sed -n '2,15p' "$0" ;;
+    *) echo "未知命令：$cmd（auto / probe / set / add / show）" >&2; exit 2 ;;
+esac

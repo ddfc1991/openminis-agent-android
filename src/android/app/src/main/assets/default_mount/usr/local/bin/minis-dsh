@@ -1,0 +1,386 @@
+#!/bin/sh
+# minis-dsh: use DeepSeek Harness (dsh) plugins in Minis, without installing dsh.
+#
+#   minis-dsh add <npm-package | github:owner/repo>   install a dsh plugin
+#   minis-dsh remove <package>                          uninstall it
+#   minis-dsh list                                      what is installed and which tools each one adds
+#   minis-dsh off|on <package>                          disable / re-enable without uninstalling
+#   minis-dsh gateway                                   serve plugin models (OpenAI format) on 127.0.0.1:8790
+#   minis-dsh web                                       serve Web UI / widget plugins on 127.0.0.1:8791
+#   minis-dsh selftest                                  install known plugins in a scratch home and check they load
+#   minis-dsh wb-login <file> [--ai]                    phone sign-in for dsh-workbuddy-connect
+#   minis-dsh mcp-add <name> <npm-package> [args…]       add an MCP server (runs with npx)
+#   minis-dsh mcp-remove <name>                         remove it
+#
+# All plugins share ONE MCP server named "dsh" in Minis (started only when a
+# tool is called), so adding plugins doesn't add background processes.
+# Works for plugins that add tools / prompt sections, model providers (llm
+# service → `gateway`) and Web UI widgets (webServer → `web`, shown by Mines
+# as a floating widget). Plugins needing dsh's own model loop or sessions are
+# reported as unsupported. Installs never ask questions (no terminal needed).
+set -e
+H="${MINIS_DSH_HOME:-$HOME/.minis-dsh}"
+SOCK="${MINIS_DSH_SOCK:-/usr/local/lib/minis-dsh/socket.mjs}"
+SERVERS="${MINIS_MCP_SERVERS:-/var/minis/mcp-servers/servers.json}"
+mkdir -p "$H"
+[ -f "$H/package.json" ] || printf '{"name":"minis-dsh-plugins","private":true,"type":"module"}\n' > "$H/package.json"
+[ -f "$H/plugins.json" ] || printf '{"plugins":[]}\n' > "$H/plugins.json"
+
+need_node() {
+    git_https
+    command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && return
+    echo "第一次使用，正在安装 Node.js（只装一次）…" >&2
+    apk add --no-cache nodejs npm >/dev/null
+}
+
+# [Mines-38.9.7] the phone sandbox has no GitHub SSH key: npm's git deps (github:, git+ssh://) go over HTTPS, never prompt
+git_https() {
+    export GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=2 \
+        GIT_CONFIG_KEY_0=url.https://github.com/.insteadOf GIT_CONFIG_VALUE_0=ssh://git@github.com/ \
+        GIT_CONFIG_KEY_1=url.https://github.com/.insteadOf GIT_CONFIG_VALUE_1=git@github.com:
+    command -v git >/dev/null 2>&1 || { command -v apk >/dev/null 2>&1 && apk add --no-cache git >/dev/null 2>&1; } || true
+}
+
+# npm spec -> HTTPS spec for GitHub (github:o/r, git+ssh://git@github.com/o/r.git, git@github.com:o/r.git)
+https_spec() {
+    printf '%s' "$1" | sed -E 's#^github:([^/]+)/([^#]+)#git+https://github.com/\1/\2.git#; s#^(git\+)?ssh://git@github\.com[:/]#git+https://github.com/#; s#^git@github\.com:#git+https://github.com/#; s#\.git\.git#.git#'
+}
+
+# [Mines-dsh-25] The plugin check, as Mines runs it: bounded in time, stdin
+# closed, output through a file so a process a plugin leaves behind can't keep
+# the caller's pipe open. socket.mjs also kills its children on exit.
+check() {
+    _o=$(mktemp)
+    MINIS_DSH_HOME="$H" timeout 90 node "$SOCK" --check </dev/null >"$_o" 2>&1 || echo "（检查超时或出错，下面是已知结果）" >>"$_o"
+    cat "$_o"; rm -f "$_o"
+}
+
+# Edit plugins.json / servers.json with node (always present after need_node).
+js() { node --input-type=module -e "$1" -- "$@"; }
+
+register_mcp() {
+    [ -f "$SERVERS" ] || { echo "minis-dsh: 找不到 Minis 的 MCP 配置（$SERVERS）" >&2; return 0; }
+    NODE_BIN=$(command -v node)
+    SERVERS="$SERVERS" NODE_BIN="$NODE_BIN" SOCK="$SOCK" H="$H" node --input-type=module -e '
+      import fs from "node:fs"
+      const f = process.env.SERVERS
+      const j = JSON.parse(fs.readFileSync(f, "utf8") || "{}")
+      j.mcpServers ||= {}
+      j.mcpServers.dsh = { command: process.env.NODE_BIN, args: [process.env.SOCK],
+        env: { MINIS_DSH_HOME: process.env.H }, note: "dsh 插件插座（minis-dsh 管理）" }
+      fs.writeFileSync(f, JSON.stringify(j, null, 2))
+    '
+}
+
+unregister_if_empty() {
+    [ -f "$SERVERS" ] || return 0
+    H="$H" SERVERS="$SERVERS" node --input-type=module -e '
+      import fs from "node:fs"
+      const p = JSON.parse(fs.readFileSync(process.env.H + "/plugins.json", "utf8"))
+      if ((p.plugins || []).length) process.exit(0)
+      const j = JSON.parse(fs.readFileSync(process.env.SERVERS, "utf8"))
+      if (j.mcpServers) delete j.mcpServers.dsh
+      fs.writeFileSync(process.env.SERVERS, JSON.stringify(j, null, 2))
+    '
+}
+
+set_state() { # op pkg
+    H="$H" OP="$1" PKG="$2" node --input-type=module -e '
+      import fs from "node:fs"
+      const f = process.env.H + "/plugins.json"
+      const j = JSON.parse(fs.readFileSync(f, "utf8")); j.plugins ||= []
+      const pkg = process.env.PKG, op = process.env.OP
+      const i = j.plugins.findIndex(p => p.package === pkg)
+      if (op === "add") { if (i < 0) j.plugins.push({ package: pkg, enabled: true }); else j.plugins[i].enabled = true }
+      if (op === "remove" && i >= 0) j.plugins.splice(i, 1)
+      if (op === "off" && i >= 0) j.plugins[i].enabled = false
+      if (op === "on" && i >= 0) j.plugins[i].enabled = true
+      fs.writeFileSync(f, JSON.stringify(j, null, 2))
+    '
+}
+
+# [Mines-dsh] Make package.json list every package that is already installed
+# at top level. npm prunes anything installed but not in the manifest, which is
+# how one `add` used to remove 17 other plugins ("removed 17 packages").
+adopt_installed() {
+    [ -d "$H/node_modules" ] || return 0
+    H="$H" node --input-type=module -e '
+      import fs from "node:fs"; import path from "node:path"
+      const H = process.env.H, f = path.join(H, "package.json")
+      const pj = JSON.parse(fs.readFileSync(f, "utf8")); pj.dependencies ||= {}
+      const nm = path.join(H, "node_modules")
+      const tops = []
+      for (const d of fs.readdirSync(nm)) {
+        if (d.startsWith(".")) continue
+        if (d.startsWith("@")) { for (const e of fs.readdirSync(path.join(nm, d))) tops.push(d + "/" + e) } else tops.push(d)
+      }
+      // Only adopt what something we manage needs: plugins in plugins.json and
+      // the @deepseek-ai libraries; transitive deps stay transitive.
+      let plugins = []
+      try { plugins = (JSON.parse(fs.readFileSync(path.join(H, "plugins.json"), "utf8")).plugins || []).map(p => p.package) } catch {}
+      let changed = false
+      for (const name of tops) {
+        if (pj.dependencies[name]) continue
+        if (!plugins.includes(name) && !name.startsWith("@deepseek-ai/")) continue
+        try {
+          const v = JSON.parse(fs.readFileSync(path.join(nm, name, "package.json"), "utf8")).version
+          if (v) { pj.dependencies[name] = "^" + v; changed = true }
+        } catch {}
+      }
+      if (changed) fs.writeFileSync(f, JSON.stringify(pj, null, 2) + "\n")
+    ' 2>/dev/null || true
+}
+
+# npm spec -> installed package name
+pkg_name() {
+    case "$1" in
+        github:*|*/*.git|https://*|git+*)
+            (cd "$H" && node -e 'const d=require("./package.json").dependencies||{};const s=process.argv[1];for(const[k,v]of Object.entries(d))if(v.includes(s.replace(/^github:/,"").replace(/^https:\/\/github.com\//,"").replace(/\.git$/,""))){console.log(k);process.exit(0)}' "$1") ;;
+        @*/*@*) echo "${1%@*}" ;;
+        @*) echo "$1" ;;
+        *@*) echo "${1%%@*}" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+# [Mines-38.9.7] the agent's path to a DSH tool: plugin → socket.mjs (stdio MCP server "dsh") → tools/call.
+# Plants a tiny tool plugin, runs initialize + tools/list + tools/call exactly as Mines' MCP client does, removes it.
+call_test() {
+    # own variable names: selftest keeps its `out` (the list output) and its temp MINIS_DSH_HOME
+    _H="${MINIS_DSH_HOME:-$H}"; mkdir -p "$_H"; [ -f "$_H/plugins.json" ] || echo '{"plugins":[]}' > "$_H/plugins.json"
+    _CE="$_H/node_modules/mines-selftest-echo"; mkdir -p "$_CE"
+    printf '{"name":"mines-selftest-echo","version":"1.0.0","type":"module","main":"index.js"}\n' > "$_CE/package.json"
+    printf 'export default { name: "mines-selftest-echo", apply(ctx) { ctx.tools.register({ name: "mines_echo", description: "echo", parameters: { type: "object", properties: { text: { type: "string" } } }, execute: async (a) => "echo:" + a.text }) } }\n' > "$_CE/index.js"
+    H="$_H" node --input-type=module -e '
+      import fs from "node:fs"; const f = process.env.H + "/plugins.json"
+      const j = JSON.parse(fs.readFileSync(f, "utf8")); j.plugins = j.plugins.filter(p => p.package !== "mines-selftest-echo"); j.plugins.push({ package: "mines-selftest-echo", enabled: true })
+      fs.writeFileSync(f, JSON.stringify(j, null, 2))'
+    _co=$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
+        '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+        '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"mines_echo","arguments":{"text":"hi"}}}' \
+        | (cat; sleep 8) | MINIS_DSH_HOME="$_H" timeout 60 node "$SOCK" 2>/dev/null)
+    H="$_H" node --input-type=module -e '
+      import fs from "node:fs"; const f = process.env.H + "/plugins.json"
+      const j = JSON.parse(fs.readFileSync(f, "utf8")); j.plugins = j.plugins.filter(p => p.package !== "mines-selftest-echo")
+      fs.writeFileSync(f, JSON.stringify(j, null, 2))'
+    rm -rf "$_CE"
+    _cn=$(printf '%s\n' "$_co" | grep -c '"name":"[^"]*"' || true)
+    if printf '%s' "$_co" | grep -q 'echo:hi'; then echo "✓ DSH 工具调用：tools/call mines_echo → echo:hi（共列出工具 $_cn 行）"; return 0; fi
+    echo "✗ DSH 工具调用没成功"; printf '%s\n' "$_co" | head -5; return 1
+}
+
+cmd="${1:-help}"; [ $# -gt 0 ] && shift
+case "$cmd" in
+add)
+    [ -n "$1" ] || { echo "用法: minis-dsh add <npm 包名 或 github:用户/仓库>" >&2; exit 2; }
+    need_node
+    echo "安装 $1 …" >&2
+    NPMI="npm install --save --no-audit --no-fund --omit=dev --ignore-scripts --legacy-peer-deps --yes"
+    export npm_config_yes=true CI=true
+    adopt_installed
+    # The pieces of dsh that plugins import directly (about 11 MB, installed once).
+    [ -d "$H/node_modules/@deepseek-ai/dsh-tools" ] || (cd "$H" && $NPMI @deepseek-ai/dsh-tools@next @deepseek-ai/cordis@next \
+        @deepseek-ai/dsh-scope@next @deepseek-ai/dsh-llm@next @deepseek-ai/dsh-sandbox@next \
+        @deepseek-ai/dsh-llm-pi-ai@next @deepseek-ai/schemastery @deepseek-ai/dsh-home-paths@next >&2) || true
+    _l=$(mktemp)
+    if ! (cd "$H" && $NPMI "$1" >"$_l" 2>&1); then
+        cat "$_l" >&2
+        if grep -qiE 'publickey|ssh://git@github|Host key verification' "$_l"; then
+            echo "这个插件要从 GitHub 拉代码，已改用 HTTPS 重试 RETRIED_HTTPS" >&2
+            (cd "$H" && $NPMI "$(https_spec "$1")" >&2) || { rm -f "$_l"; exit 1; }
+        else rm -f "$_l"; exit 1; fi
+    else cat "$_l" >&2; fi
+    rm -f "$_l"
+    name=$(pkg_name "$1"); [ -n "$name" ] || name="$1"
+    set_state add "$name"
+    # Fill in any other dsh library the plugin imports (only @deepseek-ai/*).
+    i=0
+    while [ $i -lt 16 ]; do
+        miss=$(check | grep -F "$name" | grep -o "Cannot find package '@deepseek-ai/[^']*'" | sed "s/Cannot find package '//;s/'//" | head -1)
+        [ -n "$miss" ] || break
+        echo "补装 $miss …" >&2
+        (cd "$H" && { $NPMI "$miss@next" >/dev/null 2>&1 || $NPMI "$miss" >/dev/null 2>&1; }) || break
+        i=$((i+1))
+    done
+    adopt_installed
+    register_mcp
+    check | grep -F "$name" || true
+    ;;
+remove|rm)
+    need_node
+    name=$(pkg_name "$1")
+    set_state remove "$name"
+    adopt_installed
+    (cd "$H" && npm uninstall --save --no-audit --no-fund "$name" >/dev/null 2>&1) || true
+    unregister_if_empty
+    echo "已卸载 $name"
+    ;;
+off|on)
+    need_node; set_state "$cmd" "$1"
+    # [Mines-dsh-29] `off` used to only edit plugins.json: the running widget
+    # host (minis-dsh web) and the app's floating widget kept going. Stop the
+    # host so it reloads without the plugin, refresh status.json (the app's
+    # widget window watches it and closes when no enabled widget is left).
+    pkill -f "socket.mjs --web" 2>/dev/null || true
+    check >/dev/null 2>&1 || true
+    echo "$1: $cmd" ;;
+list|ls)
+    need_node
+    check
+    ;;
+calltest)
+    need_node; call_test ;;
+gateway)
+    need_node
+    exec env MINIS_DSH_HOME="$H" node "$SOCK" --gateway ;;
+web)
+    need_node
+    exec env MINIS_DSH_HOME="$H" node "$SOCK" --web ;;
+selftest)
+    # [Mines-dsh-25] Exercises the code path the app uses, not a shortcut:
+    #   1. installs the plugins with `minis-dsh add` (as the market does);
+    #   2. plants a stale status.json from an older build plus a plugin that
+    #      leaves a child process running, then runs `minis-dsh list` (what
+    #      「检查」 runs) and requires it to finish in time and kill the child;
+    #   3. reads status.json the way Mines does (kind + status.meta.json);
+    #   4. starts `minis-dsh web` (what 「显示挂件」 starts) and checks the page,
+    #      the widget script, and that the widget can find its chat root.
+    # Exit 0 only when every step passes.
+    need_node
+    T=$(mktemp -d)
+    export MINIS_DSH_HOME="$T/home" MINIS_MCP_SERVERS="$T/servers.json"
+    echo '{"mcpServers":{}}' > "$MINIS_MCP_SERVERS"
+    PLUGS="${*:-dsh-workbuddy-connect dsh-whale-widget}"
+    rc=0
+    for p in $PLUGS; do
+        echo "== 安装 $p" >&2
+        sh "$0" add "$p@latest" >"$T/add.log" 2>&1 || { echo "✗ $p 安装失败"; tail -5 "$T/add.log"; rc=1; }
+    done
+    # Stale status (build-23 socket: no ui, no kind, no meta) + a lingering plugin.
+    printf '{"dsh-whale-widget":{"ok":true,"reason":"","tools":[],"llm":[]}}\n' > "$MINIS_DSH_HOME/status.json"
+    rm -f "$MINIS_DSH_HOME/status.meta.json"
+    L="$MINIS_DSH_HOME/node_modules/mines-selftest-linger"; mkdir -p "$L"
+    printf '{"name":"mines-selftest-linger","version":"1.0.0","type":"module","main":"index.js"}\n' > "$L/package.json"
+    printf 'import { exec } from "node:child_process"\nexport default { name: "linger", apply() { exec("sleep 307") } }\n' > "$L/index.js"
+    H="$MINIS_DSH_HOME" node --input-type=module -e '
+      import fs from "node:fs"; const f = process.env.H + "/plugins.json"
+      const j = JSON.parse(fs.readFileSync(f, "utf8")); j.plugins.push({ package: "mines-selftest-linger", enabled: true })
+      fs.writeFileSync(f, JSON.stringify(j, null, 2))'
+    t0=$(date +%s)
+    out=$(sh "$0" list 2>&1); echo "$out"
+    t1=$(date +%s)
+    if [ $((t1 - t0)) -le 60 ]; then echo "✓ 检查 $((t1 - t0)) 秒内结束"; else echo "✗ 检查用了 $((t1 - t0)) 秒"; rc=1; fi
+    sleep 1
+    if ps -o pid,args 2>/dev/null | grep -v grep | grep -q "sleep 307" || ps aux 2>/dev/null | grep -v grep | grep -q "sleep 307"; then
+        echo "✗ 插件留下的子进程没被清理"; rc=1; pkill -f "sleep 307" 2>/dev/null
+    else echo "✓ 插件子进程已清理"; fi
+    H="$MINIS_DSH_HOME" node --input-type=module -e '
+      import fs from "node:fs"; const f = process.env.H + "/plugins.json"
+      const j = JSON.parse(fs.readFileSync(f, "utf8")); j.plugins = j.plugins.filter(p => p.package !== "mines-selftest-linger")
+      fs.writeFileSync(f, JSON.stringify(j, null, 2))'
+    rm -rf "$L"
+    for p in $PLUGS; do printf '%s\n' "$out" | grep -q "^✓ $p" || { echo "✗ $p 没加载"; rc=1; }; done
+    call_test || rc=1   # [38.9.7] after the list check (it used to overwrite $out)
+    # What the app reads.
+    H="$MINIS_DSH_HOME" PLUGS="$PLUGS" node --input-type=module -e '
+      import fs from "node:fs"; const H = process.env.H
+      let bad = 0
+      const meta = JSON.parse(fs.readFileSync(H + "/status.meta.json", "utf8"))
+      if (!(meta.v >= 25)) { console.log("✗ status.meta.json 版本不对"); bad = 1 } else console.log("✓ 状态文件版本 " + meta.v)
+      const st = JSON.parse(fs.readFileSync(H + "/status.json", "utf8"))
+      const want = { "dsh-whale-widget": "widget", "dsh-workbuddy-connect": "model" }
+      for (const p of process.env.PLUGS.split(/\s+/).filter(Boolean)) {
+        const k = st[p] && st[p].kind
+        if (want[p] && k !== want[p]) { console.log(`✗ ${p} 类型是 ${k}，应为 ${want[p]}`); bad = 1 } else console.log(`✓ ${p} 类型 ${k}`)
+      }
+      process.exit(bad)' || rc=1
+    if printf '%s\n' "$PLUGS" | grep -q whale; then
+        MINIS_DSH_WEB_PORT=18791 sh "$0" web >"$T/web.log" 2>&1 & wp=$!
+        ok=0; i=0; while [ $i -lt 60 ]; do curl -fs http://127.0.0.1:18791/__mines/health >/dev/null 2>&1 && { ok=1; break; }; sleep 0.5; i=$((i+1)); done
+        page=$(curl -fs http://127.0.0.1:18791/ 2>/dev/null)
+        if [ $ok = 1 ] && printf '%s' "$page" | grep -q 'id="root"' && printf '%s' "$page" | grep -q "dsh-whale/widget.js"; then echo "✓ 挂件页面可用（含 #root 和挂件脚本）"; else echo "✗ 挂件页面没起来或缺少挂件脚本"; rc=1; fi
+        code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18791/dsh-whale/widget.js)
+        [ "$code" = 200 ] && echo "✓ 挂件脚本 200" || { echo "✗ 挂件脚本 $code"; rc=1; }
+        # Headless browser, when the machine has one (CI does): the widget must
+        # actually start (it only starts when it finds a chat composer in #root).
+        BR=$(command -v google-chrome || command -v chromium || command -v chromium-browser || true)
+        if [ -n "$BR" ]; then
+            dom=$("$BR" --headless=new --no-sandbox --disable-gpu --window-size=300,380 --virtual-time-budget=9000 --dump-dom http://127.0.0.1:18791/ 2>/dev/null)
+            if printf '%s' "$dom" | grep -q 'dshwv-'; then echo "✓ 挂件在浏览器里启动了"; else echo "✗ 挂件在浏览器里没有启动"; rc=1; fi
+        else echo "· 没有浏览器，跳过渲染检查"; fi
+        kill $wp 2>/dev/null; pkill -f "socket.mjs --web" 2>/dev/null || true
+    fi
+    rm -rf "$T"; echo "selftest rc=$rc"; exit $rc
+    ;;
+wb-login)
+    # The phone has no WorkBuddy desktop app, so the plugin can't read its
+    # sign-in. Take a sign-in the user copies over instead and store it as the
+    # plugin's own credential copy ($DSH_HOME/.workbuddy[-ai]-auth.json), which
+    # the plugin reads and refreshes by itself.
+    [ -n "$1" ] || { echo "用法: minis-dsh wb-login <登录文件> [--ai]" >&2; exit 2; }
+    need_node
+    IN="$1" AI="${2:-}" node --input-type=module -e '
+      import fs from "node:fs"; import path from "node:path"
+      const text = fs.readFileSync(process.env.IN, "utf8").trim()
+      const home = process.env.DSH_HOME || path.join(process.env.HOME || "/root", ".dsh")
+      const ms = (v) => typeof v !== "number" || v <= 0 ? 0 : (v > 1e12 ? v : v * 1000)
+      const str = (v) => typeof v === "string" && v ? v : undefined
+      let doc; try { doc = JSON.parse(text) } catch {}
+      let cred
+      if (doc && doc.version === 1 && doc.credential) cred = doc.credential
+      else if (doc && typeof doc === "object") {
+        const auth = doc.auth && typeof doc.auth === "object" ? doc.auth : doc
+        const acc = doc.account && typeof doc.account === "object" ? doc.account : doc
+        if (str(auth.accessToken)) cred = {
+          accessToken: auth.accessToken, refreshToken: str(auth.refreshToken) || "",
+          expiresAtMs: ms(auth.expiresAt) || ms(auth.expiresAtMs) || Date.now() + 6 * 3600e3,
+          ...(ms(auth.refreshExpiresAt) ? { refreshExpiresAtMs: ms(auth.refreshExpiresAt) } : {}),
+          domain: str(auth.domain) || "", uid: str(acc.uid) || "",
+          ...(str(acc.enterpriseId) ? { enterpriseId: acc.enterpriseId } : {}),
+          ...(str(acc.nickname) ? { nickname: acc.nickname } : {}), source: "desktop" }
+        else { console.error("这个文件里没有可用的登录令牌。新版 WorkBuddy 桌面端的 .info 文件是加密的，手机解不开：请在电脑上用 DSH 装好 WorkBuddy 插件并运行一次，然后拷贝电脑上的 ~/.dsh/.workbuddy-auth.json（国际版是 .workbuddy-ai-auth.json）。"); process.exit(3) }
+      } else if (/^[A-Za-z0-9._~+\/=-]{20,}$/.test(text)) {
+        cred = { accessToken: text, refreshToken: "", expiresAtMs: Date.now() + 6 * 3600e3, domain: process.env.AI ? "www.workbuddy.ai" : "", uid: "", source: "desktop" }
+      } else { console.error("看不懂这个登录信息。"); process.exit(3) }
+      if (process.env.AI && !cred.domain) cred.domain = "www.workbuddy.ai"
+      const global = /(^|\.)workbuddy\.ai$/i.test((cred.domain || "").trim())
+      fs.mkdirSync(home, { recursive: true, mode: 0o700 })
+      const out = path.join(home, global ? ".workbuddy-ai-auth.json" : ".workbuddy-auth.json")
+      fs.writeFileSync(out, JSON.stringify({ version: 1, credential: cred }, null, 2) + "\n", { mode: 0o600 })
+      console.log(`已保存 ${global ? "WorkBuddy AI（国际版）" : "WorkBuddy（国内版）"} 登录${cred.nickname ? "：" + cred.nickname : ""}`)
+    '
+    case "$1" in "$H"/*) rm -f "$1" ;; esac   # the app's temporary import copy
+    ;;
+mcp-add)
+    [ -n "$2" ] || { echo "用法: minis-dsh mcp-add <名字> <npm 包> [参数…]" >&2; exit 2; }
+    need_node
+    name="$1"; pkg="$2"; shift 2
+    [ -f "$SERVERS" ] || { mkdir -p "$(dirname "$SERVERS")"; echo '{"mcpServers":{}}' > "$SERVERS"; }
+    echo "预先安装 $pkg …" >&2
+    # [Mines-mcp-29] Install globally so the server starts as `node <bin>`
+    # without npx asking the registry on every cold start (minis-mcp-cli
+    # resolves `npx -y <pkg>` to the global install when it exists).
+    timeout 600 npm install -g --no-audit --no-fund "$pkg" >/dev/null 2>&1 || npm cache add "$pkg" >/dev/null 2>&1 || true
+    SERVERS="$SERVERS" NAME="$name" PKG="$pkg" ARGS="$*" node --input-type=module -e '
+      import fs from "node:fs"
+      const f = process.env.SERVERS
+      const j = JSON.parse(fs.readFileSync(f, "utf8") || "{}"); j.mcpServers ||= {}
+      const extra = (process.env.ARGS || "").split(" ").filter(Boolean)
+      j.mcpServers[process.env.NAME] = { command: "npx", args: ["-y", process.env.PKG, ...extra], note: "来自 Mines 市场" }
+      fs.writeFileSync(f, JSON.stringify(j, null, 2))
+    '
+    echo "已添加 MCP 服务 $name"
+    ;;
+mcp-remove)
+    need_node
+    SERVERS="$SERVERS" NAME="$1" node --input-type=module -e '
+      import fs from "node:fs"
+      const f = process.env.SERVERS
+      const j = JSON.parse(fs.readFileSync(f, "utf8") || "{}")
+      if (j.mcpServers) delete j.mcpServers[process.env.NAME]
+      fs.writeFileSync(f, JSON.stringify(j, null, 2))
+    '
+    echo "已移除 MCP 服务 $1"
+    ;;
+*) sed -n '2,22p' "$0" ;;
+esac

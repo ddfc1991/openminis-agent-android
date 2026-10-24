@@ -49,7 +49,7 @@ import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
+import com.openminis.app.ui.theme.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -220,7 +220,8 @@ private fun availableCredentials(type: ProviderType): List<ProviderCredential> {
         ProviderType.openRouter -> listOf(ProviderCredential.apiKey, ProviderCredential.oauth)
         ProviderType.anthropic,
         ProviderType.openAI -> listOf(ProviderCredential.apiKey, ProviderCredential.oauth)
-        ProviderType.gemini -> listOf(ProviderCredential.apiKey)
+        // [Mines-38.9.11 b] Google-account sign-in (Code Assist pool, Pro quota) first, API key second
+        ProviderType.gemini -> listOf(ProviderCredential.oauth, ProviderCredential.apiKey)
         // xAI Grok primarily targets SuperGrok / X Premium+ OAuth, but also
         // offers a plain API key path (api.x.ai). Mirror OpenAI's pattern
         // of exposing both so users on tiers without OAuth API access can
@@ -321,6 +322,22 @@ private fun ChooseProviderScreen(
             }
         }
 
+        // [Mines-38.9.9] GitHub Models preset: OpenAI-compatible, base …/inference (no /v1), ids publisher/model,
+        // model list from the public catalogue. Needs a GitHub token with the Models: read permission.
+        SettingsSection(
+            header = "常用预设",
+            footer = "GitHub Models：用 GitHub 细粒度令牌（勾选 Models: read）。地址 https://models.github.ai/inference，不加 /v1；模型 id 形如 openai/gpt-4.1，免费额度每天有限。",
+        ) {
+            SettingsRow(
+                title = "GitHub Models",
+                subtitle = "OpenAI 兼容 · 免费额度 · 令牌需要 Models 权限",
+                icon = Icons.Default.Hub,
+                iconColor = Color(0xFF6E5494),
+                onClick = { onSelectVoiceTemplate(com.openminis.app.data.model.VoiceProviderTemplate.githubModels) },
+                showDivider = false,
+            )
+        }
+
         // [T-android-provider-voice] Voice Chat Providers — one row per voice
         // vendor template. Tapping prefills the underlying protocol + base URL
         // and jumps to configure (mirrors iOS voiceProviderSection).
@@ -364,6 +381,7 @@ private fun ChooseCredentialScreen(
     onSelect: (ProviderCredential) -> Unit,
 ) {
     val credentials = availableCredentials(providerType)
+    val credCtx = LocalContext.current
 
     SettingsScaffold(
         title = stringResource(R.string.add_provider_auth_method),
@@ -390,7 +408,11 @@ private fun ChooseCredentialScreen(
                     title = title,
                     subtitle = description,
                     icon = icon,
-                    onClick = { onSelect(credential) },
+                    onClick = {
+                        // [Mines-38.9.11 b] Gemini + 谷歌账号 → the account-pool page (many isolated Google accounts)
+                        if (providerType == ProviderType.gemini && credential == ProviderCredential.oauth) com.openminis.app.plus.GeminiAccounts.open(credCtx, addNew = true)
+                        else onSelect(credential)
+                    },
                     showDivider = index < credentials.size - 1,
                 )
             }
@@ -408,7 +430,7 @@ private fun apiKeyDescription(type: ProviderType): String = when (type) {
     ProviderType.kimiCode -> "Use an API key from your Moonshot account"
     // [T-copilot-provider] Never offered (availableCredentials returns OAuth
     // only); present because this helper is total over the enum.
-    ProviderType.githubCopilot -> "GitHub Copilot requires signing in with GitHub"
+    ProviderType.githubCopilot -> "GitHub Copilot 需要用 GitHub 账号登录"
     ProviderType.openAIResponses -> "Supports the OpenAI Responses API and compatible endpoints"
     ProviderType.antigravity,
     ProviderType.unsupported -> "This provider type is not supported on Android"
@@ -416,7 +438,7 @@ private fun apiKeyDescription(type: ProviderType): String = when (type) {
 
 private fun oauthDescription(type: ProviderType): String = when (type) {
     ProviderType.anthropic -> "Sign in with your Claude account"
-    ProviderType.gemini -> "Sign in with Google for Cloud Code Assist"
+    ProviderType.gemini -> "用谷歌账号登录（Gemini Pro 免费额度，可加多个账号轮流用，不用 API Key）"
     ProviderType.openAI -> "Sign in with OpenAI Codex"
     ProviderType.xAI -> "Sign in with xAI (requires SuperGrok or X Premium+)"
     ProviderType.openRouter -> "Sign in with OpenRouter"
@@ -599,13 +621,13 @@ private fun ColumnScope.ApiKeyConfigSection(
         // without scraping issue threads. Default Anthropic + other
         // provider types keep their original footer copy.
         val baseUrlFooter = if (providerType == ProviderType.gemini) {
-            "Leave empty to use the default Google endpoint. Enter the full base URL including version path."
+            "留空就用 Google 默认地址；要填的话，请填到版本路径为止的完整地址（例如 …/v1beta）。"
         } else if (providerType == ProviderType.anthropic) {
             stringResource(R.string.add_provider_endpoint_anthropic_hint)
         } else if (appendV1Suffix) {
-            "Leave empty to use the default endpoint. \"/v1\" is appended automatically — enter the base host only."
+            "留空就用默认地址。会自动在末尾加上「/v1」，这里只填主机地址即可。"
         } else {
-            "The URL is used verbatim. Include the full path up to (but not including) the endpoint."
+            "地址会原样使用：请填到接口名之前的完整路径（不含 /chat/completions 这类接口名）。"
         }
         SettingsSection(
             header = stringResource(R.string.add_provider_endpoint),

@@ -2,11 +2,14 @@ package com.openminis.app.ui.components
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.AnchoredDraggableState
-import androidx.compose.foundation.gestures.DraggableAnchors
-import androidx.compose.foundation.gestures.Orientation
-import androidx.compose.foundation.gestures.anchoredDraggable
-import androidx.compose.foundation.gestures.animateTo
+import androidx.compose.animation.core.Animatable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.positionChangeIgnoreConsumed
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.util.VelocityTracker
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -31,8 +34,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.compositeOver
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.layout
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
@@ -50,8 +56,6 @@ data class SwipeRowAction(
     val onClick: () -> Unit,
 )
 
-/** Anchor states for [SwipeRowActions]. */
-private enum class SwipeAnchor { Resting, Revealed }
 
 /**
  * [T-android-swipe-row-actions] Swipe-LEFT-to-reveal action buttons behind a
@@ -103,34 +107,87 @@ fun SwipeRowActions(
     val haptics = LocalHapticFeedback.current
     val scope = rememberCoroutineScope()
     val revealPx = with(density) { (actionWidth * actions.size).toPx() }
+    val flingPx = with(density) { 400.dp.toPx() }
 
-    val state = remember(revealPx) {
-        AnchoredDraggableState(
-            initialValue = SwipeAnchor.Resting,
-            anchors = DraggableAnchors {
-                SwipeAnchor.Resting at 0f
-                SwipeAnchor.Revealed at -revealPx
-            },
-        )
-    }
-
-    // Buzz once when the row latches open, matching the long-press feedback
-    // the rest of this app's list interactions give.
-    LaunchedEffect(state.settledValue) {
-        if (state.settledValue == SwipeAnchor.Revealed) {
-            haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-        }
+    // [Mines-38.9.9 i27] ONE gesture owner for every swipe row (服务商 / 模型组 / 备份): the OUTER, non-moving Box watches
+    // the pointer in the Initial pass (before any child) and only consumes once the finger has moved past touch slop
+    // horizontally. So: children (row click, long-press reorder handle, nested clickables) can no longer steal the swipe
+    // (smoke 39197873667 服务商: drag ended with off=0), and a tap that never moves is NOT consumed, so the 编辑 / 删除
+    // buttons uncovered by the slid row get their own clicks (the old detector sat before .offset on the foreground,
+    // whose un-moved bounds covered the buttons and swallowed the 删除 tap → no dialog).
+    val offset = remember(revealPx) { Animatable(0f) }
+    fun settle(open: Boolean) = scope.launch {
+        offset.animateTo(if (open) -revealPx else 0f)
+        if (open) haptics.performHapticFeedback(HapticFeedbackType.LongPress)
     }
 
     var rowHeightPx by remember { mutableIntStateOf(0) }
     val rowHeight = with(density) { rowHeightPx.toDp() }
 
-    Box(modifier = modifier.clipToBounds()) {
-        // Action buttons sit UNDER the row, pinned to the trailing edge, and
-        // are sized to the row's measured height so they never dictate it.
-        Row(
+    // Opaque slid row: the card colour is translucent glass, so it is laid over the theme's opaque reading paper
+    // (light #FFFCF9 / dark #24201F). [i27] (was laid over a fixed page tint / Transparent surface → greyish in light.)
+    val m = com.openminis.app.ui.plus.mines()
+    val paper = com.openminis.app.ui.plus.minesReadingSurface()
+    val solidRow = SwipeRevealCore.solidRowColor(rowColor, paper, m.dark)
+    val off = offset.value
+    val open = SwipeRevealCore.showActions(off)
+    Box(
+        modifier = modifier
+            .clipToBounds()
+            .pointerInput(revealPx) {
+                val slop = viewConfiguration.touchSlop
+                val longPressMs = viewConfiguration.longPressTimeoutMillis
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                    val startOff = offset.value
+                    val onActions = SwipeRevealCore.hitsActions(down.position.x, size.width.toFloat(), startOff)
+                    val vt = VelocityTracker().apply { addPosition(down.uptimeMillis, down.position) }
+                    var dx = 0f; var dy = 0f; var dragging = false; var cur = startOff
+                    while (true) {
+                        val ev = awaitPointerEvent(PointerEventPass.Initial)
+                        val ch = ev.changes.firstOrNull { it.id == down.id } ?: break
+                        if (!ch.pressed) {
+                            if (dragging) {
+                                ch.consume()
+                                val v = vt.calculateVelocity().x
+                                val o = SwipeRevealCore.settleOpen(cur, v, revealPx, flingPx)
+                                SwipeRevealCore.probe = "end off=${cur.roundToInt()} v=${v.roundToInt()} reveal=${revealPx.roundToInt()} open=$o"
+                                settle(o)
+                            } else if (SwipeRevealCore.showActions(startOff) && !onActions) {
+                                // tap on the slid row while open = just close it (do not also open the row)
+                                ch.consume(); SwipeRevealCore.probe = "tapclose off=${startOff.roundToInt()}"; settle(false)
+                            } else if (onActions) {
+                                SwipeRevealCore.probe = "actiontap x=${down.position.x.roundToInt()} off=${startOff.roundToInt()}"
+                            }
+                            break
+                        }
+                        val d = ch.positionChangeIgnoreConsumed()
+                        vt.addPosition(ch.uptimeMillis, ch.position)
+                        if (!dragging) {
+                            dx += d.x; dy += d.y
+                            when (SwipeRevealCore.claim(dx, dy, slop, ch.uptimeMillis - down.uptimeMillis, longPressMs)) {
+                                SwipeRevealCore.Claim.VERTICAL, SwipeRevealCore.Claim.LONG_PRESS -> break   // scroll / reorder own it
+                                SwipeRevealCore.Claim.HORIZONTAL -> {
+                                    dragging = true; ch.consume()
+                                    cur = (startOff + dx).coerceIn(-revealPx, 0f)
+                                    SwipeRevealCore.probe = "start off=${startOff.roundToInt()}"
+                                    val t = cur; scope.launch { offset.snapTo(t) }
+                                }
+                                SwipeRevealCore.Claim.UNDECIDED -> Unit
+                            }
+                        } else {
+                            ch.consume()
+                            cur = (cur + d.x).coerceIn(-revealPx, 0f)
+                            val t = cur; scope.launch { offset.snapTo(t) }
+                        }
+                    }
+                }
+            },
+    ) {
+        if (open) Row(
             modifier = Modifier
                 .align(Alignment.CenterEnd)
+                .alpha(SwipeRevealCore.actionAlpha(off, revealPx))
                 .then(if (rowHeightPx > 0) Modifier.height(rowHeight) else Modifier),
             horizontalArrangement = Arrangement.End,
         ) {
@@ -141,19 +198,15 @@ fun SwipeRowActions(
                         .fillMaxHeight()
                         .background(action.containerColor)
                         .clickable {
-                            // Close first so the row is resting again whatever
-                            // the action does (open a dialog, navigate away).
-                            scope.launch { state.animateTo(SwipeAnchor.Resting) }
+                            // Run the action first (e.g. show the delete confirmation), then close the row.
+                            SwipeRevealCore.probe = "action ${action.label}"
                             action.onClick()
+                            settle(false)
                         },
                     verticalArrangement = Arrangement.Center,
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
-                    Icon(
-                        action.icon,
-                        contentDescription = action.label,
-                        tint = action.contentColor,
-                    )
+                    Icon(action.icon, contentDescription = action.label, tint = action.contentColor)
                     Text(
                         action.label,
                         style = MaterialTheme.typography.labelSmall,
@@ -164,24 +217,25 @@ fun SwipeRowActions(
             }
         }
 
+        // Foreground: no gesture code of its own. [Mines-38.9.10 i28] it NARROWS by the revealed width instead of sliding:
+        // smoke 39206653353 (cmp-01/02) showed the slid row as blank + chevron — the content moved left by 2 × 88 dp, which
+        // is wider than the title's left inset, so the whole title went off the clipped edge. Now the row is re-measured at
+        // (width − revealed): title / subtitle stay at their place and ellipsize, the chevron sits next to the buttons, and
+        // the uncovered buttons are outside the measured row, so they are hit-tested directly.
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .onSizeChanged { rowHeightPx = it.height }
-                // offset{} reads the drag value in the LAYOUT phase, so a drag
-                // reposition never invalidates composition.
-                .offset { IntOffset(state.requireOffset().roundToInt(), 0) }
-                // The row must be OPAQUE: the action buttons are painted behind
-                // it, so a transparent row leaves them permanently visible
-                // instead of revealed-on-swipe. [rowColor] defaults to the card
-                // surface these lists actually sit on.
-                .background(rowColor)
-                .anchoredDraggable(
-                    state = state,
-                    orientation = Orientation.Horizontal,
-                ),
+                .layout { measurable, constraints ->
+                    val full = constraints.maxWidth
+                    val w = SwipeRevealCore.narrowWidth(full, offset.value)
+                    val pl = measurable.measure(constraints.copy(minWidth = w, maxWidth = w))
+                    layout(full, pl.height) { pl.place(0, 0) }
+                }
+                .background(if (open) solidRow else rowColor),
         ) {
             content()
         }
     }
 }
+

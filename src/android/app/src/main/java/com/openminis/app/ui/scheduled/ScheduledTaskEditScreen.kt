@@ -1,5 +1,7 @@
 package com.openminis.app.ui.scheduled
 
+import com.openminis.app.ui.plus.MT
+
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -21,11 +23,11 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material3.AlertDialog
+import com.openminis.app.ui.glass.AlertDialog
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DatePicker
-import androidx.compose.material3.DatePickerDialog
+import com.openminis.app.ui.glass.DatePickerDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
@@ -39,12 +41,12 @@ import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TimeInput
-import androidx.compose.material3.TopAppBar
+import com.openminis.app.ui.theme.TopAppBar
 import androidx.compose.material3.rememberDatePickerState
 import androidx.compose.material3.rememberTimePickerState
 import com.openminis.app.data.model.ThinkingLevel
 import com.openminis.app.ui.chat.localizedName
-import androidx.compose.material3.ModalBottomSheet
+import com.openminis.app.ui.glass.ModalBottomSheet
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -451,7 +453,7 @@ private fun EditFormBody(
                         selected = targetKind == kind,
                         onClick = { onTargetKindChange(kind) },
                         shape = SegmentedButtonDefaults.itemShape(idx, targetOpts.size),
-                    ) { Text(stringResource(resId), fontSize = 13.sp) }
+                    ) { Text(stringResource(resId), fontSize = MT.Caption) }
                 }
             }
             if (targetKind != TargetKind.NEW) {
@@ -513,7 +515,7 @@ private fun EditFormBody(
                         selected = repeatMode == mode,
                         onClick = { onRepeatModeChange(mode) },
                         shape = SegmentedButtonDefaults.itemShape(idx, options.size),
-                    ) { Text(stringResource(resId), fontSize = 13.sp) }
+                    ) { Text(stringResource(resId), fontSize = MT.Caption) }
                 }
             }
             if (repeatMode == ScheduledRepeatMode.CUSTOM) {
@@ -537,7 +539,7 @@ private fun EditFormBody(
                                 }
                                 onCustomDaysChange(next)
                             },
-                            label = { Text(name, fontSize = 12.sp) },
+                            label = { Text(name, fontSize = MT.Caption) },
                             modifier = Modifier.weight(1f),
                         )
                     }
@@ -584,7 +586,7 @@ private fun EditFormBody(
         } else {
             Text(
                 stringResource(R.string.scheduled_task_rerun_note),
-                fontSize = 12.sp,
+                fontSize = MT.Caption,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
@@ -855,7 +857,7 @@ private fun MessagePickerDialog(
                             Modifier.fillMaxWidth().clickable { onPick(m.id, m.preview) }
                                 .padding(vertical = 10.dp),
                         ) {
-                            Text(m.preview, maxLines = 2, overflow = TextOverflow.Ellipsis, fontSize = 14.sp)
+                            Text(m.preview, maxLines = 2, overflow = TextOverflow.Ellipsis, fontSize = MT.Body)
                         }
                     }
                 }
@@ -879,7 +881,7 @@ private fun DateDialog(initialMs: Long?, onDismiss: () -> Unit, onPick: (Long) -
         },
         dismissButton = { MinisTextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) } },
     ) {
-        DatePicker(state = state)
+        DatePicker(state = state, colors = androidx.compose.material3.DatePickerDefaults.colors(containerColor = androidx.compose.ui.graphics.Color.Transparent))
     }
 }
 

@@ -43,7 +43,7 @@ import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material.icons.filled.Web
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
+import com.openminis.app.ui.glass.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
@@ -440,7 +440,7 @@ private fun IconOption(
                 color = borderColor,
                 shape = RoundedCornerShape(10.dp),
             )
-            .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(10.dp))
+            .background(MaterialTheme.colorScheme.surfaceContainerLow, RoundedCornerShape(10.dp))
             .clickable(onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {

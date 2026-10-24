@@ -14,7 +14,7 @@ import os
 import subprocess
 import threading
 
-from transport.http import MCPError, expand_env  # reuse error type + expander
+from transport.errors import MCPError, expand_env  # reuse error type + expander
 from utils import deps
 
 TIMEOUT_SECONDS = 300  # 5 min

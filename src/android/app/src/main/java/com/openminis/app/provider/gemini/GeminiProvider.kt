@@ -37,11 +37,16 @@ class GeminiProvider(
     private val apiKey: String,
     override var model: LLMModel = LLMModel.gemini25Flash,
     private val basePath: String = "https://generativelanguage.googleapis.com/v1beta",
+    /** [Mines-38.9.11 b] non-null = Google-account sign-in (Code Assist pool) instead of the API key */
+    private val codeAssist: CodeAssistTransport? = null,
 ) : LLMProvider {
     override val name = "Google"
 
     private val client = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
+        // [38.9.11.3] per-host route (China direct / foreign via proxy, the other as fallback), 10 s connect, DNS ≤ 5 s
+        .connectTimeout(com.openminis.app.plus.ProviderRouteCore.CONNECT_MS, TimeUnit.MILLISECONDS)
+        .proxySelector(com.openminis.app.plus.ProviderRoutes.selector)
+        .dns(com.openminis.app.plus.ProviderRoutes.TimedDns)
         .readTimeout(10, TimeUnit.MINUTES)
         .writeTimeout(30, TimeUnit.SECONDS)
         // [T-android-stale-conn-retry-hang] Shared pool — see NetworkMonitor.
@@ -59,6 +64,7 @@ class GeminiProvider(
         thinkingLevel: ThinkingLevel,
     ): LLMResponse = withContext(Dispatchers.IO) {
         val body = buildRequestBody(messages, systemPrompt, maxTokens, temperature, imageParts, tools, thinkingLevel)
+        val response = if (codeAssist != null) codeAssist.execute(model.id, body, stream = false) else {
         val url = "$basePath/models/${model.id}:generateContent?key=$apiKey"
         val request = Request.Builder()
             .url(url)
@@ -69,14 +75,15 @@ class GeminiProvider(
             .applyUserAgentOverride(null)
             .build()
 
-        val response = client.newCall(request).execute()
+        client.newCall(request).execute()
+        }
         val responseBody = response.body?.string() ?: ""
 
         if (!response.isSuccessful) {
             throw mapHttpError(response.code, responseBody)
         }
 
-        val json = JSONObject(responseBody)
+        val json = CodeAssistTransport.unwrap(JSONObject(responseBody))
         val text = extractText(json)
         val finishReason = extractFinishReason(json)
         val usage = extractUsage(json)
@@ -123,6 +130,7 @@ class GeminiProvider(
         thinkingLevel: ThinkingLevel,
     ): Flow<LLMStreamChunk> = callbackFlow {
         val body = buildRequestBody(messages, systemPrompt, maxTokens, temperature, imageParts, tools, thinkingLevel)
+        val response = if (codeAssist != null) codeAssist.execute(model.id, body, stream = true) else {
         val url = "$basePath/models/${model.id}:streamGenerateContent?alt=sse&key=$apiKey"
         val request = Request.Builder()
             .url(url)
@@ -132,7 +140,8 @@ class GeminiProvider(
             .applyUserAgentOverride(null)
             .build()
 
-        val response = client.newCall(request).execute()
+        client.newCall(request).execute()
+        }
         if (!response.isSuccessful) {
             val errorBody = response.body?.string() ?: ""
             response.close()
@@ -149,7 +158,7 @@ class GeminiProvider(
                 if (!l.startsWith("data: ")) continue
                 val payload = l.removePrefix("data: ")
 
-                val json = try { JSONObject(payload) } catch (_: Exception) { continue }
+                val json = try { CodeAssistTransport.unwrap(JSONObject(payload)) } catch (_: Exception) { continue }
 
                 if (!started) {
                     send(LLMStreamChunk.Started)

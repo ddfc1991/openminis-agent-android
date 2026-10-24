@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -44,7 +45,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
+import com.openminis.app.ui.theme.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -205,7 +206,7 @@ class WebAppActivity : ComponentActivity() {
 
     /**
      * T-pwa-3: replaces the prior toast-and-finish with an inline error
-     * screen offering an "Open in Minis" escape hatch.
+     * screen offering an "Open in Mines" escape hatch.
      */
     @OptIn(ExperimentalMaterial3Api::class)
     private fun renderSourceMissing(sourceSessionId: String?) {
@@ -285,7 +286,8 @@ class WebAppActivity : ComponentActivity() {
             }
         }
 
-        Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+        // [Mines-webfit-38.3] keyboard pushes the page up instead of covering its inputs
+        Box(modifier = Modifier.fillMaxSize().background(Color.Black).imePadding()) {
             AndroidView(
                 modifier = Modifier.fillMaxSize(),
                 factory = { ctx ->
@@ -490,6 +492,8 @@ class WebAppActivity : ComponentActivity() {
             allowUniversalAccessFromFileURLs = false
             mediaPlaybackRequiresUserGesture = false
         }
+        // [Mines-webfit-38.3] fit the screen width, zoomable, text follows the font size
+        com.openminis.app.browser.WebFit.apply(webView)
     }
 
     private fun loadHtml(webView: WebView, file: File) {

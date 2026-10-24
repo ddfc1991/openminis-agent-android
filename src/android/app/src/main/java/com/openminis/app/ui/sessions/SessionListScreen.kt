@@ -1,5 +1,8 @@
 package com.openminis.app.ui.sessions
 
+import androidx.compose.ui.draw.clipToBounds
+import com.openminis.app.ui.brand.MinesIcon
+
 import android.content.Context
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
@@ -26,6 +29,9 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
@@ -98,10 +104,10 @@ import android.content.Intent
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
-import androidx.compose.material3.DropdownMenu
+import com.openminis.app.ui.glass.DropdownMenu
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.LinearProgressIndicator
-import androidx.compose.material3.AlertDialog
+import com.openminis.app.ui.glass.AlertDialog
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Surface
 import com.openminis.app.ui.components.MinisAlertDialog
@@ -111,19 +117,19 @@ import com.openminis.app.ui.components.MinisMenuDivider
 import com.openminis.app.ui.components.SectionDesign
 import com.openminis.app.ui.components.SectionTextField
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.ModalBottomSheet
+import com.openminis.app.ui.glass.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
-import androidx.compose.material3.FloatingActionButton
+import com.openminis.app.ui.theme.FloatingActionButton
 import androidx.compose.material3.FloatingActionButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
+import com.openminis.app.ui.theme.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
@@ -163,6 +169,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
@@ -556,7 +563,7 @@ fun SessionListScreen(
     // the database or the repository's flows — it exists for exactly as long
     // as the detail pane holds an unsaved draft, and vanishes on its own when
     // the user switches away without sending. Mirrors iOS displaySessions.
-    val sessions = remember(persistedSessions, draftPlaceholderId) {
+    val minesAllSessions = remember(persistedSessions, draftPlaceholderId) {
         val draftId = draftPlaceholderId
         if (draftId == null || persistedSessions.any { it.id == draftId }) {
             persistedSessions
@@ -577,10 +584,34 @@ fun SessionListScreen(
         }
     }
     val isInitialLoadComplete by viewModel.isInitialLoadComplete.collectAsState()
+    // [Mines-38.9.5 i11] progress: load the store if launch has not yet, and count only chats that exist in the list
+    LaunchedEffect(persistedSessions) {
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.TaskProgress.init(context) }
+        com.openminis.app.plus.TaskProgress.setVisible(persistedSessions.map { it.id }.toSet())
+        // [Mines-38.9.6 i12] every chat gets its goal / steps / summary: build the missing ones from history in the background
+        // (newest first, one at a time, cached in the progress store)
+        kotlinx.coroutines.delay(1500)
+        runCatching { com.openminis.app.plus.TaskProgress.backfill(context, persistedSessions.sortedByDescending { it.updatedAt }.map { it.id to it.title }) }
+    }
     val isSearchActive by viewModel.isSearchActive.collectAsState()
     val searchQuery by viewModel.searchQuery.collectAsState()
     val isSearching by viewModel.isSearching.collectAsState()
     val searchSnippets by viewModel.searchSnippets.collectAsState()
+    // [Mines] 对话整理: hide auto-archived chats, filter by topic chip.
+    // Search always looks at everything.
+    com.openminis.app.plus.ChatOrganizer.init(context)
+    val minesChatFilter by com.openminis.app.plus.ChatOrganizer.filter.collectAsState()
+    val minesRestored by com.openminis.app.plus.ChatOrganizer.restored.collectAsState()
+    val minesTidy by com.openminis.app.plus.ChatOrganizer.settings.collectAsState()
+    val minesManual by com.openminis.app.plus.ChatOrganizer.manual.collectAsState()   // [Mines-38.9.6] one-tap archive
+    val sessions = remember(minesAllSessions, minesChatFilter, minesRestored, minesTidy, minesManual, isSearchActive, searchQuery) {
+        if (isSearchActive && searchQuery.isNotBlank()) minesAllSessions
+        else com.openminis.app.plus.ChatOrganizer.apply(minesAllSessions, minesChatFilter)
+    }
+    // [Mines-38.8 v5d] a search with no hits empties displayedSessions; the home (face, greeting row with the
+    // in-place field, nav) must stay up then — it used to fall back to the old bottom search field (focus jumped to it,
+    // the typed text came out reordered, 「inesM」)
+    val minesHomeShown = minesAllSessions.isNotEmpty() || (isSearchActive && searchQuery.isNotBlank())
     val isSelecting by viewModel.isSelecting.collectAsState()
     val selectedIds by viewModel.selectedIds.collectAsState()
     val regeneratingIds by viewModel.regeneratingIds.collectAsState()
@@ -634,6 +665,10 @@ fun SessionListScreen(
     // sent / loop completed), and the ChatViewModel re-asserts it on load if the
     // session is still interrupted. Clearing here just caused a flicker.
     val onSessionClickGuarded: (String) -> Unit = { id ->
+        // [Mines] Opening an archived chat brings it back to the list.
+        minesAllSessions.firstOrNull { it.id == id }?.let { s0 ->
+            if (com.openminis.app.plus.ChatOrganizer.isArchived(s0)) com.openminis.app.plus.ChatOrganizer.restore(context, id)
+        }
         exitSearchIfQueryBlank()
         onSessionClick(id)
     }
@@ -656,7 +691,30 @@ fun SessionListScreen(
     var editSession by remember { mutableStateOf<ChatSessionEntity?>(null) }
     var showBrowserSheet by remember { mutableStateOf(false) }
     var showBrowserSettings by remember { mutableStateOf(false) }
-    val browserTabPool = remember { com.openminis.app.browser.BrowserTabPool(context) }
+    // [Mines-38.9.7] the home browser IS the process-wide shared pool (was a private remember{} pool no agent could see),
+    // so an agent taking over drives the tab the user signed in on
+    val browserTabPool = remember { (context.applicationContext as com.openminis.app.MinisApp).sharedBrowserTabPool }
+    // [Mines-38.9.7] 无痕标签: separate profile pool, wiped when its sheet closes
+    var incognitoPool by remember { mutableStateOf<com.openminis.app.browser.BrowserTabPool?>(null) }
+    androidx.compose.runtime.DisposableEffect(Unit) {
+        onDispose { incognitoPool?.let { com.openminis.app.browser.Incognito.close(it) }; incognitoPool = null }
+    }
+    // [Mines-webfit-38.3] open the browser on a URL handed over from elsewhere (self-test / deep link)
+    val openBrowserUrl by com.openminis.app.ui.plus.PlusNav.openBrowser.collectAsState()
+    // [Mines-38.9.11.2] 无痕: a fresh profile pool (PROFILE path) or the ":incog" process (PROCESS path)
+    val openIncognitoUrl by com.openminis.app.ui.plus.PlusNav.openIncognito.collectAsState()
+    LaunchedEffect(openIncognitoUrl) {
+        val u = openIncognitoUrl ?: return@LaunchedEffect
+        com.openminis.app.ui.plus.PlusNav.openIncognito.value = null
+        incognitoPool?.let { com.openminis.app.browser.Incognito.close(it); incognitoPool = null }
+        com.openminis.app.browser.Incognito.open(context, u) { incognitoPool = it }
+    }
+    LaunchedEffect(openBrowserUrl) {
+        val u = openBrowserUrl ?: return@LaunchedEffect
+        com.openminis.app.ui.plus.PlusNav.openBrowser.value = null
+        if (browserTabPool.selectOrCreateTabForURL(u) == null) browserTabPool.ensureTabForUI()
+        showBrowserSheet = true
+    }
 
     // [T-android-session-grouping] Groups are pulled out FIRST; only the
     // leftovers go through date bucketing. Assembly order below is
@@ -821,9 +879,94 @@ fun SessionListScreen(
             .map { list -> list.count { it.enabled } }
     }.collectAsState(initial = 0)
 
+    // [Mines-design-34] Home always sits on a backdrop: the user's photo / preset, or the
+    // 「暖雾」 porcelain gradient tinted by the character. Bars stay transparent.
+    val minesPhotoWall = com.openminis.app.ui.plus.wallpaperOn(home = true)
+    val minesHomeWallpaper = true
+    // [Mines-wallpaper-edge] The wallpaper is the Scaffold's own background,
+    // drawn edge to edge behind the status bar, top bar and navigation bar.
+    // The Scaffold and its top bar go fully transparent so no opaque band
+    // (the old 60%-surface bar) sits over the picture.
+    // [Mines-38.6] ☰ + its warm menu, shared by the home header and the selection top bar.
+    val minesNavIcon: @Composable () -> Unit = {
+        Box {
+            // [Mines-38.7] ☰ uses the same round porcelain button as ⚙ (38.6 had a bare icon on the left, a round one on the right)
+            com.openminis.app.ui.plus.WarmRoundButton(com.openminis.app.ui.brand.MinesIcons.named("menu")!!, "更多",
+                onClick = { showOverflowMenu = true })   // [Mines-38.8] 42 dp like the 消息 page's round buttons (was 44)
+            fun ic(n: String) = com.openminis.app.ui.brand.MinesIcons.named(n)
+            com.openminis.app.ui.plus.WarmMenu(showOverflowMenu, onDismiss = { showOverflowMenu = false }) {
+                if (sessions.isNotEmpty()) com.openminis.app.ui.plus.WarmMenuItem("选择对话", ic("list-select")) {
+                    showOverflowMenu = false; viewModel.isSelecting.value = true
+                }
+                com.openminis.app.ui.plus.WarmMenuItem("AI 群聊", ic("users")) {
+                    showOverflowMenu = false; com.openminis.app.ui.plus.PlusNav.go(com.openminis.app.ui.group.GroupRoutes.HOME)
+                }
+                com.openminis.app.ui.plus.WarmMenuItem(if (scheduledTaskCount > 0) "定时任务  $scheduledTaskCount" else "定时任务", ic("clock")) {
+                    showOverflowMenu = false; onScheduledTasksClick()
+                }
+                // [Mines-38.9.4] user 「ai服务加到第二幅那个地方，不好找」 + 「账号和关联一起」: the merged 账号 page (服务 / 登录)
+                com.openminis.app.ui.plus.WarmMenuDivider()
+                // [Mines-38.9.5 i] user 22:02: here it should be 「AI 服务」 → the services list itself (关联账号 stays in 设置 › 账号)
+                com.openminis.app.ui.plus.WarmMenuItem("AI 服务", ic("sparkles") ?: ic("cpu") ?: ic("user")) {
+                    showOverflowMenu = false; com.openminis.app.ui.plus.PlusNav.go(com.openminis.app.ui.plus.PlusRoutes.AI_SERVICES)
+                }
+                // [Mines-38.9.9] user: 免登录 AI is its own page, one tap from here
+                com.openminis.app.ui.plus.WarmMenuItem("免登录 AI", ic("key-round") ?: ic("sparkles")) {
+                    showOverflowMenu = false; com.openminis.app.ui.plus.PlusNav.go(com.openminis.app.ui.plus.PlusRoutes.FREE_AI)
+                }
+                com.openminis.app.ui.plus.WarmMenuDivider()
+                com.openminis.app.ui.plus.WarmMenuItem(stringResource(R.string.sessionlist_shell_terminal), ic("terminal")) {
+                    showOverflowMenu = false; onTerminalClick()
+                }
+                com.openminis.app.ui.plus.WarmMenuItem(stringResource(R.string.sessionlist_rootfs_management), ic("hard-drive")) {
+                    showOverflowMenu = false; onRootfsClick()
+                }
+                com.openminis.app.ui.plus.WarmMenuDivider()
+                com.openminis.app.ui.plus.WarmMenuItem(stringResource(R.string.sessionlist_open_browser), ic("globe")) {
+                    showOverflowMenu = false; browserTabPool.ensureTabForUI(); showBrowserSheet = true
+                }
+                com.openminis.app.ui.plus.WarmMenuItem("无痕标签", ic("eye-off") ?: ic("globe")) {
+                    showOverflowMenu = false
+                    com.openminis.app.ui.plus.PlusNav.openIncognito.value = ""
+                }
+                com.openminis.app.ui.plus.WarmMenuItem(stringResource(R.string.sessionlist_browser_settings), ic("settings")) {
+                    showOverflowMenu = false; showBrowserSettings = true
+                }
+            }
+        }
+    }
+    Box(Modifier.fillMaxSize()) {
+    if (minesPhotoWall) com.openminis.app.ui.plus.ChatWallpaperLayer(Modifier.fillMaxSize(), home = true)
+    else com.openminis.app.ui.plus.PorcelainBackdrop(Modifier.fillMaxSize())
+    // [Mines-38.8 v5d] faint weather ambience over the fog, behind every card (not over a photo wallpaper)
+    if (!minesPhotoWall) com.openminis.app.ui.plus.WeatherAmbienceLayer(Modifier.fillMaxSize())
     Scaffold(
+        containerColor = if (minesHomeWallpaper) Color.Transparent else MaterialTheme.colorScheme.background,
         topBar = {
-            TopAppBar(
+            // [Mines-38.6] user 2026-10-15 「头像不够上，再上一点，得接近两侧边的两个图标高度」: on the home list the
+            // character face sits in the top bar itself, centred between ☰ and ⚙ with its upper half level with
+            // them (face top right under the status bar); the name/status line and everything below move up with it.
+            if (!isSelecting && isInitialLoadComplete && minesHomeShown) {
+                // [Mines-38.7] weather line above the face (hidden when there is no weather); ☰ / face / ⚙ keep their row
+                Column(Modifier.fillMaxWidth().windowInsetsPadding(androidx.compose.material3.TopAppBarDefaults.windowInsets),
+                    horizontalAlignment = Alignment.CenterHorizontally) {
+                // [Mines-38.8] user 2026-10-16: the home top bar is as compact as the 消息 page's (☰ · 56 dp face + name plate · ⚙);
+                // 38.7 had a 58 dp weather room + a 106 dp face here. The weather sprite circles the small face, a tap shows the pill.
+                com.openminis.app.ui.plus.HomeCompactHeader(
+                    modifier = Modifier.semantics { contentDescription = "Mines" }.padding(bottom = 2.dp),
+                    leading = {
+                        androidx.compose.runtime.CompositionLocalProvider(
+                            androidx.compose.material3.LocalContentColor provides MaterialTheme.colorScheme.onSurface,
+                        ) { minesNavIcon() }
+                    },
+                    trailing = {
+                        com.openminis.app.ui.plus.WarmRoundButton(com.openminis.app.ui.brand.MinesIcons.named("settings")!!,
+                            stringResource(R.string.sessionlist_settings), onClick = onSettingsClick)
+                    },
+                )
+                com.openminis.app.ui.plus.HomeWeatherPill() // [Mines-38.7] 「26° 晴」 under the face while the big picture is up
+                }
+            } else TopAppBar(
                 title = {
                     if (isSelecting) {
                         Text(
@@ -831,26 +974,29 @@ fun SessionListScreen(
                                 stringResource(R.string.sessionlist_select_title)
                             else
                                 stringResource(R.string.sessionlist_n_selected, selectedIds.size),
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 20.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = com.openminis.app.ui.plus.MT.PageTitle,   // [Mines-38.9.4] same title size as the other pages
                         )
                     } else {
+                        // [Mines-warm-36] the character's face + name plate below is the title now
                         Text(
-                            stringResource(R.string.app_name),
+                            "",
                             fontWeight = FontWeight.Bold,
                             fontSize = 20.sp,
+                            modifier = Modifier.semantics { contentDescription = "Mines" },
                         )
                     }
                 },
                 navigationIcon = {
                     if (isSelecting) {
-                        MinisTextButton(onClick = { viewModel.clearSelection() }) {
-                            Text(stringResource(R.string.cancel))
+                        // [Mines-38.9.4] user 「取」: 「取消」 was squeezed into the round header button → the same round ✕ as other pages
+                        Box(Modifier.padding(start = 8.dp)) {
+                            com.openminis.app.ui.plus.WarmRoundButton(com.openminis.app.ui.brand.MinesIcons.named("x")!!,
+                                stringResource(R.string.cancel), size = 40.dp) { viewModel.clearSelection() }
                         }
                     } else {
-                        IconButton(onClick = onSettingsClick) {
-                            Icon(Icons.Default.Settings, contentDescription = stringResource(R.string.sessionlist_settings))
-                        }
+                        // [Mines-38.1] board 01: ☰ (left) holds the developer tools in a warm menu; ⚙ (right) opens settings.
+                        Box(Modifier.padding(start = 8.dp)) { minesNavIcon() }
                     }
                 },
                 actions = {
@@ -864,95 +1010,15 @@ fun SessionListScreen(
                             )
                         }
                     } else {
-                        // [T-android-scheduled-tasks-design] Scheduled-tasks entry,
-                        // sits to the left of the Shell button on the home toolbar.
-                        // [T-android-scheduled-tasks-full] Badge shows the count of
-                        // scheduled tasks so the user can see at a glance how many
-                        // are configured without opening the list.
-                        IconButton(onClick = onScheduledTasksClick) {
-                            if (scheduledTaskCount > 0) {
-                                BadgedBox(badge = { Badge { Text("$scheduledTaskCount") } }) {
-                                    Icon(
-                                        Icons.Outlined.Schedule,
-                                        contentDescription = stringResource(R.string.sessionlist_scheduled_tasks),
-                                    )
-                                }
-                            } else {
-                                Icon(
-                                    Icons.Outlined.Schedule,
-                                    contentDescription = stringResource(R.string.sessionlist_scheduled_tasks),
-                                )
-                            }
-                        }
-                        // Shell menu (matching iOS trailing shell button: Terminal, Rootfs, Browser)
-                        Box {
-                            IconButton(onClick = { showOverflowMenu = true }) {
-                                Icon(Icons.Outlined.Terminal, contentDescription = stringResource(R.string.sessionlist_shell))
-                            }
-                            MinisMenu(
-                                expanded = showOverflowMenu,
-                                onDismissRequest = { showOverflowMenu = false },
-                                offset = DpOffset(0.dp, 0.dp),
-                            ) {
-                                if (sessions.isNotEmpty()) {
-                                    DropdownMenuItem(
-                                        text = { Text(stringResource(R.string.sessionlist_select_action)) },
-                                        onClick = {
-                                            showOverflowMenu = false
-                                            viewModel.isSelecting.value = true
-                                        },
-                                        leadingIcon = {
-                                            Icon(Icons.Outlined.ChecklistRtl, contentDescription = null)
-                                        },
-                                    )
-                                    MinisMenuDivider()
-                                }
-                                DropdownMenuItem(
-                                    text = { Text(stringResource(R.string.sessionlist_shell_terminal)) },
-                                    onClick = {
-                                        showOverflowMenu = false
-                                        onTerminalClick()
-                                    },
-                                    leadingIcon = {
-                                        Icon(Icons.Outlined.Terminal, contentDescription = null)
-                                    },
-                                )
-                                DropdownMenuItem(
-                                    text = { Text(stringResource(R.string.sessionlist_rootfs_management)) },
-                                    onClick = {
-                                        showOverflowMenu = false
-                                        onRootfsClick()
-                                    },
-                                    leadingIcon = {
-                                        Icon(Icons.Outlined.Settings, contentDescription = null)
-                                    },
-                                )
-                                MinisMenuDivider()
-                                DropdownMenuItem(
-                                    text = { Text(stringResource(R.string.sessionlist_open_browser)) },
-                                    onClick = {
-                                        showOverflowMenu = false
-                                        browserTabPool.ensureTabForUI()
-                                        showBrowserSheet = true
-                                    },
-                                    leadingIcon = {
-                                        Icon(Icons.Outlined.Language, contentDescription = null)
-                                    },
-                                )
-                                DropdownMenuItem(
-                                    text = { Text(stringResource(R.string.sessionlist_browser_settings)) },
-                                    onClick = {
-                                        showOverflowMenu = false
-                                        showBrowserSettings = true
-                                    },
-                                    leadingIcon = {
-                                        Icon(Icons.Outlined.Settings, contentDescription = null)
-                                    },
-                                )
-                            }
-                        }
+                        com.openminis.app.ui.plus.WarmRoundButton(com.openminis.app.ui.brand.MinesIcons.named("settings")!!,
+                            stringResource(R.string.sessionlist_settings), size = 40.dp, onClick = onSettingsClick)
+                        Spacer(Modifier.width(8.dp))
                     }
                 },
+                colors = androidx.compose.material3.TopAppBarDefaults.topAppBarColors(
+                    containerColor = if (minesHomeWallpaper) Color.Transparent else MaterialTheme.colorScheme.surface,
+                    scrolledContainerColor = if (minesHomeWallpaper) Color.Transparent else MaterialTheme.colorScheme.surface,
+                ),
             )
         },
         // No default FAB — we draw dual FABs manually at bottom
@@ -969,7 +1035,7 @@ fun SessionListScreen(
             // iOS `didInitialLoad` on ContentView. The transition is usually
             // sub-200ms, so no spinner.
             if (isInitialLoadComplete) Column(modifier = Modifier.fillMaxSize()) {
-                if (sessions.isEmpty()) {
+                if (!minesHomeShown) {   // [Mines-38.8] no-results now shows inside the list, under the in-place search field
                     if (isSearchActive && searchQuery.isNotBlank()) {
                         Box(
                             modifier = Modifier.fillMaxSize(),
@@ -1009,14 +1075,57 @@ fun SessionListScreen(
                         )
                     }
                 } else {
+                    androidx.compose.foundation.layout.Column(Modifier.fillMaxSize()) {
+                    // [Mines-compact-29] The header above the list (Today card,
+                    // update card, gateway cards, filter chips) changes height
+                    // after the list has laid out (fade-in, collapse, chips
+                    // appearing). The list kept its scroll offset, so its first
+                    // conversation started half under the chips (user
+                    // screenshot: first row's title + icon cut off). When the
+                    // header height changes and the list is near the top, snap
+                    // it back to the very top.
+                    var minesHeaderH by androidx.compose.runtime.remember { androidx.compose.runtime.mutableIntStateOf(0) }
+                    androidx.compose.runtime.LaunchedEffect(minesHeaderH) {
+                        if (listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset > 0) listState.scrollToItem(0)
+                    }
+                    if (!isSelecting) androidx.compose.foundation.layout.Column(
+                        Modifier.fillMaxWidth().onSizeChanged { minesHeaderH = it.height },
+                    ) {
+                        com.openminis.app.ui.plus.TodayCard(
+                            showAvatar = false,  // [Mines-38.6] the face is in the top bar now
+                            onOpen = { route -> com.openminis.app.ui.plus.PlusNav.go(route) },
+                            onSearch = { viewModel.isSearchActive.value = true },
+                            all = minesAllSessions,
+                            // [Mines-38.8] search lives in the greeting row (in place); the bottom search bar is not used on home
+                            searching = isSearchActive, query = searchQuery, resultCount = sessions.size,
+                            onQuery = { viewModel.searchQuery.value = it },
+                            onCloseSearch = {
+                                com.openminis.app.plus.Digest.recordSearch(context, viewModel.searchQuery.value)
+                                viewModel.searchQuery.value = ""
+                                viewModel.isSearchActive.value = false
+                            },
+                        )
+                        com.openminis.app.ui.plus.SafeStartHomeCard()   // [Mines-38.9.12.1]
+                        com.openminis.app.ui.plus.UpdateHomeCard(onOpen = { com.openminis.app.ui.plus.PlusNav.go(com.openminis.app.ui.plus.PlusRoutes.UPDATE) })
+                        com.openminis.app.ui.plus.LocalGatewayCards()
+                        // [Mines-38.1] topic chips moved into 「全部 ›」 (they overlapped the first row)
+                    }
+                    com.openminis.app.ui.plus.DshModelsAutoStart()
                     LazyColumn(
                         // [T-android-newchat-list-autoscroll] Hoisted state so
                         // the new-session autoscroll effect above can drive it.
                         state = listState,
-                        modifier = Modifier.fillMaxSize(),
-                        // Leave space for bottom FAB row
-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 96.dp),
+                        // [Mines-38.8] the list ends above the glass input bar + nav (rows never show through the glass)
+                        modifier = Modifier.fillMaxWidth().weight(1f).padding(bottom = if (isSearchActive) 0.dp else 150.dp).clipToBounds(),
+                        // Leave space for bottom FAB row; [Mines-compact-29] small top gap under the chips
+                        // [Mines-38.8] with the keyboard up the last rows stay reachable above it (list is not cut under the IME)
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(top = 4.dp,
+                            bottom = maxOf(12.dp, androidx.compose.foundation.layout.WindowInsets.ime.asPaddingValues().calculateBottomPadding() + 16.dp)),
                     ) {
+                        if (isSearchActive && searchQuery.isNotBlank() && sessions.isEmpty()) item(key = "mines_no_results") {
+                            Text(stringResource(R.string.search_no_results, searchQuery), fontSize = 15.sp,
+                                color = com.openminis.app.ui.plus.mines().ink2, modifier = Modifier.padding(horizontal = 24.dp, vertical = 16.dp))
+                        }
                         // T25: search-active path used to flatten the list and skip
                         // section headers entirely. Now reuses the same grouped
                         // rendering — `displayedSessions` is already filtered by
@@ -1075,7 +1184,24 @@ fun SessionListScreen(
                                             },
                                         )
                                 } else {
+                                    // [Mines-38.1] ungrouped rows weld into ONE solid porcelain card (board 01):
+                                    // rounded 20 dp on the first/last row, hairline between rows.
+                                    val idx = rows.indexOfFirst { it.id == session.id }
+                                    val first = idx == 0; val last = idx == rows.size - 1
+                                    val shape = RoundedCornerShape(
+                                        topStart = if (first) 20.dp else 0.dp, topEnd = if (first) 20.dp else 0.dp,
+                                        bottomStart = if (last) 20.dp else 0.dp, bottomEnd = if (last) 20.dp else 0.dp,
+                                    )
+                                    val mc = com.openminis.app.ui.plus.mines()
                                     Modifier
+                                        .padding(start = 16.dp, end = 16.dp, bottom = if (last) 8.dp else 0.dp)
+                                        .then(if (first || last) Modifier.shadow(0.dp, shape, clip = false,
+                                            ambientColor = Color(0x143C2814), spotColor = Color(0x143C2814)) else Modifier)
+                                        .clip(shape)
+                                        .background(com.openminis.app.ui.plus.minesGlassFill(strong = true))   // [Mines-38.8] frosted glass card (fog shows through)
+                                        .then(if (!first) Modifier.drawBehind {
+                                            drawLine(mc.hairline, Offset(64.dp.toPx(), 0f), Offset(size.width - 16.dp.toPx(), 0f), 1.dp.toPx())
+                                        } else Modifier)
                                 }
                                 // animateItem gives the accordion its motion:
                                 // member rows fade+slide over 250ms instead of
@@ -1132,8 +1258,7 @@ fun SessionListScreen(
                                     rowBackground = when {
                                         session.id == selectedSessionId ->
                                             MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
-                                        inFolder -> Color.Transparent
-                                        else -> null
+                                        else -> Color.Transparent  // [Mines-38.1] the welded card paints the fill
                                     },
                                     isFolderMember = inFolder,
                                 )
@@ -1196,20 +1321,11 @@ fun SessionListScreen(
                             }
                         }
 
-                        trailingDateGroups.forEach { (period, periodSessions) ->
-                            item(key = "header_${period.name}") {
-                                SectionHeader(title = stringResource(when (period) {
-                                    DatePeriod.PINNED -> R.string.sessionlist_section_pinned
-                                    DatePeriod.TODAY -> R.string.sessionlist_section_today
-                                    DatePeriod.YESTERDAY -> R.string.sessionlist_section_yesterday
-                                    DatePeriod.THIS_WEEK -> R.string.sessionlist_section_this_week
-                                    DatePeriod.THIS_MONTH -> R.string.sessionlist_section_this_month
-                                    DatePeriod.EARLIER -> R.string.sessionlist_section_earlier
-                                }))
-                            }
-                            renderSessionRows(periodSessions)
-                        }
+                        // [Mines-38.1] board 01: no Today / Yesterday headers; all recent chats in one card under 「最近对话」
+                        val minesTrailing = trailingDateGroups.flatMap { it.second }
+                        if (minesTrailing.isNotEmpty()) renderSessionRows(minesTrailing)
                     }
+                    } // Plus: Today card column
                 }
             }
 
@@ -1266,7 +1382,7 @@ fun SessionListScreen(
                                 // Folder names are user data — verbatim.
                                 Text(
                                     bar.folder.name,
-                                    fontSize = 14.sp,
+                                    fontSize = 15.sp,
                                     fontWeight = FontWeight.SemiBold,
                                     color = MaterialTheme.colorScheme.onSurface,
                                     maxLines = 1,
@@ -1285,7 +1401,7 @@ fun SessionListScreen(
                                         viewModel.toggleFolderCollapsed(bar.folder.id)
                                     },
                             ) {
-                                Icon(
+                                MinesIcon(
                                     Icons.Default.KeyboardArrowUp,
                                     contentDescription = stringResource(R.string.group_collapse),
                                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1336,7 +1452,21 @@ fun SessionListScreen(
                     onDelete = { showBulkDeleteDialog = true },
                     modifier = Modifier.align(Alignment.BottomCenter),
                 )
-            } else if (hasProviders && (sessions.isNotEmpty() || isSearchActive)) {
+            } else if (hasProviders && !isSearchActive && minesAllSessions.isNotEmpty()) {
+                // [Mines-38.5] solid band behind both bars (no list text between / through them)
+                com.openminis.app.ui.plus.WarmBottomDock(Modifier.align(Alignment.BottomCenter))
+                // [Mines-38.1] board 01 bottom input bar above the 5-tab bar
+                com.openminis.app.ui.plus.WarmHomeInputBar(
+                    onNewChat = {
+                        scope.launch {
+                            val sessionId = viewModel.createNewSession()
+                            if (sessionId != null) onNewChatGuarded(sessionId)
+                        }
+                    },
+                    onVoice = { com.openminis.app.ui.plus.PlusNav.go(com.openminis.app.ui.plus.PlusRoutes.VOICE) },
+                    modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 80.dp),  // [Mines-38.5] nav bar 74 dp
+                )
+            } else if (hasProviders && isSearchActive && !minesHomeShown) {
                 // Dual FAB row (matching iOS: New Chat left + Search right, or vice versa).
                 // Hidden while the onboarding landing is showing — Step 3 provides the CTA.
                 // T46: stay visible while search is active even when the result
@@ -1363,6 +1493,7 @@ fun SessionListScreen(
                     modelGroups = providerConfig.modelGroups,
                     onSearchToggle = {
                         if (isSearchActive) {
+                            com.openminis.app.plus.Digest.recordSearch(context, viewModel.searchQuery.value)
                             viewModel.searchQuery.value = ""
                             viewModel.isSearchActive.value = false
                         } else {
@@ -1371,14 +1502,22 @@ fun SessionListScreen(
                     },
                     onSearchQueryChange = { viewModel.searchQuery.value = it },
                     onSearchDismiss = {
+                        com.openminis.app.plus.Digest.recordSearch(context, viewModel.searchQuery.value)  // [Mines-38.5] 为你推荐 learns from searches
                         viewModel.searchQuery.value = ""
                         viewModel.isSearchActive.value = false
                     },
-                    modifier = Modifier.align(Alignment.BottomCenter),
+                    modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 76.dp),
                 )
             }
+            // [Mines-warm-36] bottom bar (对话 · 消息 · 灵感 · 任务 · 应用); 消息 shows the red count of things to handle
+            if (!isSelecting && isInitialLoadComplete && minesHomeShown) com.openminis.app.ui.plus.WarmHomeNav(
+                modifier = Modifier.align(Alignment.BottomCenter),
+                onTasks = onScheduledTasksClick,
+                onTop = { scope.launch { listState.animateScrollToItem(0) } },
+            )
         }
     }
+    } // [Mines-wallpaper-edge] Box
 
     // Single delete confirmation
     if (showDeleteDialog && deleteTargetId != null) {
@@ -1482,7 +1621,7 @@ fun SessionListScreen(
         // text fields, and MinisAlertDialog is a title/text/buttons component.
         // Widening it for a single caller would push layout complexity into
         // every other dialog in the app.
-        androidx.compose.material3.AlertDialog(
+        com.openminis.app.ui.glass.AlertDialog(
             onDismissRequest = { folderToRename = null },
             title = { Text(stringResource(R.string.group_rename)) },
             text = {
@@ -1585,6 +1724,16 @@ fun SessionListScreen(
         )
     }
 
+    incognitoPool?.let { ip ->
+        com.openminis.app.ui.browser.BrowserSheet(
+            tabPool = ip,
+            onDismiss = {
+                com.openminis.app.browser.Incognito.close(ip); incognitoPool = null
+                android.widget.Toast.makeText(context, com.openminis.app.browser.IncognitoCore.CLOSED_MSG, android.widget.Toast.LENGTH_SHORT).show()
+            },
+        )
+    }
+
     // Browser Settings sheet
     if (showBrowserSettings) {
         com.openminis.app.ui.browser.BrowserSettingsSheet(
@@ -1613,6 +1762,7 @@ private fun DualFabRow(
     onSearchQueryChange: (String) -> Unit,
     onSearchDismiss: () -> Unit,
     modifier: Modifier = Modifier,
+    minesSearchOnly: Boolean = true,
 ) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("ui_prefs", Context.MODE_PRIVATE) }
@@ -1691,7 +1841,7 @@ private fun DualFabRow(
                     .shadow(8.dp, CircleShape, ambientColor = Color.Black.copy(alpha = 0.2f)),
                 elevation = FloatingActionButtonDefaults.elevation(defaultElevation = 6.dp),
             ) {
-                Icon(Icons.Outlined.Forum, contentDescription = "New Chat", tint = Color.White, modifier = Modifier.size(24.dp))
+                MinesIcon(Icons.Outlined.Forum, contentDescription = "New Chat", tint = Color.White, modifier = Modifier.size(24.dp))
             }
             DropdownMenu(
                 expanded = showGroupMenu,
@@ -1700,7 +1850,7 @@ private fun DualFabRow(
                 topGroups.forEach { group ->
                     DropdownMenuItem(
                         text = { Text(group.name) },
-                        leadingIcon = { Icon(Icons.Outlined.Forum, contentDescription = null) },
+                        leadingIcon = { MinesIcon(Icons.Outlined.Forum, contentDescription = null) },
                         onClick = {
                             showGroupMenu = false
                             onNewChatWithGroup(group.id)
@@ -1743,7 +1893,7 @@ private fun DualFabRow(
                         .shadow(6.dp, CircleShape, ambientColor = Color.Black.copy(alpha = 0.15f)),
                     elevation = FloatingActionButtonDefaults.elevation(defaultElevation = 4.dp),
                 ) {
-                    Icon(Icons.Outlined.Search, contentDescription = stringResource(R.string.sessionlist_search_action), tint = MaterialTheme.colorScheme.onSurface, modifier = Modifier.size(24.dp))
+                    MinesIcon(Icons.Outlined.Search, contentDescription = stringResource(R.string.sessionlist_search_action), tint = MaterialTheme.colorScheme.onSurface, modifier = Modifier.size(24.dp))
                 }
             }
         }
@@ -1760,8 +1910,9 @@ private fun DualFabRow(
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        // Render in swapped or normal order
-        if (isSwapped) { searchFab(); } else { chatFab() }
+        // [Mines-38.1] the round chat / search FABs are gone (board 01: 「开个新对话…」 bar + search in the header);
+        // this row now only carries the search field while searching.
+        if (!minesSearchOnly) { if (isSwapped) { searchFab(); } else { chatFab() } }
 
         // Middle: Inline search bar (when active)
         AnimatedVisibility(
@@ -1775,7 +1926,7 @@ private fun DualFabRow(
                 singleLine = true,
                 placeholder = { Text(stringResource(R.string.search_chats_placeholder)) },
                 leadingIcon = {
-                    Icon(Icons.Outlined.Search, contentDescription = null, modifier = Modifier.size(18.dp))
+                    MinesIcon(Icons.Outlined.Search, contentDescription = null, modifier = Modifier.size(18.dp))
                 },
                 trailingIcon = {
                     // T46: while debounce is in flight, swap the close icon
@@ -1792,7 +1943,7 @@ private fun DualFabRow(
                         )
                     } else {
                         IconButton(onClick = onSearchDismiss) {
-                            Icon(Icons.Default.Close, contentDescription = stringResource(R.string.sessionlist_dismiss), modifier = Modifier.size(18.dp))
+                            MinesIcon(Icons.Default.Close, contentDescription = stringResource(R.string.sessionlist_dismiss), modifier = Modifier.size(18.dp))
                         }
                     }
                 },
@@ -1834,7 +1985,7 @@ private fun DualFabRow(
             )
         }
 
-        if (isSwapped) { chatFab() } else { searchFab() }
+        if (!minesSearchOnly) { if (isSwapped) { chatFab() } else { searchFab() } }
     }
 }
 
@@ -1850,10 +2001,16 @@ private fun SelectionToolbar(
     onDelete: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    // [Mines-38.9.4] frosted glass bar (was a 95 % grey slab); disabled actions stay readable (ink2), enabled ones use ink
+    val mc = com.openminis.app.ui.plus.mines()
+    androidx.compose.runtime.CompositionLocalProvider(
+        androidx.compose.material3.LocalContentColor provides if (selectedCount > 0) mc.ink else mc.ink2,
+    ) {
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.95f))
+            .background(com.openminis.app.ui.plus.minesGlassFill(strong = true))
+            .drawBehind { drawLine(mc.glassBorder, Offset(0f, 0f), Offset(size.width, 0f), 1.dp.toPx()) }
             .padding(vertical = 10.dp),
         horizontalArrangement = Arrangement.SpaceEvenly,
     ) {
@@ -1863,15 +2020,16 @@ private fun SelectionToolbar(
             MinisTextButton(
                 onClick = { showExportMenu = true },
                 enabled = selectedCount > 0,
+            colors = toolbarButtonColors(),
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(
+                    MinesIcon(
                         Icons.Default.Share,
                         contentDescription = stringResource(R.string.sessionlist_export),
                         modifier = Modifier.size(20.dp),
                     )
                     Spacer(Modifier.height(4.dp))
-                    Text(stringResource(R.string.sessionlist_export), fontSize = 11.sp)
+                    Text(stringResource(R.string.sessionlist_export), fontSize = 12.sp)
                 }
             }
             DropdownMenu(expanded = showExportMenu, onDismissRequest = { showExportMenu = false }) {
@@ -1896,15 +2054,16 @@ private fun SelectionToolbar(
         MinisTextButton(
             onClick = onMove,
             enabled = selectedCount > 0,
+            colors = toolbarButtonColors(),
         ) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Icon(
+                MinesIcon(
                     Icons.Default.Folder,
                     contentDescription = stringResource(R.string.group_move_action),
                     modifier = Modifier.size(20.dp),
                 )
                 Spacer(Modifier.height(4.dp))
-                Text(stringResource(R.string.group_move_action), fontSize = 11.sp)
+                Text(stringResource(R.string.group_move_action), fontSize = 12.sp)
             }
         }
 
@@ -1912,23 +2071,32 @@ private fun SelectionToolbar(
         MinisTextButton(
             onClick = onDelete,
             enabled = selectedCount > 0,
+            colors = toolbarButtonColors(),
         ) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Icon(
+                MinesIcon(
                     Icons.Default.Delete,
                     contentDescription = stringResource(R.string.delete),
-                    tint = if (selectedCount > 0) MaterialTheme.colorScheme.error else Color.Gray,
+                    tint = if (selectedCount > 0) MaterialTheme.colorScheme.error else com.openminis.app.ui.plus.mines().ink2,
                     modifier = Modifier.size(20.dp),
                 )
                 Spacer(Modifier.height(4.dp))
                 Text(
                     stringResource(R.string.delete),
-                    fontSize = 11.sp,
-                    color = if (selectedCount > 0) MaterialTheme.colorScheme.error else Color.Gray,
+                    fontSize = 12.sp,
+                    color = if (selectedCount > 0) MaterialTheme.colorScheme.error else com.openminis.app.ui.plus.mines().ink2,
                 )
             }
         }
     }
+    }
+}
+
+/** [Mines-38.9.4] toolbar actions: enabled = ink, disabled = ink2 (readable, not 38 % grey). */
+@Composable
+private fun toolbarButtonColors(): androidx.compose.material3.ButtonColors {
+    val m = com.openminis.app.ui.plus.mines()
+    return androidx.compose.material3.ButtonDefaults.textButtonColors(contentColor = m.ink, disabledContentColor = m.ink2.copy(alpha = 0.85f))
 }
 
 // ─── Section Header (matching iOS .subheadline.weight(.semibold)) ───────────
@@ -1946,7 +2114,7 @@ private fun SectionHeader(title: String) {
             .padding(top = 4.dp),
     ) {
         if (isPinned) {
-            Icon(
+            MinesIcon(
                 imageVector = Icons.Default.PushPin,
                 contentDescription = null,
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1958,7 +2126,7 @@ private fun SectionHeader(title: String) {
         }
         Text(
             text = title,
-            fontSize = 14.sp,
+            fontSize = 15.sp,
             fontWeight = FontWeight.SemiBold,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -2024,7 +2192,7 @@ private fun SessionItemContent(
             rowBackground = rowBackground,
             isFolderMember = isFolderMember,
             leadingIcon = {
-                Icon(
+                MinesIcon(
                     imageVector = if (isSelected) Icons.Filled.CheckCircle else Icons.Outlined.Circle,
                     contentDescription = null,
                     tint = if (isSelected) MaterialTheme.colorScheme.primary
@@ -2073,7 +2241,7 @@ private fun SessionItemContent(
                 Box(
                     modifier = Modifier
                         .matchParentSize()
-                        .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.7f)),
+                        .background(MaterialTheme.colorScheme.surfaceContainerLow.copy(alpha = 0.94f)),
                     contentAlignment = Alignment.Center,
                 ) {
                     Row(
@@ -2112,10 +2280,24 @@ private fun SessionItemContent(
                         onPinToggle(session.id)
                     },
                     leadingIcon = {
-                        Icon(
+                        MinesIcon(
                             if (isPinned) Icons.Default.Close else Icons.Default.PushPin,
                             contentDescription = null,
                         )
+                    },
+                )
+                // [Mines-38.9.6 i12] one-tap archive (撤销 toast) / 取消归档
+                val minesArchCtx = androidx.compose.ui.platform.LocalContext.current
+                val minesArchived = com.openminis.app.plus.ChatOrganizer.isArchived(session)
+                DropdownMenuItem(
+                    text = { Text(if (minesArchived) "取消归档" else "归档") },
+                    onClick = {
+                        showContextMenu = false
+                        if (minesArchived) com.openminis.app.plus.ChatOrganizer.restore(minesArchCtx, session.id)
+                        else com.openminis.app.plus.ChatOrganizer.archive(minesArchCtx, session.id)
+                    },
+                    leadingIcon = {
+                        com.openminis.app.ui.plus.WarmIcons.of("archive")?.let { MinesIcon(it, contentDescription = null) }
                     },
                 )
                 // Export submenu (JSON / Plain Text)
@@ -2124,12 +2306,12 @@ private fun SessionItemContent(
                     text = {
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                             Text(stringResource(R.string.sessionlist_export))
-                            Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null, modifier = Modifier.size(16.dp))
+                            MinesIcon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null, modifier = Modifier.size(16.dp))
                         }
                     },
                     onClick = { showExportSub = !showExportSub },
                     leadingIcon = {
-                        Icon(Icons.Default.Share, contentDescription = null)
+                        MinesIcon(Icons.Default.Share, contentDescription = null)
                     },
                 )
                 if (showExportSub) {
@@ -2156,7 +2338,7 @@ private fun SessionItemContent(
                         onEditRequest(session)
                     },
                     leadingIcon = {
-                        Icon(Icons.Default.Edit, contentDescription = null)
+                        MinesIcon(Icons.Default.Edit, contentDescription = null)
                     },
                 )
                 // Regenerate Title
@@ -2167,7 +2349,7 @@ private fun SessionItemContent(
                         onRegenerateTitle(session.id)
                     },
                     leadingIcon = {
-                        Icon(Icons.Default.Refresh, contentDescription = null)
+                        MinesIcon(Icons.Default.Refresh, contentDescription = null)
                     },
                 )
                 // Duplicate
@@ -2178,7 +2360,7 @@ private fun SessionItemContent(
                         onDuplicate(session.id)
                     },
                     leadingIcon = {
-                        Icon(Icons.Default.ContentCopy, contentDescription = null)
+                        MinesIcon(Icons.Default.ContentCopy, contentDescription = null)
                     },
                 )
                 // Move to / Change Group
@@ -2204,7 +2386,7 @@ private fun SessionItemContent(
                         onMoveToGroup(session.id)
                     },
                     leadingIcon = {
-                        Icon(
+                        MinesIcon(
                             if (isFiled) Icons.Default.DriveFileMove
                             else Icons.Default.Folder,
                             contentDescription = null,
@@ -2223,7 +2405,7 @@ private fun SessionItemContent(
                         onEnterSelect(session.id)
                     },
                     leadingIcon = {
-                        Icon(Icons.Outlined.ChecklistRtl, contentDescription = null)
+                        MinesIcon(Icons.Outlined.ChecklistRtl, contentDescription = null)
                     },
                 )
                 MinisMenuDivider()
@@ -2235,7 +2417,7 @@ private fun SessionItemContent(
                         onDeleteRequest(session.id)
                     },
                     leadingIcon = {
-                        Icon(
+                        MinesIcon(
                             Icons.Default.Delete,
                             contentDescription = null,
                             tint = MaterialTheme.colorScheme.error,
@@ -2282,7 +2464,7 @@ private fun folderEdgeColor(): Color =
     else Color.Black.copy(alpha = 0.08f)
 
 @Composable
-private fun folderFillColor(): Color = MaterialTheme.colorScheme.surfaceContainerLow
+private fun folderFillColor(): Color = com.openminis.app.ui.plus.homeCardColor(MaterialTheme.colorScheme.surfaceContainerLow)
 
 private fun Modifier.folderSurface(
     segment: FolderSegment,
@@ -2558,7 +2740,7 @@ private fun FolderCard(
                 // User data — rendered verbatim, never a string lookup.
                 Text(
                     block.folder.name,
-                    fontSize = 16.sp,
+                    fontSize = 15.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.onSurface,
                     maxLines = 1,
@@ -2576,7 +2758,7 @@ private fun FolderCard(
                             stringResource(R.string.group_n_chats, block.totalCount)
                         else -> stringResource(R.string.group_empty)
                     },
-                    fontSize = 14.sp,
+                    fontSize = 15.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
@@ -2589,22 +2771,23 @@ private fun FolderCard(
             ) {
                 Text(
                     dateText,
-                    fontSize = 13.sp,
-                    color = MaterialTheme.colorScheme.outline,
+                    fontSize = 15.sp,
+                    // [Mines-a11y-26] was colorScheme.outline (too dark to read)
+                    color = com.openminis.app.ui.plus.readableSecondary(),
                 )
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
                     if (block.folder.isPinned) {
-                        Icon(
+                        MinesIcon(
                             Icons.Default.PushPin,
                             contentDescription = null,
                             tint = MaterialTheme.colorScheme.outline,
                             modifier = Modifier.size(12.dp),
                         )
                     }
-                    Icon(
+                    MinesIcon(
                         Icons.Default.KeyboardArrowDown,
                         contentDescription = null,
                         tint = MaterialTheme.colorScheme.outline,
@@ -2635,7 +2818,7 @@ private fun FolderCard(
                 // in a four-item menu.
                 val menuIcon: @Composable (androidx.compose.ui.graphics.vector.ImageVector) -> Unit =
                     { image ->
-                        Icon(
+                        MinesIcon(
                             image,
                             contentDescription = null,
                             modifier = Modifier.size(20.dp),
@@ -2690,7 +2873,7 @@ private fun FolderCard(
                     },
                     onClick = { menuOpen = false; onDeleteWithSessions() },
                     leadingIcon = {
-                        Icon(
+                        MinesIcon(
                             Icons.Outlined.Delete,
                             contentDescription = null,
                             tint = MaterialTheme.colorScheme.error,
@@ -2789,9 +2972,18 @@ private fun SessionRow(
             // clip only ever shaped the ripple. Now the tint is the rounded
             // rect itself, matching the folder card's shape and leaving equal
             // 6dp gutters left and right.
-            .background(
-                if (selectionTint != null) Color.Transparent
-                else rowBackground ?: MaterialTheme.colorScheme.surface,
+            // [Mines-glass-26] frosted gradient rows over a home wallpaper (hairline edge when not in a folder)
+            .then(
+                run {
+                    val glass = if (selectionTint == null && rowBackground == null) com.openminis.app.ui.plus.glassRowBrush() else null
+                    if (glass != null) Modifier.background(glass).then(
+                        if (!inFolder) Modifier.border(1.dp, Color.White.copy(alpha = 0.10f), RoundedCornerShape(16.dp)) else Modifier
+                    )
+                    else Modifier.background(
+                        if (selectionTint != null) Color.Transparent
+                        else rowBackground ?: com.openminis.app.ui.plus.homeCardColor(MaterialTheme.colorScheme.surface),
+                    )
+                }
             )
             // [T-android-selection-no-reflow] DRAWN, not padded.
             //
@@ -2914,7 +3106,8 @@ private fun SessionRow(
                 // tinted rectangle looked. Row metrics are left exactly as they
                 // were; the pill's proportions are handled by the inset of the
                 // drawn tint instead (see the drawBehind above).
-                vertical = 12.dp,
+                // [Mines-38.2] compact home card (board 68 px row x 0.874 = 59 dp): 9 dp, was 12 dp
+                vertical = 9.dp,
             ),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -2935,38 +3128,42 @@ private fun SessionRow(
         // future ICLOUD_SYNCING uses the same anchor.
         val badgeMap by com.openminis.app.service.SessionBadgeStore.byId.collectAsState()
         val badgeHead = badgeMap[session.id]?.firstOrNull()
+        // [Mines-38.1] one accent: 36 dp circle, terracotta line icon on a pale terracotta fill (board 01)
+        val minesC = com.openminis.app.ui.plus.mines()
         Box(
-            modifier = Modifier.size(44.dp),
+            modifier = Modifier.size(36.dp),
         ) {
             Box(
                 modifier = Modifier
-                    .size(44.dp)
+                    .size(36.dp)
                     .background(
-                        color = style.color.copy(alpha = 0.18f),
+                        color = if (minesC.dark) Color(0xFF3A2820) else Color(0xFFFBEDE6),
                         shape = CircleShape,
                     ),
                 contentAlignment = Alignment.Center,
             ) {
-                Icon(
+                MinesIcon(
                     imageVector = style.icon,
                     contentDescription = null,
-                    tint = style.color,
-                    modifier = Modifier.size(20.dp),
+                    tint = minesC.icon,
+                    modifier = Modifier.size(18.dp),
                 )
             }
             if (isActive) {
                 Box(
                     modifier = Modifier
-                        .size(44.dp)
+                        .size(36.dp)
                         .align(Alignment.Center),
                     contentAlignment = Alignment.Center,
                 ) {
                     SpinningRing(
-                        color = style.color,
-                        modifier = Modifier.size(42.dp),
+                        color = minesC.icon,
+                        modifier = Modifier.size(36.dp),
                     )
                 }
             }
+            // [Mines-38.9.5 i] progress arc (steps done) + state dot over the same icon; layout unchanged
+            com.openminis.app.ui.plus.ProgressRingOverlay(session.id, showArc = !isActive)
             if (badgeHead != null) {
                 SessionBadgeOverlay(
                     state = badgeHead,
@@ -2980,12 +3177,12 @@ private fun SessionRow(
             modifier = Modifier.weight(1f),
             verticalArrangement = Arrangement.spacedBy(1.dp),
         ) {
-            val titleText = session.title ?: "New Chat"
+            val titleText = session.title ?: "新对话"
             if (searchQuery.isNotBlank()) {
                 Text(
                     text = highlightedAnnotatedString(titleText, searchQuery),
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Medium,
                     color = MaterialTheme.colorScheme.onSurface,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
@@ -2993,8 +3190,8 @@ private fun SessionRow(
             } else {
                 Text(
                     text = titleText,
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Medium,
                     color = MaterialTheme.colorScheme.onSurface,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
@@ -3006,15 +3203,15 @@ private fun SessionRow(
             if (searchQuery.isNotBlank() && searchSnippet != null) {
                 Text(
                     text = highlightedAnnotatedString(searchSnippet, searchQuery),
-                    fontSize = 14.sp,
+                    fontSize = 13.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                 )
             } else {
                 Text(
-                    text = session.lastMessage ?: "No messages yet",
-                    fontSize = 14.sp,
+                    text = session.lastMessage ?: "还没有消息",
+                    fontSize = 13.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
@@ -3023,11 +3220,24 @@ private fun SessionRow(
         }
 
         // Relative timestamp
-        Text(
-            text = timeText,
-            fontSize = 13.sp,
-            color = MaterialTheme.colorScheme.outline,
-        )
+        // [Mines-38.9.5 i] user 19:27: a 「⋯」 pill under the time opens the progress card; the rest of the row still opens the chat
+        var progressOpen by remember(session.id) { mutableStateOf(false) }   // [Mines-38.9.6 i14] per chat, never inherited by the next row
+        Column(
+            modifier = Modifier.align(Alignment.Top).padding(top = 2.dp),  // [Mines-38.2] board: time sits on the title line
+            horizontalAlignment = Alignment.End,
+        ) {
+            Text(
+                text = timeText,
+                fontSize = 13.sp,
+                maxLines = 1,
+                softWrap = false,
+                // [Mines-a11y-26] was colorScheme.outline (too dark to read)
+                color = com.openminis.app.ui.plus.readableSecondary(),
+            )
+            com.openminis.app.ui.plus.ProgressMorePill(session.id) { progressOpen = true }
+        }
+        if (progressOpen) com.openminis.app.ui.plus.ProgressSheet(session.id, session.title ?: "新对话", onDismiss = { progressOpen = false }, onOpenChat = onClick,
+            autoArchived = com.openminis.app.plus.ChatOrganizer.isArchived(session))
     }
 }
 
@@ -3136,14 +3346,14 @@ private fun SessionBadgeOverlay(
                     )
                     .border(
                         width = 1.5.dp,
-                        color = MaterialTheme.colorScheme.surface,
+                        color = MaterialTheme.colorScheme.surfaceContainerLow,
                         shape = CircleShape,
                     ),
                 contentAlignment = Alignment.Center,
             ) {
                 // Pause glyph (⏸) — mirrors iOS's "pause.fill" badge so the
                 // cross-platform "this task was paused" affordance matches.
-                Icon(
+                MinesIcon(
                     imageVector = Icons.Filled.Pause,
                     contentDescription = null,
                     tint = Color.White,
@@ -3181,7 +3391,7 @@ private fun OnboardingLanding(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
-        Icon(
+        MinesIcon(
             imageVector = Icons.Default.AutoAwesome,
             contentDescription = null,
             modifier = Modifier.size(56.dp),
@@ -3264,7 +3474,7 @@ private fun OnboardingLanding(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                Icon(
+                MinesIcon(
                     imageVector = Icons.Default.History,
                     contentDescription = null,
                     modifier = Modifier.size(16.dp),
@@ -3313,7 +3523,7 @@ private fun SetupStepCard(
             contentAlignment = Alignment.Center,
         ) {
             if (isDone) {
-                Icon(
+                MinesIcon(
                     imageVector = Icons.Default.Check,
                     contentDescription = null,
                     tint = Color.White,
@@ -3348,7 +3558,7 @@ private fun SetupStepCard(
         }
 
         if (!isDone && isEnabled) {
-            Icon(
+            MinesIcon(
                 imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
                 contentDescription = null,
                 tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
@@ -3410,7 +3620,7 @@ internal fun SessionEditSheet(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                MinisTextButton(onClick = onDismiss) { Text("Cancel") }
+                MinisTextButton(onClick = onDismiss) { Text("取消") }
                 Spacer(Modifier.weight(1f))
                 Text(
                     "Edit Session",
@@ -3420,7 +3630,7 @@ internal fun SessionEditSheet(
                 Spacer(Modifier.weight(1f))
                 MinisTextButton(
                     onClick = { onSave(title.ifBlank { "New Chat" }, selectedCategory) },
-                ) { Text("Save") }
+                ) { Text("保存") }
             }
 
             Spacer(Modifier.height(16.dp))
@@ -3429,7 +3639,7 @@ internal fun SessionEditSheet(
             OutlinedTextField(
                 value = title,
                 onValueChange = { title = it },
-                label = { Text("Title") },
+                label = { Text("标题") },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
             )
@@ -3466,7 +3676,7 @@ internal fun SessionEditSheet(
                         contentAlignment = Alignment.Center,
                     ) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Icon(
+                            MinesIcon(
                                 imageVector = style.icon,
                                 contentDescription = null,
                                 tint = style.color,
@@ -3475,7 +3685,7 @@ internal fun SessionEditSheet(
                             Spacer(Modifier.height(4.dp))
                             Text(
                                 cat,
-                                fontSize = 11.sp,
+                                fontSize = 12.sp,
                                 color = if (isSelected) style.color
                                 else MaterialTheme.colorScheme.onSurfaceVariant,
                                 fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
@@ -3504,7 +3714,7 @@ internal fun SessionEditSheet(
                     Spacer(Modifier.width(8.dp))
                     Text(stringResource(R.string.sessionlist_regenerating_title))
                 } else {
-                    Icon(
+                    MinesIcon(
                         Icons.Default.Refresh,
                         contentDescription = null,
                         modifier = Modifier.size(18.dp),
@@ -3587,9 +3797,9 @@ private fun SessionExportSummaryDialog(
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 for ((label, value) in rows) {
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        Text(label, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 14.sp)
+                        Text(label, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 15.sp)
                         Spacer(Modifier.width(12.dp))
-                        Text(value, fontSize = 14.sp)
+                        Text(value, fontSize = 15.sp)
                     }
                 }
             }

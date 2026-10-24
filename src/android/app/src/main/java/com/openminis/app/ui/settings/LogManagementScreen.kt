@@ -1,5 +1,7 @@
 package com.openminis.app.ui.settings
 
+import com.openminis.app.ui.plus.MT
+
 import com.openminis.app.R
 import com.openminis.app.ui.components.MinisTextButton
 
@@ -24,7 +26,7 @@ import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Share
-import androidx.compose.material3.AlertDialog
+import com.openminis.app.ui.glass.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -32,7 +34,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
+import com.openminis.app.ui.theme.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -513,7 +515,7 @@ fun LogDetailScreen(
                         loadError ?: "",
                         style = TextStyle(
                             fontFamily = FontFamily.Monospace,
-                            fontSize = 12.sp,
+                            fontSize = MT.Caption,
                             color = MaterialTheme.colorScheme.error,
                         ),
                         modifier = Modifier.padding(12.dp),
@@ -533,8 +535,8 @@ fun LogDetailScreen(
                             text = log.readLine(i),
                             style = TextStyle(
                                 fontFamily = FontFamily.Monospace,
-                                fontSize = 11.sp,
-                                lineHeight = 16.sp,
+                                fontSize = MT.Caption,
+                                lineHeight = MT.CaptionLH,
                                 color = MaterialTheme.colorScheme.onSurface,
                             ),
                             modifier = Modifier.fillMaxWidth(),

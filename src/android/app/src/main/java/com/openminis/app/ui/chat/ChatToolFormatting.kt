@@ -127,23 +127,16 @@ internal fun toolAccentColorInt(toolName: String?): Int = when (toolName) {
  * several sessions edit concurrently; the vocabulary here is small and stable.
  */
 internal fun friendlyToolTitleFor(toolName: String?): String = when (toolName) {
-    null, "" -> "Minis"
-    "shell_execute" -> "Execute Shell"
-    "file_read" -> "Read File"
-    "file_write" -> "Write File"
-    "file_edit" -> "Edit File"
-    "browser_use" -> "Browse Web"
-    "read_image" -> "Read Image"
-    "memory_write" -> "Write Memory"
-    "memory_get" -> "Read Memory"
-    "web_search" -> "Search Web"
-    else -> toolName
+    null, "" -> "Mines"
+    "shell_execute", "file_read", "file_write", "file_edit", "browser_use", "read_image", "memory_write", "memory_get", "web_search", "task_progress" ->
+        com.openminis.app.plus.ToolZh.name(toolName)!!   // [38.9.11 i32] Chinese (user: 「Task Progress」「Execute Shell」)
+    else -> com.openminis.app.plus.ToolZh.name(toolName) ?: toolName
         .split('_')
         .filter { it.isNotEmpty() }
         .joinToString(" ") { it.replaceFirstChar { ch -> ch.uppercase() } }
 }
 
-// Helper: tool display name for "Minis is using X"
+// Helper: tool display name for "Mines is using X"
 internal fun toolDisplayName(toolName: String): String = when (toolName) {
     "shell_execute" -> "terminal"
     "file_read" -> "file reader"
@@ -159,20 +152,20 @@ internal fun toolDisplayName(toolName: String): String = when (toolName) {
 }
 
 /**
- * Full "Minis is …" label shown in the tool detail sheet's bottom bar.
+ * Full "Mines is …" label shown in the tool detail sheet's bottom bar.
  * Mirrors iOS ToolLiveSheet.toolTitle so the wording matches per tool.
  */
 internal fun toolTitleLabel(toolName: String): String = when (toolName) {
-    "shell_execute" -> "Minis is using Shell"
-    "file_read" -> "Minis is reading File"
-    "file_write" -> "Minis is using Editor"
-    "file_edit" -> "Minis is editing File"
-    "browser_use" -> "Minis is using Browser"
-    "read_image" -> "Minis is reading Image"
-    "memory_write", "memory_get" -> "Minis is using Memory"
-    "web_search" -> "Minis is using Search"
-    "subagent_task", "delegate_task", "agent_status" -> "Minis is using an Agent"
-    else -> "Minis is using ${toolDisplayName(toolName)}"
+    "shell_execute" -> "Mines is using Shell"
+    "file_read" -> "Mines is reading File"
+    "file_write" -> "Mines is using Editor"
+    "file_edit" -> "Mines is editing File"
+    "browser_use" -> "Mines is using Browser"
+    "read_image" -> "Mines is reading Image"
+    "memory_write", "memory_get" -> "Mines is using Memory"
+    "web_search" -> "Mines is using Search"
+    "subagent_task", "delegate_task", "agent_status" -> "Mines is using an Agent"
+    else -> "Mines is using ${toolDisplayName(toolName)}"
 }
 
 // Helper: format duration (iOS: < 1s → "0.1s", < 60s → "45s", >= 60s → "2m 10s")

@@ -67,10 +67,11 @@ object ExecutionCoordinator {
         timeout: Long,
         lineCallback: ((String) -> Unit)?,
         fsSessionId: String?,
+        secretEnv: Map<String, String> = emptyMap(),
     ): CommandResult {
         val startTime = System.currentTimeMillis()
         val bindMounts = buildSessionBindMounts(fsSessionId ?: sessionId)
-        val envVars = envVarRepository?.allAsDict() ?: emptyMap()
+        val envVars = (envVarRepository?.allAsDict() ?: emptyMap()) + secretEnv
 
         suspend fun attempt(noSeccomp: Boolean): Pair<String, Int> {
             val shell = FreshProcessShell(
@@ -278,6 +279,12 @@ object ExecutionCoordinator {
             Log.i(TAG, "[$sessionId] Auto-booting PRootKernel")
             PRootKernel.boot(appContext)
         }
+        // [Mines-38.9.11 b] {{secret:ID}} placeholders from the secure login card → "$MINES_SECRET_ID" + env for THIS command
+        // only; the value never appears in the command text, and output / live lines are masked.
+        runCatching { com.openminis.app.plus.SecretRefs.init(appContext) }
+        val secretEnv = com.openminis.app.plus.SecretRefs.envFor(command)
+        val command = if (secretEnv.isEmpty()) command else com.openminis.app.plus.SecretRefs.rewrite(command)
+        val lineCallback: ((String) -> Unit)? = if (secretEnv.isEmpty()) lineCallback else lineCallback?.let { cb -> { l: String -> cb(com.openminis.app.plus.SecretRefs.scrub(l)) } }
 
         // [T-android-a11y-helper-mount] Remember whose /var/minis dirs this
         // dispatch id is mounted with, so native offloads (which only learn
@@ -304,19 +311,20 @@ object ExecutionCoordinator {
             isStartFailure = ::isStartFailure,
         ) {
             if (executionStrategy == ShellExecutionStrategy.FRESH_PROCESS) {
-                executeFresh(sessionId, command, timeout, lineCallback, fsSessionId)
+                executeFresh(sessionId, command, timeout, lineCallback, fsSessionId, secretEnv)
             } else {
-                executeWarm(sessionId, command, timeout, lineCallback, fsSessionId)
+                executeWarm(sessionId, command, timeout, lineCallback, fsSessionId, secretEnv)
             }
         }
         return when (outcome) {
             is GlobalShellThrottle.Outcome.Ran -> {
-                if (!outcome.queued) outcome.value
-                else outcome.value.copy(queueNote = queueNote(outcome.queuedMs, outcome.startRetries))
+                val ran = if (secretEnv.isEmpty()) outcome.value else outcome.value.copy(output = com.openminis.app.plus.SecretRefs.scrub(outcome.value.output))
+                if (!outcome.queued) ran
+                else ran.copy(queueNote = queueNote(outcome.queuedMs, outcome.startRetries))
             }
             is GlobalShellThrottle.Outcome.QueueTimedOut -> CommandResult(
                 output = "Not run: waited ${outcome.waitedMs / 1000}s for Android's per-app process limit to " +
-                    "free up (${outcome.lastLiveCount} Minis processes running, budget " +
+                    "free up (${outcome.lastLiveCount} Mines processes running, budget " +
                     "${GlobalShellThrottle.PROCESS_BUDGET}), or for the shell to start. Nothing was executed; " +
                     "retry once other commands or background processes have finished.",
                 exitCode = 124,
@@ -352,6 +360,7 @@ object ExecutionCoordinator {
         timeout: Long,
         lineCallback: ((String) -> Unit)?,
         fsSessionId: String?,
+        secretEnv: Map<String, String> = emptyMap(),
     ): CommandResult {
         val lease = acquireShellLease(sessionId, fsSessionId ?: sessionId)
 
@@ -380,7 +389,7 @@ object ExecutionCoordinator {
             // command. Before that, a cold-start shell death between here and
             // executeCommand silently dropped the whole environment and the
             // user's first tool call ran bare.
-            val envVars = envVarRepository?.allAsDict() ?: emptyMap()
+            val envVars = (envVarRepository?.allAsDict() ?: emptyMap()) + secretEnv
             val previousKeys = lastInjectedKeys[lease.key] ?: emptySet()
             if (envVars.isNotEmpty() || previousKeys.isNotEmpty()) {
                 shell.applyEnvironment(envVars, previousKeys = previousKeys)

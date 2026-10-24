@@ -61,12 +61,12 @@ class AgentNotificationContentTest {
     fun `tool row title prefers the model-supplied tool_title`() {
         assertEquals("Open Baidu home page", toolRowTitle("browser_use", "Open Baidu home page"))
         assertEquals("Browse Web", toolRowTitle("browser_use", "   "))
-        assertEquals("Execute Shell", toolRowTitle("shell_execute", null))
+        assertEquals("执行命令", toolRowTitle("shell_execute", null))
     }
 
     @Test
     fun `default Running status is humanized, custom statuses pass through`() {
-        assertEquals("Execute Shell", humanizeToolStatus("Running: shell_execute", "shell_execute"))
+        assertEquals("执行命令", humanizeToolStatus("Running: shell_execute", "shell_execute"))
         assertEquals("Tapping Login button", humanizeToolStatus("Tapping Login button", "accessibility"))
         assertEquals("Running: shell_execute", humanizeToolStatus("Running: shell_execute", null))
     }

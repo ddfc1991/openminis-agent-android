@@ -71,9 +71,9 @@ class BrowserHistoryStore private constructor(private val context: Context) {
             cal.timeInMillis = entry.timestamp
             when {
                 cal.get(java.util.Calendar.YEAR) == today.get(java.util.Calendar.YEAR) &&
-                    cal.get(java.util.Calendar.DAY_OF_YEAR) == today.get(java.util.Calendar.DAY_OF_YEAR) -> "Today"
+                    cal.get(java.util.Calendar.DAY_OF_YEAR) == today.get(java.util.Calendar.DAY_OF_YEAR) -> "今天"
                 cal.get(java.util.Calendar.YEAR) == yesterday.get(java.util.Calendar.YEAR) &&
-                    cal.get(java.util.Calendar.DAY_OF_YEAR) == yesterday.get(java.util.Calendar.DAY_OF_YEAR) -> "Yesterday"
+                    cal.get(java.util.Calendar.DAY_OF_YEAR) == yesterday.get(java.util.Calendar.DAY_OF_YEAR) -> "昨天"
                 else -> {
                     val month = cal.get(java.util.Calendar.MONTH) + 1
                     val day = cal.get(java.util.Calendar.DAY_OF_MONTH)

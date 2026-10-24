@@ -28,8 +28,24 @@ object SessionConcurrencyManager {
     private data class Waiter(val sessionId: String, val continuation: Continuation<Unit>)
     private val waitQueue = LinkedList<Waiter>()
 
+    /**
+     * [Mines-38.9.12.1] user's OOM 2026-10-23 (5/5 sessions, heap 93 %): while the Java heap is ≥ 75 % of its cap no NEW
+     * session starts — it queues like a 6th one and starts when a running one ends (limit ≥ 1, so never a deadlock).
+     */
+    @Volatile var heapGated: Int = 0
+        private set
+    private fun limitNow(): Int {
+        val r = Runtime.getRuntime()
+        val lim = com.openminis.app.plus.SafeStartCore.slotLimit(r.totalMemory() - r.freeMemory(), r.maxMemory(), MAX_CONCURRENT, _runningSessions.value.size)
+        if (lim < MAX_CONCURRENT && _runningSessions.value.size >= lim) {
+            heapGated++
+            runCatching { com.openminis.app.plus.MemGuard.trim("新任务排队：堆紧张") }
+        }
+        return lim
+    }
+
     suspend fun acquireSlot(sessionId: String) {
-        if (_runningSessions.value.size < MAX_CONCURRENT) {
+        if (_runningSessions.value.size < MAX_CONCURRENT && _runningSessions.value.size < limitNow()) {
             _runningSessions.value = _runningSessions.value + sessionId
             // [T-STALL-DIAG] Fast path taken — record who now holds slots so a
             // later leak can be traced back to the turn that opened it.

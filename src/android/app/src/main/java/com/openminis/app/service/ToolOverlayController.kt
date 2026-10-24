@@ -815,7 +815,7 @@ class ToolOverlayController(private val context: Context) {
         // [T-android-overlay-no-idle] After a tool completes,
         // SessionActivityTracker resets currentToolStatus to "Idle" and
         // toolName to null — flowing that through verbatim would render a noisy
-        // "Minis / Idle" capsule that tells the user nothing. When not running
+        // "Mines / Idle" capsule that tells the user nothing. When not running
         // and we have neither a toolTitle nor a real toolName, hide the tool
         // row so only the app/outcome line remains.
         val hasToolIdentity = !toolTitle.isNullOrBlank() || toolName != null
@@ -839,10 +839,10 @@ class ToolOverlayController(private val context: Context) {
         // the current call is doing.
         labelView?.let { lv ->
             // On completion the outcome word stands alone rather than as
-            // "Minis — <outcome>": row 1 shares its width with the status tick
+            // "Mines — <outcome>": row 1 shares its width with the status tick
             // and the elapsed clock, and the localized words are long enough
             // (zh "执行完成" is four full-width characters) that the combined
-            // string ellipsized to an unreadable "Minis — 执...". The app
+            // string ellipsized to an unreadable "Mines — 执...". The app
             // identity is already carried by the logo to the left, so dropping
             // it here loses nothing.
             // [T-android-overlay-multitask] Row 1 names the TASK, not the

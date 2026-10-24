@@ -19,8 +19,17 @@ object SoulIcon {
     /** The stored prefix. PNG specifically: it is the format we re-encode to. */
     const val DATA_URI_PREFIX = "data:image/png;base64,"
 
-    /** Longest edge of the stored bitmap, in pixels. ~1-4 KB as a data URI. */
-    const val STORED_PIXELS = 96
+    /**
+     * Longest edge of the stored bitmap, in pixels.
+     *
+     * [Mines-qq-avatar] 192 rather than 96: the chat header now renders a
+     * 44.dp avatar, which is ~132px at xxhdpi. A 96px source upscaled to
+     * that reads soft, and `encode` deliberately never upscales — so the
+     * stored resolution has to cover the largest surface that draws it.
+     * Still far below [MAX_DATA_URI_CHARS]: a 192px PNG of a flat-colour
+     * avatar is a few KB.
+     */
+    const val STORED_PIXELS = 192
 
     /**
      * Hard cap on the stored string. A 96px PNG lands far below this; the cap

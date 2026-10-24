@@ -91,7 +91,10 @@ class SpeechOffloadHandler(private val context: Context) : NativeOffloadHandler 
         val hasMic = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
             PackageManager.PERMISSION_GRANTED
         val body = JSONObject()
-            .put("available", ok)
+            .put("available", ok || com.openminis.app.speech.OfflineAsrEngine.modelReady(context, com.openminis.app.speech.OfflineAsrEngine.MODEL_ZH))
+            .put("system_recognizer", ok)
+            .put("on_device_recognizer", Build.VERSION.SDK_INT >= 31 && runCatching { SpeechRecognizer.isOnDeviceRecognitionAvailable(context) }.getOrDefault(false))
+            .put("offline_vosk_ready", com.openminis.app.speech.OfflineAsrEngine.modelReady(context, com.openminis.app.speech.OfflineAsrEngine.MODEL_ZH))
             .put("has_record_audio_permission", hasMic)
             .toString(2)
         return NativeOffloadResult(0, OffloadOutput.formatBody(body, args) + "\n")
@@ -99,7 +102,8 @@ class SpeechOffloadHandler(private val context: Context) : NativeOffloadHandler 
 
     private fun cmdTranscribe(args: OffloadArgs): NativeOffloadResult {
         val available = try { SpeechRecognizer.isRecognitionAvailable(context) } catch (_: Throwable) { false }
-        if (!available) {
+        // [Mines-stt-29] No system service is no longer fatal: Listen falls back to Vosk offline.
+        if (!available && false) {
             val body = JSONObject()
                 .put("error", "recognizer_unavailable")
                 .put(
@@ -152,8 +156,23 @@ class SpeechOffloadHandler(private val context: Context) : NativeOffloadHandler 
         val lang = args.get("language")
         val maxResults = args.getInt("max") ?: 3
         val durationSec = args.getInt("duration") ?: args.getInt("timeout") ?: 30
-        val text = recognize(lang, maxResults, durationSec.toLong())
-        return NativeOffloadResult(0, OffloadOutput.formatBody(text, args) + "\n")
+        // [Mines-stt-29] system → on-device → Vosk offline (see plus/Listen.kt for
+        // the realme "Client error" root cause). `--engine system` keeps the
+        // old single-engine path.
+        if (args.get("engine") == "system") {
+            val text = recognize(lang, maxResults, durationSec.toLong())
+            return NativeOffloadResult(0, OffloadOutput.formatBody(text, args) + "\n")
+        }
+        val r = com.openminis.app.plus.Listen.once(context, durationSec.coerceIn(3, 60), lang,
+            allowDownload = !args.hasFlag("no-download"))
+        val json = JSONObject().put("engine", r.engine).put("tried", JSONArray(r.tried))
+        return if (r.text != null) {
+            NativeOffloadResult(0, OffloadOutput.formatBody(json.put("text", r.text).toString(2), args) + "\n")
+        } else {
+            json.put("error", if (r.error == com.openminis.app.plus.Listen.NO_SPEECH) "no_speech" else "recognition_failed")
+                .put("message", r.error ?: "unknown")
+            NativeOffloadResult(1, OffloadOutput.formatBody(json.toString(2), args) + "\n")
+        }
     }
 
     /**
@@ -265,7 +284,7 @@ class SpeechOffloadHandler(private val context: Context) : NativeOffloadHandler 
                     OffloadPermissionManager.SettingsGateRequest(
                         id = Manifest.permission.RECORD_AUDIO,
                         title = "Microphone permission needed",
-                        message = "Minis needs microphone permission to transcribe speech. Open Settings to allow it.",
+                        message = "Mines needs microphone permission to transcribe speech. Open Settings to allow it.",
                         settingsAction = android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
                         requiresPackageUri = true,
                         positiveLabel = "Open Settings",

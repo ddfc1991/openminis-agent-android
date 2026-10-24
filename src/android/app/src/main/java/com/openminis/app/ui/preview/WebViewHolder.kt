@@ -96,6 +96,8 @@ class WebViewHolder(
         // implicitly via WebViewAssetLoader's defaults.
         settings.useWideViewPort = true
         settings.loadWithOverviewMode = true
+        // [Mines-webfit-38.3] zoomable, text follows the font size, mobile UA
+        com.openminis.app.browser.WebFit.apply(this)
         mobileUserAgent = settings.userAgentString
         // T-android-webview-v3-port: enable first- + third-party cookies so
         // the in-chat preview matches Chrome cookie semantics. Without
@@ -231,7 +233,7 @@ class WebViewHolder(
             ): Boolean {
                 val ctx = view?.context ?: return false.also { result?.cancel() }
                 if (ctx !is android.app.Activity) { result?.cancel(); return true }
-                android.app.AlertDialog.Builder(ctx)
+                com.openminis.app.ui.plus.GlassViewDialog.builder(ctx)
                     .setMessage(message.orEmpty())
                     .setPositiveButton(android.R.string.ok) { _, _ -> result?.confirm() }
                     .setOnCancelListener { result?.cancel() }
@@ -247,7 +249,7 @@ class WebViewHolder(
             ): Boolean {
                 val ctx = view?.context ?: return false.also { result?.cancel() }
                 if (ctx !is android.app.Activity) { result?.cancel(); return true }
-                android.app.AlertDialog.Builder(ctx)
+                com.openminis.app.ui.plus.GlassViewDialog.builder(ctx)
                     .setMessage(message.orEmpty())
                     .setPositiveButton(android.R.string.ok) { _, _ -> result?.confirm() }
                     .setNegativeButton(android.R.string.cancel) { _, _ -> result?.cancel() }
@@ -276,7 +278,7 @@ class WebViewHolder(
                     setPadding(pad, pad / 2, pad, 0)
                     addView(input)
                 }
-                android.app.AlertDialog.Builder(ctx)
+                com.openminis.app.ui.plus.GlassViewDialog.builder(ctx)
                     .setMessage(message.orEmpty())
                     .setView(wrapper)
                     // confirm() carries the typed text back to the page; a bare
@@ -385,8 +387,13 @@ class WebViewHolder(
             applyShrinkToFit(DESKTOP_VIEWPORT_CSS_WIDTH)
         } else {
             webView.settings.userAgentString = mobileUserAgent
-            webView.settings.useWideViewPort = false
-            webView.settings.loadWithOverviewMode = false
+            // [Mines-webfit-38.3] mobile mode also keeps wide viewport + overview (fits the screen width;
+            // pages without a meta viewport are zoomed out to fit instead of cut off) and stays zoomable
+            webView.settings.useWideViewPort = true
+            webView.settings.loadWithOverviewMode = true
+            webView.settings.setSupportZoom(true)
+            webView.settings.builtInZoomControls = true
+            webView.settings.displayZoomControls = false
             webView.setInitialScale(0)
         }
         AppLogger.info(TAG, "toggleDesktopMode → $desktopMode")

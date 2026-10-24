@@ -55,11 +55,11 @@ internal fun notificationSmallIconFor(phase: AgentPhase, toolName: String?): Int
  * Title for the [AgentPhase.TOOL] row: the model-supplied `tool_title`
  * ("Open Baidu home page") when there is one, otherwise the per-tool label
  * the overlay uses ("Execute Shell"). Both are far shorter than the old
- * "Minis is using Shell" sentence, which matters on OEM chips that fall
+ * "Mines is using Shell" sentence, which matters on OEM chips that fall
  * back to the content title (see [chipTimerText]).
  */
 internal fun toolRowTitle(toolName: String, toolTitle: String?): String =
-    toolTitle?.takeIf { it.isNotBlank() } ?: friendlyToolTitleFor(toolName)
+    com.openminis.app.plus.ToolZh.title(toolTitle, toolName)
 
 /**
  * The tracker's default status line is the raw `"Running: <tool_name>"`.

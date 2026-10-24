@@ -1,5 +1,7 @@
 package com.openminis.app.ui.sandbox
 
+import com.openminis.app.ui.brand.MinesIcon
+
 import com.openminis.app.ui.settings.SettingsSwitch
 import com.openminis.app.R
 
@@ -43,7 +45,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
+import com.openminis.app.ui.theme.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -85,7 +87,8 @@ enum class MirrorCategory(
     val configPath: String,
 ) {
     ALPINE("alpine", "Alpine APK", "etc/apk/repositories"),
-    PIP("pip", "Python pip", "etc/pip/pip.conf"),
+    // [Mines-net-26] pip reads /etc/pip.conf (and /etc/xdg/pip/pip.conf), never /etc/pip/pip.conf.
+    PIP("pip", "Python pip", "etc/pip.conf"),
     NPM("npm", "Node.js npm", "root/.npmrc");
 
     val icon: ImageVector
@@ -393,8 +396,11 @@ object MirrorSpeedTestViewModel {
         val p = prefs(context)
         if (!p.getBoolean("rootfs.freshInstall", false)) return
         p.edit().remove("rootfs.freshInstall").apply()
-        Log.i(TAG, "Fresh rootfs detected — running auto mirror detection")
-
+        Log.i(TAG, "Fresh rootfs detected — mirrors are picked by minis-mirror inside the sandbox")
+        // [Mines-net-26] Mines picks mirrors from inside the sandbox (SandboxNet.kickMirrors →
+        // minis-mirror), which tests the path apk/pip really use. The old app-side HEAD test
+        // kept the official CDN whenever it answered first, even where downloads then stall.
+        if (true) return
         scope.launch {
             // Reuse the normal test flow, then await its completion via currentJob.
             runAllTests(context)
@@ -452,8 +458,10 @@ object MirrorSpeedTestViewModel {
                 break-system-packages = true
                 index-url = ${mirror.baseURL}
                 trusted-host = $host
+                timeout = 20
+                retries = 3
 
-                """.trimIndent()
+                """.trimIndent() + (if (File(dataDir, "etc/ssl/minis-ca.pem").isFile) "cert = /etc/ssl/minis-ca.pem\n" else "")
             }
             MirrorCategory.NPM -> "registry=${mirror.baseURL}\n"
         }
@@ -555,7 +563,7 @@ private fun MirrorCategoryRow(category: MirrorCategory, onClick: () -> Unit) {
                     LatencyBadge(fastest.latencyMs)
                     Spacer(Modifier.width(4.dp))
                 }
-                Icon(
+                MinesIcon(
                     Icons.AutoMirrored.Filled.KeyboardArrowRight,
                     contentDescription = null,
                     tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
@@ -570,19 +578,9 @@ private fun Modifier.widthIfShort(): Modifier = this
 
 @Composable
 private fun CircleIconBadge(icon: ImageVector, tint: Color) {
-    Box(
-        modifier = Modifier
-            .size(26.dp)
-            .clip(CircleShape)
-            .background(tint),
-        contentAlignment = Alignment.Center,
-    ) {
-        Icon(
-            icon,
-            contentDescription = null,
-            tint = Color.White,
-            modifier = Modifier.size(14.dp),
-        )
+    // [Mines-brand-26] monochrome line icon, no coloured badge
+    Box(modifier = Modifier.size(26.dp), contentAlignment = Alignment.Center) {
+        MinesIcon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.onSurface, modifier = Modifier.size(20.dp))
     }
 }
 
@@ -627,7 +625,7 @@ fun MirrorCategoryDetailScreen(
                 title = { Text(category.displayName) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = stringResource(R.string.mirror_back))
+                        MinesIcon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = stringResource(R.string.mirror_back))
                     }
                 },
             )
@@ -769,7 +767,7 @@ private fun MirrorRow(
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Icon(
+        MinesIcon(
             if (isSelected) Icons.Filled.CheckCircle else Icons.Filled.RadioButtonUnchecked,
             contentDescription = null,
             tint = if (isSelected) MaterialTheme.colorScheme.primary

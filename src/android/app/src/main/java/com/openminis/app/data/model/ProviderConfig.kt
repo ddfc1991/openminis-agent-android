@@ -318,7 +318,8 @@ data class ProviderInstance(
     val effectiveBaseURL: String?
         get() {
             val base = customBaseURL?.trimEnd('/') ?: return null
-            return if (appendV1Suffix && !base.endsWith("/v1")) "$base/v1" else base
+            // [Mines-38.9.9] GitHub Models has no /v1 (…/inference/chat/completions)
+            return if (appendV1Suffix && !base.endsWith("/v1") && !base.lowercase().contains("models.github.ai")) "$base/v1" else base
         }
 
     /**

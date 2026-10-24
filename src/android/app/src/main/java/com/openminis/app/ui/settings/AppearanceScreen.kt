@@ -1,5 +1,7 @@
 package com.openminis.app.ui.settings
 
+import com.openminis.app.ui.plus.MT
+
 import com.openminis.app.R
 import com.openminis.app.data.repository.AppIconRepository
 import com.openminis.app.ui.components.MinisTextButton
@@ -240,7 +242,7 @@ fun getAppearancePrefs(context: Context): SharedPreferences =
     context.getSharedPreferences(PREF_APPEARANCE, Context.MODE_PRIVATE)
 
 fun getThemeMode(context: Context): Int =
-    getAppearancePrefs(context).getInt(KEY_THEME_MODE, 0)
+    getAppearancePrefs(context).getInt(KEY_THEME_MODE, 3)
 
 fun getFontScale(context: Context, key: String): Float =
     fontScaleForLevel(getAppearancePrefs(context).getInt(key, 0))
@@ -258,7 +260,7 @@ fun AppearanceScreen(
     val context = LocalContext.current
     val prefs = remember { getAppearancePrefs(context) }
 
-    var themeMode by remember { mutableIntStateOf(prefs.getInt(KEY_THEME_MODE, 0)) }
+    var themeMode by remember { mutableIntStateOf(prefs.getInt(KEY_THEME_MODE, 3)) }
     var launchSession by remember { mutableIntStateOf(prefs.getInt(KEY_LAUNCH_SESSION, 0)) }
     var returnKeyBehavior by remember { mutableIntStateOf(prefs.getInt(KEY_RETURN_KEY_BEHAVIOR, 0)) }
     var keepScreenAwake by remember { mutableStateOf(prefs.getBoolean(KEY_KEEP_SCREEN_AWAKE, false)) }
@@ -297,6 +299,8 @@ fun AppearanceScreen(
                 ThemeRow(stringResource(R.string.appearance_theme_system), Icons.Outlined.BrightnessAuto, tilePurple),
                 ThemeRow(stringResource(R.string.appearance_theme_light), Icons.Outlined.LightMode, tileOrange),
                 ThemeRow(stringResource(R.string.appearance_theme_dark), Icons.Outlined.DarkMode, tilePurple),
+                // [Mines-38.7] index 3: day / night by sunrise & sunset, with the animated change (default)
+                ThemeRow("随日出日落（自动）", Icons.Outlined.BrightnessAuto, tileOrange),
             )
             themeRows.forEachIndexed { idx, row ->
                 SettingsChoiceRow(
@@ -806,7 +810,7 @@ private fun FontScaleSliderRow(
             )
         }
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-            Text("A", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("A", fontSize = MT.Caption, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Slider(
                 value = sliderPos,
                 onValueChange = { sliderPos = it },
@@ -821,7 +825,7 @@ private fun FontScaleSliderRow(
                     .weight(1f)
                     .padding(horizontal = 8.dp),
             )
-            Text("A", fontSize = 20.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("A", fontSize = MT.PageTitle, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
     if (showDivider) {

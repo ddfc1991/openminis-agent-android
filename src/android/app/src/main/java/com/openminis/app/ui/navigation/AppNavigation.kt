@@ -77,6 +77,7 @@ import com.openminis.app.sandbox.RootfsManager
 import com.openminis.app.sandbox.TerminalSession
 import com.openminis.app.ui.terminal.TerminalScreen
 import com.openminis.app.ui.onboarding.OnboardingModelSelectionScreen
+import com.openminis.app.ui.group.groupRoutes // [Mines-group-37]
 
 // T342: Material 3 motion easing curves. Compose-Material3 (1.3.x) ships
 // `MotionScheme` only in 1.4-alpha; mirror the spec values directly so we
@@ -363,7 +364,8 @@ fun AppNavigation(
         val mode = if (
             com.openminis.app.diagnostics.HangDetector.shouldForceHomeOnLaunch(context) ||
             com.openminis.app.crash.CrashFrequencyDetector.shouldForceHomeOnLaunch(context) ||
-            com.openminis.app.diagnostics.LaunchCycleBeacon.shouldForceHomeOnLaunch()
+            com.openminis.app.diagnostics.LaunchCycleBeacon.shouldForceHomeOnLaunch() ||
+            com.openminis.app.plus.SafeStart.forceHome   // [Mines-38.9.12.1] OOM safe start: home, not the last chat
         ) 3 else rawMode
         val autoThresholdMs = 15L * 60 * 1000
         // [T-android-first-launch-lands-home] Read once, before the mode
@@ -515,6 +517,43 @@ fun AppNavigation(
         quickActionStart != null -> quickActionStart
         else -> Routes.SESSION_LIST
     }
+    androidx.compose.runtime.DisposableEffect(navController) {
+        // [Mines-feed-35.3] safeNavigate silently drops a call while the current entry is not RESUMED (a sheet or
+        // transition closing). Plus pages (消息 actions, desk pet, notifications) wait up to ~1.5 s for RESUMED instead,
+        // then navigate anyway, so a tap is never swallowed.
+        com.openminis.app.ui.plus.PlusNav.navigate = { route ->
+            val h = android.os.Handler(android.os.Looper.getMainLooper())
+            fun attempt(n: Int) {
+                val st = navController.currentBackStackEntry?.lifecycle?.currentState
+                if (st == androidx.lifecycle.Lifecycle.State.RESUMED || n >= 15) {
+                    runCatching { navController.navigate(route) }.onFailure {
+                        com.openminis.app.logging.AppLogger.warning("PlusNav", "navigate $route failed: ${it.message}")
+                        com.openminis.app.ui.plus.FeedTasks.toast(context, "打不开这个页面：${it.message ?: "未知原因"}", long = true)
+                    }
+                } else h.postDelayed({ attempt(n + 1) }, 100)
+            }
+            if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) attempt(0) else h.post { attempt(0) }
+        }
+        // [Mines-38.9] open a web page in Mines' in-app browser from any page (账号关联 打开网站 / 改密码 / 安全设置)
+        com.openminis.app.ui.plus.PlusNav.openWeb = { url ->
+            com.openminis.app.ui.plus.PlusNav.openBrowser.value = url
+            runCatching { navController.popBackStack(Routes.SESSION_LIST, false) }
+        }
+        com.openminis.app.ui.plus.PlusNav.pending?.let { r ->
+            com.openminis.app.ui.plus.PlusNav.pending = null
+            navController.safeNavigate(r)
+        }
+        onDispose { com.openminis.app.ui.plus.PlusNav.navigate = null }
+    }
+    // [Mines-crash-28] Offer the last crash record once after it happened.
+    // [Mines-38.9.11.3] the blocking crash dialog is replaced by the small CrashCardHost card (JVM crash + ANR + native, redacted)
+    // Mines: one-time offer to pull data from the earlier Mines install.
+    com.openminis.app.ui.plus.MinesMigrationPrompt(
+        onOpen = { navController.safeNavigate(com.openminis.app.ui.plus.PlusRoutes.MIGRATE) },
+    )
+    // [Mines-38.1] one porcelain backdrop (blurred + masked wallpaper) behind every screen; pages are transparent.
+    androidx.compose.foundation.layout.Box(Modifier.fillMaxSize()) {
+    com.openminis.app.ui.plus.MinesBackdrop(Modifier.fillMaxSize())
     NavHost(
         navController = navController,
         startDestination = startDestination,
@@ -526,8 +565,7 @@ fun AppNavigation(
         // the active Material colorScheme also keeps the first frame
         // correct on cold start.
         modifier = Modifier
-            .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background),
+            .fillMaxSize(),
         // T342: Material 3 motion — shared-axis X transition.
         // Spec (m3.material.io/styles/motion/transitions):
         //   - enter uses EmphasizedDecelerate (cubic-bezier 0.05, 0.7, 0.1, 1.0)
@@ -548,24 +586,28 @@ fun AppNavigation(
         // flashes; the slightly longer enter spec (300ms vs 220ms) is
         // covered by the same guard.
         enterTransition = {
+            if (com.openminis.app.plus.Diag.navAnimOff) androidx.compose.animation.EnterTransition.None else   // [38.9.11.3 g2] 远程诊断 nav_anim=off
             slideIntoContainer(
                 AnimatedContentTransitionScope.SlideDirection.Start,
                 animationSpec = tween(300, easing = EmphasizedDecelerate),
             ) + fadeIn(animationSpec = tween(300, easing = EmphasizedDecelerate))
         },
         exitTransition = {
+            if (com.openminis.app.plus.Diag.navAnimOff) androidx.compose.animation.ExitTransition.None else   // [38.9.11.3 g2] 远程诊断 nav_anim=off
             slideOutOfContainer(
                 AnimatedContentTransitionScope.SlideDirection.Start,
                 animationSpec = tween(200, easing = EmphasizedAccelerate),
             ) + fadeOut(animationSpec = tween(200, easing = EmphasizedAccelerate))
         },
         popEnterTransition = {
+            if (com.openminis.app.plus.Diag.navAnimOff) androidx.compose.animation.EnterTransition.None else   // [38.9.11.3 g2] 远程诊断 nav_anim=off
             slideIntoContainer(
                 AnimatedContentTransitionScope.SlideDirection.End,
                 animationSpec = tween(300, easing = EmphasizedDecelerate),
             ) + fadeIn(animationSpec = tween(300, easing = EmphasizedDecelerate))
         },
         popExitTransition = {
+            if (com.openminis.app.plus.Diag.navAnimOff) androidx.compose.animation.ExitTransition.None else   // [38.9.11.3 g2] 远程诊断 nav_anim=off
             slideOutOfContainer(
                 AnimatedContentTransitionScope.SlideDirection.End,
                 animationSpec = tween(200, easing = EmphasizedAccelerate),
@@ -608,8 +650,136 @@ fun AppNavigation(
             )
         }
 
+        composable(com.openminis.app.ui.plus.PlusRoutes.WORK) {
+            com.openminis.app.ui.plus.WorkLocationScreen(
+                onBack = { navController.safePopBackStack() },
+                onOpenTerminal = { cmd -> navController.safeNavigate(Routes.terminal(cmd)) },
+                onOpenServer = { id -> navController.safeNavigate(com.openminis.app.ui.plus.PlusRoutes.server(id)) },
+            )
+        }
+        composable(
+            route = com.openminis.app.ui.plus.PlusRoutes.SERVER,
+            arguments = listOf(navArgument("id") { type = NavType.StringType }),
+        ) { entry ->
+            com.openminis.app.ui.plus.ServerDetailScreen(
+                serverId = entry.arguments?.getString("id") ?: "",
+                onBack = { navController.safePopBackStack() },
+                onOpenTerminal = { cmd -> navController.safeNavigate(Routes.terminal(cmd)) },
+            )
+        }
+        composable(com.openminis.app.ui.plus.PlusRoutes.SANDBOX) {
+            com.openminis.app.ui.plus.SandboxScreen(onBack = { navController.safePopBackStack() })
+        }
+        composable(com.openminis.app.ui.plus.PlusRoutes.PLUGINS) {
+            com.openminis.app.ui.plus.PluginsScreen(
+                onBack = { navController.safePopBackStack() },
+                onOpenTerminal = { cmd -> navController.safeNavigate(Routes.terminal(cmd)) },
+                onOpenMarket = { navController.safeNavigate(com.openminis.app.ui.plus.PlusRoutes.MARKET) },
+            )
+        }
+        composable(com.openminis.app.ui.plus.PlusRoutes.MARKET) {
+            com.openminis.app.ui.plus.MarketScreen(
+                onBack = { navController.safePopBackStack() },
+                onOpenTerminal = { cmd -> navController.safeNavigate(Routes.terminal(cmd)) },
+            )
+        }
+        composable(com.openminis.app.ui.plus.PlusRoutes.ROUTING) {
+            com.openminis.app.ui.plus.RoutingScreen(onBack = { navController.safePopBackStack() })
+        }
+        composable(com.openminis.app.ui.plus.PlusRoutes.KNOWLEDGE) {
+            com.openminis.app.ui.plus.KnowledgeScreen(onBack = { navController.safePopBackStack() })
+        }
+        composable(com.openminis.app.ui.plus.PlusRoutes.TIDY) {
+            com.openminis.app.ui.plus.TidyScreen(onBack = { navController.safePopBackStack() })
+        }
+        composable(com.openminis.app.ui.plus.PlusRoutes.VERIFY) {
+            com.openminis.app.ui.plus.VerifyScreen(onBack = { navController.safePopBackStack() })
+        }
+        composable(com.openminis.app.ui.plus.PlusRoutes.VOICE_SETTINGS) {
+            com.openminis.app.ui.plus.VoiceSettingsScreen(onBack = { navController.safePopBackStack() })
+        }
+        composable(com.openminis.app.ui.plus.PlusRoutes.CODESRC) {
+            com.openminis.app.ui.plus.CodeSourcesScreen(onBack = { navController.safePopBackStack() })
+        }
+        composable(com.openminis.app.ui.plus.PlusRoutes.CARDS) {
+            com.openminis.app.ui.plus.PayCardsScreen(onBack = { navController.safePopBackStack() })
+        }
+        composable(com.openminis.app.ui.plus.PlusRoutes.DIGEST) {
+            com.openminis.app.ui.plus.DigestScreen(onBack = { navController.safePopBackStack() })
+        }
+        composable(com.openminis.app.ui.plus.PlusRoutes.REPORT) {
+            com.openminis.app.ui.plus.ReportScreen(onBack = { navController.safePopBackStack() })
+        }
+        composable(com.openminis.app.ui.plus.PlusRoutes.UPDATE) {
+            com.openminis.app.ui.plus.UpdateScreen(onBack = { navController.safePopBackStack() })
+        }
+        // [Mines-38.9] 账号关联 keychain + detail, 应用代理, 外观调节, 经验
+        composable(com.openminis.app.ui.plus.PlusRoutes.KEYCHAIN) {
+            // [Mines-38.9.3] 账号关联 + 账号连接 merged into 「账号」: this route opens its 登录 tab
+            com.openminis.app.ui.plus.AccountsScreen(1, onBack = { navController.safePopBackStack() }, go = { navController.safeNavigate(it) })
+        }
+        composable(
+            route = com.openminis.app.ui.plus.PlusRoutes.KEYCHAIN_DETAIL,
+            arguments = listOf(navArgument("id") { type = NavType.StringType }),
+        ) { entry ->
+            com.openminis.app.ui.plus.KeychainDetailScreen(id = entry.arguments?.getString("id") ?: "", onBack = { navController.safePopBackStack() })
+        }
+        composable(com.openminis.app.ui.plus.PlusRoutes.AGENTS) {
+            com.openminis.app.ui.plus.AppAgentsScreen(onBack = { navController.safePopBackStack() }, go = { navController.safeNavigate(it) })
+        }
+        composable(com.openminis.app.ui.plus.PlusRoutes.LOOK) {
+            com.openminis.app.ui.plus.LookScreen(onBack = { navController.safePopBackStack() })
+        }
+        composable(com.openminis.app.ui.plus.PlusRoutes.EXPERIENCE) {
+            com.openminis.app.ui.plus.ExperienceScreen(onBack = { navController.safePopBackStack() })
+        }
+        composable(com.openminis.app.ui.plus.PlusRoutes.WORKFLOWS) {
+            com.openminis.app.ui.plus.WorkflowLogScreen(onBack = { navController.safePopBackStack() },
+                onOpenChat = { sid -> navController.safeNavigate(com.openminis.app.ui.navigation.Routes.chat(sid)) })
+        }
+        composable(com.openminis.app.ui.plus.PlusRoutes.FREE_AI) {
+            com.openminis.app.ui.plus.FreeAiScreen(onBack = { navController.safePopBackStack() },
+                openLogin = { id -> navController.safeNavigate(com.openminis.app.ui.group.GroupRoutes.webLogin(id)) })
+        }
+        // [Mines-38.9.12] 应用 hub · 账号自动调用 · 协作工作区
+        composable(com.openminis.app.ui.plus.Routes3912.APPS) {
+            com.openminis.app.ui.plus.AppsHubScreen(onBack = { navController.safePopBackStack() }, go = { navController.safeNavigate(it) })
+        }
+        composable(com.openminis.app.ui.plus.Routes3912.AUTOLOGIN) {
+            com.openminis.app.ui.plus.AutoLoginScreen(onBack = { navController.safePopBackStack() })
+        }
+        composable(com.openminis.app.ui.plus.Routes3912.WORKPOOL) {
+            com.openminis.app.ui.plus.WorkPoolScreen(onBack = { navController.safePopBackStack() }, go = { navController.safeNavigate(it) })
+        }
+        composable(com.openminis.app.ui.plus.Routes3912.REGISTER) {
+            com.openminis.app.ui.plus.RegisterLedgerScreen(onBack = { navController.safePopBackStack() }, go = { navController.safeNavigate(it) })
+        }
+        composable(com.openminis.app.ui.plus.Routes3912.CONNECT) {
+            com.openminis.app.ui.plus.QuickConnectScreen(onBack = { navController.safePopBackStack() }, go = { navController.safeNavigate(it) })
+        }
+        composable(com.openminis.app.ui.plus.PlusRoutes.MIGRATE) {
+            com.openminis.app.ui.plus.MigrateScreen(onBack = { navController.safePopBackStack() })
+        }
+        groupRoutes(navController) // [Mines-group-37] AI 群聊 / AI 伙伴
+        composable(com.openminis.app.ui.plus.PlusRoutes.CONNECTIONS) {
+            com.openminis.app.ui.plus.AccountsScreen(0, onBack = { navController.safePopBackStack() }, go = { navController.safeNavigate(it) })   // [Mines-38.9.3] 「账号」 › 服务
+        }
+        composable(com.openminis.app.ui.plus.PlusRoutes.AI_SERVICES) {   // [Mines-38.9.5 i] ☰ › AI 服务
+            com.openminis.app.ui.plus.ConnectionsScreen(onBack = { navController.safePopBackStack() }, onTab = null, title = "AI 服务")
+        }
+        composable(com.openminis.app.ui.plus.PlusRoutes.VOICE) {
+            com.openminis.app.ui.plus.VoiceLiveScreen(
+                onBack = { navController.safePopBackStack() },
+                onOpenConnections = { navController.safeNavigate(com.openminis.app.ui.plus.PlusRoutes.CONNECTIONS) },
+            )
+        }
+        composable(com.openminis.app.ui.plus.PlusRoutes.PERSONALIZE) {
+            com.openminis.app.ui.plus.PersonalizeScreen(onBack = { navController.safePopBackStack() })
+        }
+
         composable(Routes.SETTINGS) {
             SettingsScreen(
+                onPlusClick = { route -> navController.safeNavigate(route) },
                 onBack = { navController.safePopBackStack() },
                 onProvidersClick = { navController.safeNavigate(Routes.PROVIDER_LIST) },
                 onModelGroupsClick = { navController.safeNavigate(Routes.MODEL_GROUPS) },
@@ -1563,5 +1733,6 @@ fun AppNavigation(
                 },
             )
         }
+    }
     }
 }

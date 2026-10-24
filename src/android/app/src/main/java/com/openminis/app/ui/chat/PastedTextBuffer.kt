@@ -424,7 +424,7 @@ fun PastedTextChip(
             modifier = Modifier
                 .align(Alignment.TopEnd)
                 .size(20.dp)
-                .background(MaterialTheme.colorScheme.surface, CircleShape)
+                .background(MaterialTheme.colorScheme.surfaceContainerLow, CircleShape)
                 .border(0.5.dp, ChatColors.thumbnailBorder, CircleShape)
                 .clip(CircleShape)
                 .clickable(onClick = onRemove),
@@ -464,11 +464,9 @@ private fun PastedTextPreviewDialog(
     onDismiss: () -> Unit,
 ) {
     Dialog(onDismissRequest = onDismiss) {
-        Surface(
-            shape = RoundedCornerShape(16.dp),
-            color = MaterialTheme.colorScheme.surface,
-            tonalElevation = 6.dp,
-        ) {
+        // [Mines-38.9.6 i13] shared glass (was a solid surfaceContainerLow card with tonal elevation)
+        com.openminis.app.ui.plus.GlassWindowEffect()
+        com.openminis.app.ui.plus.GlassSurface(shape = RoundedCornerShape(16.dp)) {
             Column(modifier = Modifier.padding(20.dp)) {
                 Text(
                     text = "${pasted.placeholder}  ·  ${pasted.text.length}",

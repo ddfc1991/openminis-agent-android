@@ -48,7 +48,7 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.outlined.ChatBubble
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.Language
-import androidx.compose.material3.AlertDialog
+import com.openminis.app.ui.glass.AlertDialog
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -58,14 +58,14 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
+import com.openminis.app.ui.glass.ModalBottomSheet
 import com.openminis.app.ui.components.DialogTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
+import com.openminis.app.ui.theme.TopAppBar
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -369,7 +369,7 @@ fun SkillsManagementScreen(
                 MinisTextButton(onClick = {
                     deleteSkillId?.let { skillRepository.delete(it) }
                     deleteSkillId = null
-                }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+                }) { Text("删除", color = MaterialTheme.colorScheme.error) }
             },
             dismissButton = {
                 MinisTextButton(onClick = { deleteSkillId = null }) { Text(stringResource(R.string.common_cancel)) }
@@ -646,9 +646,12 @@ fun SkillDetailScreen(
         SkillRepository.ImportSource.SESSION -> stringResource(R.string.skill_detail_source_session)
     }
 
+    // [Mines-38.9.4] skill document = reading surface: opaque warm paper, never fog under text.
     Scaffold(
+        containerColor = com.openminis.app.ui.plus.minesReadingSurface(),
         topBar = {
             TopAppBar(
+                solid = com.openminis.app.ui.plus.minesReadingBar(),
                 title = { Text(skill.name) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
@@ -898,7 +901,7 @@ fun SkillDetailScreen(
                     skillRepository.delete(skill.id)
                     showDeleteDialog = false
                     onBack()
-                }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+                }) { Text("删除", color = MaterialTheme.colorScheme.error) }
             },
             dismissButton = {
                 MinisTextButton(onClick = { showDeleteDialog = false }) { Text(stringResource(R.string.common_cancel)) }
@@ -954,7 +957,7 @@ private fun DetailSection(
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontWeight = androidx.compose.ui.text.font.FontWeight.Medium,
-                letterSpacing = 0.5.sp,
+                letterSpacing = 0.sp,
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
             )
         }
@@ -1104,10 +1107,10 @@ private fun relativeTime(millis: Long): String {
     val hours = diff / 3_600_000
     val days = diff / 86_400_000
     return when {
-        minutes < 1 -> "just now"
-        minutes < 60 -> "$minutes min ago"
-        hours < 24 -> "$hours hr ago"
-        days < 30 -> "$days days ago"
+        minutes < 1 -> "刚刚"  // [Mines-38.1] Chinese
+        minutes < 60 -> "$minutes 分钟前"
+        hours < 24 -> "$hours 小时前"
+        days < 30 -> "$days 天前"
         else -> SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date(millis))
     }
 }

@@ -23,26 +23,7 @@ except ImportError:  # pragma: no cover - the sh wrapper installs httpx first
 
 TIMEOUT_SECONDS = 300  # 5 min
 
-# $VAR and $$VAR both expand from the process env; the UI picker emits $$VAR to
-# make a reference visually explicit. The optional second `$` is consumed in the
-# same match (no double-expansion), so $$VAR / $${VAR} resolve identically to
-# $VAR / ${VAR}.
-_ENV_RE = re.compile(r"\$\$?\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
-
-
-class MCPError(Exception):
-    def __init__(self, code, message):
-        super().__init__(message)
-        self.code = code
-        self.message = message
-
-
-def expand_env(value):
-    """Replace $VAR / ${VAR} / $$VAR / $${VAR} with the environment value (empty
-    if unset)."""
-    if not isinstance(value, str):
-        return value
-    return _ENV_RE.sub(lambda m: os.environ.get(m.group(1), ""), value)
+from transport.errors import MCPError, expand_env, _ENV_RE  # noqa: E402,F401 (re-exported)
 
 
 def _expand_headers(headers):

@@ -334,6 +334,12 @@ object ChatViewModelStore {
      *  - the session currently on screen, which would otherwise be torn down
      *    underneath the composition that is reading it.
      */
+    /** [Mines-38.9.10 i29] MemGuard summary: live chat view models (normal + sub agent) */
+    @Synchronized
+    fun debugSize(): String = runCatching {
+        "${stores.size} 个（子任务 ${poolSize(PoolKind.CHILD)}）"
+    }.getOrDefault("?")
+
     /** Number of cached stores currently belonging to [kind]. */
     private fun poolSize(kind: PoolKind?): Int {
         if (kind == null) return 0

@@ -86,7 +86,39 @@ object VisionGroupResolver {
      * individually, so one dangling reference cannot disqualify a good sibling.
      */
     fun candidates(repo: ProviderRepository, context: Context?, seed: Int = 0): List<Pair<ProviderInstance, ModelEntry>> =
-        repo.resolveVisionCandidates(loadBalanceSeed = seed)
+        repo.resolveVisionCandidates(loadBalanceSeed = seed).ifEmpty { autoCandidates(repo) }
+
+    /**
+     * [Mines-38.9.11 b] 「图片看不见」 with a text-only main model (DeepSeek …) and no Vision Group set up: use any image-
+     * capable model the user already has working (enabled, credentialed, not hidden), Google-account Gemini first, so a
+     * picture is described instead of "当前模型不能看图片". Only credentialed instances — an auto pick must be able to answer.
+     */
+    /**
+     * [38.9.11.3.1] The main thread (tool list for the context estimate on chat open / send) never waits for the encrypted
+     * stores' first open — Android Keystore, 5–12 s on some phones, behind Tink's one global lock (3 ANRs on a realme,
+     * 2026-10-21/22). Until they are open the instance counts as credentialed, the same rule as Vision Group members:
+     * a missing credential surfaces at request time, where this runs off the main thread with the real check.
+     */
+    private fun credentialedNoWait(repo: ProviderRepository, inst: ProviderInstance): Boolean {
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper() &&
+            !com.openminis.app.util.EncryptedPrefsFactory.isOpen(*com.openminis.app.util.EncryptedPrefsFactory.UI_STORES)) return true
+        return runCatching { repo.hasAnyCredential(inst) }.getOrDefault(false)
+    }
+
+    private fun autoCandidates(repo: ProviderRepository): List<Pair<ProviderInstance, ModelEntry>> = runCatching {
+        val cfg = repo.config.value
+        cfg.modelEntries.asSequence()
+            .filter { !it.isHidden && it.model.hasImageInput }
+            .mapNotNull { e -> cfg.instances.firstOrNull { it.id == e.providerInstanceId }?.let { it to e } }
+            .filter { (inst, _) -> inst.isEnabled && credentialedNoWait(repo, inst) }
+            .sortedWith(compareBy<Pair<ProviderInstance, ModelEntry>>(
+                { if (it.first.providerType == com.openminis.app.data.model.ProviderType.gemini) 0 else 1 },
+                { if (it.second.model.id.contains("flash", true) || it.second.model.id.contains("mini", true)) 0 else 1 },
+            ))
+            .distinctBy { it.second.id }
+            .take(3)
+            .toList()
+    }.getOrDefault(emptyList())
 
     /**
      * [T-android-image-path-metadata] Path note appended AFTER the pixels for a
@@ -286,6 +318,26 @@ object VisionGroupResolver {
         val detail = if (failures.isEmpty()) "all vision models failed"
             else failures.joinToString("; ") { "${it.first}: ${it.second}" }
         return VisionResult.Failure(detail)
+    }
+
+    /**
+     * [Mines-38.9] Cloud OCR for phone screen reading (tier 3 when ML Kit's Latin model reads little or the screen is
+     * Chinese): the user's Vision Group first, else any enabled image-capable model they already configured (cheap /
+     * fast names first: flash, mini, lite, haiku, turbo …). No new service. Returns (raw model text, model name) or null.
+     */
+    suspend fun ocrOnce(repo: ProviderRepository, context: Context?, imageData: ByteArray, mimeType: String, instruction: String): Pair<String, String>? {
+        val group = candidates(repo, context)
+        val extra = runCatching {
+            repo.allVisibleEntries().filter { it.model.hasImageInput }.mapNotNull { e -> repo.instance(e.providerInstanceId)?.takeIf { it.isEnabled }?.let { it to e } }
+        }.getOrDefault(emptyList())
+        val cheap = Regex("(?i)(flash|mini|lite|haiku|turbo|nano|small|8b|7b|air)")
+        val all = (group + extra.sortedByDescending { cheap.containsMatchIn(it.second.model.id) }).distinctBy { it.second.id }.take(MAX_ATTEMPTS)
+        for ((inst, entry) in all) {
+            val txt = runCatching { describeOnce(repo, context, inst, entry, imageData, mimeType, instruction) }
+                .onFailure { android.util.Log.w("VisionGroup", "[OCR] ${entry.model.id} failed: ${it.message}") }.getOrNull()
+            if (!txt.isNullOrBlank()) return txt to displayName(inst, entry)
+        }
+        return null
     }
 
     /** One describe request against one entry, bounded by [PER_ATTEMPT_TIMEOUT_MS]. */

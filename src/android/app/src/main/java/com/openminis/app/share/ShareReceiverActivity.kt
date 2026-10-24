@@ -44,6 +44,17 @@ class ShareReceiverActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // [Mines-38.9.8] a Clash subscription shared from the Clash app (just the link) → 分流代理 › 内置 Clash, imported on one tap
+        if (runCatching {
+                val t = intent?.takeIf { it.action == Intent.ACTION_SEND }?.getStringExtra(Intent.EXTRA_TEXT)?.trim()
+                val link = t?.takeIf { it.length < 2000 }?.let { com.openminis.app.plus.ClashSubCore.findLink(it) }
+                if (link != null && t != null && t.lines().size <= 3 && t.length < link.length + 80) {
+                    com.openminis.app.plus.ClashCore.pendingLink = link; com.openminis.app.plus.ClashCore.pendingFrom = "分享"
+                    startActivity(Intent(this, com.openminis.app.MainActivity::class.java).putExtra("mines_route", com.openminis.app.ui.plus.PlusRoutes.ROUTING)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP))
+                    finish(); true
+                } else false
+            }.getOrDefault(false)) return
         val items = mutableListOf<PendingShare.Item>()
         try {
             when (intent?.action) {
@@ -162,7 +173,7 @@ class ShareReceiverActivity : ComponentActivity() {
         items: List<PendingShare.Item>,
     ): Boolean {
         return try {
-            android.app.AlertDialog.Builder(this)
+            com.openminis.app.ui.plus.GlassViewDialog.builder(this)
                 .setTitle(getString(com.openminis.app.R.string.share_provider_json_title))
                 .setMessage(getString(com.openminis.app.R.string.share_provider_json_message))
                 .setPositiveButton(getString(com.openminis.app.R.string.share_provider_json_import)) { _, _ ->

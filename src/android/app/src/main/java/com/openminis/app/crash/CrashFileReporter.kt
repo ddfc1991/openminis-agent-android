@@ -50,7 +50,8 @@ class CrashFileSender : ReportSender {
                 appendLine(logcat)
             }
         }
-        out.writeText(body)
+        // [Mines-38.9.11.3] no key / password / token / phone ever lands in a crash file
+        out.writeText(CrashRedactCore.redact(body))
     }
 
     companion object {

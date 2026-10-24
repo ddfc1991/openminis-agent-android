@@ -146,6 +146,21 @@ object OpenAIModelsApi {
             cache.load(context, cacheKey)?.let { return@withContext it }
         }
 
+        // [Mines-38.9.9] GitHub Models: no /models under /inference; the list is the public catalogue (publisher/model ids).
+        if (CompatQuirks.isGitHubModels(baseURL)) {
+            val gh = runCatching {
+                val r = client.newCall(Request.Builder().url(CompatQuirks.GITHUB_MODELS_CATALOG)
+                    .header("Authorization", "Bearer $apiKey").header("Accept", "application/json")
+                    .header("X-GitHub-Api-Version", "2022-11-28").applyUserAgentOverride(customUserAgent).build()).execute()
+                r.use { if (it.isSuccessful) CompatQuirks.parseGitHubCatalog(it.body?.string().orEmpty()) else emptyList() }
+            }.getOrDefault(emptyList())
+            val ghModels = gh.map { (id, name) -> LLMModel(id = id, displayName = name, provider = "Custom",
+                supportsReasoning = if (id.lowercase().let { it.contains("/o1") || it.contains("/o3") || it.contains("/o4") || it.contains("gpt-5") || it.contains("reason") || it.contains("-r1") }) true else null) }
+            if (ghModels.isEmpty()) return@withContext fallback
+            if (context != null) cache.save(context, cacheKey, ghModels)
+            return@withContext ghModels
+        }
+
         val url = buildURL(baseURL)
         val request = Request.Builder()
             .url(url)

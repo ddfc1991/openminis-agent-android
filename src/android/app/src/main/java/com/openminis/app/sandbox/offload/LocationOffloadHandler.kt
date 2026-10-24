@@ -127,17 +127,19 @@ class LocationOffloadHandler(private val context: Context) : NativeOffloadHandle
                     r = OffloadPermissionManager.AndroidPermissionResult.GRANTED
                 }
                 if (r == OffloadPermissionManager.AndroidPermissionResult.DENIED) {
-                    r = OffloadPermissionManager.requestSettingsGate(
+                    // [Mines-loc-29] bounded: the in-app dialog may never be seen
+                    // while Mines is in the background.
+                    r = kotlinx.coroutines.withTimeoutOrNull(90_000) { OffloadPermissionManager.requestSettingsGate(
                         OffloadPermissionManager.SettingsGateRequest(
                             id = Manifest.permission.ACCESS_FINE_LOCATION,
                             title = "Location permission needed",
-                            message = "Minis needs location permission to get your current location. Open Settings to allow it.",
+                            message = "Mines needs location permission to get your current location. Open Settings to allow it.",
                             settingsAction = android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
                             requiresPackageUri = true,
                             positiveLabel = "Open Settings",
                         ),
                         check = { hasPermission() },
-                    )
+                    ) } ?: OffloadPermissionManager.AndroidPermissionResult.TIMEOUT
                 }
                 r
             }
@@ -170,9 +172,20 @@ class LocationOffloadHandler(private val context: Context) : NativeOffloadHandle
         } catch (_: Throwable) { false }
 
         if (!locationEnabled || enabled.isEmpty()) {
+            // [Mines-loc-29] Say it plainly and give the user a one-tap way
+            // to the switch: a notification 「点这里打开定位」 always, and with
+            // --open-settings the settings page is opened directly.
+            val settings = android.content.Intent(android.provider.Settings.ACTION_LOCATION_SOURCE_SETTINGS)
+            val opened = args.hasFlag("open-settings") &&
+                com.openminis.app.plus.AppLauncher.startFromBackground(context, settings)
+            if (!opened) com.openminis.app.plus.AppLauncher.postTapToOpen(context, settings, "定位设置")
             val body = JSONObject()
                 .put("error", "location_services_disabled")
-                .put("message", "Location services are off on this device. Ask the user to enable Location in system settings.")
+                .put("message", "定位服务未开（系统「位置信息」总开关关着）。" +
+                    (if (opened) "已打开定位设置页，请打开「位置信息」开关后重试。"
+                    else "已发通知「点这里打开定位设置」；也可以运行 android-location --open-settings 直接打开设置页。") +
+                    " Location services are off.")
+                .put("settings_opened", opened)
                 .put("enabled_providers", JSONArray(enabled))
                 .toString()
             return NativeOffloadResult(1, OffloadOutput.formatBody(body, args) + "\n")
@@ -206,7 +219,7 @@ class LocationOffloadHandler(private val context: Context) : NativeOffloadHandle
             Build.MANUFACTURER.equals("OnePlus", ignoreCase = true) ||
             Build.MANUFACTURER.equals("Vivo", ignoreCase = true)
         ) {
-            " On ${OsCompat.oemLabel()} devices, disable battery optimization and enable autostart for Minis so background location stays active."
+            " On ${OsCompat.oemLabel()} devices, disable battery optimization and enable autostart for Mines so background location stays active."
         } else ""
         val body = JSONObject()
             .put("error", "location_unavailable_stale")

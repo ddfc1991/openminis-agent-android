@@ -1,5 +1,7 @@
 package com.openminis.app.ui.settings
 
+import com.openminis.app.ui.plus.MT
+
 import android.app.Activity
 import android.content.Intent
 import android.net.Uri
@@ -34,7 +36,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
+import com.openminis.app.ui.theme.TopAppBar
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -298,7 +300,7 @@ fun BackgroundSettingsScreen(onBack: () -> Unit) {
 private fun BgSectionTitle(text: String) {
     Text(
         text = text.uppercaseForDisplay(),
-        fontSize = 12.sp,
+        fontSize = MT.Caption,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
         modifier = Modifier.padding(start = 4.dp, top = 4.dp, bottom = 6.dp),
     )
@@ -308,7 +310,7 @@ private fun BgSectionTitle(text: String) {
 private fun BgFooter(text: String) {
     Text(
         text = text,
-        fontSize = 12.sp,
+        fontSize = MT.Caption,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
         modifier = Modifier.padding(start = 4.dp, end = 4.dp, top = 6.dp),
     )
@@ -353,7 +355,7 @@ private fun BgToggleRow(
         Spacer(Modifier.width(12.dp))
         Text(
             text = title,
-            fontSize = 15.sp,
+            fontSize = MT.Body,
             fontWeight = FontWeight.Medium,
             color = MaterialTheme.colorScheme.onSurface.copy(alpha = rowAlpha),
             modifier = Modifier.weight(1f),
@@ -402,14 +404,14 @@ private fun BgRow(
         Column(modifier = Modifier.padding(end = 6.dp)) {
             Text(
                 text = title,
-                fontSize = 15.sp,
+                fontSize = MT.Body,
                 fontWeight = FontWeight.Medium,
                 color = MaterialTheme.colorScheme.onSurface,
             )
             if (!subtitle.isNullOrEmpty()) {
                 Text(
                     text = subtitle,
-                    fontSize = 12.sp,
+                    fontSize = MT.Caption,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }

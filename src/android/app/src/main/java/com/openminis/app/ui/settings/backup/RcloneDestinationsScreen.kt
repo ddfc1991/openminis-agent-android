@@ -1,5 +1,7 @@
 package com.openminis.app.ui.settings.backup
 
+import com.openminis.app.ui.glass.GlassExposedDropdownMenu
+
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -18,7 +20,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.CreateNewFolder
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.NorthWest
-import androidx.compose.material3.AlertDialog
+import com.openminis.app.ui.glass.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ExposedDropdownMenuBox
@@ -262,7 +264,7 @@ internal fun AddServerForm(
                 trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(backendExpanded) },
                 modifier = Modifier.fillMaxWidth().menuAnchor(),
             )
-            ExposedDropdownMenu(
+            GlassExposedDropdownMenu(
                 expanded = backendExpanded,
                 onDismissRequest = { backendExpanded = false },
             ) {

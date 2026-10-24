@@ -243,7 +243,7 @@ fun ComposerSendButton(
     ) {
         Icon(
             Icons.Default.ArrowUpward,
-            contentDescription = "Send",
+            contentDescription = "发送",   // [Mines-38.9.6 i13] (smoke driver taps 「Send」 or 「发送」)
             tint = if (canActivate) ChatColors.background
             else ChatColors.primaryText.copy(alpha = 0.5f),
             modifier = Modifier.size(20.dp),
@@ -330,16 +330,9 @@ private fun SendReturnModeMenu(
         properties = PopupProperties(focusable = false, dismissOnClickOutside = true),
     ) {
         val shape = RoundedCornerShape(20.dp)
-        // Same surface language as MinisMenu (elevated container in dark,
-        // white in light, launcher-style soft halo, hairline border), with a
-        // touch of translucency so the composer reads through the edges.
-        val container = if (ChatColors.isDark) MaterialTheme.colorScheme.surfaceContainerHigh else Color.White
-        val border = if (ChatColors.isDark) {
-            BorderStroke(0.5.dp, MaterialTheme.colorScheme.outlineVariant)
-        } else {
-            BorderStroke(0.5.dp, Color.Black.copy(alpha = 0.05f))
-        }
-        Surface(
+        // [Mines-38.9.6 i12] the shared glass (GlassSurface): no elevation shadow under a translucent fill
+        com.openminis.app.ui.plus.GlassWindowEffect()
+        com.openminis.app.ui.plus.GlassSurface(
             modifier = Modifier
                 .graphicsLayer {
                     val p = progress.value
@@ -350,18 +343,9 @@ private fun SendReturnModeMenu(
                     transformOrigin = origin.value
                 }
                 .width(IntrinsicSize.Max)
-                .widthIn(min = 200.dp, max = 280.dp)
-                .shadow(
-                    elevation = 24.dp,
-                    shape = shape,
-                    clip = false,
-                    ambientColor = Color.Black.copy(alpha = 0.35f),
-                    spotColor = Color.Black.copy(alpha = 0.35f),
-                ),
+                .widthIn(min = 200.dp, max = 280.dp),
             shape = shape,
-            color = container.copy(alpha = 0.97f),
-            tonalElevation = 3.dp,
-            border = border,
+            halo = false,
         ) {
             Column(modifier = Modifier.padding(vertical = 6.dp).selectableGroup()) {
                 val header = stringResource(R.string.appearance_section_return_key)
@@ -430,3 +414,6 @@ private fun ReturnModeRow(
         }
     }
 }
+
+/** [Mines-38.9.6 i13] groups made by older onboarding were named "Default Models": shown as 默认模型. */
+fun groupLabel(name: String): String = if (name.trim().equals("Default Models", ignoreCase = true)) "默认模型" else name
