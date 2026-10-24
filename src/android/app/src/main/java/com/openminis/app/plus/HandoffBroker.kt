@@ -102,7 +102,7 @@ return JSON.stringify({pw:pw,t:t.slice(0,6000),av:av});}catch(x){return '{}';}})
 
     suspend fun probe(m: BrowserUseManager): Probe? {
         val url = m.currentURL.value
-        val scan = HumanVerify.parseScan(m.handoffEval(HumanVerify.DETECT_JS))
+        val scan = HumanVerify.parseScan(m.handoffEval(HumanVerify.DETECT_JS) ?: return null)
         val raw = m.handoffEval(PROBE_JS) ?: return null
         val o = runCatching { JSONObject(raw) }.getOrNull() ?: return null
         val words = o.optBoolean("av") || HandoffCore.SIGNED_IN_WORDS.containsMatchIn(o.optString("t"))
@@ -518,7 +518,8 @@ return JSON.stringify({pw:pw,t:t.slice(0,6000),av:av});}catch(x){return '{}';}})
     }
 
     // ── system prompt (ChatViewModel) ─────────────────────────────────
-    fun promptLine(legacyGoogle: String): String {
+    fun promptLine(c: Context, legacyGoogle: String): String {
+        init(c)
         if (!HandoffFlags.on(HandoffFlags.MASTER)) return legacyGoogle
         val sb = StringBuilder()
         if (resumeOn()) sb.append("人机验证 / 安全登录框 / 验证码交给用户时，浏览器结果里会有 [交接中 handoff_id=…]：不要重试点击，调用 browser 的 " +

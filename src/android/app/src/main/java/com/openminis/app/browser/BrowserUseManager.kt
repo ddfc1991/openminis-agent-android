@@ -772,6 +772,7 @@ class BrowserUseManager(
     // -- Execute Action --
 
     suspend fun execute(input: BrowserActionInput): BrowserActionResult {
+        appContext?.let { com.openminis.app.plus.HandoffBroker.init(it) }
         agentDepth++
         try { return executeAction(input) } finally { agentDepth--; agentEndedAt = android.os.SystemClock.uptimeMillis() }
     }
@@ -816,7 +817,8 @@ class BrowserUseManager(
                 input.scrollCount, input.itemSelector, input.keywords,
             )
             BrowserAction.WAIT_FOR_DOM_STABLE -> return waitForDomStable(input.timeoutMs)
-            BrowserAction.WAIT_FOR_HUMAN -> return minesWaitForHuman()
+            BrowserAction.WAIT_FOR_HUMAN -> return if (com.openminis.app.plus.HandoffBroker.resumeOn() &&
+                com.openminis.app.plus.HandoffBroker.openFor(poolRef?.sessionKey) != null) minesWaitForHandoff(null) else minesWaitForHuman()
             BrowserAction.WAIT_FOR_OTP -> return minesWaitForOtp(input.selector)
             BrowserAction.WAIT_FOR_HANDOFF -> return minesWaitForHandoff(input.text)
             BrowserAction.NEW_TAB, BrowserAction.CLOSE_TAB, BrowserAction.LIST_TABS ->
