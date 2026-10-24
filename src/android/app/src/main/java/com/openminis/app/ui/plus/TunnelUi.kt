@@ -51,7 +51,7 @@ private fun copy(c: android.content.Context, text: String) {
 }
 
 @Composable
-private fun SwitchRow(title: String, sub: String?, on: Boolean, onChange: (Boolean) -> Unit) {
+private fun TunnelSwitchRow(title: String, sub: String?, on: Boolean, onChange: (Boolean) -> Unit) {
     val m = mines()
     Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).clickable { onChange(!on) }.padding(horizontal = 16.dp, vertical = 8.dp)
         .semantics { contentDescription = title + "，" + if (on) "已打开" else "已关闭" }, verticalAlignment = Alignment.CenterVertically) {
@@ -64,7 +64,7 @@ private fun SwitchRow(title: String, sub: String?, on: Boolean, onChange: (Boole
 }
 
 @Composable
-private fun Line(text: String, color: Color? = null) {
+private fun TunnelLine(text: String, color: Color? = null) {
     Text(text, fontSize = MT.Body, lineHeight = MT.BodyLH, color = color ?: mines().ink, modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp))
 }
 
@@ -94,13 +94,13 @@ fun TunnelServerSection(server: VpsServer) {
     }
 
     PlusSection("内网穿透（经 AWS）") {
-        if (hub == null) { Line("先在「工作位置 → 内网穿透」选 AWS 服务器", Red); return@PlusSection }
-        SwitchRow("经 AWS 穿透", "这台机器没有公网端口时，通过 ${hub.name.ifBlank { hub.host }} 连接", e != null) { Tunnel.mark(c, server, it) }
+        if (hub == null) { TunnelLine("先在「工作位置 → 内网穿透」选 AWS 服务器", Red); return@PlusSection }
+        TunnelSwitchRow("经 AWS 穿透", "这台机器没有公网端口时，通过 ${hub.name.ifBlank { hub.host }} 连接", e != null) { Tunnel.mark(c, server, it) }
         if (e == null) return@PlusSection
         val p = probe[server.id]
         val st = TunnelCore.status(true, p != null, p?.first == true)
-        Line("状态：$st", when (st) { TunnelCore.ON -> Green; TunnelCore.DOWN -> Red; else -> null })
-        msg?.let { Line(it) }
+        TunnelLine("状态：$st", when (st) { TunnelCore.ON -> Green; TunnelCore.DOWN -> Red; else -> null })
+        msg?.let { TunnelLine(it) }
         Button(onClick = {
             act("正在这台机器上安装穿透…") {
                 val r = Tunnel.install(c, server)
@@ -111,7 +111,7 @@ fun TunnelServerSection(server: VpsServer) {
             Text(if (busy) "请稍候…" else "开启穿透", fontSize = MT.Button)
         }
         script?.let { s ->
-            Line("Mines 连不上这台机器，没法自动装。复制下面的命令，到这台机器的网页控制台里粘贴运行一次：", Red)
+            TunnelLine("Mines 连不上这台机器，没法自动装。复制下面的命令，到这台机器的网页控制台里粘贴运行一次：", Red)
             OutlinedButton(onClick = { copy(c, s) }, modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp).heightIn(min = 48.dp)) { Text("复制安装命令") }
             OutlinedButton(onClick = {
                 val t = (c.getSystemService(android.content.ClipboardManager::class.java)?.primaryClip?.getItemAt(0)?.coerceToText(c) ?: "").toString()
@@ -121,7 +121,7 @@ fun TunnelServerSection(server: VpsServer) {
             }, modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp).heightIn(min = 48.dp)) { Text("运行后，复制最后一行，点这里粘贴") }
         }
         Tunnel.keyLine(server.id)?.let { line ->
-            Line("AWS 上要加的一行（只允许这台机器用端口 ${e.sshPort}${if (e.webPort > 0) " 和 ${e.webPort}" else ""}）：")
+            TunnelLine("AWS 上要加的一行（只允许这台机器用端口 ${e.sshPort}${if (e.webPort > 0) " 和 ${e.webPort}" else ""}）：")
             Text(line, fontSize = MT.Caption, lineHeight = MT.CaptionLH, color = mines().ink2, maxLines = 3, modifier = Modifier.padding(horizontal = 16.dp))
             Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(onClick = { copy(c, line) }, modifier = Modifier.weight(1f).heightIn(min = 48.dp)) { Text("复制这一行") }
@@ -140,18 +140,18 @@ fun TunnelServerSection(server: VpsServer) {
             }, modifier = Modifier.heightIn(min = 52.dp)) { Text("保存") }
         }
         if (e.webPort > 0) {
-            SwitchRow("网页公开到外网", null, e.webPublic) { pub ->
+            TunnelSwitchRow("网页公开到外网", null, e.webPublic) { pub ->
                 Tunnel.setWeb(c, server.id, e.webLocal, pub)
                 msg = "已改。再点「开启穿透」和「应用到 AWS」生效"
             }
             if (e.webPublic) {
-                Line("注意：知道地址的任何人都能打开这个网页，请确认它有密码。", Red)
-                Tunnel.publicWebUrl(server.id)?.let { u -> Line("外网地址：$u") }
-            } else Line("只能在 Mines 里打开（别人访问不到）")
+                TunnelLine("注意：知道地址的任何人都能打开这个网页，请确认它有密码。", Red)
+                Tunnel.publicWebUrl(server.id)?.let { u -> TunnelLine("外网地址：$u") }
+            } else TunnelLine("只能在 Mines 里打开（别人访问不到）")
             Button(onClick = { act("正在接通网页…") { Tunnel.webUrl(c, server.id).map { u ->
                     // in-app tab over Mines (loopback forward on the phone; the page never goes public)
                     com.openminis.app.browser.GoogleAuthRouter.openInCustomTab(c, u); "已打开 $u"
-                } } } }, enabled = !busy,
+                } } }, enabled = !busy,
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp).heightIn(min = 52.dp)) { Text("打开网页") }
         }
         TextButton(onClick = { act("正在关闭…") { Tunnel.uninstall(c, server) } }, enabled = !busy,
@@ -175,11 +175,11 @@ fun TunnelHubSection() {
     var msg by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
     PlusSection("内网穿透（实验）") {
-        SwitchRow("内网穿透", "没有公网 IP 的机器经 AWS 连接；手机端口可临时公开", on) { Tunnel.setOn(c, it) }
+        TunnelSwitchRow("内网穿透", "没有公网 IP 的机器经 AWS 连接；手机端口可临时公开", on) { Tunnel.setOn(c, it) }
         if (!on) return@PlusSection
         val hub = Tunnel.hub()
         Box {
-            Line("AWS 中转：" + (hub?.let { it.name.ifBlank { it.host } } ?: "未选择（点这里选）"), if (hub == null) Red else null)
+            TunnelLine("AWS 中转：" + (hub?.let { it.name.ifBlank { it.host } } ?: "未选择（点这里选）"), if (hub == null) Red else null)
             Box(Modifier.matchParentSize().clickable { pick = true }.semantics { contentDescription = "选择 AWS 中转服务器" })
             DropdownMenu(pick, { pick = false }) {
                 servers.forEach { s ->
@@ -188,7 +188,7 @@ fun TunnelHubSection() {
             }
         }
         // Part 2
-        Line("把手机端口公开", null)
+        TunnelLine("把手机端口公开", null)
         val p = pub
         if (p == null) {
             Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically,
@@ -204,15 +204,15 @@ fun TunnelHubSection() {
                     }
                 }, enabled = !busy && hub != null, modifier = Modifier.heightIn(min = 52.dp)) { Text("公开") }
             }
-            Line("注意：公开后，知道地址的任何人都能访问这个端口。用完请关掉；Mines 被关掉时也会自动停止。", Red)
+            TunnelLine("注意：公开后，知道地址的任何人都能访问这个端口。用完请关掉；Mines 被关掉时也会自动停止。", Red)
         } else {
-            Line("已公开：手机 ${p.localPort} → ${p.address}", Green)
+            TunnelLine("已公开：手机 ${p.localPort} → ${p.address}", Green)
             Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(onClick = { copy(c, p.address) }, modifier = Modifier.weight(1f).heightIn(min = 48.dp)) { Text("复制地址") }
                 Button(onClick = { Tunnel.PhonePort.stop(null); msg = "已停止公开" }, modifier = Modifier.weight(1f).heightIn(min = 48.dp)) { Text("停止公开") }
             }
-            Line("任何人都能访问这个地址。", Red)
+            TunnelLine("任何人都能访问这个地址。", Red)
         }
-        (note ?: msg)?.let { Line(it) }
+        (note ?: msg)?.let { TunnelLine(it) }
     }
 }
