@@ -17,6 +17,8 @@ dependencyResolutionManagement {
         // uses, so both platforms segment speech with the same model and the
         // same tunables.
         maven { url = uri("https://jitpack.io") }
+        // [Mines-38.9.13 mines_browser] GeckoView
+        maven { url = uri("https://maven.mozilla.org/maven2/") }
         // rclone.aar — the backup feature's remote destinations (SMB / WebDAV /
         // SFTP / S3 / FTP). Not published to any Maven repo: it is built from
         // deps/rclone-mobile by `deps/build_rclone_android.sh`, which is also

@@ -13944,7 +13944,7 @@ class ChatViewModel(
         // job ends, whatever the outcome. Fired from AgentJobRegistry.finish so
         // a cancelled or timed-out agent releases too, not just a clean one.
         registry.registerTabRelease(job.id) {
-            viewModelScope.launch { browserTabPool.releaseTabs(child.id) }
+            viewModelScope.launch { browserTabPool.releaseTabs(child.id); com.openminis.app.plus.MinesBrowser.endTask(child.id) }   // [38.9.13 mines_browser] task end wipes its private session
         }
         val startedAt = System.currentTimeMillis()
         // Live block writes while THIS tool call is still executing go through
@@ -14896,7 +14896,7 @@ class ChatViewModel(
             ?: return ToolExecutionResult("Error: Invalid browser_use input", false)
 
         return try {
-            val result = browserTabPool.execute(input, owner = browserOwnerId)
+            val result = com.openminis.app.plus.MinesBrowser.route(context, argsJson, input, browserOwnerId) { browserTabPool.execute(input, owner = browserOwnerId) }   // [38.9.13 mines_browser]
             val toolTitle = try {
                 JSONObject(argsJson).optString("tool_title", "browser_use")
             } catch (_: Exception) { "browser_use" }
@@ -15876,6 +15876,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                 // [Mines-38.9.8] 自我地图: providers / 模型组 / 工作位置 ports as seen from this phone (cached, refreshed in background)
                 com.openminis.app.plus.SelfMap.promptBlock(context).takeIf { it.isNotBlank() }?.let { append("\n"); append(it) }
                 com.openminis.app.plus.AppAgents.promptLine(context)?.let { append("\n"); append(it) }
+                com.openminis.app.plus.MinesBrowser.promptLine()?.let { append("\n"); append(it) }   // [38.9.13 mines_browser] self-knowledge
                 // [Mines-38.9.5 i] progress card + linked accounts + 工作位置 self-registration
                 append("\n"); append(com.openminis.app.plus.TaskProgress.PROMPT)
                 append("\n"); append(com.openminis.app.plus.WorkspaceStore.PROMPT)
@@ -15938,7 +15939,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
             ?: return BrowserToolResult(text = "Error: Invalid browser_use input. Required: 'action' parameter.", success = false)
 
         return try {
-            val result = browserTabPool.execute(input, owner = browserOwnerId)
+            val result = com.openminis.app.plus.MinesBrowser.route(context, argsJson, input, browserOwnerId) { browserTabPool.execute(input, owner = browserOwnerId) }   // [38.9.13 mines_browser]
             BrowserToolResult(
                 text = result.text,
                 success = result.success,

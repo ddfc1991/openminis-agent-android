@@ -169,7 +169,7 @@ android {
     }
 
     androidResources {
-        noCompress += listOf("tar.gz", "proot-aarch64")
+        noCompress += listOf("tar.gz", "proot-aarch64", "ja")   // [38.9.13 mines_browser] GeckoView omni.ja stays stored (no inflate at start)
     }
 
     testOptions {
@@ -395,6 +395,17 @@ dependencies {
     // sibling CSS/JS resolve against the file's parent dir without
     // granting WebView raw file:// access.
     implementation("androidx.webkit:webkit:1.12.1")
+    // [Mines-38.9.13 mines_browser] Mines' own browser: GeckoView (Firefox engine, MPL-2.0), arm64 only. 153 is the newest
+    // build without minCompileSdk 37 / AGP 9.1; its kotlin-stdlib 2.3 / androidx.core 1.18 / collection 1.6 / annotation 1.10 /
+    // lifecycle 2.10 are excluded so the app keeps its own (class-file check: GeckoView + media3 use none of the newer members).
+    implementation("org.mozilla.geckoview:geckoview-arm64-v8a:153.0.20260810162159") {
+        exclude(group = "org.jetbrains.kotlin")
+        exclude(group = "org.jetbrains.kotlinx")
+        exclude(group = "androidx.core")
+        exclude(group = "androidx.collection")
+        exclude(group = "androidx.annotation")
+        exclude(group = "androidx.lifecycle")
+    }
     // [Mines-cards-35.1] on-device card OCR (bundled Latin model, works offline, image never leaves the phone)
     implementation("com.google.mlkit:text-recognition:16.0.1")
     // [Mines-38.7] SMS User Consent API (one-message consent; phones without Play services use RECEIVE_SMS instead)
