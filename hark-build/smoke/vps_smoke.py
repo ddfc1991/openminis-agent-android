@@ -7329,7 +7329,7 @@ def b3913(res):
         for _ in range(3):
             scroll_down(); r = dump(); seen |= set(texts(r))
         shot("settings-experiments-2")
-        want = ("新版 VPS / 电脑 页", "任务项目", "分类记忆", "交接 v2（验证/登录后自动继续）", "回到你操作的那个标签页", "打开 Mines 浏览器")
+        want = ("新版 VPS / 电脑 页", "任务项目", "分类记忆", "交接 v2（验证/登录后自动继续）", "回到你操作的那个标签页", "打开 Mines 浏览器", "内网穿透")
         miss = [w for w in want if not any(w in t for t in seen)]
         o["experiments_missing"] = miss
         if miss: fail(f"实验功能 rows missing: {miss}")
@@ -7455,6 +7455,28 @@ def b3913(res):
         if not tap_text("好了，交还给 Mines", wait=3): back(1)
         f = wait_fake("GECKOREAD", 3, 60); o["gecko_after"] = (f.get("results") or [])[2:3]
 
+    def tunnel():
+        o["servers"] = result_json("group", "i3911 servers", timeout=30)
+        o["tunnelseed"] = result_json("group", "i3913 tunnelseed", timeout=30); print("I3913 TUNNEL " + json.dumps(o["tunnelseed"], ensure_ascii=False), flush=True)
+        route("plus_server/smoke-mengyun", 5)
+        r = None
+        for _ in range(8):
+            r = dump()
+            if r is not None and find(r, "经 AWS 穿透"): break
+            scroll_down()
+        r = shot("server-tunnel"); t = _txt(r); o["server_tunnel_txt"] = t[:600]
+        if "内网穿透（经 AWS）" not in t or "经 AWS 穿透" not in t: fail("服务器详情 → 内网穿透 section not shown")
+        back(1); time.sleep(1)
+        route("plus_work_location", 5)
+        seen = ""
+        for _ in range(6):
+            r = dump(); seen += " " + _txt(r)
+            if "内网穿透：" in seen: break
+            scroll_down()
+        shot("vps-tunnel-status"); o["vps_tunnel_status"] = re.findall(r"内网穿透：\S+", seen)
+        if not o["vps_tunnel_status"]: page_missing.append("i3913 vps: no 内网穿透 status on any machine card (梦云 card not bound to the seeded server?)")
+        back(1); time.sleep(1)
+
     step("experiments", experiments)
     step("vps", vps)
     step("tasks", lambda: tasks("tasks"))
@@ -7463,6 +7485,7 @@ def b3913(res):
     step("project", project)
     step("memory", memory)
     step("gecko", gecko)
+    step("tunnel", tunnel)
     print("I3913 RESULT " + json.dumps(o, ensure_ascii=False)[:12000], flush=True)
 
 
