@@ -75,21 +75,26 @@ object Inbox3912Core {
     }
 
     /** the one-click registration task handed to a new Mines conversation (agent uses accounts register_pick / register_done) */
-    fun registerTask(platform: String, url: String, tempBox: String?): String = buildString {
+    fun registerTask(platform: String, url: String, tempBox: String?, emailOnly: Boolean = false): String = buildString {
         append("帮我注册 $platform（$url）。\n")
         append("1. 用 accounts(action=register_pick, site=$url, n=1) 从台账取一个还没在该平台注册过的邮箱，并生成强密码（自动存进台账，备注 注册中）")
         if (!tempBox.isNullOrBlank()) append("；没有可用邮箱时用临时邮箱 $tempBox")
         append("。\n2. 打开注册页填写，验证码从邮箱自动读取。\n3. 完成后调用 accounts(action=register_done, ok=true)，失败则 ok=false。\n")
         append("遵守平台规则：一人一号、不批量注册；遇到人机验证、手机号验证或付款时停下来叫我，不要绕过。")
+        if (emailOnly) append(EMAIL_ONLY_LINE)
     }
 
     /** [Mines-38.9.12.1] register with a fresh address on the user's own domain (codes are read from that inbox) */
-    fun registerTaskSelf(platform: String, url: String, address: String): String = buildString {
+    fun registerTaskSelf(platform: String, url: String, address: String, emailOnly: Boolean = false): String = buildString {
         append("帮我注册 $platform（$url）。\n")
         append("1. 用这个新邮箱注册：$address（我自己的域名，收件已接通）。用 accounts(action=register_pick, site=$url, n=1) 生成强密码并存进台账（备注 注册中），账号填这个邮箱。\n")
         append("2. 打开注册页填写，验证码会从这个邮箱自动读取。\n3. 完成后调用 accounts(action=register_done, ok=true)，失败则 ok=false。\n")
         append("遵守平台规则：一人一号、不批量注册；遇到人机验证、手机号验证或付款时停下来叫我，不要绕过。")
+        if (emailOnly) append(EMAIL_ONLY_LINE)
     }
+
+    /** [Mines-38.9.13 handoff_v2.oauth] Google / Apple refuse the in-app browser; that session would stay in Chrome */
+    const val EMAIL_ONLY_LINE = "\n用邮箱注册，不要点 Google / Apple / 微软 等第三方登录按钮；页面只提供第三方登录时停下来告诉我。"
 
     val PLATFORMS = listOf(
         "Cloudflare" to "https://dash.cloudflare.com/sign-up", "GitHub" to "https://github.com/signup",

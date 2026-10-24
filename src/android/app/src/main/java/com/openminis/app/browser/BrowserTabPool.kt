@@ -189,6 +189,8 @@ class BrowserTabPool(
     private var customUserAgentString: String? = null
 
     private var sessionId: String? = null
+    /** [Mines-38.9.13 handoff_v2] the conversation this pool belongs to (handoffs are per conversation) */
+    val sessionKey: String? get() = sessionId
     private val savedURLs = mutableMapOf<Int, String>()
 
     // ── Tab ownership  [T-android-browser-tab-ownership] ────────────────────
@@ -868,8 +870,13 @@ class BrowserTabPool(
             // budget. A deadline hit, or a cancellation that arrives after the
             // action had already run a long time (the CLI giving up at 90s),
             // flags the tab; the next acquireTab then rebuilds it.
+            // [38.9.13 handoff_v2] the user is working on this tab: no page-changing agent action, and never "frozen"
+            com.openminis.app.plus.HandoffBroker.busyFor(sessionId, tab.id, input.action.value)?.let {
+                return stampTabId(BrowserActionResult(text = it, pageURL = tab.manager.currentURL.value), tab.id)
+            }
             val outcome = BrowserActionGuard.runGuarded(
                 onSuspect = { reason -> tab.manager.markWedged(reason) },
+                exempt = { com.openminis.app.plus.HandoffBroker.exempt(sessionId, tab.id) },
             ) { tab.manager.execute(input) }
             val result = when (outcome) {
                 is BrowserActionGuard.Outcome.Done -> outcome.value
@@ -903,9 +910,13 @@ class BrowserTabPool(
             // assuming the page did what it asked. Prepended so it is read
             // before the result it qualifies; draining clears the queue, so each
             // dialog is reported exactly once.
-            val withDialogs = tab.manager.drainInterceptedDialogReport()
+            val withDialogs0 = tab.manager.drainInterceptedDialogReport()
                 ?.let { result.copy(text = it + result.text) }
                 ?: result
+            // [38.9.13 handoff_v2] a handoff that finished while the agent did something else / a Google click turned hand-off
+            val handoffNotes = listOfNotNull(com.openminis.app.plus.HandoffBroker.takeActionNote(tab.manager),
+                com.openminis.app.plus.HandoffBroker.drainNotes(sessionId)).joinToString("\n")
+            val withDialogs = if (handoffNotes.isEmpty()) withDialogs0 else withDialogs0.copy(text = withDialogs0.text + "\n" + handoffNotes)
             // [T-android-browser-result-tab-id] Stamp the VERIFIED tab id — the
             // id of the tab we actually acquired and dispatched on, NOT the
             // global selectedTabId, which the fan-out branch in acquireTab
@@ -1259,6 +1270,7 @@ class BrowserTabPool(
         wireDownloadHandlers(manager)
 
         manager.incognito = incognito
+        manager.poolRef = this; manager.tabId = id   // [38.9.13 handoff_v2]
         // [Mines-38.9.11.2] 无痕 policy last (the manager's setup turned third-party cookies / caching on)
         if (incognito) Incognito.harden(webView, incognitoProfile)
         val tab = Tab(id = id, manager = manager)
@@ -1434,6 +1446,7 @@ class BrowserTabPool(
         manager.onCloseWindow = { handleCloseWindow(manager) }
         wireDownloadHandlers(manager)
 
+        manager.poolRef = this; manager.tabId = id   // [38.9.13 handoff_v2] window.open popups count as the user's tabs
         val tab = Tab(id = id, manager = manager)
         currentTabs.add(tab)
         _tabs.value = currentTabs
@@ -1476,6 +1489,21 @@ class BrowserTabPool(
         if (_tabs.value.any { it.id == id }) {
             _selectedTabId.value = id
         }
+    }
+
+    /**
+     * [Mines-38.9.13 handoff_v2.tab] The user finished a handoff on [toTab] (a tab they opened, or a window.open popup):
+     * the agent that drove [fromTab] continues there. Main thread.
+     */
+    fun handoffAdopt(fromTab: Int, toTab: Int) {
+        if (_tabs.value.none { it.id == toTab }) return
+        val owner = tabOwner[fromTab]
+        if (owner != null && tabOwner[toTab] == null) {
+            tabOwner[toTab] = owner
+            lastTabByOwner[owner] = toTab
+        }
+        _selectedTabId.value = toTab
+        saveState()
     }
 
     /** Create a new tab from the UI (user tapped + button). */

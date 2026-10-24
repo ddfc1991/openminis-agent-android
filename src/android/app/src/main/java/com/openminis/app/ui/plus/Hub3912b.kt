@@ -250,13 +250,16 @@ fun RegisterLedgerScreen(onBack: () -> Unit, go: (String) -> Unit) {
                             val addr = com.openminis.app.plus.AgentMailbox.selfNewAddress(com.openminis.app.plus.SelfMailCore.prefixFor(name, (System.currentTimeMillis() / 1000).toInt()))
                             busy = null
                             if (addr == null) android.widget.Toast.makeText(ctx, "自建域名没建出邮箱，先用台账邮箱", android.widget.Toast.LENGTH_LONG).show()
-                            startDraft(ctx, if (addr != null) Inbox3912Core.registerTaskSelf(name, url, addr) else Inbox3912Core.registerTask(name, url, temp))
-                        } else startDraft(ctx, Inbox3912Core.registerTask(name, url, temp))
+                            startDraft(ctx, if (addr != null) Inbox3912Core.registerTaskSelf(name, url, addr, emailOnlyReg(ctx)) else Inbox3912Core.registerTask(name, url, temp, emailOnlyReg(ctx)))
+                        } else startDraft(ctx, Inbox3912Core.registerTask(name, url, temp, emailOnlyReg(ctx)))
                     }.padding(vertical = 10.dp, horizontal = 6.dp))
                 }
             }
         })
 }
+
+/** [Mines-38.9.13 handoff_v2.oauth] the one-click sign-up task asks for an e-mail sign-up, never Google / Apple */
+private fun emailOnlyReg(ctx: android.content.Context): Boolean { com.openminis.app.plus.HandoffFlags.init(ctx); return com.openminis.app.plus.HandoffFlags.on(com.openminis.app.plus.HandoffFlags.OAUTH) }
 
 /** a new Mines conversation with [text] waiting in the input (same hand-off as 知识库 「在对话中引用」) */
 internal fun startDraft(ctx: android.content.Context, text: String) {

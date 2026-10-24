@@ -95,6 +95,7 @@ internal fun ChatViewModel.toggleBrowserSheet() {
 
 internal fun ChatViewModel.dismissBrowserSheet() {
     _showBrowserSheet.value = false
+    runCatching { com.openminis.app.plus.HandoffBroker.onSheetClosed(browserTabPool.sessionKey) }   // [38.9.13 handoff_v2] resume event
 }
 
 /**

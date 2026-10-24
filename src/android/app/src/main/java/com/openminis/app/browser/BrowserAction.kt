@@ -29,7 +29,10 @@ enum class BrowserAction(val value: String) {
     // [Mines] Human verification: wait (≤50 s per call) for the user to clear a captcha.
     WAIT_FOR_HUMAN("wait_for_human"),
     // [Mines] Wait for an SMS / e-mail one-time code and fill it in (code never shown).
-    WAIT_FOR_OTP("wait_for_otp");
+    WAIT_FOR_OTP("wait_for_otp"),
+    // [Mines-38.9.13 handoff_v2] Wait (≤55 s per call) for a step handed to the user (captcha / sign-in / code / Chrome);
+    // `text` may carry the handoff_id from the [交接中 …] line.
+    WAIT_FOR_HANDOFF("wait_for_handoff");
 
     /**
      * [T-browser-readaction-follow-tab-and-yolo-android] True when this action

@@ -303,6 +303,7 @@ object Diag {
         "sky_fps_cap" -> com.openminis.app.ui.plus.WeatherSky.fpsCap.takeIf { it > 0 }?.toString() ?: "default"
         "nav_anim" -> if (navAnimOff) "off" else "default"
         "log_level" -> if (level == "warn") "default" else level
+        "handoff_v2", "handoff_v2.resume", "handoff_v2.tab", "handoff_v2.oauth", "handoff_v2.label" -> HandoffFlags.remoteValue(key)   // [38.9.13]
         else -> "default"
     }
 
@@ -313,6 +314,7 @@ object Diag {
             "sky_fps_cap" -> { W.fpsCap = value.toIntOrNull() ?: 0; W.bump() }
             "nav_anim" -> navAnimOff = value == "off"
             "log_level" -> level = if (value == "default") "warn" else value
+            "handoff_v2", "handoff_v2.resume", "handoff_v2.tab", "handoff_v2.oauth", "handoff_v2.label" -> HandoffFlags.setRemote(key, value)   // [38.9.13]
         }
     }
 

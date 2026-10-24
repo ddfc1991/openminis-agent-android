@@ -50,6 +50,13 @@ class BrowserUseManager(
 ) {
     /** [Mines-38.9.7] 无痕标签: no history, no account recording. Set by the pool right after construction. */
     @Volatile var incognito: Boolean = false
+    /** [Mines-38.9.13 handoff_v2] which pool / tab this manager is (set by BrowserTabPool) — handoffs are per conversation + tab */
+    @Volatile var poolRef: BrowserTabPool? = null
+    @Volatile var tabId: Int = -1
+    /** > 0 while an agent action runs: a page navigation then came from the agent, not from the user's tap */
+    @Volatile private var agentDepth = 0
+    @Volatile private var agentEndedAt = 0L
+    @Volatile private var otpMisses = 0
 
     companion object {
         private const val TAG = "BrowserUseManager"
@@ -447,7 +454,10 @@ class BrowserUseManager(
                 // session instead of hitting 403 disallowed_useragent.
                 if (GoogleAuthRouter.shouldRouteExternally(urlStr)) {
                     if (urlStr != null) {
-                        GoogleAuthRouter.openInCustomTab(view.context, urlStr)
+                        // [38.9.13 handoff_v2.oauth] the agent's click: a hand-off the user starts (no Chrome popping up by itself)
+                        val byAgent = agentDepth > 0 || android.os.SystemClock.uptimeMillis() - agentEndedAt < 3_000L
+                        val handedOff = byAgent && runCatching { com.openminis.app.plus.HandoffBroker.oauthIntercept(this@BrowserUseManager, urlStr) }.getOrDefault(false)
+                        if (!handedOff) GoogleAuthRouter.openInCustomTab(view.context, urlStr)
                     }
                     return true
                 }
@@ -469,6 +479,11 @@ class BrowserUseManager(
                     )
             }
 
+            override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
+                super.doUpdateVisitedHistory(view, url, isReload)
+                runCatching { com.openminis.app.plus.HandoffBroker.onPage(this@BrowserUseManager) }   // [38.9.13] SPA route change
+            }
+
             override fun onPageFinished(view: WebView, url: String?) {
                 _isLoading.value = false
                 if (IncognitoCore.feedsAccounts(incognito)) runCatching { com.openminis.app.plus.AutoAccounts.onPage(view, url) }   // [Mines-38.8] auto-record sign-ups / sign-ins
@@ -488,6 +503,7 @@ class BrowserUseManager(
                     navigationTarget = null
                 } else Log.i(TAG, "ignoring onPageFinished(${BrowserLogMask.mask(url)}) while navigating to ${BrowserLogMask.mask(target)}")
                 BrowserZoom.onPage(view, url, finished = true)
+                runCatching { com.openminis.app.plus.HandoffBroker.onPage(this@BrowserUseManager) }   // [38.9.13] handoff resumes on events
                 // Record in browser history
                 val histUrl = url ?: ""
                 val histTitle = view.title ?: ""
@@ -756,6 +772,11 @@ class BrowserUseManager(
     // -- Execute Action --
 
     suspend fun execute(input: BrowserActionInput): BrowserActionResult {
+        agentDepth++
+        try { return executeAction(input) } finally { agentDepth--; agentEndedAt = android.os.SystemClock.uptimeMillis() }
+    }
+
+    private suspend fun executeAction(input: BrowserActionInput): BrowserActionResult {
         // (GH#245) Fail fast instead of driving a WebView that cannot answer.
         // The pool normally rebuilds such a tab before handing it out; this
         // catches the call that was already routed here when the flag flipped.
@@ -797,6 +818,7 @@ class BrowserUseManager(
             BrowserAction.WAIT_FOR_DOM_STABLE -> return waitForDomStable(input.timeoutMs)
             BrowserAction.WAIT_FOR_HUMAN -> return minesWaitForHuman()
             BrowserAction.WAIT_FOR_OTP -> return minesWaitForOtp(input.selector)
+            BrowserAction.WAIT_FOR_HANDOFF -> return minesWaitForHandoff(input.text)
             BrowserAction.NEW_TAB, BrowserAction.CLOSE_TAB, BrowserAction.LIST_TABS ->
                 return BrowserActionResult.error("Tab management actions must be routed through BrowserTabPool")
         }
@@ -841,13 +863,19 @@ class BrowserUseManager(
         val ctx = appContext ?: return result
         val hv = com.openminis.app.plus.HumanVerify
         hv.init(ctx)
+        // [38.9.13 handoff_v2] waits for the user leave this action: a handoff record per conversation + tab
+        val broker = com.openminis.app.plus.HandoffBroker
+        broker.init(ctx)
+        val v2 = broker.resumeOn() && poolRef?.sessionKey != null && tabId >= 0
+        var text = result.text
         val st = hv.settings.value
         if (!st.challenges && !st.otpAutofill) return result
         val scan = minesScan()
-        var text = result.text
         var snap = false
         if (st.challenges) {
-            hv.handle(ctx, scan, minesUrl(), rescan = { minesScan() }, currentUrl = { minesUrl() })?.let { text += "\n" + it; snap = true }
+            val note = if (v2 && scan.kind.isNotBlank()) minesChallengeHandoff(scan)
+                else hv.handle(ctx, scan, minesUrl(), rescan = { minesScan() }, currentUrl = { minesUrl() })
+            note?.let { text += "\n" + it; snap = true }
         }
         if (st.otpAutofill && scan.otpField) {
             hv.armOtp()
@@ -864,11 +892,34 @@ class BrowserUseManager(
         }
         // [38.9.11.1] sign-in page without a saved login (or a refused one) → the secure login card; values go into the page
         runCatching {
-            com.openminis.app.plus.AgentLogin.handle(ctx, minesUrl(), sessionIdProvider()) { js -> runCatching { evaluateJavascript(js) }.getOrNull() }
+            com.openminis.app.plus.AgentLogin.handle(ctx, minesUrl(), sessionIdProvider(), if (v2) this else null) { js -> runCatching { evaluateJavascript(js) }.getOrNull() }
         }.getOrNull()?.let { text += "\n" + it; snap = true }
+        // [38.9.13] remember a sign-in page the agent was left on: if the user then signs in by hand, the agent is woken
+        if (v2 && com.openminis.app.plus.HandoffCore.isAuthUrl(minesUrl()))
+            broker.noteAuthPage(this, handoffEval("!!document.querySelector('input[type=password]')") == "true")
         val out = result.copy(text = text)
         return if (snap) attachSnapshot(out) else out
     }
+
+    /** [38.9.13 handoff_v2] a captcha: quiet Cloudflare wait (≤ 15 s, as before), else a handoff — never a wait for the user here */
+    private suspend fun minesChallengeHandoff(scan: com.openminis.app.plus.HumanVerify.Scan): String? {
+        val hv = com.openminis.app.plus.HumanVerify
+        hv.trySilent(scan.kind, minesUrl(), rescan = { minesScan() }, currentUrl = { minesUrl() })?.let { return it }
+        val b = com.openminis.app.plus.HandoffBroker
+        val h = b.open(this, com.openminis.app.plus.HandoffCore.Kind.CAPTCHA, detail = scan.kind)
+            ?: return hv.handle(appContext, scan, minesUrl(), rescan = { minesScan() }, currentUrl = { minesUrl() })
+        return com.openminis.app.plus.HandoffCore.pendingText(h, b.verb(h))
+    }
+
+    /** [38.9.13 handoff_v2] browser wait_for_handoff: [id] optional (default = this conversation's open handoff) */
+    private suspend fun minesWaitForHandoff(id: String?): BrowserActionResult {
+        appContext?.let { com.openminis.app.plus.HandoffBroker.init(it) }
+        val text = com.openminis.app.plus.HandoffBroker.await(poolRef?.sessionKey, id)
+        return BrowserActionResult(text = text, pageURL = minesUrl())
+    }
+
+    /** [38.9.13 handoff_v2] page probe for handoffs: short, and never marks the tab wedged */
+    suspend fun handoffEval(js: String, timeoutMs: Long = 2_000L): String? = evalSoft(js, timeoutMs)
 
     private suspend fun minesWaitForHuman(): BrowserActionResult {
         val ctx = appContext ?: return BrowserActionResult.error("no app context")
@@ -897,7 +948,16 @@ class BrowserUseManager(
         // [Mines-38.9.5 i] mail codes only from the site this page belongs to
         hv.expectSite = runCatching { com.openminis.app.plus.AccountsCore.accountSite(minesUrl()) }.getOrDefault("")
         val code = hv.awaitCode(com.openminis.app.plus.HumanVerify.WAIT_SLICE_MS)
-            ?: return BrowserActionResult(text = "约 50 秒内没收到验证码短信/邮件通知。确认已经点了发送验证码后，可以再调用一次 wait_for_otp。", success = true)
+            ?: run {
+                // [38.9.13 handoff_v2] second miss in a row: ask the user to type the code on the page (输验证码)
+                val b = com.openminis.app.plus.HandoffBroker
+                if (b.resumeOn() && ++otpMisses >= 2) b.open(this, com.openminis.app.plus.HandoffCore.Kind.OTP)?.let { h ->
+                    otpMisses = 0
+                    return BrowserActionResult(text = com.openminis.app.plus.HandoffCore.pendingText(h, b.verb(h)), success = true)
+                }
+                return BrowserActionResult(text = "约 50 秒内没收到验证码短信/邮件通知。确认已经点了发送验证码后，可以再调用一次 wait_for_otp。", success = true)
+            }
+        otpMisses = 0
         val r = runCatching { evaluateJavascript(hv.fillJs(code, selector)) }.getOrNull()
         return if (r == "ok") {
             attachSnapshot(BrowserActionResult(text = "已收到验证码并填入（${code.length} 位，内容不显示）。接下来点击提交/登录按钮。", pageURL = minesUrl()))
@@ -927,6 +987,11 @@ class BrowserUseManager(
 
         var normalized = urlString
         if (!normalized.contains("://")) normalized = "https://$normalized"
+        // [38.9.13 handoff_v2.oauth] loadUrl skips shouldOverrideUrlLoading: Google / Apple sign-in never loads here (403)
+        if (GoogleAuthRouter.shouldRouteExternally(normalized) &&
+            runCatching { com.openminis.app.plus.HandoffBroker.oauthIntercept(this, normalized) }.getOrDefault(false)) {
+            return BrowserActionResult(text = com.openminis.app.plus.HandoffBroker.takeActionNote(this) ?: BrowserHandoffCore.CUSTOM_TAB_NOTE, pageURL = _currentURL.value)
+        }
 
         val deferred = CompletableDeferred<Unit>()
         navigationDeferred = deferred

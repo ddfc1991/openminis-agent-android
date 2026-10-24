@@ -78,12 +78,17 @@ internal object BrowserActionGuard {
      * as frozen: the deadline fired, or the caller was cancelled after at
      * least [suspectMs]. A cancellation is ALWAYS rethrown — swallowing it
      * would break the caller's structured concurrency.
+     *
+     * [Mines-38.9.13 handoff_v2] [exempt] true = the tab is handed to the user
+     * (captcha / sign-in): a long or cancelled action there is the user taking
+     * their time, never a frozen page, so [onSuspect] is not called.
      */
     suspend fun <T : Any> runGuarded(
         deadlineMs: Long = ACTION_DEAD_TIMEOUT_MS,
         suspectMs: Long = WEDGE_SUSPECT_MS,
         clock: () -> Long = { System.nanoTime() / 1_000_000L },
         onSuspect: (String) -> Unit,
+        exempt: () -> Boolean = { false },
         block: suspend () -> T,
     ): Outcome<T> {
         val startedAt = clock()
@@ -93,14 +98,14 @@ internal object BrowserActionGuard {
                 Outcome.Done(value)
             } else {
                 val elapsed = clock() - startedAt
-                onSuspect("action exceeded ${deadlineMs / 1000}s deadline")
+                if (!exempt()) onSuspect("action exceeded ${deadlineMs / 1000}s deadline")
                 Outcome.DeadlineExceeded(elapsed)
             }
         } catch (e: WebViewWedgedException) {
             Outcome.Wedged(e.message ?: "browser tab stopped responding")
         } catch (e: CancellationException) {
             val elapsed = clock() - startedAt
-            if (elapsed >= suspectMs) onSuspect("cancelled after ${elapsed}ms")
+            if (elapsed >= suspectMs && !exempt()) onSuspect("cancelled after ${elapsed}ms")
             throw e
         }
     }

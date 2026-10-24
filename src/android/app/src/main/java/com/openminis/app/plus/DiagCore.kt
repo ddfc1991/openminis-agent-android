@@ -210,7 +210,10 @@ object DiagCore {
 
     /** [38.9.11.3 g2] remote config: Mines-internal switches only, in-memory (process death / 诊断关闭 / 24 h → back to the
      *  user's own values), bounded values; "default" = the user's own value. Labels are what the in-app card shows. */
-    val CONFIG_LABELS = linkedMapOf("sky_mode" to "天空动画", "sky_fps_cap" to "天空动画帧率上限", "nav_anim" to "翻页动画", "log_level" to "诊断日志级别")
+    val CONFIG_LABELS = linkedMapOf("sky_mode" to "天空动画", "sky_fps_cap" to "天空动画帧率上限", "nav_anim" to "翻页动画", "log_level" to "诊断日志级别",
+        // [Mines-38.9.13 handoff_v2] each part of the handoff fix can be rolled back on its own (on / off only)
+        "handoff_v2" to "交接 v2", "handoff_v2.resume" to "交接 v2 · 自动继续", "handoff_v2.tab" to "交接 v2 · 标签页",
+        "handoff_v2.oauth" to "交接 v2 · Google 登录", "handoff_v2.label" to "交接 v2 · 弹窗说明")
     fun configValue(key: String, raw: String?): String? {
         val v = (raw ?: "").trim()
         if (v == "default" && key in CONFIG_LABELS) return v
@@ -218,6 +221,7 @@ object DiagCore {
             "sky_mode" -> v.takeIf { it in setOf("smooth", "rich", "off") }
             "sky_fps_cap" -> v.toIntOrNull()?.takeIf { it in 5..30 }?.toString()
             "nav_anim" -> v.takeIf { it in setOf("on", "off") }
+            "handoff_v2", "handoff_v2.resume", "handoff_v2.tab", "handoff_v2.oauth", "handoff_v2.label" -> v.takeIf { it in setOf("on", "off") }
             "log_level" -> v.takeIf { it in LOG_LEVELS }
             else -> null
         }

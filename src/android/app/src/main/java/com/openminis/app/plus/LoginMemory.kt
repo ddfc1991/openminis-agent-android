@@ -138,7 +138,8 @@ object LoginMemory {
  * wants); the answer goes straight into the page in the background WebView. Values never reach chat, logs or the AI.
  */
 object LoginCard {
-    data class Req(val host: String, val name: String, val ask: LoginMemoryCore.Ask, val account: String, val lastLine: String?) {
+    /** [38.9.13 handoff_v2.label] [task] = the task name shown above the site name (「Railway 注册 · 第2次」) */
+    data class Req(val host: String, val name: String, val ask: LoginMemoryCore.Ask, val account: String, val lastLine: String?, val task: String = "") {
         val id = System.nanoTime()
     }
     data class Answer(val account: String, val password: String, val code: String, val save: Boolean)

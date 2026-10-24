@@ -29,7 +29,9 @@ object AgentLogin {
      * [sessionId] = the conversation the page belongs to. [38.9.11.3] a 台账 account is filled in any conversation (the
      * 38.9.11.2 rule — only where the user had picked it — is gone) and then bound to it; the card's 提交 binds too.
      */
-    suspend fun handle(ctx: Context, url: String, sessionId: String? = null, eval: suspend (String) -> String?): String? {
+    /** [Mines-38.9.13 handoff_v2] [handoff] = the agent's tab manager when the card must not block the browser action */
+    suspend fun handle(ctx: Context, url: String, sessionId: String? = null, handoff: com.openminis.app.browser.BrowserUseManager? = null,
+                       eval: suspend (String) -> String?): String? {
         if (LoginCard.pending.value != null) return null
         val host = Keychain.hostOf(url).ifBlank { return null }
         val fj = runCatching { JSONObject(eval(LoginAssist.FIELDS_JS) ?: return null) }.getOrNull() ?: return null
@@ -39,6 +41,8 @@ object AgentLogin {
             pendingOk.remove(host)?.let { (acct, at) -> if (now - at < OK_WINDOW_MS) runCatching { Ledger.markOk(ctx, host, acct) } }
             runCatching { AutoLogin.markOk(ctx, host) }
             // [38.9.12] Google's account chooser after 「Continue with Google」: pick the account
+            // [38.9.13 handoff_v2.oauth] Google pages never load in the agent browser any more (routed to a Chrome hand-off)
+            if (HandoffFlags.on(HandoffFlags.OAUTH)) return null
             return runCatching { AutoLogin.onChooser(ctx, url, eval) }.getOrNull()   // phone / e-mail code pages: the OTP flow handles them
         }
         val pwEmpty = fj.optBoolean("pwEmpty", true)
@@ -78,8 +82,28 @@ object AgentLogin {
         // [38.9.11.2] a saved account not yet picked in this conversation: offered (prefilled), filled only after 提交
         val savedHere = if (!refused) runCatching { SavedLogins.forUrl(ctx, url) }.getOrNull()?.takeIf { it.pass.isNotBlank() } else null
         runCatching { Ledger.clearChip(null) }
-        val a = LoginCard.ask(LoginCard.Req(host, site, ask, savedHere?.user ?: memo?.account.orEmpty(), runCatching { LoginMemoryCore.lastLine(memo) }.getOrNull()), ctx)
-            ?: return "[登录] 用户关掉了安全登录框，没有填。不要在聊天里问账号密码；需要时再打开登录页，Mines 会再弹框。"
+        val account = savedHere?.user ?: memo?.account.orEmpty()
+        val lastLine = runCatching { LoginMemoryCore.lastLine(memo) }.getOrNull()
+        // [38.9.13 handoff_v2] the card waits outside the browser action (a slow sign-in no longer closes it or rebuilds the tab)
+        if (handoff != null) HandoffBroker.open(handoff, HandoffCore.Kind.LOGIN, startPw = true)?.let { h ->
+            HandoffBroker.launch {
+                val a = LoginCard.ask(LoginCard.Req(host, site, ask, account, lastLine, task = if (HandoffFlags.on(HandoffFlags.LABEL)) HandoffBroker.labelOf(h.id) else ""), null)
+                val cur = HandoffBroker.get(h.id)
+                if (cur == null || cur.state == HandoffCore.State.DONE || cur.state == HandoffCore.State.CANCELLED) return@launch
+                if (a == null) { HandoffBroker.cancel(h.id, CLOSED.removePrefix("[登录] ").removeSuffix("。")); return@launch }
+                HandoffBroker.loginFilled(h.id, fillAnswer(ctx, host, site, savedHere, a, sessionId, eval))
+            }
+            return HandoffCore.pendingText(h, "登录（Mines 的安全登录框）")
+        }
+        val a = LoginCard.ask(LoginCard.Req(host, site, ask, account, lastLine), ctx) ?: return CLOSED
+        return fillAnswer(ctx, host, site, savedHere, a, sessionId, eval)
+    }
+
+    private const val CLOSED = "[登录] 用户关掉了安全登录框，没有填。不要在聊天里问账号密码；需要时再打开登录页，Mines 会再弹框。"
+
+    /** the card's answer goes straight into the page; returns the note for the agent (values never in it) */
+    private suspend fun fillAnswer(ctx: Context, host: String, site: String, savedHere: SavedLogins.Entry?, a: LoginCard.Answer,
+                                   sessionId: String?, eval: suspend (String) -> String?): String {
         val sb = StringBuilder()
         if (a.account.isNotBlank() || a.password.isNotBlank()) {
             // the saved account picked as offered (password left empty) → its saved password; either way bound to this conversation
