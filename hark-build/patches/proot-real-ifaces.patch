@@ -1,0 +1,272 @@
+diff --git a/src/extension/fake_netlink/fake_netlink.c b/src/extension/fake_netlink/fake_netlink.c
+index 6738e0f..bcfb7b1 100644
+--- a/src/extension/fake_netlink/fake_netlink.c
++++ b/src/extension/fake_netlink/fake_netlink.c
+@@ -63,6 +63,7 @@
+ #include <linux/if_arp.h>
+ #include <linux/if_addr.h>
+ #include <talloc.h>
++#include <arpa/inet.h>
+ 
+ #include "extension/fake_netlink/fake_netlink.h"
+ #include "syscall/syscall.h"
+@@ -220,75 +221,208 @@ static size_t put_attr(char *p, size_t off, uint16_t type,
+  * more confusingly, which is the failure mode this whole extension exists to
+  * avoid.
+  */
++/* [T-android-fake-netlink-real-ifaces] Real interfaces published by the app.
++ *
++ * The host app (which, unlike the guest, may ask ConnectivityManager) writes
++ * the active network's interfaces to the file named by
++ * $PROOT_FAKE_NETLINK_IFACES, one address per line:
++ *
++ *     <ifname> <4|6> <address> <prefixlen>
++ *
++ * The file is re-read on every dump, so a Wi-Fi -> mobile switch is visible to
++ * the next query without restarting the shell. These are the device's TRUE
++ * addresses, so a guest that binds to one gets a socket the kernel accepts. A
++ * missing or unreadable file degrades to loopback-only, the previous answer. */
++#define FAKE_NETLINK_MAX_IFADDRS 16
++#define FAKE_NETLINK_REPLY_MAX 4096
++/* Worst case one put_link/put_addr writes (header + struct + attrs with an
++ * IFNAMSIZ label), rounded up. Every emitter checks it before writing, so
++ * raising FAKE_NETLINK_MAX_IFADDRS or adding an attribute can only shorten
++ * the list, never overrun the buffer. */
++#define FAKE_NETLINK_ENTRY_MAX 256
++#define HAS_ROOM(off) ((off) + FAKE_NETLINK_ENTRY_MAX + NLMSG_HDRLEN <= FAKE_NETLINK_REPLY_MAX)
++
++typedef struct {
++	char name[IFNAMSIZ];
++	int index;
++	int family;
++	unsigned char addr[16];
++	int prefix;
++} FakeIfAddr;
++
++static int load_real_ifaddrs(FakeIfAddr *out, int max)
++{
++	const char *path = getenv("PROOT_FAKE_NETLINK_IFACES");
++	char line[256], names[FAKE_NETLINK_MAX_IFADDRS][IFNAMSIZ];
++	int n = 0, nnames = 0;
++	FILE *f;
++
++	if (path == NULL || path[0] == '\0') return 0;
++	f = fopen(path, "r");
++	if (f == NULL) return 0;
++
++	while (n < max && fgets(line, sizeof(line), f) != NULL) {
++		char name[64], addr[64];
++		int fam, prefix, i, idx = -1;
++
++		if (sscanf(line, "%63s %d %63s %d", name, &fam, addr, &prefix) != 4)
++			continue;
++		if (strlen(name) >= IFNAMSIZ || strcmp(name, "lo") == 0) continue;
++		if (fam == 4) {
++			if (inet_pton(AF_INET, addr, out[n].addr) != 1) continue;
++			out[n].family = AF_INET;
++			if (prefix < 0 || prefix > 32) continue;
++		} else if (fam == 6) {
++			if (inet_pton(AF_INET6, addr, out[n].addr) != 1) continue;
++			out[n].family = AF_INET6;
++			if (prefix < 0 || prefix > 128) continue;
++		} else continue;
++
++		{
++			/* VPN stacks can report one address twice; list it once. */
++			bool dup = false;
++			size_t alen = out[n].family == AF_INET ? 4 : 16;
++			for (i = 0; i < n; i++)
++				if (out[i].family == out[n].family && strcmp(out[i].name, name) == 0
++				    && memcmp(out[i].addr, out[n].addr, alen) == 0) { dup = true; break; }
++			if (dup) continue;
++		}
++		for (i = 0; i < nnames; i++)
++			if (strcmp(names[i], name) == 0) { idx = i; break; }
++		if (idx < 0) {
++			if (nnames >= FAKE_NETLINK_MAX_IFADDRS) continue;
++			idx = nnames;
++			strcpy(names[nnames++], name);
++		}
++		strcpy(out[n].name, name);
++		out[n].index = idx + 2;	/* 1 is lo */
++		out[n].prefix = prefix;
++		n++;
++	}
++	fclose(f);
++	return n;
++}
++
++static size_t put_link(char *msg, size_t off, uint32_t seq, const char *name,
++		       int index, bool loopback)
++{
++	struct nlmsghdr *nh = (struct nlmsghdr *) (msg + off);
++	struct ifinfomsg ifi;
++	uint32_t mtu = loopback ? 65536 : 1500;
++	unsigned char mac[6] = { 0 };
++	size_t start = off;
++
++	/* A stable made-up MAC per interface name (FNV-1a), locally administered
++	 * unicast (02:..). Display only: nothing is ever sent from it, but tools
++	 * that expect an Ethernet-looking link (Go's net.Interface, dnsmasq)
++	 * take their normal path instead of the "no hardware address" one. */
++	if (!loopback) {
++		uint32_t h = 2166136261u;
++		const char *c;
++		for (c = name; *c; c++) { h ^= (unsigned char) *c; h *= 16777619u; }
++		mac[0] = 0x02; mac[1] = 0x6d;	/* 'm' for minis */
++		mac[2] = h >> 24; mac[3] = h >> 16; mac[4] = h >> 8; mac[5] = h;
++	}
++
++	memset(&ifi, 0, sizeof(ifi));
++	ifi.ifi_family = AF_UNSPEC;
++	ifi.ifi_type = loopback ? ARPHRD_LOOPBACK : ARPHRD_ETHER;
++	ifi.ifi_index = index;
++	ifi.ifi_flags = loopback ? (IFF_UP | IFF_LOOPBACK | IFF_RUNNING)
++				 : (IFF_UP | IFF_RUNNING | IFF_MULTICAST);
++	ifi.ifi_change = 0xFFFFFFFF;
++
++	nh->nlmsg_type = RTM_NEWLINK;
++	nh->nlmsg_flags = NLM_F_MULTI;
++	nh->nlmsg_seq = seq;
++	nh->nlmsg_pid = FAKE_NETLINK_PORT_ID;
++	memcpy(NLMSG_DATA(nh), &ifi, sizeof(ifi));
++	off += NLMSG_LENGTH(sizeof(ifi));
++	off = put_attr(msg, off, IFLA_IFNAME, name, strlen(name) + 1);
++	off = put_attr(msg, off, IFLA_MTU, &mtu, sizeof(mtu));
++	off = put_attr(msg, off, IFLA_ADDRESS, mac, sizeof(mac));
++	nh->nlmsg_len = off - start;
++	return NLMSG_ALIGN(off);
++}
++
++static size_t put_addr(char *msg, size_t off, uint32_t seq, const char *label,
++		       int index, int family, const unsigned char *addr,
++		       int prefix, int scope)
++{
++	struct nlmsghdr *nh = (struct nlmsghdr *) (msg + off);
++	struct ifaddrmsg ifa;
++	size_t alen = family == AF_INET ? 4 : 16;
++	size_t start = off;
++
++	memset(&ifa, 0, sizeof(ifa));
++	ifa.ifa_family = family;
++	ifa.ifa_prefixlen = prefix;
++	ifa.ifa_flags = IFA_F_PERMANENT;
++	ifa.ifa_scope = scope;
++	ifa.ifa_index = index;
++
++	nh->nlmsg_type = RTM_NEWADDR;
++	nh->nlmsg_flags = NLM_F_MULTI;
++	nh->nlmsg_seq = seq;
++	nh->nlmsg_pid = FAKE_NETLINK_PORT_ID;
++	memcpy(NLMSG_DATA(nh), &ifa, sizeof(ifa));
++	off += NLMSG_LENGTH(sizeof(ifa));
++	off = put_attr(msg, off, IFA_ADDRESS, addr, alen);
++	if (family == AF_INET) {
++		off = put_attr(msg, off, IFA_LOCAL, addr, alen);
++		off = put_attr(msg, off, IFA_LABEL, label, strlen(label) + 1);
++	}
++	nh->nlmsg_len = off - start;
++	return NLMSG_ALIGN(off);
++}
++
++/**
++ * Build the reply to an RTM_GETLINK / RTM_GETADDR dump: loopback (always,
++ * see [T-android-fake-netlink-loopback] in git history for why an empty list
++ * stalls tsnet) plus the real interfaces the app published, if any.
++ */
+ static int emit_dump_reply(Tracee *tracee, const FakeNetlinkConfig *cfg,
+ 			   int slot, word_t buf, word_t len)
+ {
+-	/* One message plus NLMSG_DONE; generous headroom for alignment. */
+-	char msg[512];
++	char msg[FAKE_NETLINK_REPLY_MAX];	/* on the stack: no shared state between calls */
++	FakeIfAddr ifs[FAKE_NETLINK_MAX_IFADDRS];
+ 	size_t off = 0;
+ 	uint16_t req = slot >= 0 ? cfg->last_type[slot] : 0;
+ 	uint32_t seq = slot >= 0 ? cfg->last_seq[slot] : 0;
+-	struct nlmsghdr *nh;
+ 	struct nlmsghdr done;
++	int nifs = 0, i, j;
+ 
+ 	memset(msg, 0, sizeof(msg));
++	if (req == RTM_GETLINK || req == RTM_GETADDR)
++		nifs = load_real_ifaddrs(ifs, FAKE_NETLINK_MAX_IFADDRS);
+ 
+ 	if (req == RTM_GETLINK) {
+-		struct ifinfomsg ifi;
+-		const char *name = "lo";
+-		uint32_t mtu = 65536;
+-		/* 00:00:00:00:00:00 — loopback has no meaningful MAC. */
+-		char mac[6] = { 0 };
+-
+-		memset(&ifi, 0, sizeof(ifi));
+-		ifi.ifi_family = AF_UNSPEC;
+-		ifi.ifi_type = ARPHRD_LOOPBACK;
+-		ifi.ifi_index = 1;
+-		ifi.ifi_flags = IFF_UP | IFF_LOOPBACK | IFF_RUNNING;
+-		ifi.ifi_change = 0xFFFFFFFF;
+-
+-		nh = (struct nlmsghdr *) msg;
+-		nh->nlmsg_type = RTM_NEWLINK;
+-		nh->nlmsg_flags = NLM_F_MULTI;
+-		nh->nlmsg_seq = seq;
+-		nh->nlmsg_pid = FAKE_NETLINK_PORT_ID;
+-		memcpy(NLMSG_DATA(nh), &ifi, sizeof(ifi));
+-		off = NLMSG_LENGTH(sizeof(ifi));
+-		off = put_attr(msg, off, IFLA_IFNAME, name, strlen(name) + 1);
+-		off = put_attr(msg, off, IFLA_MTU, &mtu, sizeof(mtu));
+-		off = put_attr(msg, off, IFLA_ADDRESS, mac, sizeof(mac));
+-		nh->nlmsg_len = off;
++		off = put_link(msg, off, seq, "lo", 1, true);
++		for (i = 0; i < nifs; i++) {
++			bool seen = false;
++			for (j = 0; j < i; j++)
++				if (ifs[j].index == ifs[i].index) { seen = true; break; }
++			if (!HAS_ROOM(off)) break;
++			if (!seen)
++				off = put_link(msg, off, seq, ifs[i].name, ifs[i].index, false);
++		}
+ 	} else if (req == RTM_GETADDR) {
+-		struct ifaddrmsg ifa;
+-		/* 127.0.0.1 in network byte order. */
+ 		unsigned char v4[4] = { 127, 0, 0, 1 };
+-		const char *label = "lo";
+-
+-		memset(&ifa, 0, sizeof(ifa));
+-		ifa.ifa_family = AF_INET;
+-		ifa.ifa_prefixlen = 8;
+-		ifa.ifa_flags = IFA_F_PERMANENT;
+-		ifa.ifa_scope = RT_SCOPE_HOST;
+-		ifa.ifa_index = 1;
+-
+-		nh = (struct nlmsghdr *) msg;
+-		nh->nlmsg_type = RTM_NEWADDR;
+-		nh->nlmsg_flags = NLM_F_MULTI;
+-		nh->nlmsg_seq = seq;
+-		nh->nlmsg_pid = FAKE_NETLINK_PORT_ID;
+-		memcpy(NLMSG_DATA(nh), &ifa, sizeof(ifa));
+-		off = NLMSG_LENGTH(sizeof(ifa));
+-		off = put_attr(msg, off, IFA_ADDRESS, v4, sizeof(v4));
+-		off = put_attr(msg, off, IFA_LOCAL, v4, sizeof(v4));
+-		off = put_attr(msg, off, IFA_LABEL, label, strlen(label) + 1);
+-		nh->nlmsg_len = off;
++		off = put_addr(msg, off, seq, "lo", 1, AF_INET, v4, 8, RT_SCOPE_HOST);
++		for (i = 0; i < nifs; i++) {
++			int scope = RT_SCOPE_UNIVERSE;
++			if (!HAS_ROOM(off)) break;
++			if (ifs[i].family == AF_INET6 && ifs[i].addr[0] == 0xfe
++			    && (ifs[i].addr[1] & 0xc0) == 0x80)
++				scope = RT_SCOPE_LINK;
++			off = put_addr(msg, off, seq, ifs[i].name, ifs[i].index,
++				       ifs[i].family, ifs[i].addr, ifs[i].prefix, scope);
++		}
+ 	}
+ 	/* Anything else (a request type we do not model) falls through with
+ 	 * off == 0 and gets a bare DONE, which is a well-formed "nothing to
+ 	 * report" rather than a hang. */
+ 
+-	/* Terminate the dump. NLM_F_MULTI is set on the payload messages
+-	 * above, so the client keeps reading until it sees this. */
+ 	memset(&done, 0, sizeof(done));
+ 	done.nlmsg_len = NLMSG_HDRLEN;
+ 	done.nlmsg_type = NLMSG_DONE;
