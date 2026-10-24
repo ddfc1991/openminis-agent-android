@@ -68,6 +68,7 @@ object TaskProgress {
     }
 
     fun init(c: Context) {
+        runCatching { TaskProjects.init(c) }   // [Mines-38.9.13 task_projects]
         if (db != null) return
         synchronized(this) {
             if (db != null) return
@@ -101,6 +102,7 @@ object TaskProgress {
     /** [Mines-38.9.5 i11] a new chat's first turn starts before it has its real id: carry that row over to the real id. */
     fun move(from: String, to: String) {
         if (from.isBlank() || to.isBlank() || from == to) return
+        TaskProjects.move(from, to)   // [Mines-38.9.13 task_projects]
         val old = _tasks.value[from] ?: return
         if (_tasks.value[to] == null) put(old.copy(sid = to))
         forget(from)
@@ -119,7 +121,10 @@ object TaskProgress {
 
     // ---------------- runtime hooks (ChatViewModel) ----------------
 
-    fun onTurnStart(sid: String, userText: String? = null) { if (sid.isNotBlank()) put(TaskProgressCore.autoTurnStart(get(sid), sid, userText, now())) }
+    fun onTurnStart(sid: String, userText: String? = null) {
+        if (sid.isNotBlank()) put(TaskProgressCore.autoTurnStart(get(sid), sid, userText, now()))
+        runCatching { TaskProjects.onUserText(sid, userText) }   // [Mines-38.9.13 task_projects] 小任务 → 注册 = 立项?
+    }
     fun onTurnEnd(sid: String, cancelled: Boolean, answer: String? = null) { if (sid.isNotBlank()) put(TaskProgressCore.autoTurnEnd(get(sid), sid, cancelled, answer, now())) }
     /** [Mines-38.9.6 i12] every tool the agent runs becomes a short step (auto tables only). */
     fun onToolStart(sid: String, title: String?) { if (sid.isNotBlank()) put(TaskProgressCore.autoToolStart(get(sid), sid, title, now())) }

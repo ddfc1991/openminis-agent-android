@@ -143,11 +143,13 @@ object AccountsTool {
             }
             "register_pick" -> {
                 if (site.isBlank()) return@runCatching ToolExecutionResult("site 是空的", false)
+                runCatching { TaskProjects.onRegister(c, sid, site, "") }   // [Mines-38.9.13 task_projects] 立项?
                 ToolExecutionResult(Ledger.registerPick(c, site, a.optInt("count", 1).coerceIn(1, 20)), true)
             }
             "register_done" -> {
                 val acct = a.optString("account").trim()
                 if (site.isBlank() || acct.isBlank()) return@runCatching ToolExecutionResult("site 和 account 都要填", false)
+                if (a.optBoolean("ok", true)) runCatching { TaskProjects.onRegister(c, sid, site, acct) }   // [Mines-38.9.13 task_projects]
                 ToolExecutionResult(Ledger.registerDone(c, site, acct, a.optBoolean("ok", true), a.optString("note").trim()), true)
             }
             "use" -> {

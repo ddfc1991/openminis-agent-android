@@ -1512,7 +1512,7 @@ fun SessionListScreen(
             // [Mines-warm-36] bottom bar (对话 · 消息 · 灵感 · 任务 · 应用); 消息 shows the red count of things to handle
             if (!isSelecting && isInitialLoadComplete && minesHomeShown) com.openminis.app.ui.plus.WarmHomeNav(
                 modifier = Modifier.align(Alignment.BottomCenter),
-                onTasks = onScheduledTasksClick,
+                onTasks = { if (com.openminis.app.plus.TaskProjects.enabled()) com.openminis.app.ui.plus.PlusNav.go(com.openminis.app.ui.plus.TaskRoutes.TASKS) else onScheduledTasksClick() },   // [Mines-38.9.13 task_projects]
                 onTop = { scope.launch { listState.animateScrollToItem(0) } },
             )
         }
