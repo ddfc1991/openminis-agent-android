@@ -173,6 +173,7 @@ fun VpsPageScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onOpenSe
     var checking by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf<Machine?>(null) }
     var adding by remember { mutableStateOf(false) }
+    var monitorOf by remember { mutableStateOf<String?>(com.openminis.app.plus.VpsPlan.openMonitor) }   // [38.9.13] machine monitor shown in this card
     fun upd(f: (VpsPlanCore.Overrides) -> VpsPlanCore.Overrides) = VpsPlan.update(ctx, f)
     fun check() {
         if (checking) return
@@ -271,7 +272,8 @@ fun VpsPageScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onOpenSe
                 (h.memPct ?: 0) >= th -> Triple(A, "在线 · 停接", Color(0xFF8A4E00))
                 else -> Triple(G, "在线" + (srv.lastLatencyMs.takeIf { it >= 0 }?.let { " · $it ms" } ?: ""), Color(0xFF1E6B40))
             }
-            GlassBox(onClick = { editing = mc }) {
+            // [38.9.13] a card bound to a 工作位置 server opens its monitor on tap (编辑分工 inside); the others keep the edit dialog
+            GlassBox(onClick = { if (srv != null) monitorOf = if (monitorOf == mc.id) null else mc.id else editing = mc }) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Box(Modifier.size(9.dp).clip(CircleShape).background(dot)); Spacer(Modifier.width(8.dp))
                     Text(mc.name, fontSize = MT.Body, fontWeight = FontWeight.SemiBold, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis,
@@ -288,7 +290,11 @@ fun VpsPageScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onOpenSe
                     Text("内网穿透：$ts", fontSize = MT.Meta, fontWeight = FontWeight.Medium, modifier = Modifier.padding(top = 2.dp),
                         color = when (ts) { "穿透中" -> Color(0xFF1E6B40); "断开" -> Color(0xFFB3261E); else -> m.ink2 })
                 }
-                if (lv != null) Row(Modifier.padding(top = 7.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                if (srv != null && monitorOf == mc.id) {
+                    VpsMonitorPanel(srv, WorkspaceStore.meta(srv.id) ?: b?.meta)
+                    Text("编辑分工 ›", fontSize = MT.Sub, fontWeight = FontWeight.Medium, color = m.primaryText,
+                        modifier = Modifier.padding(top = 6.dp).clip(RoundedCornerShape(8.dp)).clickable { editing = mc }.padding(vertical = 6.dp))
+                } else if (lv != null) Row(Modifier.padding(top = 7.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Bar("CPU", lv.cpu, th, Modifier.weight(1f)); Bar("内存", lv.mem, th, Modifier.weight(1f))
                 } else if (mc.id == VpsPlanCore.PHONE && phoneMem >= 0) Row(Modifier.padding(top = 7.dp)) {
                     Bar("内存", phoneMem, th, Modifier.weight(1f)); Spacer(Modifier.weight(1f))

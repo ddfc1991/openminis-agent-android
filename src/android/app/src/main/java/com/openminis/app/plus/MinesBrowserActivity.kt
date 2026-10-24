@@ -34,6 +34,7 @@ class MinesBrowserActivity : Activity() {
         view = gv
         val done = Button(this).apply {
             text = "好了，交还给 Mines"
+            isAllCaps = false   // [38.9.13] the Button theme upper-cased it to 「MINES」
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
             setTextColor(Color.BLACK); setBackgroundColor(Color.WHITE)
             gravity = Gravity.CENTER

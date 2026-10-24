@@ -21,6 +21,9 @@ object VpsPlan {
     val overrides: StateFlow<VpsPlanCore.Overrides> = _o.asStateFlow()
     @Volatile private var loaded = false
 
+    /** [38.9.13] machine id whose monitor the VPS page opens with (smoke hook 'i3913 sshseed'; null = all collapsed) */
+    @Volatile var openMonitor: String? = null
+
     /** server id → memory % read by the page (live, not persisted) */
     val memPct = ConcurrentHashMap<String, Int>()
 

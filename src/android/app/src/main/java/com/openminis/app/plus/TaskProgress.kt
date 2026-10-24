@@ -125,7 +125,11 @@ object TaskProgress {
         if (sid.isNotBlank()) put(TaskProgressCore.autoTurnStart(get(sid), sid, userText, now()))
         runCatching { TaskProjects.onUserText(sid, userText) }   // [Mines-38.9.13 task_projects] 小任务 → 注册 = 立项?
     }
-    fun onTurnEnd(sid: String, cancelled: Boolean, answer: String? = null) { if (sid.isNotBlank()) put(TaskProgressCore.autoTurnEnd(get(sid), sid, cancelled, answer, now())) }
+    fun onTurnEnd(sid: String, cancelled: Boolean, answer: String? = null, userText: String? = null) {
+        if (sid.isNotBlank()) put(TaskProgressCore.autoTurnEnd(get(sid), sid, cancelled, answer, now()))
+        // [Mines-38.9.13 task_projects] a new chat has no real id at turn start, so its first message is checked here too
+        runCatching { TaskProjects.onUserText(sid, userText) }
+    }
     /** [Mines-38.9.6 i12] every tool the agent runs becomes a short step (auto tables only). */
     fun onToolStart(sid: String, title: String?) { if (sid.isNotBlank()) put(TaskProgressCore.autoToolStart(get(sid), sid, title, now())) }
     fun onToolEnd(sid: String, title: String?, ok: Boolean) { if (sid.isNotBlank()) get(sid)?.let { put(TaskProgressCore.autoToolEnd(it, sid, title, ok, now())) } }

@@ -850,7 +850,19 @@ object GroupSelfTest {
                         sv.firstOrNull { it.id == "smoke-mengyun" }?.let { T.mark(context, it, true) }
                         JSONObject().put("hub", T.hub()?.id ?: "").put("state", com.openminis.app.plus.TunnelState.of("梦云") ?: JSONObject.NULL).toString()
                     }
-                    else -> "i3913 chat <text> | say <text> | state | tunnelseed"
+                    // [38.9.13] machine monitor: 梦云 = the runner's own sshd (10.0.2.2:22, emulator-local), 30 days left + 免费 registered,
+                    // its card opens expanded; returns the app's public key for the harness to authorise on the runner
+                    "sshseed" -> {
+                        val P = com.openminis.app.plus.PlusPrefs; val W = com.openminis.app.plus.WorkspaceStore; W.init(context)
+                        val now = System.currentTimeMillis()
+                        if (P.state.value.servers.none { it.id == "smoke-mengyun" }) P.update(context) { cur ->
+                            cur.copy(servers = cur.servers + com.openminis.app.plus.VpsServer(id = "smoke-mengyun", name = "梦云", host = "10.0.2.2", port = 22, lastLatencyMs = 40, lastCheckedAt = now, authorized = true)) }
+                        val old = W.meta("smoke-mengyun") ?: com.openminis.app.plus.WorkspaceCore.Meta("smoke-mengyun", name = "梦云", host = "10.0.2.2", addedAt = now)
+                        W.upsert(old.copy(expiresAt = now + 30L * 86_400_000L, cost = "免费")); W.touch()
+                        com.openminis.app.plus.VpsPlan.openMonitor = com.openminis.app.plus.VpsPlanCore.MENGYUN
+                        JSONObject().put("pub", com.openminis.app.plus.VpsSsh.ensureKey(context).second).toString()
+                    }
+                    else -> "i3913 chat <text> | say <text> | state | tunnelseed | sshseed"
                 }
             }
             "i39113" -> {

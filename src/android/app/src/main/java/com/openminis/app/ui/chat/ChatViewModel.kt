@@ -5946,7 +5946,7 @@ class ChatViewModel(
                 val justFinished = wasStreaming && !streaming
                 wasStreaming = streaming
                 if (!justFinished) return@collect
-                runCatching { minesProgressFollowSid(); com.openminis.app.plus.TaskProgress.onTurnEnd(minesSid(), lastTurnWasCancelled, minesLastAnswer()) }
+                runCatching { minesProgressFollowSid(); com.openminis.app.plus.TaskProgress.onTurnEnd(minesSid(), lastTurnWasCancelled, minesLastAnswer(), _messages.value.lastOrNull { it.role == "user" && !it.isQueued }?.content) }
                 if (lastTurnWasCancelled) {
                     lastTurnWasCancelled = false
                     return@collect
