@@ -25,7 +25,7 @@ class MinesBrowserActivity : Activity() {
         val dp = { v: Float -> TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, resources.displayMetrics).toInt() }
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(Color.BLACK) }
         val head = TextView(this).apply {
-            text = "Mines 浏览器 · 请你在这页完成付款或确认\n" + MinesBrowser.handoverUrl()
+            text = MinesBrowser.handoverHead + "\n" + MinesBrowser.handoverUrl()
             setTextColor(Color.WHITE); setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
             setPadding(dp(16f), dp(12f), dp(16f), dp(10f))
         }

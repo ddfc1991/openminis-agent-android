@@ -420,6 +420,8 @@ fun SettingsScreen(
                 com.openminis.app.ui.plus.HandoffFlagRows()
                 com.openminis.app.ui.plus.PlusDivider()
                 com.openminis.app.ui.plus.MinesBrowserFlagRow()
+                com.openminis.app.ui.plus.PlusDivider()
+                com.openminis.app.ui.plus.TunnelFlagRow()
             }
             // [Mines-38.9.11.3] 远程诊断 — off by default, 24 h auto-off
             SettingsSection(title = "远程诊断", footer = "打开后，把卡顿、内存和崩溃信息发给开发者看（密钥、密码和聊天内容都会隐去）。对方只能做几项固定检查，不能操作手机；要截图会先问你。24 小时后自动关闭。") {

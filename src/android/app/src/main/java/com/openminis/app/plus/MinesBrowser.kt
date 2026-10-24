@@ -521,7 +521,23 @@ object MinesBrowser {
         t.lastUsed = SystemClock.elapsedRealtime()
         t.handedToUser = false
         handoverKey = null
+        handoverHead = "Mines 浏览器 · 请你在这页完成付款或确认"
     }
 
     internal fun handoverUrl(): String = tasks[handoverKey ?: ""]?.url.orEmpty()
+
+    /** first line of [MinesBrowserActivity]: what the user is asked to do there */
+    @Volatile internal var handoverHead: String = "Mines 浏览器 · 请你在这页完成付款或确认"; private set
+
+    /**
+     * [Mines-38.9.13 integ] show [url] to the user in Mines' own browser (内网穿透 「打开网页」): its own private session, wiped
+     * by the idle sweeper like any task. Throws [GeckoUnavailable] when GeckoView cannot start (caller falls back).
+     */
+    suspend fun showUrl(c: Context, url: String, head: String) {
+        init(c)
+        val t = task("user-web")
+        navigate(t, url)
+        t.handedToUser = true; handoverKey = t.key; handoverHead = head
+        withContext(Dispatchers.Main) { c.startActivity(Intent(c, MinesBrowserActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+    }
 }

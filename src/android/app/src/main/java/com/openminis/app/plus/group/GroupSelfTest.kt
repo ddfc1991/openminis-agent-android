@@ -842,7 +842,15 @@ object GroupSelfTest {
                                 .put("memory_v2", com.openminis.app.plus.MemoryV2.isOn(context)).put("handoff_v2", com.openminis.app.plus.HandoffBroker.resumeOn())
                                 .put("mines_browser", com.openminis.app.plus.MinesBrowser.on())).toString()
                     }
-                    else -> "i3913 chat <text> | say <text> | state"
+                    // after 'i3911 servers': alvps (10.0.2.2) = the hub, 梦云 marked for 内网穿透 — emulator-local, no real server touched
+                    "tunnelseed" -> {
+                        val T = com.openminis.app.plus.Tunnel; T.init(context); T.setOn(context, true)
+                        val sv = com.openminis.app.plus.PlusPrefs.state.value.servers
+                        sv.firstOrNull { it.id == "smoke-alvps" }?.let { T.setHub(context, it.id) }
+                        sv.firstOrNull { it.id == "smoke-mengyun" }?.let { T.mark(context, it, true) }
+                        JSONObject().put("hub", T.hub()?.id ?: "").put("state", com.openminis.app.plus.TunnelState.of("梦云") ?: JSONObject.NULL).toString()
+                    }
+                    else -> "i3913 chat <text> | say <text> | state | tunnelseed"
                 }
             }
             "i39113" -> {

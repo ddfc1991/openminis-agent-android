@@ -150,13 +150,25 @@ fun TunnelServerSection(server: VpsServer) {
             } else TunnelLine("只能在 Mines 里打开（别人访问不到）")
             Button(onClick = { act("正在接通网页…") { Tunnel.webUrl(c, server.id).map { u ->
                     // in-app tab over Mines (loopback forward on the phone; the page never goes public)
-                    com.openminis.app.browser.GoogleAuthRouter.openInCustomTab(c, u); "已打开 $u"
+                    // [Mines-38.9.13 integ] Mines' own browser when mines_browser is on, else the Custom Tab as before
+                    val mb = com.openminis.app.plus.MinesBrowser.also { it.init(c) }
+                    if (mb.on() && runCatching { mb.showUrl(c, u, "Mines 浏览器 · ${server.name.ifBlank { server.host }} 的网页（经内网穿透）") }.isSuccess) "已打开 $u"
+                    else { com.openminis.app.browser.GoogleAuthRouter.openInCustomTab(c, u); "已打开 $u" }
                 } } }, enabled = !busy,
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp).heightIn(min = 52.dp)) { Text("打开网页") }
         }
         TextButton(onClick = { act("正在关闭…") { Tunnel.uninstall(c, server) } }, enabled = !busy,
             modifier = Modifier.padding(horizontal = 8.dp)) { Text("关闭穿透（从这台机器上移除）", color = Red) }
     }
+}
+
+/** [Mines-38.9.13 integ] the tunnel_v1 switch; in 工作位置 → 内网穿透 and in 设置 → 实验功能. */
+@Composable
+fun TunnelFlagRow() {
+    val c = LocalContext.current
+    Tunnel.init(c)
+    val on by Tunnel.on.collectAsState()
+    TunnelSwitchRow("内网穿透", "没有公网 IP 的机器经 AWS 连接；手机端口可临时公开", on) { Tunnel.setOn(c, it) }
 }
 
 /** 工作位置 → 「内网穿透（实验）」: feature switch, hub choice, 「把手机端口公开」. */
@@ -175,7 +187,7 @@ fun TunnelHubSection() {
     var msg by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
     PlusSection("内网穿透（实验）") {
-        TunnelSwitchRow("内网穿透", "没有公网 IP 的机器经 AWS 连接；手机端口可临时公开", on) { Tunnel.setOn(c, it) }
+        TunnelFlagRow()
         if (!on) return@PlusSection
         val hub = Tunnel.hub()
         Box {

@@ -283,6 +283,11 @@ fun VpsPageScreen(onBack: () -> Unit, onOpenTerminal: (String) -> Unit, onOpenSe
                 }
                 val sub = listOfNotNull(b?.host, lv?.let { "${it.cores}核 / ${if (it.memTotalMb >= 1024) String.format(java.util.Locale.US, "%.1fG", it.memTotalMb / 1024.0) else "${it.memTotalMb}M"}" } ?: mc.sub)
                 Text(sub.joinToString(" · "), fontSize = MT.Meta, color = m.ink2, modifier = Modifier.padding(top = 2.dp))
+                // [Mines-38.9.13 integ] 内网穿透 status of this machine (null = flag off / not a known server → nothing)
+                runCatching { com.openminis.app.plus.TunnelState.of(srv?.name?.ifBlank { null } ?: b?.host ?: mc.name) }.getOrNull()?.let { ts ->
+                    Text("内网穿透：$ts", fontSize = MT.Meta, fontWeight = FontWeight.Medium, modifier = Modifier.padding(top = 2.dp),
+                        color = when (ts) { "穿透中" -> Color(0xFF1E6B40); "断开" -> Color(0xFFB3261E); else -> m.ink2 })
+                }
                 if (lv != null) Row(Modifier.padding(top = 7.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Bar("CPU", lv.cpu, th, Modifier.weight(1f)); Bar("内存", lv.mem, th, Modifier.weight(1f))
                 } else if (mc.id == VpsPlanCore.PHONE && phoneMem >= 0) Row(Modifier.padding(top = 7.dp)) {
