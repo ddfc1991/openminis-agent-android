@@ -300,7 +300,7 @@ object MinesBrowser {
 
     private suspend fun evalSoft(t: Task, js: String): String? = runCatching { evaluate(t, js, 6_000L) }.getOrNull()
 
-    private suspend fun capture(t: Task): Bitmap? = runCatching { t.display?.capturePixels()?.await(8_000L) }.getOrNull()
+    private suspend fun capture(t: Task): Bitmap? = runCatching { withContext(Dispatchers.Main) { t.display?.capturePixels() }?.await(8_000L) }.getOrNull()
 
     private fun saveJpeg(bmp: Bitmap, quality: Int): Pair<File, ByteArray> {
         val bytes = ByteArrayOutputStream().also { bmp.compress(Bitmap.CompressFormat.JPEG, quality, it) }.toByteArray()
