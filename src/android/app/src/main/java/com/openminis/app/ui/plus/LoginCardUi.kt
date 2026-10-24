@@ -68,6 +68,7 @@ fun LoginCardHost() {
             AcctLogo(r.host, r.name)
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
+                if (r.task.isNotBlank()) Text(r.task, fontSize = MT.Meta, color = m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis)   // [38.9.13] task name
                 Text(r.name, fontSize = MT.Body, lineHeight = MT.SubLH, fontWeight = FontWeight.SemiBold, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Text(r.ask.title, fontSize = MT.Caption, lineHeight = MT.CaptionLH, color = if (r.ask.refused) danger else m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }

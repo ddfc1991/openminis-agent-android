@@ -512,6 +512,7 @@ class MainActivity : ComponentActivity() {
         // the navigation stack lands on that chat instead of the
         // sessions list. T166.
         val explicitDeepLink = DeepLinkHandler.parse(intent?.data)
+        runCatching { com.openminis.app.plus.HandoffBroker.onDeepLink(intent?.data) }   // [38.9.13] notification → that tab
         val launchDeepLink = if (explicitDeepLink !is DeepLinkAction.Unknown) {
             explicitDeepLink
         } else {
@@ -643,6 +644,8 @@ class MainActivity : ComponentActivity() {
                 com.openminis.app.ui.plus.KeychainHost()
                 // [Mines-38.9.5 i] secure login card (first sign-in / refused password / code that never came)
                 com.openminis.app.ui.plus.LoginCardHost()
+                // [Mines-38.9.13 handoff_v2] 「{任务} · 需要你…」 popup + bar with 去那个页面 / 继续接管 (any conversation)
+                com.openminis.app.ui.plus.HandoffHost()
                 // [Mines-38.9.11.3] 「已用 台账：邮箱」 · 换一个 · 设为默认 (non-blocking)
                 com.openminis.app.ui.plus.LedgerChipHost()
                 // [Mines-38.9.11.3] 「复制崩溃日志」 after a crash / ANR (redacted)
@@ -837,6 +840,7 @@ class MainActivity : ComponentActivity() {
 
     private fun handleDeepLink(uri: Uri?) {
         val action = DeepLinkHandler.parse(uri)
+        runCatching { com.openminis.app.plus.HandoffBroker.onDeepLink(uri) }   // [38.9.13] notification → that conversation's tab
         val nav = navController ?: return
         when (action) {
             is DeepLinkAction.OpenTerminal -> {

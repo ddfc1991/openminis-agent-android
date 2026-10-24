@@ -466,7 +466,10 @@ fun BrowserSheet(
 
                 // [Mines] While a captcha waits for the user, hand the page over.
                 val minesVerifyPending by com.openminis.app.plus.HumanVerify.pending.collectAsState()
-                if (isAgentBusy && minesVerifyPending == null) {
+                // [38.9.13 handoff_v2] a handoff on this conversation: no 「Mines 正在浏览」 cover, a bar with 「继续接管」 instead
+                val handoffs by com.openminis.app.plus.HandoffBroker.list.collectAsState()
+                val myHandoff = handoffs.filter { it.sessionId == tabPool.sessionKey }.maxByOrNull { it.createdAt }
+                if (isAgentBusy && minesVerifyPending == null && myHandoff?.open != true) {
                     AgentBrowsingOverlay(
                         accent = accent,
                         // [T-android-browser-release-all-semantics] Takeover
@@ -475,6 +478,7 @@ fun BrowserSheet(
                         onTakeover = { tabPool.releaseAllTabsToUser() },
                     )
                 }
+                myHandoff?.let { com.openminis.app.ui.plus.HandoffSheetBar(it, Modifier.align(Alignment.BottomCenter)) }
             }
 
             // ── Download progress banner ──

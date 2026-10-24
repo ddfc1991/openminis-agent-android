@@ -172,6 +172,25 @@ return JSON.stringify({kind:kind,otp:cands.length>0,split:single.length>=4,otpEm
         return waitForHuman(context, scan.kind, url, rescan, currentUrl, maxWaitMs = 30_000L)
     }
 
+    /**
+     * [Mines-38.9.5 i] Cloudflare / Turnstile usually clears by itself in a real WebView: wait up to 15 s quietly
+     * before bothering the user (never clicked or solved by Mines). Returns the agent note when it cleared, else null.
+     */
+    suspend fun trySilent(kind: String, url: String, rescan: suspend () -> Scan, currentUrl: suspend () -> String): String? {
+        if (AccountsCore.challenge(kind) != AccountsCore.Challenge.SILENT_WAIT) return null
+        val t0 = System.currentTimeMillis()
+        val had = hasClearance(url)
+        while (System.currentTimeMillis() - t0 < AccountsCore.TURNSTILE_WAIT_MS) {
+            delay(1500)
+            val now = runCatching { currentUrl() }.getOrDefault(url)
+            if (now.substringBefore('#') != url.substringBefore('#') || (!had && hasClearance(now)) || runCatching { rescan().kind.isBlank() }.getOrDefault(false)) {
+                delay(800); runCatching { CookieManager.getInstance().flush() }
+                return "[人工验证] 页面出现$kind，已自动通过（没有打扰用户），现在可以继续操作（先截图看看当前页面）。"
+            }
+        }
+        return null
+    }
+
     suspend fun waitForHuman(
         context: Context,
         kind: String,
@@ -180,20 +199,7 @@ return JSON.stringify({kind:kind,otp:cands.length>0,split:single.length>=4,otpEm
         currentUrl: suspend () -> String,
         maxWaitMs: Long = WAIT_SLICE_MS,
     ): String {
-        // [Mines-38.9.5 i] Cloudflare / Turnstile usually clears by itself in a real WebView: wait up to 15 s quietly
-        // before bothering the user (never clicked or solved by Mines)
-        if (AccountsCore.challenge(kind) == AccountsCore.Challenge.SILENT_WAIT && _pending.value == null) {
-            val t0 = System.currentTimeMillis()
-            val had = hasClearance(url)
-            while (System.currentTimeMillis() - t0 < AccountsCore.TURNSTILE_WAIT_MS) {
-                delay(1500)
-                val now = runCatching { currentUrl() }.getOrDefault(url)
-                if (now.substringBefore('#') != url.substringBefore('#') || (!had && hasClearance(now)) || runCatching { rescan().kind.isBlank() }.getOrDefault(false)) {
-                    delay(800); runCatching { CookieManager.getInstance().flush() }
-                    return "[人工验证] 页面出现$kind，已自动通过（没有打扰用户），现在可以继续操作（先截图看看当前页面）。"
-                }
-            }
-        }
+        if (_pending.value == null) trySilent(kind, url, rescan, currentUrl)?.let { return it }
         val prior = _pending.value
         if (prior == null || prior.url.substringBefore('#') != url.substringBefore('#')) {
             val p = Pending(url, kind)

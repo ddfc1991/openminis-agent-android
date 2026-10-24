@@ -59,16 +59,43 @@ return String(n);})()"""
 var h=((e.name||'')+' '+(e.id||'')+' '+(e.placeholder||'')+' '+(e.getAttribute('autocomplete')||'')+' '+(e.getAttribute('aria-label')||'')).toLowerCase();
 return h.indexOf('one-time-code')>=0||h.indexOf('otp')>=0||h.indexOf('code')>=0||h.indexOf('验证码')>=0||e.maxLength===1;});return i?'1':'';})()"""
 
+    /**
+     * [Mines-38.9.13 handoff_v2.oauth] e-mail / phone sign-up first: press 「Continue with Email」 when that is how the form
+     * opens; a page that offers ONLY third-party buttons gets GitHub (phone signed in) and otherwise a plain explanation
+     * instead of a Google / Apple click (they refuse in-app browsers; that session would stay in Chrome).
+     * Returns a line to show when the run must stop here, null to go on with the e-mail form below.
+     */
+    private suspend fun emailFirst(eval: suspend (String) -> String): String? {
+        val o = runCatching { JSONObject(eval(com.openminis.app.plus.OAuthOnlyCore.PAGE_JS)) }.getOrNull() ?: return null
+        val labels = o.optJSONArray("labels")?.let { a -> (0 until a.length()).map { a.optString(it) } }.orEmpty()
+        return when (com.openminis.app.plus.OAuthOnlyCore.detect(o.optBoolean("input"), labels)) {
+            com.openminis.app.plus.OAuthOnlyCore.Kind.EMAIL -> {
+                if (!o.optBoolean("input")) com.openminis.app.plus.OAuthOnlyCore.emailEntry(labels)?.let { eval(clickJs(listOf(it))); delay(1500) }
+                null
+            }
+            com.openminis.app.plus.OAuthOnlyCore.Kind.OAUTH_ONLY -> {
+                val ghSession = runCatching { android.webkit.CookieManager.getInstance().getCookie("https://github.com").orEmpty().contains("logged_in=yes") }.getOrDefault(false)
+                if (ghSession && labels.any { it.contains("GitHub", ignoreCase = true) } && eval(clickJs(github)).isNotBlank())
+                    "已点「用 GitHub 登录」，用的是你手机上已登录的 GitHub。如果页面要你点「授权」，点一下就好，然后 Mines 会自动继续"
+                else "这个网站只能用 Google / Apple 等第三方账号注册，App 里的浏览器登录不了。要用的话点「用系统浏览器打开」在 Chrome 里注册，注册好把需要的结果复制回来"
+            }
+            com.openminis.app.plus.OAuthOnlyCore.Kind.UNKNOWN -> null
+        }
+    }
+
     /** Runs the sign-up on the open page; [eval] runs JS with KeyAgent's helper; returns the line to show. */
     suspend fun run(context: Context, accountId: String, email: String, eval: suspend (String) -> String, status: (String) -> Unit): String {
         PlusVault.extra(accountId, "login_email")?.takeIf { it != "-" }?.let { return "这个服务已经用 $it 注册过了，不再重复注册。直接登录就好" }
+        com.openminis.app.plus.HandoffFlags.init(context)
+        val useEmail = com.openminis.app.plus.HandoffFlags.on(com.openminis.app.plus.HandoffFlags.OAUTH)
+        if (useEmail) emailFirst(eval)?.let { return it }
         // 1) GitHub, when the phone is already signed in to GitHub
         val ghSession = runCatching { android.webkit.CookieManager.getInstance().getCookie("https://github.com").orEmpty().contains("logged_in=yes") }.getOrDefault(false)
-        if (ghSession && eval(clickJs(github)).isNotBlank()) {
+        if (!useEmail && ghSession && eval(clickJs(github)).isNotBlank()) {
             return "已点「用 GitHub 登录」，用的是你手机上已登录的 GitHub。如果页面要你点「授权」，点一下就好，然后 Mines 会自动继续"
         }
         // 2) Google (finished in Chrome)
-        if (eval(clickJs(google)).isNotBlank()) {
+        if (!useEmail && eval(clickJs(google)).isNotBlank()) {
             return "已点「用 Google 登录」，Google 要在 Chrome 里完成。选你的账号后回到这里点「继续」"
         }
         // 3) e-mail sign-up

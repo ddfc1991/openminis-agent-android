@@ -264,6 +264,7 @@ fun VerifyScreen(onBack: () -> Unit) {
             Text("各网站的登录状态（Cookie）分网站保存在手机上，验证通过后立刻存盘，重启后还在。", style = MaterialTheme.typography.bodyMedium,
                 modifier = Modifier.padding(16.dp))
         }
+        HandoffFlagsSection()   // [Mines-38.9.13 handoff_v2]
     }
 }
 
