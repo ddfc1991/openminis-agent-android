@@ -269,6 +269,8 @@ class MinisApp : Application(), ImageLoaderFactory {
         // [Mines-38.9.6 i14] embedded Clash (mihomo) core, when switched on
         runCatching { Thread({ runCatching { com.openminis.app.plus.ClashCore.init(this) } }, "mines-clash-init").start() }
         runCatching { com.openminis.app.plus.HumanVerify.init(this) }
+        // [Mines-38.9.13 integ] handoff popups name the task project (「Railway 注册 · 第2次」); TaskName.of already carries 第N次
+        com.openminis.app.plus.HandoffBroker.projectNameOf = { sid -> com.openminis.app.plus.TaskName.of(sid)?.let { it to 1 } }
         // [Mines-38.9.4] endpoints that reject the `thinking` field (remembered across launches)
         runCatching {
             val sp = getSharedPreferences("mines_thinking_fb", MODE_PRIVATE)

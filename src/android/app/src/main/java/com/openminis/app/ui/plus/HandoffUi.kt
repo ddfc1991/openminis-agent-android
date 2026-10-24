@@ -165,15 +165,21 @@ fun HandoffSheetBar(h: Handoff, modifier: Modifier = Modifier) {
 /** 设置 → 浏览器验证: the handoff_v2 switches (实验功能, default on) */
 @Composable
 fun HandoffFlagsSection() {
+    PlusSection("交接 v2（实验功能）", footer = "验证、登录弹窗关掉后 Mines 马上继续；回到你操作的那个页面；弹窗写明是哪个项目、哪个网站。关掉总开关 = 回到旧版做法。") {
+        HandoffFlagRows()
+    }
+}
+
+/** [Mines-38.9.13 integ] the handoff_v2 switches; also listed in 设置 → 实验功能. */
+@Composable
+fun HandoffFlagRows() {
     val ctx = LocalContext.current
     LaunchedEffect(Unit) { HandoffFlags.init(ctx) }
     val rev by HandoffFlags.rev.collectAsState()
-    PlusSection("交接 v2（实验功能）", footer = "验证、登录弹窗关掉后 Mines 马上继续；回到你操作的那个页面；弹窗写明是哪个项目、哪个网站。关掉总开关 = 回到旧版做法。") {
-        val keys = listOf(HandoffFlags.MASTER) + HandoffFlags.SUBS
-        keys.forEachIndexed { i, k ->
-            if (i > 0) PlusDivider()
-            val on = remember(rev) { HandoffFlags.userValue(k) }
-            SwitchRow(HandoffFlags.ZH[k] ?: k, null, on) { v -> HandoffFlags.set(ctx, k, v) }
-        }
+    val keys = listOf(HandoffFlags.MASTER) + HandoffFlags.SUBS
+    keys.forEachIndexed { i, k ->
+        if (i > 0) PlusDivider()
+        val on = remember(rev) { HandoffFlags.userValue(k) }
+        SwitchRow(HandoffFlags.ZH[k] ?: k, null, on) { v -> HandoffFlags.set(ctx, k, v) }
     }
 }

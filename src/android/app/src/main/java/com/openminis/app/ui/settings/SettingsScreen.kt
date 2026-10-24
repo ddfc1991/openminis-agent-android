@@ -413,14 +413,17 @@ fun SettingsScreen(
             // [Mines-38.9.13] 实验功能: each feature of this release can be switched off
             SettingsSection(title = "实验功能") {
                 com.openminis.app.ui.plus.VpsPageFlagRow()
+                com.openminis.app.ui.plus.PlusDivider()
+                com.openminis.app.ui.plus.TaskProjectsFlagRow()
+                com.openminis.app.ui.plus.PlusDivider()
+                MemoryV2FlagRows(lastDivider = true)
+                com.openminis.app.ui.plus.HandoffFlagRows()
+                com.openminis.app.ui.plus.PlusDivider()
+                com.openminis.app.ui.plus.MinesBrowserFlagRow()
             }
             // [Mines-38.9.11.3] 远程诊断 — off by default, 24 h auto-off
             SettingsSection(title = "远程诊断", footer = "打开后，把卡顿、内存和崩溃信息发给开发者看（密钥、密码和聊天内容都会隐去）。对方只能做几项固定检查，不能操作手机；要截图会先问你。24 小时后自动关闭。") {
                 com.openminis.app.ui.plus.DiagSettingsRow()
-            }
-            // [Mines-38.9.13] 实验功能 (each 38.9.13 feature adds its own row here)
-            SettingsSection(title = "实验功能") {
-                com.openminis.app.ui.plus.TaskProjectsFlagRow()
             }
             }
 

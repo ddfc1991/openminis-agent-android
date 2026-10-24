@@ -266,11 +266,18 @@ fun VerifyScreen(onBack: () -> Unit) {
         }
         HandoffFlagsSection()   // [Mines-38.9.13 handoff_v2]
         // [38.9.13 mines_browser] 实验功能 switch
-        var geckoOn by remember { mutableStateOf(com.openminis.app.plus.MinesBrowser.also { it.init(ctx) }.on()) }
         PlusSection("Mines 自己的浏览器（实验）", footer = "火狐内核，装在 Mines 里。AI 在这里替你操作：每个任务一个无痕空间，做完就清除；走你的代理；验证码 Mines 自己收自己填。只有付款和手机上的确认才交给你。关掉后全部用原来的内置浏览器。") {
-            SwitchRow("打开 Mines 浏览器", null, geckoOn) { on -> com.openminis.app.plus.MinesBrowser.setOn(ctx, on); geckoOn = on }
+            MinesBrowserFlagRow()
         }
     }
+}
+
+/** [38.9.13 mines_browser] switch row; also listed in 设置 → 实验功能. */
+@Composable
+fun MinesBrowserFlagRow() {
+    val ctx = LocalContext.current
+    var geckoOn by remember { mutableStateOf(com.openminis.app.plus.MinesBrowser.also { it.init(ctx) }.on()) }
+    SwitchRow("打开 Mines 浏览器", null, geckoOn) { on -> com.openminis.app.plus.MinesBrowser.setOn(ctx, on); geckoOn = on }
 }
 
 // ── 检查更新 ───────────────────────────────────────────────────────────
