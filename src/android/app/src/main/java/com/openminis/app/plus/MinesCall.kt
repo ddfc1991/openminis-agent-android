@@ -21,7 +21,16 @@ object MinesCall {
     const val NOTIF_ID = 0x4D43   // "MC"
     @Volatile var lastRungAt: Long = 0L
 
-    fun enabled(c: Context) = c.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("on", false)
+    /** [Mines-38.9.14.1] the 来电 feature is removed (user 2026-10-25 「要么修好，要么不要」): never on, never rings */
+    @Suppress("UNUSED_PARAMETER") fun enabled(c: Context) = false
+
+    /** [Mines-38.9.14.1] clean up what earlier builds left: the old switch, a ringing notification, the 「Mines 来电」 channel */
+    fun retire(c: Context) {
+        val app = c.applicationContext
+        runCatching { app.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean("on", false).apply() }
+        runCatching { NotificationManagerCompat.from(app).cancel(NOTIF_ID) }
+        runCatching { app.getSystemService(NotificationManager::class.java)?.deleteNotificationChannel(CHANNEL) }
+    }
     fun setEnabled(c: Context, on: Boolean) = c.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean("on", on).apply()
 
     private fun channel(c: Context) {
@@ -36,6 +45,7 @@ object MinesCall {
 
     /** ring now: [title] e.g. 「任务完成」, [body] the last reply line, [sessionId] for 转文字 */
     fun ring(c: Context, title: String, body: String, sessionId: String?) {
+        if (!enabled(c)) return   // [Mines-38.9.14.1] removed: MinesCallActivity is no longer in the manifest
         val app = c.applicationContext
         channel(app)
         lastRungAt = System.currentTimeMillis()

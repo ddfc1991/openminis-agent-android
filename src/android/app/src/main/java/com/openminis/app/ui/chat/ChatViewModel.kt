@@ -18293,9 +18293,16 @@ internal fun warmUpBudget(window: Int?, compactThreshold: Int?, ratio: Double, f
 internal fun <T> kotlinx.coroutines.flow.Flow<T>.minesStallWatchdog(idleMs: Long): kotlinx.coroutines.flow.Flow<T> {
     val upstream = this
     return kotlinx.coroutines.flow.flow {
-        kotlinx.coroutines.coroutineScope {
-            val ch = upstream.produceIn(this)
-            var got = false
+        // [38.9.14.1] smoke 40172410482: inside coroutineScope the stall error waited 80 s for the producer, which sat in a
+        // blocking socket read that ignores cancellation. The producer now runs in a DETACHED scope: on a stall it is cancelled
+        // and abandoned (its read ends when the call is cancelled / the socket closes) and the turn retries at once.
+        val ctx = kotlinx.coroutines.currentCoroutineContext()
+        val job = kotlinx.coroutines.SupervisorJob()
+        val scope = kotlinx.coroutines.CoroutineScope(ctx.minusKey(kotlinx.coroutines.Job) + job +
+            kotlinx.coroutines.CoroutineExceptionHandler { _, t -> runCatching { android.util.Log.w("MinesStall", "abandoned producer ended: ${t.message}") } })
+        val ch = upstream.produceIn(scope)
+        var got = false
+        try {
             while (true) {
                 val r = kotlinx.coroutines.withTimeoutOrNull(idleMs) { ch.receiveCatching() }
                 if (r == null) {
@@ -18306,11 +18313,13 @@ internal fun <T> kotlinx.coroutines.flow.Flow<T>.minesStallWatchdog(idleMs: Long
                 }
                 if (r.isClosed) {
                     r.exceptionOrNull()?.let { throw it }
-                    return@coroutineScope
+                    break
                 }
                 got = true
                 emit(r.getOrThrow())
             }
+        } finally {
+            job.cancel()
         }
     }
 }

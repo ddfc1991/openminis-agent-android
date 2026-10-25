@@ -1085,7 +1085,10 @@ internal fun FloatingToolStatusBar(
     val barHeight = 38.dp
     val thumbnailOverhang = thumbnailHeight - barHeight  // 14dp above bar
     val thumbnailInset = 10.dp
-    val barStartPadding = if (previewEnabled) thumbnailWidth + thumbnailInset + 8.dp else 12.dp
+    // [Mines-38.9.14.1] user 2026-10-25 screenshot: the black preview tile sat ON the bar (「检查谷歌登录状态」). The bar now starts
+    // to the right of the tile (outer margin), so the tile never covers it; same height as before.
+    val barOuterStart = if (previewEnabled) thumbnailWidth + thumbnailInset + 6.dp else 0.dp
+    val barStartPadding = 12.dp
 
     Box(
         modifier = modifier
@@ -1095,6 +1098,7 @@ internal fun FloatingToolStatusBar(
         // Layer 1: Status bar (bottom layer, fills from bottom)
         Row(
             modifier = Modifier
+                .padding(start = barOuterStart)
                 .fillMaxWidth()
                 .height(barHeight)
                 .align(Alignment.BottomCenter)

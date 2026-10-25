@@ -79,7 +79,8 @@ private fun hm(at: Long): String = if (at <= 0) "" else java.text.SimpleDateForm
 
 /** one task row written into 聊天: CREATED = chip + 「已创建任务」 line; 等你 / 出错 / 完成 = a card naming the task */
 @Composable
-fun MinesTaskNotice(tag: ChatHomeCore.Tag) {
+fun MinesTaskNotice(tag: ChatHomeCore.Tag, fold: ChatHomeCore.Fold? = null) {
+    if (fold?.show == false) return   // [38.9.14.1] folded into this task's newest card
     val m = mines()
     val tasks by ChatHome.tasks.collectAsState()
     val t = tasks.firstOrNull { it.id == tag.taskId }
@@ -123,6 +124,24 @@ fun MinesTaskNotice(tag: ChatHomeCore.Tag) {
                         modifier = Modifier.clip(RoundedCornerShape(50)).background(tone.copy(alpha = 0.14f)).padding(horizontal = 8.dp, vertical = 2.dp))
                 }
                 Text(tag.body, fontSize = MT.Body, lineHeight = MT.BodyLH, color = m.ink, modifier = Modifier.padding(top = 4.dp), maxLines = 6, overflow = TextOverflow.Ellipsis)
+                // [38.9.14.1] 「已重试 N 次 · 历史尝试 N ›」: the older cards of this task, folded; tap to expand
+                val hist = fold?.history.orEmpty()
+                if (hist.isNotEmpty()) {
+                    var open by remember(tag.taskId, hist.size) { mutableStateOf(false) }
+                    val line = listOf(fold?.retryLine.orEmpty(), "历史尝试 ${hist.size} " + if (open) "⌃" else "›").filter { it.isNotEmpty() }.joinToString(" · ")
+                    Text(line, fontSize = MT.Meta, color = m.ink2, maxLines = 1,
+                        modifier = Modifier.padding(top = 6.dp).clip(RoundedCornerShape(8.dp)).clickable { open = !open }
+                            .semantics { contentDescription = line + if (open) "，点按收起" else "，点按展开" }.padding(vertical = 4.dp))
+                    if (open) hist.asReversed().forEach { h ->
+                        val w = when (h.kind) { ChatHomeCore.Kind.ASK -> "等你"; ChatHomeCore.Kind.ERROR -> "出错"; ChatHomeCore.Kind.DONE -> "完成"; else -> "已建" }
+                        val c = toneColor(when (h.kind) { ChatHomeCore.Kind.ASK -> ChatHomeCore.Tone.WAIT; ChatHomeCore.Kind.ERROR -> ChatHomeCore.Tone.ERR; else -> ChatHomeCore.Tone.DONE })
+                        Row(Modifier.padding(top = 4.dp), verticalAlignment = Alignment.Top) {
+                            Text(w, fontSize = MT.Meta, fontWeight = FontWeight.SemiBold, color = c, maxLines = 1, softWrap = false)
+                            Spacer(Modifier.width(8.dp))
+                            Text(h.body, fontSize = MT.Meta, color = m.ink2, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+                }
             }
         }
     }
