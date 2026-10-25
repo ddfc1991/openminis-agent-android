@@ -7672,6 +7672,35 @@ def b3914(res):
         if not hidden: fail("pip: the user message is not visible above the strip")
     step("pip", pip)
 
+    def stepfold():
+        # [38.9.14.2 step_fold] user 20:57 「对话要会伸缩进一个任务项，就是聚合」: a 13-step reply (7 深度思考 + 6 tools) shows as ONE
+        # task row (no 深度思考 card visible while folded); tapping opens the steps; tapping again closes them
+        o["stepfold_chat"] = result_json("group", "i3913 chat STEPFOLD 聚合测试", timeout=40)
+        r = None; t = ""
+        for _ in range(36):
+            time.sleep(2.5); r = dump(); t = alltxt(r)
+            if "STEPFOLD 完成" in t: break
+        time.sleep(2); r = shot("stepfold-folded"); t = alltxt(r)
+        rows = [d for _t, d, *_ in nodes(r) if (d or "").startswith("步骤：")]
+        o["stepfold_rows"] = rows; o["stepfold_posts"] = fake().get("stepfold_posts")
+        if "STEPFOLD 完成" not in t: fail("stepfold: the 13-step reply did not finish / final answer not visible")
+        if len(rows) != 1: fail(f"stepfold: {len(rows)} task rows for one reply (want 1): {rows}")
+        elif "13 步" not in rows[0]: fail(f"stepfold: task row does not say 13 步: {rows[0]}")
+        if "深度思考" in _txt(r): fail("stepfold: a 深度思考 card is visible while folded")
+        if bounds_of(r, "工具状态条"): fail("stepfold: the floating status strip duplicates the folded row")
+        if not rows: return
+        p = find(r, "步骤：")
+        sh(f"input tap {p[0]} {p[1]}"); time.sleep(2.5)
+        r = shot("stepfold-open"); t = _txt(r)
+        o["stepfold_open_txt"] = t[-400:]
+        if "深度思考" not in t and "列出源码结构" not in t and "全盘搜索构建依赖" not in t: fail("stepfold: opening the row did not show the steps")
+        p = find(r, "步骤：")
+        if p:
+            sh(f"input tap {p[0]} {p[1]}"); time.sleep(2)
+            r = dump()
+            if "深度思考" in _txt(r): fail("stepfold: tapping again did not fold the steps")
+    step("stepfold", stepfold)
+
     def experiments():
         route("settings", 3); tap_text("测试与上报", wait=3)
         seen = set()
