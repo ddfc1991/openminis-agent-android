@@ -7422,6 +7422,27 @@ def b3914(res):
         time.sleep(2); shot("quick-answer")
     step("quick", quick)
 
+    def stall():
+        # [38.9.14.1 stall_watch] the model hangs once (headers, then nothing): after 40 s the turn is retried on the same model
+        # with 「模型没响应，正在重试…」 shown, and the reply arrives within ~60 s; logged as a stall
+        t0 = time.time()
+        result_json("group", "i3914 say 卡住测试 STALLONCE", timeout=40)
+        s = wait_state(lambda s: any(x.get("kind") == "retry" for x in (s.get("stalls") or [])), 55)
+        o["stall_retry_s"] = int(time.time() - t0)
+        if not any(x.get("kind") == "retry" for x in (s.get("stalls") or [])): fail(f"stall: no retry logged within 55 s: {s.get('stalls')}")
+        r = shot("stall-retry"); t = _txt(r); o["stall_retry_txt"] = t[-300:]
+        if "模型没响应" not in t: fail("stall: 「模型没响应，正在重试…」 line not shown during the retry")
+        s = wait_state(lambda s: any("卡住后已恢复" in (x.get("text") or "") for x in (s.get("rows") or [])), max(5, 75 - (time.time() - t0)))
+        dt = int(time.time() - t0); o["stall_reply_s"] = dt; o["stall_stalls"] = s.get("stalls")
+        f = fake(); o["stall_posts"] = f.get("stall_posts")
+        if not any("卡住后已恢复" in (x.get("text") or "") for x in (s.get("rows") or [])): fail(f"stall: no reply after the retry ({dt} s)")
+        elif dt > 65: fail(f"stall: reply took {dt} s (> 65)")
+        if (f.get("stall_posts") or 0) < 2: fail(f"stall: model not called again ({f.get('stall_posts')})")
+        time.sleep(1); r = shot("stall-done")
+        if "模型没响应" in _txt(r): fail("stall: retry line still shown after the reply")
+        one_bar("stall-done")
+    step("stall", stall)
+
     def tabs():
         if not tap_dock("任务"): fail("dock 任务 not found"); return
         r = shot("tab-tasks"); t = _txt(r); o["tab_tasks"] = t[:500]
