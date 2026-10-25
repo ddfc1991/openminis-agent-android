@@ -131,7 +131,10 @@ fun TasksScreen(onBack: () -> Unit, go: (String) -> Unit) {
     var openArchive by remember { mutableStateOf(false) }
     val now = System.currentTimeMillis()
     val projSids = projects.flatMap { p -> p.attempts.map { it.sid } }.toSet()
-    val small = sessions.filter { it.id !in projSids }
+    // [Mines-38.9.14 chat_home] 聊天 itself and its auto tasks are not 小任务 (auto tasks are listed in AutoTasksSection)
+    val chatHome = com.openminis.app.plus.ChatHome.enabled()
+    val autoSids = if (chatHome) com.openminis.app.plus.ChatHome.tasks.collectAsState().value.map { it.sid }.toSet() else emptySet()
+    val small = sessions.filter { it.id !in projSids && (!chatHome || (it.id != com.openminis.app.plus.ChatHome.mainSid && it.id !in autoSids)) }
     val (archived, live) = small.partition { ChatOrganizer.isArchived(it, now) }
 
     PlusPage("任务", onBack, actions = {
@@ -159,6 +162,7 @@ fun TasksScreen(onBack: () -> Unit, go: (String) -> Unit) {
             return@PlusPage
         }
 
+        AutoTasksSection(go)   // [Mines-38.9.14 chat_home] 等你处理 / 进行中 / 已完成 (nothing while the flag is off)
         WarmGroupLabel("项目  ${projects.size} 个 · 不自动归档", "注册台账 ›") { go(Routes3912.REGISTER) }
         if (projects.isEmpty()) InfoLine("还没有项目。小任务变成注册 / 开通账号时，会问你要不要立项。")
         projects.sortedByDescending { p -> p.attempts.maxOfOrNull { tasks[it.sid]?.updatedAt ?: it.at } ?: p.createdAt }.forEach { p ->
@@ -199,6 +203,7 @@ fun TasksScreen(onBack: () -> Unit, go: (String) -> Unit) {
                 MinesIcon(icT("chevron-right"), null, tint = m.ink2, modifier = Modifier.size(18.dp))
             }
         }
+        if (com.openminis.app.plus.ChatHome.enabled()) Spacer(Modifier.size(84.dp))   // [Mines-38.9.14 chat_home] room for the dock
     }
 }
 

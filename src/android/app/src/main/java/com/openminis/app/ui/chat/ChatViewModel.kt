@@ -9199,7 +9199,20 @@ class ChatViewModel(
         com.openminis.app.agent.jobs.AgentJobRegistry.clearDelegationMute(activeSessionId)
         val q = _quoteDraft.value
         val out = if (q != null) { _quoteDraft.value = null; com.openminis.app.plus.QuoteReply.compose(q, text) } else text
+        // [Mines-38.9.14 chat_home] 聊天 (the main conversation): the router answers inline or starts a background task
+        if (com.openminis.app.plus.ChatHome.intercept(activeSessionId, out, _attachments.value.isNotEmpty()) { minesSendDirect(it) }) return
         sendMessage(out, skipContextCheck = false, headless = false)
+    }
+
+    /** [Mines-38.9.14 chat_home] the router said 「quick」: the ordinary send */
+    fun minesSendDirect(text: String) { sendMessage(text, skipContextCheck = false, headless = false) }
+
+    /** [Mines-38.9.14 chat_home] rows were written into this conversation from outside (task notices): show them once idle */
+    fun minesReload() {
+        viewModelScope.launch {
+            if (_isStreaming.value) _isStreaming.first { !it }
+            reloadSessionFromDb()
+        }
     }
 
     /**

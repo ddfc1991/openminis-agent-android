@@ -66,6 +66,7 @@ fun AppsHubScreen(onBack: () -> Unit, go: (String) -> Unit) {
     PlusPrefs.init(ctx)
     val st by PlusPrefs.state.collectAsState()
     val tiles = listOf(
+        HubTile("知识库", "book-open", Color(0xFF35607F), PlusRoutes.KNOWLEDGE),   // [Mines-38.9.14 chat_home] 知识库 lives in 应用 (first)
         HubTile("浏览器", "globe", Color(0xFF4F7FB5), "__browser"),
         HubTile("账号台账", "key-round", Color(0xFFC0633F), PlusRoutes.KEYCHAIN),
         HubTile("服务器", "server", Color(0xFF3F8A5C), PlusRoutes.WORK),
@@ -114,6 +115,7 @@ fun AppsHubScreen(onBack: () -> Unit, go: (String) -> Unit) {
                     .putExtra("title", "测试来电").putExtra("body", "你好，我是 Mines。接听后我先把这句话念给你，然后你可以直接和我说话。"))   // [38.9.12.1] no 「示例」
             })
         }
+        if (com.openminis.app.plus.ChatHome.enabled()) Spacer(Modifier.size(84.dp))   // [Mines-38.9.14 chat_home] room for the dock
     }
 }
 

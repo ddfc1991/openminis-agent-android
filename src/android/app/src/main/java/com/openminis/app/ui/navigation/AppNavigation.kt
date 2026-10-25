@@ -15,6 +15,11 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.navigation.compose.currentBackStackEntryAsState
+import kotlinx.coroutines.launch
 import com.openminis.app.deeplink.DeepLinkAction
 import com.openminis.app.deeplink.DeepLinkCoordinator
 import com.openminis.app.ui.settings.KEY_LAUNCH_SESSION
@@ -390,6 +395,17 @@ fun AppNavigation(
                 "hasPendingShare=$hasPendingShare hasAnySession=$hasAnySession " +
                 "hasAnyProvider=$hasAnyProvider",
         )
+        // [Mines-38.9.14 chat_home] 聊天主页 (设置 → 实验功能, default on): launch opens the one main conversation instead of
+        // the list (a crash / hang breaker that forced home, a pending share or no provider keep the old dispatch below)
+        com.openminis.app.plus.ChatHome.init(context)
+        if (com.openminis.app.plus.ChatHome.enabled() && !(mode == 3 && rawMode != 3) && !hasPendingShare && hasAnyProvider) {
+            com.openminis.app.plus.ChatHome.redirected = true
+            val main = com.openminis.app.plus.ChatHome.ensureMain(context)
+            if (main != null) {
+                navController.navigate(Routes.chat(main)) { popUpTo(Routes.SESSION_LIST) { inclusive = false } }
+                return@LaunchedEffect
+            }
+        }
         val target: String? = when {
             // T185: if a system share is buffered and the configured launch
             // mode would leave us on the session list (mode 3 = Home), the
@@ -543,7 +559,9 @@ fun AppNavigation(
             com.openminis.app.ui.plus.PlusNav.pending = null
             navController.safeNavigate(r)
         }
-        onDispose { com.openminis.app.ui.plus.PlusNav.navigate = null }
+        // [Mines-38.9.14 chat_home] 任务 → 全部对话: the old conversation list
+        com.openminis.app.ui.plus.ChatHomeNav.history = { runCatching { navController.popBackStack(Routes.SESSION_LIST, false) } }
+        onDispose { com.openminis.app.ui.plus.PlusNav.navigate = null; com.openminis.app.ui.plus.ChatHomeNav.history = null }
     }
     // [Mines-crash-28] Offer the last crash record once after it happened.
     // [Mines-38.9.11.3] the blocking crash dialog is replaced by the small CrashCardHost card (JVM crash + ANR + native, redacted)
@@ -639,6 +657,9 @@ fun AppNavigation(
             arguments = listOf(navArgument("sessionId") { type = NavType.StringType }),
         ) { backStackEntry ->
             val sessionId = backStackEntry.arguments?.getString("sessionId") ?: return@composable
+            // [Mines-38.9.14 chat_home] the main conversation leaves room for the dock (none while the keyboard is up)
+            val dockRoom = if (com.openminis.app.plus.ChatHome.isMain(sessionId) && !imeUp()) 70.dp else 0.dp
+            androidx.compose.foundation.layout.Box(Modifier.fillMaxSize().padding(bottom = dockRoom)) {
             ChatSplitScaffoldRoute(
                 initialSessionId = sessionId,
                 navController = navController,
@@ -648,6 +669,7 @@ fun AppNavigation(
                 skillRepository = skillRepository,
                 mcpRepository = mcpRepository,
             )
+            }
         }
 
         composable(com.openminis.app.ui.plus.PlusRoutes.WORK) {
@@ -1746,5 +1768,50 @@ fun AppNavigation(
             )
         }
     }
+    // [Mines-38.9.14 chat_home] the 4-tab frosted dock over 聊天 / 任务 / 消息 / 应用 + 「正在安排…」 above the composer
+    ChatHomeOverlay(navController)
     }
+}
+
+@Composable
+private fun imeUp(): Boolean {
+    val d = androidx.compose.ui.platform.LocalDensity.current
+    return androidx.compose.foundation.layout.WindowInsets.ime.getBottom(d) > 0
+}
+
+@Composable
+private fun androidx.compose.foundation.layout.BoxScope.ChatHomeOverlay(navController: NavHostController) {
+    val on by com.openminis.app.plus.ChatHome.on.collectAsState()
+    if (!on || !com.openminis.app.plus.ChatHome.loaded) return
+    val entry by navController.currentBackStackEntryAsState()
+    val route = entry?.destination?.route
+    val sid = entry?.arguments?.getString("sessionId")
+    val tab = when {
+        route == Routes.CHAT && com.openminis.app.plus.ChatHome.isMain(sid) -> 0
+        route == com.openminis.app.ui.plus.TaskRoutes.TASKS -> 1
+        route == com.openminis.app.ui.plus.PlusRoutes.DIGEST -> 2
+        route == com.openminis.app.ui.plus.Routes3912.APPS -> 3
+        else -> -1
+    }
+    if (tab < 0 || imeUp()) return
+    val context = LocalContext.current
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    fun go(target: String) {
+        if (tab == 0) navController.navigate(target) { launchSingleTop = true }
+        else navController.navigate(target) { route?.let { popUpTo(it) { inclusive = true } }; launchSingleTop = true }
+    }
+    if (tab == 0) com.openminis.app.ui.plus.ChatHomeRoutingPill(Modifier.align(androidx.compose.ui.Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 150.dp))
+    com.openminis.app.ui.plus.ChatHomeDock(
+        current = tab,
+        onChat = {
+            if (tab != 0) scope.launch {
+                val main = com.openminis.app.plus.ChatHome.ensureMain(context) ?: return@launch
+                navController.navigate(Routes.chat(main)) { popUpTo(Routes.SESSION_LIST) { inclusive = false }; launchSingleTop = true }
+            }
+        },
+        onTasks = { if (tab != 1) go(com.openminis.app.ui.plus.TaskRoutes.TASKS) },
+        onMessages = { if (tab != 2) go(com.openminis.app.ui.plus.PlusRoutes.DIGEST) },
+        onApps = { if (tab != 3) go(com.openminis.app.ui.plus.Routes3912.APPS) },
+        modifier = Modifier.align(androidx.compose.ui.Alignment.BottomCenter),
+    )
 }

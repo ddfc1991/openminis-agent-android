@@ -1437,6 +1437,7 @@ internal fun HelperTranscript(
             when (item) {
                 is FlatChatItem.UserBubble -> UserMessageBubble(message = item.message, precededByUser = item.precededByUser, onRetry = null, onEdit = null, onDeleteFromHere = null)
                 is FlatChatItem.AgentCallbackCard -> AgentCallbackCard(item.callback, onTap = { onOpenCallback(item.callback) })
+                is FlatChatItem.MinesTaskItem -> com.openminis.app.ui.plus.MinesTaskNotice(item.tag)
                 // [T-android-scheduled-task-card] Same card in the read-only
                 // transcript: a scheduled task can fire into a child session.
                 is FlatChatItem.ScheduledTaskCardItem -> ScheduledTaskCard(marker = item.marker)

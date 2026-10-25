@@ -320,6 +320,18 @@ fetch('/linkfake/send?'+k+'='+encodeURIComponent(v));document.getElementById('fc
             text = json.dumps(KB_JSON, ensure_ascii=False)
         if "COPYTEST" in last_user_text(msgs):   # [38.9.9] copy UX: markdown + a code block
             text = "## 复制测试\n这是**加粗**的一段话，还有 `行内代码`。\n\n```bash\nminis-vps run uptime\n```\n\n最后一行。"
+        ut0 = last_user_text(msgs)
+        if "MINES_ROUTER" in ut0:   # [38.9.14 chat_home] router: registrations / deployments are tasks, the rest quick
+            q = ut0.split("用户：", 1)[-1]
+            STATS.setdefault("router", []).append(q[:40])
+            text = json.dumps({"mode": "task", "name": "Zeabur 注册"} if ("注册" in q or "部署" in q) else {"mode": "quick"}, ensure_ascii=False)
+        elif "今天几号" in ut0:
+            STATS["quick_posts"] = STATS.get("quick_posts", 0) + 1
+            text = "今天是 10 月 25 日，星期日。"
+        elif ut0.strip() == "帮我注册 zeabur" and body.get("stream"):   # the background task's own turn: slow enough to see 进行中
+            STATS["task_posts"] = STATS.get("task_posts", 0) + 1
+            time.sleep(12)
+            text = "Zeabur 注册已完成：账号 smoke@example.com 已登记到注册台账。"
         if "MULTIPART" in last_user_text(msgs):
             STATS["multipart"] = STATS.get("multipart", 0) + 1
             text = MULTIPART

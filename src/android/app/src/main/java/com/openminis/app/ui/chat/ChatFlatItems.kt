@@ -334,6 +334,18 @@ internal sealed class FlatChatItem {
         override fun hashCode(): Int = message.hashCode()
     }
 
+    /** [Mines-38.9.14 chat_home] a background task's chip / notice in 聊天 (assistant row written by ChatHome) */
+    class MinesTaskItem(
+        val message: ChatMessage,
+        val tag: com.openminis.app.plus.ChatHomeCore.Tag,
+    ) : FlatChatItem() {
+        override val key = "minestask:${message.id}"
+        override val contentType = "minestask"
+        override fun equals(other: Any?): Boolean =
+            this === other || (other is MinesTaskItem && message == other.message)
+        override fun hashCode(): Int = message.hashCode()
+    }
+
     class AgentCallbackCard(
         val message: ChatMessage,
         val callback: com.openminis.app.agent.jobs.AgentCallback,
@@ -647,6 +659,7 @@ internal fun buildFlatChatItems(
         return when (item) {
             is FlatChatItem.UserBubble -> FlatChatItem.UserBubble(item.message.copy(id = "${item.message.id}#$n"), item.precededByUser)
             is FlatChatItem.AgentCallbackCard -> FlatChatItem.AgentCallbackCard(item.message.copy(id = "${item.message.id}#$n"), item.callback)
+            is FlatChatItem.MinesTaskItem -> FlatChatItem.MinesTaskItem(item.message.copy(id = "${item.message.id}#$n"), item.tag)
             is FlatChatItem.ScheduledTaskCardItem -> FlatChatItem.ScheduledTaskCardItem(item.message.copy(id = "${item.message.id}#$n"), item.marker)
             is FlatChatItem.AssistantHeader -> item.copy(messageId = "${item.messageId}#$n")
             is FlatChatItem.AssistantText -> FlatChatItem.AssistantText(
@@ -690,6 +703,11 @@ internal fun buildFlatChatItems(
                 "buildFlatChatItems.progress",
                 "msgIdx=$idx of=${messages.size} rowsSoFar=${out.size}",
             )
+        }
+        // [Mines-38.9.14 chat_home] a task chip / notice (cheap prefix check; plain replies fall through)
+        if (message.role == "assistant") {
+            val tag = com.openminis.app.plus.ChatHomeCore.parseTag(message.toolBlocks.firstOrNull { it.kind == "text" }?.content ?: message.content)
+            if (tag != null) { out.add(dedupe(FlatChatItem.MinesTaskItem(message, tag))); continue }
         }
         if (message.role == "user") {
             // [T-android-scheduled-task-card] A task's own prompt, not the

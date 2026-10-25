@@ -865,6 +865,39 @@ object GroupSelfTest {
                     else -> "i3913 chat <text> | say <text> | state | tunnelseed | sshseed"
                 }
             }
+            // [Mines-38.9.14 chat_home] smoke: 'i3914 main' = open 聊天 (main conversation); 'i3914 say <text>' = type <text> into it
+            // through the normal send (router decides); 'i3914 state' = flag, main sid, tasks, last decision, main rows (role + tag)
+            "i3914" -> {
+                val sub = rest.substringBefore(' ').trim(); val text = rest.substringAfter(' ', "").trim()
+                val app = context.applicationContext as com.openminis.app.MinisApp
+                val main = kotlinx.coroutines.Dispatchers.Main
+                val H = com.openminis.app.plus.ChatHome; H.init(context)
+                when (sub) {
+                    "main" -> {
+                        val sid = H.ensureMain(context) ?: return@runBlocking "no model"
+                        kotlinx.coroutines.withContext(main) { com.openminis.app.ui.plus.PlusNav.navigate?.invoke(com.openminis.app.ui.navigation.Routes.chat(sid)) }
+                        JSONObject().put("sid", sid).toString()
+                    }
+                    "say" -> {
+                        val sid = H.mainSid
+                        var vm: com.openminis.app.ui.chat.ChatViewModel? = null
+                        repeat(40) { if (vm == null) { vm = kotlinx.coroutines.withContext(main) { com.openminis.app.ui.chat.ChatViewModelStore.existing(sid) }; if (vm == null) delay(250) } }
+                        val v = vm ?: return@runBlocking JSONObject().put("sid", sid).put("err", "no view model").toString()
+                        kotlinx.coroutines.withContext(main) { v.sendMessage(text) }
+                        JSONObject().put("sid", sid).put("sent", text).toString()
+                    }
+                    "state" -> {
+                        val rows = JSONArray()
+                        if (H.mainSid.isNotBlank()) app.chatRepository.dao.loadMessages(H.mainSid).takeLast(30).forEach { m ->
+                            val t = runCatching { JSONArray(m.partsJson).optJSONObject(0)?.optString("value").orEmpty() }.getOrDefault("")
+                            rows.put(JSONObject().put("role", m.role).put("tag", com.openminis.app.plus.ChatHomeCore.parseTag(t)?.let { "${it.kind.name}:${it.taskId}" } ?: "")
+                                .put("text", t.take(80)))
+                        }
+                        JSONObject(H.stateJson()).put("rows", rows).toString()
+                    }
+                    else -> "i3914 main | say <text> | state"
+                }
+            }
             "i39113" -> {
                 val sub = rest.substringBefore(' ').trim(); val arg2 = rest.substringAfter(' ', "").trim()
                 val R = com.openminis.app.plus.ProviderRoutes

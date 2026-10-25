@@ -4059,6 +4059,7 @@ fun ChatScreen(
                 fun FlatChatItem.isCompacted(): Boolean = when (this) {
                     is FlatChatItem.UserBubble -> grayedMap[originalMessageId(message.id)] == true
                     is FlatChatItem.AgentCallbackCard -> grayedMap[originalMessageId(message.id)] == true
+                    is FlatChatItem.MinesTaskItem -> false
                     is FlatChatItem.ScheduledTaskCardItem -> grayedMap[originalMessageId(message.id)] == true
                     is FlatChatItem.AssistantHeader -> grayedMap[originalMessageId(messageId)] == true
                     is FlatChatItem.AssistantText -> grayedMap[originalMessageId(messageId)] == true
@@ -4670,6 +4671,8 @@ fun ChatScreen(
                             )
                             // [T-p2-delegate-render] A helper block gets its
                             // own card; everything else keeps the pill.
+                            // [Mines-38.9.14 chat_home] 已建任务 chip / task notice
+                            is FlatChatItem.MinesTaskItem -> com.openminis.app.ui.plus.MinesTaskNotice(item.tag)
                             is FlatChatItem.AgentCallbackCard -> AgentCallbackCard(
                                 callback = item.callback,
                                 onTap = { callbackDetailBlock = item.callback.syntheticBlock() },

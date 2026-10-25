@@ -412,6 +412,8 @@ fun SettingsScreen(
             }
             // [Mines-38.9.13] 实验功能: each feature of this release can be switched off
             SettingsSection(title = "实验功能") {
+                com.openminis.app.ui.plus.ChatHomeFlagRow()   // [Mines-38.9.14 chat_home]
+                com.openminis.app.ui.plus.PlusDivider()
                 com.openminis.app.ui.plus.VpsPageFlagRow()
                 com.openminis.app.ui.plus.PlusDivider()
                 com.openminis.app.ui.plus.TaskProjectsFlagRow()
