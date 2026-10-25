@@ -7573,11 +7573,21 @@ def bregauto(res):
     o["custom_ok"] = result_json("group", "ira custom zeabur.com", timeout=20)
     o["custom_bad"] = result_json("group", "ira custom 注册一下", timeout=20)
     if (o["custom_ok"] or {}).get("url") != "https://zeabur.com/": fail(f"custom zeabur.com not accepted {o['custom_ok']}")
+    # [ledger v2] a custom site is named by its domain, an IP-only one never by its IP
+    if (o["custom_ok"] or {}).get("name") != "zeabur.com": fail(f"custom site not named by its domain {o['custom_ok']}")
+    o["custom_ip"] = result_json("group", "ira custom " + B + "/signup", timeout=20)
+    if (o["custom_ip"] or {}).get("name") != "自定义网站": fail(f"IP site named {o['custom_ip']}")
+    def alltxt(r): return " ".join((t or "") + " " + (d or "") for t, d, *_ in nodes(r)) if r is not None else ""
+    def descs(r, pre): return [d for _, d, *_ in nodes(r) if (d or "").startswith(pre)] if r is not None else []
     if not (o["custom_bad"] or {}).get("why"): fail("custom bad input accepted")
 
     def ui_run():
         route("plus_register_ledger", 5)
-        shot("ledger-before")
+        r0 = shot("ledger-before")
+        # [ledger v2] the auto-整理 on a clean ledger changes nothing → no 「整理 0 个 · 补全 0 · 删除 0」 bar; one short intro line
+        o["ledger_before_txt"] = alltxt(r0)[:400]
+        if "整理 0 个" in alltxt(r0): fail("整理 bar shown although nothing changed (整理 0 个 · 补全 0 · 删除 0)")
+        if "遵守平台规则" in alltxt(r0): fail("the long 一键注册 explanation is still shown")
         if not tap_text("开始注册", wait=3): fail("no 开始注册 button"); return
         r = shot("sheet")
         if not find(r, "选择要注册的平台"): fail("pick sheet not shown")
@@ -7605,7 +7615,8 @@ def bregauto(res):
         o["run1"] = {k: s.get(k) for k in ("items", "ledger")}; o["run1_log"] = (s.get("log") or [])[-25:]
         its = s.get("items") or []
         if not its or its[0].get("st") != "DONE": fail(f"custom site not registered end-to-end: {its} log={(s.get('log') or [])[-12:]}")
-        if its and its[0].get("title") != "10.0.2.2 注册 · 完成": fail(f"item title {its[0].get('title')}")
+        # [ledger v2] the IP-only test site is named by its page title (「SmokeCloud sign up」), never 「10.0.2.2」
+        if its and its[0].get("title") != "SmokeCloud 注册 · 完成": fail(f"item title {its[0].get('title')}")
         led = s.get("ledger") or []
         if not led or not led[0].get("note", "").startswith("注册于") or not led[0].get("pw") or led[0].get("st") != "已验证":
             fail(f"ledger row not written as 已验证 with a saved password: {led}")
@@ -7619,9 +7630,13 @@ def bregauto(res):
         if not find(r, "一键注册 · 完成 1/1"): fail("folded task row not 「一键注册 · 完成 1/1」")
         tap_text("一键注册 · 完成", wait=2)
         r = shot("ledger-done-open")
-        if not find(r, "10.0.2.2 注册 · 完成"): fail("unfolded row 「10.0.2.2 注册 · 完成 ›」 missing")
+        if not find(r, "SmokeCloud 注册 · 完成"): fail("unfolded row 「SmokeCloud 注册 · 完成 ›」 missing")
         scroll_down(); r = shot("ledger-rows")
-        if not find(r, "10.0.2.2"): fail("台账 rows do not list the new account")
+        rows = descs(r, "SmokeCloud，")
+        o["ledger_rows_desc"] = rows
+        if not rows: fail("台账 rows do not lead with the platform name 「SmokeCloud」")
+        if any(t == "10.0.2.2" for t, *_ in nodes(r)): fail("a 台账 row is titled with the raw IP 10.0.2.2")
+        if "自动延时" in alltxt(r) or "探针保活" in alltxt(r): fail("自动延时 / 探针保活 switches still on the list cards")
         h = result_json("group", "i3914 state", timeout=20)
         tasks = (h or {}).get("tasks") or [] if isinstance(h, dict) else []
         o["chat_tasks"] = [t for t in tasks if str(t.get("sid", "")).startswith("regauto:")]
@@ -7644,10 +7659,11 @@ def bregauto(res):
         route("plus_register_ledger", 4)
         r = shot("captcha-ask")
         if not find(r, "一键注册 · 等你"): fail("folded row not 等你")
-        if not tap_text("10.0.2.2 注册 · 等你", wait=3): fail("waiting item not tappable"); route("plus_register_takeover", 4)
+        if not tap_text("注册 · 等你", wait=3): fail("waiting item not tappable"); route("plus_register_takeover", 4)
         r = shot("captcha-takeover")
         if not find(r, "好了，继续") or not find(r, "跳过这个平台"): fail("takeover screen buttons missing")
-        if not find(r, "要做人机验证"): fail("takeover screen has no ask line")
+        if not find(r, "完成人机验证"): fail("takeover screen has no line for the step")
+        if find(r, "点这里"): fail("takeover line still says 「点这里」 while already on the page")
         tap_text("跳过这个平台", wait=3)
         t0 = time.time()
         while time.time() - t0 < 20:
@@ -7692,12 +7708,28 @@ def bregauto(res):
     def keepalive():   # 自动延时 + 探针保活 switches (default off), one simulated 续期 + 探活
         l = led()
         if any(k.get("e") or k.get("p") for k in (l.get("ka") or [])): fail("a keep-alive switch is on by default")
-        route("plus_register_ledger", 5)
-        r = dump()
-        for i in range(4):
-            if find(r, "自动延时 10.0.2.2"): break
-            scroll_down(); r = dump()
-        if not tap_text("自动延时 10.0.2.2", wait=1.5): fail("no 自动延时 switch on the account row"); return
+        # [ledger v2] the switches are on the account's detail page (tap the platform row)
+        def open_detail():
+            route("plus_register_ledger", 5)
+            r = dump()
+            for i in range(4):
+                ok = [d for d in descs(r, "SmokeCloud，") if "已验证" in d]
+                if ok: break
+                scroll_down(); r = dump()
+            ok = [d for d in descs(r, "SmokeCloud，") if "已验证" in d]
+            if not ok: fail("no 已验证 SmokeCloud row to open"); return None
+            tap_text(ok[0], wait=3)
+            return dump()
+        r = open_detail()
+        if r is None: return
+        r = shot("detail")
+        a = alltxt(r); o["detail_txt"] = a[:600]
+        for k in ("网址", "账号", "密码", "邮箱", "状态", "时间", "重新收码"):
+            if k not in a: fail(f"detail page lacks {k}")
+        if "密码，已隐藏" not in a: fail("password not hidden by default on the detail page")
+        tap_text("密码，已隐藏", wait=1.2)
+        if "密码已显示" not in alltxt(dump()): fail("tap did not reveal the password")
+        if not tap_text("自动延时 10.0.2.2", wait=1.5): fail("no 自动延时 switch on the detail page"); return
         if not tap_text("探针保活 10.0.2.2", wait=1.5): fail("no 探针保活 switch")
         shot("ka-on")
         l = led(); ka = [k for k in (l.get("ka") or []) if k.get("k", "").startswith("acct|10.0.2.2|")]
@@ -7712,10 +7744,9 @@ def bregauto(res):
         l = led(); ka = [k for k in (l.get("ka") or []) if k.get("k", "").startswith("acct|10.0.2.2|")]
         o["ka_after"] = ka
         if not ka or not ka[0].get("ea") or not ka[0].get("pa") or not ka[0].get("po"): fail(f"keep-alive times not recorded {ka}")
-        route("plus_register_ledger", 4)
-        r = dump()
-        for i in range(4):
-            if find(r, "下次续期"): break
+        r = open_detail()
+        for i in range(3):
+            if r is None or find(r, "下次续期"): break
             scroll_down(); r = dump()
         r = shot("ka-status")
         if not find(r, "下次续期") or not find(r, "上次探活"): fail("status line 「下次续期 / 上次探活」 missing")
@@ -7735,6 +7766,10 @@ def bregauto(res):
             time.sleep(3)
         o["tidy"] = l.get("tidy"); o["tidy_log"] = (l.get("log") or [])[-12:]
         if not l.get("tidy"): fail("整理 did not finish"); return
+        t_tidy = time.time()
+        route("plus_register_ledger", 3)
+        r_sum = shot("tidy-summary")
+        if not find(r_sum, "整理 "): fail("summary line not shown right after a 整理 that changed something")
         m = re.match(r"整理 (\d+) 个 · 补全 (\d+) · 删除 (\d+) ›", l["tidy"])
         if not m or int(m.group(3)) < 1 or int(m.group(2)) < 1: fail(f"summary {l['tidy']}")
         saved = result_json("group", "ira saved", timeout=20) or []
@@ -7750,12 +7785,16 @@ def bregauto(res):
         trash = l.get("trash") or []
         if not any(t.get("a") == "gone-smoke@smoke-mail.test" for t in trash): fail(f"deleted row not in 最近删除 {trash}")
         if any("gmail" in str(t.get("a")) for t in trash): fail("gmail row in 最近删除")
-        route("plus_register_ledger", 4)
-        r = shot("tidy-summary")
-        if not find(r, "整理 "): fail("summary line not shown")
-        if not tap_text("整理 ", wait=3): route("plus_register_trash", 3)
+        route("plus_register_trash", 3)
         r = shot("trash")
         if not find(r, "恢复") or not find(r, "dead.example"): fail("最近删除 does not list the deleted row")
+        # the tidied row: brand from its mail, URL only the saved one (never a guessed https://<ip>/)
+        if recs and str(recs[0].get("u", "")).startswith("https://10.0.2.2"): fail(f"整理 guessed an IP URL {recs[0]}")
+        wait = 33 - (time.time() - t_tidy)
+        if wait > 0: time.sleep(wait)
+        route("plus_register_ledger", 3)
+        r = shot("tidy-gone")
+        if find(r, "整理 4 个") or find(r, "补全 1"): fail("整理 bar did not go away by itself")
     step("tidy", tidy)
     print("IREG RESULT " + json.dumps(o, ensure_ascii=False)[:8000], flush=True)
 

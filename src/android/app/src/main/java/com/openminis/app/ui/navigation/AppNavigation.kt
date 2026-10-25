@@ -801,7 +801,13 @@ fun AppNavigation(
             com.openminis.app.ui.plus.RegisterTakeover.Screen(onBack = { navController.safePopBackStack() })
         }
         composable(com.openminis.app.ui.plus.RegisterBox.ROUTE) { e ->
-            com.openminis.app.ui.plus.RegisterBox.Screen(android.net.Uri.decode(e.arguments?.getString("a") ?: ""), onBack = { navController.safePopBackStack() })
+            com.openminis.app.ui.plus.RegisterBox.Screen(android.net.Uri.decode(e.arguments?.getString("a") ?: ""), onBack = { navController.safePopBackStack() },
+                go = { navController.safeNavigate(it) })
+        }
+        // [ledger v2] one 台账 account: platform, URL, account, password, mailbox, status, 重新收码, 自动延时 / 探针保活
+        composable(com.openminis.app.ui.plus.RegisterAcct.ROUTE) { e ->
+            com.openminis.app.ui.plus.RegisterAcct.Screen(android.net.Uri.decode(e.arguments?.getString("b") ?: ""), android.net.Uri.decode(e.arguments?.getString("h") ?: ""),
+                onBack = { navController.safePopBackStack() }, go = { navController.safeNavigate(it) })
         }
         composable(com.openminis.app.ui.plus.RegisterBox.TRASH) {
             com.openminis.app.ui.plus.RegisterBox.Trash(onBack = { navController.safePopBackStack() })

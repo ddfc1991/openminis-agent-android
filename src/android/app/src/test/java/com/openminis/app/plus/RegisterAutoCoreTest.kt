@@ -42,6 +42,8 @@ class RegisterAutoCoreTest {
         val list = listOf(Platform("GitHub", "https://github.com/signup"))
         val (p, why) = RegisterAutoCore.custom("zeabur.com", list)
         assertNotNull(p); assertNull(why); assertTrue(p!!.custom); assertEquals("zeabur.com", p.host)
+        assertEquals("zeabur.com", p.name)   // [ledger v2] a custom site is called by its domain
+        assertEquals("自定义网站", RegisterAutoCore.custom("http://10.0.2.2:8096/signup", list).first!!.name)   // never the IP
         val (dup, why2) = RegisterAutoCore.custom("https://github.com/join", list)
         assertNull(dup); assertTrue(why2!!.contains("已经在列表里"))
         assertTrue(RegisterAutoCore.custom("hello", list).second!!.contains("不是网址"))
@@ -77,6 +79,12 @@ class RegisterAutoCoreTest {
         assertTrue(s.email); assertEquals(2, s.pass); assertTrue(s.phone); assertFalse(s.phoneRequired); assertEquals("http://x/", s.url)
         assertEquals(Page.UNKNOWN, RegisterAutoCore.classify(RegisterAutoCore.parseScan("garbage")))
         assertEquals(Page.CAPTCHA, RegisterAutoCore.classify(RegisterAutoCore.parseScan(null, "hCaptcha")))
+    }
+
+    @Test fun takeoverLineDoesNotSayTapHere() {
+        Page.values().forEach { assertFalse(RegisterAutoCore.takeoverLine(it).contains("点这里")) }
+        assertTrue(RegisterAutoCore.takeoverLine(Page.CAPTCHA).contains("人机验证"))
+        assertTrue(RegisterAutoCore.takeoverLine(Page.PAYMENT).contains("不代付"))
     }
 
     @Test fun askLineIsOneShortChineseLine() {

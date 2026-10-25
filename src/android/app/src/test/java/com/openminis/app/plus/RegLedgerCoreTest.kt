@@ -57,11 +57,12 @@ class RegLedgerCoreTest {
     @Test fun tidyFillsVerifiesAndKeepsAliveBox() {
         val box = "fill1@smoke-mail.test"
         val mails = listOf(Mail("no-reply@smokecloud.test", "Confirm your SmokeCloud email", "open http://10.0.2.2:8096/verify-link?token=t9 to confirm", 50_000))
-        val p = RegLedgerCore.tidy(box, listOf(Entry("10.0.2.2", box, true, "", "10.0.2.2")), emptyList(), mails, 99_000)
+        val p = RegLedgerCore.tidy(box, listOf(Entry("10.0.2.2", box, true, "", "10.0.2.2", "http://10.0.2.2:8096/")), emptyList(), mails, 99_000)
         assertEquals(1, p.keep.size); assertTrue(p.trash.isEmpty())
         val r = p.keep[0]
         assertEquals("http://10.0.2.2:8096/verify-link?token=t9", p.verify.single().second)
-        assertEquals("https://10.0.2.2/", r.url); assertEquals(50_000L, r.createdAt); assertTrue(r.platform.isNotBlank())
+        assertEquals("http://10.0.2.2:8096/", r.url); assertEquals(50_000L, r.createdAt); assertTrue(r.platform.isNotBlank())
+        assertFalse(r.platform == "10.0.2.2")
         assertEquals(1, p.filled)
     }
 
@@ -99,6 +100,46 @@ class RegLedgerCoreTest {
         val kept = RegLedgerCore.purge(t, now)
         assertEquals(listOf("t2"), kept.map { it.id }); assertEquals(6, RegLedgerCore.daysLeft(kept[0], now))
         assertEquals(kept, RegLedgerCore.trashOf(RegLedgerCore.trashJson(kept)))
+    }
+
+    // ── [ledger v2] user 2026-10-26 06:38 「看不出来平台」 ──
+
+    @Test fun tidyNeverGuessesUrlOrIpName() {
+        val box = "g1@smoke-mail.test"
+        val p = RegLedgerCore.tidy(box, listOf(Entry("10.0.2.2", box, true, "", "10.0.2.2")), emptyList(), emptyList(), 5)
+        assertEquals("", p.keep[0].url)            // no 「https://10.0.2.2/」 made up
+        assertEquals("", p.keep[0].platform)       // an IP is not a name → shown as 自定义网站
+        assertEquals("自定义网站", RegLedgerCore.platformTitle(p.keep[0].platform, p.keep[0].host))
+        val q = RegLedgerCore.tidy(box, listOf(Entry("zeabur.com", box, true, "", "")), emptyList(), emptyList(), 5)
+        assertEquals("zeabur.com", q.keep[0].platform); assertEquals("", q.keep[0].url)
+    }
+
+    @Test fun platformTitleShowsBrandOrDomainNeverIpOrUrl() {
+        assertEquals("Cloudflare", RegLedgerCore.platformTitle("Cloudflare", "dash.cloudflare.com"))
+        assertEquals("zeabur.com", RegLedgerCore.platformTitle("", "zeabur.com"))
+        assertEquals("zeabur.com", RegLedgerCore.platformTitle("https://zeabur.com/signup", "www.zeabur.com"))
+        assertEquals("自定义网站", RegLedgerCore.platformTitle("10.0.2.2", "10.0.2.2"))
+        assertEquals("SmokeCloud", RegLedgerCore.platformTitle("SmokeCloud", "10.0.2.2"))
+        assertEquals("自定义网站", RegLedgerCore.platformTitle("", "localhost"))
+        assertEquals("C", RegLedgerCore.letter("cloudflare")); assertEquals("自", RegLedgerCore.letter("自定义网站"))
+    }
+
+    @Test fun brandFromPageTitle() {
+        assertEquals("SmokeCloud", RegLedgerCore.brandFromTitle("SmokeCloud sign up"))
+        assertEquals("Zeabur", RegLedgerCore.brandFromTitle("Sign up · Zeabur"))
+        assertEquals("Railway", RegLedgerCore.brandFromTitle("Railway | Login"))
+        assertEquals("某某云", RegLedgerCore.brandFromTitle("注册 - 某某云"))
+        assertEquals(null, RegLedgerCore.brandFromTitle("Sign up"))
+        assertEquals(null, RegLedgerCore.brandFromTitle("10.0.2.2"))
+        assertEquals(null, RegLedgerCore.brandFromTitle(null))
+    }
+
+    @Test fun tidyBarOnlyWhenSomethingChangedAndGoesAway() {
+        assertFalse(RegLedgerCore.showTidy(RegLedgerCore.Summary(0, 0, 0), 1000, 1001))
+        assertFalse(RegLedgerCore.showTidy(RegLedgerCore.Summary(4, 0, 0), 1000, 1001))   // looked at 4, nothing changed
+        assertFalse(RegLedgerCore.showTidy(null, 1000, 1001))
+        assertTrue(RegLedgerCore.showTidy(RegLedgerCore.Summary(4, 1, 1), 1000, 1001))
+        assertFalse(RegLedgerCore.showTidy(RegLedgerCore.Summary(4, 1, 1), 1000, 1000 + RegLedgerCore.TIDY_SHOW_MS))
     }
 
     @Test fun renewScriptNeverPays() {

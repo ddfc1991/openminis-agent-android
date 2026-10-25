@@ -50,6 +50,37 @@ object RegLedgerCore {
         return a in known || a.substringAfter('@') in tempDomains
     }
 
+    // ── [38.9.15 ledger v2] what a row is called (user 2026-10-26 06:38 「看不出来平台」) ──
+
+    private val IP = Regex("""^\d{1,3}(?:\.\d{1,3}){3}$""")
+    fun isIpHost(h: String): Boolean = h.trim().lowercase().let { IP.matches(it) || it == "localhost" || it.isBlank() }
+
+    /**
+     * The platform title of a row: the brand (Cloudflare, GitHub, SmokeCloud …) when known, else the domain (zeabur.com);
+     * never a raw IP or a URL — an IP-only custom site without a brand is 「自定义网站」 (its address is on the detail page).
+     */
+    fun platformTitle(platform: String, host: String): String {
+        val p = platform.trim()
+        val pOk = p.isNotBlank() && !p.contains("://") && !p.contains('/') && !isIpHost(p)
+        if (pOk) return p
+        val h = host.trim().lowercase().removePrefix("www.")
+        return if (!isIpHost(h)) h else "自定义网站"
+    }
+
+    /** the letter on the avatar tile (「C」 for Cloudflare, 「自」 for 自定义网站) */
+    fun letter(title: String): String = title.trim().firstOrNull()?.uppercaseChar()?.toString() ?: "?"
+
+    /** 「SmokeCloud sign up」「Sign up · Zeabur」「注册 - 某某云」 → the brand; null when the title says nothing useful */
+    fun brandFromTitle(title: String?): String? {
+        val parts = title.orEmpty().split('|', '·', '–', '—', '-', ':', '｜').map { it.trim() }
+        val noise = Regex("""(?i)\b(sign ?up|sign ?in|log ?in|register|create( your)?( an)? account|account|welcome|get started|join|free|for)\b|注册|登录|创建账号|账号|欢迎""")
+        for (part in parts) {
+            val b = part.replace(noise, " ").replace(Regex("""\s+"""), " ").trim().trim(',', '.', '!')
+            if (b.length in 2..24 && !isIpHost(b) && !b.contains("://") && b.any { it.isLetter() }) return b
+        }
+        return null
+    }
+
     // ── records ──
 
     fun upsert(list: List<Rec>, r: Rec): List<Rec> {
@@ -127,7 +158,7 @@ if(!t)return 'R:none';t.click();return 'R:clicked';
     // ── 整理临时邮箱账号 ──
 
     /** a 台账 entry (SavedLogins + 备注) that belongs to a box */
-    data class Entry(val host: String, val account: String, val hasPw: Boolean, val note: String, val name: String = "")
+    data class Entry(val host: String, val account: String, val hasPw: Boolean, val note: String, val name: String = "", val url: String = "")
     /** what the box's inbox says (null = could not sign in: the box is gone or its password is not known) */
     data class Mail(val from: String, val subject: String, val text: String, val at: Long)
 
@@ -162,8 +193,10 @@ if(!t)return 'R:none';t.click();return 'R:clicked';
             }.ifEmpty { if (hosts.size == 1) mails.orEmpty() else emptyList() }
             val brand = ms.map { brandOf(it) }.firstOrNull { it.isNotBlank() }.orEmpty()
             var r = r0
-            if (r.platform.isBlank()) { val p = e?.name?.takeIf { it.isNotBlank() && !it.contains('.') } ?: brand.ifBlank { if (h.isNotBlank()) RegisterAutoCore.nameFor("https://$h/") else "" }; if (p.isNotBlank()) r = r.copy(platform = p) }
-            if (r.url.isBlank() && h.isNotBlank()) r = r.copy(url = "https://$h/")
+            // [ledger v2] never a guessed name / URL: the brand from the name or the mail, else the domain (an IP stays unnamed →
+            // 「自定义网站」 on screen); the URL only when the 台账 entry has the real one
+            if (r.platform.isBlank()) { val p = e?.name?.takeIf { it.isNotBlank() && !it.contains('.') } ?: brand.ifBlank { if (!isIpHost(h)) h else "" }; if (p.isNotBlank()) r = r.copy(platform = p) }
+            if (r.url.isBlank()) e?.url?.takeIf { it.startsWith("http") }?.let { r = r.copy(url = it) }
             if (r.createdAt == 0L) ms.minOfOrNull { it.at }?.takeIf { it > 0 }?.let { r = r.copy(createdAt = it) }
             val noteOk = e?.note?.startsWith("注册于") == true
             val mailOk = ms.any { Regex("(?i)(verified|confirmed|activated|welcome|验证成功|已激活|注册成功)").containsMatchIn(it.subject) }
@@ -183,7 +216,13 @@ if(!t)return 'R:none';t.click();return 'R:clicked';
 
     data class Summary(val total: Int, val filled: Int, val deleted: Int) {
         val line: String get() = "整理 $total 个 · 补全 $filled · 删除 $deleted ›"
+        /** [ledger v2] nothing filled or deleted → no bar at all */
+        val changed: Boolean get() = filled + deleted > 0
     }
+
+    /** the 整理 bar shows only when something changed, and only for [TIDY_SHOW_MS] after it */
+    const val TIDY_SHOW_MS = 20_000L
+    fun showTidy(s: Summary?, at: Long, now: Long): Boolean = s != null && s.changed && now - at < TIDY_SHOW_MS
 
     // ── 最近删除 (7 days) ──
 

@@ -70,7 +70,9 @@ object RegisterAutoCore {
     /** a custom entry added to the list (null + the reason when it can not be used) */
     fun custom(input: String, list: List<Platform>): Pair<Platform?, String?> {
         val u = normUrl(input) ?: return null to "这不是网址。填域名或完整链接，例如 zeabur.com"
-        val p = Platform(nameFor(u), u, custom = true)
+        // [ledger v2] a custom site is called by its domain (zeabur.com); an IP-only site 「自定义网站」 until its page names it
+        val h = hostOf(u)
+        val p = Platform(if (RegLedgerCore.isIpHost(h)) "自定义网站" else h, u, custom = true)
         if (list.any { it.host == p.host }) return null to "${p.name} 已经在列表里"
         return p to null
     }
@@ -116,6 +118,14 @@ object RegisterAutoCore {
         Page.PHONE -> "$name 要手机号验证，点这里填好后我接着注册。"
         Page.PAYMENT -> "$name 要填付款信息，我不替你付款。点这里自己决定。"
         else -> "$name 需要你看一下，点这里。"
+    }
+
+    /** [ledger v2] the takeover screen's own line: the user is already on the page, so no 「点这里」 */
+    fun takeoverLine(p: Page): String = when (p) {
+        Page.CAPTCHA -> "在下面完成人机验证，然后点「好了，继续」。"
+        Page.PHONE -> "在下面填手机号和短信验证码，然后点「好了，继续」。"
+        Page.PAYMENT -> "这一步要付款，Mines 不代付。自己决定，或点「跳过这个平台」。"
+        else -> "在下面处理好，然后点「好了，继续」。"
     }
 
     // ── mail ──

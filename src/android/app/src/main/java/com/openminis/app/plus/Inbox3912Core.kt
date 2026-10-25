@@ -52,7 +52,7 @@ object Inbox3912Core {
     // ── 注册台账 ──
     enum class RegSt(val zh: String) { DONE("已验证"), PENDING("未完成"), ROTATE("待轮换"), SAVED("已保存") }
 
-    data class RegRow(val host: String, val account: String, val note: String, val st: RegSt)
+    data class RegRow(val host: String, val account: String, val note: String, val st: RegSt, val name: String = "")
 
     /** status from the 台账 备注 written by register_pick / register_done (RegisterCore.note) */
     fun regStatus(note: String): RegSt = when {

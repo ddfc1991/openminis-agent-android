@@ -150,7 +150,7 @@ object Register3912 {
         com.openminis.app.plus.SavedLogins.all(c).map { e ->
             val host = e.host.ifBlank { e.name }
             val note = runCatching { com.openminis.app.plus.Ledger.cands(c, host).firstOrNull { it.account.equals(e.user, true) }?.note }.getOrNull().orEmpty()
-            Inbox3912Core.RegRow(host, e.user, note, Inbox3912Core.regStatus(note))
+            Inbox3912Core.RegRow(host, e.user, note, Inbox3912Core.regStatus(note), e.name)
         }.let { it + com.openminis.app.plus.TaskProjects.ledgerRows(it) }   // [Mines-38.9.13 task_projects] project accounts (no password)
     }.getOrDefault(emptyList())
 }
@@ -209,8 +209,8 @@ fun RegisterLedgerScreen(onBack: () -> Unit, go: (String) -> Unit) {
                         modifier = Modifier.clip(RoundedCornerShape(50)).background(Color(0x22C0633F)).clickable { pick = true }
                             .semantics { contentDescription = "开始注册" }.padding(horizontal = 12.dp, vertical = 5.dp))
                 }
-                Text("选平台或填网址 → 每个平台一个临时邮箱 → 自动填表收码 → 写入台账", fontSize = MT.Sub, color = m.ink2, modifier = Modifier.padding(top = 6.dp))
-                Text("遵守平台规则：一人一号，不批量注册；遇到人机验证、手机号或付款时停下来问你。", fontSize = MT.Meta, color = m.ink3, modifier = Modifier.padding(top = 4.dp))
+                // [ledger v2] user 2026-10-26 06:38 「台账乱了点」: one short line instead of the two-line explanation
+                Text("每个平台一个临时邮箱，遇到验证会停下问你", fontSize = MT.Meta, color = m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 4.dp))
             }
         }
         RegisterRunCard(go)   // [Mines-38.9.15 register_auto] one folded task row
@@ -222,27 +222,17 @@ fun RegisterLedgerScreen(onBack: () -> Unit, go: (String) -> Unit) {
         }
         WarmGroupLabel("按邮箱", "全部 ›") { go(PlusRoutes.KEYCHAIN) }
         if (rows != null && all.isEmpty()) InfoLine("台账里还没有账号。一键注册完成的账号会自动出现在这里。")
+        // [ledger v2] long-term boxes: same compact rows (platform first), no switches on the list — they live on the detail page
         groups.filter { (box, _) -> tempSet.none { it.equals(box, true) } }.take(8).forEach { (box, list) ->
-            MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp)) {
-                Column(Modifier.padding(vertical = 6.dp)) {
-                    Row(Modifier.padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text(Inbox3912Core.maskMail(box), fontSize = MT.Sub, fontFamily = FontFamily.Monospace, color = m.ink, modifier = Modifier.weight(1f), maxLines = 1)
-                        val tempBox = list.any { it.note.contains("Mail.tm") } || box.endsWith("@" + (temp?.substringAfter('@') ?: "\u0000"))
-                        StatusPill(if (tempBox) "临时" else "长期", null)
-                    }
-                    list.take(6).forEach { r ->
-                        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Box(Modifier.size(34.dp).clip(RoundedCornerShape(9.dp)).background(Color(0xFFD9822F)), contentAlignment = Alignment.Center) {
-                                Text(r.host.take(2).uppercase(), color = Color.White, fontSize = MT.Meta, fontWeight = FontWeight.SemiBold)
-                            }
-                            Column(Modifier.weight(1f).padding(start = 12.dp)) {
-                                Text(r.host, fontSize = MT.Body, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                Text((if (r.note.contains("密码在手机")) "" else "密码 ••••••") + (r.note.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""), fontSize = MT.Meta, color = m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            }
-                            StatusPill(r.st.zh, when (r.st) { Inbox3912Core.RegSt.DONE -> true; Inbox3912Core.RegSt.PENDING, Inbox3912Core.RegSt.ROTATE -> false; else -> null })
-                        }
-                        KaLine(com.openminis.app.plus.RegLedgerCore.acctKey(r.host, r.account), r.host)   // [38.9.15] 自动延时 / 探针保活
-                    }
+            val tempBox = list.any { it.note.contains("Mail.tm") } || box.endsWith("@" + (temp?.substringAfter('@') ?: "\u0000"))
+            LedgerBoxCard(box, if (tempBox) "临时" else "长期", list.size, onHeader = null) {
+                list.take(6).forEachIndexed { i, r ->
+                    if (i > 0) WarmDivider(start = 68.dp)
+                    LedgerPlatformRow(
+                        title = com.openminis.app.plus.RegLedgerCore.platformTitle(r.name, r.host), host = r.host, account = box,
+                        sub = Inbox3912Core.maskMail(box), pill = r.st.zh,
+                        ok = when (r.st) { Inbox3912Core.RegSt.DONE -> true; Inbox3912Core.RegSt.PENDING, Inbox3912Core.RegSt.ROTATE -> false; else -> null },
+                    ) { go(RegisterAcct.route(box, r.host)) }
                 }
             }
         }

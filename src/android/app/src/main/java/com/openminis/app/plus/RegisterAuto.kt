@@ -127,6 +127,15 @@ object RegisterAuto {
             val page = RegisterAutoCore.classify(s)
             note("$host round $round page $page url ${s.url.take(80)}")
             if (s.url != lastUrl) { lastUrl = s.url }
+            // [ledger v2] an IP-only custom site is named by its page (「SmokeCloud sign up」 → SmokeCloud), never by the IP
+            if (round == 0 && RegLedgerCore.isIpHost(host) || round == 0 && p.name == "自定义网站") {
+                RegLedgerCore.brandFromTitle(RegisterBrowser.eval("document.title"))?.let { b ->
+                    note("$host brand $b")
+                    setItem(i) { it.copy(p = it.p.copy(name = b)) }
+                    SavedLogins.put(c, SavedLogins.Entry(b, origin(p.url), box.addr, pw))
+                    RegLedger.put(RegLedgerCore.Rec(box.addr, host, b, p.url, st = RegLedgerCore.RSt.RUNNING))
+                }
+            }
             when (page) {
                 Page.CAPTCHA, Page.PHONE, Page.PAYMENT -> {
                     if (!ask(i, page, s.captcha)) { finishItem(i, false, when (page) { Page.CAPTCHA -> "人机验证没完成"; Page.PHONE -> "要手机号，跳过了"; else -> "要付款，跳过了" }); return }

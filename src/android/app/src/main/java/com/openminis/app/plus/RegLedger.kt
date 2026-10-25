@@ -42,6 +42,8 @@ object RegLedger {
     private val _trash = MutableStateFlow<List<RegLedgerCore.Trashed>>(emptyList()); val trash: StateFlow<List<RegLedgerCore.Trashed>> = _trash.asStateFlow()
     /** the last 整理 summary (shown once as one line on the 台账) */
     val lastTidy = MutableStateFlow<RegLedgerCore.Summary?>(null)
+    /** [ledger v2] when [lastTidy] was made (the bar hides itself [RegLedgerCore.TIDY_SHOW_MS] later) */
+    @Volatile var lastTidyAt = 0L
     private val tidyLock = Mutex()
     private val kaLock = Mutex()
     private val http = OkHttpClient.Builder().connectTimeout(10, TimeUnit.SECONDS).readTimeout(20, TimeUnit.SECONDS).callTimeout(30, TimeUnit.SECONDS).build()
@@ -270,7 +272,7 @@ object RegLedger {
         for (b in boxes) {
             val es = all.filter { it.user.equals(b, true) }.map { e ->
                 val note = runCatching { Ledger.cands(c, e.host).firstOrNull { it.account.equals(e.user, true) }?.note }.getOrNull().orEmpty()
-                RegLedgerCore.Entry(e.host, e.user, e.pass.isNotBlank(), note, e.name)
+                RegLedgerCore.Entry(e.host, e.user, e.pass.isNotBlank(), note, e.name, e.url)
             }
             val mails = read(b)
             val plan = RegLedgerCore.tidy(b, es, recsFor(b), mails, now)
@@ -302,7 +304,7 @@ object RegLedger {
         }
         saveAll()
         p()?.edit()?.putBoolean("tidy_v1", true)?.apply()
-        RegLedgerCore.Summary(total, filled, deleted).also { lastTidy.value = it; note("tidy $it") }
+        RegLedgerCore.Summary(total, filled, deleted).also { lastTidy.value = it; lastTidyAt = System.currentTimeMillis(); note("tidy $it") }
     }
 
     private fun day(t: Long) = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date(t))
