@@ -28,6 +28,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.drawscope.translate
+import androidx.compose.ui.graphics.layer.drawLayer
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
@@ -150,9 +157,31 @@ fun ChatHomeDock(current: Int, onChat: () -> Unit, onTasks: () -> Unit, onMessag
         WarmNavItem("消息", icH("mail"), onClick = onMessages),
         WarmNavItem("应用", icH("layout-grid"), onClick = onApps),
     )
-    Row(
+    // [Mines-38.9.14.1] real frosted glass: the page behind (recorded by [dockBlurSource]) is drawn here blurred (RenderEffect,
+    // API 31+) under a 76 % tint; without blur (API < 31 / no source yet) the tint is 92 % so list text never reads through.
+    val src = DockBlur.layer
+    val blur = src != null && android.os.Build.VERSION.SDK_INT >= 31
+    var dockPos by remember { mutableStateOf(androidx.compose.ui.geometry.Offset.Zero) }
+    val radiusPx = with(androidx.compose.ui.platform.LocalDensity.current) { 22.dp.toPx() }
+    Box(
         modifier.navigationBarsPadding().fillMaxWidth().padding(horizontal = 18.dp, vertical = 6.dp)
-            .glassOuterShadow(shape, dark = m.dark).clip(shape).background(minesGlassFill()).glassSheen(shape, m.dark).border(1.dp, m.glassBorder, shape)
+            .glassOuterShadow(shape, dark = m.dark).clip(shape)
+            .onGloballyPositioned { dockPos = it.positionInRoot() },
+    ) {
+        if (blur && src != null) Box(
+            Modifier.matchParentSize()
+                .graphicsLayer {
+                    renderEffect = androidx.compose.ui.graphics.BlurEffect(radiusPx, radiusPx, androidx.compose.ui.graphics.TileMode.Clamp)
+                    clip = true   // the outer Box already clips to the dock's rounded shape
+                }
+                .drawBehind {
+                    val o = DockBlur.origin
+                    translate(o.x - dockPos.x, o.y - dockPos.y) { drawLayer(src) }
+                },
+        )
+        Box(Modifier.matchParentSize().background(GlassTint.of(m.dark).copy(alpha = if (blur) DockBlur.TINT_BLUR else DockBlur.TINT_SOLID)))
+    Row(
+        Modifier.fillMaxWidth().glassSheen(shape, m.dark).border(1.dp, m.glassBorder, shape)
             .heightIn(min = 58.dp).padding(horizontal = 4.dp, vertical = 3.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -178,6 +207,7 @@ fun ChatHomeDock(current: Int, onChat: () -> Unit, onTasks: () -> Unit, onMessag
             }
         }
     }
+    }   // glass Box
 }
 
 // ───────────────────────────── 任务 page ─────────────────────────────
@@ -262,4 +292,40 @@ fun ChatHomeFlagRow() {
         }
         MinesSwitch(on, "聊天主页") { ChatHome.setOn(ctx, it) }
     }
+}
+
+
+/** [Mines-38.9.14.1] what the dock blurs: the NavHost content, recorded each frame into one GraphicsLayer (Haze-style). */
+object DockBlur {
+    const val TINT_BLUR = 0.76f
+    const val TINT_SOLID = 0.92f
+    /** dock height without the navigation bar inset: 6 + 3 + 58 + 3 + 6 dp */
+    val DOCK_H = 76.dp
+    var layer by mutableStateOf<androidx.compose.ui.graphics.layer.GraphicsLayer?>(null)
+    @Volatile var origin: androidx.compose.ui.geometry.Offset = androidx.compose.ui.geometry.Offset.Zero
+}
+
+/** records the content for [ChatHomeDock]'s blur (only while 聊天主页 is on and blur exists, API 31+) */
+@Composable
+fun Modifier.dockBlurSource(): Modifier {
+    val on by ChatHome.on.collectAsState()
+    if (!on || android.os.Build.VERSION.SDK_INT < 31) return this
+    val layer = androidx.compose.ui.graphics.rememberGraphicsLayer()
+    androidx.compose.runtime.DisposableEffect(layer) {
+        DockBlur.layer = layer
+        onDispose { if (DockBlur.layer === layer) DockBlur.layer = null }
+    }
+    return this.onGloballyPositioned { DockBlur.origin = it.positionInRoot() }.drawWithContent {
+        layer.record { this@drawWithContent.drawContent() }
+        drawLayer(layer)
+    }
+}
+
+/** [Mines-38.9.14.1] bottom room a tab page's list needs so its last item scrolls above the dock (0 when the dock is off) */
+@Composable
+fun chatHomeDockPad(): androidx.compose.ui.unit.Dp {
+    if (!ChatHome.enabled()) return 0.dp
+    val nav = androidx.compose.foundation.layout.WindowInsets.navigationBars
+    val navPad = with(androidx.compose.ui.platform.LocalDensity.current) { nav.getBottom(this).toDp() }
+    return DockBlur.DOCK_H + navPad + 12.dp
 }
