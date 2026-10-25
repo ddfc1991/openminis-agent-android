@@ -3328,7 +3328,7 @@ def main():
         elif I397: fns = (b397,)   # [38.9.7] its own short gate (1080x2412 / 480 dpi, custom avatar)
         elif I396: fns = ((b396x,) if I396X else ()) + ((b396m,) if I396M else ()) + (b396,) + (tuple(fns) if I395 else ())   # [38.9.6 i12] glass / auto progress / archive shots first, then the full i395 pass + 自检
         elif H3894: fns = (b3894_h,) + tuple(fns)   # [38.9.4 h] SkillHub market, Memoh, a11y wording, 账号 entries, glass / opaque reading, g2 defects first
-        if I3915: fns = (b3915,)   # [38.9.15] 伪人核心 gate only
+        if I3915: fns = (b3914, b3915)   # [38.9.15] 38.9.14.1 chat-home gate (single bottom bar on every tab, back on 聊天) + 伪人核心 / sign-in / slider
         for fn in fns:
             try:
                 fn(res)
@@ -7405,6 +7405,118 @@ def b3915(res):
             theme388(2); time.sleep(2); open_page(); time.sleep(2); shot("page-dark"); back(1); theme388(1); time.sleep(2)
         except Exception as e: print("I3915 dark error", e, flush=True)
     step("dark", dark)
+
+    # ---- [38.9.15] takeover slider: the browser sheet must not take the drag; a horizontal drag moves the page's slider ----
+    F = "http://10.0.2.2:8088"
+    def sv():
+        d = result_json("group", "i3915 sliderval", timeout=25)
+        raw = (d or {}).get("raw", "") if isinstance(d, dict) else ""
+        m = re.search(r"SV(\{.*?\})SV", raw.replace('\\"', '"'))
+        try: v = json.loads(m.group(1)) if m else {}
+        except Exception: v = {}
+        v["open"] = (d or {}).get("open") if isinstance(d, dict) else None
+        return v
+    def slider():
+        tap_dock("聊天"); time.sleep(2)
+        d = result_json("group", f"i3915 slider {F}/sliderfake", timeout=40); o["slider_open"] = d
+        time.sleep(7)
+        r = shot("slider-before"); t = _txt(r)
+        v0 = sv(); o["slider_v0"] = v0
+        if "向右拖动滑块" not in t and "安全验证" not in t and not v0.get("width"): fail(f"slider page not shown: {t[:200]}")
+        wv = None
+        for n in (r.iter("node") if r is not None else []):
+            if "WebView" in (n.get("class") or ""):
+                b = list(map(int, re.findall(r"\d+", n.get("bounds", ""))))
+                if len(b) == 4 and (wv is None or (b[2]-b[0])*(b[3]-b[1]) > (wv[2]-wv[0])*(wv[3]-wv[1])): wv = b
+        o["slider_wv"] = wv
+        if wv and v0.get("dpr") and v0.get("width"):
+            sc = (wv[2] - wv[0]) / float(v0.get("iw") or ((wv[2]-wv[0]) / v0["dpr"]))
+            y = int(wv[1] + v0["mid"] * sc); x1 = int(wv[0] + (v0["left"] + 28) * sc); x2 = int(wv[0] + (v0["left"] + v0["width"] - 10) * sc)
+        else:
+            p = find(r, "向右拖动滑块")
+            if not p: fail("slider track not found on screen"); return
+            y = p[1]; x1 = int(SCREEN[0] * 0.12); x2 = int(SCREEN[0] * 0.9)
+        o["slider_drag"] = [x1, y, x2, y]
+        sh(f"input swipe {x1} {y} {x2} {y} 1200"); time.sleep(2)
+        v1 = sv(); o["slider_v1"] = v1
+        r = shot("slider-after"); t2 = _txt(r)
+        if not v1.get("open"): fail(f"browser sheet closed / moved by the horizontal drag: {v1}")
+        if (v1.get("v") or 0) < 80: fail(f"slider did not follow the drag: before {v0.get('v')} after {v1.get('v')} moves {v1.get('moves')} cancel {v1.get('cancel')}")
+        if (v1.get("cancel") or 0) > (v0.get("cancel") or 0): fail(f"the drag was cancelled by a parent (pointercancel): {v1}")
+        if v1.get("open"): back(1); time.sleep(1)
+        sh(f"am start -n {PKG}/com.openminis.app.MainActivity"); time.sleep(2)
+    step("slider", slider)
+
+    # ---- [38.9.15] account picker: several unlinked accounts → card, user picks, remembered; linked → no card, ≤ 2 tries → 等你处理 ----
+    def pst(tag):
+        s = result_json("group", f"i3915 pickstate {tag}", timeout=20)
+        return s if isinstance(s, dict) else {}
+    def pick():
+        seed = result_json("group", "i3915 pickseed", timeout=20); o["pick_seed"] = seed
+        if not isinstance(seed, dict) or seed.get("ways") != 2 or seed.get("link"): fail(f"pickseed: {seed}")
+        sh(f"am start -n {PKG}/com.openminis.app.MainActivity"); time.sleep(2)
+        tap_dock("聊天"); time.sleep(1)
+        result_json("group", "i3915 pickrun a", timeout=20)
+        s = {}; t0 = time.time()
+        while time.time() - t0 < 20:
+            s = pst("a")
+            if s.get("card"): break
+            time.sleep(1.5)
+        o["pick_card"] = s.get("card")
+        if not s.get("card"): fail(f"no 选账号 card for two unlinked accounts (auto-picked?): {s}"); return
+        if s.get("outcomes"): fail(f"a sign-in ran before the user picked: {s.get('outcomes')}")
+        time.sleep(1.5)
+        r = shot("pick-card"); t = _txt(r); o["pick_txt"] = t[:300]
+        for w in ("选一个 cloudflare.com 账号", "Google 登录", "邮箱+密码", "记住"):
+            if w not in t: fail(f"pick card missing {w}")
+        tgt = None
+        for tx, d, x, y, n in nodes(r) if r is not None else []:
+            if (d or "").startswith("选 邮箱+密码"): tgt = (x, y)
+        if not tgt:
+            p = find(r, "邮箱+密码"); tgt = p
+        if not tgt: fail("pick row 邮箱+密码 not found"); return
+        sh(f"input tap {tgt[0]} {tgt[1]}")
+        t0 = time.time()
+        while time.time() - t0 < 30:
+            s = pst("a")
+            if len(s.get("outcomes") or []) >= 3 or any(x.get("k") != "tried" for x in (s.get("outcomes") or [])): break
+            time.sleep(1.5)
+        o["pick_a"] = s
+        if s.get("answer") != "email_pw:smoke.b@163.com:true": fail(f"picked answer wrong (记住 should default on): {s.get('answer')}")
+        if s.get("link") != "email_pw:smoke.b@163.com:true": fail(f"pick not remembered as the site's link: {s.get('link')}")
+        oc = s.get("outcomes") or []
+        tried = [x for x in oc if x.get("k") == "tried"]
+        if len(tried) != 2: fail(f"expected exactly 2 automatic tries, got {oc}")
+        if any(x.get("acct") != "smoke.b@163.com" for x in tried): fail(f"a try drifted to another account: {tried}")
+        if not oc or oc[-1].get("k") != "handoff": fail(f"no 等你处理 after 2 failures: {oc}")
+        if s.get("progress") != "waiting": fail(f"task not 等你处理 after the failures: {s.get('progress')} {s.get('reason')}")
+        shown_a = s.get("shownId")
+        # linked to the Google account (user-set) → no card, both tries with it, then 等你处理
+        result_json("group", "i3915 pickrun b linked", timeout=20)
+        t0 = time.time(); sb = {}
+        while time.time() - t0 < 30:
+            sb = pst("b")
+            if sb.get("card"): break
+            if len(sb.get("outcomes") or []) >= 3 or any(x.get("k") != "tried" for x in (sb.get("outcomes") or [])): break
+            time.sleep(1.5)
+        o["pick_b"] = sb
+        if sb.get("card") or sb.get("shownId") != shown_a: fail(f"card shown although the site is linked: {sb.get('card')}")
+        ocb = sb.get("outcomes") or []
+        tb = [x for x in ocb if x.get("k") == "tried"]
+        if len(tb) != 2 or any(x.get("acct") != "smoke.a@gmail.com" or x.get("group") != "google" for x in tb): fail(f"linked account not used for both tries: {ocb}")
+        if not ocb or ocb[-1].get("k") != "handoff": fail(f"linked: no 等你处理 after 2 failures: {ocb}")
+        # 账号台账 → 按登录方式 shows both groups and 你定的 on the linked one
+        route("plus_keychain", 6)
+        r = shot("ledger-groups"); t = _txt(r)
+        for i in range(2):
+            if "按登录方式" in t: break
+            scroll_down(); r = shot("ledger-groups"); t = _txt(r)
+        o["ledger_txt"] = t[:400]
+        if "按登录方式" not in t: fail("账号台账 has no 按登录方式 section")
+        if "Google 登录" not in t or "邮箱+密码" not in t: fail("按登录方式 misses a group")
+        if "你定的" not in t: fail("linked account not marked 你定的")
+        back(1)
+    step("pick", pick)
 
     def experiments():
         route("settings", 3); tap_text("测试与上报", wait=3)

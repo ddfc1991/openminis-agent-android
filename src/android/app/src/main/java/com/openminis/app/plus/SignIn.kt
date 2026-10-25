@@ -72,6 +72,7 @@ object SignIn {
             }
         }
         runCatching { if (CloudflareApi.token(c) != null) out += Item("Cloudflare API", "cloudflare.com", "API token", Group.API_KEY, null) }
+        smokeWays.forEach { (host, ws) -> ws.forEach { w -> out += Item(host, host, w.account, link(host)?.takeIf { it.account.equals(w.account, true) }?.group ?: w.group, null) } }
         return out.distinctBy { it.host + "|" + it.account.lowercase() + "|" + it.group.id }
     }
 

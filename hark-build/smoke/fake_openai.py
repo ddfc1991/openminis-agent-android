@@ -223,6 +223,19 @@ class H(BaseHTTPRequestHandler):
                     '<pre id="out" style="margin-top:20px"></pre></body></html>').encode()
             self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(html))); self.end_headers(); self.wfile.write(html); return
+        # [38.9.15] takeover slider: a captcha-like drag slider (pointer events, touch-action none); value in window.__sv
+        if self.path.startswith("/sliderfake"):
+            return self._html("""<html><head><meta name="viewport" content="width=device-width,initial-scale=1"><meta charset="utf-8"><title>滑块测试</title>
+<style>body{font-family:sans-serif;font-size:18px;margin:0;padding:24px 16px} #track{position:relative;height:56px;border-radius:28px;background:#e8e8ee;touch-action:none;user-select:none}
+#fill{position:absolute;left:0;top:0;bottom:0;width:0;border-radius:28px;background:#9fd3a8} #knob{position:absolute;left:0;top:0;width:56px;height:56px;border-radius:28px;background:#4a7;box-shadow:0 1px 4px #0004}
+#lbl{position:absolute;left:0;right:0;top:16px;text-align:center;color:#555;pointer-events:none}</style></head>
+<body><h3>安全验证</h3><p>请把滑块拖到最右边</p><div id="track"><div id="fill"></div><div id="knob"></div><div id="lbl">向右拖动滑块</div></div><p id="val">0</p>
+<script>window.__sv=0;window.__moves=0;var t=document.getElementById('track'),k=document.getElementById('knob'),f=document.getElementById('fill'),down=false;
+function set(x){var r=t.getBoundingClientRect();var v=Math.max(0,Math.min(100,Math.round((x-r.left-28)/(r.width-56)*100)));window.__sv=v;
+k.style.left=(v/100*(r.width-56))+'px';f.style.width=(v/100*(r.width-56)+56)+'px';document.getElementById('val').innerText=String(v);if(v>=95)document.getElementById('lbl').innerText='验证通过';}
+t.addEventListener('pointerdown',function(e){down=true;t.setPointerCapture(e.pointerId);set(e.clientX);});
+t.addEventListener('pointermove',function(e){if(!down)return;window.__moves++;set(e.clientX);});
+t.addEventListener('pointerup',function(e){down=false;});t.addEventListener('pointercancel',function(e){down=false;window.__cancel=(window.__cancel||0)+1;});</script></body></html>""")
         # [38.9.1] 一键关联 against an e-mail login page: 手机号登录 (default tab) / 邮箱登录 tab; e-mail + 发送验证码 → code from IMAP
         if self.path.startswith("/linkfake/home"):
             return self._html('<html><head><meta name="viewport" content="width=device-width"><meta charset="utf-8"><title>控制台</title></head>'
