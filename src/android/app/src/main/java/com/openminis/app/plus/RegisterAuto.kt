@@ -363,7 +363,7 @@ object RegisterBrowser {
         loaded = CompletableDeferred()
         withContext(Dispatchers.Main) { wv.loadUrl(url) }
         val ok = withTimeoutOrNull(30_000L) { loaded.await() } != null
-        settle()
+        delay(900)   // scripts that build the form after load
         return ok || !withContext(Dispatchers.Main) { wv.url }.isNullOrBlank()
     }
 
