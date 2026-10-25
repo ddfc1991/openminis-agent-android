@@ -42,7 +42,6 @@ import kotlin.coroutines.resume
 object RegisterAuto {
     const val SID_PREFIX = "regauto:"
     private const val PREFS = "mines_register_auto"
-    private const val BOX = "agent_mail"   // vault kind of the Mail.tm box passwords (same as AgentMailbox)
 
     @Volatile private var app: Context? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -65,6 +64,7 @@ object RegisterAuto {
         synchronized(this) {
             if (app != null) return
             app = c.applicationContext
+            RegLedger.init(c)
             val p = c.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             p.getString("mail_base", null)?.let { mailBase = it }
             RegisterAutoCore.fromJson(p.getString("run", null))?.let { _run.value = it }
@@ -115,6 +115,8 @@ object RegisterAuto {
         SavedLogins.put(c, SavedLogins.Entry(p.name, origin(p.url), box.addr, pw))
         Ledger.setNote(c, host, box.addr, RegisterAutoCore.ledgerNote(today(), false, "Mail.tm"))
         setItem(i) { it.copy(email = box.addr, line = "打开注册页") }
+        // 临时邮箱台账: box (password / token in the vault), platform, sign-up URL, 进行中, time
+        RegLedger.put(RegLedgerCore.Rec(box.addr, host, p.name, p.url, st = RegLedgerCore.RSt.RUNNING, createdAt = System.currentTimeMillis()))
         // 3. the sign-up page in the persistent in-app browser
         val since = System.currentTimeMillis() - 60_000
         if (!RegisterBrowser.load(c, p.url)) { finishItem(i, false, "注册页打不开"); return }
@@ -179,6 +181,7 @@ object RegisterAuto {
         val line = RegisterAutoCore.askLine(item.p.name, page, detail)
         val d = CompletableDeferred<Boolean>(); answer = d
         setItem(i) { it.copy(st = St.WAITING, ask = page, line = line) }
+        if (item.email.isNotBlank()) RegLedger.put(RegLedgerCore.Rec(item.email, item.p.host, item.p.name, item.p.url, st = stuck(page), why = line))
         note("ask ${item.p.host} $page")
         runCatching { MinesCall.onNeedsAttention(c, "一键注册 · 等你", line) }
         if (!ChatHome.enabled()) runCatching { notifyAsk(c, line) }
@@ -194,8 +197,14 @@ object RegisterAuto {
             Ledger.setNote(c, item.p.host, item.email, RegisterAutoCore.ledgerNote(today(), ok, why))
             if (ok) Ledger.markOk(c, item.p.host, item.email)
         }
+        if (item.email.isNotBlank()) RegLedger.put(RegLedgerCore.Rec(item.email, item.p.host, item.p.name, item.p.url,
+            st = if (ok) RegLedgerCore.RSt.VERIFIED else item.ask?.let { stuck(it) } ?: RegLedgerCore.RSt.PENDING, why = if (ok) "" else why))
         note("done ${item.p.host} ok=$ok $why")
         setItem(i) { it.copy(st = if (ok) St.DONE else St.PENDING, ask = null, line = if (ok) "已验证 · ${item.email}" else why) }
+    }
+
+    private fun stuck(p: Page): RegLedgerCore.RSt = when (p) {
+        Page.CAPTCHA -> RegLedgerCore.RSt.CAPTCHA; Page.PHONE -> RegLedgerCore.RSt.PHONE; Page.PAYMENT -> RegLedgerCore.RSt.PAYMENT; else -> RegLedgerCore.RSt.PENDING
     }
 
     // ── state → 台账 card + ChatHome task ──
@@ -252,7 +261,7 @@ object RegisterAuto {
             val addr = AiMailCore.userName(System.currentTimeMillis(), rnd.nextInt(900)) + "@" + dom
             val (c1, _) = req("POST", "/accounts", JSONObject().put("address", addr).put("password", pass))
             if (c1 in 200..299) {
-                PlusVault.setSecretExtra(BOX, "regbox_$addr", pass)
+                RegLedger.setBoxPass(addr, pass)
                 return@withContext Box(addr, pass)
             }
             note("mailtm account $c1")
@@ -265,7 +274,7 @@ object RegisterAuto {
     /** an earlier box for this host whose sign-up never finished (备注 注册中 · Mail.tm), password still in the vault */
     private fun reuseBox(c: Context, host: String): Box? = runCatching {
         Ledger.cands(c, host).firstOrNull { it.note.startsWith("注册中") && it.note.contains("Mail.tm") }?.let { cand ->
-            PlusVault.secretExtra(BOX, "regbox_${cand.account}")?.let { Box(cand.account, it) }
+            RegLedger.boxPass(cand.account)?.let { Box(cand.account, it) }
         }
     }.getOrNull()
 

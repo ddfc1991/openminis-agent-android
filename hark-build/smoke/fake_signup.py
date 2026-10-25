@@ -20,6 +20,8 @@ TOKENS = {}       # token -> address
 MAILS = {}        # address -> [msg]
 ACCOUNTS = {}     # email -> {"pw":..., "user":..., "code":..., "verified":bool}
 LOG = []
+COUNT = {"renew": 0, "probe": 0, "verify_link": 0}
+LINKS = {}      # token -> address
 
 FORM = """<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1"><title>SmokeCloud sign up</title>
 <style>body{{font-family:sans-serif;margin:24px}}input{{display:block;width:90%;margin:8px 0;padding:10px;font-size:16px}}button{{padding:12px 20px;font-size:16px}}</style></head>
@@ -81,12 +83,27 @@ class H(BaseHTTPRequestHandler):
         LOG.append("GET " + self.path)
         if p == "/signup":
             return self.send(200, FORM.format(extra="", action="/signup"))
+        if p == "/":   # [保活] the service's dashboard: a probe hits it, 续期 presses its free Renew button
+            COUNT["probe"] += 1
+            return self.send(200, "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'><title>SmokeCloud</title></head><body>"
+                "<h2>Your free server</h2><p>Expires in 2 days.</p><form method=post action='/renew'><button type=submit>Upgrade to Pro ($5)</button></form>"
+                "<form method=post action='/renew'><button type=submit>Renew for free</button></form></body></html>")
+        if p == "/verify-link":
+            tok = parse_qs(u.query).get("token", [""])[0]
+            if tok in LINKS:
+                COUNT["verify_link"] += 1
+                ACCOUNTS.setdefault(LINKS[tok], {})["verified"] = True
+                return self.send(200, DONE)
+            return self.send(400, "<html><body>link expired</body></html>")
+        if p == "/mailtm/me":
+            a = self.auth()
+            return self.js(200, {"address": a}) if a else self.js(401, {"message": "no token"})
         if p == "/captcha-signup":
             return self.send(200, FORM.format(extra=TURNSTILE, action="/signup"))
         if p == "/login":
             return self.send(200, "<html><body>login</body></html>")
         if p == "/state":
-            return self.send(200, json.dumps({"accounts": ACCOUNTS, "boxes": list(BOXES), "mails": {k: len(v) for k, v in MAILS.items()}, "log": LOG[-60:]}), "application/json")
+            return self.send(200, json.dumps({"count": COUNT, "accounts": ACCOUNTS, "boxes": list(BOXES), "mails": {k: len(v) for k, v in MAILS.items()}, "log": LOG[-60:]}), "application/json")
         if p == "/mailtm/domains":
             return self.js(200, {"hydra:member": [{"id": "d1", "domain": "smoke-mail.test", "isActive": True, "isPrivate": False}]})
         if p == "/mailtm/messages":
@@ -119,6 +136,18 @@ class H(BaseHTTPRequestHandler):
             t = "t%06d" % random.randint(0, 999999)
             TOKENS[t] = o["address"]
             return self.js(200, {"token": t, "id": "x"})
+        if p == "/seed":   # [整理] a temp box with a confirmation link waiting in it (driver-side, runner only)
+            o = json.loads(raw or "{}")
+            BOXES[o["address"]] = o["password"]
+            tok = "s%06d" % random.randint(0, 999999); LINKS[tok] = o["address"]
+            MAILS.setdefault(o["address"], []).insert(0, {"id": "m%d" % random.randint(1, 10**9), "from": {"address": "no-reply@smokecloud.test", "name": "SmokeCloud"},
+                "subject": "Confirm your SmokeCloud email", "intro": "Confirm your email", "createdAt": now_iso(),
+                "text": "Welcome to SmokeCloud. Open http://10.0.2.2:%d/verify-link?token=%s to confirm your email." % (PORT, tok),
+                "html": ["<a href=\"http://10.0.2.2:%d/verify-link?token=%s\">Confirm</a>" % (PORT, tok)]})
+            return self.js(200, {"ok": True, "token": tok})
+        if p == "/renew":
+            COUNT["renew"] += 1
+            return self.send(200, "<html><body><h2>Renewed</h2><p>Your server now expires in 7 days.</p></body></html>")
         f = {k: v[0] for k, v in parse_qs(raw).items()}
         if p == "/signup":
             em = f.get("email", "")

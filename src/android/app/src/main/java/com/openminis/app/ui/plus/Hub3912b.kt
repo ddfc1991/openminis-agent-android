@@ -172,7 +172,23 @@ fun RegisterLedgerScreen(onBack: () -> Unit, go: (String) -> Unit) {
     val temp = com.openminis.app.plus.AgentMailbox.address("mailtm")
     // [Mines-38.9.12.1] the user's own domain (unlimited addresses) is the preferred source when connected
     val selfDom = remember { if (com.openminis.app.plus.AgentMailbox.ready("selfhost")) com.openminis.app.plus.AgentMailbox.selfDomain() else null }
+    // [Mines-38.9.15 register_auto] 临时邮箱台账: records + 整理 (once after the upgrade, then from the menu)
+    remember { com.openminis.app.plus.RegLedger.init(ctx); 0 }
+    val tempRecs by com.openminis.app.plus.RegLedger.recs.collectAsState()
+    var tidying by remember { mutableStateOf(false) }
+    fun runTidy() {
+        if (tidying) return
+        tidying = true
+        scope.launch {
+            runCatching { com.openminis.app.plus.RegLedger.tidy(ctx) }
+            rows = withContext(Dispatchers.IO) { Register3912.rows(ctx) }
+            tidying = false
+        }
+    }
+    LaunchedEffect(Unit) { if (!com.openminis.app.plus.RegLedger.tidyDone()) runTidy() }
     PlusPage("注册台账", onBack, actions = {
+        Text(if (tidying) "整理中…" else "整理", fontSize = MT.Sub, color = m.ink, modifier = Modifier.clip(RoundedCornerShape(50)).clickable(enabled = !tidying) { runTidy() }
+            .semantics { contentDescription = "整理临时邮箱账号" }.padding(horizontal = 10.dp, vertical = 6.dp))
         Box(Modifier.size(40.dp).clip(CircleShape).clickable { pick = true }.semantics { contentDescription = "一键注册" }, contentAlignment = Alignment.Center) {
             MinesIcon(ic2("plus"), null, tint = m.ink, modifier = Modifier.size(20.dp))
         }
@@ -197,9 +213,16 @@ fun RegisterLedgerScreen(onBack: () -> Unit, go: (String) -> Unit) {
             }
         }
         RegisterRunCard(go)   // [Mines-38.9.15 register_auto] one folded task row
+        TidySummaryLine(go)
+        // [Mines-38.9.15 register_auto] temporary boxes: their own group, 「临时」, tap = the box (platforms + 重新收码)
+        val tempSet = remember(tempRecs, all) { tempBoxesOf(tempRecs, all) }
+        if (tempSet.isNotEmpty()) {
+            WarmGroupLabel("临时邮箱", "${tempSet.size} 个")
+            tempSet.take(12).forEach { b -> TempBoxCard(b, tempRecs.filter { it.box.equals(b, true) }, all.filter { it.account.equals(b, true) }, go) }
+        }
         WarmGroupLabel("按邮箱", "全部 ›") { go(PlusRoutes.KEYCHAIN) }
         if (rows != null && all.isEmpty()) InfoLine("台账里还没有账号。一键注册完成的账号会自动出现在这里。")
-        groups.take(8).forEach { (box, list) ->
+        groups.filter { (box, _) -> tempSet.none { it.equals(box, true) } }.take(8).forEach { (box, list) ->
             MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp)) {
                 Column(Modifier.padding(vertical = 6.dp)) {
                     Row(Modifier.padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -218,6 +241,7 @@ fun RegisterLedgerScreen(onBack: () -> Unit, go: (String) -> Unit) {
                             }
                             StatusPill(r.st.zh, when (r.st) { Inbox3912Core.RegSt.DONE -> true; Inbox3912Core.RegSt.PENDING, Inbox3912Core.RegSt.ROTATE -> false; else -> null })
                         }
+                        KaLine(com.openminis.app.plus.RegLedgerCore.acctKey(r.host, r.account), r.host)   // [38.9.15] 自动延时 / 探针保活
                     }
                 }
             }

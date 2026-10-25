@@ -800,6 +800,12 @@ fun AppNavigation(
         composable(com.openminis.app.ui.plus.RegisterTakeover.ROUTE) {
             com.openminis.app.ui.plus.RegisterTakeover.Screen(onBack = { navController.safePopBackStack() })
         }
+        composable(com.openminis.app.ui.plus.RegisterBox.ROUTE) { e ->
+            com.openminis.app.ui.plus.RegisterBox.Screen(android.net.Uri.decode(e.arguments?.getString("a") ?: ""), onBack = { navController.safePopBackStack() })
+        }
+        composable(com.openminis.app.ui.plus.RegisterBox.TRASH) {
+            com.openminis.app.ui.plus.RegisterBox.Trash(onBack = { navController.safePopBackStack() })
+        }
         // [Mines-38.9.13 task_projects] 任务 (项目 / 小任务 / 已归档) · 项目详情
         composable(com.openminis.app.ui.plus.TaskRoutes.TASKS) {
             com.openminis.app.ui.plus.TasksScreen(onBack = { navController.safePopBackStack() }, go = { navController.safeNavigate(it) })

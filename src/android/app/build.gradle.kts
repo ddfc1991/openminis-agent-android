@@ -290,6 +290,7 @@ dependencies {
     val composeBom = platform("androidx.compose:compose-bom:2025.09.00")
     implementation(composeBom)
     implementation("androidx.compose.material3:material3")
+    implementation("androidx.work:work-runtime-ktx:2.9.1")   // [Mines-38.9.15 register_auto] 台账 自动延时 / 探针保活
     implementation("androidx.compose.material:material-icons-extended")
 
     // [T-android-tablet-split] Adaptive list-detail layout for tablets/large

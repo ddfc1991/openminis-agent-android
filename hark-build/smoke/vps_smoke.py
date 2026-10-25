@@ -7657,6 +7657,104 @@ def bregauto(res):
         if not its or its[0].get("st") != "PENDING": fail(f"skip did not end the item as 未完成 {its}")
         route("plus_register_ledger", 4); shot("captcha-skipped")
     step("captcha_run", captcha_run)
+
+    def led():
+        s = result_json("group", "ira led", timeout=30)
+        return s if isinstance(s, dict) else {}
+
+    def ledger_rows():   # 临时邮箱台账: every temp sign-up is booked, the skipped one as 未完成 (卡在人机验证)
+        l = led(); recs = l.get("recs") or []
+        o["led_recs"] = recs
+        ok = [r for r in recs if r.get("s") == "VERIFIED" and r.get("h") == "10.0.2.2"]
+        if not ok: fail(f"temp ledger: no 已验证 record {recs}"); return
+        r = ok[0]
+        if not (r.get("boxPass") and r.get("pw") and r.get("p") and str(r.get("u", "")).endswith("/signup") and (r.get("c") or 0) > 0 and r.get("v") == "Mail.tm"):
+            fail(f"temp ledger record incomplete {r}")
+        cap = [x for x in recs if x.get("s") == "CAPTCHA"]
+        if not cap or not cap[0].get("w") or not str(cap[0].get("u", "")).endswith("/captcha-signup"): fail(f"stopped sign-up not booked as 卡在人机验证 {recs}")
+        route("plus_register_ledger", 5)
+        r0 = shot("temp-group")
+        for i in range(3):
+            if find(r0, "临时邮箱 "): break
+            scroll_down(); r0 = shot("temp-group")
+        if not find(r0, "临时"): fail("no 「临时」 group / pill on 注册台账")
+        if not tap_text("临时邮箱 ", wait=3): fail("temp box card not tappable"); return
+        r1 = shot("temp-box")
+        if not find(r1, "注册了"): fail("box screen has no platform list")
+        tap_text("重新收码", wait=6)
+        r2 = shot("temp-box-codes")
+        if not (find(r2, "验证码 ") or find(r2, "验证链接") or find(r2, "没有验证码")): fail("重新收码 showed nothing")
+        back(1)
+    step("ledger_rows", ledger_rows)
+
+    def keepalive():   # 自动延时 + 探针保活 switches (default off), one simulated 续期 + 探活
+        l = led()
+        if any(k.get("e") or k.get("p") for k in (l.get("ka") or [])): fail("a keep-alive switch is on by default")
+        route("plus_register_ledger", 5)
+        r = dump()
+        for i in range(4):
+            if find(r, "自动延时 10.0.2.2"): break
+            scroll_down(); r = dump()
+        if not tap_text("自动延时 10.0.2.2", wait=1.5): fail("no 自动延时 switch on the account row"); return
+        if not tap_text("探针保活 10.0.2.2", wait=1.5): fail("no 探针保活 switch")
+        shot("ka-on")
+        l = led(); ka = [k for k in (l.get("ka") or []) if k.get("k", "").startswith("acct|10.0.2.2|")]
+        o["ka_on"] = ka; o["work"] = l.get("work")
+        if not ka or not ka[0].get("e") or not ka[0].get("p"): fail(f"switches not saved {ka}")
+        if "ENQUEUED" not in str(l.get("work")) and "RUNNING" not in str(l.get("work")): fail(f"WorkManager job not enqueued: {l.get('work')}")
+        f0 = (fake().get("count") or {})
+        o["karun"] = result_json("group", "ira karun", timeout=120)
+        f1 = (fake().get("count") or {}); o["fake_count"] = f1
+        if (f1.get("renew") or 0) <= (f0.get("renew") or 0): fail(f"simulated 续期 did not press Renew {o['karun']}")
+        if (f1.get("probe") or 0) <= (f0.get("probe") or 0): fail(f"simulated 探活 did not reach the service {o['karun']}")
+        l = led(); ka = [k for k in (l.get("ka") or []) if k.get("k", "").startswith("acct|10.0.2.2|")]
+        o["ka_after"] = ka
+        if not ka or not ka[0].get("ea") or not ka[0].get("pa") or not ka[0].get("po"): fail(f"keep-alive times not recorded {ka}")
+        route("plus_register_ledger", 4)
+        r = dump()
+        for i in range(4):
+            if find(r, "下次续期"): break
+            scroll_down(); r = dump()
+        r = shot("ka-status")
+        if not find(r, "下次续期") or not find(r, "上次探活"): fail("status line 「下次续期 / 上次探活」 missing")
+    step("keepalive", keepalive)
+
+    def tidy():   # 整理: one fillable temp row, one dead temp row without password, one gmail row that must stay
+        box = "fill%d@smoke-mail.test" % int(time.time())
+        subprocess.run(f"curl -s -XPOST {B}/seed -d '{{\"address\":\"{box}\",\"password\":\"SeedBox-1\"}}'", shell=True, timeout=10)
+        o["seed"] = result_json("group", f"ira seedtidy {box} SeedBox-1", timeout=30)
+        f0 = (fake().get("count") or {})
+        route("plus_register_ledger", 4)
+        if not tap_text("整理临时邮箱账号", wait=2): fail("no 整理临时邮箱账号 in the menu")
+        t0 = time.time(); l = {}
+        while time.time() - t0 < 90:
+            l = led()
+            if l.get("tidy"): break
+            time.sleep(3)
+        o["tidy"] = l.get("tidy"); o["tidy_log"] = (l.get("log") or [])[-12:]
+        if not l.get("tidy"): fail("整理 did not finish"); return
+        m = re.match(r"整理 (\d+) 个 · 补全 (\d+) · 删除 (\d+) ›", l["tidy"])
+        if not m or int(m.group(3)) < 1 or int(m.group(2)) < 1: fail(f"summary {l['tidy']}")
+        saved = result_json("group", "ira saved", timeout=20) or []
+        o["saved"] = saved
+        if any(x.get("user") == "gone-smoke@smoke-mail.test" for x in saved): fail("dead temp row without password was not deleted")
+        if not any(x.get("user") == "smoke.long@gmail.com" and x.get("pw") for x in saved): fail("gmail row was touched")
+        if not any(x.get("user") == box and x.get("pw") for x in saved): fail("fillable temp row lost")
+        recs = [x for x in (l.get("recs") or []) if x.get("b") == box]
+        o["tidy_rec"] = recs
+        if not recs or not recs[0].get("p") or not recs[0].get("u") or not (recs[0].get("c") or 0) > 0: fail(f"fillable row not completed {recs}")
+        if not recs or recs[0].get("s") != "VERIFIED": fail(f"link in the box not used to verify {recs}")
+        if ((fake().get("count") or {}).get("verify_link") or 0) <= (f0.get("verify_link") or 0): fail("verification link not opened")
+        trash = l.get("trash") or []
+        if not any(t.get("a") == "gone-smoke@smoke-mail.test" for t in trash): fail(f"deleted row not in 最近删除 {trash}")
+        if any("gmail" in str(t.get("a")) for t in trash): fail("gmail row in 最近删除")
+        route("plus_register_ledger", 4)
+        r = shot("tidy-summary")
+        if not find(r, "整理 "): fail("summary line not shown")
+        if not tap_text("整理 ", wait=3): route("plus_register_trash", 3)
+        r = shot("trash")
+        if not find(r, "恢复") or not find(r, "dead.example"): fail("最近删除 does not list the deleted row")
+    step("tidy", tidy)
     print("IREG RESULT " + json.dumps(o, ensure_ascii=False)[:8000], flush=True)
 
 

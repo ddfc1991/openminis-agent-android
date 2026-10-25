@@ -53,6 +53,7 @@ import com.openminis.app.plus.RegisterAuto
 import com.openminis.app.plus.RegisterAutoCore
 import com.openminis.app.plus.RegisterAutoCore.Platform
 import com.openminis.app.plus.RegisterBrowser
+import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -216,6 +217,198 @@ object RegisterTakeover {
                 }
             }
             Spacer(Modifier.width(1.dp))
+        }
+    }
+}
+
+// ───────────── [Mines-38.9.15 register_auto] 临时邮箱台账 · 自动延时 / 探针保活 · 整理 · 最近删除 ─────────────
+
+private fun hmd(t: Long): String = if (t <= 0) "—" else java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.CHINA).format(java.util.Date(t))
+
+/** boxes shown under 临时邮箱: every box with a record, plus 台账 accounts on the same temp domains (never gmail / 163 …) */
+internal fun tempBoxesOf(recs: List<com.openminis.app.plus.RegLedgerCore.Rec>, rows: List<Inbox3912Core.RegRow>): List<String> {
+    val known = recs.map { it.box.lowercase() }.toSet() + com.openminis.app.plus.RegLedger.knownBoxes()
+    val doms = known.map { it.substringAfter('@') }.toSet()
+    return (recs.sortedByDescending { it.updatedAt }.map { it.box.lowercase() } +
+        rows.map { it.account.lowercase() }.filter { com.openminis.app.plus.RegLedgerCore.isTemp(it, doms, known) }).distinct()
+}
+
+/** the two small switches + 「下次续期 · 上次探活」 under a row (default off) */
+@Composable
+fun KaLine(key: String, label: String) {
+    val m = mines()
+    val ctx = LocalContext.current
+    val all by com.openminis.app.plus.RegLedger.ka.collectAsState()
+    val k = all[key] ?: com.openminis.app.plus.RegLedgerCore.Ka(key)
+    Column(Modifier.fillMaxWidth().padding(start = if (key.startsWith("box|")) 16.dp else 62.dp, end = 16.dp, bottom = 6.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            KaChip("自动延时", k.extend, "自动延时 $label") { com.openminis.app.plus.RegLedger.setKa(ctx, k.copy(extend = !k.extend)) }
+            KaChip("探针保活" + if (k.probe) " ${k.everyH}h" else "", k.probe, "探针保活 $label") { com.openminis.app.plus.RegLedger.setKa(ctx, k.copy(probe = !k.probe)) }
+            if (k.probe) Text("改间隔", fontSize = MT.Meta, color = m.ink2, modifier = Modifier.clip(RoundedCornerShape(50))
+                .clickable { com.openminis.app.plus.RegLedger.setKa(ctx, k.copy(everyH = com.openminis.app.plus.RegLedgerCore.cycleHours(k.everyH))) }
+                .padding(horizontal = 6.dp, vertical = 3.dp).semantics { contentDescription = "探活间隔 ${k.everyH} 小时，点按切换 $label" })
+        }
+        val line = com.openminis.app.plus.RegLedgerCore.statusLine(k, ::hmd)
+        if (line.isNotEmpty()) Text(line, fontSize = MT.Meta, color = if (!k.probeOk) Color(0xFFB0574F) else m.ink2, maxLines = 2, overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(top = 3.dp))
+    }
+}
+
+@Composable
+private fun KaChip(text: String, on: Boolean, desc: String, onClick: () -> Unit) {
+    val m = mines()
+    Row(Modifier.clip(RoundedCornerShape(50)).background(if (on) Color(0x22C0633F) else Color.Transparent).border(1.dp, if (on) Color(ORANGE) else m.glassBorder, RoundedCornerShape(50))
+        .clickable(onClick = onClick).padding(horizontal = 8.dp, vertical = 3.dp)
+        .semantics(mergeDescendants = true) { role = Role.Switch; selected = on; contentDescription = desc + if (on) "，已开" else "，已关" },
+        verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.size(6.dp).clip(CircleShape).background(if (on) Color(ORANGE) else m.ink3))
+        Text(text, fontSize = MT.Meta, color = if (on) Color(ORANGE) else m.ink2, modifier = Modifier.padding(start = 5.dp))
+    }
+}
+
+/** one temporary box on 注册台账: masked address + 「临时」, its platforms with status, its own switches; tap → the box */
+@Composable
+fun TempBoxCard(box: String, recs: List<com.openminis.app.plus.RegLedgerCore.Rec>, rows: List<Inbox3912Core.RegRow>, go: (String) -> Unit) {
+    val m = mines()
+    val hosts = (recs.map { it.host } + rows.map { it.host }).filter { it.isNotBlank() }.distinctBy { it.lowercase() }
+    MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp), onClick = { go(RegisterBox.route(box)) }) {
+        Column(Modifier.padding(vertical = 6.dp)) {
+            Row(Modifier.padding(horizontal = 16.dp, vertical = 6.dp).semantics(mergeDescendants = true) { contentDescription = "临时邮箱 ${Inbox3912Core.maskMail(box)}，${hosts.size} 个平台。点按查看" },
+                verticalAlignment = Alignment.CenterVertically) {
+                Text(Inbox3912Core.maskMail(box), fontSize = MT.Sub, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace, color = m.ink, modifier = Modifier.weight(1f), maxLines = 1)
+                StatusPill("临时", null)
+            }
+            hosts.take(4).forEach { h ->
+                val r = recs.firstOrNull { it.host.equals(h, true) }
+                val row = rows.firstOrNull { it.host.equals(h, true) }
+                val st = r?.st?.pill ?: row?.st?.zh ?: "已保存"
+                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(r?.platform?.ifBlank { null } ?: h, fontSize = MT.Body, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(listOfNotNull(h.takeIf { r?.platform?.isNotBlank() == true }, r?.st?.takeIf { !it.ok && it != com.openminis.app.plus.RegLedgerCore.RSt.RUNNING }?.zh?.takeIf { it != "未完成" },
+                            r?.why?.takeIf { it.isNotBlank() }, r?.let { hmd(it.createdAt.takeIf { t -> t > 0 } ?: it.updatedAt) }).joinToString(" · "),
+                            fontSize = MT.Meta, color = m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                    StatusPill(st, when (st) { "已验证" -> true; "未完成" -> false; else -> null })
+                }
+                KaLine(com.openminis.app.plus.RegLedgerCore.acctKey(h, box), h)   // this account: 自动延时 / 探针保活
+            }
+            KaLine(com.openminis.app.plus.RegLedgerCore.boxKey(box), "邮箱 " + Inbox3912Core.maskMail(box))
+        }
+    }
+}
+
+/** 「整理 N 个 · 补全 N · 删除 N ›」 once after a 整理 (tap → 最近删除) */
+@Composable
+fun TidySummaryLine(go: (String) -> Unit) {
+    val m = mines()
+    val s by com.openminis.app.plus.RegLedger.lastTidy.collectAsState()
+    val sum = s ?: return
+    Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp).clip(RoundedCornerShape(12.dp)).background(Color(0x14C0633F))
+        .clickable { go(RegisterBox.TRASH) }.padding(horizontal = 14.dp, vertical = 9.dp).semantics(mergeDescendants = true) { contentDescription = sum.line + " 点按查看最近删除" },
+        verticalAlignment = Alignment.CenterVertically) {
+        Text(sum.line, fontSize = MT.Sub, color = m.ink, modifier = Modifier.weight(1f), maxLines = 1)
+        Text("✕", fontSize = MT.Meta, color = m.ink2, modifier = Modifier.clip(CircleShape).clickable { com.openminis.app.plus.RegLedger.lastTidy.value = null }.padding(6.dp)
+            .semantics { contentDescription = "关闭整理小结" })
+    }
+}
+
+object RegisterBox {
+    const val ROUTE = "plus_register_box/{a}"
+    const val TRASH = "plus_register_trash"
+    fun route(a: String) = "plus_register_box/" + android.net.Uri.encode(a)
+
+    /** one temporary box: what it registered (platform, URL, status, time) + 重新收码 */
+    @Composable
+    fun Screen(box: String, onBack: () -> Unit) {
+        val m = mines()
+        val ctx = LocalContext.current
+        val scope = androidx.compose.runtime.rememberCoroutineScope()
+        remember { com.openminis.app.plus.RegLedger.init(ctx); 0 }
+        val all by com.openminis.app.plus.RegLedger.recs.collectAsState()
+        val recs = all.filter { it.box.equals(box, true) }
+        var codes by remember { mutableStateOf<List<com.openminis.app.plus.RegLedger.Code>?>(null) }
+        var busy by remember { mutableStateOf(false) }
+        var err by remember { mutableStateOf<String?>(null) }
+        val hasPass = remember { com.openminis.app.plus.RegLedger.boxPass(box) != null }
+        PlusPage("临时邮箱", onBack, subtitle = box) {
+            WarmGroupLabel("注册了 ${recs.size} 个平台")
+            if (recs.isEmpty()) InfoLine("这个邮箱还没有注册记录。")
+            MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp)) {
+                Column(Modifier.padding(vertical = 4.dp)) {
+                    recs.forEachIndexed { i, r ->
+                        if (i > 0) WarmDivider(16.dp)
+                        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)
+                            .semantics(mergeDescendants = true) { contentDescription = "${r.platform.ifBlank { r.host }}，${r.st.zh}" }, verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(r.platform.ifBlank { r.host }, fontSize = MT.Body, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(r.url.ifBlank { r.host }, fontSize = MT.Meta, color = m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(listOf(r.st.zh, r.why, "注册于 " + hmd(r.createdAt.takeIf { it > 0 } ?: r.updatedAt), "密码在台账").filter { it.isNotBlank() }.distinct().joinToString(" · "),
+                                    fontSize = MT.Meta, color = m.ink2, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            }
+                            StatusPill(r.st.pill, when { r.st.ok -> true; r.st == com.openminis.app.plus.RegLedgerCore.RSt.RUNNING -> null; else -> false })
+                        }
+                    }
+                }
+            }
+            WarmGroupLabel("收件")
+            MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp)) {
+                Column(Modifier.padding(horizontal = 16.dp, vertical = 10.dp)) {
+                    Text(if (hasPass) "Mail.tm · 邮箱密码在钥匙串，可随时再收信" else "Mail.tm · 没有这个邮箱的密码，收不了信", fontSize = MT.Meta, color = m.ink2)
+                    Box(Modifier.fillMaxWidth().padding(top = 10.dp).clip(RoundedCornerShape(12.dp)).background(if (busy) m.ink3.copy(alpha = 0.3f) else Color(0xFFD06A3A))
+                        .clickable(enabled = !busy) {
+                            busy = true; err = null
+                            scope.launch {
+                                val r = com.openminis.app.plus.RegLedger.codes(box, recs.firstOrNull()?.host.orEmpty())
+                                if (r == null) err = "邮箱登录不上（可能已失效）" else codes = r
+                                busy = false
+                            }
+                        }.padding(vertical = 11.dp).semantics { contentDescription = "重新收码" }, contentAlignment = Alignment.Center) {
+                        Text(if (busy) "收信中…" else "重新收码", color = Color.White, fontSize = MT.Button, fontWeight = FontWeight.Medium)
+                    }
+                    err?.let { Text(it, fontSize = MT.Meta, color = Color(0xFFB0574F), modifier = Modifier.padding(top = 6.dp)) }
+                    codes?.let { l ->
+                        if (l.isEmpty()) Text("没有验证码或验证链接。", fontSize = MT.Sub, color = m.ink2, modifier = Modifier.padding(top = 8.dp))
+                        l.take(5).forEach { c0 ->
+                            Column(Modifier.fillMaxWidth().padding(top = 8.dp)) {
+                                Text(if (c0.isLink) "验证链接" else Inbox3912Core.spaced(c0.text), fontSize = MT.Body, fontWeight = FontWeight.SemiBold, color = m.ink,
+                                    modifier = Modifier.semantics { contentDescription = if (c0.isLink) "验证链接" else "验证码 ${c0.text}" })
+                                Text(c0.subject.take(40) + " · " + hmd(c0.at), fontSize = MT.Meta, color = m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
+                    }
+                }
+            }
+            KaLine(com.openminis.app.plus.RegLedgerCore.boxKey(box), Inbox3912Core.maskMail(box))
+        }
+    }
+
+    /** 最近删除: what 整理 removed, kept 7 days, 恢复 puts the row (and its password) back */
+    @Composable
+    fun Trash(onBack: () -> Unit) {
+        val m = mines()
+        val ctx = LocalContext.current
+        remember { com.openminis.app.plus.RegLedger.init(ctx); 0 }
+        val l by com.openminis.app.plus.RegLedger.trash.collectAsState()
+        val now = System.currentTimeMillis()
+        PlusPage("最近删除", onBack, subtitle = "整理删掉的临时邮箱账号，保留 7 天") {
+            if (l.isEmpty()) InfoLine("没有删除的账号。")
+            if (l.isNotEmpty()) MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp)) {
+                Column(Modifier.padding(vertical = 4.dp)) {
+                    l.forEachIndexed { i, t ->
+                        if (i > 0) WarmDivider(16.dp)
+                        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(t.rec.platform.ifBlank { t.host.ifBlank { "未知平台" } }, fontSize = MT.Body, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(Inbox3912Core.maskMail(t.account) + " · 还剩 ${com.openminis.app.plus.RegLedgerCore.daysLeft(t, now)} 天", fontSize = MT.Meta, color = m.ink2, maxLines = 1)
+                            }
+                            Text("恢复", fontSize = MT.Sub, color = Color(ORANGE), modifier = Modifier.clip(RoundedCornerShape(50)).background(Color(0x22C0633F))
+                                .clickable { com.openminis.app.plus.RegLedger.restore(ctx, t.id) }.padding(horizontal = 12.dp, vertical = 5.dp)
+                                .semantics { contentDescription = "恢复 ${t.host}" })
+                        }
+                    }
+                }
+            }
         }
     }
 }
