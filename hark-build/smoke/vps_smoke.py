@@ -7313,6 +7313,33 @@ def b3914(res):
         if best: sh(f"input tap {best[0]} {best[1]}"); time.sleep(3); return True
         return False
 
+    # [38.9.14.1] exactly one bottom bar: the old home bar (对话 / 知识库 …) must never show, and no dock label appears twice
+    def bars(r):
+        old, new = set(), {}
+        for t, d, x, y, n in nodes(r) if r is not None else []:
+            if y <= SCREEN[1] * 0.8: continue
+            for lab in {t, (d or "").split("，")[0]}:
+                if lab in ("对话", "知识库"): old.add(lab)
+                if lab in ("聊天", "任务", "消息", "应用"): new.setdefault(lab, []).append(x)
+        def clusters(xs):
+            xs = sorted(xs); c = 0; last = None
+            for v in xs:
+                if last is None or v - last > 60: c += 1
+                last = v
+            return c
+        return old, {k: clusters(v) for k, v in new.items()}
+    def one_bar(name, dock=True):
+        r = dump(); old, new = bars(r)
+        o.setdefault("bars", {})[name] = {"old": sorted(old), "dock": new}
+        if old: fail(f"{name}: old bottom bar shown ({sorted(old)})")
+        twice = [k for k, v in new.items() if v > 1]
+        if twice: fail(f"{name}: bottom label shown twice {twice} (two bars?)")
+        if dock and len(new) < 4: fail(f"{name}: 4-tab dock missing ({sorted(new)})")
+        if not dock and new and len(new) >= 3: fail(f"{name}: unexpected dock here ({sorted(new)})")
+        return r
+    def top_act():
+        return sh("dumpsys activity activities | grep -E 'topResumedActivity|mResumedActivity' | head -2")
+
     set_zh(); o["seedmodel"] = seed_model()
     try: result_json("group", "wallpaper off")
     except Exception: pass
@@ -7327,7 +7354,27 @@ def b3914(res):
         miss = [w for w in ("聊天", "任务", "消息", "应用") if w not in t]
         if miss: fail(f"launch: not on 聊天 with the dock (missing {miss})")
         if "最近对话" in t: fail("launch: old conversation list shown instead of 聊天")
+        one_bar("launch")
     step("launch", launch)
+
+    def back_root():
+        # [38.9.14.1] back on 聊天 (root) → Mines goes to the background (launcher); never the old list / old bar
+        back(1); time.sleep(2.5)
+        top = top_act(); o["back_top"] = top.strip()[:200]
+        r = shot("after-back"); t = _txt(r); o["after_back_txt"] = t[:300]
+        if PKG in top:
+            o["back_root"] = "stayed"
+            if "最近对话" in t or "开个新对话" in t: fail("back on 聊天 opened the old conversation list")
+            one_bar("after-back")
+        else:
+            o["back_root"] = "background"
+        if not alive(): fail("back on 聊天 killed Mines")
+        sh(f"am start -n {PKG}/com.openminis.app.MainActivity"); time.sleep(6)
+        r = shot("resume"); t = _txt(r); o["resume_txt"] = t[:300]
+        if "最近对话" in t: fail("resume after back: old conversation list shown")
+        if PKG not in top_act(): fail("resume after back: Mines not in front")
+        one_bar("resume")
+    step("back_root", back_root)
 
     def task():
         out = result_json("group", "i3914 say 帮我注册 zeabur", timeout=40); o["say_task"] = out
@@ -7363,6 +7410,7 @@ def b3914(res):
         back(1); time.sleep(2)
         r = dump()
         if r is None or "已建任务" not in _txt(r): fail("back from the task conversation did not return to 聊天")
+        one_bar("chip-back")
     step("open_chip", open_chip)
 
     def quick():
@@ -7379,15 +7427,38 @@ def b3914(res):
         r = shot("tab-tasks"); t = _txt(r); o["tab_tasks"] = t[:500]
         for w in ("等你处理", "进行中", "已完成", "Zeabur"):
             if w not in t: fail(f"任务 page missing {w}")
+        # [38.9.14.1] the finished register task is listed once (its 项目 card), not again under 已完成
+        a, b = t.find("已完成"), t.find("项目  ")
+        if a >= 0 and b > a and "Zeabur" in t[a:b]: fail("finished task shown twice on 任务 (已完成 + 项目)")
+        one_bar("tab-tasks")
+        # 全部对话 (old list, history only): no old bar; back returns to 任务 with the dock
+        r = dump(); p = find(r, "全部对话 ›") or find(r, "全部对话")
+        if not p: fail("任务: 全部对话 link not found")
+        else:
+            sh(f"input tap {p[0]} {p[1]}"); time.sleep(4)
+            r = shot("history"); o["history_txt"] = _txt(r)[:300]
+            one_bar("history", dock=False)
+            back(1); time.sleep(3)
+            r = shot("history-back"); t2 = _txt(r); o["history_back_txt"] = t2[:200]
+            if "等你处理" not in t2: fail("back from 全部对话 did not return to 任务")
+            one_bar("history-back")
         if not tap_dock("消息"): fail("dock 消息 not found")
-        shot("tab-messages")
+        shot("tab-messages"); one_bar("tab-messages")
         if not tap_dock("应用"): fail("dock 应用 not found"); return
         r = shot("tab-apps"); t = _txt(r); o["tab_apps"] = t[:300]
+        one_bar("tab-apps")
         if "知识库" not in t: fail("应用: 知识库 missing")
         elif t.find("知识库") > t.find("浏览器") >= 0: fail("应用: 知识库 not first")
         if not tap_dock("聊天"): fail("dock 聊天 not found"); return
         r = shot("tab-chat")
         if "已建任务" not in _txt(r): fail("dock 聊天 did not return to the main conversation")
+        one_bar("tab-chat")
+        back(1); time.sleep(2.5)   # [38.9.14.1] back on 聊天 reached via the dock: still never the old list
+        top = top_act(); r = dump(); t = _txt(r) if PKG in top else ""
+        o["tab_chat_back"] = "stayed" if PKG in top else "background"
+        if "最近对话" in t or "开个新对话" in t: fail("back on 聊天 (after tabs) opened the old conversation list")
+        if PKG not in top: sh(f"am start -n {PKG}/com.openminis.app.MainActivity"); time.sleep(5)
+        shot("tab-chat-back")
     step("tabs", tabs)
 
     def dark():

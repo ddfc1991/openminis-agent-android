@@ -643,6 +643,17 @@ fun AppNavigation(
         // them keeps working unchanged. On a phone the scaffold resolves to a
         // single pane, so those pushes look and behave exactly as before.
         composable(Routes.SESSION_LIST) {
+            // [Mines-38.9.14.1 chat_home] here the list is 全部对话 (opened from 任务): back returns to 聊天 → 任务, not out of the app
+            val chOn by com.openminis.app.plus.ChatHome.on.collectAsState()
+            val histCtx = LocalContext.current
+            val histScope = androidx.compose.runtime.rememberCoroutineScope()
+            androidx.activity.compose.BackHandler(enabled = chOn && com.openminis.app.plus.ChatHome.loaded && (com.openminis.app.plus.ChatHome.redirected || com.openminis.app.plus.ChatHome.mainSid.isNotBlank())) {
+                histScope.launch {
+                    val main = com.openminis.app.plus.ChatHome.ensureMain(histCtx) ?: return@launch
+                    navController.navigate(Routes.chat(main)) { popUpTo(Routes.SESSION_LIST) { inclusive = false }; launchSingleTop = true }
+                    navController.navigate(com.openminis.app.ui.plus.TaskRoutes.TASKS) { launchSingleTop = true }
+                }
+            }
             ChatSplitScaffoldRoute(
                 initialSessionId = null,
                 navController = navController,

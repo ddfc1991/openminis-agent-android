@@ -1452,7 +1452,7 @@ fun SessionListScreen(
                     onDelete = { showBulkDeleteDialog = true },
                     modifier = Modifier.align(Alignment.BottomCenter),
                 )
-            } else if (hasProviders && !isSearchActive && minesAllSessions.isNotEmpty()) {
+            } else if (hasProviders && !isSearchActive && minesAllSessions.isNotEmpty() && !com.openminis.app.plus.ChatHome.enabled()) {   // [Mines-38.9.14.1] no old input bar / dock under 聊天主页
                 // [Mines-38.5] solid band behind both bars (no list text between / through them)
                 com.openminis.app.ui.plus.WarmBottomDock(Modifier.align(Alignment.BottomCenter))
                 // [Mines-38.1] board 01 bottom input bar above the 5-tab bar
@@ -1510,7 +1510,8 @@ fun SessionListScreen(
                 )
             }
             // [Mines-warm-36] bottom bar (对话 · 消息 · 灵感 · 任务 · 应用); 消息 shows the red count of things to handle
-            if (!isSelecting && isInitialLoadComplete && minesHomeShown) com.openminis.app.ui.plus.WarmHomeNav(
+            // [Mines-38.9.14.1 chat_home] with 聊天主页 on this list is only 全部对话 (history): the 4-tab dock is the one bottom bar
+            if (!isSelecting && isInitialLoadComplete && minesHomeShown && !com.openminis.app.plus.ChatHome.enabled()) com.openminis.app.ui.plus.WarmHomeNav(
                 modifier = Modifier.align(Alignment.BottomCenter),
                 onTasks = { if (com.openminis.app.plus.TaskProjects.enabled()) com.openminis.app.ui.plus.PlusNav.go(com.openminis.app.ui.plus.TaskRoutes.TASKS) else onScheduledTasksClick() },   // [Mines-38.9.13 task_projects]
                 onTop = { scope.launch { listState.animateScrollToItem(0) } },
