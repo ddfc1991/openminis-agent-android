@@ -22,6 +22,21 @@ def _url(base):
     return b + "/chat/completions"
 
 
+_DEAD = {}          # base url -> unreachable until (epoch s); e.g. a China-only endpoint seen from the Singapore box
+DEAD_FOR = 600
+
+
+def _reachable(base, timeout=8):
+    """a fast TCP check so an unreachable gateway costs 8 s, not three 90 s read timeouts"""
+    from urllib.parse import urlparse
+    u = urlparse(base)
+    try:
+        socket.create_connection((u.hostname, u.port or (443 if u.scheme == "https" else 80)), timeout).close()
+        return True
+    except OSError:
+        return False
+
+
 def chat(provider, messages, tools=None, timeout=90, max_tokens=2000):
     body = {"model": provider["model"], "messages": messages, "max_tokens": max_tokens, "temperature": 0.3}
     if tools:
@@ -60,7 +75,15 @@ def chat_with_fallback(providers, messages, tools=None, tries_per_model=3, backo
                        timeout=90):
     """per-step retry with back-off on the same model, then the next model; raises the last error when all fail"""
     last = None
-    for p in providers:
+    now = time.time()
+    live = [p for p in providers if _DEAD.get(p.get("base", ""), 0) < now]
+    for p in (live or providers):
+        if not _reachable(p.get("base", "")):
+            _DEAD[p.get("base", "")] = time.time() + DEAD_FOR
+            last = ModelError(f"network: {p.get('base', '')} 连不上（服务器所在地区访问不了）", retry=True)
+            if log:
+                log(p, 0, last)
+            continue
         for i in range(tries_per_model):
             try:
                 out = chat(p, messages, tools, timeout=timeout)

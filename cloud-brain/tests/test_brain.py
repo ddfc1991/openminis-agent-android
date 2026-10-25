@@ -141,6 +141,32 @@ class BrainCase(unittest.TestCase):
         self.assertIn("flaky-1", retries)       # 2 retries with back-off on the flaky one, then it answered
         self.assertEqual([e for e in ev["events"] if e["type"] == "say"][0]["data"]["model"], "flaky-1")
 
+    def test_unreachable_gateway_skipped_fast(self):
+        mdl._DEAD.clear()
+        self.c.req("POST", "/v1/providers", {"providers": [
+            {"name": "cn-only", "base": "http://127.0.0.1:1/v1", "model": "dead-cn"},
+            {"name": "fake", "base": FAKE_BASE + "/v1", "model": "fake-1"}]})
+        t0 = time.time()
+        tid = self.submit(script({"say": "绕过了"}))
+        t = self.c.wait_status(tid, ("done", "error"))
+        self.assertEqual(t["status"], "done", t)
+        self.assertLess(time.time() - t0, 10)
+        self.assertIn("http://127.0.0.1:1/v1", mdl._DEAD)
+        mdl._DEAD.clear()
+
+    def test_unreachable_gateway_skipped_fast(self):
+        mdl._DEAD.clear()
+        self.c.req("POST", "/v1/providers", {"providers": [
+            {"name": "cn-only", "base": "http://127.0.0.1:1/v1", "model": "dead-cn"},
+            {"name": "fake", "base": FAKE_BASE + "/v1", "model": "fake-1"}]})
+        t0 = time.time()
+        tid = self.submit(script({"say": "绕过了"}))
+        t = self.c.wait_status(tid, ("done", "error"))
+        self.assertEqual(t["status"], "done", t)
+        self.assertLess(time.time() - t0, 10)
+        self.assertIn("http://127.0.0.1:1/v1", mdl._DEAD)
+        mdl._DEAD.clear()
+
     def test_all_models_down_requeues_then_errors(self):
         self.c.req("POST", "/v1/providers", {"providers": [{"name": "dead", "base": FAKE_BASE + "/fail500/v1", "model": "dead-1"}]})
         tid = self.submit(script({"say": "x"}))
