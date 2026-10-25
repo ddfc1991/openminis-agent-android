@@ -148,6 +148,11 @@ try:
     I3913 = "i3913" in open("hark-build/smoke/target").read().splitlines()[1:2][0].split()   # [38.9.13] task projects / VPS page / handoff v2 / memory v2 / Mines browser
 except Exception:
     I3913 = False
+try:
+    I3914 = "i3914" in open("hark-build/smoke/target").read().splitlines()[1:2][0].split()   # [38.9.14] chat_home: 聊天 + auto tasks
+except Exception:
+    I3914 = False
+if I3914: I397 = True
 if I39113: I39112 = True
 if I39112: I39111 = True
 if I3911: I397 = True
@@ -3308,6 +3313,7 @@ def main():
         if I395: fns = (b395_i2, b395_i) if I395B else (b395_i,)   # [38.9.5 i] build-i gate only: 一键关联 / 一键重新登录, gateway, new screens light + dark
         if I39113: fns = ((b3913,) if I3913 else ()) + ((b39121,) if I39121 else ()) + ((b3912,) if I3912 else ()) + (b39113,)
         elif I39112: fns = (b39112,)
+        if I3914: fns = (b3914,)
         elif I39111: fns = (b39111,)
         elif I3911: fns = (b3911,)
         elif I3910: fns = (b3910,)
@@ -7271,6 +7277,139 @@ def b39121(res):
 
 
 # ======================= [38.9.13 integ] task projects / VPS page / handoff v2 / memory v2 / Mines browser =======================
+def b3914(res):
+    """[38.9.14 chat_home] cold launch lands on 聊天 (main conversation) with the 4-tab dock; 「帮我注册 zeabur」 → router says task →
+    「已建任务」 chip, the task runs in its own conversation in the background (进行中 → 完成, notice in 聊天), tap chip opens the task;
+    「今天几号」 → inline answer, no new task; dock 任务 (等你处理 / 进行中 / 已完成) / 消息 / 应用 (知识库 first) / 聊天; 实验功能 row."""
+    o = res.setdefault("i3914", {})
+    def shot(name):
+        r = snap("i3914-" + name)
+        subprocess.run(f"cp {OUT}/{step_no:02d}-i3914-{name}.png {OUT}/i3914-{name}.png", shell=True)
+        return r
+    def fail(m): selftest_fail.append("i3914 " + m); print("I3914 FAIL " + m, flush=True)
+    def state():
+        s = result_json("group", "i3914 state", timeout=20)
+        return s if isinstance(s, dict) else {}
+    def fake():
+        try: return json.loads(subprocess.run("curl -s http://127.0.0.1:8088/stats", shell=True, capture_output=True, text=True, timeout=10).stdout)
+        except Exception: return {}
+    def wait_state(pred, secs):
+        t0 = time.time(); s = state()
+        while time.time() - t0 < secs:
+            if pred(s): return s
+            time.sleep(2); s = state()
+        return s
+    def step(name, f):
+        t0 = time.time()
+        try: f()
+        except Exception as e:
+            import traceback; traceback.print_exc(); fail(f"{name} error {e}")
+        print(f"I3914 STEP {name} {int(time.time() - t0)} s", flush=True)
+        if not alive(): crashed.append(f"i3914 {name}"); recover(f"i3914 {name}")
+    def tap_dock(label):
+        r = dump(); best = None
+        for t, d, x, y, n in nodes(r) if r is not None else []:
+            if (t == label or d == label or (d or "").startswith(label + "，")) and y > SCREEN[1] * 0.8: best = (x, y)
+        if best: sh(f"input tap {best[0]} {best[1]}"); time.sleep(3); return True
+        return False
+
+    set_zh(); o["seedmodel"] = seed_model()
+    try: result_json("group", "wallpaper off")
+    except Exception: pass
+
+    def launch():
+        sh(f"am force-stop {PKG}"); time.sleep(2)
+        sh(f"am start -W -n {PKG}/com.openminis.app.MainActivity", timeout=90); time.sleep(10); dismiss_dialogs()
+        r = shot("launch"); t = _txt(r); o["launch_txt"] = t[:300]
+        s = state(); o["state0"] = s
+        if not s.get("on"): fail(f"flag chat_home not on by default: {s}")
+        if not s.get("main"): fail("no main conversation after launch")
+        miss = [w for w in ("聊天", "任务", "消息", "应用") if w not in t]
+        if miss: fail(f"launch: not on 聊天 with the dock (missing {miss})")
+        if "最近对话" in t: fail("launch: old conversation list shown instead of 聊天")
+    step("launch", launch)
+
+    def task():
+        out = result_json("group", "i3914 say 帮我注册 zeabur", timeout=40); o["say_task"] = out
+        s = wait_state(lambda s: len(s.get("tasks") or []) >= 1, 40); o["state_task"] = s
+        ts = s.get("tasks") or []
+        if not ts: fail(f"no task created for 帮我注册 zeabur: {s}"); return
+        t = ts[-1]; o["task"] = t
+        if "Zeabur" not in t.get("name", ""): fail(f"task name not the project: {t.get('name')}")
+        if not str(s.get("last", "")).startswith("TASK"): fail(f"router decision not TASK: {s.get('last')}")
+        time.sleep(2); r = shot("chip-running"); txt = _txt(r)
+        if "已建任务" not in txt: fail("chip 已建任务 not shown in 聊天")
+        o["chip_running_state"] = t.get("st")
+        if t.get("st") not in ("queued", "running"): print(f"I3914 note: task already {t.get('st')} at first look", flush=True)
+        rows = s.get("rows") or []
+        if not any(x.get("tag", "").startswith("CREATED") for x in rows): fail(f"no CREATED row in 聊天: {rows[-3:]}")
+        if any(x.get("role") == "assistant" and not x.get("tag") for x in rows[-2:]): fail("main chat got a model reply for the task message (tool spam?)")
+        s2 = wait_state(lambda s: any(x.get("st") == "done" for x in (s.get("tasks") or [])), 120); o["state_done"] = s2
+        d = [x for x in (s2.get("tasks") or []) if x.get("st") == "done"]
+        if not d: fail(f"task did not finish in background: {(s2.get('tasks') or [])}"); return
+        o["task_done"] = d[-1]
+        time.sleep(3); r = shot("chip-done"); txt = _txt(r)
+        if not any(x.get("tag", "").startswith("DONE") for x in (s2.get("rows") or [])): fail("no DONE notice row in 聊天")
+        if "完成" not in txt: fail("完成 not visible in 聊天 after the task finished")
+        if (fake().get("task_posts") or 0) < 1: fail("the task conversation never called the model")
+    step("task", task)
+
+    def open_chip():
+        r = dump(); p = find(r, "已建任务")
+        if not p: fail("chip not found to tap"); return
+        sh(f"input tap {p[0]} {p[1]}"); time.sleep(4)
+        r = shot("task-page"); t = _txt(r); o["task_page"] = t[:400]
+        if "帮我注册 zeabur" not in t: fail("tapping the chip did not open the task conversation")
+        back(1); time.sleep(2)
+        r = dump()
+        if r is None or "已建任务" not in _txt(r): print("I3914 note: back from task did not return to 聊天", flush=True)
+    step("open_chip", open_chip)
+
+    def quick():
+        n0 = len(state().get("tasks") or [])
+        result_json("group", "i3914 say 今天几号", timeout=40)
+        s = wait_state(lambda s: any("10 月 25 日" in (x.get("text") or "") for x in (s.get("rows") or [])), 40); o["state_quick"] = s
+        if len(s.get("tasks") or []) != n0: fail("今天几号 created a task")
+        if not any("10 月 25 日" in (x.get("text") or "") for x in (s.get("rows") or [])): fail("今天几号 not answered inline")
+        time.sleep(2); shot("quick-answer")
+    step("quick", quick)
+
+    def tabs():
+        if not tap_dock("任务"): fail("dock 任务 not found"); return
+        r = shot("tab-tasks"); t = _txt(r); o["tab_tasks"] = t[:500]
+        for w in ("等你处理", "进行中", "已完成", "Zeabur"):
+            if w not in t: fail(f"任务 page missing {w}")
+        if not tap_dock("消息"): fail("dock 消息 not found")
+        shot("tab-messages")
+        if not tap_dock("应用"): fail("dock 应用 not found"); return
+        r = shot("tab-apps"); t = _txt(r); o["tab_apps"] = t[:300]
+        if "知识库" not in t: fail("应用: 知识库 missing")
+        elif t.find("知识库") > t.find("浏览器") >= 0: fail("应用: 知识库 not first")
+        if not tap_dock("聊天"): fail("dock 聊天 not found"); return
+        r = shot("tab-chat")
+        if "已建任务" not in _txt(r): fail("dock 聊天 did not return to the main conversation")
+    step("tabs", tabs)
+
+    def dark():
+        try:
+            theme388(2); time.sleep(3); shot("chat-dark")
+            tap_dock("任务"); shot("tab-tasks-dark"); tap_dock("聊天"); theme388(1); time.sleep(2)
+        except Exception as e: print("I3914 dark error", e, flush=True)
+    step("dark", dark)
+
+    def experiments():
+        route("settings", 3); tap_text("测试与上报", wait=3)
+        seen = set()
+        for i in range(10):
+            r = dump(); seen |= set(texts(r))
+            if any("聊天主页" in x for x in seen): shot("settings-experiments"); break
+            scroll_down()
+        if not any("聊天主页" in x for x in seen): fail("实验功能: 聊天主页 row missing")
+        back(2)
+    step("experiments", experiments)
+    print("I3914 RESULT " + json.dumps(o, ensure_ascii=False)[:6000], flush=True)
+
+
 def b3913(res):
     """[38.9.13] integrated build: 设置 → 实验功能 (one section, every flag) + 浏览器验证 rows; VPS / 电脑 page (change a rule →
     已改 → 恢复默认); 任务 page (项目 / 已归档); 「帮我注册 zeabur.com」 → 立项 sheet without a password field → project; Google sign-in
