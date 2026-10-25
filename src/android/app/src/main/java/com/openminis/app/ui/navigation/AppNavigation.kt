@@ -18,6 +18,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.ime
 import androidx.navigation.compose.currentBackStackEntryAsState
 import kotlinx.coroutines.launch
 import com.openminis.app.deeplink.DeepLinkAction
@@ -1776,7 +1778,7 @@ fun AppNavigation(
 @Composable
 private fun imeUp(): Boolean {
     val d = androidx.compose.ui.platform.LocalDensity.current
-    return androidx.compose.foundation.layout.WindowInsets.ime.getBottom(d) > 0
+    return WindowInsets.ime.getBottom(d) > 0
 }
 
 @Composable
