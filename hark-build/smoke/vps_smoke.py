@@ -7337,6 +7337,10 @@ def b3914(res):
         if dock and len(new) < 4: fail(f"{name}: 4-tab dock missing ({sorted(new)})")
         if not dock and new and len(new) >= 3: fail(f"{name}: unexpected dock here ({sorted(new)})")
         return r
+    def to_bottom():
+        # new 聊天 rows written by ChatHome while the list is scrolled up show 「回到底部」: go down first
+        r = dump(); p = find(r, "回到底部")
+        if p: sh(f"input tap {p[0]} {p[1]}"); time.sleep(1.5)
     def top_act():
         return sh("dumpsys activity activities | grep -E 'topResumedActivity|mResumedActivity' | head -2")
 
@@ -7495,7 +7499,7 @@ def b3914(res):
         elif t.find("知识库") > t.find("浏览器") >= 0: fail("应用: 知识库 not first")
         if not tap_dock("聊天"): fail("dock 聊天 not found"); return
         r = shot("tab-chat")
-        if "已建任务" not in _txt(r): fail("dock 聊天 did not return to the main conversation")
+        if "已建任务" not in _txt(r) and "已创建任务" not in _txt(r): fail("dock 聊天 did not return to the main conversation")
         one_bar("tab-chat")
         back(1); time.sleep(2.5)   # [38.9.14.1] back on 聊天 reached via the dock: still never the old list
         top = top_act(); r = dump(); t = _txt(r) if PKG in top else ""
@@ -7525,7 +7529,9 @@ def b3914(res):
         if not drops: fail(f"netdrop: no drop logged within 60 s: {(s.get('netdrops') or [])[-4:]}"); return
         o["netdrop_drop"] = drops[-1]
         if not drops[-1].get("state"): fail("netdrop: drop logged without the device state (screen / app / net / idle)")
+        to_bottom()
         r = dump(); p = find(r, "已建任务 断网测试") or find(r, "断网测试")
+        opened = bool(p)
         if p: sh(f"input tap {p[0]} {p[1]}"); time.sleep(2.5)
         else: fail("netdrop: chip 「已建任务 断网测试」 not found")
         r = shot("netdrop-wait"); t = _txt(r); o["netdrop_wait_txt"] = t[-300:]
@@ -7540,9 +7546,46 @@ def b3914(res):
         time.sleep(2); r = shot("netdrop-done"); t = _txt(r); o["netdrop_done_txt"] = t[-300:]
         if "断网后已继续" not in t: fail("netdrop: resumed reply not visible in the task conversation")
         if "网络断了" in t: fail("netdrop: wait line still shown after the reply")
-        back(1); time.sleep(2.5)
-        r = shot("netdrop-chat"); one_bar("netdrop-chat")
+        if opened: back(1); time.sleep(2.5)
+        to_bottom(); r = shot("netdrop-chat"); one_bar("netdrop-chat")
     step("netdrop", netdrop)
+
+    def fold():
+        # [38.9.14.1] one card per task: 出错 → 等你 → 出错 → 完成 of one task show as ONE 完成 card with 「已重试 2 次 · 历史尝试 3 ›」;
+        # tapping it expands the older attempts
+        tap_dock("聊天"); time.sleep(1)
+        o["fold_seed"] = result_json("group", "i3914 foldseed", timeout=30); time.sleep(4); to_bottom()
+        r = shot("fold"); t = _txt(r); o["fold_txt"] = t[-400:]
+        cards = [x for x in texts(r) if "账号关联测试 · 回复你" in x]
+        o["fold_cards"] = len(cards)
+        if len(cards) != 1: fail(f"fold: {len(cards)} cards for one task (want 1)")
+        if "已重试 2 次" not in t: fail("fold: 「已重试 2 次」 missing on the folded card")
+        if "完成 · 6/6 步" not in t: fail("fold: the folded card does not show the latest state (完成)")
+        p = find(r, "历史尝试")
+        if not p: fail("fold: 「历史尝试」 link missing"); return
+        sh(f"input tap {p[0]} {p[1]}"); time.sleep(2)
+        r = shot("fold-open"); t = _txt(r); o["fold_open_txt"] = t[-400:]
+        if t.count("Software caused connection abort") < 3: fail("fold: expanding did not show the 3 older attempts")
+        one_bar("fold-open")
+    step("fold", fold)
+
+    def nocall():
+        # [38.9.14.1] the 来电 (MinesCallActivity) feature is removed: no 提醒/来电 rows on 应用, no activity in the manifest, no crash
+        if not tap_dock("应用"): fail("nocall: dock 应用 not found"); return
+        seen = set()
+        for _ in range(8):
+            r = dump(); seen |= set(texts(r)); scroll_down()
+        time.sleep(1); r = shot("apps-nocall"); seen |= set(texts(r))
+        bad = [x for x in seen if "来电" in x]
+        o["nocall_rows"] = bad[:5]
+        if bad: fail(f"nocall: 来电 entry still shown {bad[:3]}")
+        o["nocall_selftest"] = result_json("group", "i3912 call", timeout=15)
+        act = sh(f"dumpsys package {PKG} | grep -c MinesCallActivity").strip()
+        o["nocall_manifest"] = act
+        if act not in ("", "0"): fail(f"nocall: MinesCallActivity still in the manifest ({act})")
+        if not alive(): fail("nocall: Mines died"); crashed.append("i3914 nocall"); recover("i3914 nocall")
+        tap_dock("聊天")
+    step("nocall", nocall)
 
     def experiments():
         route("settings", 3); tap_text("测试与上报", wait=3)

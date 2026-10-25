@@ -74,6 +74,9 @@ object ChatHome {
     private fun save() { prefs()?.edit()?.putString("tasks", ChatHomeCore.toJson(_tasks.value.takeLast(200)))?.apply() }
     fun setOn(c: Context, v: Boolean) { init(c); _on.value = v; prefs()?.edit()?.putBoolean("on", v)?.apply() }
 
+    /** [38.9.14.1] smoke only: put a finished task in the list (its notices are written by the caller) */
+    fun seedForTest(t: AutoTask) { _tasks.value = _tasks.value.filter { it.id != t.id } + t; save() }
+
     private fun update(id: String, f: (AutoTask) -> AutoTask) {
         synchronized(this) { _tasks.value = _tasks.value.map { if (it.id == id) f(it) else it } }
         save()

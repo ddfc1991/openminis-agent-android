@@ -675,9 +675,7 @@ object GroupSelfTest {
                     "autoclean" -> kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                         com.openminis.app.plus.LoginMemory.forget(context, "login.autologin-smoke.test"); "cleaned"
                     }
-                    "call" -> { kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) { context.startActivity(android.content.Intent(context, com.openminis.app.ui.plus.MinesCallActivity::class.java)
-                        .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK).putExtra("silent", true)
-                        .putExtra("title", "任务完成 · 12 家报价已汇总").putExtra("body", "最低是 Vultr \$12/月，接起来我跟你说细节，或者直接转成文字。")) }; "ok" }
+                    "call" -> "removed"   // [Mines-38.9.14.1] 来电 removed
                     "pool" -> JSONObject().put("reads", com.openminis.app.ui.plus.WorkPoolLive.reads).put("nodes", JSONArray(com.openminis.app.ui.plus.WorkPoolLive.nodes.values.map {
                         JSONObject().put("name", it.name).put("role", it.role.name).put("online", it.online).put("mem", it.memPct) })).toString()
                     // [Mines-38.9.12 b] 'mailcodes' (fake mailbox + 2 code mails) · 'codes' (验证码 tab readout) · 'mailoff' · 'attn' · 'reg'
@@ -895,7 +893,22 @@ object GroupSelfTest {
                         }
                         JSONObject(H.stateJson()).put("rows", rows).put("stalls", com.openminis.app.plus.StallWatch.json()).put("netdrops", com.openminis.app.plus.NetDrop.json()).toString()
                     }
-                    else -> "i3914 main | say <text> | state"
+                    // [38.9.14.1] one card per task: a task with 出错 → 等你 → 出错 → 完成 notices (like the user's screenshot)
+                    "foldseed" -> {
+                        if (H.mainSid.isBlank()) H.ensureMain(context)
+                        val now = System.currentTimeMillis()
+                        val g = "账号关联测试：那么账号关联这里有没有办法解决？"
+                        val t = com.openminis.app.plus.ChatHomeCore.AutoTask("fold3914", "", "账号关联测试", g, com.openminis.app.plus.ChatHomeCore.St.DONE,
+                            6, 6, "完成 · 6/6 步", now - 60_000, now, "done")
+                        H.seedForTest(t)
+                        val K = com.openminis.app.plus.ChatHomeCore.Kind
+                        H.appendToMain(listOf("user" to g, "assistant" to com.openminis.app.plus.ChatHomeCore.tagText(t.id, K.CREATED, com.openminis.app.plus.ChatHomeCore.createdLine(t.name))))
+                        for ((k, b) in listOf(K.ERROR to "没完成：Software caused connection abort", K.ASK to "Software caused connection abort",
+                                K.ERROR to "没完成：Software caused connection abort", K.DONE to "完成 · 6/6 步"))
+                            H.appendToMain(listOf("assistant" to com.openminis.app.plus.ChatHomeCore.tagText(t.id, k, b)))
+                        JSONObject().put("seeded", t.id).toString()
+                    }
+                    else -> "i3914 main | say <text> | state | foldseed"
                 }
             }
             "i39113" -> {

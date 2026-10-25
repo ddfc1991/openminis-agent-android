@@ -4212,6 +4212,13 @@ fun ChatScreen(
                 val perfFirstLayoutFired = remember(sessionId) { java.util.concurrent.atomic.AtomicBoolean(false) }
                 Box {
                 AlwaysStretchOverscrollBox { sharedEffect ->
+                // [Mines-38.9.14.1] one card per task: fold retries / repeated state cards of the same task root into the newest one
+                val minesTasksNow by com.openminis.app.plus.ChatHome.tasks.collectAsState()
+                val minesFold = remember(flatItems, minesTasksNow) {
+                    com.openminis.app.plus.ChatHomeCore.foldNotices(flatItems.mapNotNull { (it as? FlatChatItem.MinesTaskItem)?.let { t ->
+                        com.openminis.app.plus.ChatHomeCore.NoticeRef(t.key, t.tag.taskId, t.tag.kind, t.tag.body) } }) { id ->
+                        com.openminis.app.plus.ChatHomeCore.rootKey(minesTasksNow.firstOrNull { it.id == id }, id) }
+                }
                 LazyColumn(
                     state = listState,
                     reverseLayout = true,
@@ -4675,7 +4682,7 @@ fun ChatScreen(
                             // [T-p2-delegate-render] A helper block gets its
                             // own card; everything else keeps the pill.
                             // [Mines-38.9.14 chat_home] 已建任务 chip / task notice
-                            is FlatChatItem.MinesTaskItem -> com.openminis.app.ui.plus.MinesTaskNotice(item.tag)
+                            is FlatChatItem.MinesTaskItem -> com.openminis.app.ui.plus.MinesTaskNotice(item.tag, minesFold[item.key])
                             is FlatChatItem.AgentCallbackCard -> AgentCallbackCard(
                                 callback = item.callback,
                                 onTap = { callbackDetailBlock = item.callback.syntheticBlock() },
