@@ -796,6 +796,10 @@ fun AppNavigation(
         composable(com.openminis.app.ui.plus.Routes3912.REGISTER) {
             com.openminis.app.ui.plus.RegisterLedgerScreen(onBack = { navController.safePopBackStack() }, go = { navController.safeNavigate(it) })
         }
+        // [Mines-38.9.15 register_auto] the step Mines stops for (captcha / phone / payment), on the same page
+        composable(com.openminis.app.ui.plus.RegisterTakeover.ROUTE) {
+            com.openminis.app.ui.plus.RegisterTakeover.Screen(onBack = { navController.safePopBackStack() })
+        }
         // [Mines-38.9.13 task_projects] 任务 (项目 / 小任务 / 已归档) · 项目详情
         composable(com.openminis.app.ui.plus.TaskRoutes.TASKS) {
             com.openminis.app.ui.plus.TasksScreen(onBack = { navController.safePopBackStack() }, go = { navController.safeNavigate(it) })

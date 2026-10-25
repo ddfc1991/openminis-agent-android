@@ -162,7 +162,6 @@ fun RegisterLedgerScreen(onBack: () -> Unit, go: (String) -> Unit) {
     val scope = rememberCoroutineScope()
     var rows by remember { mutableStateOf<List<Inbox3912Core.RegRow>?>(null) }
     var boxes by remember { mutableStateOf(com.openminis.app.plus.AgentMailbox.boxes()) }
-    var busy by remember { mutableStateOf<String?>(null) }
     var pick by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
         rows = withContext(Dispatchers.IO) { Register3912.rows(ctx) }
@@ -173,14 +172,14 @@ fun RegisterLedgerScreen(onBack: () -> Unit, go: (String) -> Unit) {
     val temp = com.openminis.app.plus.AgentMailbox.address("mailtm")
     // [Mines-38.9.12.1] the user's own domain (unlimited addresses) is the preferred source when connected
     val selfDom = remember { if (com.openminis.app.plus.AgentMailbox.ready("selfhost")) com.openminis.app.plus.AgentMailbox.selfDomain() else null }
-    var useSelf by remember { mutableStateOf(selfDom != null) }
     PlusPage("注册台账", onBack, actions = {
         Box(Modifier.size(40.dp).clip(CircleShape).clickable { pick = true }.semantics { contentDescription = "一键注册" }, contentAlignment = Alignment.Center) {
             MinesIcon(ic2("plus"), null, tint = m.ink, modifier = Modifier.size(20.dp))
         }
     }) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Tile3912("临时邮箱", if (selfDom != null) "∞" else "${boxes.size}", if (selfDom != null) "自建域名 @$selfDom" else if (temp != null) "Mail.tm 可用" else "未创建", Modifier.weight(1f))
+            val regBoxes = all.filter { it.note.contains("Mail.tm") }.map { it.account.lowercase() }.distinct().size   // [38.9.15] one box per platform
+            Tile3912("临时邮箱", if (selfDom != null) "∞" else "${boxes.size + regBoxes}", if (selfDom != null) "自建域名 @$selfDom" else "Mail.tm · 每个平台一个", Modifier.weight(1f))
             Tile3912("已注册平台", if (rows == null) "…" else "${all.map { it.host }.distinct().size}",
                 "已验证 ${all.count { it.st == Inbox3912Core.RegSt.DONE }} · 未完成 ${all.count { it.st == Inbox3912Core.RegSt.PENDING }}", Modifier.weight(1f))
         }
@@ -188,22 +187,16 @@ fun RegisterLedgerScreen(onBack: () -> Unit, go: (String) -> Unit) {
             Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("一键注册", fontSize = MT.Body, fontWeight = FontWeight.Medium, color = m.ink, modifier = Modifier.weight(1f))
-                    Text(busy ?: (if (temp == null && selfDom == null) "新建临时邮箱" else "开始注册"), fontSize = MT.Sub, color = Color(0xFFC0633F),
-                        modifier = Modifier.clip(RoundedCornerShape(50)).background(Color(0x22C0633F)).clickable(enabled = busy == null) {
-                            if (temp != null || selfDom != null) { pick = true; return@clickable }
-                            busy = "正在创建…"
-                            scope.launch {
-                                val why = com.openminis.app.plus.AgentMailbox.openMailTm()
-                                boxes = com.openminis.app.plus.AgentMailbox.boxes()
-                                busy = null
-                                if (why == null) pick = true else android.widget.Toast.makeText(ctx, why, android.widget.Toast.LENGTH_LONG).show()
-                            }
-                        }.padding(horizontal = 12.dp, vertical = 5.dp))
+                    // [Mines-38.9.15 register_auto] one tap opens the pick sheet; the run then goes by itself (own Mail.tm box per platform)
+                    Text(if (com.openminis.app.plus.RegisterAuto.running()) "注册中…" else "开始注册", fontSize = MT.Sub, color = Color(0xFFC0633F),
+                        modifier = Modifier.clip(RoundedCornerShape(50)).background(Color(0x22C0633F)).clickable { pick = true }
+                            .semantics { contentDescription = "开始注册" }.padding(horizontal = 12.dp, vertical = 5.dp))
                 }
-                Text("选择平台 → 生成邮箱与密码 → 自动收码 → 写入台账", fontSize = MT.Sub, color = m.ink2, modifier = Modifier.padding(top = 6.dp))
+                Text("选平台或填网址 → 每个平台一个临时邮箱 → 自动填表收码 → 写入台账", fontSize = MT.Sub, color = m.ink2, modifier = Modifier.padding(top = 6.dp))
                 Text("遵守平台规则：一人一号，不批量注册；遇到人机验证、手机号或付款时停下来问你。", fontSize = MT.Meta, color = m.ink3, modifier = Modifier.padding(top = 4.dp))
             }
         }
+        RegisterRunCard(go)   // [Mines-38.9.15 register_auto] one folded task row
         WarmGroupLabel("按邮箱", "全部 ›") { go(PlusRoutes.KEYCHAIN) }
         if (rows != null && all.isEmpty()) InfoLine("台账里还没有账号。一键注册完成的账号会自动出现在这里。")
         groups.take(8).forEach { (box, list) ->
@@ -211,7 +204,7 @@ fun RegisterLedgerScreen(onBack: () -> Unit, go: (String) -> Unit) {
                 Column(Modifier.padding(vertical = 6.dp)) {
                     Row(Modifier.padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                         Text(Inbox3912Core.maskMail(box), fontSize = MT.Sub, fontFamily = FontFamily.Monospace, color = m.ink, modifier = Modifier.weight(1f), maxLines = 1)
-                        val tempBox = box.endsWith("@" + (temp?.substringAfter('@') ?: "\u0000"))
+                        val tempBox = list.any { it.note.contains("Mail.tm") } || box.endsWith("@" + (temp?.substringAfter('@') ?: "\u0000"))
                         StatusPill(if (tempBox) "临时" else "长期", null)
                     }
                     list.take(6).forEach { r ->
@@ -230,32 +223,13 @@ fun RegisterLedgerScreen(onBack: () -> Unit, go: (String) -> Unit) {
             }
         }
     }
-    if (pick) AlertDialog(onDismissRequest = { pick = false }, confirmButton = { TextButton({ pick = false }) { Text("取消") } },
-        title = { Text("选择要注册的平台") },
-        text = {
-            Column {
-                // [Mines-38.9.12.1] mailbox source: 自建域名 (a fresh address per platform) or the Mail.tm box
-                if (selfDom != null) Row(Modifier.fillMaxWidth().padding(bottom = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf(true to "自建域名", false to (if (temp != null) "Mail.tm" else "台账邮箱")).forEach { (v, label) ->
-                        Text(label, fontSize = MT.Sub, color = if (useSelf == v) Color.White else m.ink,
-                            modifier = Modifier.clip(RoundedCornerShape(50)).background(if (useSelf == v) Color(0xFFC0633F) else Color(0x14000000))
-                                .clickable { useSelf = v }.padding(horizontal = 12.dp, vertical = 5.dp).semantics { contentDescription = "邮箱来源 $label" })
-                    }
-                }
-                Inbox3912Core.PLATFORMS.forEach { (name, url) ->
-                    Text(name, fontSize = MT.Body, color = m.ink, modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).clickable {
-                        pick = false
-                        if (selfDom != null && useSelf) scope.launch {
-                            busy = "正在建邮箱…"
-                            val addr = com.openminis.app.plus.AgentMailbox.selfNewAddress(com.openminis.app.plus.SelfMailCore.prefixFor(name, (System.currentTimeMillis() / 1000).toInt()))
-                            busy = null
-                            if (addr == null) android.widget.Toast.makeText(ctx, "自建域名没建出邮箱，先用台账邮箱", android.widget.Toast.LENGTH_LONG).show()
-                            startDraft(ctx, if (addr != null) Inbox3912Core.registerTaskSelf(name, url, addr, emailOnlyReg(ctx)) else Inbox3912Core.registerTask(name, url, temp, emailOnlyReg(ctx)))
-                        } else startDraft(ctx, Inbox3912Core.registerTask(name, url, temp, emailOnlyReg(ctx)))
-                    }.padding(vertical = 10.dp, horizontal = 6.dp))
-                }
-            }
-        })
+    if (pick) RegisterPickSheet(onDismiss = { pick = false }, onStarted = {
+        pick = false
+        scope.launch { kotlinx.coroutines.delay(1500); rows = withContext(Dispatchers.IO) { Register3912.rows(ctx) } }
+    })
+    // the 台账 rows follow the run (a finished platform shows up at once)
+    val run by com.openminis.app.plus.RegisterAuto.run.collectAsState()
+    LaunchedEffect(run?.items?.map { it.st }) { if (run != null) rows = withContext(Dispatchers.IO) { Register3912.rows(ctx) } }
 }
 
 /** [Mines-38.9.13 handoff_v2.oauth] the one-click sign-up task asks for an e-mail sign-up, never Google / Apple */

@@ -64,7 +64,10 @@ object ChatHome {
             _on.value = p.getBoolean("on", true)
             mainSid = p.getString("main", "").orEmpty()
             // a run cut by a restart is queued again (its conversation keeps what it did)
-            _tasks.value = ChatHomeCore.fromJson(p.getString("tasks", "[]")).map { if (it.st == St.RUNNING) it.copy(st = St.QUEUED) else it }
+            _tasks.value = ChatHomeCore.fromJson(p.getString("tasks", "[]")).map {
+                // [Mines-38.9.15 register_auto] a 一键注册 task has no conversation: it is never queued for the chat runner
+                if (isExternal(it.sid)) { if (it.st == St.RUNNING || it.st == St.QUEUED || it.st == St.WAITING) it.copy(st = St.ERROR, line = "Mines 重启，注册中断了", told = St.ERROR.id) else it }
+                else if (it.st == St.RUNNING) it.copy(st = St.QUEUED) else it }
             app = c.applicationContext
         }
         observe(); pump()
@@ -92,6 +95,29 @@ object ChatHome {
         mainSid = s.id
         prefs()?.edit()?.putString("main", s.id)?.apply()
         s.id
+    }
+
+    // ── [Mines-38.9.15 register_auto] tasks run by Mines itself (no conversation): one row, notices like any task ──
+
+    fun isExternal(sid: String?): Boolean = sid?.startsWith(RegisterAuto.SID_PREFIX) == true
+
+    /** create or update a task that [RegisterAuto] (not the chat runner) drives; 等你 / 完成 post their notice once */
+    fun putExternal(sid: String, id: String, name: String, goal: String, st: St, step: Int, total: Int, line: String, createdAt: Long) {
+        if (app == null) return
+        val now = System.currentTimeMillis()
+        var created = false
+        synchronized(this) {
+            val cur = _tasks.value.firstOrNull { it.id == id }
+            if (cur == null) {
+                created = true
+                _tasks.value = _tasks.value + AutoTask(id, sid, name, goal, st, step, total, line, createdAt, now)
+            } else _tasks.value = _tasks.value.map {
+                if (it.id != id) it else it.copy(st = st, step = step, total = total, line = line, updatedAt = now, told = if (st != it.st) "" else it.told)
+            }
+        }
+        save()
+        if (created && mainSid.isNotBlank()) scope.launch { runCatching { appendToMain(listOf("assistant" to ChatHomeCore.tagText(id, ChatHomeCore.Kind.CREATED, ChatHomeCore.createdLine(name)))) } }
+        if (st == St.WAITING || st == St.DONE || st == St.ERROR) postNotices()
     }
 
     // ── router (ChatViewModel.sendMessage) ──
@@ -179,7 +205,7 @@ object ChatHome {
         scope.launch {
             pumpLock.withLock {
                 while (true) {
-                    val next = ChatHomeCore.nextQueued(_tasks.value) ?: break
+                    val next = ChatHomeCore.nextQueued(_tasks.value.filterNot { isExternal(it.sid) }) ?: break
                     val autoRunning = _tasks.value.count { it.id in inRunner }
                     val all = com.openminis.app.service.SessionConcurrencyManager.runningSessions.value.size
                     if (!ChatHomeCore.canStart(autoRunning, all, com.openminis.app.service.SessionConcurrencyManager.MAX_CONCURRENT, heapCritical())) {
@@ -220,6 +246,7 @@ object ChatHome {
                 var changed = false
                 synchronized(this@ChatHome) {
                     _tasks.value = _tasks.value.map { t ->
+                        if (isExternal(t.sid)) return@map t   // [38.9.15 register_auto] its state comes from RegisterAuto only
                         val live = t.sid in running || t.id in inRunner
                         var n = ChatHomeCore.onProgress(t, p[t.sid], live, now)
                         // the user went on inside a finished / waiting task: running again, its next end is told again
@@ -269,7 +296,9 @@ object ChatHome {
             if (sys?.getNotificationChannel(CHANNEL) == null)
                 sys?.createNotificationChannel(android.app.NotificationChannel(CHANNEL, "任务提醒", android.app.NotificationManager.IMPORTANCE_DEFAULT))
         }
-        val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("minis://session/${t.sid}"))
+        val intent = if (isExternal(t.sid)) (c.packageManager.getLaunchIntentForPackage(c.packageName) ?: return)
+                .putExtra("mines_route", com.openminis.app.ui.plus.TaskRoutes.chat(t.sid)).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            else android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("minis://session/${t.sid}"))
             .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP)
         val pi = android.app.PendingIntent.getActivity(c, t.sid.hashCode(), intent,
             android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE)

@@ -55,7 +55,8 @@ object TaskRoutes {
     const val TASKS = "plus_task_projects"
     const val PROJECT = "plus_task_project/{id}"
     fun project(id: String) = "plus_task_project/" + android.net.Uri.encode(id)
-    fun chat(sid: String) = "chat/$sid"
+    // [Mines-38.9.15 register_auto] a 一键注册 task opens 注册台账 (its progress card), not a conversation
+    fun chat(sid: String) = if (sid.startsWith(com.openminis.app.plus.RegisterAuto.SID_PREFIX)) Routes3912.REGISTER else "chat/$sid"
 }
 
 private fun icT(n: String) = com.openminis.app.ui.brand.MinesIcons.named(n)!!

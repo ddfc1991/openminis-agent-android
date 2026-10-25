@@ -156,6 +156,11 @@ try:
     I3915 = "i3915" in open("hark-build/smoke/target").read().splitlines()[1:2][0].split()   # [38.9.15] 伪人核心
 except Exception:
     I3915 = False
+try:
+    IREG = "iregauto" in open("hark-build/smoke/target").read().splitlines()[1:2][0].split()   # [38.9.15 register_auto] 一键注册 runs by itself
+except Exception:
+    IREG = False
+if IREG: I397 = True
 if I3915: I3914 = True
 if I3914: I397 = True
 if I39113: I39112 = True
@@ -3329,6 +3334,7 @@ def main():
         elif I396: fns = ((b396x,) if I396X else ()) + ((b396m,) if I396M else ()) + (b396,) + (tuple(fns) if I395 else ())   # [38.9.6 i12] glass / auto progress / archive shots first, then the full i395 pass + 自检
         elif H3894: fns = (b3894_h,) + tuple(fns)   # [38.9.4 h] SkillHub market, Memoh, a11y wording, 账号 entries, glass / opaque reading, g2 defects first
         if I3915: fns = (b3914, b3915)   # [38.9.15] 38.9.14.1 chat-home gate (single bottom bar on every tab, back on 聊天) + 伪人核心 / sign-in / slider
+        if IREG: fns = (bregauto,)   # [38.9.15 register_auto] own short gate
         for fn in fns:
             try:
                 fn(res)
@@ -7529,6 +7535,129 @@ def b3915(res):
         back(2)
     step("experiments", experiments)
     print("I3915 RESULT " + json.dumps(o, ensure_ascii=False)[:6000], flush=True)
+
+
+def bregauto(res):
+    """[38.9.15 register_auto] 注册台账 → 开始注册 → sheet → 自定义网址 (fake sign-up site on the runner) → one tap → Mines makes a
+    Mail.tm box (fake Mail.tm), fills the form, reads the 6-digit code from the box, verifies, writes the 台账 row (已验证, password
+    saved); one folded task row 「一键注册 · …」 with 「10.0.2.2 注册 · 完成」; 任务 tab has the task. A second run on a page behind a
+    Cloudflare Turnstile box stops and asks (等你 + one line), the takeover screen shows the page, 跳过 → 未完成. Shots iregauto-*.png."""
+    o = res.setdefault("iregauto", {})
+    B = "http://10.0.2.2:8096"
+    def shot(name):
+        r = snap("iregauto-" + name)
+        subprocess.run(f"cp {OUT}/{step_no:02d}-iregauto-{name}.png {OUT}/iregauto-{name}.png", shell=True)
+        return r
+    def fail(m): selftest_fail.append("iregauto " + m); print("IREG FAIL " + m, flush=True)
+    def st():
+        s = result_json("group", "ira state", timeout=20)
+        return s if isinstance(s, dict) else {}
+    def fake():
+        try: return json.loads(subprocess.run(f"curl -s {B}/state", shell=True, capture_output=True, text=True, timeout=10).stdout or "{}")
+        except Exception as e: return {"err": str(e)}
+    def step(name, f):
+        t0 = time.time()
+        try: f()
+        except Exception as e:
+            import traceback; traceback.print_exc(); fail(f"{name} error {e}")
+        print(f"IREG STEP {name} {int(time.time() - t0)} s", flush=True)
+        if not alive(): crashed.append(f"iregauto {name}"); recover(f"iregauto {name}")
+
+    set_zh()
+    try: result_json("group", "wallpaper off")
+    except Exception: pass
+    o["base"] = result_json("group", "ira base " + B + "/mailtm", timeout=20)
+    result_json("group", "ira reset", timeout=20)
+    # unit-level check through the app: 自定义网址 parsing
+    o["custom_ok"] = result_json("group", "ira custom zeabur.com", timeout=20)
+    o["custom_bad"] = result_json("group", "ira custom 注册一下", timeout=20)
+    if (o["custom_ok"] or {}).get("url") != "https://zeabur.com/": fail(f"custom zeabur.com not accepted {o['custom_ok']}")
+    if not (o["custom_bad"] or {}).get("why"): fail("custom bad input accepted")
+
+    def ui_run():
+        route("plus_register_ledger", 5)
+        shot("ledger-before")
+        if not tap_text("开始注册", wait=3): fail("no 开始注册 button"); return
+        r = shot("sheet")
+        if not find(r, "选择要注册的平台"): fail("pick sheet not shown")
+        if not find(r, "自定义网址"): fail("no 自定义网址 field")
+        tap_text("自定义网址", wait=1.2)
+        type_text(B + "/signup"); time.sleep(1)
+        sh("input keyevent KEYCODE_BACK"); time.sleep(1)   # keyboard down
+        r = dump()
+        if not find(r, "选择要注册的平台"):   # back closed the sheet instead of the keyboard
+            tap_text("开始注册", wait=3); tap_text("自定义网址", wait=1.2); type_text(B + "/signup"); time.sleep(1)
+        tap_text("添加自定义网址", wait=1.5)
+        r = shot("sheet-custom")
+        if not find(r, "开始注册（1 个）"):
+            w, hh = SCREEN; sh(f"input swipe {w//2} {int(hh*0.85)} {w//2} {int(hh*0.55)} 300"); time.sleep(1.2); r = shot("sheet-custom")
+        if not (find(r, "10.0.2.2 · 自定义") or find(r, "10.0.2.2 自定义")): fail("custom URL not added to the list")
+        if not find(r, "开始注册（1 个）"): fail("custom URL not ticked (button not 开始注册（1 个）)")
+        tap_text("开始注册（1 个）", wait=3)
+        shot("run-started")
+        t0 = time.time(); s = {}
+        while time.time() - t0 < 150:
+            s = st()
+            its = s.get("items") or []
+            if its and all(i.get("st") in ("DONE", "PENDING") for i in its) and not s.get("running"): break
+            time.sleep(3)
+        o["run1"] = {k: s.get(k) for k in ("items", "ledger")}; o["run1_log"] = (s.get("log") or [])[-25:]
+        its = s.get("items") or []
+        if not its or its[0].get("st") != "DONE": fail(f"custom site not registered end-to-end: {its} log={(s.get('log') or [])[-12:]}")
+        if its and its[0].get("title") != "10.0.2.2 注册 · 完成": fail(f"item title {its[0].get('title')}")
+        led = s.get("ledger") or []
+        if not led or not led[0].get("note", "").startswith("注册于") or not led[0].get("pw") or led[0].get("st") != "已验证":
+            fail(f"ledger row not written as 已验证 with a saved password: {led}")
+        f = fake(); o["fake1"] = {k: f.get(k) for k in ("accounts", "boxes", "mails")}
+        acc = (f.get("accounts") or {}).get(its[0].get("email") if its else "", {})
+        if not acc.get("verified"): fail(f"fake site: account not verified {f.get('accounts')}")
+        if (acc.get("pw_len") or 0) < 12: fail(f"password too short / missing {acc}")
+        if (f.get("boxes") or [None])[0] != (its[0].get("email") if its else None): fail("Mail.tm box is not the registered address")
+        route("plus_register_ledger", 4)
+        r = shot("ledger-done-folded")
+        if not find(r, "一键注册 · 完成 1/1"): fail("folded task row not 「一键注册 · 完成 1/1」")
+        tap_text("一键注册 · 完成", wait=2)
+        r = shot("ledger-done-open")
+        if not find(r, "10.0.2.2 注册 · 完成"): fail("unfolded row 「10.0.2.2 注册 · 完成 ›」 missing")
+        scroll_down(); r = shot("ledger-rows")
+        if not find(r, "10.0.2.2"): fail("台账 rows do not list the new account")
+        h = result_json("group", "i3914 state", timeout=20)
+        tasks = (h or {}).get("tasks") or [] if isinstance(h, dict) else []
+        o["chat_tasks"] = [t for t in tasks if str(t.get("sid", "")).startswith("regauto:")]
+        if not o["chat_tasks"] or o["chat_tasks"][-1].get("st") != "done": fail(f"任务 tab has no finished 一键注册 task {o['chat_tasks']}")
+        route("plus_task_projects", 4); shot("tasks-tab")
+    step("ui_run", ui_run)
+
+    def captcha_run():
+        o["start2"] = result_json("group", "ira start " + B + "/captcha-signup", timeout=20)
+        t0 = time.time(); s = {}
+        while time.time() - t0 < 90:
+            s = st(); its = s.get("items") or []
+            if its and its[0].get("st") == "WAITING": break
+            if its and its[0].get("st") in ("DONE", "PENDING"): break
+            time.sleep(2)
+        its = s.get("items") or []
+        o["run2_wait"] = its; o["run2_log"] = (s.get("log") or [])[-15:]
+        if not its or its[0].get("st") != "WAITING" or its[0].get("ask") != "CAPTCHA": fail(f"captcha page did not stop and ask: {its}"); return
+        if "人机验证" not in its[0].get("line", ""): fail(f"ask line {its[0].get('line')}")
+        route("plus_register_ledger", 4)
+        r = shot("captcha-ask")
+        if not find(r, "一键注册 · 等你"): fail("folded row not 等你")
+        if not tap_text("10.0.2.2 注册 · 等你", wait=3): fail("waiting item not tappable"); route("plus_register_takeover", 4)
+        r = shot("captcha-takeover")
+        if not find(r, "好了，继续") or not find(r, "跳过这个平台"): fail("takeover screen buttons missing")
+        if not find(r, "要做人机验证"): fail("takeover screen has no ask line")
+        tap_text("跳过这个平台", wait=3)
+        t0 = time.time()
+        while time.time() - t0 < 20:
+            s = st(); its = s.get("items") or []
+            if its and its[0].get("st") == "PENDING": break
+            time.sleep(2)
+        o["run2_end"] = its
+        if not its or its[0].get("st") != "PENDING": fail(f"skip did not end the item as 未完成 {its}")
+        route("plus_register_ledger", 4); shot("captcha-skipped")
+    step("captcha_run", captcha_run)
+    print("IREG RESULT " + json.dumps(o, ensure_ascii=False)[:8000], flush=True)
 
 
 def b3914(res):
