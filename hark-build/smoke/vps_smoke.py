@@ -7422,6 +7422,27 @@ def b3914(res):
         time.sleep(2); shot("quick-answer")
     step("quick", quick)
 
+    def stall():
+        # [38.9.14.1 stall_watch] the model hangs once (headers, then nothing): after 40 s the turn is retried on the same model
+        # with 「模型没响应，正在重试…」 shown, and the reply arrives within ~60 s; logged as a stall
+        t0 = time.time()
+        result_json("group", "i3914 say 卡住测试 STALLONCE", timeout=40)
+        s = wait_state(lambda s: any(x.get("kind") == "retry" for x in (s.get("stalls") or [])), 55)
+        o["stall_retry_s"] = int(time.time() - t0)
+        if not any(x.get("kind") == "retry" for x in (s.get("stalls") or [])): fail(f"stall: no retry logged within 55 s: {s.get('stalls')}")
+        r = shot("stall-retry"); t = _txt(r); o["stall_retry_txt"] = t[-300:]
+        if "模型没响应" not in t: fail("stall: 「模型没响应，正在重试…」 line not shown during the retry")
+        s = wait_state(lambda s: any("卡住后已恢复" in (x.get("text") or "") for x in (s.get("rows") or [])), max(5, 75 - (time.time() - t0)))
+        dt = int(time.time() - t0); o["stall_reply_s"] = dt; o["stall_stalls"] = s.get("stalls")
+        f = fake(); o["stall_posts"] = f.get("stall_posts")
+        if not any("卡住后已恢复" in (x.get("text") or "") for x in (s.get("rows") or [])): fail(f"stall: no reply after the retry ({dt} s)")
+        elif dt > 65: fail(f"stall: reply took {dt} s (> 65)")
+        if (f.get("stall_posts") or 0) < 2: fail(f"stall: model not called again ({f.get('stall_posts')})")
+        time.sleep(1); r = shot("stall-done")
+        if "模型没响应" in _txt(r): fail("stall: retry line still shown after the reply")
+        one_bar("stall-done")
+    step("stall", stall)
+
     def tabs():
         if not tap_dock("任务"): fail("dock 任务 not found"); return
         r = shot("tab-tasks"); t = _txt(r); o["tab_tasks"] = t[:500]
@@ -7442,6 +7463,16 @@ def b3914(res):
             r = shot("history-back"); t2 = _txt(r); o["history_back_txt"] = t2[:200]
             if "等你处理" not in t2: fail("back from 全部对话 did not return to 任务")
             one_bar("history-back")
+        # [38.9.14.1] 任务 scrolled to the bottom: the last item sits above the frosted dock (bottom contentPadding)
+        for _ in range(6): scroll_down()
+        time.sleep(1.5); r = shot("tab-tasks-bottom")
+        dock_lab = ("聊天", "任务", "消息", "应用")
+        ys = [y for t, d, x, y, n in nodes(r) if (t in dock_lab or (d or "").split("，")[0] in dock_lab) and y > SCREEN[1] * 0.8]
+        top = (min(ys) - 60) if ys else SCREEN[1] * 0.88
+        under = [t or d for t, d, x, y, n in nodes(r) if (t or d) and y > top and not (t in dock_lab or (d or "").split("，")[0] in dock_lab)]
+        o["tasks_bottom_under_dock"] = under[:8]
+        if under: fail(f"任务 bottom: items still under the dock {under[:5]}")
+        one_bar("tab-tasks-bottom")
         if not tap_dock("消息"): fail("dock 消息 not found")
         shot("tab-messages"); one_bar("tab-messages")
         if not tap_dock("应用"): fail("dock 应用 not found"); return

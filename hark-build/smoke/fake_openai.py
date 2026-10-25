@@ -332,6 +332,19 @@ fetch('/linkfake/send?'+k+'='+encodeURIComponent(v));document.getElementById('fc
             STATS["task_posts"] = STATS.get("task_posts", 0) + 1
             time.sleep(12)
             text = "Zeabur 注册已完成：账号 smoke@example.com 已登记到注册台账。"
+        # [38.9.14.1 stall_watch] the first streamed turn for STALLONCE hangs after the headers (no event at all); the retry is
+        # slow to start (8 s) so the 「模型没响应，正在重试…」 line can be seen, then answers
+        if "STALLONCE" in ut0 and "MINES_ROUTER" not in ut0 and body.get("stream"):
+            STATS["stall_posts"] = STATS.get("stall_posts", 0) + 1
+            if STATS["stall_posts"] == 1:
+                STATS["stall_hang_at"] = time.time()
+                self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers(); self.wfile.flush()
+                for _ in range(120):
+                    time.sleep(1)
+                return
+            STATS["stall_retry_at"] = time.time()
+            time.sleep(8)
+            text = "卡住后已恢复，这是重试后的回答。"
         if "MULTIPART" in last_user_text(msgs):
             STATS["multipart"] = STATS.get("multipart", 0) + 1
             text = MULTIPART
