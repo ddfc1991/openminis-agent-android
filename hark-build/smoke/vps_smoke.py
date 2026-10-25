@@ -5922,7 +5922,7 @@ def b399(res):
             x, y = (b[0] + b[2]) // 2, (b[1] + b[3]) // 2
             sh(f"input swipe {x} {y} {x} {y} 900"); time.sleep(2)
             r = shot("chat-longpress"); t = _txt(r); o["longpress"] = t[:300]
-            if "复制全文" not in t: selftest_fail.append(f"i399 long-press did not open the one sheet ({t[:100]})")
+            if "选择文字" not in t or "复制全文" in t: selftest_fail.append(f"i399 long-press did not open the one sheet ({t[:100]})")
             if tap_text("选择文字", exact=True, wait=2): time.sleep(1.5); shot("chat-select-all")
             back(1); time.sleep(1)
         else: page_missing.append("i399 chat: reply text not found for long-press")
@@ -7543,7 +7543,13 @@ def b3914(res):
         if p: sh(f"input tap {p[0]} {p[1]}"); time.sleep(2.5)
         else: fail("netdrop: chip 「已建任务 断网测试」 not found")
         r = shot("netdrop-wait"); t = _txt(r); o["netdrop_wait_txt"] = t[-300:]
-        if "网络断了" not in t: fail("netdrop: 「网络断了，等网络恢复后继续」 line not shown in the task while it waits")
+        if "网络断了" not in t:
+            # [38.9.14.1 smoke] the emulator's network is up, so the wait is one 2 s back-off (MinesNet "resume waited=0s"); by the
+            # time the chip is opened the turn has usually resumed. Only a failure when it has NOT resumed yet and no line shows.
+            s2 = state(); res = [x for x in (s2.get("netdrops") or []) if x.get("kind") == "resume"]
+            o["netdrop_wait_missed"] = {"resumed": bool(res), "reply": "断网后已继续" in t}
+            if not res and "断网后已继续" not in t: fail("netdrop: 「网络断了，等网络恢复后继续」 line not shown in the task while it waits")
+            else: print("I3914 NOTE netdrop wait line already gone (resumed within the 2 s back-off)", flush=True)
         s = wait_state(lambda s: any(x.get("name") == "断网测试" and x.get("st") == "done" for x in (s.get("tasks") or [])), 100)
         dt = int(time.time() - t0); o["netdrop_done_s"] = dt; o["netdrop_log"] = (s.get("netdrops") or [])[-6:]
         f = fake(); o["netdrop_posts"] = f.get("netdrop_posts")
@@ -7554,6 +7560,25 @@ def b3914(res):
         time.sleep(2); r = shot("netdrop-done"); t = _txt(r); o["netdrop_done_txt"] = t[-300:]
         if "断网后已继续" not in t: fail("netdrop: resumed reply not visible in the task conversation")
         if "网络断了" in t: fail("netdrop: wait line still shown after the reply")
+        # [38.9.14.1] long-press menu on a reply (user 17:56): 选择文字 / 回复 / 引用 / 复制 first, no 「复制全文」; 回复 → reply bar
+        b = node_bounds(r, lambda n: "断网后已继续" in (n.get("text") or ""))
+        if b:
+            x, y = (b[0] + b[2]) // 2, (b[1] + b[3]) // 2
+            sh(f"input swipe {x} {y} {x} {y} 900"); time.sleep(2)
+            r = shot("msg-menu"); tl = texts(r); o["msg_menu"] = [x for x in tl if x in ("选择文字", "回复", "引用", "复制", "复制为 Markdown", "朗读", "复制全文")]
+            want = ["选择文字", "回复", "引用", "复制"]
+            got = [x for x in o["msg_menu"] if x in want]
+            if got[:4] != want: fail(f"msgmenu: front rows {got} (want {want})")
+            if "复制全文" in tl: fail("msgmenu: 「复制全文」 still shown")
+            if o["msg_menu"] and o["msg_menu"][0] != "选择文字": fail(f"msgmenu: first row is {o['msg_menu'][0]}")
+            if tap_text("回复", exact=True, wait=2):
+                time.sleep(1); r = shot("msg-reply"); t2 = _txt(r); o["msg_reply_txt"] = t2[-200:]
+                if "回复 Mines：" not in t2: fail("msgmenu: 回复 did not put the 「回复 Mines：…」 bar above the input")
+                p2 = find(r, "取消回复")
+                if p2: sh(f"input tap {p2[0]} {p2[1]}"); time.sleep(1)
+                if "mInputShown=true" in sh("dumpsys input_method | grep -o 'mInputShown=[a-z]*'"): sh("input keyevent KEYCODE_BACK"); time.sleep(0.8)   # hide the keyboard only
+            else: fail("msgmenu: 回复 row not tappable")
+        else: fail("msgmenu: reply text not found for the long-press")
         if opened: back(1); time.sleep(2.5)
         to_bottom(); r = shot("netdrop-chat"); one_bar("netdrop-chat")
     step("netdrop", netdrop)

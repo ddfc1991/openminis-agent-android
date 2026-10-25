@@ -189,4 +189,12 @@ object QuoteReply {
         val quoted = capped.lines().joinToString("\n") { if (it.isBlank()) ">" else "> $it" }
         return if (message.isBlank()) quoted else "$quoted\n\n$message"
     }
+
+    /** [Mines-38.9.14.1] 「回复」: a short reference to the replied message (not the full quote), then the message. */
+    fun composeReply(who: String, target: String?, message: String): String {
+        val t = target?.trim().orEmpty()
+        if (t.isEmpty()) return message
+        val head = "（回复 ${who.ifBlank { "这条消息" }}：「${preview(t, 80)}」）"
+        return if (message.isBlank()) head else "$head\n$message"
+    }
 }
