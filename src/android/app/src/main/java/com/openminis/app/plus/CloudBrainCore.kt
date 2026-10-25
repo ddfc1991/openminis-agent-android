@@ -71,12 +71,17 @@ object CloudBrainCore {
         else -> a.line
     }
 
+    private val STEP_ONLY = Regex("""^第\s*\d+\s*步[。.]?$""")
+
+    /** 「☁ 第 N 步 · text」, or just 「☁ 第 N 步」 when the model said nothing but a step label (no 「第 3 步 · 第 3 步」) */
+    fun sayRow(step: Int, text: String): String = if (STEP_ONLY.matches(text)) "☁ 第 $step 步" else "☁ 第 $step 步 · $text"
+
     /** one line in the task conversation per event worth reading (null = not shown) */
     fun row(e: Event): String? {
         val d = e.data
         return when (e.type) {
             "created" -> "☁ 已交给云端执行（手机黑屏、断网、退出都不影响）"
-            "say" -> d.optString("text").trim().takeIf { it.isNotEmpty() }?.let { "☁ 第 ${d.optInt("step")} 步 · $it" }
+            "say" -> d.optString("text").trim().takeIf { it.isNotEmpty() }?.let { sayRow(d.optInt("step"), it) }
             "tool" -> "☁ " + d.optString("line").ifBlank { d.optString("tool") }
             "ask" -> "☁ " + askLine(askOf(e)!!)
             "retry", "note" -> d.optString("line").takeIf { it.isNotBlank() }?.let { "☁ $it" }

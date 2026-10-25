@@ -110,6 +110,9 @@ object ChatHomeCore {
      */
     fun onProgress(t: AutoTask, p: TaskProgressCore.Task?, running: Boolean, now: Long): AutoTask {
         if (t.st == St.QUEUED) return t
+        // [38.10] a cloud task is driven only by the brain's events (CloudBrainCore.apply): its conversation holds ☁ rows,
+        // and reading them as a phone run made 完成 「已回答：☁ 第 3 步 …」 before the brain's own result arrived
+        if (t.cloud.isNotEmpty()) return t
         val steps = p?.steps.orEmpty()
         val total = steps.size; val step = steps.count { it.st == TaskProgressCore.StepSt.DONE }
         val st = when {
@@ -172,7 +175,8 @@ object ChatHomeCore {
     }
 
     fun chip(t: AutoTask): Chip = Chip(
-        t.name, if (t.cloud.isNotEmpty() && t.st != St.DONE) t.st.label + " · 云端" else t.st.label,
+        // [38.10] a cloud task keeps 「· 云端」 in every state, 完成 included, so the user can tell where it ran
+        t.name, if (t.cloud.isNotEmpty()) t.st.label + " · 云端" else t.st.label,
         if (t.total > 0 && t.st != St.QUEUED) "${t.step.coerceAtMost(t.total)}/${t.total}" else "",
         when (t.st) { St.WAITING -> Tone.WAIT; St.RUNNING -> Tone.RUN; St.ERROR -> Tone.ERR; St.DONE -> Tone.DONE; St.QUEUED -> Tone.IDLE },
     )

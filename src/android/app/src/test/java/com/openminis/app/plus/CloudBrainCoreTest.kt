@@ -106,7 +106,28 @@ class CloudBrainCoreTest {
         assertEquals("ct9", ChatHomeCore.fromJson(ChatHomeCore.toJson(listOf(t)))[0].cloud)
         assertEquals("", ChatHomeCore.fromJson("""[{"id":"a","sid":"b","n":"c","g":"d","st":"running"}]""")[0].cloud)   // old saves
         assertEquals("进行中 · 云端", ChatHomeCore.chip(t).state)
-        assertEquals("完成", ChatHomeCore.chip(t.copy(st = St.DONE)).state)
+        assertEquals("完成 · 云端", ChatHomeCore.chip(t.copy(st = St.DONE)).state)   // 完成 keeps 「· 云端」
+        assertEquals("等你 · 云端", ChatHomeCore.chip(t.copy(st = St.WAITING)).state)
+        assertEquals("完成", ChatHomeCore.chip(t.copy(st = St.DONE, cloud = "")).state)  // phone tasks unchanged
+    }
+
+    @Test fun cloudDoneNoticeIsTheBrainResult() {
+        // the task conversation's ☁ rows must not decide a cloud task's state or line (it read 「已回答：☁ 第 3 步 · 第 3 步」)
+        val run = task()
+        val prog = TaskProgressCore.Task("s1", st = TaskProgressCore.St.DONE)
+        assertEquals(run, ChatHomeCore.onProgress(run, prog, false, 5))
+        val done = C.apply(run, ev(9, "status", JSONObject().put("st", "done").put("line", "云端已完成：帮我注册 doroai")), 6)
+        assertEquals(St.DONE, done.st)
+        assertEquals(done, ChatHomeCore.onProgress(done, prog, false, 7))     // a later progress tick keeps the result
+        val (kind, body) = ChatHomeCore.noticeOf(done)!!
+        assertEquals(ChatHomeCore.Kind.DONE, kind)
+        assertEquals("云端已完成：帮我注册 doroai", body)
+        assertFalse(body.contains("已回答")); assertFalse(body.contains("第 3 步"))
+    }
+
+    @Test fun sayRowDoesNotRepeatTheStep() {
+        assertEquals("☁ 第 3 步", C.row(ev(1, "say", JSONObject().put("step", 3).put("text", "第 3 步"))))
+        assertEquals("☁ 第 2 步 · 先在云端看一下", C.row(ev(2, "say", JSONObject().put("step", 2).put("text", "先在云端看一下"))))
     }
 
     @Test fun statusLine() {
