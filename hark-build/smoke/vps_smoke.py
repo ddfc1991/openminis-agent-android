@@ -7666,6 +7666,8 @@ def b3914(res):
             # [smoke 40198408547] the tile's terminal text measures wider / taller than the tile (clipped): its centre fell
             # outside the tile and it was taken for the last message (bottom 2112 > strip top). Skip any node touching the tile.
             if tile and not (b[2] <= tile[0] or tile[2] <= b[0] or b[3] <= tile[1] or tile[3] <= b[1]): continue
+            # [smoke 40202885854] the strip's own label (bounds [434,1982,1016,2112], 13 px taller than the strip) is not a message
+            if strip[0] <= x <= strip[2] and strip[1] <= y <= strip[3]: continue
             if low is None or b[3] > low[3]: low = b; low_t = t
         o["pip_last"] = low; o["pip_last_text"] = low_t[:60] if low else None
         if low is None: fail("pip: no message found above the strip")
