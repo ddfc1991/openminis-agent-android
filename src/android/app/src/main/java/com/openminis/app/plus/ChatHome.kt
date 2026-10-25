@@ -41,6 +41,10 @@ object ChatHome {
         private set
     /** launch opened 聊天 once in this process (back / 历史 then show the old list without bouncing) */
     @Volatile var redirected = false
+    /** [38.9.14.2] a crash / hang breaker tripped on this launch: 聊天主页 安全模式 (queued tasks wait [SAFE_DELAY_MS]) */
+    @Volatile var safeLaunch = false
+    private const val SAFE_DELAY_MS = 20_000L
+    @Volatile private var initAt = 0L
     /** last router decision (smoke / 自检) */
     @Volatile var lastDecision: ChatHomeCore.Decision? = null
 
@@ -66,6 +70,7 @@ object ChatHome {
             // a run cut by a restart is queued again (its conversation keeps what it did)
             _tasks.value = ChatHomeCore.fromJson(p.getString("tasks", "[]")).map { if (it.st == St.RUNNING) it.copy(st = St.QUEUED) else it }
             app = c.applicationContext
+            initAt = android.os.SystemClock.uptimeMillis()
         }
         observe(); pump()
     }
@@ -80,6 +85,14 @@ object ChatHome {
     private fun update(id: String, f: (AutoTask) -> AutoTask) {
         synchronized(this) { _tasks.value = _tasks.value.map { if (it.id == id) f(it) else it } }
         save()
+    }
+
+    /** [38.9.14.2] the main conversation if it already exists (no provider needed, never creates one) */
+    suspend fun existingMain(c: Context): String? = withContext(Dispatchers.IO) {
+        init(c)
+        val a = c.applicationContext as? com.openminis.app.MinisApp ?: return@withContext null
+        val cur = mainSid
+        if (cur.isNotBlank() && runCatching { a.chatRepository.getSession(cur) }.getOrNull() != null) cur else null
     }
 
     /** the main conversation (created once, titled 「Mines」, on the default model group) */
@@ -179,6 +192,11 @@ object ChatHome {
     /** start queued tasks while the gate allows; otherwise look again in 15 s */
     fun pump() {
         if (!loaded) return
+        val wait = if (safeLaunch) SAFE_DELAY_MS - (android.os.SystemClock.uptimeMillis() - initAt) else 0L
+        if (wait > 0) {
+            if (retryPending.compareAndSet(false, true)) scope.launch { delay(wait); retryPending.set(false); pump() }
+            return
+        }
         scope.launch {
             pumpLock.withLock {
                 while (true) {

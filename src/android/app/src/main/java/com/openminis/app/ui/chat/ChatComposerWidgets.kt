@@ -1102,6 +1102,7 @@ internal fun FloatingToolStatusBar(
                 .fillMaxWidth()
                 .height(barHeight)
                 .align(Alignment.BottomCenter)
+                .semantics { contentDescription = "工具状态条" }   // [38.9.14.2] smoke: bounds vs the preview tile / last message
                 .glassInput(RoundedCornerShape(10.dp), com.openminis.app.ui.plus.glassInputFill(field = true), ChatColors.isDark)   // [Mines-38.9.6] shared glass
                 .border(0.5.dp, ChatColors.toolBorder, RoundedCornerShape(10.dp))
                 .padding(start = barStartPadding, end = 12.dp),
@@ -1233,7 +1234,8 @@ internal fun FloatingToolStatusBar(
             Box(
                 modifier = Modifier
                     .align(Alignment.TopStart)
-                    .padding(start = thumbnailInset),
+                    .padding(start = thumbnailInset)
+                    .semantics { contentDescription = "工具预览" },   // [38.9.14.2] smoke: must not intersect the status strip
             ) {
                 // [T-android-browser-preview-thumb] Resolve the previous
                 // browser_use screenshot fallback here (toolBlocks is in

@@ -130,6 +130,12 @@ object SplitProxy {
             val p = context.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
             prefs = p
             _settings.value = read(p)
+            // [38.9.14.2] the upstream password sits in the vault, which no longer opens on the main thread at start-up:
+            // fill it in as soon as the vault is open
+            if (_settings.value.upstreamUser.isNotBlank() && _settings.value.upstreamPass.isEmpty()) PlusVault.onSecretsReady {
+                val pw = runCatching { PlusVault.secretExtra("splitproxy", "upass").orEmpty() }.getOrDefault("")
+                if (pw.isNotEmpty()) { _settings.value = _settings.value.copy(upstreamPass = pw); _current.value = null; autoCache.clear() }
+            }
             installSelector()
             if (_settings.value.enabled) start()
         }

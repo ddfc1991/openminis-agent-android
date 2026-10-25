@@ -2789,6 +2789,9 @@ fun ChatScreen(
     // [Mines] Full-screen chat wallpaper: bars and composer go translucent so it shows through.
     val minesWallpaper = com.openminis.app.ui.plus.wallpaperOn()
     val minesChatSky = com.openminis.app.ui.plus.chatSkyOn()
+    // [Mines-38.9.14.2] 聊天主页 (user 2026-10-25 20:14 「首页白底去掉」, 20:16 「有点乱」): the sky shows through the title bar,
+    // replies and composer (the old home's frosted glass, light and dark), no 「模型 · 复制」 footer, task notices as one-line chips
+    val minesHomeGlass = com.openminis.app.plus.ChatHome.isMain(sessionId)
     val minesBasePalette = com.openminis.app.ui.theme.LocalChatPalette.current
     val minesPalette = if (minesWallpaper) minesBasePalette.copy(inputBg = minesBasePalette.inputBg.copy(alpha = 0.82f)) else minesBasePalette
     CompositionLocalProvider(
@@ -3530,8 +3533,8 @@ fun ChatScreen(
                 },
                 windowInsets = WindowInsets.statusBars,
                 colors = androidx.compose.material3.TopAppBarDefaults.topAppBarColors(
-                    containerColor = ChatColors.background.copy(alpha = if (minesWallpaper) 0.55f else 0.92f),
-                    scrolledContainerColor = ChatColors.background.copy(alpha = if (minesWallpaper) 0.55f else 0.92f),
+                    containerColor = if (minesHomeGlass) com.openminis.app.ui.plus.minesGlassFill() else ChatColors.background.copy(alpha = if (minesWallpaper) 0.55f else 0.92f),
+                    scrolledContainerColor = if (minesHomeGlass) com.openminis.app.ui.plus.minesGlassFill() else ChatColors.background.copy(alpha = if (minesWallpaper) 0.55f else 0.92f),
                 ),
                 // [T-android-topbar-shrink] 76dp → 68dp. The earlier
                 // T-topbar-model-row-clip fix bumped 60dp → 76dp to give the
@@ -3684,8 +3687,10 @@ fun ChatScreen(
                 // (user reported "the bottom of the text is slightly clipped"). The floating-tools branch
                 // already reserves visualOverlayHeight (65dp) + buffer and
                 // was not part of the report; keep its +14 buffer.
+                // [Mines-38.9.14.2] user 2026-10-25 19:07: the status strip sat on the last message (深度思考 card cut). Reserve
+                // what the floating bar really measures (tile overhang + strip + its 6 dp margin) plus the gap, never less.
                 val bottomReserve =
-                    if (hasFloatingTools) visualOverlayHeight + 14.dp else 20.dp
+                    if (hasFloatingTools) maxOf(visualOverlayHeight + 14.dp, toolBarHeightDp + 12.dp) else 20.dp
                 // T174: when bottomReserve changes (toolbar appearing /
                 // disappearing or thumbnail height shift), re-pin to bottom
                 // if we are currently following. Without this, the new
@@ -4619,7 +4624,7 @@ fun ChatScreen(
                                 }
                             }
                             // [38.9.11 i32] a blank block (whitespace between tool calls) drew an empty card with ‹ › edges
-                            is FlatChatItem.AssistantMarkdownBlock -> if (item.rawText.isBlank()) androidx.compose.foundation.layout.Spacer(Modifier.height(0.dp)) else com.openminis.app.ui.plus.ReplyCardSlice(minesCardSeg[item.key] ?: 3) { BoundsTrackedBlock(
+                            is FlatChatItem.AssistantMarkdownBlock -> if (item.rawText.isBlank()) androidx.compose.foundation.layout.Spacer(Modifier.height(0.dp)) else com.openminis.app.ui.plus.ReplyCardSlice(minesCardSeg[item.key] ?: 3, soft = minesHomeGlass) { BoundsTrackedBlock(
                                 messageId = item.messageId,
                                 slotKey = "mdblock:${item.parentBlockId}:${item.blockIndex}",
                                 markdown = item.messageMarkdown,
@@ -4867,7 +4872,7 @@ fun ChatScreen(
                                     }
                                     // [Mines-38.9.1] small 「model · account」 tag under every finished reply (hidden while the capsule shows)
                                     // [Mines-38.9.9] footer row: 「model · account」 + a one-tap 复制 (whole reply, plain text)
-                                    if (!shown) Row(
+                                    if (!shown && !minesHomeGlass) Row(   // [38.9.14.2] none on 聊天主页 (复制 is in the long-press menu)
                                         modifier = Modifier.fillMaxWidth(),
                                         verticalAlignment = Alignment.CenterVertically,
                                     ) {
@@ -5927,7 +5932,7 @@ fun ChatScreen(
                         .fillMaxWidth()
                         // [Mines-38.9.6 i12] the composer is the shared input glass (was an opaque card with no rim: 「看不清」):
                         // dense tint (≥ 90 %, it sits over sharp chat text with no blur), soft visible rim, halo outside only
-                        .glassInput(RoundedCornerShape(20.dp), com.openminis.app.ui.plus.glassInputFill(field = true), ChatColors.isDark)
+                        .glassInput(RoundedCornerShape(20.dp), if (minesHomeGlass) com.openminis.app.ui.plus.minesGlassFill(strong = true) else com.openminis.app.ui.plus.glassInputFill(field = true), ChatColors.isDark)
                         // [T-android-context-usage-hint] Ambient inner glow
                         // along the card's inside edge once the context window
                         // is under pressure. Applied to the composer CARD (not
@@ -7665,7 +7670,7 @@ fun ChatScreen(
                 .background(
                     androidx.compose.ui.graphics.Brush.verticalGradient(
                         colors = listOf(
-                            ChatColors.background,
+                            if (minesHomeGlass) androidx.compose.ui.graphics.Color.Transparent else ChatColors.background,
                             ChatColors.background.copy(alpha = 0f),
                         ),
                     )

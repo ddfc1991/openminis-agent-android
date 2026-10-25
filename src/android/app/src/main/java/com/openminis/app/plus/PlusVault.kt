@@ -526,7 +526,35 @@ object PlusVault {
     private val _entries = MutableStateFlow<Map<String, ConnectionEntry>>(emptyMap())
     val entries: StateFlow<Map<String, ConnectionEntry>> = _entries.asStateFlow()
     @Volatile private var meta: SharedPreferences? = null
-    @Volatile private var secrets: SharedPreferences? = null
+    @Volatile private var secretsStore: SharedPreferences? = null
+    /**
+     * [Mines-38.9.14.2] reads never open the Keystore-backed store on the main thread (seconds on the realme at cold start,
+     * a 3 s+ main-thread stall): there they get null until the background open finishes; any other thread opens it.
+     */
+    private val secrets: SharedPreferences?
+        get() {
+            secretsStore?.let { return it }
+            val ctx = appCtx ?: return null
+            if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper() &&
+                !com.openminis.app.util.EncryptedPrefsFactory.isOpen(SECRETS)) { openSecretsAsync(ctx); return null }
+            return secretsW
+        }
+    /** writes always land: they open the store wherever they run (user actions, long after start-up) */
+    private val secretsW: SharedPreferences?
+        get() {
+            secretsStore?.let { return it }
+            val ctx = appCtx ?: return null
+            return runCatching { com.openminis.app.util.EncryptedPrefsFactory.safeCreate(ctx, SECRETS) }.getOrNull()?.also { secretsStore = it; fireReady() }
+        }
+    private val opening = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val readyListeners = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+    /** [38.9.14.2] run [f] once the secrets store is open (now, if it already is) */
+    fun onSecretsReady(f: () -> Unit) { if (secretsStore != null) f() else readyListeners += f }
+    private fun fireReady() { val l = readyListeners.toList(); readyListeners.clear(); l.forEach { runCatching { it() } } }
+    private fun openSecretsAsync(ctx: Context) {
+        if (!opening.compareAndSet(false, true)) return
+        Thread({ runCatching { secretsW } }, "mines-vault-open").apply { isDaemon = true }.start()
+    }
     @Volatile private var appCtx: Context? = null
 
     fun init(context: Context) {
@@ -536,10 +564,8 @@ object PlusVault {
             val ctx = context.applicationContext
             appCtx = ctx
             val m = ctx.getSharedPreferences(META, Context.MODE_PRIVATE)
-            secrets = runCatching {
-                com.openminis.app.util.EncryptedPrefsFactory.safeCreate(ctx, SECRETS)
-            }.getOrNull()
             meta = m
+            if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) openSecretsAsync(ctx) else secretsW
             // [38.9.11.2] atomic file (+2 backups) → the prefs copy → one notice if all fail
             val (file, allFailed) = AtomicStore.read(ctx, "plus_vault_entries.json") { runCatching { JSONArray(it); true }.getOrDefault(false) }
             val src = file ?: m.getString("entries", null)?.takeIf { runCatching { JSONArray(it) }.isSuccess }
@@ -553,7 +579,8 @@ object PlusVault {
                     e.kindId to e
                 }
             }.getOrDefault(emptyMap())
-            runCatching { dedupeOnce() }
+            // [38.9.14.2] the dedupe reads secrets, so it waits for the store (opened in the background from the main thread)
+            if (secretsStore != null) runCatching { dedupeOnce() } else onSecretsReady { synchronized(this) { runCatching { dedupeOnce() } } }
         }
     }
 
@@ -567,10 +594,10 @@ object PlusVault {
         for (f in plan) {
             val keep = _entries.value[f.keep] ?: continue
             val drop = _entries.value[f.drop] ?: continue
-            if (f.moveSecret) secret(f.drop)?.let { secrets?.edit()?.putString(f.keep, it)?.apply() }
+            if (f.moveSecret) secret(f.drop)?.let { secretsW?.edit()?.putString(f.keep, it)?.apply() }
             _entries.value = _entries.value - f.drop + (f.keep to keep.copy(account = f.account ?: keep.account,
                 via = if (keep.via.isBlank()) drop.via else keep.via, shareWithAi = keep.shareWithAi || drop.shareWithAi))
-            secrets?.edit()?.apply { remove(f.drop); secrets?.all?.keys?.filter { it.startsWith("${f.drop}__") }?.forEach { remove(it) } }?.apply()
+            secretsW?.edit()?.apply { remove(f.drop); secretsW?.all?.keys?.filter { it.startsWith("${f.drop}__") }?.forEach { remove(it) } }?.apply()
             m.edit().apply { m.all.keys.filter { it.startsWith("perm_${f.drop}_") }?.forEach { remove(it) } }.apply()
             if (m.getString("default_${ConnDedupe.base(f.drop)}", null) == f.drop) m.edit().putString("default_${ConnDedupe.base(f.drop)}", f.keep).apply()
         }
@@ -586,7 +613,7 @@ object PlusVault {
         secrets?.getString("${kindId}__$key", null)?.takeIf { it.isNotBlank() }
 
     fun setSecretExtra(kindId: String, key: String, value: String?) {
-        val e = secrets?.edit() ?: return
+        val e = secretsW?.edit() ?: return
         if (value.isNullOrEmpty()) e.remove("${kindId}__$key") else e.putString("${kindId}__$key", value)
         e.apply()
     }
@@ -616,7 +643,7 @@ object PlusVault {
             setExtra(kind.id, "prev_at", System.currentTimeMillis().toString())
             extra(kind.id, "token_name")?.let { setExtra(kind.id, "prev_token_name", it) } ?: setExtra(kind.id, "prev_token_name", "-")
         }
-        if (secret != null && secret.isNotEmpty()) secrets?.edit()?.putString(kind.id, secret)?.apply()
+        if (secret != null && secret.isNotEmpty()) secretsW?.edit()?.putString(kind.id, secret)?.apply()
         if (secret != null && secret.isNotEmpty() && via != "model") runCatching { unmarkRemoved(secret) }   // [Mines-38.9.1] re-added on purpose
         val prev = _entries.value[kind.id]
         val e = ConnectionEntry(kind.id, account.trim(), share, System.currentTimeMillis(),
@@ -662,9 +689,9 @@ object PlusVault {
         init(context)
         // [Mines-38.9.1] a deleted key stays deleted: 模型组 adoption must not bring it back (KeyTombstone)
         runCatching { secret(kind.id)?.takeIf { it.isNotBlank() }?.let { k -> meta?.edit()?.putString("removed_keys", KeyTombstone.add(meta?.getString("removed_keys", null), k))?.apply() } }
-        secrets?.edit()?.apply {
+        secretsW?.edit()?.apply {
             remove(kind.id)
-            secrets?.all?.keys?.filter { it.startsWith("${kind.id}__") }?.forEach { remove(it) }
+            secretsW?.all?.keys?.filter { it.startsWith("${kind.id}__") }?.forEach { remove(it) }
         }?.apply()
         _entries.value = _entries.value - kind.id
         if (meta?.getString("default_${baseId(kind.id)}", null) == kind.id) meta?.edit()?.remove("default_${baseId(kind.id)}")?.apply()

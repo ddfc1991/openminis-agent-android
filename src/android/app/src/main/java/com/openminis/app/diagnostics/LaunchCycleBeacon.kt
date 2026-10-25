@@ -169,6 +169,19 @@ object LaunchCycleBeacon {
         }
     }
 
+    /**
+     * [Mines-38.9.14.2] a new app version starts with a clean breaker: the bad cycles of the OLD build (its stalls,
+     * the swipe-kills counted as launches without a clean exit) say nothing about this one.
+     */
+    fun resetForUpgrade(context: Context) {
+        lastCycleWasCrash = false
+        lastRestartCount = 0
+        // the restart count is (launches − clean exits) over the beacon tail, so the old build's history is moved aside
+        val f = beaconFile(context)
+        runCatching { val old = File(f.parentFile, "launch-beacon.prev.log"); old.delete(); f.renameTo(old) }
+        appendLine(beaconFile(context), "[${isoLocal(System.currentTimeMillis())}] launch pid=${android.os.Process.myPid()} reason=upgrade")
+    }
+
     fun recordCleanExit(context: Context) {
         val now = System.currentTimeMillis()
         appendLine(beaconFile(context), "[${isoLocal(now)}] clean_exit pid=${android.os.Process.myPid()}")
