@@ -889,6 +889,10 @@ fun ChatSplitScaffoldRoute(
         },
         detailPane = { sessionId, onBackInPane, onNewChatInPane, onMoveToInPane,
             onToggleSidebar, sidebarCollapsed ->
+            // [Mines-38.9.14 chat_home] a task chat opened from 聊天 / 任务 goes back there, not to this entry's old list pane
+            val chatHomeBack = com.openminis.app.plus.ChatHome.enabled() && !com.openminis.app.plus.ChatHome.isMain(sessionId) &&
+                navController.previousBackStackEntry?.destination?.route.let { it != null && it != Routes.SESSION_LIST }
+            androidx.activity.compose.BackHandler(enabled = chatHomeBack) { navController.safePopBackStack() }
             com.openminis.app.ui.chat.ChatScreen(
                 // The pane navigator's contentKey IS the session id, so a
                 // draft ("__new__…") flows through unchanged and ChatScreen's
@@ -901,7 +905,7 @@ fun ChatSplitScaffoldRoute(
                 mcpRepository = mcpRepository,
                 // Back inside the pair is the pane navigator's job (it knows
                 // whether that means "hide the detail" or "pop to the list").
-                onBack = onBackInPane,
+                onBack = if (chatHomeBack) ({ navController.safePopBackStack() }) else onBackInPane,
                 // [T-android-tablet-split] Suppress the detail pane's back
                 // arrow while the list is beside it. shouldUseTwoPane() is the
                 // same window-size predicate the scaffold itself uses, so the
