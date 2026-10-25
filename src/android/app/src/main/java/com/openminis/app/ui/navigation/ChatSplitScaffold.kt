@@ -861,7 +861,12 @@ fun ChatSplitScaffoldRoute(
     ChatSplitScaffold(
         initialSessionId = initialSessionId,
         listPane = { selectedSessionId, draftPlaceholderId, onSessionSelected ->
-            com.openminis.app.ui.sessions.SessionListScreen(
+            // [Mines-38.9.14.1 chat_home] 聊天 (the main conversation's CHAT entry) never shows the old list pane on a phone —
+            // not after back, not after a state restore: it goes straight back to the main conversation.
+            if (initialSessionId != null && com.openminis.app.plus.ChatHome.isMain(initialSessionId) && !shouldUseTwoPane()) {
+                androidx.compose.runtime.LaunchedEffect(initialSessionId) { onSessionSelected(initialSessionId) }
+                androidx.compose.foundation.layout.Box(Modifier.fillMaxSize())
+            } else com.openminis.app.ui.sessions.SessionListScreen(
                 chatRepository = chatRepository,
                 providerRepository = providerRepository,
                 // Selecting a session drives the PANE navigator, not the
@@ -889,6 +894,16 @@ fun ChatSplitScaffoldRoute(
         },
         detailPane = { sessionId, onBackInPane, onNewChatInPane, onMoveToInPane,
             onToggleSidebar, sidebarCollapsed ->
+            // [Mines-38.9.14 chat_home] a task chat opened from 聊天 / 任务 goes back there, not to this entry's old list pane
+            val chatHomeBack = com.openminis.app.plus.ChatHome.enabled() && !com.openminis.app.plus.ChatHome.isMain(sessionId) &&
+                navController.previousBackStackEntry?.destination?.route.let { it != null && it != Routes.SESSION_LIST }
+            androidx.activity.compose.BackHandler(enabled = chatHomeBack) { navController.safePopBackStack() }
+            // [Mines-38.9.14.1 chat_home] 聊天 is the root: back sends Mines to the background (launcher), never to the old list
+            val chatHomeRoot = initialSessionId != null && com.openminis.app.plus.ChatHome.isMain(initialSessionId) &&
+                com.openminis.app.plus.ChatHome.isMain(sessionId) && !shouldUseTwoPane()
+            val rootCtx = androidx.compose.ui.platform.LocalContext.current
+            val toLauncher: () -> Unit = { rootCtx.findActivity()?.moveTaskToBack(true) }
+            androidx.activity.compose.BackHandler(enabled = chatHomeRoot) { toLauncher() }
             com.openminis.app.ui.chat.ChatScreen(
                 // The pane navigator's contentKey IS the session id, so a
                 // draft ("__new__…") flows through unchanged and ChatScreen's
@@ -901,7 +916,12 @@ fun ChatSplitScaffoldRoute(
                 mcpRepository = mcpRepository,
                 // Back inside the pair is the pane navigator's job (it knows
                 // whether that means "hide the detail" or "pop to the list").
-                onBack = onBackInPane,
+                onBack = when {
+                    chatHomeRoot -> toLauncher
+                    chatHomeBack -> ({ navController.safePopBackStack(); Unit })
+                    else -> onBackInPane
+                },
+                hideBack = chatHomeRoot,
                 // [T-android-tablet-split] Suppress the detail pane's back
                 // arrow while the list is beside it. shouldUseTwoPane() is the
                 // same window-size predicate the scaffold itself uses, so the
@@ -951,4 +971,11 @@ fun ChatSplitScaffoldRoute(
             )
         },
     )
+}
+
+/** [Mines-38.9.14.1 chat_home] the hosting Activity (for moveTaskToBack on 聊天). */
+private fun android.content.Context.findActivity(): android.app.Activity? {
+    var c: android.content.Context? = this
+    while (c is android.content.ContextWrapper) { if (c is android.app.Activity) return c; c = c.baseContext }
+    return null
 }

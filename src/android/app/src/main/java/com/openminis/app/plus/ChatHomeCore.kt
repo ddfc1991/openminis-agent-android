@@ -121,7 +121,7 @@ object ChatHomeCore {
         val line = when (st) {
             St.WAITING -> p?.reason?.ifBlank { null } ?: "需要你回复"
             St.ERROR -> p?.reason?.ifBlank { null } ?: if (p?.st == TaskProgressCore.St.STOPPED) "已停止" else "没完成"
-            St.DONE -> p?.let { TaskProgressCore.oneLine(it) }.orEmpty().ifBlank { t.line }
+            St.DONE -> if (t.st == St.DONE && t.line.isNotBlank()) t.line else p?.let { TaskProgressCore.oneLine(it) }.orEmpty().ifBlank { t.line }
             else -> t.line
         }
         if (st == t.st && step == t.step && total == t.total && line == t.line) return t

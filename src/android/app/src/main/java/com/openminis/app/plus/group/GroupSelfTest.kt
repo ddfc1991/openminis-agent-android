@@ -894,7 +894,7 @@ object GroupSelfTest {
                             rows.put(JSONObject().put("role", m.role).put("tag", com.openminis.app.plus.ChatHomeCore.parseTag(t)?.let { "${it.kind.name}:${it.taskId}" } ?: "")
                                 .put("text", t.take(80)))
                         }
-                        JSONObject(H.stateJson()).put("rows", rows).toString()
+                        JSONObject(H.stateJson()).put("rows", rows).put("stalls", com.openminis.app.plus.StallWatch.json()).toString()
                     }
                     else -> "i3914 main | say <text> | state"
                 }

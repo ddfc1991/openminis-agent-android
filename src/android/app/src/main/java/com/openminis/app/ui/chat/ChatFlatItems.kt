@@ -610,6 +610,22 @@ internal fun streamingOverlaySubset(
     return out
 }
 
+/** [Mines-38.9.14 chat_home] (message without its task-tag text blocks or null when nothing is left, one item per tag) */
+internal fun minesSplitTaskTags(m: ChatMessage): Pair<ChatMessage?, List<FlatChatItem.MinesTaskItem>> {
+    val texts = m.toolBlocks.filter { it.kind == "text" }
+    if (texts.isEmpty()) {
+        val tag = com.openminis.app.plus.ChatHomeCore.parseTag(m.content) ?: return m to emptyList()
+        return null to listOf(FlatChatItem.MinesTaskItem(m, tag))
+    }
+    val tagged = texts.mapNotNull { b -> com.openminis.app.plus.ChatHomeCore.parseTag(b.content)?.let { b to it } }
+    if (tagged.isEmpty()) return m to emptyList()
+    val items = tagged.mapIndexed { i, (_, tg) -> FlatChatItem.MinesTaskItem(m.copy(id = "${m.id}~t$i"), tg) }
+    val rest = m.toolBlocks.filter { b -> tagged.none { it.first === b } }
+    if (rest.isEmpty()) return null to items
+    val restText = rest.filter { it.kind == "text" }.joinToString("\n\n") { it.content }
+    return m.copy(toolBlocks = rest, content = restText) to items
+}
+
 /**
  * [T-android-fab-up-target] True when this message renders as a real user
  * bubble — something the user actually typed and can navigate back to.
@@ -692,7 +708,15 @@ internal fun buildFlatChatItems(
         }
     }
     for (idx in fromIndex until messages.size) {
-        val message = messages[idx]
+        // [Mines-38.9.14 chat_home] task chips / notices: tagged text blocks become their own rows (consecutive assistant rows are
+        // merged into one message on load, so a notice can sit inside another message); what is left renders as before
+        val message = messages[idx].let { m0 ->
+            if (m0.role != "assistant") m0 else {
+                val split = minesSplitTaskTags(m0)
+                split.second.forEach { out.add(dedupe(it)) }
+                split.first
+            }
+        } ?: continue
         // [T-android-perf-logging] Per-100-message progress breadcrumb.
         // `out.size` is the running row count, so a sudden jump between two
         // progress lines localizes the heavy batch. Only fires on the
@@ -703,11 +727,6 @@ internal fun buildFlatChatItems(
                 "buildFlatChatItems.progress",
                 "msgIdx=$idx of=${messages.size} rowsSoFar=${out.size}",
             )
-        }
-        // [Mines-38.9.14 chat_home] a task chip / notice (cheap prefix check; plain replies fall through)
-        if (message.role == "assistant") {
-            val tag = com.openminis.app.plus.ChatHomeCore.parseTag(message.toolBlocks.firstOrNull { it.kind == "text" }?.content ?: message.content)
-            if (tag != null) { out.add(dedupe(FlatChatItem.MinesTaskItem(message, tag))); continue }
         }
         if (message.role == "user") {
             // [T-android-scheduled-task-card] A task's own prompt, not the

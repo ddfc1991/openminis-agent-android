@@ -105,6 +105,8 @@ object Diag {
     fun detach(a: Activity) { if (act?.get() === a) { unhookFrames(); act = null } }
 
     fun sessionId(): String = sid
+    /** [Mines-38.9.14.1] a one-line event (stall watchdog) to the diagnostics relay when 远程诊断 is on */
+    fun event(kind: String, text: String) { if (!_on.value) return; bg?.post { send(JSONObject().put("t", kind).put("text", text.take(400))) } }
     fun isConnected(): Boolean = connected
 
     // ------------------------------------------------------------------ lifecycle

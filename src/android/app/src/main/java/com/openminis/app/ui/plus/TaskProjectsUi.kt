@@ -162,7 +162,7 @@ fun TasksScreen(onBack: () -> Unit, go: (String) -> Unit) {
             return@PlusPage
         }
 
-        AutoTasksSection(go)   // [Mines-38.9.14 chat_home] 等你处理 / 进行中 / 已完成 (nothing while the flag is off)
+        AutoTasksSection(go, projSids)   // [Mines-38.9.14 chat_home] 等你处理 / 进行中 / 已完成 (nothing while the flag is off)
         WarmGroupLabel("项目  ${projects.size} 个 · 不自动归档", "注册台账 ›") { go(Routes3912.REGISTER) }
         if (projects.isEmpty()) InfoLine("还没有项目。小任务变成注册 / 开通账号时，会问你要不要立项。")
         projects.sortedByDescending { p -> p.attempts.maxOfOrNull { tasks[it.sid]?.updatedAt ?: it.at } ?: p.createdAt }.forEach { p ->

@@ -528,6 +528,7 @@ fun ChatScreen(
      * does not, so it has to be done by hand.
      */
     isTwoPane: Boolean = false,
+    hideBack: Boolean = false,   // [Mines-38.9.14.1 chat_home] 聊天 is the root: no back arrow
     /**
      * [T-android-tablet-sidebar-collapse] Show/hide the session list, or null
      * when there is nothing to toggle.
@@ -3159,7 +3160,9 @@ fun ChatScreen(
                 },
                 navigationIcon = {
                     // [T-android-tablet-split] See `isTwoPane`.
-                    if (!isTwoPane) {
+                    if (hideBack) {
+                        // [Mines-38.9.14.1 chat_home] root 聊天: nothing to go back to
+                    } else if (!isTwoPane) {
                         IconButton(onClick = onBack) {
                             Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
                         }

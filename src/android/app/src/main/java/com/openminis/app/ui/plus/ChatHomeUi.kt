@@ -105,7 +105,7 @@ fun MinesTaskNotice(tag: ChatHomeCore.Tag) {
             val word = when (tag.kind) { ChatHomeCore.Kind.ASK -> "等你"; ChatHomeCore.Kind.ERROR -> "出错"; else -> "完成" }
             Column(Modifier.fillMaxWidth(0.86f).clip(shape).background(minesGlassFill()).border(1.dp, m.glassBorder, shape)
                 .clickable(enabled = t != null, onClick = open)
-                .semantics(mergeDescendants = true) { contentDescription = "${t?.name ?: "任务"} $word：${tag.body}。点按打开任务" }
+                .semantics(mergeDescendants = true) { contentDescription = "${t?.name ?: "任务"} $word：${tag.body.trimEnd('。')}。点按打开任务" }
                 .padding(horizontal = 14.dp, vertical = 10.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text((t?.name ?: "任务") + (if (t != null) " · 回复你 ${hm(t.createdAt)} 的消息" else ""), fontSize = MT.Meta, color = m.ink2,
@@ -184,9 +184,11 @@ fun ChatHomeDock(current: Int, onChat: () -> Unit, onTasks: () -> Unit, onMessag
 
 /** top of 任务 when 聊天主页 is on: 全部 / 等你 / 定时 › tabs, then 等你处理 / 进行中 / 已完成 and 全部对话 / 历史 */
 @Composable
-fun AutoTasksSection(go: (String) -> Unit) {
+fun AutoTasksSection(go: (String) -> Unit, inProjects: Set<String> = emptySet()) {
     if (!ChatHome.enabled()) return
-    val tasks by ChatHome.tasks.collectAsState()
+    // [Mines-38.9.14.1] a finished task that became a 项目 attempt is shown once, on its 项目 card (not again under 已完成)
+    val all by ChatHome.tasks.collectAsState()
+    val tasks = all.filter { !(it.sid in inProjects && it.st == ChatHomeCore.St.DONE) }
     var onlyWaiting by remember { mutableStateOf(false) }
     val (wait, run, done) = ChatHomeCore.groups(tasks)
     Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -202,7 +204,7 @@ fun AutoTasksSection(go: (String) -> Unit) {
     if (run.isEmpty()) InfoLine("在「聊天」里说要做的事，Mines 会自动建任务在后台运行。")
     else TaskGroup(run, go)
     WarmGroupLabel("已完成", "全部对话 ›") { ChatHomeNav.history?.invoke() }
-    if (done.isEmpty()) InfoLine("还没有完成的任务。")
+    if (done.isEmpty()) InfoLine(if (all.size > tasks.size) "完成的任务在下面它的项目里。" else "还没有完成的任务。")
     else TaskGroup(done.take(10), go)
 }
 
