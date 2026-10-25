@@ -7357,6 +7357,19 @@ def b3914(res):
         one_bar("launch")
     step("launch", launch)
 
+    def netkeep():
+        # [38.9.14.1 net_drop] the one-tap 「任务在后台不断网」 card shows on 聊天 while Mines is not battery-exempt; after the
+        # exemption (here: deviceidle whitelist = what the system 「允许」 does) it is gone on resume (emulator is not realme → no step 2)
+        r = shot("netkeep-card"); t = _txt(r); o["netkeep_txt"] = t[:200]
+        if "任务在后台不断网" not in t: fail("netkeep: 「任务在后台不断网」 card not shown on 聊天 before the exemption")
+        one_bar("netkeep-card")
+        sh(f"cmd deviceidle whitelist +{PKG}"); time.sleep(1)
+        sh("input keyevent KEYCODE_HOME"); time.sleep(2)
+        sh(f"am start -n {PKG}/com.openminis.app.MainActivity"); time.sleep(5)
+        r = shot("netkeep-gone"); t = _txt(r)
+        if "任务在后台不断网" in t or "还差一步" in t: fail("netkeep: card still shown after the battery exemption")
+    step("netkeep", netkeep)
+
     def back_root():
         # [38.9.14.1] back on 聊天 (root) → Mines goes to the background (launcher); never the old list / old bar
         back(1); time.sleep(2.5)
@@ -7498,6 +7511,38 @@ def b3914(res):
             tap_dock("任务"); shot("tab-tasks-dark"); tap_dock("聊天"); theme388(1); time.sleep(2)
         except Exception as e: print("I3914 dark error", e, flush=True)
     step("dark", dark)
+
+    def netdrop():
+        # [38.9.14.1 net_drop] a task whose model stream is cut mid-reply (TCP RST after 2 chunks, like the phone's
+        # 「Software caused connection abort」): logged as a drop with its cause, 「网络断了，等网络恢复后继续」 shown, the SAME turn
+        # resumes on the same model and the task finishes (完成) without the user doing anything
+        tap_dock("聊天"); time.sleep(1)
+        t0 = time.time()
+        result_json("group", "i3914 say 帮我部署 断网测试 NETDROPONCE", timeout=40)
+        s = wait_state(lambda s: any(x.get("kind") == "drop" for x in (s.get("netdrops") or [])), 60)
+        o["netdrop_drop_s"] = int(time.time() - t0)
+        drops = [x for x in (s.get("netdrops") or []) if x.get("kind") == "drop"]
+        if not drops: fail(f"netdrop: no drop logged within 60 s: {(s.get('netdrops') or [])[-4:]}"); return
+        o["netdrop_drop"] = drops[-1]
+        if not drops[-1].get("state"): fail("netdrop: drop logged without the device state (screen / app / net / idle)")
+        r = dump(); p = find(r, "已建任务 断网测试") or find(r, "断网测试")
+        if p: sh(f"input tap {p[0]} {p[1]}"); time.sleep(2.5)
+        else: fail("netdrop: chip 「已建任务 断网测试」 not found")
+        r = shot("netdrop-wait"); t = _txt(r); o["netdrop_wait_txt"] = t[-300:]
+        if "网络断了" not in t: fail("netdrop: 「网络断了，等网络恢复后继续」 line not shown in the task while it waits")
+        s = wait_state(lambda s: any(x.get("name") == "断网测试" and x.get("st") == "done" for x in (s.get("tasks") or [])), 100)
+        dt = int(time.time() - t0); o["netdrop_done_s"] = dt; o["netdrop_log"] = (s.get("netdrops") or [])[-6:]
+        f = fake(); o["netdrop_posts"] = f.get("netdrop_posts")
+        if not any(x.get("name") == "断网测试" and x.get("st") == "done" for x in (s.get("tasks") or [])):
+            fail(f"netdrop: task did not finish after the drop ({dt} s): {[(x.get('name'), x.get('st'), x.get('line')) for x in (s.get('tasks') or [])]}")
+        if not any(x.get("kind") == "resume" for x in (s.get("netdrops") or [])): fail("netdrop: no resume logged")
+        if (f.get("netdrop_posts") or 0) < 2: fail(f"netdrop: model not called again after the drop ({f.get('netdrop_posts')})")
+        time.sleep(2); r = shot("netdrop-done"); t = _txt(r); o["netdrop_done_txt"] = t[-300:]
+        if "断网后已继续" not in t: fail("netdrop: resumed reply not visible in the task conversation")
+        if "网络断了" in t: fail("netdrop: wait line still shown after the reply")
+        back(1); time.sleep(2.5)
+        r = shot("netdrop-chat"); one_bar("netdrop-chat")
+    step("netdrop", netdrop)
 
     def experiments():
         route("settings", 3); tap_text("测试与上报", wait=3)

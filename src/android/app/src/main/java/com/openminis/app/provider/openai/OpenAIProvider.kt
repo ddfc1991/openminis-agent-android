@@ -587,6 +587,9 @@ class OpenAIProvider private constructor(
         // a per-client pool was never evicted, and a dead h2 tunnel through
         // a local proxy got reused on every retry (silent infinite hang).
         .connectionPool(com.openminis.app.network.NetworkMonitor.sharedLLMConnectionPool)
+        // [38.9.14.1 net_drop] TCP keepalive + HTTP/2 ping so a long silent stream is not cut as idle
+        .socketFactory(com.openminis.app.network.KeepAliveSocketFactory)
+        .pingInterval(com.openminis.app.network.KeepAliveSocketFactory.PING_S, TimeUnit.SECONDS)
         .eventListenerFactory { OkHttpNetTraceListener() }
         .build()
 

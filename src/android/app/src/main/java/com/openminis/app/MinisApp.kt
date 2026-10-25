@@ -827,7 +827,7 @@ class MinisApp : Application(), ImageLoaderFactory {
         // when a chat turn started, so after any restart home showed 「都在正常跑」 and no pills although chats had progress)
         kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
             runCatching { com.openminis.app.plus.TaskProgress.init(this@MinisApp) }
-            runCatching { com.openminis.app.plus.TaskProjects.init(this@MinisApp); com.openminis.app.plus.ChatHome.init(this@MinisApp); com.openminis.app.plus.StallWatch.init(this@MinisApp) }   // [Mines-38.9.14 chat_home] queued tasks resume
+            runCatching { com.openminis.app.plus.TaskProjects.init(this@MinisApp); com.openminis.app.plus.ChatHome.init(this@MinisApp); com.openminis.app.plus.StallWatch.init(this@MinisApp); com.openminis.app.plus.NetDrop.init(this@MinisApp) }   // [Mines-38.9.14 chat_home] queued tasks resume
         }
         kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
             runCatching { com.openminis.app.plus.PartnerGateway.startAtLaunch(this@MinisApp) }

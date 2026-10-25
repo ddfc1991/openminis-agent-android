@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
@@ -328,4 +329,61 @@ fun chatHomeDockPad(): androidx.compose.ui.unit.Dp {
     val nav = androidx.compose.foundation.layout.WindowInsets.navigationBars
     val navPad = with(androidx.compose.ui.platform.LocalDensity.current) { nav.getBottom(this).toDp() }
     return DockBlur.DOCK_H + navPad + 12.dp
+}
+
+// ───────────────────────────── background keep (net_drop) ─────────────────────────────
+
+/**
+ * [Mines-38.9.14.1 net_drop] one-tap guide so a running task is not frozen / cut off in the background (user 2026-10-25:
+ * tasks died with 「Software caused connection abort」). Step 1: system dialog 「允许在后台运行」 (one tap 允许).
+ * Step 2 (realme / OPPO / OnePlus only): the app page where 「耗电管理 → 允许后台行为 / 自启动」 lives. ✕ hides it for good.
+ * Re-checked every time the app comes back.
+ */
+object NetKeep {
+    private const val P = "mines_netkeep"
+    fun oem(): Boolean = android.os.Build.MANUFACTURER.lowercase().let { it.contains("realme") || it.contains("oppo") || it.contains("oneplus") }
+    fun exempt(c: android.content.Context): Boolean = runCatching {
+        c.getSystemService(android.os.PowerManager::class.java).isIgnoringBatteryOptimizations(c.packageName) }.getOrDefault(true)
+    fun flag(c: android.content.Context, k: String) = c.getSharedPreferences(P, 0).getBoolean(k, false)
+    fun set(c: android.content.Context, k: String) { c.getSharedPreferences(P, 0).edit().putBoolean(k, true).apply() }
+    /** 0 = nothing to show, 1 = battery step, 2 = OEM background step */
+    fun step(c: android.content.Context): Int = when {
+        flag(c, "closed") -> 0
+        !exempt(c) -> 1
+        oem() && !flag(c, "oem_done") -> 2
+        else -> 0
+    }
+}
+
+@Composable
+fun NetKeepCard(modifier: Modifier = Modifier) {
+    val ctx = LocalContext.current
+    var tick by remember { mutableStateOf(0) }
+    val owner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    androidx.compose.runtime.DisposableEffect(owner) {
+        val o = androidx.lifecycle.LifecycleEventObserver { _, e -> if (e == androidx.lifecycle.Lifecycle.Event.ON_RESUME) tick++ }
+        owner.lifecycle.addObserver(o); onDispose { owner.lifecycle.removeObserver(o) }
+    }
+    val step = remember(tick) { NetKeep.step(ctx) }
+    if (step == 0) return
+    val m = mines()
+    val text = if (step == 1) "任务在后台不断网：点这里，系统问时选「允许」" else "还差一步：点这里，进「耗电管理」打开「允许后台行为」"
+    Row(modifier.padding(horizontal = 16.dp).fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(minesGlassFill(strong = true))
+        .border(1.dp, m.glassBorder, RoundedCornerShape(16.dp))
+        .clickable {
+            val pkg = android.net.Uri.parse("package:" + ctx.packageName)
+            val i = if (step == 1) android.content.Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, pkg)
+                else android.content.Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, pkg).also { NetKeep.set(ctx, "oem_done") }
+            runCatching { ctx.startActivity(i.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)) }
+                .onFailure { runCatching { ctx.startActivity(android.content.Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, pkg).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)) } }
+            tick++
+        }
+        .semantics { contentDescription = text }
+        .heightIn(min = 44.dp).padding(start = 14.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.size(7.dp).clip(CircleShape).background(toneColor(ChatHomeCore.Tone.WAIT)))
+        Spacer(Modifier.width(8.dp))
+        Text(text, fontSize = MT.Caption, color = m.ink, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+        Box(Modifier.size(40.dp).clip(CircleShape).clickable { NetKeep.set(ctx, "closed"); tick++ }.semantics { contentDescription = "不再提示" },
+            contentAlignment = Alignment.Center) { Text("✕", fontSize = MT.Caption, color = m.ink2) }
+    }
 }

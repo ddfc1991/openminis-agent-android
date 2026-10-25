@@ -18,6 +18,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.ime
 import androidx.navigation.compose.currentBackStackEntryAsState
@@ -1815,6 +1816,9 @@ private fun androidx.compose.foundation.layout.BoxScope.ChatHomeOverlay(navContr
         if (tab == 0) navController.navigate(target) { launchSingleTop = true }
         else navController.navigate(target) { route?.let { popUpTo(it) { inclusive = true } }; launchSingleTop = true }
     }
+    // [38.9.14.1 net_drop] one-tap 「后台不断网」 guide (battery exemption, then realme/OPPO background) on 聊天 / 任务
+    if (tab == 0) com.openminis.app.ui.plus.NetKeepCard(Modifier.align(androidx.compose.ui.Alignment.TopCenter).statusBarsPadding().padding(top = 60.dp))
+    if (tab == 1) com.openminis.app.ui.plus.NetKeepCard(Modifier.align(androidx.compose.ui.Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 92.dp))
     if (tab == 0) com.openminis.app.ui.plus.ChatHomeRoutingPill(Modifier.align(androidx.compose.ui.Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 150.dp))
     com.openminis.app.ui.plus.ChatHomeDock(
         current = tab,
