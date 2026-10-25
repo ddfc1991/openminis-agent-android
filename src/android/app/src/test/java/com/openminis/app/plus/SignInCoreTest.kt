@@ -39,6 +39,14 @@ class SignInCoreTest {
         assertEquals(listOf(eCode), SignInCore.order(listOf(eCode, e), l, setOf(e.key)))
     }
 
+    @Test fun linkedWayGetsItsSecondTryOnly() {
+        val l = Link(Group.EMAIL_PW, "b@163.com", byUser = true)
+        assertEquals(listOf(e), SignInCore.planOrder(listOf(e), l, setOf(e.key), 1))          // 2nd try, same linked way
+        assertEquals(emptyList<Way>(), SignInCore.planOrder(listOf(e), l, setOf(e.key), 2))   // budget spent → handoff
+        assertEquals(listOf(eCode), SignInCore.planOrder(listOf(e, eCode), l, setOf(e.key), 1)) // another way of that account first
+        assertEquals(emptyList<Way>(), SignInCore.planOrder(listOf(g), null, setOf(g.key), 1)) // unlinked: never the same twice
+    }
+
     @Test fun forNamedKeepsThatAccountOnly() {
         assertEquals(listOf(e, eCode), SignInCore.forNamed(listOf(g, e, eCode), "B@163.com"))
         assertEquals(listOf(g, e), SignInCore.forNamed(listOf(g, e), "zzz@x.com"))   // unknown name: nothing filtered

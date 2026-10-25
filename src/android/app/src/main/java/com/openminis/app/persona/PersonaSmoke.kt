@@ -101,7 +101,7 @@ object PersonaSmoke {
             "sliderval" -> {
                 val v = sliderVm ?: return JSONObject().put("err", "no sheet").toString()
                 val inp = com.openminis.app.browser.BrowserActionInput.parse(JSONObject().put("action", "execute_js")
-                    .put("script", "(function(){var t=document.getElementById('track');var r=t?t.getBoundingClientRect():{top:0,height:0,left:0,width:0};" +
+                    .put("script", "return (function(){var t=document.getElementById('track');var r=t?t.getBoundingClientRect():{top:0,height:0,left:0,width:0};" +
                         "return 'SV'+JSON.stringify({v:window.__sv===undefined?-1:window.__sv,moves:window.__moves||0,cancel:window.__cancel||0,mid:r.top+r.height/2,left:r.left,width:r.width,dpr:window.devicePixelRatio,iw:window.innerWidth})+'SV';})()").toString())!!
                 val r = kotlinx.coroutines.withTimeoutOrNull(15_000) { v.browserTabPool.execute(inp) }
                 JSONObject().put("raw", r?.text?.take(200) ?: "timeout").put("open", v.showBrowserSheet.value).toString()

@@ -8,7 +8,8 @@ import org.json.JSONObject
  *  - every saved account belongs to one sign-in group: 「Google 登录」/「GitHub 登录」/「邮箱+密码」/「手机号+验证码」/
  *    「API Key」/「其他」;
  *  - every site links to ONE group + account (remembered after the first success, or set by the user in 账号台账), so the
- *    auto-login tries that way first and never the same failing (account, way) twice;
+ *    auto-login tries that way first; an unlinked failing (account, way) is never tried twice, the linked one gets its
+ *    second try (≤ [MAX_AUTO]) — a slow page fails once without being the wrong account;
  *  - at most [MAX_AUTO] automatic sign-in attempts per site per task, then 等你处理 with a handoff — no loop.
  * Pure; unit-tested in SignInCoreTest. Android side: [SignIn].
  */
@@ -98,6 +99,17 @@ object SignInCore {
         if (named.isNullOrBlank()) cands else cands.filter { it.account.equals(named.trim(), true) }.ifEmpty { cands }
 
     const val MAX_AUTO = 2
+
+    /**
+     * [38.9.15] the ways to try now: [order] without the failed ones; when that leaves nothing but the site is linked to
+     * an account (the user's pick / remembered), that linked way gets its second try while attempts < [MAX_AUTO].
+     * Never another account — [pool] is already the linked account's ways when a link exists.
+     */
+    fun planOrder(pool: List<Way>, link: Link?, failed: Set<String>, attempts: Int): List<Way> {
+        val o = order(pool, link, failed)
+        if (o.isNotEmpty() || link == null || attempts >= MAX_AUTO) return o
+        return order(pool, link, emptySet()).filter { it.group == link.group && it.account.equals(link.account, true) }
+    }
 
     enum class Next { TRY, HANDOFF }
 

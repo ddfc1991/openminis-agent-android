@@ -121,7 +121,7 @@ object SignIn {
             !named.isNullOrBlank() -> SignInCore.forNamed(all, named)
             else -> all
         }
-        val order = SignInCore.order(pool, l, b.failed)
+        val order = SignInCore.planOrder(pool, l, b.failed, b.attempts)
         val haveAny = all.isNotEmpty()
         if (SignInCore.next(b.attempts, if (haveAny) order.size else -1) == SignInCore.Next.HANDOFF)
             return Plan.Handoff(SignInCore.handoffLine(root, b.attempts, b.tried))
