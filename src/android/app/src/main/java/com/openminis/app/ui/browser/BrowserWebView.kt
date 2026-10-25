@@ -46,7 +46,11 @@ fun BrowserWebView(
                 // (sheet re-open racing the old node's disposal) — detach
                 // first or addView throws "child already has a parent".
                 (webView.parent as? ViewGroup)?.removeView(webView)
+                // [Mines-38.9.15] takeover: drags (sliders / human checks) go to the page, never to a nested-scroll parent
+                webView.isNestedScrollingEnabled = false
+                webView.isFocusableInTouchMode = true
                 webView.setOnTouchListener { v, event ->
+                    if (event.actionMasked == MotionEvent.ACTION_DOWN && !v.hasFocus()) v.requestFocus()
                     when (event.actionMasked) {
                         MotionEvent.ACTION_DOWN,
                         MotionEvent.ACTION_MOVE,

@@ -163,6 +163,23 @@ object Persona {
     }
 
     /**
+     * [38.9.15] An act that ALWAYS waits for the user's 同意, whatever the flag or the account list says (Cloudflare DNS
+     * delete through the saved API token). The kill switch refuses it outright. One 同意 = one use within [APPROVAL_MS],
+     * bound to [key] (e.g. 「cloudflare.com:example.com」). The approval itself only comes from the 伪人核心 page (userApprove).
+     */
+    fun confirmAlways(c: Context, key: String, act: LimitGuardCore.Act, note: String): LimitGuardCore.Decision {
+        init(c)
+        if (_limits.value.killed) { record(key, act.id, false, LimitGuardCore.Why.KILLED.name, note); return LimitGuardCore.Decision(false, LimitGuardCore.Why.KILLED, key) }
+        val ak = key + "|" + act.id
+        val approved = synchronized(approvals) { ((approvals[ak] ?: 0L) > System.currentTimeMillis()).also { if (it) approvals.remove(ak) } }
+        if (approved) { record(key, act.id, true, "user-approved", note); return LimitGuardCore.Decision(true, LimitGuardCore.Why.OK, key) }
+        _pending.value = (_pending.value.filter { !(it.account == key && it.act == act.id) } +
+            Pending("p" + System.currentTimeMillis(), key, act.id, note.take(80), System.currentTimeMillis())).takeLast(20)
+        record(key, act.id, false, LimitGuardCore.Why.NEEDS_CONFIRM.name, note)
+        return LimitGuardCore.Decision(false, LimitGuardCore.Why.NEEDS_CONFIRM, key)
+    }
+
+    /**
      * A refused call: the tool answers with the wall, and the conversation's task goes to 「等你处理」 (chat-home task
      * states read TaskProgress), so the user sees it waiting on them instead of the agent finding another way.
      */

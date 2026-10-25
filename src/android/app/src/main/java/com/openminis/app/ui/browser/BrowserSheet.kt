@@ -195,7 +195,8 @@ fun BrowserSheet(
     // scrolls inside a webpage.
     val webViewScrollGuard = remember {
         object : NestedScrollConnection {
-            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset = available
+            // [Mines-38.9.15] only the vertical part (the sheet's own axis); horizontal drags stay with the page
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset = Offset(0f, available.y)
         }
     }
 
@@ -204,6 +205,7 @@ fun BrowserSheet(
         onDismiss = onDismiss,
         sheetMaxWidth = androidx.compose.ui.unit.Dp.Unspecified,  // [Mines-webfit-38.3] full width in landscape
         singleLineTitle = true,  // [Mines-webpaint-38.4] long titles: one line + …, close X always visible
+        sheetGesturesEnabled = false,  // [Mines-38.9.15] user: 「继续接管」 slider can't be dragged — the page owns every drag; close with X
         leadingAction = {
             // UA-profile icon doubles as the entry point to settings, matching
             // the prior centered-title-with-icon affordance.

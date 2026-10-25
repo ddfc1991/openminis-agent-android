@@ -60,6 +60,8 @@ fun StandardChatSheet(
     sheetMaxWidth: androidx.compose.ui.unit.Dp = androidx.compose.material3.BottomSheetDefaults.SheetMaxWidth,
     // [Mines-webpaint-38.4] the in-app browser: a long page title stays on one line (…) so the close X is always there
     singleLineTitle: Boolean = false,
+    // [Mines-38.9.15] the in-app browser: the sheet must not take drags from the page (sliders / human checks)
+    sheetGesturesEnabled: Boolean = true,
     content: @Composable () -> Unit,
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -72,6 +74,7 @@ fun StandardChatSheet(
         sheetMaxWidth = sheetMaxWidth,
         containerColor = ChatColors.background,
         dragHandle = { CompactDragHandle() },
+        sheetGesturesEnabled = sheetGesturesEnabled,
     ) {
         Column(
             modifier = Modifier

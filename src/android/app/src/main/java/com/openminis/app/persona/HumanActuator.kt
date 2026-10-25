@@ -25,10 +25,13 @@ object HumanActuator {
      */
     fun gate(c: Context, argsJson: String, pageUrl: String?, owner: String? = null): Gate {
         Persona.init(c)
-        if (!Persona.on.value) return Gate(null, argsJson, 0L)
         val o = runCatching { JSONObject(argsJson) }.getOrNull() ?: return Gate(null, argsJson, 0L)
         val action = o.optString("action").trim().lowercase()
         val url = o.optString("url").takeIf { it.isNotBlank() } ?: pageUrl
+        // [38.9.15] sign-in loop guard (any flag): re-opening a site's sign-in page counts against the same ≤ 2 budget
+        // as accounts login; past it the step goes to 等你处理 instead of looping (user's CF screenshot: 64 steps)
+        if (action == "navigate" && owner != null) loginLoop(c, owner, o.optString("url"), pageUrl)?.let { return Gate(it, argsJson, 0L) }
+        if (!Persona.on.value) return Gate(null, argsJson, 0L)
         val text = o.optString("text")
         val target = listOf(text, o.optString("selector")).joinToString(" ")
         val act = LimitGuardCore.actOf("browser_use", action, target)
@@ -46,6 +49,18 @@ object HumanActuator {
         }
         val dwell = if (action in PACED) HumanActuatorCore.readDwellMs(text.length + 200) else 0L
         return Gate(null, args, dwell)
+    }
+
+    private fun loginLoop(c: Context, owner: String, target: String, last: String?): String? {
+        val host = com.openminis.app.plus.Keychain.hostOf(target).ifBlank { return null }
+        val lastHost = com.openminis.app.plus.Keychain.hostOf(last)
+        val authNow = com.openminis.app.plus.HandoffCore.isAuthUrl(target)
+        val wasAuth = last != null && com.openminis.app.plus.Keychain.root(lastHost) == com.openminis.app.plus.Keychain.root(host) && com.openminis.app.plus.HandoffCore.isAuthUrl(last)
+        if (!authNow && !wasAuth) return null
+        com.openminis.app.plus.SignIn.init(c)
+        val line = com.openminis.app.plus.SignIn.browserAuthHit(owner, host) ?: return null
+        com.openminis.app.plus.SignIn.notifyUser(c, owner, host, line)
+        return line
     }
 
     private val PACED = setOf("click", "type", "scroll", "hover", "navigate")

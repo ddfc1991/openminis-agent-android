@@ -41,7 +41,7 @@ object ChatHomeCore {
         }
     }
 
-    private val ACTION = Regex("""(?i)注册|开通|激活|部署|安装|配置|搭建|迁移|修复|爬取|抓取|批量|监控|续费|购买|下单|申请|创建|发布|上传|下载|整理成|写一[个份篇]|做一[个份]|生成一[份个]|帮我把|替我|登录到|跑一下|检查一下.+(服务器|内存|端口|日志)|sign ?up|deploy|install""")
+    private val ACTION = Regex("""(?i)注册|开通|激活|部署|安装|配置|搭建|迁移|修复|爬取|抓取|批量|监控|续费|购买|下单|申请|创建|发布|上传|下载|整理成|写一[个份篇]|做一[个份]|生成一[份个]|帮我把|替我|登录到|跑一下|检查一下.+(服务器|内存|端口|日志)|发.{0,8}(邮件|消息|私信|帖子|微博|朋友圈|推文)|回复.{0,6}(邮件|消息|私信)|清理.{0,4}(邮箱|收件箱|邮件)|sign ?up|deploy|install""")   // [38.9.15] sending / posting as the user is real work → a task (limits layer applies)
 
     /** used when no model answers: action words → task, anything else → quick */
     fun heuristic(text: String): Decision =

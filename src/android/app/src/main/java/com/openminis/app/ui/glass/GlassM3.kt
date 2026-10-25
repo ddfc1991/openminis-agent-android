@@ -98,6 +98,8 @@ fun ModalBottomSheet(
     dragHandle: @Composable (() -> Unit)? = { GlassDragHandle() },
     contentWindowInsets: @Composable () -> WindowInsets = { BottomSheetDefaults.windowInsets },
     properties: androidx.compose.material3.ModalBottomSheetProperties = androidx.compose.material3.ModalBottomSheetDefaults.properties,
+    /** [Mines-38.9.15] false = the sheet does not follow drags (the in-app browser: a slider on the page owns the finger) */
+    sheetGesturesEnabled: Boolean = true,
     content: @Composable ColumnScope.() -> Unit,
 ) {
     val m = mines()
@@ -123,6 +125,7 @@ fun ModalBottomSheet(
         dragHandle = dragHandle,
         contentWindowInsets = contentWindowInsets,
         properties = properties,
+        sheetGesturesEnabled = sheetGesturesEnabled,
     ) {
         // [Mines-38.9.9] user (快速测试 over 选择模型): the stacked sheet's own backdrop pass (window dim + a blurred copy of the
         // page in the activity layer) dimmed only part of the sheet below and left a full-width bright seam under 「自动（推荐）」.

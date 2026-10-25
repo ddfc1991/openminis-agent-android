@@ -49,6 +49,8 @@ class ChatHomeCoreTest {
     @Test fun heuristicAndNames() {
         assertEquals(Route.QUICK, C.heuristic("新加坡天气怎么样").route)
         assertEquals(Route.TASK, C.heuristic("帮我注册 railway.com").route)
+        assertEquals(Route.TASK, C.heuristic("帮我给老板发周报邮件").route)   // [38.9.15]
+        assertEquals(Route.TASK, C.heuristic("帮我清理一下邮箱").route)
         assertEquals("Railway 注册", C.nameFor("帮我注册 railway.com"))
         assertEquals("Zeabur 注册", C.nameFor("帮我注册 zeabur"))
         assertEquals("清理阿里云 socat", C.nameFor("帮我清理阿里云 socat。"))

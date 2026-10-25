@@ -283,6 +283,7 @@ return JSON.stringify({pw:pw,t:t.slice(0,6000),av:av});}catch(x){return '{}';}})
 
     private fun expire(id: String) {
         val h = update(id) { HandoffCore.move(it, State.EXPIRED, now())?.copy(stage = 3) } ?: return
+        cancelNotif(h)   // [Mines-38.9.15] the ongoing human-check notice must not outlive its handoff
         runCatching { TaskProgress.onWaiting(h.sessionId, "等你在 ${HandoffCore.site(h.host)} ${verb(h)}") }
         deliver(h, HandoffCore.expiredText(h), wake = false)
     }
@@ -504,7 +505,9 @@ return JSON.stringify({pw:pw,t:t.slice(0,6000),av:av});}catch(x){return '{}';}})
             val n = NotificationCompat.Builder(c, CHANNEL)
                 .setSmallIcon(android.R.drawable.ic_dialog_alert)
                 .setContentTitle(title).setContentText(body)
-                .setPriority(NotificationCompat.PRIORITY_HIGH).setAutoCancel(true)
+                .setPriority(NotificationCompat.PRIORITY_HIGH).setAutoCancel(h.kind != Kind.CAPTCHA)
+                // [Mines-38.9.15] a human check stays in the shade until the handoff ends (cancelNotif), not swiped away by a tap
+                .setOngoing(h.kind == Kind.CAPTCHA).setCategory(NotificationCompat.CATEGORY_REMINDER)
                 .apply { if (pi != null) { setContentIntent(pi); if (labelled) addAction(0, "去那个页面", pi) } }
                 .build()
             nm.notify(NOTIF_BASE + (h.id.hashCode() and 0xfff), n)

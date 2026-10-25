@@ -59,7 +59,7 @@ object AccountsTool {
             "name" to AgentToolParam("string", "secret: what it is, shown on the card (e.g. 梦云 VPS, OpenAI)"),
             "purpose" to AgentToolParam("string", "secret: why you need it, a few words in the user's language"),
             "site" to AgentToolParam("string", "Domain or URL, e.g. aliyun.com or https://bailian.console.aliyun.com"),
-            "account" to AgentToolParam("string", "remember / use / register_done: the account (address / user name)"),
+            "account" to AgentToolParam("string", "login: the account the task names (else Mines asks the user when there are several); remember / use / register_done: the account (address / user name)"),
             "count" to AgentToolParam("integer", "register_pick: how many accounts to register (1–20)"),
             "ok" to AgentToolParam("boolean", "register_done: true = the account was created, false = failed (removed from the 台账)"),
             "note" to AgentToolParam("string", "register_done: extra 备注 (a few words)"),
@@ -134,7 +134,10 @@ object AccountsTool {
                 remember(site, hit.key)
                 ToolExecutionResult("记住了：$site 以后用 ${AccountsCore.maskPhone(acct)}", true)
             }
-            "pick" -> ToolExecutionResult(pickText(c, sid, site, all), true)
+            "pick" -> ToolExecutionResult(pickText(c, sid, site, all) + SignIn.waysFor(c, site).takeIf { it.isNotEmpty() }?.let { w ->
+                "\n登录方式：" + w.joinToString("；") { "${AccountsCore.maskPhone(it.account)} = ${it.group.zh}" } +
+                    (SignIn.link(site)?.let { l -> "（这个网站记住的是 ${l.group.zh} · ${AccountsCore.maskPhone(l.account)}）" } ?: "")
+            }.orEmpty(), true)
             // [38.9.11.3] 台账: accounts with saved passwords for a site, ranked (named in chat > bound > 备注 > last success > 默认)
             "ledger" -> {
                 if (site.isBlank()) return@runCatching ToolExecutionResult("site 是空的", false)
@@ -175,16 +178,35 @@ object AccountsTool {
             "login" -> {
                 if (site.isBlank()) return@runCatching ToolExecutionResult("site 是空的", false)
                 val pick = AccountsCore.pick(site, all, remembered(site))
-                if (pick is AccountsCore.Pick.Ask) return@runCatching ToolExecutionResult(pickText(c, sid, site, all), true)
+                val named = a.optString("account").trim().takeIf { it.isNotBlank() }
+                // [38.9.15] several accounts: the 「选账号」 card asks the user (below); the text list only when the ledger has no ways for the site
+                if (pick is AccountsCore.Pick.Ask && named == null && SignIn.waysFor(c, Keychain.root(AccountsCore.accountSite(site))).isEmpty())
+                    return@runCatching ToolExecutionResult(pickText(c, sid, site, all), true)
                 val acct = (pick as? AccountsCore.Pick.One)?.acct
                 acct?.let { TaskProgress.usedAccount(sid, "${it.name} · ${AccountsCore.maskPhone(it.identity)}") }
                 if (acct != null && Way.KEY in acct.ways) return@runCatching ToolExecutionResult("${acct.name} 是 API 密钥服务：直接调用即可（密钥在保险箱，由 Mines 带上）", true)
                 val root = Keychain.root(AccountsCore.accountSite(site))
                 if (Relogin.recheck(c, root, force = true) == true) return@runCatching ToolExecutionResult("$site 已登录" + (acct?.let { "（${AccountsCore.maskPhone(it.identity)}）" } ?: "") + "：用 browser 直接打开，会话是共享的", true)
-                TaskProgress.onWaiting(sid, "正在登录 $site")
-                val res = hiddenLogin(c, root)
-                if (res.ok) TaskProgress.onTurnStart(sid) else if (res.needsUser) TaskProgress.onWaiting(sid, res.line)
-                ToolExecutionResult(res.line, res.ok)
+                // [38.9.15] Cloudflare with a saved API token: no web sign-in at all
+                if (root == "cloudflare.com" && CloudflareApi.token(c) != null)
+                    return@runCatching ToolExecutionResult("Cloudflare 有你保存的 API token：DNS / 隧道用 cloudflare 工具直接做，不用登录网页。", true)
+                // [38.9.15] sign-in group + account per site: several unlinked accounts → the user picks (card); ≤ 2 automatic
+                // tries per task with the linked account only, then 等你处理 (no 64-step loops)
+                val task = runCatching { TaskProgress.get(sid)?.goal }.getOrNull().orEmpty()
+                when (val out = SignIn.run(c, sid, root, named, task) { way ->
+                    TaskProgress.onWaiting(sid, "正在登录 $site" + (way?.let { "（${it.group.zh} · ${AccountsCore.maskPhone(it.account)}）" } ?: ""))
+                    val res = hiddenLogin(c, root)
+                    if (res.ok) TaskProgress.onTurnStart(sid) else if (res.needsUser) TaskProgress.onWaiting(sid, res.line)
+                    res.ok to res.line
+                }) {
+                    is SignIn.Outcome.NoPick -> ToolExecutionResult(out.line, false)
+                    is SignIn.Outcome.Handoff -> ToolExecutionResult(out.line, false)
+                    is SignIn.Outcome.Tried -> {
+                        val tail = if (out.ok) "" else if (out.attempt >= SignInCore.MAX_AUTO) "\n" + SignInCore.handoffLine(root, out.attempt, listOfNotNull(out.way)).also { SignIn.notifyUser(c, sid, root, it) }
+                            else "\n这次用的是 ${out.way?.group?.zh ?: "页面默认方式"}；再调用一次会换下一种方式（同一个账号，最多 ${SignInCore.MAX_AUTO} 次），不要自己反复打开登录页。"
+                        ToolExecutionResult(out.line + tail, out.ok)
+                    }
+                }
             }
             else -> ToolExecutionResult("action 只能是 list / pick / login / status / remember / secret / ledger / use / register_pick / register_done", false)
         }

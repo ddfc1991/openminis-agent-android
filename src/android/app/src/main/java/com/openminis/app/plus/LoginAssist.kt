@@ -163,7 +163,7 @@ var b=((document.body&&document.body.innerText)||'');if(/disallowed_useragent|æ­
         val offers = IdentityCore.parseOffers(offersJson)
         return IdentityCore.choose(offers, IdentityStore.recFor(context, host), IdentityStore.current(context)) { v ->
             runCatching { if (v.isBlank()) SavedLogins.forUrl(context, "https://$host/") != null else SavedLogins.find(context, host, v) != null }.getOrDefault(false)
-        }
+        }.let { runCatching { SignIn.reorder(host, it) }.getOrDefault(it) }   // [38.9.15] the site's linked sign-in group first, failed ways dropped
     }
 
     /**

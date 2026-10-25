@@ -13697,6 +13697,7 @@ class ChatViewModel(
             com.openminis.app.plus.WorkspaceStore.TOOL_NAME ->
                 kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.openminis.app.plus.WorkspaceStore.runTool(context, argsJson) }
             com.openminis.app.persona.PersonaTool.TOOL_NAME -> com.openminis.app.persona.PersonaTool.runTool(context, minesSid(), argsJson)   // [38.9.15 伪人核心]
+            com.openminis.app.plus.CloudflareApi.TOOL_NAME -> com.openminis.app.plus.CloudflareApi.runTool(context, minesSid(), argsJson)   // [38.9.15]
             else -> ToolExecutionResult("Unknown tool: $name", false)
         }
     }

@@ -303,6 +303,7 @@ fun KeychainScreen(onBack: () -> Unit, go: (String) -> Unit, onTab: ((Int) -> Un
         }
         LaunchedEffect(Unit) { while (true) { delay(2500); afOn = MinesAutofillService.enabled(ctx) } }
         msg?.let { Text(it, fontSize = MT.Sub, color = m.ink2, modifier = Modifier.padding(horizontal = 26.dp, vertical = 6.dp)) }
+        if (query.isBlank() && !onlyBad) SignInGroupsSection(rev)   // [Mines-38.9.15] 按登录方式 (Google / 邮箱+密码 / 手机号+验证码 / API Key)
         // [Mines-38.9.1] groups are made from the identities that exist — any type, no fixed 手机号 / 邮箱 slots
         val groups = remember(shown, idents) { runCatching { Keychain.idGroups(ctx, shown) }.getOrDefault(emptyList()) }
         if (all.isEmpty() && idents.isEmpty()) InfoLine("还没有记下的账号。点右上角 +：一键关联，或者登记你的手机号、邮箱、Google 等身份。在 Mines 里登录 / 注册一次也会自动记下。")
