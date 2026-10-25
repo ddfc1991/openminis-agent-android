@@ -110,16 +110,24 @@ object MinesBrowser {
      * cannot start, the call falls back to the WebView pool with a one-line note.
      */
     suspend fun route(
-        context: Context, argsJson: String, input: BrowserActionInput, owner: String?,
-        webView: suspend () -> BrowserActionResult,
+        context: Context, argsJson0: String, input0: BrowserActionInput, owner: String?,
+        webView0: suspend (BrowserActionInput) -> BrowserActionResult,
     ): BrowserActionResult {
         init(context)
+        // [38.9.15 伪人核心] the one choke point for both engines: limits (user-only), voice filter, human pace
+        val pg = com.openminis.app.persona.HumanActuator.gate(context, argsJson0, com.openminis.app.persona.HumanActuator.lastUrl(owner), owner)
+        if (pg.refusal != null) return BrowserActionResult.error(pg.refusal)
+        com.openminis.app.persona.HumanActuator.dwell(pg.dwellMs)
+        val argsJson = (if (com.openminis.app.persona.Persona.enabled()) com.openminis.app.persona.HumanActuator.typingArgs(pg.args) else null) ?: pg.args
+        val input = if (argsJson === argsJson0) input0 else BrowserActionInput.parse(argsJson) ?: input0
+        com.openminis.app.persona.HumanActuator.profileFor(owner)?.let { p -> tasks[key(owner)]?.takeIf { it.contextId != p }?.let { endTask(owner) } }
+        val webView: suspend () -> BrowserActionResult = { webView0(input).also { com.openminis.app.persona.HumanActuator.noteUrl(owner, it.pageURL) } }
         val engine = MinesBrowserCore.engineOf(argsJson)
         val action = runCatching { JSONObject(argsJson).optString("action") }.getOrDefault(input.action.value)
         if (!MinesBrowserCore.useGecko(on(), engine, hasTask(owner), action)) return webView()
         if (action !in MinesBrowserCore.SUPPORTED) return BrowserActionResult.error(MinesBrowserCore.unsupported(action).removePrefix("Error: "))
         return try {
-            execute(owner, input, action)
+            execute(owner, input, action).also { com.openminis.app.persona.HumanActuator.noteUrl(owner, it.pageURL) }
         } catch (e: GeckoUnavailable) {
             val r = webView()
             r.copy(text = "[Mines 浏览器没能启动（${e.message}），这次改用普通内置浏览器]\n" + r.text)
@@ -177,8 +185,10 @@ object MinesBrowser {
     }
 
     private fun openSession(rt: GeckoRuntime, k: String): Task {
-        val cid = MinesBrowserCore.contextId(k, serial.incrementAndGet())
-        val s = GeckoSession(GeckoSessionSettings.Builder().usePrivateMode(true).contextId(cid).useTrackingProtection(true).build())
+        // [38.9.15 伪人核心] an allow-listed account keeps ONE persistent (non-private) context across tasks
+        val persona = com.openminis.app.persona.HumanActuator.profileFor(k)
+        val cid = persona ?: MinesBrowserCore.contextId(k, serial.incrementAndGet())
+        val s = GeckoSession(GeckoSessionSettings.Builder().usePrivateMode(persona == null).contextId(cid).useTrackingProtection(true).build())
         val t = Task(k, cid, s)
         s.navigationDelegate = object : GeckoSession.NavigationDelegate {
             override fun onLocationChange(session: GeckoSession, url: String?, perms: MutableList<GeckoSession.PermissionDelegate.ContentPermission>, hasUserGesture: Boolean) {
@@ -246,7 +256,7 @@ object MinesBrowser {
         withContext(Dispatchers.Main) {
             detachOffscreen(t)
             runCatching { t.session.close() }
-            runCatching { runtime?.storageController?.clearDataForSessionContext(t.contextId) }
+            if (!com.openminis.app.persona.PersonaCore.isPersonaProfile(t.contextId)) runCatching { runtime?.storageController?.clearDataForSessionContext(t.contextId) }
         }
         t.pending.values.forEach { it.completeExceptionally(Exception("task closed")) }
     }

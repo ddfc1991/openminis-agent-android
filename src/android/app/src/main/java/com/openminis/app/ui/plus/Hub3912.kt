@@ -77,6 +77,7 @@ fun AppsHubScreen(onBack: () -> Unit, go: (String) -> Unit) {
         HubTile("自动登录", "fingerprint", Color(0xFF6B5E58), Routes3912.AUTOLOGIN),
         HubTile("注册台账", "user", Color(0xFFB0574F), Routes3912.REGISTER),
         HubTile("快速连接", "terminal", Color(0xFF35607F), Routes3912.CONNECT),
+        HubTile("伪人核心", "shield-check", Color(0xFF5E6B7E), PersonaRoutes.PAGE),   // [Mines-38.9.15 伪人核心]
     )
     PlusPage("应用", onBack) {
         MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp)) {

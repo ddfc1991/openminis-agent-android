@@ -867,6 +867,7 @@ object GroupSelfTest {
             }
             // [Mines-38.9.14 chat_home] smoke: 'i3914 main' = open 聊天 (main conversation); 'i3914 say <text>' = type <text> into it
             // through the normal send (router decides); 'i3914 state' = flag, main sid, tasks, last decision, main rows (role + tag)
+            "i3915" -> com.openminis.app.persona.PersonaSmoke.handle(context, rest)   // [Mines-38.9.15 伪人核心] smoke hooks
             "i3914" -> {
                 val sub = rest.substringBefore(' ').trim(); val text = rest.substringAfter(' ', "").trim()
                 val app = context.applicationContext as com.openminis.app.MinisApp

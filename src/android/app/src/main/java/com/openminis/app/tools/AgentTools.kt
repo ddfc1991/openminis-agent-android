@@ -80,6 +80,7 @@ object AgentTools {
         if (!isHelper) add(com.openminis.app.plus.TaskProgress.definition())
         add(com.openminis.app.plus.AccountsTool.definition())
         if (!isHelper) add(com.openminis.app.plus.WorkspaceStore.definition())
+        if (com.openminis.app.persona.Persona.enabled()) add(com.openminis.app.persona.PersonaTool.definition())   // [38.9.15 伪人核心]
     }
 
     /**

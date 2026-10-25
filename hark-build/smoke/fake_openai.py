@@ -95,6 +95,9 @@ I3913_SCRIPTS = {
                   ("browser_use", {"tool_title": "读页面文字", "action": "get_text", "engine": "gecko"}),
                   ("browser_use", {"tool_title": "把页面给用户看", "action": "wait_for_human", "engine": "gecko"})],
     "OAUTHTEST": [("browser_use", {"tool_title": "打开 Google 登录", "action": "navigate", "url": "https://accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Fzeabur.com"})],
+    # [38.9.15 伪人核心] the agent tries to send a mail as the user from a mailbox that is NOT allow-listed → 限制层 refuses → 等你处理
+    "SENDMAILTEST": [("persona", {"tool_title": "发邮件给老板", "action": "send_email", "who": "boss@example.com", "from": "smoke@163.com",
+                                  "subject": "周报", "body": "作为AI助手，我可以帮你：周报已整理好。"})],
 }
 
 class H(BaseHTTPRequestHandler):
@@ -324,7 +327,7 @@ fetch('/linkfake/send?'+k+'='+encodeURIComponent(v));document.getElementById('fc
         if "MINES_ROUTER" in ut0:   # [38.9.14 chat_home] router: registrations / deployments are tasks, the rest quick
             q = ut0.split("用户：", 1)[-1]
             STATS.setdefault("router", []).append(q[:40])
-            text = json.dumps({"mode": "task", "name": "Zeabur 注册"} if ("注册" in q or "部署" in q) else {"mode": "quick"}, ensure_ascii=False)
+            text = json.dumps({"mode": "task", "name": "发周报"} if "SENDMAILTEST" in q else {"mode": "task", "name": "Zeabur 注册"} if ("注册" in q or "部署" in q) else {"mode": "quick"}, ensure_ascii=False)
         elif "今天几号" in ut0:
             STATS["quick_posts"] = STATS.get("quick_posts", 0) + 1
             text = "今天是 10 月 25 日，星期日。"

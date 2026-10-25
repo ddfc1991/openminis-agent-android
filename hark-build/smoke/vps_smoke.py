@@ -152,6 +152,11 @@ try:
     I3914 = "i3914" in open("hark-build/smoke/target").read().splitlines()[1:2][0].split()   # [38.9.14] chat_home: 聊天 + auto tasks
 except Exception:
     I3914 = False
+try:
+    I3915 = "i3915" in open("hark-build/smoke/target").read().splitlines()[1:2][0].split()   # [38.9.15] 伪人核心
+except Exception:
+    I3915 = False
+if I3915: I3914 = True
 if I3914: I397 = True
 if I39113: I39112 = True
 if I39112: I39111 = True
@@ -3323,6 +3328,7 @@ def main():
         elif I397: fns = (b397,)   # [38.9.7] its own short gate (1080x2412 / 480 dpi, custom avatar)
         elif I396: fns = ((b396x,) if I396X else ()) + ((b396m,) if I396M else ()) + (b396,) + (tuple(fns) if I395 else ())   # [38.9.6 i12] glass / auto progress / archive shots first, then the full i395 pass + 自检
         elif H3894: fns = (b3894_h,) + tuple(fns)   # [38.9.4 h] SkillHub market, Memoh, a11y wording, 账号 entries, glass / opaque reading, g2 defects first
+        if I3915: fns = (b3915,)   # [38.9.15] 伪人核心 gate only
         for fn in fns:
             try:
                 fn(res)
@@ -7277,6 +7283,142 @@ def b39121(res):
 
 
 # ======================= [38.9.13 integ] task projects / VPS page / handoff v2 / memory v2 / Mines browser =======================
+def b3915(res):
+    """[38.9.15 伪人核心] 应用 → 伪人核心 page (总开关 / 账号 / 我做过什么); an agent task that tries send_email from a mailbox
+    that is NOT allow-listed is refused by the limits layer and the task becomes 等你处理; an agent-side kill call (no user tap)
+    changes nothing; the kill switch toggles from the page (stop instant, resume through the device lock = none on the
+    emulator); 设置 → 实验功能 has 伪人核心. Screens i3915-*.png."""
+    o = res.setdefault("i3915", {})
+    def shot(name):
+        r = snap("i3915-" + name)
+        subprocess.run(f"cp {OUT}/{step_no:02d}-i3915-{name}.png {OUT}/i3915-{name}.png", shell=True)
+        return r
+    def fail(m): selftest_fail.append("i3915 " + m); print("I3915 FAIL " + m, flush=True)
+    def pstate():
+        s = result_json("group", "i3915 state", timeout=20)
+        return s if isinstance(s, dict) else {}
+    def hstate():
+        s = result_json("group", "i3914 state", timeout=20)
+        return s if isinstance(s, dict) else {}
+    def step(name, f):
+        t0 = time.time()
+        try: f()
+        except Exception as e:
+            import traceback; traceback.print_exc(); fail(f"{name} error {e}")
+        print(f"I3915 STEP {name} {int(time.time() - t0)} s", flush=True)
+        if not alive(): crashed.append(f"i3915 {name}"); recover(f"i3915 {name}")
+    def tap_dock(label):
+        r = dump(); best = None
+        for t, d, x, y, n in nodes(r) if r is not None else []:
+            if (t == label or d == label or (d or "").startswith(label + "，")) and y > SCREEN[1] * 0.8: best = (x, y)
+        if best: sh(f"input tap {best[0]} {best[1]}"); time.sleep(3); return True
+        return False
+    def open_page():
+        if tap_dock("应用"):
+            r = dump()
+            for i in range(4):
+                if r is not None and find(r, "伪人核心"): break
+                scroll_down(); r = dump()
+            if r is not None and find(r, "伪人核心"):
+                tap_text("伪人核心", wait=3); return True
+        route("plus_persona", 3); return False
+
+    set_zh(); o["seedmodel"] = seed_model()
+    try: result_json("group", "wallpaper off")
+    except Exception: pass
+
+    def launch():
+        sh(f"am force-stop {PKG}"); time.sleep(2)
+        sh(f"am start -W -n {PKG}/com.openminis.app.MainActivity", timeout=90); time.sleep(10); dismiss_dialogs()
+        shot("launch")
+        s = pstate(); o["state0"] = s
+        if not s.get("on"): fail(f"flag persona_core not on by default: {s}")
+        if s.get("killed"): fail("kill switch on at start")
+        if any(a.get("allowed") for a in (s.get("accounts") or [])): fail("an account starts allow-listed")
+    step("launch", launch)
+
+    def page():
+        via_tile = open_page(); o["via_tile"] = via_tile
+        if not via_tile: fail("应用 has no 伪人核心 tile (opened by route)")
+        r = shot("page"); t = _txt(r); o["page_txt"] = t[:400]
+        for w in ("伪人核心", "总开关", "允许我以你的身份做事", "我是谁", "账号"):
+            if w not in t: fail(f"page missing {w}")
+        for i in range(3): scroll_down()
+        r = shot("page-bottom"); t2 = _txt(r)
+        if "我做过什么" not in t2 and "我做过什么" not in t: fail("page missing 我做过什么")
+        back(1)
+    step("page", page)
+
+    def agent_send():
+        tap_dock("聊天"); time.sleep(2)
+        hs = hstate()
+        if not hs.get("main"): result_json("group", "i3914 main", timeout=40); time.sleep(4)
+        n0 = len(hstate().get("tasks") or [])
+        out = result_json("group", "i3914 say 帮我给老板发周报邮件 SENDMAILTEST", timeout=40); o["say"] = out
+        t0 = time.time(); st = {}
+        while time.time() - t0 < 120:
+            st = hstate(); ts = st.get("tasks") or []
+            w = [x for x in ts[n0:] if x.get("st") in ("waiting", "error", "done")]
+            if w: break
+            time.sleep(3)
+        ts = (st.get("tasks") or [])[n0:]; o["tasks"] = ts
+        if not ts: fail(f"no task for the send: {st.get('last')}"); return
+        t = ts[-1]
+        if t.get("st") != "waiting": fail(f"send task not 等你处理: {t}")
+        if "限制层" not in (t.get("line") or ""): fail(f"task line does not say 限制层: {t.get('line')}")
+        ps = pstate(); o["state_after_send"] = ps
+        acc = [a for a in (ps.get("accounts") or []) if "smoke@163.com" in a.get("id", "")]
+        if not acc: fail("mailbox not listed after the attempt")
+        elif acc[0].get("allowed"): fail("mailbox became allow-listed by itself")
+        if not any(e.get("act") == "send" and not e.get("ok") and e.get("why") == "NOT_ALLOWED" for e in (ps.get("log") or [])): fail("audit log has no refused send")
+        if not tap_dock("任务"): fail("dock 任务 not found")
+        r = shot("tasks-waiting"); tx = _txt(r)
+        if "等你处理" not in tx: fail("任务 page has no 等你处理")
+        if "发周报" not in tx: fail("send task not listed on 任务")
+        tap_dock("聊天"); shot("chat-notice")
+    step("agent_send", agent_send)
+
+    def direct():
+        d = result_json("group", "i3915 direct", timeout=40); o["direct"] = d
+        if not isinstance(d, dict) or d.get("ok") or d.get("progress") != "waiting": fail(f"direct send_email not refused / not waiting: {d}")
+        k = result_json("group", "i3915 agentkill", timeout=20); o["agentkill"] = k
+        if not isinstance(k, dict) or k.get("changed") or k.get("killed"): fail(f"a non-user call changed the kill switch: {k}")
+    step("direct", direct)
+
+    def kill():
+        open_page(); time.sleep(1)
+        if not tap_text("允许我以你的身份做事", wait=3): fail("kill switch row not found"); return
+        s = pstate(); o["killed"] = s.get("killed")
+        if not s.get("killed"): fail("kill switch did not stop")
+        r = shot("killed"); t = _txt(r)
+        if "已全部停止" not in t: fail("page does not say 已全部停止")
+        d = result_json("group", "i3915 direct", timeout=40)
+        if isinstance(d, dict) and "总开关已关" not in (d.get("out") or ""): fail(f"send after kill not refused by the kill switch: {d}")
+        tap_text("已全部停止", wait=4); dismiss_dialogs()
+        s = pstate(); o["resumed"] = not s.get("killed")
+        if s.get("killed"): fail("resume did not work (emulator has no screen lock)")
+        shot("resumed"); back(1)
+    step("kill", kill)
+
+    def dark():
+        try:
+            theme388(2); time.sleep(2); open_page(); time.sleep(2); shot("page-dark"); back(1); theme388(1); time.sleep(2)
+        except Exception as e: print("I3915 dark error", e, flush=True)
+    step("dark", dark)
+
+    def experiments():
+        route("settings", 3); tap_text("测试与上报", wait=3)
+        seen = set()
+        for i in range(10):
+            r = dump(); seen |= set(texts(r))
+            if any("伪人核心" in x for x in seen): shot("settings-experiments"); break
+            scroll_down()
+        if not any("伪人核心" in x for x in seen): fail("实验功能: 伪人核心 row missing")
+        back(2)
+    step("experiments", experiments)
+    print("I3915 RESULT " + json.dumps(o, ensure_ascii=False)[:6000], flush=True)
+
+
 def b3914(res):
     """[38.9.14 chat_home] cold launch lands on 聊天 (main conversation) with the 4-tab dock; 「帮我注册 zeabur」 → router says task →
     「已建任务」 chip, the task runs in its own conversation in the background (进行中 → 完成, notice in 聊天), tap chip opens the task;

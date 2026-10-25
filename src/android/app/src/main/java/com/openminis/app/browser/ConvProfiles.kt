@@ -34,6 +34,8 @@ object ConvProfiles {
     @Synchronized fun profileFor(c: Context, sessionId: String?): String? {
         if (!ConvProfilesCore.isConversation(sessionId) || !active()) return null
         init(c)
+        // [38.9.15 伪人核心] working on an allow-listed account: that account's persistent profile, shared across tasks
+        com.openminis.app.persona.HumanActuator.profileFor(sessionId)?.let { p -> runCatching { ProfileStore.getInstance().getOrCreateProfile(p) }; return p }
         val name = map.getOrPut(sessionId!!) { ConvProfilesCore.profileName(sessionId) }
         save()
         runCatching { ProfileStore.getInstance().getOrCreateProfile(name) }

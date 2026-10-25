@@ -793,6 +793,9 @@ fun AppNavigation(
         composable(com.openminis.app.ui.plus.Routes3912.CONNECT) {
             com.openminis.app.ui.plus.QuickConnectScreen(onBack = { navController.safePopBackStack() }, go = { navController.safeNavigate(it) })
         }
+        composable(com.openminis.app.ui.plus.PersonaRoutes.PAGE) {   // [Mines-38.9.15 伪人核心]
+            com.openminis.app.ui.plus.PersonaScreen(onBack = { navController.safePopBackStack() })
+        }
         composable(com.openminis.app.ui.plus.PlusRoutes.MIGRATE) {
             com.openminis.app.ui.plus.MigrateScreen(onBack = { navController.safePopBackStack() })
         }
