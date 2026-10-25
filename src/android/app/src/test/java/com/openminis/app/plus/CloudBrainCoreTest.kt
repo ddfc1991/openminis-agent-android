@@ -14,7 +14,7 @@ import org.junit.Test
 /** [Mines-38.10 cloud_brain] event page / cursor, task state from cloud events, rows, 同意/拒绝 parsing, back-off, JSON. */
 class CloudBrainCoreTest {
     private val C = CloudBrainCore
-    private fun ev(id: Long, type: String, data: JSONObject = JSONObject(), task: String = "ct1") = C.Event(id, task, type, data)
+    private fun ev(id: Long, type: String, data: JSONObject = JSONObject(), task: String = "ct1") = CloudBrainCore.Event(id, task, type, data)
     private fun task(st: St = St.RUNNING) = AutoTask("t1", "s1", "Zeabur 注册", "帮我注册 zeabur", st, cloud = "ct1")
 
     @Test fun pageKeepsOrderAndCursor() {
@@ -71,12 +71,12 @@ class CloudBrainCoreTest {
     }
 
     @Test fun replyVerbs() {
-        assertEquals(C.Verb.ALLOW, C.verbOf("同意", true))
-        assertEquals(C.Verb.ALLOW, C.verbOf(" 可以。", true))
-        assertEquals(C.Verb.TEXT, C.verbOf("同意", false))          // nothing to approve: it is just text
-        assertEquals(C.Verb.DENY, C.verbOf("拒绝", true))
-        assertEquals(C.Verb.CANCEL, C.verbOf("取消任务", false))
-        assertEquals(C.Verb.TEXT, C.verbOf("用 a@b.com 注册", true))
+        assertEquals(CloudBrainCore.Verb.ALLOW, C.verbOf("同意", true))
+        assertEquals(CloudBrainCore.Verb.ALLOW, C.verbOf(" 可以。", true))
+        assertEquals(CloudBrainCore.Verb.TEXT, C.verbOf("同意", false))          // nothing to approve: it is just text
+        assertEquals(CloudBrainCore.Verb.DENY, C.verbOf("拒绝", true))
+        assertEquals(CloudBrainCore.Verb.CANCEL, C.verbOf("取消任务", false))
+        assertEquals(CloudBrainCore.Verb.TEXT, C.verbOf("用 a@b.com 注册", true))
     }
 
     @Test fun backoffGrowsAndCaps() {
@@ -84,7 +84,7 @@ class CloudBrainCoreTest {
     }
 
     @Test fun providersJsonDedupesAndCaps() {
-        val l = (1..9).map { C.Prov("p$it", "https://g/v1", "k$it", if (it < 3) "m" else "m$it") }
+        val l = (1..9).map { CloudBrainCore.Prov("p$it", "https://g/v1", "k$it", if (it < 3) "m" else "m$it") }
         val a = JSONObject(C.providersJson(l)).getJSONArray("providers")
         assertEquals(6, a.length())
         assertEquals("m", a.getJSONObject(0).getString("model"))
