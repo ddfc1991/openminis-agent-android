@@ -203,11 +203,11 @@ object ChatHome {
         val now = System.currentTimeMillis()
         res.onSuccess { pr ->
             when {
-                pr.status == "Rejected" || pr.status == "Error" -> update(t.id) { ChatHomeCore.runFailed(it, ChatHomeCore.rejectZh(pr.responseText)) }
-                pr.timedOut -> update(t.id) { if (it.st == St.WAITING) it else ChatHomeCore.runFailed(it, "45 分钟还没做完，点开看看") }
+                pr.status == "Rejected" || pr.status == "Error" -> update(t.id) { ChatHomeCore.runFailed(it, ChatHomeCore.rejectZh(pr.responseText), now) }
+                pr.timedOut -> update(t.id) { if (it.st == St.WAITING) it else ChatHomeCore.runFailed(it, "45 分钟还没做完，点开看看", now) }
                 else -> update(t.id) { ChatHomeCore.runEnded(ChatHomeCore.onProgress(it, TaskProgress.get(t.sid), false, now), pr.responseText, now) }
             }
-        }.onFailure { e -> update(t.id) { ChatHomeCore.runFailed(it, e.message ?: e.javaClass.simpleName) } }
+        }.onFailure { e -> update(t.id) { ChatHomeCore.runFailed(it, e.message ?: e.javaClass.simpleName, now) } }
         postNotices()
         pump()
     }
