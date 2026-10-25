@@ -901,10 +901,9 @@ object GroupSelfTest {
                         val t = com.openminis.app.plus.ChatHomeCore.AutoTask("fold3914", "", "账号关联测试", g, com.openminis.app.plus.ChatHomeCore.St.DONE,
                             6, 6, "完成 · 6/6 步", now - 60_000, now, "done")
                         H.seedForTest(t)
-                        val K = com.openminis.app.plus.ChatHomeCore.Kind
-                        H.appendToMain(listOf("user" to g, "assistant" to com.openminis.app.plus.ChatHomeCore.tagText(t.id, K.CREATED, com.openminis.app.plus.ChatHomeCore.createdLine(t.name))))
-                        for ((k, b) in listOf(K.ERROR to "没完成：Software caused connection abort", K.ASK to "Software caused connection abort",
-                                K.ERROR to "没完成：Software caused connection abort", K.DONE to "完成 · 6/6 步"))
+                        H.appendToMain(listOf("user" to g, "assistant" to com.openminis.app.plus.ChatHomeCore.tagText(t.id, com.openminis.app.plus.ChatHomeCore.Kind.CREATED, com.openminis.app.plus.ChatHomeCore.createdLine(t.name))))
+                        for ((k, b) in listOf(com.openminis.app.plus.ChatHomeCore.Kind.ERROR to "没完成：Software caused connection abort", com.openminis.app.plus.ChatHomeCore.Kind.ASK to "Software caused connection abort",
+                                com.openminis.app.plus.ChatHomeCore.Kind.ERROR to "没完成：Software caused connection abort", com.openminis.app.plus.ChatHomeCore.Kind.DONE to "完成 · 6/6 步"))
                             H.appendToMain(listOf("assistant" to com.openminis.app.plus.ChatHomeCore.tagText(t.id, k, b)))
                         JSONObject().put("seeded", t.id).toString()
                     }
