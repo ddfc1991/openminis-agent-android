@@ -965,7 +965,15 @@ class ChatViewModel(
     // [Mines-38.9.5 i] 「引用回复」: quoted text waits above the input and goes out as a Markdown quote with the next send
     private val _quoteDraft = MutableStateFlow<String?>(null)
     val quoteDraft: StateFlow<String?> = _quoteDraft.asStateFlow()
-    fun setQuoteDraft(text: String?) { _quoteDraft.value = text?.trim()?.takeIf { it.isNotEmpty() } }
+    fun setQuoteDraft(text: String?) { _quoteDraft.value = text?.trim()?.takeIf { it.isNotEmpty() }; if (_quoteDraft.value != null) _replyDraft.value = null }
+    /** [Mines-38.9.14.1] 「回复」 target (who, message text); one of reply / quote at a time */
+    private val _replyDraft = MutableStateFlow<Pair<String, String>?>(null)
+    val replyDraft: StateFlow<Pair<String, String>?> = _replyDraft.asStateFlow()
+    fun setReplyDraft(who: String, text: String?) {
+        val t = text?.trim()?.takeIf { it.isNotEmpty() }
+        _replyDraft.value = t?.let { who to it }; if (t != null) _quoteDraft.value = null
+    }
+    fun clearReplyDraft() { _replyDraft.value = null }
 
     private val _isStreaming = MutableStateFlow(false)
     val isStreaming: StateFlow<Boolean> = _isStreaming.asStateFlow()
@@ -9198,7 +9206,12 @@ class ChatViewModel(
         // stop: delegations from here on may drive the turn again.
         com.openminis.app.agent.jobs.AgentJobRegistry.clearDelegationMute(activeSessionId)
         val q = _quoteDraft.value
-        val out = if (q != null) { _quoteDraft.value = null; com.openminis.app.plus.QuoteReply.compose(q, text) } else text
+        val rp = _replyDraft.value
+        val out = when {
+            q != null -> { _quoteDraft.value = null; com.openminis.app.plus.QuoteReply.compose(q, text) }
+            rp != null -> { _replyDraft.value = null; com.openminis.app.plus.QuoteReply.composeReply(rp.first, rp.second, text) }
+            else -> text
+        }
         // [Mines-38.9.14 chat_home] 聊天 (the main conversation): the router answers inline or starts a background task
         if (com.openminis.app.plus.ChatHome.intercept(activeSessionId, out, _attachments.value.isNotEmpty()) { minesSendDirect(it) }) return
         sendMessage(out, skipContextCheck = false, headless = false)

@@ -15,6 +15,8 @@ import androidx.compose.material.icons.filled.FormatQuote
 import androidx.compose.material.icons.filled.RecordVoiceOver
 import androidx.compose.material.icons.filled.SelectAll
 import androidx.compose.material.icons.filled.Code
+import androidx.compose.material.icons.automirrored.filled.Reply
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -31,7 +33,10 @@ import com.openminis.app.ui.theme.ChatColors
 /**
  * [Mines-38.9.9] user 10:02: copying a reply was painful (long-press picked 2 characters, then two stacked floating menus
  * hid the text and 复制全文 sat in a submenu). Now: a one-tap 复制 in each reply's footer (whole reply, markdown stripped,
- * toast 「已复制」), and long-press opens ONE bottom sheet — 复制全文 / 复制为 Markdown / 选择文字 / 引用 / 朗读.
+ * toast 「已复制」), and long-press opens ONE bottom sheet.
+ * [Mines-38.9.14.1] user 2026-10-25 17:56 (screenshot): the default must not be 「复制全文」 — order is now
+ * 选择文字 (pick a paragraph) / 回复 (this message becomes the reply target, input focused) / 引用 / 复制 (whole message),
+ * then, below a divider and smaller, 复制为 Markdown / 朗读.
  */
 object ReplyCopy {
     /** the reply's own markdown: its text blocks in order (legacy messages: content) */
@@ -82,6 +87,7 @@ internal fun ReplyActionSheet(
     onSelectText: () -> Unit,
     onQuote: ((String) -> Unit)?,
     onRead: ((String) -> Unit)?,
+    onReply: ((String) -> Unit)? = null,
 ) {
     val ctx = LocalContext.current
     com.openminis.app.ui.glass.ModalBottomSheet(
@@ -90,20 +96,24 @@ internal fun ReplyActionSheet(
     ) {
         Column(Modifier.fillMaxWidth().padding(bottom = 16.dp)) {
             @Composable
-            fun row(icon: ImageVector, label: String, action: () -> Unit) {
+            fun row(icon: ImageVector, label: String, secondary: Boolean = false, action: () -> Unit) {
+                val tint = if (secondary) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface
                 Row(
-                    Modifier.fillMaxWidth().clickable { action() }.heightIn(min = 52.dp).padding(horizontal = 24.dp),
+                    Modifier.fillMaxWidth().clickable { action() }.heightIn(min = if (secondary) 44.dp else 52.dp).padding(horizontal = 24.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.onSurface, modifier = Modifier.size(20.dp))
-                    Text(label, fontSize = 16.sp, color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.padding(start = 16.dp))
+                    Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(if (secondary) 18.dp else 20.dp))
+                    Text(label, fontSize = if (secondary) 14.sp else 16.sp, color = tint, modifier = Modifier.padding(start = 16.dp))
                 }
             }
-            row(Icons.Default.ContentCopy, "复制全文") { ReplyCopy.copyPlain(ctx, markdown); onDismiss() }
-            row(Icons.Default.Code, "复制为 Markdown") { ReplyCopy.copyMarkdown(ctx, markdown); onDismiss() }
+            // [Mines-38.9.14.1] front row: 选择文字 / 回复 / 引用 / 复制
             row(Icons.Default.SelectAll, "选择文字") { onSelectText() }
+            if (onReply != null) row(Icons.AutoMirrored.Filled.Reply, "回复") { onReply(markdown); onDismiss() }
             if (onQuote != null) row(Icons.Default.FormatQuote, "引用") { onQuote(markdown); onDismiss() }
-            if (onRead != null) row(Icons.Default.RecordVoiceOver, "朗读") { onRead(markdown); onDismiss() }
+            row(Icons.Default.ContentCopy, "复制") { ReplyCopy.copyPlain(ctx, markdown); onDismiss() }
+            HorizontalDivider(Modifier.padding(horizontal = 24.dp, vertical = 4.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+            row(Icons.Default.Code, "复制为 Markdown", secondary = true) { ReplyCopy.copyMarkdown(ctx, markdown); onDismiss() }
+            if (onRead != null) row(Icons.Default.RecordVoiceOver, "朗读", secondary = true) { onRead(markdown); onDismiss() }
             Spacer(Modifier.height(8.dp))
         }
     }

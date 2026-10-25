@@ -866,6 +866,8 @@ data class SelectionToolbarActions(
     val onAddToInput: ((String) -> Unit)? = null,
     /** [Mines-38.9.5 i] 「引用回复」: quote the selection (or, from the overflow, the whole message) above the input. */
     val onQuote: ((String) -> Unit)? = null,
+    /** [Mines-38.9.14.1] 「回复」: make the long-pressed message the reply target and focus the input. Null hides it. */
+    val onReply: ((String) -> Unit)? = null,
     /**
      * [T-android-selection-readaloud] Speak the currently-selected plain text
      * through Minis TTS. Null hides the button. Mirrors iOS's "Read Selection".
@@ -919,6 +921,7 @@ fun MinisSelectionToolbarHost(
             onSelectText = { controller.selectAllInMessage(sheetMsg); sheetDone.value = true },
             onQuote = actions.onQuote,
             onRead = actions.onReadFromStart ?: actions.onReadAloud,
+            onReply = actions.onReply,
         )
         return
     }

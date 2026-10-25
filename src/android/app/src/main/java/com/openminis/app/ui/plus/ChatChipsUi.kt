@@ -29,6 +29,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.automirrored.filled.Reply
 import androidx.compose.material.icons.filled.FormatQuote
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
@@ -122,6 +123,26 @@ private fun openOrShare(ctx: Context, c: ValueChips.ValueChip) {
         ctx.startActivity((view ?: share).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     } catch (_: Exception) {
         try { ctx.startActivity(share.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) } catch (_: Exception) { toast(ctx, "没有能打开它的应用") }
+    }
+}
+
+/** [Mines-38.9.14.1] 「回复」 bar above the input: 「回复 Mines：…」 one line, × to drop. Sent as a short reference. */
+@Composable
+fun ReplyDraftBlock(who: String, target: String, onClear: () -> Unit) {
+    val m = mines()
+    val (fill, border) = chipGlass()
+    val shape = RoundedCornerShape(12.dp)
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp).clip(shape).background(fill).border(0.75.dp, border, shape)
+            .semantics(mergeDescendants = true) { contentDescription = "回复 $who：" + QuoteReply.preview(target, 120) },
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(Icons.AutoMirrored.Filled.Reply, null, tint = m.primary, modifier = Modifier.padding(start = 10.dp).size(16.dp))
+        Text("回复 $who：" + QuoteReply.preview(target), fontSize = MT.Caption, lineHeight = MT.CaptionLH, color = m.ink2, maxLines = 1,
+            overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f).padding(start = 6.dp, top = 8.dp, bottom = 8.dp))
+        Box(Modifier.size(36.dp).clickable(onClick = onClear).semantics { contentDescription = "取消回复" }, contentAlignment = Alignment.Center) {
+            Icon(Icons.Filled.Close, null, tint = m.ink2, modifier = Modifier.size(16.dp))
+        }
     }
 }
 

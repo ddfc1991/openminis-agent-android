@@ -5006,6 +5006,12 @@ fun ChatScreen(
                             try { inputFocusRequester.requestFocus() } catch (_: IllegalStateException) {}
                             keyboardController?.show()
                         },
+                        // [Mines-38.9.14.1] 回复: the long-pressed reply becomes the reply target, input focused
+                        onReply = { snippet ->
+                            viewModel.setReplyDraft("Mines", snippet)
+                            try { inputFocusRequester.requestFocus() } catch (_: IllegalStateException) {}
+                            keyboardController?.show()
+                        },
                         // [T-android-selection-readaloud] Speak the selection
                         // through the same screen-scoped lazy player the
                         // Compose-SelectionContainer toolbar uses.
@@ -6256,6 +6262,8 @@ fun ChatScreen(
                     run {
                         val minesQuote by viewModel.quoteDraft.collectAsState()
                         minesQuote?.let { q -> com.openminis.app.ui.plus.QuoteDraftBlock(q) { viewModel.setQuoteDraft(null) } }
+                        val minesReply by viewModel.replyDraft.collectAsState()
+                        minesReply?.let { (who, t) -> com.openminis.app.ui.plus.ReplyDraftBlock(who, t) { viewModel.clearReplyDraft() } }
                     }
                     val recSttState by com.openminis.app.speech.SpeechRecognitionManager
                         .state.collectAsState()

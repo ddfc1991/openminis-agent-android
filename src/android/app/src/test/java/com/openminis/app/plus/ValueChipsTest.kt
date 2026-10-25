@@ -98,6 +98,10 @@ class ValueChipsTest {
         assertEquals("你好", QuoteReply.compose(null, "你好"))
         assertEquals("> 只引用", QuoteReply.compose("只引用", ""))
         assertEquals("a b c", QuoteReply.preview("a\n b   c"))
+        // [Mines-38.9.14.1] 回复: a short reference, not the full quote
+        assertEquals("（回复 Mines：「第一行 第二行」）\n好的", QuoteReply.composeReply("Mines", "第一行\n第二行", "好的"))
+        assertEquals("好的", QuoteReply.composeReply("Mines", "  ", "好的"))
+        assertEquals("（回复 Mines：「x」）", QuoteReply.composeReply("Mines", "x", ""))
         assertTrue(QuoteReply.preview("x".repeat(100)).length == 60)
     }
 }
