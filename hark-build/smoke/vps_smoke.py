@@ -7343,6 +7343,15 @@ def b3914(res):
         if p: sh(f"input tap {p[0]} {p[1]}"); time.sleep(1.5)
     def top_act():
         return sh("dumpsys activity activities | grep -E 'topResumedActivity|mResumedActivity' | head -2")
+    def alltxt(r):
+        # [38.9.14.2] text AND content-desc of every node (one-line task chips carry their full words in the description)
+        return " ".join((t or "") + " " + (d or "") for t, d, *_ in nodes(r)) if r is not None else ""
+    def bounds_of(r, desc):
+        for t, d, x, y, n in nodes(r) if r is not None else []:
+            if (d or "") == desc:
+                b = list(map(int, re.findall(r"\d+", n.get("bounds", ""))))
+                if len(b) == 4: return b
+        return None
 
     set_zh(); o["seedmodel"] = seed_model()
     try: result_json("group", "wallpaper off")
@@ -7352,14 +7361,8 @@ def b3914(res):
         sh(f"am force-stop {PKG}"); time.sleep(2)
         sh(f"am start -W -n {PKG}/com.openminis.app.MainActivity", timeout=90); time.sleep(10); dismiss_dialogs()
         r = shot("launch"); t = _txt(r); o["launch_txt"] = t[:300]
-        # [38.9.14.1 smoke, same as 38.9.15 6cf2c71] the upstream crash/hang breaker (LaunchCycleBeacon: an emulator cold-start
-        # stall after several force-stops → effectiveMode=3) forces the old home on purpose; record it and relaunch once
-        lm = sh("logcat -d | grep 'launch/mode' | tail -1")
-        if "最近对话" in t and "effectiveMode=3" in lm and "rawMode=3" not in lm:
-            o["breaker"] = lm.strip()[-160:]; print("I3914 NOTE launch hit the crash/hang breaker (old home on purpose); relaunching once", flush=True)
-            sh(f"am force-stop {PKG}"); time.sleep(2)
-            sh(f"am start -W -n {PKG}/com.openminis.app.MainActivity", timeout=90); time.sleep(10); dismiss_dialogs()
-            r = shot("launch"); t = _txt(r); o["launch_txt"] = t[:300]
+        # [38.9.14.2] no relaunch: 聊天主页 must win on the FIRST cold start even when a crash / hang breaker tripped
+        o["launch_mode"] = sh("logcat -d | grep 'launch/mode' | tail -1").strip()[-200:]
         s = state(); o["state0"] = s
         if not s.get("on"): fail(f"flag chat_home not on by default: {s}")
         if not s.get("main"): fail("no main conversation after launch")
@@ -7368,6 +7371,28 @@ def b3914(res):
         if "最近对话" in t: fail("launch: old conversation list shown instead of 聊天")
         one_bar("launch")
     step("launch", launch)
+
+    def breaker():
+        # [38.9.14.2] the realme case (2026-10-25 19:53): breakers tripped (hang count, crash window, stall log + launches with no
+        # clean exit), 3 force-kills, then a REAL 3.5 s main-thread stall on a cold start → every cold start must still be 聊天
+        # with the dock (安全模式 at most), never the old home. FAIL otherwise.
+        o["trip"] = result_json("group", "i3914 trip", timeout=20)
+        o["breakers_after_trip"] = result_json("group", "i3914 breakers", timeout=20)
+        bad = []
+        for i in range(4):
+            sh(f"am force-stop {PKG}"); time.sleep(2)
+            sh(f"am start -W -n {PKG}/com.openminis.app.MainActivity", timeout=90); time.sleep(9 if i == 0 else 7); dismiss_dialogs()
+            r = shot(f"breaker-{i}"); t = _txt(r)
+            old, new = bars(r)
+            ok = all(w in t for w in ("聊天", "任务", "消息", "应用")) and "最近对话" not in t and not old
+            o.setdefault("breaker_runs", []).append({"i": i, "ok": ok, "mode": sh("logcat -d | grep 'launch/mode' | tail -1").strip()[-160:]})
+            if not ok: bad.append(i)
+        o["breakers_end"] = result_json("group", "i3914 breakers", timeout=20)
+        o["stall_seen"] = sh("logcat -d | grep -c 'hang detected'").strip()
+        if bad: fail(f"breaker: cold start {bad} not on 聊天 + dock after 3 kills + a slow start (old home?)")
+        if "safe=true" not in json.dumps(o["breaker_runs"], ensure_ascii=False): fail("breaker: no launch went through 聊天主页 安全模式 (breaker not tripped?)")
+        one_bar("breaker-end")
+    step("breaker", breaker)
 
     def netkeep():
         # [38.9.14.1 net_drop] the one-tap 「任务在后台不断网」 card shows on 聊天 while Mines is not battery-exempt; after the
@@ -7410,7 +7435,7 @@ def b3914(res):
         if "Zeabur" not in t.get("name", ""): fail(f"task name not the project: {t.get('name')}")
         if not str(s.get("last", "")).startswith("TASK"): fail(f"router decision not TASK: {s.get('last')}")
         time.sleep(2); r = shot("chip-running"); txt = _txt(r)
-        if "已建任务" not in txt: fail("chip 已建任务 not shown in 聊天")
+        if "Zeabur 注册 ·" not in alltxt(r) or "已建任务" not in alltxt(r): fail("one-line chip 「Zeabur 注册 · …」 not shown in 聊天")
         o["chip_running_state"] = t.get("st")
         if t.get("st") not in ("queued", "running"): print(f"I3914 note: task already {t.get('st')} at first look", flush=True)
         rows = s.get("rows") or []
@@ -7422,19 +7447,20 @@ def b3914(res):
         o["task_done"] = d[-1]
         time.sleep(3); r = shot("chip-done"); txt = _txt(r)
         if not any(x.get("tag", "").startswith("DONE") for x in (s2.get("rows") or [])): fail("no DONE notice row in 聊天")
-        if "回复你" not in txt: fail("完成 notice card (「… · 回复你 HH:mm 的消息」) not visible in 聊天 after the task finished")
+        if "Zeabur 注册，完成" not in alltxt(r): fail("完成 chip 「Zeabur 注册 · 完成 ›」 not visible in 聊天 after the task finished")
+        if "回复你" in txt: fail("old big notice card (「… · 回复你 HH:mm 的消息」) still shown")
         if (fake().get("task_posts") or 0) < 1: fail("the task conversation never called the model")
     step("task", task)
 
     def open_chip():
-        r = dump(); p = find(r, "已建任务")
+        r = dump(); p = find(r, "Zeabur 注册，完成") or find(r, "Zeabur 注册 ·")
         if not p: fail("chip not found to tap"); return
         sh(f"input tap {p[0]} {p[1]}"); time.sleep(4)
         r = shot("task-page"); t = _txt(r); o["task_page"] = t[:400]
         if "帮我注册 zeabur" not in t: fail("tapping the chip did not open the task conversation")
         back(1); time.sleep(2)
         r = dump()
-        if r is None or "已建任务" not in _txt(r): fail("back from the task conversation did not return to 聊天")
+        if r is None or "Zeabur 注册" not in alltxt(r): fail("back from the task conversation did not return to 聊天")
         one_bar("chip-back")
     step("open_chip", open_chip)
 
@@ -7507,7 +7533,7 @@ def b3914(res):
         elif t.find("知识库") > t.find("浏览器") >= 0: fail("应用: 知识库 not first")
         if not tap_dock("聊天"): fail("dock 聊天 not found"); return
         r = shot("tab-chat")
-        if "已建任务" not in _txt(r) and "已创建任务" not in _txt(r): fail("dock 聊天 did not return to the main conversation")
+        if "Zeabur 注册" not in alltxt(r): fail("dock 聊天 did not return to the main conversation")
         one_bar("tab-chat")
         back(1); time.sleep(2.5)   # [38.9.14.1] back on 聊天 reached via the dock: still never the old list
         top = top_act(); r = dump(); t = _txt(r) if PKG in top else ""
@@ -7538,7 +7564,7 @@ def b3914(res):
         o["netdrop_drop"] = drops[-1]
         if not drops[-1].get("state"): fail("netdrop: drop logged without the device state (screen / app / net / idle)")
         to_bottom()
-        r = dump(); p = find(r, "已建任务 断网测试") or find(r, "断网测试")
+        r = dump(); p = find(r, "断网测试")
         opened = bool(p)
         if p: sh(f"input tap {p[0]} {p[1]}"); time.sleep(2.5)
         else: fail("netdrop: chip 「已建任务 断网测试」 not found")
@@ -7589,16 +7615,13 @@ def b3914(res):
         tap_dock("聊天"); time.sleep(1)
         o["fold_seed"] = result_json("group", "i3914 foldseed", timeout=30); time.sleep(4); to_bottom()
         r = shot("fold"); t = _txt(r); o["fold_txt"] = t[-400:]
-        cards = [x for x in texts(r) if "账号关联测试 · 回复你" in x]
-        o["fold_cards"] = len(cards)
-        if len(cards) != 1: fail(f"fold: {len(cards)} cards for one task (want 1)")
-        if "已重试 2 次" not in t: fail("fold: 「已重试 2 次」 missing on the folded card")
-        if "完成 · 6/6 步" not in t: fail("fold: the folded card does not show the latest state (完成)")
-        p = find(r, "历史尝试")
-        if not p: fail("fold: 「历史尝试」 link missing"); return
-        sh(f"input tap {p[0]} {p[1]}"); time.sleep(2)
-        r = shot("fold-open"); t = _txt(r); o["fold_open_txt"] = t[-400:]
-        if t.count("Software caused connection abort") < 3: fail("fold: expanding did not show the 3 older attempts")
+        # [38.9.14.2] notices are one-line chips: one chip for the folded notices of the task, carrying 完成 + the retry line
+        cards = [d for t, d, *_ in nodes(r) if "账号关联测试，" in (d or "") and not (d or "").startswith("已建任务")]
+        o["fold_cards"] = cards
+        if len(cards) != 1: fail(f"fold: {len(cards)} notice chips for one task (want 1)")
+        elif "完成" not in cards[0] or "已重试 2 次" not in cards[0]: fail(f"fold: chip does not carry 完成 + 已重试 2 次: {cards[0]}")
+        if "Software caused connection abort" in _txt(r): fail("fold: notice body text shown in 聊天 (want the chip only)")
+        r = shot("fold-open")
         one_bar("fold-open")
     step("fold", fold)
 
@@ -7619,6 +7642,35 @@ def b3914(res):
         if not alive(): fail("nocall: Mines died"); crashed.append("i3914 nocall"); recover("i3914 nocall")
         tap_dock("聊天")
     step("nocall", nocall)
+
+    def pip():
+        # [38.9.14.2] user 2026-10-25 19:07: the black preview tile covered the left half of the status strip 「全盘搜索构建依赖 13/13」
+        # and the strip covered the last message. While a shell step runs: tile and strip bounds must not intersect, and the
+        # last message must end above the strip (bottom ≤ strip top).
+        o["pip_chat"] = result_json("group", "i3913 chat PIPTEST 全盘搜索构建依赖", timeout=40)
+        tile = strip = None; r = None
+        for _ in range(12):
+            time.sleep(2.5); r = dump(); tile = bounds_of(r, "工具预览"); strip = bounds_of(r, "工具状态条")
+            if strip: break
+        r = shot("pip"); tile = bounds_of(r, "工具预览") or tile; strip = bounds_of(r, "工具状态条") or strip
+        o["pip_tile"] = tile; o["pip_strip"] = strip
+        if not strip: fail("pip: status strip (工具状态条) not shown while the shell step runs"); return
+        if tile and not (tile[2] <= strip[0] or strip[2] <= tile[0] or tile[3] <= strip[1] or strip[3] <= tile[1]):
+            fail(f"pip: preview tile {tile} intersects the status strip {strip}")
+        # last message = the lowest text node above the composer that is not part of the strip / tile
+        low = None
+        for t, d, x, y, n in nodes(r):
+            if not t or t.startswith("发消息"): continue
+            b = list(map(int, re.findall(r"\d+", n.get("bounds", ""))))
+            if len(b) != 4 or b[1] >= strip[1] - 2: continue
+            if tile and tile[0] <= x <= tile[2] and tile[1] <= y <= tile[3]: continue
+            if low is None or b[3] > low[3]: low = b
+        o["pip_last"] = low
+        if low is None: fail("pip: no message found above the strip")
+        elif low[3] > strip[1]: fail(f"pip: last message bottom {low[3]} > strip top {strip[1]} (covered)")
+        hidden = [t for t, d, x, y, n in nodes(r) if t and "PIPTEST" in t]
+        if not hidden: fail("pip: the user message is not visible above the strip")
+    step("pip", pip)
 
     def experiments():
         route("settings", 3); tap_text("测试与上报", wait=3)

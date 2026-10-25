@@ -907,7 +907,28 @@ object GroupSelfTest {
                             H.appendToMain(listOf("assistant" to com.openminis.app.plus.ChatHomeCore.tagText(t.id, k, b)))
                         JSONObject().put("seeded", t.id).toString()
                     }
-                    else -> "i3914 main | say <text> | state | foldseed"
+                    // [38.9.14.2] trip every crash / hang breaker the way the realme did (hang count 3, crash force-home window,
+                    // a stall log + several launches without a clean exit) and make the NEXT cold start stall 3.5 s on the
+                    // main thread; 'i3914 breakers' reports what they say now
+                    "trip" -> {
+                        context.getSharedPreferences("hang_detector_prefs", android.content.Context.MODE_PRIVATE).edit()
+                            .putInt("hang_count", 3).putLong("last_hang_at_ms", System.currentTimeMillis()).commit()
+                        context.getSharedPreferences("crash_freq_prefs", android.content.Context.MODE_PRIVATE).edit()
+                            .putLong("force_home_until", System.currentTimeMillis() + 3_600_000L).commit()
+                        val logs = java.io.File(context.filesDir, "logs").apply { mkdirs() }
+                        java.io.File(logs, "stall-smoke-trip.log").writeText("[smoke] simulated 3.5 s main-thread stall\n")
+                        val fmt = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS", java.util.Locale.US)
+                        val bf = java.io.File(logs, "launch-beacon.log")
+                        repeat(6) { i -> bf.appendText("[${fmt.format(java.util.Date(System.currentTimeMillis() - 60_000L + i * 1000L))}] launch pid=1\n") }
+                        context.getSharedPreferences("mines_smoke", android.content.Context.MODE_PRIVATE).edit().putBoolean("slow_start", true).commit()
+                        JSONObject().put("tripped", true).toString()
+                    }
+                    "breakers" -> JSONObject()
+                        .put("hang", com.openminis.app.diagnostics.HangDetector.shouldForceHomeOnLaunch(context))
+                        .put("crash", com.openminis.app.crash.CrashFrequencyDetector.shouldForceHomeOnLaunch(context))
+                        .put("beacon", com.openminis.app.diagnostics.LaunchCycleBeacon.shouldForceHomeOnLaunch())
+                        .put("safeLaunch", H.safeLaunch).toString()
+                    else -> "i3914 main | say <text> | state | foldseed | trip | breakers"
                 }
             }
             "i39113" -> {

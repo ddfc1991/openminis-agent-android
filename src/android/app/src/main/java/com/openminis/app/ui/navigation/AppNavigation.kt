@@ -344,7 +344,7 @@ fun AppNavigation(
     // need to navigate at all so we can skip the wait entirely.
     LaunchedEffect(Unit) {
         val hasDeepLink = initialDeepLink != null && initialDeepLink !is DeepLinkAction.Unknown
-        if (hasDeepLink) return@LaunchedEffect
+        if (hasDeepLink) { com.openminis.app.ui.plus.ChatHomeNav.launchResolved.value = true; return@LaunchedEffect }
         val hasPendingShare =
             com.openminis.app.share.ShareCoordinator.bufferVersion.value > 0
         val rawMode = getAppearancePrefs(context).getInt(KEY_LAUNCH_SESSION, 0)
@@ -376,6 +376,28 @@ fun AppNavigation(
             com.openminis.app.diagnostics.LaunchCycleBeacon.shouldForceHomeOnLaunch() ||
             com.openminis.app.plus.SafeStart.forceHome   // [Mines-38.9.12.1] OOM safe start: home, not the last chat
         ) 3 else rawMode
+        // [Mines-38.9.14.2 chat_home] 聊天主页 is the ONLY launch target while it is on: a crash / hang breaker never lands on
+        // the old home any more (realme 2026-10-25 19:53: one 3 s cold-start stall + the usual swipe-kills → old list without
+        // the dock). The breaker only downgrades to 聊天主页 安全模式 (queued background tasks start 20 s later, nothing resumed).
+        // Decided before the 2 s provider wait: an existing main conversation needs no provider to open.
+        // [38.9.14.2 smoke] 'i3914 trip' asks for one slow cold start: a real 3.5 s main-thread stall (HangDetector sees it)
+        run {
+            val sp = context.getSharedPreferences("mines_smoke", android.content.Context.MODE_PRIVATE)
+            if (sp.getBoolean("slow_start", false)) { sp.edit().remove("slow_start").commit(); Thread.sleep(3_500) }
+        }
+        com.openminis.app.plus.ChatHome.safeLaunch = mode == 3 && rawMode != 3
+        com.openminis.app.plus.ChatHome.init(context)
+        if (com.openminis.app.plus.ChatHome.enabled() && !hasPendingShare) {
+            val existing = com.openminis.app.plus.ChatHome.existingMain(context)
+            if (existing != null) {
+                com.openminis.app.logging.AppLogger.info("XSessionDiag",
+                    "[XSessionDiag] launch/mode: rawMode=$rawMode effectiveMode=$mode chatHome=main safe=${com.openminis.app.plus.ChatHome.safeLaunch}")
+                com.openminis.app.plus.ChatHome.redirected = true
+                navController.navigate(Routes.chat(existing)) { popUpTo(Routes.SESSION_LIST) { inclusive = false }; launchSingleTop = true }
+                com.openminis.app.ui.plus.ChatHomeNav.launchResolved.value = true
+                return@LaunchedEffect
+            }
+        }
         val autoThresholdMs = 15L * 60 * 1000
         // [T-android-first-launch-lands-home] Read once, before the mode
         // branches: "is this device set up at all?" is the question that
@@ -401,12 +423,12 @@ fun AppNavigation(
         )
         // [Mines-38.9.14 chat_home] 聊天主页 (设置 → 实验功能, default on): launch opens the one main conversation instead of
         // the list (a crash / hang breaker that forced home, a pending share or no provider keep the old dispatch below)
-        com.openminis.app.plus.ChatHome.init(context)
-        if (com.openminis.app.plus.ChatHome.enabled() && !(mode == 3 && rawMode != 3) && !hasPendingShare && hasAnyProvider) {
+        com.openminis.app.ui.plus.ChatHomeNav.launchResolved.value = true
+        if (com.openminis.app.plus.ChatHome.enabled() && !hasPendingShare && hasAnyProvider) {
             com.openminis.app.plus.ChatHome.redirected = true
             val main = com.openminis.app.plus.ChatHome.ensureMain(context)
             if (main != null) {
-                navController.navigate(Routes.chat(main)) { popUpTo(Routes.SESSION_LIST) { inclusive = false } }
+                navController.navigate(Routes.chat(main)) { popUpTo(Routes.SESSION_LIST) { inclusive = false }; launchSingleTop = true }
                 return@LaunchedEffect
             }
         }
@@ -557,6 +579,7 @@ fun AppNavigation(
         // [Mines-38.9] open a web page in Mines' in-app browser from any page (账号关联 打开网站 / 改密码 / 安全设置)
         com.openminis.app.ui.plus.PlusNav.openWeb = { url ->
             com.openminis.app.ui.plus.PlusNav.openBrowser.value = url
+            com.openminis.app.ui.plus.ChatHomeNav.listAllowed = true   // [38.9.14.2] the in-app browser lives on the list screen
             runCatching { navController.popBackStack(Routes.SESSION_LIST, false) }
         }
         com.openminis.app.ui.plus.PlusNav.pending?.let { r ->
@@ -564,7 +587,7 @@ fun AppNavigation(
             navController.safeNavigate(r)
         }
         // [Mines-38.9.14 chat_home] 任务 → 全部对话: the old conversation list
-        com.openminis.app.ui.plus.ChatHomeNav.history = { runCatching { navController.popBackStack(Routes.SESSION_LIST, false) } }
+        com.openminis.app.ui.plus.ChatHomeNav.history = { com.openminis.app.ui.plus.ChatHomeNav.listAllowed = true; runCatching { navController.popBackStack(Routes.SESSION_LIST, false) } }
         onDispose { com.openminis.app.ui.plus.PlusNav.navigate = null; com.openminis.app.ui.plus.ChatHomeNav.history = null }
     }
     // [Mines-crash-28] Offer the last crash record once after it happened.
@@ -656,6 +679,28 @@ fun AppNavigation(
                     navController.navigate(Routes.chat(main)) { popUpTo(Routes.SESSION_LIST) { inclusive = false }; launchSingleTop = true }
                     navController.navigate(com.openminis.app.ui.plus.TaskRoutes.TASKS) { launchSingleTop = true }
                 }
+            }
+            // [Mines-38.9.14.2 chat_home] the old home / list is never a landing page while 聊天主页 is on: only 全部对话 and the
+            // in-app browser open it on purpose (listAllowed). Anything else that lands here (cold start before the resolver,
+            // a state restore, a stray pop) shows the bare backdrop and goes to 聊天.
+            androidx.compose.runtime.DisposableEffect(Unit) { onDispose { com.openminis.app.ui.plus.ChatHomeNav.listAllowed = false } }
+            com.openminis.app.plus.ChatHome.init(histCtx)
+            val gate = androidx.compose.runtime.remember {
+                chOn && com.openminis.app.plus.ChatHome.mainSid.isNotBlank() && !com.openminis.app.ui.plus.ChatHomeNav.listAllowed &&
+                    com.openminis.app.ui.plus.PlusNav.openBrowser.value == null
+            }
+            if (gate) {
+                val resolved by com.openminis.app.ui.plus.ChatHomeNav.launchResolved.collectAsState()
+                androidx.compose.runtime.LaunchedEffect(resolved) {
+                    if (!resolved) return@LaunchedEffect
+                    kotlinx.coroutines.delay(150)
+                    if (navController.currentDestination?.route != Routes.SESSION_LIST) return@LaunchedEffect
+                    val main = com.openminis.app.plus.ChatHome.existingMain(histCtx) ?: com.openminis.app.plus.ChatHome.ensureMain(histCtx)
+                    if (main != null) navController.navigate(Routes.chat(main)) { popUpTo(Routes.SESSION_LIST) { inclusive = false }; launchSingleTop = true }
+                    else com.openminis.app.ui.plus.ChatHomeNav.gateFailed.value = true
+                }
+                val failed by com.openminis.app.ui.plus.ChatHomeNav.gateFailed.collectAsState()
+                if (!failed) { androidx.compose.foundation.layout.Box(Modifier.fillMaxSize()); return@composable }
             }
             ChatSplitScaffoldRoute(
                 initialSessionId = null,

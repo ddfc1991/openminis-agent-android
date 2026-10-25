@@ -94,6 +94,8 @@ I3913_SCRIPTS = {
     "GECKOREAD": [("browser_use", {"tool_title": "用 Mines 浏览器打开", "action": "navigate", "engine": "gecko", "url": GK}),
                   ("browser_use", {"tool_title": "读页面文字", "action": "get_text", "engine": "gecko"}),
                   ("browser_use", {"tool_title": "把页面给用户看", "action": "wait_for_human", "engine": "gecko"})],
+    # [38.9.14.2] a long shell step so the floating status strip + preview tile stay up while the smoke measures them
+    "PIPTEST": [("shell_execute", {"tool_title": "全盘搜索构建依赖", "command": "echo '=== 全盘找 hark apk ==='; echo '=== 找 baksmali 全盘 ==='; sleep 50; echo done"})],
     "OAUTHTEST": [("browser_use", {"tool_title": "打开 Google 登录", "action": "navigate", "url": "https://accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Fzeabur.com"})],
 }
 
