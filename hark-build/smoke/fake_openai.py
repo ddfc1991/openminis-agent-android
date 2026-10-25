@@ -427,6 +427,31 @@ fetch('/linkfake/send?'+k+'='+encodeURIComponent(v));document.getElementById('fc
                 emit({}, "tool_calls")
             self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
             return
+        if "STEPFOLD" in last_user_text(msgs) and body.get("stream"):
+            # [38.9.14.2 step_fold] one reply with 13 steps: 7 深度思考 (reasoning_content) + 6 tool calls, then the answer
+            n = 0
+            for m in reversed(msgs):
+                if m.get("role") == "user": break
+                if m.get("role") == "tool": n += 1
+            names = [t.get("function", {}).get("name") for t in body.get("tools") or []]
+            STATS["stepfold_posts"] = STATS.get("stepfold_posts", 0) + 1
+            self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+            def emit(delta, fin=None):
+                d = {"id": "x", "object": "chat.completion.chunk", "created": int(time.time()), "model": "smoke-model",
+                     "choices": [{"index": 0, "delta": delta, "finish_reason": fin}]}
+                self.wfile.write(b"data: " + json.dumps(d, ensure_ascii=False).encode() + b"\n\n"); self.wfile.flush()
+            emit({"role": "assistant", "reasoning_content": f"第 {n + 1} 步：先看看构建脚本和依赖，再决定下一步。"})
+            time.sleep(0.3)
+            tool = "memory" if "memory" in names else (pick_tool(body.get("tools"))[0])
+            if n < 6:
+                titles = ["解压并查看压缩包内容", "读取 BUILD.md 了解项目", "列出源码结构", "查看最新增量类与构建脚本", "查记忆", "全盘搜索构建依赖"]
+                a = {"tool_title": titles[n], "action": "find", "query": f"STEPFOLD-{n}"} if tool == "memory" else pick_tool(body.get("tools"))[1]
+                emit({"tool_calls": [{"index": 0, "id": f"call_sf_{n}", "type": "function", "function": {"name": tool, "arguments": json.dumps(a, ensure_ascii=False)}}]})
+                emit({}, "tool_calls")
+            else:
+                emit({"content": "STEPFOLD 完成：构建依赖都找到了，可以开始打包。"}); emit({}, "stop")
+            self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
+            return
         if "LOOPTEST" in last_user_text(msgs) and body.get("stream"):
             # [build-30 smoke] A model that repeats the same text + tool call forever.
             STATS["loop_posts"] += 1

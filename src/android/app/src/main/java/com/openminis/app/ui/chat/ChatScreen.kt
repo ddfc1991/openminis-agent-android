@@ -3594,6 +3594,9 @@ fun ChatScreen(
             // Messages + scroll-to-bottom button
             Box(modifier = Modifier.weight(1f)) {
                 var toolBarHeightPx by remember { mutableStateOf(0) }
+                // [Mines-38.9.14.2 step_fold] the floating status strip duplicates a folded step row → hidden (set below)
+                var stepFoldHidesBar by remember { mutableStateOf(false) }
+                var minesStepBlockIds by remember { mutableStateOf<Set<String>>(emptySet()) }
                 // [T-p2-agent-callback] Synthetic delegate block behind a tapped
                 // callback card; hosted at this stable scope so the sheet survives
                 // LazyColumn item disposal.
@@ -3690,7 +3693,7 @@ fun ChatScreen(
                 // [Mines-38.9.14.2] user 2026-10-25 19:07: the status strip sat on the last message (深度思考 card cut). Reserve
                 // what the floating bar really measures (tile overhang + strip + its 6 dp margin) plus the gap, never less.
                 val bottomReserve =
-                    if (hasFloatingTools) maxOf(visualOverlayHeight + 14.dp, toolBarHeightDp + 12.dp) else 20.dp
+                    if (hasFloatingTools && !stepFoldHidesBar) maxOf(visualOverlayHeight + 14.dp, toolBarHeightDp + 12.dp) else 20.dp
                 // T174: when bottomReserve changes (toolbar appearing /
                 // disappearing or thumbnail height shift), re-pin to bottom
                 // if we are currently following. Without this, the new
@@ -4224,6 +4227,26 @@ fun ChatScreen(
                         com.openminis.app.plus.ChatHomeCore.NoticeRef(t.key, t.tag.taskId, t.tag.kind, t.tag.body) } }) { id ->
                         com.openminis.app.plus.ChatHomeCore.rootKey(minesTasksNow.firstOrNull { it.id == id }, id) }
                 }
+                // [Mines-38.9.14.2 step_fold] one task row per reply's thinking + tool steps (collapsed by default)
+                val stepOpen = remember(sessionId) { androidx.compose.runtime.mutableStateMapOf<String, Boolean>() }
+                val stepWasRunning = remember(sessionId) { HashSet<String>() }
+                val minesSteps = remember(flatItems) { StepFold.groups(flatItems) }
+                LaunchedEffect(minesSteps) {
+                    for (g in minesSteps.values) {
+                        if (g.running) stepWasRunning += g.id
+                        else if (stepWasRunning.remove(g.id)) stepOpen.remove(g.id)   // finished → closes by itself
+                    }
+                }
+                val stepOpenKeys = stepOpen.filterValues { it }.keys.toSet()
+                val shownItems = remember(flatItems, minesSteps, stepOpenKeys) { StepFold.visible(flatItems, minesSteps) { it in stepOpenKeys } }
+                // the FAB jump map must count the rows actually in the list
+                val shownIndex = remember(shownItems) { if (shownItems === flatItems) null else buildMap { shownItems.forEachIndexed { idx, row -> put(row.key, idx) } } }
+                val stepBlockIds = remember(minesSteps) { minesSteps.values.flatMapTo(HashSet()) { it.blockIds } }
+                SideEffect {
+                    if (shownIndex != null) { if (flatRowIndexByKey.value !== shownIndex) flatRowIndexByKey.value = shownIndex }
+                    else if (flatRowIndexByKey.value.size != flatItems.size) flatRowIndexByKey.value = buildMap { flatItems.forEachIndexed { idx, row -> put(row.key, idx) } }
+                    if (minesStepBlockIds != stepBlockIds) minesStepBlockIds = stepBlockIds
+                }
                 LazyColumn(
                     state = listState,
                     reverseLayout = true,
@@ -4382,14 +4405,14 @@ fun ChatScreen(
                     // markdown block; each block draws its own slice of the card (first = rounded top, last = rounded
                     // bottom, middle = straight edges) so selection and per-item measuring are untouched.
                     val minesCardSeg = HashMap<String, Int>()
-                    for (ci in flatItems.indices) {
-                        val cur = flatItems[ci] as? FlatChatItem.AssistantMarkdownBlock ?: continue
-                        val prev = (flatItems.getOrNull(ci - 1) as? FlatChatItem.AssistantMarkdownBlock)?.takeIf { it.rawText.isNotBlank() }
-                        val next = (flatItems.getOrNull(ci + 1) as? FlatChatItem.AssistantMarkdownBlock)?.takeIf { it.rawText.isNotBlank() }
+                    for (ci in shownItems.indices) {
+                        val cur = shownItems[ci] as? FlatChatItem.AssistantMarkdownBlock ?: continue
+                        val prev = (shownItems.getOrNull(ci - 1) as? FlatChatItem.AssistantMarkdownBlock)?.takeIf { it.rawText.isNotBlank() }
+                        val next = (shownItems.getOrNull(ci + 1) as? FlatChatItem.AssistantMarkdownBlock)?.takeIf { it.rawText.isNotBlank() }
                         minesCardSeg[cur.key] = (if (prev?.messageId == cur.messageId) 0 else 1) or (if (next?.messageId == cur.messageId) 0 else 2)
                     }
                     items(
-                        items = flatItems.asReversed(),
+                        items = shownItems.asReversed(),
                         key = { it.key },
                         contentType = { it.contentType },
                     ) { item ->
@@ -4452,6 +4475,13 @@ fun ChatScreen(
                             }
                         }
                         val isNewestItem = item == flatItems.lastOrNull()
+                        val stepGrp = minesSteps[item.key]
+                        androidx.compose.foundation.layout.Column(Modifier.fillMaxWidth()) {
+                        if (stepGrp != null) {
+                            val opened = stepOpen[stepGrp.id] == true
+                            StepFoldRow(stepGrp, opened) { if (opened) stepOpen.remove(stepGrp.id) else stepOpen[stepGrp.id] = true }
+                            if (!opened) return@items
+                        }
                         Box(
                             modifier = Modifier
                                 .alpha(rowAlpha)
@@ -4921,6 +4951,7 @@ fun ChatScreen(
                             }
                         }
                         } // Box (alpha wrapper)
+                        } // Column (step_fold row + item)
                     }
                     // [T-android-larky-longsession-followup] "Load older
                     // messages" header — placed AFTER items() so under
@@ -5074,7 +5105,10 @@ fun ChatScreen(
                 // [T-p2-agent-series] The agent block is just another entry of
                 // the floating tool bar (its background block stays RUNNING);
                 // the standalone capsule is gone.
-                if (lastToolBlocks.isNotEmpty()) {
+                // [Mines-38.9.14.2 step_fold] the strip is a second copy of the folded row's current step: hidden then
+                val barDup = lastToolBlocks.lastOrNull()?.id?.let { it in minesStepBlockIds } == true
+                SideEffect { stepFoldHidesBar = barDup }
+                if (lastToolBlocks.isNotEmpty() && !barDup) {
                     Box(
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
