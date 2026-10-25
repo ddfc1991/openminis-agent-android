@@ -7352,6 +7352,14 @@ def b3914(res):
         sh(f"am force-stop {PKG}"); time.sleep(2)
         sh(f"am start -W -n {PKG}/com.openminis.app.MainActivity", timeout=90); time.sleep(10); dismiss_dialogs()
         r = shot("launch"); t = _txt(r); o["launch_txt"] = t[:300]
+        # [38.9.14.1 smoke, same as 38.9.15 6cf2c71] the upstream crash/hang breaker (LaunchCycleBeacon: an emulator cold-start
+        # stall after several force-stops → effectiveMode=3) forces the old home on purpose; record it and relaunch once
+        lm = sh("logcat -d | grep 'launch/mode' | tail -1")
+        if "最近对话" in t and "effectiveMode=3" in lm and "rawMode=3" not in lm:
+            o["breaker"] = lm.strip()[-160:]; print("I3914 NOTE launch hit the crash/hang breaker (old home on purpose); relaunching once", flush=True)
+            sh(f"am force-stop {PKG}"); time.sleep(2)
+            sh(f"am start -W -n {PKG}/com.openminis.app.MainActivity", timeout=90); time.sleep(10); dismiss_dialogs()
+            r = shot("launch"); t = _txt(r); o["launch_txt"] = t[:300]
         s = state(); o["state0"] = s
         if not s.get("on"): fail(f"flag chat_home not on by default: {s}")
         if not s.get("main"): fail("no main conversation after launch")
