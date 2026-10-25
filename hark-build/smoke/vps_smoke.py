@@ -152,6 +152,11 @@ try:
     I3914 = "i3914" in open("hark-build/smoke/target").read().splitlines()[1:2][0].split()   # [38.9.14] chat_home: 聊天 + auto tasks
 except Exception:
     I3914 = False
+try:
+    I310 = "i310" in open("hark-build/smoke/target").read().splitlines()[1:2][0].split()   # [38.10] cloud brain: tasks 「在云端」
+except Exception:
+    I310 = False
+if I310: I3914 = True
 if I3914: I397 = True
 if I39113: I39112 = True
 if I39112: I39111 = True
@@ -3313,7 +3318,7 @@ def main():
         if I395: fns = (b395_i2, b395_i) if I395B else (b395_i,)   # [38.9.5 i] build-i gate only: 一键关联 / 一键重新登录, gateway, new screens light + dark
         if I39113: fns = ((b3913,) if I3913 else ()) + ((b39121,) if I39121 else ()) + ((b3912,) if I3912 else ()) + (b39113,)
         elif I39112: fns = (b39112,)
-        if I3914: fns = (b3914,)
+        if I3914: fns = (b3914,) + ((b310,) if I310 else ())
         elif I39111: fns = (b39111,)
         elif I3911: fns = (b3911,)
         elif I3910: fns = (b3910,)
@@ -7277,6 +7282,140 @@ def b39121(res):
 
 
 # ======================= [38.9.13 integ] task projects / VPS page / handoff v2 / memory v2 / Mines browser =======================
+def b310(res):
+    """[38.10 cloud_brain] mines-brain runs on the runner (127.0.0.1:8790, scripted model); the app reaches it through its SSH
+    session to 10.0.2.2:22 with a local port forward. 「云端执行」 row says 已连接; 「帮我注册 doroai」 → task 「在云端」 (chip
+    「… · 云端」, ☁ rows) → cloud ask 「用哪个邮箱注册？」 → 等你处理 notice; Mines force-stopped, the answer goes to the brain
+    directly, the brain finishes while the phone app is dead; relaunch → the app catches up from its cursor → 完成 notice;
+    link dropped mid-task → reconnect → done; 限制层: a send waits for 同意 typed on the phone → runs → done."""
+    o = res.setdefault("i310", {})
+    def shot(name):
+        r = snap("i310-" + name)
+        subprocess.run(f"cp {OUT}/{step_no:02d}-i310-{name}.png {OUT}/i310-{name}.png", shell=True)
+        return r
+    def fail(m): selftest_fail.append("i310 " + m); print("I310 FAIL " + m, flush=True)
+    def cstate():
+        s = result_json("group", "c310 state", timeout=30)
+        return s if isinstance(s, dict) else {}
+    def hstate():
+        s = result_json("group", "i3914 state", timeout=20)
+        return s if isinstance(s, dict) else {}
+    def wait_c(pred, secs):
+        t0 = time.time(); s = cstate()
+        while time.time() - t0 < secs:
+            if pred(s): return s
+            time.sleep(2); s = cstate()
+        return s
+    def brain(method, path, body=None):
+        tok = os.environ.get("MB_TOKEN", "")
+        cmd = ["curl", "-s", "-m", "20", "-X", method, "-H", f"Authorization: Bearer {tok}", "-H", "Content-Type: application/json", f"http://127.0.0.1:8790{path}"]
+        if body is not None: cmd += ["-d", json.dumps(body)]
+        try: return json.loads(subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout or "{}")
+        except Exception as e: return {"err": str(e)}
+    def step(name, f):
+        t0 = time.time()
+        try: f()
+        except Exception as e:
+            import traceback; traceback.print_exc(); fail(f"{name} error {e}")
+        print(f"I310 STEP {name} {int(time.time() - t0)} s", flush=True)
+        if not alive(): crashed.append(f"i310 {name}"); recover(f"i310 {name}")
+    def launch():
+        sh(f"am start -n {PKG}/com.openminis.app.MainActivity"); time.sleep(6); dismiss_dialogs()
+
+    o["brain_health"] = brain("GET", "/v1/health")
+    if not o["brain_health"].get("ok"): fail(f"mines-brain not running on the runner: {o['brain_health']}"); return
+
+    def link():
+        sd = result_json("group", "i3913 sshseed", timeout=30); pub = (sd or {}).get("pub", "") if isinstance(sd, dict) else ""
+        if not pub: fail(f"sshseed gave no public key: {sd}"); return
+        subprocess.run("sudo mkdir -p /root/.ssh && sudo chmod 700 /root/.ssh && sudo tee -a /root/.ssh/authorized_keys >/dev/null && sudo chmod 600 /root/.ssh/authorized_keys",
+                       shell=True, input=pub.strip() + "\n", text=True, timeout=20)
+        p = None
+        for i in range(4):
+            p = result_json("group", "c310 probe", timeout=90); o.setdefault("probe", []).append(p)
+            if isinstance(p, dict) and p.get("ok"): break
+            time.sleep(5)
+        if not (isinstance(p, dict) and p.get("ok")): fail(f"app could not reach the brain through the SSH tunnel: {p}")
+        info = brain("GET", "/v1/info"); o["info"] = {k: info.get(k) for k in ("v", "workers", "models")}
+    step("link", link)
+
+    def settings_row():
+        route("settings", 3); tap_text("测试与上报", wait=3)
+        seen = set()
+        for i in range(12):
+            r = dump(); seen |= set(texts(r))
+            if any("云端执行" in x for x in seen) and any("已连接" in x for x in seen): shot("settings-cloud"); break
+            scroll_down()
+        o["settings_seen"] = [x for x in seen if "云端" in x or "已连接" in x][:6]
+        if not any("云端执行" in x for x in seen): fail("实验功能: 云端执行 row missing")
+        elif not any("已连接" in x for x in seen): fail(f"云端执行 row not 已连接: {o['settings_seen']}")
+        back(2)
+    step("settings_row", settings_row)
+
+    def cloud_task():
+        result_json("group", "i3914 main", timeout=20); time.sleep(3)
+        result_json("group", "i3914 say 帮我注册 doroai", timeout=40)
+        s = wait_c(lambda s: str((s.get("task") or {}).get("cloud", "")).startswith("ct"), 60); o["state_submit"] = s
+        t = s.get("task") or {}
+        if not str(t.get("cloud", "")).startswith("ct"): fail(f"task did not go to the cloud: {s} / {hstate().get('tasks')}"); return
+        time.sleep(2); shot("chat-cloud-running")
+        s = wait_c(lambda s: (s.get("task") or {}).get("st") == "waiting", 90); o["state_wait"] = s
+        t = s.get("task") or {}
+        if t.get("st") != "waiting": fail(f"cloud ask did not reach the phone as 等你处理: {t}"); return
+        if "邮箱" not in t.get("line", ""): fail(f"等你 line is not the cloud question: {t.get('line')}")
+        time.sleep(3); r = shot("chat-cloud-waiting"); txt = _txt(r)
+        if "云端" not in txt: fail("chip / notice in 聊天 does not say 云端")
+        o["cloud_id"] = t.get("cloud")
+    step("cloud_task", cloud_task)
+
+    def app_killed():
+        cid = o.get("cloud_id")
+        if not cid: fail("no cloud task to continue"); return
+        sh(f"am force-stop {PKG}"); time.sleep(3)
+        if alive(): fail("Mines still running after force-stop")
+        r = brain("POST", f"/v1/tasks/{cid}/reply", {"text": "smoke@example.com"}); o["direct_reply"] = r.get("status")
+        t0 = time.time(); bt = {}
+        while time.time() - t0 < 60:
+            bt = brain("GET", f"/v1/tasks/{cid}")
+            if bt.get("status") in ("done", "error"): break
+            time.sleep(2)
+        o["brain_while_app_dead"] = bt.get("status")
+        if bt.get("status") != "done": fail(f"brain did not finish while Mines was dead: {bt}")
+        launch()
+        s = wait_c(lambda s: (s.get("task") or {}).get("st") == "done", 90); o["state_catchup"] = s
+        t = s.get("task") or {}
+        if t.get("st") != "done": fail(f"relaunched app did not catch up to 完成: {t}"); return
+        rows = [x.get("text", "") for x in s.get("rows") or []]
+        if not any("☁ 完成" in x for x in rows): fail(f"no ☁ 完成 row in the task conversation: {rows[-5:]}")
+        if not any("邮箱" in x for x in rows): fail("the cloud question is missing from the task conversation (events lost?)")
+        hs = hstate()
+        if not any(x.get("tag", "").startswith("DONE") for x in (hs.get("rows") or [])): fail("no 完成 notice in 聊天 after catch-up")
+        time.sleep(3); shot("chat-cloud-done")
+        result_json("group", "c310 open", timeout=20); time.sleep(4)
+        r = shot("task-cloud-rows"); o["task_rows_txt"] = _txt(r)[:400]
+        if "☁" not in _txt(r): fail("task conversation shows no ☁ cloud progress rows")
+        back(1); time.sleep(2)
+    step("app_killed", app_killed)
+
+    def approve_and_drop():
+        n0 = len(hstate().get("tasks") or [])
+        result_json("group", "i3914 say 帮我部署好后发一封邮件通知 smoke", timeout=40)
+        s = wait_c(lambda s: str((s.get("task") or {}).get("cloud", "")).startswith("ct") and (s.get("task") or {}).get("cloud") != o.get("cloud_id"), 60)
+        result_json("group", "c310 drop", timeout=20)          # the link dies as a frozen app / VPN reconnect would
+        s = wait_c(lambda s: (s.get("task") or {}).get("st") == "waiting", 90); o["state_approve"] = s
+        t = s.get("task") or {}
+        if t.get("st") != "waiting" or "同意" not in t.get("line", ""): fail(f"限制层 send did not wait for 同意: {t}"); return
+        time.sleep(2); shot("chat-cloud-approve")
+        r = result_json("group", "c310 reply 同意", timeout=40); o["approve_reply"] = r
+        s = wait_c(lambda s: (s.get("task") or {}).get("st") == "done", 90); o["state_approved"] = s
+        if (s.get("task") or {}).get("st") != "done": fail(f"approved send did not finish: {s.get('task')}")
+        ev = brain("GET", f"/v1/events?task={(s.get('task') or {}).get('cloud')}").get("events") or []
+        if not any(e.get("type") == "tool" and (e.get("data") or {}).get("tool") == "http_fetch" for e in ev): fail("the approved send never ran on the brain")
+        if len(hstate().get("tasks") or []) <= n0: fail("no task created for the send")
+    step("approve_and_drop", approve_and_drop)
+    print("I310 RESULT " + json.dumps(o, ensure_ascii=False)[:6000], flush=True)
+
+
 def b3914(res):
     """[38.9.14 chat_home] cold launch lands on 聊天 (main conversation) with the 4-tab dock; 「帮我注册 zeabur」 → router says task →
     「已建任务」 chip, the task runs in its own conversation in the background (进行中 → 完成, notice in 聊天), tap chip opens the task;

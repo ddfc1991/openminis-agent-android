@@ -51,6 +51,8 @@ class H(BaseHTTPRequestHandler):
             script = [{"say": "先在云端看一下", "tool": "shell", "args": {"command": "echo cloud-ok"}}]
             if "注册" in goal:
                 script.append({"say": "需要你确认邮箱", "tool": "ask_user", "args": {"question": "用哪个邮箱注册？"}})
+            if "邮件" in goal:   # a send: 限制层 holds it until the phone says 同意
+                script.append({"say": "发通知邮件", "tool": "http_fetch", "args": {"url": "https://example.com/send", "method": "POST", "body": "hi", "text": "发送邮件"}})
             script.append({"tool": "finish", "args": {"result": "云端已完成：" + goal.strip()[:20]}})
         turn = sum(1 for m in msgs if m["role"] == "assistant")
         step = script[turn] if turn < len(script) else {"say": "脚本结束"}

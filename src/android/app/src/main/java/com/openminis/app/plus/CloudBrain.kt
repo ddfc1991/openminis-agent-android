@@ -188,9 +188,8 @@ object CloudBrain {
             if (_models.value == 0) syncProviders()
             val (code, body) = call(s, "POST", "/v1/tasks", CloudBrainCore.submitJson(t.goal, t.name, CloudBrainCore.clientRef(t.id)), token, 30_000)
             if (code !in 200..299) { _err.value = "HTTP $code"; return@withContext null }
-            val id = JSONObject(body).optString("id").takeIf { it.isNotBlank() } ?: return@withContext null
-            pump()
-            id
+            JSONObject(body).optString("id").takeIf { it.isNotBlank() }   // ChatHome maps it, then starts the pump
+        
         }.onFailure { _err.value = VpsSsh.reason(it); dropForward(s.id) }.getOrNull()
     }
 
@@ -226,6 +225,8 @@ object CloudBrain {
                         val cur = current()
                         if (cur == null) { if (!probe()) { delay(CloudBrainCore.backoffMs(++fails)); continue } else { fails = 0; continue } }
                         val (s, token) = cur
+                        // a submit in flight: its first events must not slip past the cursor before the task knows its id
+                        if (ChatHome.tasks.value.any { it.cloud == "…" }) { delay(1_000); continue }
                         try {
                             val (code, body) = call(s, "GET", "/v1/events?after=$cursor&wait=25", null, token, 40_000)
                             if (code != 200) throw IOException("HTTP $code")
@@ -267,7 +268,7 @@ object CloudBrain {
     /** one catch-up read (CloudBrainJob, app in the background or just started by the job): deliver what happened */
     suspend fun catchUpOnce(): Int = withContext(Dispatchers.IO) {
         if (!enabled()) return@withContext 0
-        if (pumping) { delay(30_000); return@withContext 0 }      // the live pump is already delivering
+        if (pumping || ChatHome.tasks.value.any { it.cloud == "…" }) { delay(30_000); return@withContext 0 }   // the live pump delivers
         if (current() == null && !probe()) return@withContext 0
         val (s, token) = current() ?: return@withContext 0
         lock.withLock {
