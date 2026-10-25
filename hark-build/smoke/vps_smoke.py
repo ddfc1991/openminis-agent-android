@@ -7362,7 +7362,7 @@ def b3914(res):
         if "帮我注册 zeabur" not in t: fail("tapping the chip did not open the task conversation")
         back(1); time.sleep(2)
         r = dump()
-        if r is None or "已建任务" not in _txt(r): print("I3914 note: back from task did not return to 聊天", flush=True)
+        if r is None or "已建任务" not in _txt(r): fail("back from the task conversation did not return to 聊天")
     step("open_chip", open_chip)
 
     def quick():

@@ -105,7 +105,7 @@ fun MinesTaskNotice(tag: ChatHomeCore.Tag) {
             val word = when (tag.kind) { ChatHomeCore.Kind.ASK -> "等你"; ChatHomeCore.Kind.ERROR -> "出错"; else -> "完成" }
             Column(Modifier.fillMaxWidth(0.86f).clip(shape).background(minesGlassFill()).border(1.dp, m.glassBorder, shape)
                 .clickable(enabled = t != null, onClick = open)
-                .semantics(mergeDescendants = true) { contentDescription = "${t?.name ?: "任务"} $word：${tag.body}。点按打开任务" }
+                .semantics(mergeDescendants = true) { contentDescription = "${t?.name ?: "任务"} $word：${tag.body.trimEnd('。')}。点按打开任务" }
                 .padding(horizontal = 14.dp, vertical = 10.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text((t?.name ?: "任务") + (if (t != null) " · 回复你 ${hm(t.createdAt)} 的消息" else ""), fontSize = MT.Meta, color = m.ink2,
