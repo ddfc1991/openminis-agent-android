@@ -7717,6 +7717,16 @@ def b3914(res):
             r = shot("history-back"); t2 = _txt(r); o["history_back_txt"] = t2[:200]
             if "等你处理" not in t2: fail("back from 全部对话 did not return to 任务")
             one_bar("history-back")
+        # [38.9.14.1] 任务 scrolled to the bottom: the last item sits above the frosted dock (bottom contentPadding)
+        for _ in range(6): scroll_down()
+        time.sleep(1.5); r = shot("tab-tasks-bottom")
+        dock_lab = ("聊天", "任务", "消息", "应用")
+        ys = [y for t, d, x, y, n in nodes(r) if (t in dock_lab or (d or "").split("，")[0] in dock_lab) and y > SCREEN[1] * 0.8]
+        top = (min(ys) - 60) if ys else SCREEN[1] * 0.88
+        under = [t or d for t, d, x, y, n in nodes(r) if (t or d) and y > top and not (t in dock_lab or (d or "").split("，")[0] in dock_lab)]
+        o["tasks_bottom_under_dock"] = under[:8]
+        if under: fail(f"任务 bottom: items still under the dock {under[:5]}")
+        one_bar("tab-tasks-bottom")
         if not tap_dock("消息"): fail("dock 消息 not found")
         shot("tab-messages"); one_bar("tab-messages")
         if not tap_dock("应用"): fail("dock 应用 not found"); return

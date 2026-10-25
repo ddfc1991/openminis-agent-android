@@ -203,7 +203,7 @@ fun TasksScreen(onBack: () -> Unit, go: (String) -> Unit) {
                 MinesIcon(icT("chevron-right"), null, tint = m.ink2, modifier = Modifier.size(18.dp))
             }
         }
-        if (com.openminis.app.plus.ChatHome.enabled()) Spacer(Modifier.size(84.dp))   // [Mines-38.9.14 chat_home] room for the dock
+        // [38.9.14.1] room for the dock: PlusPage's bottom padding (chatHomeDockPad) now covers it
     }
 }
 
