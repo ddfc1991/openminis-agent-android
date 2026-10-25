@@ -21,6 +21,12 @@ class RegLedgerCoreTest {
         assertFalse(RegLedgerCore.isTemp("nobody@unknown.io", doms, emptySet()))
     }
 
+    @Test fun maskBoxKeepsTwoBoxesApart() {
+        assertEquals("mine••8587@smoke-mail.test", RegLedgerCore.maskBox("minesfncch8587@smoke-mail.test"))
+        assertFalse(RegLedgerCore.maskBox("minesfncch8587@x.test") == RegLedgerCore.maskBox("minesfndhuz626@x.test"))
+        assertEquals("k7q2••@mail.tm", RegLedgerCore.maskBox("k7q2abcd@mail.tm"))
+    }
+
     @Test fun recordKeepsPlatformUrlAndFirstTime() {
         var l = RegLedgerCore.upsert(emptyList(), Rec("a@dcpa.net", "zeabur.com", "Zeabur", "https://zeabur.com/sign-up", st = RSt.RUNNING, createdAt = 100))
         l = RegLedgerCore.upsert(l, Rec("a@dcpa.net", "zeabur.com", st = RSt.CAPTCHA, why = "人机", createdAt = 999))

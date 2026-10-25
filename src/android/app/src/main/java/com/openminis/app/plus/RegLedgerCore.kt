@@ -36,6 +36,13 @@ object RegLedgerCore {
 
     private val LONG = Regex("(?i)@(gmail|googlemail|163|126|yeah|qq|foxmail|outlook|hotmail|live|msn|icloud|me|yahoo|proton|protonmail|sina|sohu|aliyun|139)\\.")
 
+    /** temp boxes all start with the same prefix (mines…@domain): keep the last 4 of the local part so two boxes never look the same */
+    fun maskBox(a: String): String {
+        val at = a.indexOf('@'); if (at <= 0) return a
+        val u = a.substring(0, at)
+        return if (u.length >= 10) u.take(4) + "••" + u.takeLast(4) + a.substring(at) else Inbox3912Core.maskMail(a)
+    }
+
     /** a temporary box: one Mines made / knows the password of, or on a temp-mail domain; long-term providers never are */
     fun isTemp(addr: String, tempDomains: Set<String>, known: Set<String>): Boolean {
         val a = addr.trim().lowercase()

@@ -171,7 +171,7 @@ fun RegisterRunCard(go: (String) -> Unit) {
                     Column(Modifier.weight(1f).padding(start = 20.dp)) {
                         Text(RegisterAutoCore.itemTitle(it0) + " ›", fontSize = MT.Sub, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         val sub = when (it0.st) {
-                            RegisterAutoCore.St.DONE -> Inbox3912Core.maskMail(it0.email)
+                            RegisterAutoCore.St.DONE -> com.openminis.app.plus.RegLedgerCore.maskBox(it0.email)
                             else -> it0.line.ifBlank { it0.p.host }
                         }
                         Text(sub, fontSize = MT.Meta, color = if (w) Color(0xFFD08A1E) else m.ink2, maxLines = 2, overflow = TextOverflow.Ellipsis)
@@ -235,13 +235,14 @@ internal fun tempBoxesOf(recs: List<com.openminis.app.plus.RegLedgerCore.Rec>, r
 
 /** the two small switches + 「下次续期 · 上次探活」 under a row (default off) */
 @Composable
-fun KaLine(key: String, label: String) {
+fun KaLine(key: String, label: String, start: androidx.compose.ui.unit.Dp? = null, prefix: String? = null) {
     val m = mines()
     val ctx = LocalContext.current
     val all by com.openminis.app.plus.RegLedger.ka.collectAsState()
     val k = all[key] ?: com.openminis.app.plus.RegLedgerCore.Ka(key)
-    Column(Modifier.fillMaxWidth().padding(start = if (key.startsWith("box|")) 16.dp else 62.dp, end = 16.dp, bottom = 6.dp)) {
+    Column(Modifier.fillMaxWidth().padding(start = start ?: if (key.startsWith("box|")) 16.dp else 62.dp, end = 16.dp, bottom = 6.dp)) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            if (prefix != null) Text(prefix, fontSize = MT.Meta, color = m.ink3)
             KaChip("自动延时", k.extend, "自动延时 $label") { com.openminis.app.plus.RegLedger.setKa(ctx, k.copy(extend = !k.extend)) }
             KaChip("探针保活" + if (k.probe) " ${k.everyH}h" else "", k.probe, "探针保活 $label") { com.openminis.app.plus.RegLedger.setKa(ctx, k.copy(probe = !k.probe)) }
             if (k.probe) Text("改间隔", fontSize = MT.Meta, color = m.ink2, modifier = Modifier.clip(RoundedCornerShape(50))
@@ -273,9 +274,9 @@ fun TempBoxCard(box: String, recs: List<com.openminis.app.plus.RegLedgerCore.Rec
     val hosts = (recs.map { it.host } + rows.map { it.host }).filter { it.isNotBlank() }.distinctBy { it.lowercase() }
     MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp), onClick = { go(RegisterBox.route(box)) }) {
         Column(Modifier.padding(vertical = 6.dp)) {
-            Row(Modifier.padding(horizontal = 16.dp, vertical = 6.dp).semantics(mergeDescendants = true) { contentDescription = "临时邮箱 ${Inbox3912Core.maskMail(box)}，${hosts.size} 个平台。点按查看" },
+            Row(Modifier.padding(horizontal = 16.dp, vertical = 6.dp).semantics(mergeDescendants = true) { contentDescription = "临时邮箱 ${com.openminis.app.plus.RegLedgerCore.maskBox(box)}，${hosts.size} 个平台。点按查看" },
                 verticalAlignment = Alignment.CenterVertically) {
-                Text(Inbox3912Core.maskMail(box), fontSize = MT.Sub, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace, color = m.ink, modifier = Modifier.weight(1f), maxLines = 1)
+                Text(com.openminis.app.plus.RegLedgerCore.maskBox(box), fontSize = MT.Sub, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace, color = m.ink, modifier = Modifier.weight(1f), maxLines = 1)
                 StatusPill("临时", null)
             }
             hosts.take(4).forEach { h ->
@@ -291,9 +292,9 @@ fun TempBoxCard(box: String, recs: List<com.openminis.app.plus.RegLedgerCore.Rec
                     }
                     StatusPill(st, when (st) { "已验证" -> true; "未完成" -> false; else -> null })
                 }
-                KaLine(com.openminis.app.plus.RegLedgerCore.acctKey(h, box), h)   // this account: 自动延时 / 探针保活
+                KaLine(com.openminis.app.plus.RegLedgerCore.acctKey(h, box), h, start = 16.dp, prefix = "账号")   // this account: 自动延时 / 探针保活
             }
-            KaLine(com.openminis.app.plus.RegLedgerCore.boxKey(box), "邮箱 " + Inbox3912Core.maskMail(box))
+            KaLine(com.openminis.app.plus.RegLedgerCore.boxKey(box), "邮箱 " + com.openminis.app.plus.RegLedgerCore.maskBox(box), prefix = "邮箱")
         }
     }
 }
@@ -379,7 +380,7 @@ object RegisterBox {
                     }
                 }
             }
-            KaLine(com.openminis.app.plus.RegLedgerCore.boxKey(box), Inbox3912Core.maskMail(box))
+            KaLine(com.openminis.app.plus.RegLedgerCore.boxKey(box), com.openminis.app.plus.RegLedgerCore.maskBox(box))
         }
     }
 
@@ -400,7 +401,7 @@ object RegisterBox {
                         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                             Column(Modifier.weight(1f)) {
                                 Text(t.rec.platform.ifBlank { t.host.ifBlank { "未知平台" } }, fontSize = MT.Body, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                Text(Inbox3912Core.maskMail(t.account) + " · 还剩 ${com.openminis.app.plus.RegLedgerCore.daysLeft(t, now)} 天", fontSize = MT.Meta, color = m.ink2, maxLines = 1)
+                                Text(com.openminis.app.plus.RegLedgerCore.maskBox(t.account) + " · 还剩 ${com.openminis.app.plus.RegLedgerCore.daysLeft(t, now)} 天", fontSize = MT.Meta, color = m.ink2, maxLines = 1)
                             }
                             Text("恢复", fontSize = MT.Sub, color = Color(ORANGE), modifier = Modifier.clip(RoundedCornerShape(50)).background(Color(0x22C0633F))
                                 .clickable { com.openminis.app.plus.RegLedger.restore(ctx, t.id) }.padding(horizontal = 12.dp, vertical = 5.dp)

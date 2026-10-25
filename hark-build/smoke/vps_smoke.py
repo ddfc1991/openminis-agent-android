@@ -7543,7 +7543,8 @@ def bregauto(res):
     saved); one folded task row 「一键注册 · …」 with 「10.0.2.2 注册 · 完成」; 任务 tab has the task. A second run on a page behind a
     Cloudflare Turnstile box stops and asks (等你 + one line), the takeover screen shows the page, 跳过 → 未完成. Shots iregauto-*.png."""
     o = res.setdefault("iregauto", {})
-    B = "http://10.0.2.2:8096"
+    B = "http://10.0.2.2:8096"    # as the emulator sees the runner
+    HB = "http://127.0.0.1:8096"  # as the driver (on the runner) sees it — 10.0.2.2 only exists inside the emulator
     def shot(name):
         r = snap("iregauto-" + name)
         subprocess.run(f"cp {OUT}/{step_no:02d}-iregauto-{name}.png {OUT}/iregauto-{name}.png", shell=True)
@@ -7553,7 +7554,7 @@ def bregauto(res):
         s = result_json("group", "ira state", timeout=20)
         return s if isinstance(s, dict) else {}
     def fake():
-        try: return json.loads(subprocess.run(f"curl -s {B}/state", shell=True, capture_output=True, text=True, timeout=10).stdout or "{}")
+        try: return json.loads(subprocess.run(f"curl -s {HB}/state", shell=True, capture_output=True, text=True, timeout=10).stdout or "{}")
         except Exception as e: return {"err": str(e)}
     def step(name, f):
         t0 = time.time()
@@ -7675,10 +7676,11 @@ def bregauto(res):
         route("plus_register_ledger", 5)
         r0 = shot("temp-group")
         for i in range(3):
-            if find(r0, "临时邮箱 "): break
+            if find(r0, "个平台。点按查看"): break
             scroll_down(); r0 = shot("temp-group")
         if not find(r0, "临时"): fail("no 「临时」 group / pill on 注册台账")
-        if not tap_text("临时邮箱 ", wait=3): fail("temp box card not tappable"); return
+        # 「临时邮箱 」 also matches the 一键注册 card's 「每个平台一个临时邮箱 → …」 line — tap the box card itself
+        if not tap_text("个平台。点按查看", wait=3): fail("temp box card not tappable"); return
         r1 = shot("temp-box")
         if not find(r1, "注册了"): fail("box screen has no platform list")
         tap_text("重新收码", wait=6)
@@ -7721,7 +7723,7 @@ def bregauto(res):
 
     def tidy():   # 整理: one fillable temp row, one dead temp row without password, one gmail row that must stay
         box = "fill%d@smoke-mail.test" % int(time.time())
-        subprocess.run(f"curl -s -XPOST {B}/seed -d '{{\"address\":\"{box}\",\"password\":\"SeedBox-1\"}}'", shell=True, timeout=10)
+        subprocess.run(f"curl -s -XPOST {HB}/seed -d '{{\"address\":\"{box}\",\"password\":\"SeedBox-1\"}}'", shell=True, timeout=10)
         o["seed"] = result_json("group", f"ira seedtidy {box} SeedBox-1", timeout=30)
         f0 = (fake().get("count") or {})
         route("plus_register_ledger", 4)

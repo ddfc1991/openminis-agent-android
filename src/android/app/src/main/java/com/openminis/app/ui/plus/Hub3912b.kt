@@ -193,9 +193,10 @@ fun RegisterLedgerScreen(onBack: () -> Unit, go: (String) -> Unit) {
             MinesIcon(ic2("plus"), null, tint = m.ink, modifier = Modifier.size(20.dp))
         }
     }) {
+        val tempSet = remember(tempRecs, all) { tempBoxesOf(tempRecs, all) }   // also the 临时邮箱 tile count (a stopped sign-up's row has no 「Mail.tm」 note)
         Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             val regBoxes = all.filter { it.note.contains("Mail.tm") }.map { it.account.lowercase() }.distinct().size   // [38.9.15] one box per platform
-            Tile3912("临时邮箱", if (selfDom != null) "∞" else "${boxes.size + regBoxes}", if (selfDom != null) "自建域名 @$selfDom" else "Mail.tm · 每个平台一个", Modifier.weight(1f))
+            Tile3912("临时邮箱", if (selfDom != null) "∞" else "${boxes.size + maxOf(regBoxes, tempSet.size)}", if (selfDom != null) "自建域名 @$selfDom" else "Mail.tm · 每个平台一个", Modifier.weight(1f))
             Tile3912("已注册平台", if (rows == null) "…" else "${all.map { it.host }.distinct().size}",
                 "已验证 ${all.count { it.st == Inbox3912Core.RegSt.DONE }} · 未完成 ${all.count { it.st == Inbox3912Core.RegSt.PENDING }}", Modifier.weight(1f))
         }
@@ -215,7 +216,6 @@ fun RegisterLedgerScreen(onBack: () -> Unit, go: (String) -> Unit) {
         RegisterRunCard(go)   // [Mines-38.9.15 register_auto] one folded task row
         TidySummaryLine(go)
         // [Mines-38.9.15 register_auto] temporary boxes: their own group, 「临时」, tap = the box (platforms + 重新收码)
-        val tempSet = remember(tempRecs, all) { tempBoxesOf(tempRecs, all) }
         if (tempSet.isNotEmpty()) {
             WarmGroupLabel("临时邮箱", "${tempSet.size} 个")
             tempSet.take(12).forEach { b -> TempBoxCard(b, tempRecs.filter { it.box.equals(b, true) }, all.filter { it.account.equals(b, true) }, go) }
