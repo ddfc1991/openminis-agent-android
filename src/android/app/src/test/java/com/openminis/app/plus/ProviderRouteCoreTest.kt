@@ -110,7 +110,8 @@ class ProviderRouteCoreTest {
         for (p in listOf("src/main/java/com/openminis/app/provider/anthropic/AnthropicProvider.kt", "src/main/java/com/openminis/app/provider/gemini/GeminiProvider.kt"))
             assertTrue(p, f(p).contains("proxySelector(com.openminis.app.plus.ProviderRoutes.selector)"))
         val vm = f("src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt")
-        assertTrue(vm.contains("ProviderRouteCore.silentBudgetMs("))
+        // [38.9.14.1 stall_watch] the per-turn silent budget became the 40 s stream idle watchdog (retry once, then next model)
+        assertTrue(vm.contains("minesStallWatchdog(") && vm.contains("StallWatchCore.STREAM_IDLE_MS"))
         assertTrue(f("src/main/java/com/openminis/app/ui/chat/ChatIndicators.kt").contains("ProviderRoutes.status"))
     }
 }
