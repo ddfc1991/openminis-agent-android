@@ -64,7 +64,10 @@ fun StandardChatSheet(
     sheetGesturesEnabled: Boolean = true,
     content: @Composable () -> Unit,
 ) {
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    // [Mines-38.9.15] the in-app browser: a drag never dismisses the sheet (this M3 has no sheetGesturesEnabled) — the page's
+    // slider owns the finger; close with X / back
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true,
+        confirmValueChange = { v -> sheetGesturesEnabled || v != androidx.compose.material3.SheetValue.Hidden })
     val configuration = LocalConfiguration.current
     val sheetHeight = (configuration.screenHeightDp * heightFraction.coerceIn(0.1f, 1f)).dp
 
@@ -73,8 +76,7 @@ fun StandardChatSheet(
         sheetState = sheetState,
         sheetMaxWidth = sheetMaxWidth,
         containerColor = ChatColors.background,
-        dragHandle = { CompactDragHandle() },
-        sheetGesturesEnabled = sheetGesturesEnabled,
+        dragHandle = if (sheetGesturesEnabled) ({ CompactDragHandle() }) else null,
     ) {
         Column(
             modifier = Modifier
