@@ -7658,14 +7658,16 @@ def b3914(res):
         if tile and not (tile[2] <= strip[0] or strip[2] <= tile[0] or tile[3] <= strip[1] or strip[3] <= tile[1]):
             fail(f"pip: preview tile {tile} intersects the status strip {strip}")
         # last message = the lowest text node above the composer that is not part of the strip / tile
-        low = None
+        low = None; low_t = ""
         for t, d, x, y, n in nodes(r):
             if not t or t.startswith("发消息"): continue
             b = list(map(int, re.findall(r"\d+", n.get("bounds", ""))))
             if len(b) != 4 or b[1] >= strip[1] - 2: continue
-            if tile and tile[0] <= x <= tile[2] and tile[1] <= y <= tile[3]: continue
-            if low is None or b[3] > low[3]: low = b
-        o["pip_last"] = low
+            # [smoke 40198408547] the tile's terminal text measures wider / taller than the tile (clipped): its centre fell
+            # outside the tile and it was taken for the last message (bottom 2112 > strip top). Skip any node touching the tile.
+            if tile and not (b[2] <= tile[0] or tile[2] <= b[0] or b[3] <= tile[1] or tile[3] <= b[1]): continue
+            if low is None or b[3] > low[3]: low = b; low_t = t
+        o["pip_last"] = low; o["pip_last_text"] = low_t[:60] if low else None
         if low is None: fail("pip: no message found above the strip")
         elif low[3] > strip[1]: fail(f"pip: last message bottom {low[3]} > strip top {strip[1]} (covered)")
         hidden = [t for t, d, x, y, n in nodes(r) if t and "PIPTEST" in t]
@@ -7697,8 +7699,9 @@ def b3914(res):
         p = find(r, "步骤：")
         if p:
             sh(f"input tap {p[0]} {p[1]}"); time.sleep(2)
-            r = dump()
-            if "深度思考" in _txt(r): fail("stepfold: tapping again did not fold the steps")
+            r = dump(); t2 = _txt(r)
+            o["stepfold_refold_txt"] = t2[-300:]
+            if "深度思考" in t2 or "列出源码结构" in t2: fail("stepfold: tapping again did not fold the steps")
     step("stepfold", stepfold)
 
     def experiments():
@@ -7712,6 +7715,8 @@ def b3914(res):
         back(2)
     step("experiments", experiments)
     print("I3914 RESULT " + json.dumps(o, ensure_ascii=False)[:6000], flush=True)
+    print("I3914 KEYS " + json.dumps({k: o.get(k) for k in ("breaker_runs", "breakers_end", "pip_tile", "pip_strip", "pip_last", "pip_last_text",
+                                                            "stepfold_rows", "stepfold_posts", "stepfold_refold_txt")}, ensure_ascii=False)[:4000], flush=True)
 
 
 def b3913(res):

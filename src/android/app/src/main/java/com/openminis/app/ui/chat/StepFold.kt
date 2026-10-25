@@ -100,6 +100,13 @@ internal object StepFold {
     fun stepTitle(b: AssistantBlock): String =
         if (b.kind == "thinking") "深度思考" else com.openminis.app.plus.ToolZh.title(b.toolTitle, b.toolName)
 
+    /** the folded row's words: the running step (a thinking step = 「思考中」), or, finished, the last tool step */
+    fun rowTitle(g: Group, cur: AssistantBlock): String {
+        if (g.running) return if (cur.kind == "thinking") "思考中" else stepTitle(cur)
+        val lastTool = g.blocks.lastOrNull { it.kind != "thinking" } ?: return "思考完成"
+        return stepTitle(lastTool)
+    }
+
     fun durationText(ms: Long): String {
         if (ms <= 0) return ""
         val s = (ms + 500) / 1000
@@ -129,7 +136,9 @@ internal fun StepFoldRow(g: StepFold.Group, open: Boolean, onToggle: () -> Unit)
     val cur = g.blocks.lastOrNull { it.kind != "thinking" && it.toolStatus != null && (it.toolStatus == ToolBlockStatus.RUNNING || it.toolStatus == ToolBlockStatus.STREAMING || it.toolStatus == ToolBlockStatus.PENDING) }
         ?: g.blocks.last()
     val failed = !g.running && g.blocks.lastOrNull { it.kind != "thinking" }?.let { it.toolStatus == ToolBlockStatus.FAILED || it.toolStatus == ToolBlockStatus.TIMEOUT } == true
-    val title = StepFold.stepTitle(cur)
+    // [38.9.14.2 smoke 40198408547] the row never says 「深度思考」: while it runs a thinking step reads 「思考中」, once the reply is
+    // done the row names the last tool step (or 「思考完成」 when there was none), so a folded reply shows no 深度思考 card text
+    val title = StepFold.rowTitle(g, cur)
     val took = StepFold.durationText(StepFold.elapsed(g, now))
     val meta = "${g.blocks.size} 步" + if (took.isNotEmpty()) " · $took" else ""
     val shape = RoundedCornerShape(14.dp)
