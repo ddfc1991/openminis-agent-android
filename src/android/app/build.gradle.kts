@@ -38,8 +38,8 @@ android {
         applicationId = "com.openminis.mines.plus"
         minSdk = 26
         targetSdk = 35
-        versionCode = 56
-        versionName = "1.23.14"
+        versionCode = 58
+        versionName = "1.23.14.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
