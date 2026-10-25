@@ -7396,7 +7396,15 @@ def b310(res):
         if not any("邮箱" in x for x in rows): fail("the cloud question is missing from the task conversation (events lost?)")
         hs = hstate()
         if not any(x.get("tag", "").startswith("DONE") for x in (hs.get("rows") or [])): fail("no 完成 notice in 聊天 after catch-up")
-        time.sleep(3); to_bottom(); shot("chat-cloud-done")
+        # [38.10 fix] the 完成 notice is the brain's result line (finish result), not 「已回答：☁ 第 3 步 · 第 3 步」
+        dn = [x.get("text", "") for x in (hs.get("rows") or []) if x.get("tag", "") == f"DONE:{t.get('id')}"]
+        o["done_notice"] = dn[-1:] ; o["done_line"] = t.get("line")
+        if not dn: fail("no 完成 notice for the cloud task")
+        elif "云端已完成" not in dn[-1] or "已回答" in dn[-1] or "第 3 步" in dn[-1]: fail(f"完成 notice is not the result line: {dn[-1]}")
+        time.sleep(3); to_bottom(); r = shot("chat-cloud-done"); txt = _txt(r); o["done_txt"] = txt[-300:]
+        # [38.10 fix] the 完成 chip keeps 「· 云端」
+        if "完成 · 云端" not in txt: fail("完成 chip does not keep 「· 云端」")
+        if "第 3 步 · 第 3 步" in txt: fail("step title duplicated 「第 3 步 · 第 3 步」")
         result_json("group", "c310 open", timeout=20); time.sleep(4)
         r = shot("task-cloud-rows"); o["task_rows_txt"] = _txt(r)[:400]
         if "☁" not in _txt(r): fail("task conversation shows no ☁ cloud progress rows")
