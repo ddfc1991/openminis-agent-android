@@ -340,7 +340,7 @@ fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, action
             Box(Modifier.fillMaxSize().padding(padding).nestedScroll(fogHold)) {
                 Column(
                     Modifier.fillMaxSize().verticalScroll(rememberScrollState())
-                        .padding(top = 4.dp, bottom = 96.dp),   // [Mines-38.9.1] last section never sits under the gesture bar
+                        .padding(top = 4.dp, bottom = maxOf(96.dp, chatHomeDockPad())),   // [Mines-38.9.1] last section never sits under the gesture bar; [38.9.14.1] nor the dock
                 ) {
                     // [Mines-38.5] A subtitle that needs two lines breaks at the punctuation nearest its middle (「…；」 / 「…，」),
                     // never mid-word (「一 / 键连接」) and never with one orphan character on line 2 (「…悬浮挂 / 件」).

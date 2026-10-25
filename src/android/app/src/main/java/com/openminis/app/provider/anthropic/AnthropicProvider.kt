@@ -83,6 +83,9 @@ class AnthropicProvider(
         // [T-android-stale-conn-retry-hang] Shared pool — see NetworkMonitor.
         // Network-transition eviction must reach provider connections.
         .connectionPool(com.openminis.app.network.NetworkMonitor.sharedLLMConnectionPool)
+        // [38.9.14.1 net_drop] TCP keepalive + HTTP/2 ping so a long silent stream is not cut as idle
+        .socketFactory(com.openminis.app.network.KeepAliveSocketFactory)
+        .pingInterval(com.openminis.app.network.KeepAliveSocketFactory.PING_S, TimeUnit.SECONDS)
         .build()
 
     override suspend fun sendMessageClamped(

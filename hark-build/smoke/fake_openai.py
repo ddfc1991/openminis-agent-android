@@ -324,7 +324,8 @@ fetch('/linkfake/send?'+k+'='+encodeURIComponent(v));document.getElementById('fc
         if "MINES_ROUTER" in ut0:   # [38.9.14 chat_home] router: registrations / deployments are tasks, the rest quick
             q = ut0.split("用户：", 1)[-1]
             STATS.setdefault("router", []).append(q[:40])
-            text = json.dumps({"mode": "task", "name": "Zeabur 注册"} if ("注册" in q or "部署" in q) else {"mode": "quick"}, ensure_ascii=False)
+            text = json.dumps({"mode": "task", "name": "断网测试"} if "NETDROP" in q else
+                              {"mode": "task", "name": "Zeabur 注册"} if ("注册" in q or "部署" in q) else {"mode": "quick"}, ensure_ascii=False)
         elif "今天几号" in ut0:
             STATS["quick_posts"] = STATS.get("quick_posts", 0) + 1
             text = "今天是 10 月 25 日，星期日。"
@@ -332,6 +333,39 @@ fetch('/linkfake/send?'+k+'='+encodeURIComponent(v));document.getElementById('fc
             STATS["task_posts"] = STATS.get("task_posts", 0) + 1
             time.sleep(12)
             text = "Zeabur 注册已完成：账号 smoke@example.com 已登记到注册台账。"
+        # [38.9.14.1 stall_watch] the first streamed turn for STALLONCE hangs after the headers (no event at all); the retry is
+        # slow to start (8 s) so the 「模型没响应，正在重试…」 line can be seen, then answers
+        if "STALLONCE" in ut0 and "MINES_ROUTER" not in ut0 and body.get("stream"):
+            STATS["stall_posts"] = STATS.get("stall_posts", 0) + 1
+            if STATS["stall_posts"] == 1:
+                STATS["stall_hang_at"] = time.time()
+                self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers(); self.wfile.flush()
+                for _ in range(120):
+                    time.sleep(1)
+                return
+            STATS["stall_retry_at"] = time.time()
+            time.sleep(8)
+            text = "卡住后已恢复，这是重试后的回答。"
+        # [38.9.14.1 net_drop] the first streamed turn for NETDROPONCE sends two chunks, then the TCP connection is reset (RST,
+        # like the phone's ECONNABORTED); the resumed turn is slow to start (10 s) so 「网络断了，等网络恢复后继续」 can be seen
+        if "NETDROPONCE" in ut0 and "MINES_ROUTER" not in ut0 and body.get("stream"):
+            STATS["netdrop_posts"] = STATS.get("netdrop_posts", 0) + 1
+            if STATS["netdrop_posts"] == 1:
+                import socket as _so, struct as _st
+                self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+                for piece in ("好的，", "我开始部署"):
+                    d = {"id": "x", "object": "chat.completion.chunk", "created": int(time.time()), "model": "smoke-model",
+                         "choices": [{"index": 0, "delta": {"role": "assistant", "content": piece}, "finish_reason": None}]}
+                    self.wfile.write(b"data: " + json.dumps(d, ensure_ascii=False).encode() + b"\n\n"); self.wfile.flush(); time.sleep(0.5)
+                time.sleep(1)
+                try:
+                    self.connection.setsockopt(_so.SOL_SOCKET, _so.SO_LINGER, _st.pack("ii", 1, 0))
+                    self.connection.close()
+                except Exception: pass
+                self.close_connection = True
+                return
+            time.sleep(10)
+            text = "断网后已继续，这是恢复后的回答：部署完成。"
         if "MULTIPART" in last_user_text(msgs):
             STATS["multipart"] = STATS.get("multipart", 0) + 1
             text = MULTIPART

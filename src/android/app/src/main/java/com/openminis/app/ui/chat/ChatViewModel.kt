@@ -11433,6 +11433,10 @@ class ChatViewModel(
             var degenRetries = 0
             var degenForceFallback = false
             var badKeyRotations = 0   // [38.9.11.3] same-provider key swaps after a 401 this turn
+            var stallRetries = 0   // [38.9.14.1 stall_watch] same-model retries after a silent stream (one, then the next model)
+            var stallLineUp = false   // 「模型没响应，正在重试…」 stays until the next first chunk
+            var netDropRetries = 0   // [38.9.14.1 net_drop] connection-drop resumes on this model this turn
+            var netDropUpRetries = 0   // … of those, drops while the network never went away (→ next model after 3)
             var turnThinkingOverride: ThinkingLevel? = null
             while (!collectDone) {
                 try {
@@ -11553,11 +11557,15 @@ class ChatViewModel(
                     // fallbackable ProviderError, so the group moves on (or the turn ends with the reason) instead of hanging.
                     // [Mines-38.9.11.3] the provider now bounds connect (10 s per route) and first token (45 s / 90 s reasoning) itself and
                     // moves on at once; this deadline is only the backstop = both routes' connects + probe + first token.
-                    (if (scriptedTurn != null) turnChunks else turnChunks.minesFirstChunkDeadline(
-                        com.openminis.app.plus.ProviderRouteCore.silentBudgetMs(currentProvider.model.supportsReasoning == true))).collect { chunk ->
+                    // [Mines-38.9.14.1 stall_watch] no chunk for 40 s — before the first one or mid-stream — = stalled: TransientError(模型没响应…),
+                    // retried once on the same model, then the next working model (catch below)
+                    (if (scriptedTurn != null) turnChunks else turnChunks.minesStallWatchdog(
+                        com.openminis.app.plus.StallWatchCore.STREAM_IDLE_MS)).collect { chunk ->
+                com.openminis.app.plus.NetDrop.noteByte()   // [38.9.14.1 net_drop] idle seconds at a drop
                 // [T-STALL-DIAG] Mark first byte back from the provider and log
                 // the time-to-first-chunk once per turn.
                 if (firstChunkSeen.compareAndSet(false, true)) {
+                    if (stallLineUp) { stallLineUp = false; withContext(Dispatchers.Main) { clearInlineError() } }   // [38.9.14.1]
                     com.openminis.app.plus.ProviderRoutes.idle()   // [38.9.11.3] 「正在连接 / 正在思考」 ends with the first token
                     // [T-switch-model-retry-counter-reset] The retried attempt is
                     // producing output, so the ladder is done. isBoundToAbandonedModel()
@@ -12119,15 +12127,47 @@ class ChatViewModel(
                     // `model_not_found` to ProviderError) keeps falling back
                     // immediately rather than newly sitting through three
                     // same-model retries that its own body says are pointless.
-                    val isTransient = actual is com.openminis.app.data.model.LLMError.NetworkError ||
-                        actual is com.openminis.app.data.model.LLMError.TransientError
-                    if (isTransient && retryAttempt < AUTO_RETRY_DELAYS_SEC.size) {
+                    // [Mines-38.9.14.1 stall_watch] a silent model: one same-model retry, then fallback (not three retries)
+                    val isStall = com.openminis.app.plus.StallWatch.isStall(actual)
+                    if (isStall) com.openminis.app.plus.StallWatch.log(if (stallRetries == 0) "retry" else "fallback",
+                        currentProvider.model.displayName, actual.message ?: "")
+                    val stallGiveUp = isStall && stallRetries >= 1
+                    if (isStall && !stallGiveUp) stallRetries++
+                    val isTransient = (actual is com.openminis.app.data.model.LLMError.NetworkError ||
+                        actual is com.openminis.app.data.model.LLMError.TransientError) && !stallGiveUp
+                    // [Mines-38.9.14.1 net_drop] a connection drop (ECONNABORTED / reset / broken pipe / stream reset): evict the pool,
+                    // wait for the network (≤ 2 min), back off, resume the SAME turn; 3 drops with the network up → next model
+                    val isNetDrop = !isStall && !stallGiveUp && ((isTransient && com.openminis.app.plus.NetDropCore.isDrop(actual)) ||
+                        // the phone itself is offline right now: every route / model fails the same way, so wait instead of burning the chain
+                        (actual is com.openminis.app.data.model.LLMError && actual !is com.openminis.app.data.model.LLMError.RateLimited &&
+                            actual !is com.openminis.app.data.model.LLMError.InvalidApiKey && !com.openminis.app.plus.NetDrop.online()))
+                    val netPlan = if (isNetDrop) com.openminis.app.plus.NetDropCore.plan(netDropRetries, netDropUpRetries) else null
+                    val netResume = netPlan == com.openminis.app.plus.NetDropCore.Plan.RESUME
+                    val netSwitch = netPlan == com.openminis.app.plus.NetDropCore.Plan.SWITCH
+                    if (isNetDrop) {
+                        val snap = com.openminis.app.plus.NetDrop.snapshot()
+                        com.openminis.app.plus.NetDrop.log(when (netPlan) { com.openminis.app.plus.NetDropCore.Plan.RESUME -> "drop"
+                            com.openminis.app.plus.NetDropCore.Plan.SWITCH -> "switch"; else -> "gave_up" },
+                            currentProvider.model.displayName, "#${netDropRetries + 1} " + (actual.message ?: ""), snap)
+                    }
+                    if (netResume || (isTransient && !isNetDrop && retryAttempt < AUTO_RETRY_DELAYS_SEC.size)) {
                         // [T-android-stop-retry-countdown] A stopped turn must
                         // not start a countdown: the failure it would show is
                         // most likely the Stop itself (OkHttp reports a
                         // cancelled call as an IOException, i.e. NetworkError).
                         // Mirrors iOS streamWithAutoRetry's checkCancellation.
                         if (!kotlin.coroutines.coroutineContext.isActive) throw CancellationException("stopped before retry countdown")
+                        if (netResume) {
+                            netDropRetries += 1
+                            withContext(Dispatchers.Main) { setTransientInlineError(com.openminis.app.plus.NetDropCore.LINE) }
+                            com.openminis.app.plus.NetDrop.evict()
+                            val (wasDown, waited, back) = com.openminis.app.plus.NetDrop.awaitNetwork(com.openminis.app.plus.NetDropCore.WAIT_MS)
+                            if (!wasDown) netDropUpRetries += 1
+                            kotlinx.coroutines.delay(com.openminis.app.plus.NetDropCore.backoffMs(netDropRetries - 1))
+                            com.openminis.app.plus.NetDrop.evict()
+                            com.openminis.app.plus.NetDrop.log("resume", currentProvider.model.displayName,
+                                "#$netDropRetries waited=${waited / 1000}s down=$wasDown online=$back", null)
+                        } else {
                         val delaySec = AUTO_RETRY_DELAYS_SEC[retryAttempt]
                         retryAttempt += 1
                         val errDesc = actual.message ?: actual.javaClass.simpleName
@@ -12136,7 +12176,8 @@ class ChatViewModel(
                             _autoRetryAttempt.value = retryAttempt
                             // Show the error inline on the streaming assistant message during countdown.
                             // Keeps isStreaming=true so the UI doesn't tear down the streaming state.
-                            setTransientInlineError("$errDesc — retrying ($retryAttempt/${AUTO_RETRY_DELAYS_SEC.size})…")
+                            setTransientInlineError(if (isStall) com.openminis.app.plus.StallWatchCore.retryLine()
+                                else "$errDesc — retrying ($retryAttempt/${AUTO_RETRY_DELAYS_SEC.size})…")
                         }
                         try {
                             for (remaining in delaySec downTo 1) {
@@ -12156,8 +12197,11 @@ class ChatViewModel(
                         } finally {
                             _autoRetryCountdown.value = 0
                         }
+                        }   // [38.9.14.1 net_drop] end of the normal countdown
                         // Clear inline error so the retry attempt can start cleanly.
-                        withContext(Dispatchers.Main) {
+                        // [38.9.14.1] except the stall / net-drop line: it stays (status, not an error) until the retry's first chunk
+                        if (isStall || netResume) stallLineUp = true
+                        else withContext(Dispatchers.Main) {
                             clearInlineError()
                         }
                         // Roll back partial blocks from the failed stream attempt so the retried
@@ -12329,7 +12373,7 @@ class ChatViewModel(
                     // group, as on iOS; other errors are unaffected.
                     val isDirectEntryOverflow = _selectedGroupId.value == null &&
                         ContextOverflowGuard.isContextOverflow(overflowErr?.httpStatus, overflowErr?.detail)
-                    val shouldFallback = degenForceFallback || (!isDirectEntryOverflow && (isRateLimit || is5xx || isFallbackableError ||
+                    val shouldFallback = degenForceFallback || stallGiveUp || netSwitch || (!isDirectEntryOverflow && (isRateLimit || is5xx || isFallbackableError ||
                         loopFallbackStrategy == com.openminis.app.data.model.FallbackStrategy.always))
                     // [T-android-fallback-chain-refill] Rebuild from the live
                     // group, excluding everything already tried in this streak,
@@ -12391,6 +12435,8 @@ class ChatViewModel(
                         currentProvider = next
                         // [Mines-degen-34] the next model gets its own retry and the user's thinking level
                         degenRetries = 0; degenForceFallback = false; turnThinkingOverride = null; degen.reset()
+                        stallRetries = 0   // [38.9.14.1] the next model gets its own one retry
+                        netDropRetries = 0; netDropUpRetries = 0   // [38.9.14.1 net_drop]
                         // [T-fallback-5xx-status] Fresh same-model budget for the
                         // member we just switched to. The counter is per-turn, so
                         // without this reset every member after the first got
@@ -12458,7 +12504,9 @@ class ChatViewModel(
                                 persistBinding("""{"type":"entry","entryId":"${newEntry.id}"}""")
                             }
                         }
-                        val infoText = fallbackReasons.joinToString("\n") + "\n🔄 已换到 ${currentProvider.model.displayName}" +
+                        if (isStall) com.openminis.app.plus.StallWatch.log("switched", currentProvider.model.displayName, "")
+                        val infoText = (if (isStall) com.openminis.app.plus.StallWatchCore.switchedLine(currentProvider.model.displayName) + "\n" else "") +
+                            fallbackReasons.joinToString("\n") + "\n🔄 已换到 ${currentProvider.model.displayName}" +
                             (_providerName.value.takeIf { it.isNotBlank() }?.let { " · $it" } ?: "")
                         allToolBlocks.removeAll { it.kind == "info" }
                         allToolBlocks.add(0, AssistantBlock(
@@ -13065,7 +13113,8 @@ class ChatViewModel(
                         val minesToolTitle = if (name == com.openminis.app.plus.TaskProgress.TOOL_NAME) null
                             else runCatching { JSONObject(argsStr).optString("tool_title") }.getOrNull()?.ifBlank { null } ?: name
                         if (minesToolTitle != null) runCatching { minesProgressFollowSid(); com.openminis.app.plus.TaskProgress.onToolStart(minesSid(), minesToolTitle) }
-                        val result = executeTool(name, argsStr, id, allToolBlocks, assistantId, accumulatedText)
+                        // [Mines-38.9.14.1 stall_watch] a tool past its limit is cancelled and the model gets an error result
+                        val result = minesToolWatchdog(name, argsStr) { executeTool(name, argsStr, id, allToolBlocks, assistantId, accumulatedText) }
                         if (minesToolTitle != null) runCatching { com.openminis.app.plus.TaskProgress.onToolEnd(minesSid(), minesToolTitle, result.success) }
                         android.util.Log.d("ToolChain[VM]", "[turn=$turn] executeTool END name=$name success=${result.success} title=${result.toolTitle} outputLen=${result.output.length} output=${result.output.take(200)}")
 
@@ -13551,6 +13600,27 @@ class ChatViewModel(
         args: JSONObject,
         tools: List<AgentToolDefinition>,
     ): String? = preflightValidateToolCallImpl(name, args, tools)
+
+    /** [Mines-38.9.14.1 stall_watch] runs [block] detached from this turn's own job (cancelled with it), so a tool that ignores
+     *  cancellation cannot hold the loop: past [StallWatchCore.toolLimitMs] it is cancelled and an error result is returned. */
+    private suspend fun minesToolWatchdog(name: String, argsJson: String, block: suspend () -> ToolExecutionResult): ToolExecutionResult {
+        val limit = com.openminis.app.plus.StallWatchCore.toolLimitMs(name, argsJson) ?: return block()
+        val turnJob = kotlin.coroutines.coroutineContext[kotlinx.coroutines.Job]
+        val toolJob = kotlinx.coroutines.Job()
+        val h = turnJob?.invokeOnCompletion { toolJob.cancel() }
+        val ctx = kotlin.coroutines.coroutineContext.minusKey(kotlinx.coroutines.Job) + toolJob
+        val d = kotlinx.coroutines.CoroutineScope(ctx).async { block() }
+        try {
+            val r = withTimeoutOrNull(limit) { d.await() }
+            if (r != null) return r
+            d.cancel(); toolJob.cancel()
+            com.openminis.app.plus.StallWatch.log("tool_timeout", name, "limit=${limit / 1000}s")
+            if (name == "shell_execute") ExecutionCoordinator.stopCurrentCommand(activeSessionId)   // a runaway shell is stopped too
+            return ToolExecutionResult(com.openminis.app.plus.StallWatchCore.toolTimeoutText(name, limit), success = false, toolTitle = name)
+        } finally {
+            h?.dispose()
+        }
+    }
 
     private suspend fun executeTool(
         name: String,
@@ -17074,6 +17144,14 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
             _autoRetryCountdown.value = 0
             clearInlineError()
         }
+        // [Mines-38.9.14.1] 停止 before any reply: the message goes back into the input box
+        runCatching {
+            val ms = _messages.value
+            val ui = ms.indexOfLast { it.role == "user" && !it.isQueued }
+            val ai = ms.indexOfLast { it.role == "assistant" }
+            val noReply = ai < 0 || ai < ui || ms[ai].content.isBlank()
+            if (ui >= 0 && noReply && _inputText.value.isBlank() && ms[ui].content.isNotBlank()) _inputText.value = ms[ui].content
+        }
         handleUserCancelledCleanup()
 
         // T189: iOS parity (AIChatViewModel.swift L2592-2610). If the user
@@ -18208,6 +18286,33 @@ internal fun warmUpBudget(window: Int?, compactThreshold: Int?, ratio: Double, f
     if (fixedTokens <= 0) return null
     val line = if (threshold > 0) threshold else w
     return (line / ratio).toInt() - fixedTokens
+}
+
+/** [Mines-38.9.14.1 stall_watch] fails with a [com.openminis.app.plus.StallWatch.stallError] when no element arrives for [idleMs]
+ *  — before the first element or between two; the timer runs only while waiting (not while the collector works). */
+internal fun <T> kotlinx.coroutines.flow.Flow<T>.minesStallWatchdog(idleMs: Long): kotlinx.coroutines.flow.Flow<T> {
+    val upstream = this
+    return kotlinx.coroutines.flow.flow {
+        kotlinx.coroutines.coroutineScope {
+            val ch = upstream.produceIn(this)
+            var got = false
+            while (true) {
+                val r = kotlinx.coroutines.withTimeoutOrNull(idleMs) { ch.receiveCatching() }
+                if (r == null) {
+                    ch.cancel()
+                    val e = com.openminis.app.plus.StallWatch.stallError(idleMs, got)
+                    com.openminis.app.plus.StallWatch.log(if (got) "stream_mid" else "stream_first", "", e.detail)
+                    throw e
+                }
+                if (r.isClosed) {
+                    r.exceptionOrNull()?.let { throw it }
+                    return@coroutineScope
+                }
+                got = true
+                emit(r.getOrThrow())
+            }
+        }
+    }
 }
 
 /** [Mines-38.9.1] how long a model may stay completely silent (not even message_start) before the group moves on */

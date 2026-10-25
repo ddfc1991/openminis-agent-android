@@ -7357,6 +7357,19 @@ def b3914(res):
         one_bar("launch")
     step("launch", launch)
 
+    def netkeep():
+        # [38.9.14.1 net_drop] the one-tap 「任务在后台不断网」 card shows on 聊天 while Mines is not battery-exempt; after the
+        # exemption (here: deviceidle whitelist = what the system 「允许」 does) it is gone on resume (emulator is not realme → no step 2)
+        r = shot("netkeep-card"); t = _txt(r); o["netkeep_txt"] = t[:200]
+        if "任务在后台不断网" not in t: fail("netkeep: 「任务在后台不断网」 card not shown on 聊天 before the exemption")
+        one_bar("netkeep-card")
+        sh(f"cmd deviceidle whitelist +{PKG}"); time.sleep(1)
+        sh("input keyevent KEYCODE_HOME"); time.sleep(2)
+        sh(f"am start -n {PKG}/com.openminis.app.MainActivity"); time.sleep(5)
+        r = shot("netkeep-gone"); t = _txt(r)
+        if "任务在后台不断网" in t or "还差一步" in t: fail("netkeep: card still shown after the battery exemption")
+    step("netkeep", netkeep)
+
     def back_root():
         # [38.9.14.1] back on 聊天 (root) → Mines goes to the background (launcher); never the old list / old bar
         back(1); time.sleep(2.5)
@@ -7422,6 +7435,27 @@ def b3914(res):
         time.sleep(2); shot("quick-answer")
     step("quick", quick)
 
+    def stall():
+        # [38.9.14.1 stall_watch] the model hangs once (headers, then nothing): after 40 s the turn is retried on the same model
+        # with 「模型没响应，正在重试…」 shown, and the reply arrives within ~60 s; logged as a stall
+        t0 = time.time()
+        result_json("group", "i3914 say 卡住测试 STALLONCE", timeout=40)
+        s = wait_state(lambda s: any(x.get("kind") == "retry" for x in (s.get("stalls") or [])), 55)
+        o["stall_retry_s"] = int(time.time() - t0)
+        if not any(x.get("kind") == "retry" for x in (s.get("stalls") or [])): fail(f"stall: no retry logged within 55 s: {s.get('stalls')}")
+        r = shot("stall-retry"); t = _txt(r); o["stall_retry_txt"] = t[-300:]
+        if "模型没响应" not in t: fail("stall: 「模型没响应，正在重试…」 line not shown during the retry")
+        s = wait_state(lambda s: any("卡住后已恢复" in (x.get("text") or "") for x in (s.get("rows") or [])), max(5, 75 - (time.time() - t0)))
+        dt = int(time.time() - t0); o["stall_reply_s"] = dt; o["stall_stalls"] = s.get("stalls")
+        f = fake(); o["stall_posts"] = f.get("stall_posts")
+        if not any("卡住后已恢复" in (x.get("text") or "") for x in (s.get("rows") or [])): fail(f"stall: no reply after the retry ({dt} s)")
+        elif dt > 65: fail(f"stall: reply took {dt} s (> 65)")
+        if (f.get("stall_posts") or 0) < 2: fail(f"stall: model not called again ({f.get('stall_posts')})")
+        time.sleep(1); r = shot("stall-done")
+        if "模型没响应" in _txt(r): fail("stall: retry line still shown after the reply")
+        one_bar("stall-done")
+    step("stall", stall)
+
     def tabs():
         if not tap_dock("任务"): fail("dock 任务 not found"); return
         r = shot("tab-tasks"); t = _txt(r); o["tab_tasks"] = t[:500]
@@ -7442,6 +7476,16 @@ def b3914(res):
             r = shot("history-back"); t2 = _txt(r); o["history_back_txt"] = t2[:200]
             if "等你处理" not in t2: fail("back from 全部对话 did not return to 任务")
             one_bar("history-back")
+        # [38.9.14.1] 任务 scrolled to the bottom: the last item sits above the frosted dock (bottom contentPadding)
+        for _ in range(6): scroll_down()
+        time.sleep(1.5); r = shot("tab-tasks-bottom")
+        dock_lab = ("聊天", "任务", "消息", "应用")
+        ys = [y for t, d, x, y, n in nodes(r) if (t in dock_lab or (d or "").split("，")[0] in dock_lab) and y > SCREEN[1] * 0.8]
+        top = (min(ys) - 60) if ys else SCREEN[1] * 0.88
+        under = [t or d for t, d, x, y, n in nodes(r) if (t or d) and y > top and not (t in dock_lab or (d or "").split("，")[0] in dock_lab)]
+        o["tasks_bottom_under_dock"] = under[:8]
+        if under: fail(f"任务 bottom: items still under the dock {under[:5]}")
+        one_bar("tab-tasks-bottom")
         if not tap_dock("消息"): fail("dock 消息 not found")
         shot("tab-messages"); one_bar("tab-messages")
         if not tap_dock("应用"): fail("dock 应用 not found"); return
@@ -7467,6 +7511,38 @@ def b3914(res):
             tap_dock("任务"); shot("tab-tasks-dark"); tap_dock("聊天"); theme388(1); time.sleep(2)
         except Exception as e: print("I3914 dark error", e, flush=True)
     step("dark", dark)
+
+    def netdrop():
+        # [38.9.14.1 net_drop] a task whose model stream is cut mid-reply (TCP RST after 2 chunks, like the phone's
+        # 「Software caused connection abort」): logged as a drop with its cause, 「网络断了，等网络恢复后继续」 shown, the SAME turn
+        # resumes on the same model and the task finishes (完成) without the user doing anything
+        tap_dock("聊天"); time.sleep(1)
+        t0 = time.time()
+        result_json("group", "i3914 say 帮我部署 断网测试 NETDROPONCE", timeout=40)
+        s = wait_state(lambda s: any(x.get("kind") == "drop" for x in (s.get("netdrops") or [])), 60)
+        o["netdrop_drop_s"] = int(time.time() - t0)
+        drops = [x for x in (s.get("netdrops") or []) if x.get("kind") == "drop"]
+        if not drops: fail(f"netdrop: no drop logged within 60 s: {(s.get('netdrops') or [])[-4:]}"); return
+        o["netdrop_drop"] = drops[-1]
+        if not drops[-1].get("state"): fail("netdrop: drop logged without the device state (screen / app / net / idle)")
+        r = dump(); p = find(r, "已建任务 断网测试") or find(r, "断网测试")
+        if p: sh(f"input tap {p[0]} {p[1]}"); time.sleep(2.5)
+        else: fail("netdrop: chip 「已建任务 断网测试」 not found")
+        r = shot("netdrop-wait"); t = _txt(r); o["netdrop_wait_txt"] = t[-300:]
+        if "网络断了" not in t: fail("netdrop: 「网络断了，等网络恢复后继续」 line not shown in the task while it waits")
+        s = wait_state(lambda s: any(x.get("name") == "断网测试" and x.get("st") == "done" for x in (s.get("tasks") or [])), 100)
+        dt = int(time.time() - t0); o["netdrop_done_s"] = dt; o["netdrop_log"] = (s.get("netdrops") or [])[-6:]
+        f = fake(); o["netdrop_posts"] = f.get("netdrop_posts")
+        if not any(x.get("name") == "断网测试" and x.get("st") == "done" for x in (s.get("tasks") or [])):
+            fail(f"netdrop: task did not finish after the drop ({dt} s): {[(x.get('name'), x.get('st'), x.get('line')) for x in (s.get('tasks') or [])]}")
+        if not any(x.get("kind") == "resume" for x in (s.get("netdrops") or [])): fail("netdrop: no resume logged")
+        if (f.get("netdrop_posts") or 0) < 2: fail(f"netdrop: model not called again after the drop ({f.get('netdrop_posts')})")
+        time.sleep(2); r = shot("netdrop-done"); t = _txt(r); o["netdrop_done_txt"] = t[-300:]
+        if "断网后已继续" not in t: fail("netdrop: resumed reply not visible in the task conversation")
+        if "网络断了" in t: fail("netdrop: wait line still shown after the reply")
+        back(1); time.sleep(2.5)
+        r = shot("netdrop-chat"); one_bar("netdrop-chat")
+    step("netdrop", netdrop)
 
     def experiments():
         route("settings", 3); tap_text("测试与上报", wait=3)

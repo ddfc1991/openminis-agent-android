@@ -213,7 +213,7 @@ fun DigestScreen(onBack: () -> Unit) {
             androidx.compose.foundation.lazy.LazyColumn(
                 Modifier.fillMaxSize(),
                 state = listState,
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 40.dp),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = maxOf(40.dp, chatHomeDockPad())),   // [38.9.14.1] last card above the dock
             ) {
                 // [Mines-38.1] 「接入更多来源」 card removed: sources live behind ⚙ → 消息来源 and a faint 「＋ 添加来源」 row at the end
                 // ---- [Mines-warm-36] 「N 件要处理」 strip + 4 tabs: 账号异常 / X / GitHub / 值得关注 (其他 only when it has items) ----

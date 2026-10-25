@@ -18,10 +18,12 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.ime
 import androidx.navigation.compose.currentBackStackEntryAsState
 import kotlinx.coroutines.launch
+import com.openminis.app.ui.plus.dockBlurSource
 import com.openminis.app.deeplink.DeepLinkAction
 import com.openminis.app.deeplink.DeepLinkCoordinator
 import com.openminis.app.ui.settings.KEY_LAUNCH_SESSION
@@ -585,7 +587,8 @@ fun AppNavigation(
         // the active Material colorScheme also keeps the first frame
         // correct on cold start.
         modifier = Modifier
-            .fillMaxSize(),
+            .fillMaxSize()
+            .dockBlurSource(),   // [Mines-38.9.14.1] what the 4-tab dock blurs
         // T342: Material 3 motion — shared-axis X transition.
         // Spec (m3.material.io/styles/motion/transitions):
         //   - enter uses EmphasizedDecelerate (cubic-bezier 0.05, 0.7, 0.1, 1.0)
@@ -671,7 +674,7 @@ fun AppNavigation(
         ) { backStackEntry ->
             val sessionId = backStackEntry.arguments?.getString("sessionId") ?: return@composable
             // [Mines-38.9.14 chat_home] the main conversation leaves room for the dock (none while the keyboard is up)
-            val dockRoom = if (com.openminis.app.plus.ChatHome.isMain(sessionId) && !imeUp()) 70.dp else 0.dp
+            val dockRoom = if (com.openminis.app.plus.ChatHome.isMain(sessionId) && !imeUp()) 76.dp else 0.dp
             androidx.compose.foundation.layout.Box(Modifier.fillMaxSize().padding(bottom = dockRoom)) {
             ChatSplitScaffoldRoute(
                 initialSessionId = sessionId,
@@ -1813,6 +1816,9 @@ private fun androidx.compose.foundation.layout.BoxScope.ChatHomeOverlay(navContr
         if (tab == 0) navController.navigate(target) { launchSingleTop = true }
         else navController.navigate(target) { route?.let { popUpTo(it) { inclusive = true } }; launchSingleTop = true }
     }
+    // [38.9.14.1 net_drop] one-tap 「后台不断网」 guide (battery exemption, then realme/OPPO background) on 聊天 / 任务
+    if (tab == 0) com.openminis.app.ui.plus.NetKeepCard(Modifier.align(androidx.compose.ui.Alignment.TopCenter).statusBarsPadding().padding(top = 60.dp))
+    if (tab == 1) com.openminis.app.ui.plus.NetKeepCard(Modifier.align(androidx.compose.ui.Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 92.dp))
     if (tab == 0) com.openminis.app.ui.plus.ChatHomeRoutingPill(Modifier.align(androidx.compose.ui.Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 150.dp))
     com.openminis.app.ui.plus.ChatHomeDock(
         current = tab,
@@ -1828,3 +1834,4 @@ private fun androidx.compose.foundation.layout.BoxScope.ChatHomeOverlay(navContr
         modifier = Modifier.align(androidx.compose.ui.Alignment.BottomCenter),
     )
 }
+
