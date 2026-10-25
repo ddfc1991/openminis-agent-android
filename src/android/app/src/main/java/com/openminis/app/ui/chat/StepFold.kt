@@ -37,6 +37,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.openminis.app.ui.components.DecorativeSpinner
+import com.openminis.app.ui.theme.ChatColors
 
 /**
  * [Mines-38.9.14.2] user 2026-10-25 20:57 「最主要是这个对话要会伸缩进一个任务项，就是聚合」: all 深度思考 + tool steps of one reply

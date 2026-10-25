@@ -4240,7 +4240,7 @@ fun ChatScreen(
                 val stepOpenKeys = stepOpen.filterValues { it }.keys.toSet()
                 val shownItems = remember(flatItems, minesSteps, stepOpenKeys) { StepFold.visible(flatItems, minesSteps) { it in stepOpenKeys } }
                 // the FAB jump map must count the rows actually in the list
-                val shownIndex = remember(shownItems) { if (shownItems === flatItems) null else buildMap { shownItems.forEachIndexed { idx, row -> put(row.key, idx) } } }
+                val shownIndex = remember(shownItems) { if (shownItems === flatItems) null else buildMap<String, Int> { shownItems.forEachIndexed { idx, row -> put(row.key, idx) } } }
                 val stepBlockIds = remember(minesSteps) { minesSteps.values.flatMapTo(HashSet()) { it.blockIds } }
                 SideEffect {
                     if (shownIndex != null) { if (flatRowIndexByKey.value !== shownIndex) flatRowIndexByKey.value = shownIndex }
