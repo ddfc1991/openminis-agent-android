@@ -74,6 +74,7 @@ object TaskProjects {
     }
 
     private fun propose(sid: String, site: String, verb: String, contact: String) {
+        if (ChatHome.isMain(sid)) return   // [Mines-38.9.14 chat_home] 聊天 itself is never a project (its background tasks are)
         val cur = _proposal.value
         if (cur != null && cur.sid == sid && cur.site.isNotBlank()) return
         _proposal.value = Proposal(sid, TaskProjectsCore.hostOf(site), verb, contact.ifBlank { cur?.contact.orEmpty() })

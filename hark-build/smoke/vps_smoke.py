@@ -7350,7 +7350,7 @@ def b3914(res):
         o["task_done"] = d[-1]
         time.sleep(3); r = shot("chip-done"); txt = _txt(r)
         if not any(x.get("tag", "").startswith("DONE") for x in (s2.get("rows") or [])): fail("no DONE notice row in 聊天")
-        if "完成" not in txt: fail("完成 not visible in 聊天 after the task finished")
+        if "回复你" not in txt: fail("完成 notice card (「… · 回复你 HH:mm 的消息」) not visible in 聊天 after the task finished")
         if (fake().get("task_posts") or 0) < 1: fail("the task conversation never called the model")
     step("task", task)
 
