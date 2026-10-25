@@ -7321,6 +7321,12 @@ def b310(res):
         if not alive(): crashed.append(f"i310 {name}"); recover(f"i310 {name}")
     def launch():
         sh(f"am start -n {PKG}/com.openminis.app.MainActivity"); time.sleep(6); dismiss_dialogs()
+    def to_bottom():
+        # rows written into 聊天 by a hook (not typed) while the list sits above them show 「回到底部」: go down before the shot
+        for i in range(2):
+            r = dump(); p = find(r, "回到底部")
+            if not p: break
+            sh(f"input tap {p[0]} {p[1]}"); time.sleep(1.5)
 
     o["brain_health"] = brain("GET", "/v1/health")
     if not o["brain_health"].get("ok"): fail(f"mines-brain not running on the runner: {o['brain_health']}"); return
@@ -7358,12 +7364,12 @@ def b310(res):
         s = wait_c(lambda s: str((s.get("task") or {}).get("cloud", "")).startswith("ct"), 60); o["state_submit"] = s
         t = s.get("task") or {}
         if not str(t.get("cloud", "")).startswith("ct"): fail(f"task did not go to the cloud: {s} / {hstate().get('tasks')}"); return
-        time.sleep(2); shot("chat-cloud-running")
+        time.sleep(2); to_bottom(); shot("chat-cloud-running")
         s = wait_c(lambda s: (s.get("task") or {}).get("st") == "waiting", 90); o["state_wait"] = s
         t = s.get("task") or {}
         if t.get("st") != "waiting": fail(f"cloud ask did not reach the phone as 等你处理: {t}"); return
         if "邮箱" not in t.get("line", ""): fail(f"等你 line is not the cloud question: {t.get('line')}")
-        time.sleep(3); r = shot("chat-cloud-waiting"); txt = _txt(r)
+        time.sleep(3); to_bottom(); r = shot("chat-cloud-waiting"); txt = _txt(r)
         if "云端" not in txt: fail("chip / notice in 聊天 does not say 云端")
         o["cloud_id"] = t.get("cloud")
     step("cloud_task", cloud_task)
@@ -7390,7 +7396,7 @@ def b310(res):
         if not any("邮箱" in x for x in rows): fail("the cloud question is missing from the task conversation (events lost?)")
         hs = hstate()
         if not any(x.get("tag", "").startswith("DONE") for x in (hs.get("rows") or [])): fail("no 完成 notice in 聊天 after catch-up")
-        time.sleep(3); shot("chat-cloud-done")
+        time.sleep(3); to_bottom(); shot("chat-cloud-done")
         result_json("group", "c310 open", timeout=20); time.sleep(4)
         r = shot("task-cloud-rows"); o["task_rows_txt"] = _txt(r)[:400]
         if "☁" not in _txt(r): fail("task conversation shows no ☁ cloud progress rows")
@@ -7405,7 +7411,7 @@ def b310(res):
         s = wait_c(lambda s: (s.get("task") or {}).get("st") == "waiting", 90); o["state_approve"] = s
         t = s.get("task") or {}
         if t.get("st") != "waiting" or "同意" not in t.get("line", ""): fail(f"限制层 send did not wait for 同意: {t}"); return
-        time.sleep(2); shot("chat-cloud-approve")
+        time.sleep(2); to_bottom(); shot("chat-cloud-approve")
         r = result_json("group", "c310 reply 同意", timeout=40); o["approve_reply"] = r
         s = wait_c(lambda s: (s.get("task") or {}).get("st") == "done", 90); o["state_approved"] = s
         if (s.get("task") or {}).get("st") != "done": fail(f"approved send did not finish: {s.get('task')}")
