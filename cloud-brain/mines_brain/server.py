@@ -55,7 +55,7 @@ class Brain:
     def providers(self):
         ps = self.db.kv_get("providers", [])
         env = os.environ.get("MB_PROVIDERS_FILE")
-        if not ps and env and os.path.exists(env):
+        if env and os.path.exists(env) and (not ps or os.environ.get("MB_PROVIDERS_LOCK") == "1"):   # LOCK: emulator smoke only
             try:
                 ps = json.load(open(env))
             except Exception:

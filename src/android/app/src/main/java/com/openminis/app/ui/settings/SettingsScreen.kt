@@ -414,6 +414,8 @@ fun SettingsScreen(
             SettingsSection(title = "实验功能") {
                 com.openminis.app.ui.plus.ChatHomeFlagRow()   // [Mines-38.9.14 chat_home]
                 com.openminis.app.ui.plus.PlusDivider()
+                com.openminis.app.ui.plus.CloudBrainFlagRow()   // [Mines-38.10 cloud_brain]
+                com.openminis.app.ui.plus.PlusDivider()
                 com.openminis.app.ui.plus.VpsPageFlagRow()
                 com.openminis.app.ui.plus.PlusDivider()
                 com.openminis.app.ui.plus.TaskProjectsFlagRow()

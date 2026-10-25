@@ -97,6 +97,8 @@ object ChatHomeCore {
         val createdAt: Long = 0L, val updatedAt: Long = 0L,
         /** the state whose notice was already posted into 聊天 ("" = none yet) */
         val told: String = "",
+        /** [Mines-38.10 cloud_brain] the mines-brain task id when this task runs 「在云端」 ("" = on the phone) */
+        val cloud: String = "",
     )
 
     /** a task the gate let start */
@@ -170,7 +172,7 @@ object ChatHomeCore {
     }
 
     fun chip(t: AutoTask): Chip = Chip(
-        t.name, t.st.label,
+        t.name, if (t.cloud.isNotEmpty() && t.st != St.DONE) t.st.label + " · 云端" else t.st.label,
         if (t.total > 0 && t.st != St.QUEUED) "${t.step.coerceAtMost(t.total)}/${t.total}" else "",
         when (t.st) { St.WAITING -> Tone.WAIT; St.RUNNING -> Tone.RUN; St.ERROR -> Tone.ERR; St.DONE -> Tone.DONE; St.QUEUED -> Tone.IDLE },
     )
@@ -214,7 +216,7 @@ object ChatHomeCore {
     fun toJson(l: List<AutoTask>): String = JSONArray().apply {
         l.forEach { t ->
             put(JSONObject().put("id", t.id).put("sid", t.sid).put("n", t.name).put("g", t.goal).put("st", t.st.id).put("s", t.step)
-                .put("t", t.total).put("l", t.line).put("c", t.createdAt).put("u", t.updatedAt).put("told", t.told))
+                .put("t", t.total).put("l", t.line).put("c", t.createdAt).put("u", t.updatedAt).put("told", t.told).put("cl", t.cloud))
         }
     }.toString()
 
@@ -223,7 +225,7 @@ object ChatHomeCore {
         (0 until a.length()).map { i ->
             val o = a.getJSONObject(i)
             AutoTask(o.optString("id"), o.optString("sid"), o.optString("n"), o.optString("g"), St.of(o.optString("st")),
-                o.optInt("s"), o.optInt("t"), o.optString("l"), o.optLong("c"), o.optLong("u"), o.optString("told"))
+                o.optInt("s"), o.optInt("t"), o.optString("l"), o.optLong("c"), o.optLong("u"), o.optString("told"), o.optString("cl"))
         }
     }.getOrDefault(emptyList())
 }

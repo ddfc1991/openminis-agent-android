@@ -45,7 +45,13 @@ class H(BaseHTTPRequestHandler):
             time.sleep(3)
         msgs = body.get("messages", [])
         goal = next((m["content"] for m in msgs if m["role"] == "user"), "")
-        script = json.loads(goal.split("SCRIPT:", 1)[1]) if "SCRIPT:" in goal else [{"say": "OK"}]
+        if "SCRIPT:" in goal:
+            script = json.loads(goal.split("SCRIPT:", 1)[1])
+        else:   # emulator smoke: a plain request → one shell step, an ask for a registration, then finish
+            script = [{"say": "先在云端看一下", "tool": "shell", "args": {"command": "echo cloud-ok"}}]
+            if "注册" in goal:
+                script.append({"say": "需要你确认邮箱", "tool": "ask_user", "args": {"question": "用哪个邮箱注册？"}})
+            script.append({"tool": "finish", "args": {"result": "云端已完成：" + goal.strip()[:20]}})
         turn = sum(1 for m in msgs if m["role"] == "assistant")
         step = script[turn] if turn < len(script) else {"say": "脚本结束"}
         msg = {"role": "assistant", "content": step.get("say", f"第 {turn + 1} 步")}

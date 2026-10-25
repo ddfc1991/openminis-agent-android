@@ -64,10 +64,15 @@ object ChatHome {
             _on.value = p.getBoolean("on", true)
             mainSid = p.getString("main", "").orEmpty()
             // a run cut by a restart is queued again (its conversation keeps what it did)
-            _tasks.value = ChatHomeCore.fromJson(p.getString("tasks", "[]")).map { if (it.st == St.RUNNING) it.copy(st = St.QUEUED) else it }
+            // [Mines-38.10 cloud_brain] a cloud task keeps running on the server: it is followed again, never re-run here
+            _tasks.value = ChatHomeCore.fromJson(p.getString("tasks", "[]")).map { if (it.st == St.RUNNING && it.cloud.isEmpty()) it.copy(st = St.QUEUED) else it }
             app = c.applicationContext
         }
         observe(); pump()
+        runCatching { CloudBrain.init(c) }
+        // a submit cut by a restart: submit again (the brain dedupes on client_ref, so never twice)
+        _tasks.value.filter { it.cloud == "…" }.forEach { t -> scope.launch { CloudBrain.probe(); toCloud(t) } }
+        if (_tasks.value.any { it.cloud.isNotEmpty() && it.st != St.DONE && it.st != St.ERROR }) runCatching { CloudBrainJob.schedule(c) }
     }
 
     private fun prefs() = app?.getSharedPreferences(FILE, Context.MODE_PRIVATE)
@@ -101,6 +106,8 @@ object ChatHome {
      * or turned into a background task. Attachments, slash commands and every other conversation go the old way.
      */
     fun intercept(sid: String, text: String, hasAttachments: Boolean, send: (String) -> Unit): Boolean {
+        // [Mines-38.10 cloud_brain] typing inside a cloud task's conversation talks to the cloud run (answer / 同意 / 拒绝 / 取消)
+        taskOf(sid)?.takeIf { it.cloud.isNotEmpty() && it.cloud != "…" && !hasAttachments && text.isNotBlank() }?.let { t -> cloudReply(t, text); return true }
         if (!isMain(sid) || hasAttachments || text.isBlank() || text.trimStart().startsWith("/")) return false
         if (ChatHomeCore.obviousQuick(text)) { lastDecision = ChatHomeCore.Decision(ChatHomeCore.Route.QUICK); return false }
         _routing.value = text
@@ -140,6 +147,51 @@ object ChatHome {
         return null
     }
 
+    // ── [Mines-38.10 cloud_brain] ──
+
+    /** a cloud event changed this task (CloudBrain's pump): save, notice in 聊天 + notification as for phone tasks */
+    fun applyCloud(id: String, f: (AutoTask) -> AutoTask) {
+        update(id, f)
+        postNotices()
+    }
+
+    private fun cloudReply(t: AutoTask, text: String) {
+        scope.launch {
+            val c = app as? com.openminis.app.MinisApp ?: return@launch
+            withContext(Dispatchers.IO) {
+                c.chatRepository.appendMessage(t.sid, "user", JSONArray().put(JSONObject().put("type", "text").put("value", text)).toString())
+            }
+            withContext(Dispatchers.Main) { com.openminis.app.ui.chat.ChatViewModelStore.existing(t.sid)?.minesReload() }
+            val ok = CloudBrain.reply(t.cloud, text, t.st == St.WAITING && t.line.contains("同意"))
+            if (!ok) withContext(Dispatchers.IO) {
+                c.chatRepository.appendMessage(t.sid, "assistant", JSONArray().put(JSONObject().put("type", "text")
+                    .put("value", "☁ 这条没送到云端（连不上服务器），网络好了再发一次")).toString())
+            }
+            withContext(Dispatchers.Main) { com.openminis.app.ui.chat.ChatViewModelStore.existing(t.sid)?.minesReload() }
+        }
+    }
+
+    /** submit to the cloud; on failure the task falls back to the phone (cloud cleared → the normal pump) */
+    private suspend fun toCloud(t: AutoTask) {
+        val id = runCatching { CloudBrain.submit(t) }.getOrNull()
+        if (id != null) {
+            update(t.id) { it.copy(cloud = id, st = St.RUNNING, updatedAt = System.currentTimeMillis()) }
+            app?.let { runCatching { CloudBrainJob.schedule(it) } }
+            CloudBrain.pump()
+        } else {
+            update(t.id) { it.copy(cloud = "") }
+            runCatching { appendToTask(t.sid, "☁ 云端暂时连不上，这个任务改在手机上运行") }
+        }
+        pump()
+    }
+
+    private suspend fun appendToTask(sid: String, text: String) {
+        val c = app as? com.openminis.app.MinisApp ?: return
+        withContext(Dispatchers.IO) {
+            c.chatRepository.appendMessage(sid, "assistant", JSONArray().put(JSONObject().put("type", "text").put("value", text)).toString())
+        }
+    }
+
     // ── tasks ──
 
     private suspend fun startTask(text: String, name0: String) {
@@ -161,11 +213,14 @@ object ChatHome {
             }
         }
         if (name != name0) runCatching { a.chatRepository.dao.updateSessionTitle(s.id, name, now) }
-        val t = AutoTask("t$now", s.id, name, text.trim(), St.QUEUED, createdAt = now, updatedAt = now)
+        // [Mines-38.10 cloud_brain] 云端执行 on + brain reachable + not a phone-only job → it runs on the server ("…" = submitting)
+        val cloud = CloudBrain.ready() && !CloudBrainCore.phoneOnly(text)
+        val t = AutoTask("t$now", s.id, name, text.trim(), St.QUEUED, createdAt = now, updatedAt = now, cloud = if (cloud) "…" else "")
         synchronized(this) { _tasks.value = _tasks.value + t }
         save()
-        appendToMain(listOf("user" to text, "assistant" to ChatHomeCore.tagText(t.id, ChatHomeCore.Kind.CREATED, ChatHomeCore.createdLine(name))))
-        pump()
+        val line = if (cloud) "已创建任务：$name。在云端运行，手机黑屏、断网或退出都不影响，完成或需要你处理时会在这里告诉你。" else ChatHomeCore.createdLine(name)
+        appendToMain(listOf("user" to text, "assistant" to ChatHomeCore.tagText(t.id, ChatHomeCore.Kind.CREATED, line)))
+        if (cloud) { runCatching { appendToTask(s.id, text) }; toCloud(t) } else pump()
     }
 
     private fun heapCritical(): Boolean {
@@ -179,7 +234,7 @@ object ChatHome {
         scope.launch {
             pumpLock.withLock {
                 while (true) {
-                    val next = ChatHomeCore.nextQueued(_tasks.value) ?: break
+                    val next = ChatHomeCore.nextQueued(_tasks.value.filter { it.cloud.isEmpty() }) ?: break
                     val autoRunning = _tasks.value.count { it.id in inRunner }
                     val all = com.openminis.app.service.SessionConcurrencyManager.runningSessions.value.size
                     if (!ChatHomeCore.canStart(autoRunning, all, com.openminis.app.service.SessionConcurrencyManager.MAX_CONCURRENT, heapCritical())) {
@@ -282,10 +337,10 @@ object ChatHome {
     }
 
     /** smoke / 自检: flag, main conversation, tasks, last decision */
-    fun stateJson(): String = JSONObject().put("on", _on.value).put("main", mainSid).put("routing", _routing.value ?: "")
+    fun stateJson(): String = JSONObject().put("on", _on.value).put("cloud", runCatching { JSONObject(CloudBrain.stateJson()) }.getOrNull() ?: JSONObject()).put("main", mainSid).put("routing", _routing.value ?: "")
         .put("last", lastDecision?.let { "${it.route.name}:${it.name}:${if (it.byModel) "model" else "rule"}" } ?: "")
         .put("tasks", JSONArray().apply {
             _tasks.value.forEach { t -> put(JSONObject().put("id", t.id).put("sid", t.sid).put("name", t.name).put("st", t.st.id)
-                .put("step", t.step).put("total", t.total).put("line", t.line).put("told", t.told)) }
+                .put("step", t.step).put("total", t.total).put("line", t.line).put("told", t.told).put("cloud", t.cloud)) }
         }).toString()
 }

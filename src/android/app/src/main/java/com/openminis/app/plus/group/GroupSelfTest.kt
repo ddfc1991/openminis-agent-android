@@ -898,6 +898,38 @@ object GroupSelfTest {
                     else -> "i3914 main | say <text> | state"
                 }
             }
+            // [Mines-38.10 cloud_brain] smoke: 'c310 state' | 'c310 probe' | 'c310 drop' (cut the link as a frozen app would) |
+            // 'c310 reply <text>' (type <text> into the newest cloud task's conversation) | 'c310 open' (open that conversation)
+            "c310" -> {
+                val sub = rest.substringBefore(' ').trim(); val text = rest.substringAfter(' ', "").trim()
+                val B = com.openminis.app.plus.CloudBrain; val H = com.openminis.app.plus.ChatHome
+                H.init(context); B.init(context)
+                val last = H.tasks.value.lastOrNull { it.cloud.isNotEmpty() }
+                when (sub) {
+                    "probe" -> JSONObject().put("ok", B.probe()).put("state", JSONObject(B.stateJson())).toString()
+                    "drop" -> { B.dropLink(); JSONObject().put("dropped", true).toString() }
+                    "reply" -> {
+                        val t = last ?: return@runBlocking JSONObject().put("err", "no cloud task").toString()
+                        val ok = B.reply(t.cloud, text, t.st == com.openminis.app.plus.ChatHomeCore.St.WAITING && t.line.contains("同意"))
+                        JSONObject().put("ok", ok).put("task", t.cloud).toString()
+                    }
+                    "open" -> {
+                        val t = last ?: return@runBlocking JSONObject().put("err", "no cloud task").toString()
+                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) { com.openminis.app.ui.plus.PlusNav.navigate?.invoke(com.openminis.app.ui.navigation.Routes.chat(t.sid)) }
+                        JSONObject().put("sid", t.sid).toString()
+                    }
+                    else -> {
+                        val app = context.applicationContext as com.openminis.app.MinisApp
+                        val rows = JSONArray()
+                        if (last != null) app.chatRepository.dao.loadMessages(last.sid).takeLast(30).forEach { m ->
+                            val t = runCatching { JSONArray(m.partsJson).optJSONObject(0)?.optString("value").orEmpty() }.getOrDefault("")
+                            rows.put(JSONObject().put("role", m.role).put("text", t.take(120)))
+                        }
+                        JSONObject(B.stateJson()).put("task", last?.let { JSONObject().put("id", it.id).put("cloud", it.cloud).put("st", it.st.id).put("line", it.line).put("step", it.step).put("told", it.told) } ?: JSONObject())
+                            .put("rows", rows).toString()
+                    }
+                }
+            }
             "i39113" -> {
                 val sub = rest.substringBefore(' ').trim(); val arg2 = rest.substringAfter(' ', "").trim()
                 val R = com.openminis.app.plus.ProviderRoutes

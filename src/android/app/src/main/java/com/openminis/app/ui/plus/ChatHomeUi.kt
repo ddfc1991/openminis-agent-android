@@ -20,6 +20,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -294,6 +295,29 @@ fun ChatHomeFlagRow() {
     }
 }
 
+
+/** [Mines-38.10 cloud_brain] 设置 → 实验功能 「云端执行」: on by default; used only while the brain answers */
+@Composable
+fun CloudBrainFlagRow() {
+    val ctx = LocalContext.current
+    com.openminis.app.plus.CloudBrain.init(ctx)
+    val B = com.openminis.app.plus.CloudBrain
+    val on by B.on.collectAsState()
+    val server by B.server.collectAsState()
+    val err by B.err.collectAsState()
+    val models by B.models.collectAsState()
+    val m = mines()
+    val line = com.openminis.app.plus.CloudBrainCore.statusLine(on, server, models, err)
+    LaunchedEffect(on) { if (on && server == null) B.probe() }
+    Row(Modifier.fillMaxWidth().heightIn(min = 60.dp).clickable { B.setOn(ctx, !on) }.padding(horizontal = 16.dp, vertical = 10.dp)
+        .semantics { contentDescription = "云端执行，" + (if (on) "已打开" else "已关闭") + "，" + line }, verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text("云端执行", fontSize = MT.Body, lineHeight = MT.BodyLH, fontWeight = FontWeight.Medium, color = m.ink)
+            Text(line, fontSize = MT.Caption, lineHeight = MT.CaptionLH, color = m.ink2, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        }
+        MinesSwitch(on, "云端执行") { B.setOn(ctx, it) }
+    }
+}
 
 /** [Mines-38.9.14.1] what the dock blurs: the NavHost content, recorded each frame into one GraphicsLayer (Haze-style). */
 object DockBlur {
