@@ -905,7 +905,7 @@ fun ChatSplitScaffoldRoute(
                 mcpRepository = mcpRepository,
                 // Back inside the pair is the pane navigator's job (it knows
                 // whether that means "hide the detail" or "pop to the list").
-                onBack = if (chatHomeBack) ({ navController.safePopBackStack() }) else onBackInPane,
+                onBack = if (chatHomeBack) ({ navController.safePopBackStack(); Unit }) else onBackInPane,
                 // [T-android-tablet-split] Suppress the detail pane's back
                 // arrow while the list is beside it. shouldUseTwoPane() is the
                 // same window-size predicate the scaffold itself uses, so the
