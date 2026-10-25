@@ -219,7 +219,7 @@ object ChatHomeCore {
      * 完成 only), with the older ones as its expandable history and 「已重试 N 次」 = earlier failed attempts. The 已建任务
      * chip is kept once per root (the first); later chips of the same root are folded (a retry / auto-resume adds no new card).
      */
-    fun foldNotices(rows: List<NoticeRef>, keyOf: (String) -> String): Map<String, Fold> {
+    fun foldNotices(rows: List<NoticeRef>, keyOf: (String) -> String, oneRow: Boolean = false): Map<String, Fold> {
         val out = HashMap<String, Fold>()
         val byKey = LinkedHashMap<String, MutableList<NoticeRef>>()
         val chipSeen = HashSet<String>()
@@ -234,6 +234,8 @@ object ChatHomeCore {
             hist.forEach { out[it.id] = Fold(show = false) }
             out[last.id] = Fold(show = true, history = hist, retries = hist.count { it.kind == Kind.ERROR })
         }
+        // [38.9.14.3] ONE row per task: once a task has a state row (等你 / 出错 / 完成), its 已建任务 row folds into it
+        if (oneRow) for (r in rows) if (r.kind == Kind.CREATED && byKey.containsKey(keyOf(r.taskId))) out[r.id] = Fold(show = false)
         return out
     }
 

@@ -39,6 +39,13 @@ object ChatHome {
     val routing: StateFlow<String?> = _routing.asStateFlow()
     @Volatile var mainSid: String = ""
         private set
+    /** [38.9.14.3] each task's record (state changes with time + line), kept beside the tasks */
+    private val _logs = MutableStateFlow<Map<String, List<TaskRecordCore.Ev>>>(emptyMap())
+    val logs: StateFlow<Map<String, List<TaskRecordCore.Ev>>> = _logs.asStateFlow()
+    /** the last state each task was recorded at (diffed on every save) */
+    private val seen = HashMap<String, AutoTask>()
+    /** [38.9.14.3] task id → its own conversation (「打开」) + when that conversation last got the record */
+    private val talks = HashMap<String, Pair<String, Long>>()
     /** launch opened 聊天 once in this process (back / 历史 then show the old list without bouncing) */
     @Volatile var redirected = false
     /** [38.9.14.2] a crash / hang breaker tripped on this launch: 聊天主页 安全模式 (queued tasks wait [SAFE_DELAY_MS]) */
@@ -69,6 +76,9 @@ object ChatHome {
             mainSid = p.getString("main", "").orEmpty()
             // a run cut by a restart is queued again (its conversation keeps what it did)
             _tasks.value = ChatHomeCore.fromJson(p.getString("tasks", "[]")).map { if (it.st == St.RUNNING) it.copy(st = St.QUEUED) else it }
+            _logs.value = TaskRecordCore.logOf(p.getString("logs", "{}"))
+            _tasks.value.forEach { seen[it.id] = it }
+            runCatching { val o = JSONObject(p.getString("talks", "{}") ?: "{}"); o.keys().forEach { k -> o.optJSONObject(k)?.let { talks[k] = it.optString("s") to it.optLong("t") } } }
             app = c.applicationContext
             initAt = android.os.SystemClock.uptimeMillis()
         }
@@ -76,11 +86,79 @@ object ChatHome {
     }
 
     private fun prefs() = app?.getSharedPreferences(FILE, Context.MODE_PRIVATE)
-    private fun save() { prefs()?.edit()?.putString("tasks", ChatHomeCore.toJson(_tasks.value.takeLast(200)))?.apply() }
+    private fun save() {
+        recordChanges()
+        prefs()?.edit()?.putString("tasks", ChatHomeCore.toJson(_tasks.value.takeLast(200)))?.putString("logs", TaskRecordCore.logJson(_logs.value))?.apply()
+    }
+
+    /** [38.9.14.3] every state change becomes a record line (建立 / 开始 / 等你 / 出错 / 重新开始 / 完成) */
+    private fun recordChanges() = synchronized(seen) {
+        val now = System.currentTimeMillis()
+        val keep = _tasks.value.takeLast(200)
+        var m = _logs.value
+        for (t in keep) {
+            val e = TaskRecordCore.diff(seen[t.id], t, now)
+            if (e != null) m = m + (t.id to TaskRecordCore.append(m[t.id].orEmpty(), e))
+            seen[t.id] = t
+        }
+        val ids = keep.map { it.id }.toSet()
+        _logs.value = m.filterKeys { it in ids }
+    }
+
+    private fun saveTalks() {
+        val o = JSONObject(); synchronized(talks) { talks.forEach { (k, v) -> o.put(k, JSONObject().put("s", v.first).put("t", v.second)) } }
+        prefs()?.edit()?.putString("talks", o.toString())?.apply()
+    }
+
+    private fun fmt(at: Long): String = if (at <= 0) "—" else java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.CHINA).format(java.util.Date(at))
+
+    /**
+     * [38.9.14.3] the task's own NEW conversation (user 2026-10-26 06:38 「我点进去它应该是以这个对话开的新的对话页」): made once,
+     * row 1 = the message the task came from, row 2 = its full record (state, result / error, steps, retries, timeline).
+     * Opened again later it gets one 「任务更新」 row with what happened since. Null when the task or a model is missing.
+     */
+    suspend fun openTalk(c: Context, id: String, foldRetries: Int = 0): String? = withContext(Dispatchers.IO) {
+        init(c)
+        val t = task(id) ?: return@withContext null
+        val a = c.applicationContext as? com.openminis.app.MinisApp ?: return@withContext null
+        val now = System.currentTimeMillis()
+        val log = _logs.value[id].orEmpty()
+        val ex = synchronized(talks) { talks[id] }
+        if (ex != null && runCatching { a.chatRepository.getSession(ex.first) }.getOrNull() != null) {
+            TaskRecordCore.update(log, ex.second, ::fmt)?.let { appendTo(ex.first, listOf("assistant" to it)) }
+            synchronized(talks) { talks[id] = ex.first to now }; saveTalks()
+            return@withContext ex.first
+        }
+        val main = runCatching { a.chatRepository.getSession(mainSid) }.getOrNull()
+        val run = if (t.sid.isNotBlank()) runCatching { a.chatRepository.getSession(t.sid) }.getOrNull() else null
+        val model = main?.modelId ?: run?.modelId
+            ?: a.providerRepository.allVisibleEntries().firstOrNull { ErrZhCore.chatCapable(it.baseModel.id) }?.baseModel?.id ?: "unknown"
+        val s = a.chatRepository.createSession(modelId = model, title = t.name + " · 任务对话")
+        runCatching { a.chatRepository.dao.updateSource(s.id, "tasktalk") }
+        val bind = main?.modelBinding
+        if (main != null && !bind.isNullOrBlank()) runCatching { a.chatRepository.updateSessionBinding(s.id, bind, main.modelId) }
+        else runCatching { com.openminis.app.debug.HeadlessChatRunner.applyModelOverride(c, s.id, null, null) }
+        val steps = TaskProgress.get(t.sid)?.steps.orEmpty().map { it.title to (it.st == TaskProgressCore.StepSt.DONE) }
+        appendTo(s.id, TaskRecordCore.seed(t, log, steps, TaskRecordCore.retries(log, foldRetries), ::fmt), reload = false)
+        synchronized(talks) { talks[id] = s.id to now }; saveTalks()
+        s.id
+    }
+
+    fun openTalkAsync(c: Context, id: String, foldRetries: Int = 0, then: (String) -> Unit) {
+        scope.launch {
+            val sid = runCatching { openTalk(c, id, foldRetries) }.getOrNull()
+            if (sid != null) withContext(Dispatchers.Main) { then(sid) }
+        }
+    }
+
+    /** smoke / 自检: the task's own conversation, if made */
+    fun talkOf(id: String): String? = synchronized(talks) { talks[id]?.first }
     fun setOn(c: Context, v: Boolean) { init(c); _on.value = v; prefs()?.edit()?.putBoolean("on", v)?.apply() }
 
     /** [38.9.14.1] smoke only: put a finished task in the list (its notices are written by the caller) */
     fun seedForTest(t: AutoTask) { _tasks.value = _tasks.value.filter { it.id != t.id } + t; save() }
+    /** [38.9.14.3] smoke only: give a seeded task a record (the 出错 → 等你 → 出错 → 完成 of the user's screenshot) */
+    fun seedLogForTest(id: String, evs: List<TaskRecordCore.Ev>) { _logs.value = _logs.value + (id to evs); save() }
 
     private fun update(id: String, f: (AutoTask) -> AutoTask) {
         synchronized(this) { _tasks.value = _tasks.value.map { if (it.id == id) f(it) else it } }
@@ -271,14 +349,18 @@ object ChatHome {
 
     /** rows written straight into the main conversation (no model turn), then the open chat reloads */
     suspend fun appendToMain(rows: List<Pair<String, String>>) {
+        appendTo(mainSid.ifBlank { return }, rows)
+    }
+
+    /** rows written straight into conversation [sid] (no model turn) */
+    suspend fun appendTo(sid: String, rows: List<Pair<String, String>>, reload: Boolean = true) {
         val c = app as? com.openminis.app.MinisApp ?: return
-        val sid = mainSid.ifBlank { return }
         withContext(Dispatchers.IO) {
             rows.forEach { (role, text) ->
                 c.chatRepository.appendMessage(sid, role, JSONArray().put(JSONObject().put("type", "text").put("value", text)).toString())
             }
         }
-        withContext(Dispatchers.Main) { com.openminis.app.ui.chat.ChatViewModelStore.existing(sid)?.minesReload() }
+        if (reload) withContext(Dispatchers.Main) { com.openminis.app.ui.chat.ChatViewModelStore.existing(sid)?.minesReload() }
     }
 
     private fun notify(t: AutoTask, body: String) {
@@ -307,6 +389,7 @@ object ChatHome {
         .put("last", lastDecision?.let { "${it.route.name}:${it.name}:${if (it.byModel) "model" else "rule"}" } ?: "")
         .put("tasks", JSONArray().apply {
             _tasks.value.forEach { t -> put(JSONObject().put("id", t.id).put("sid", t.sid).put("name", t.name).put("st", t.st.id)
-                .put("step", t.step).put("total", t.total).put("line", t.line).put("told", t.told)) }
+                .put("step", t.step).put("total", t.total).put("line", t.line).put("told", t.told)
+                .put("log", _logs.value[t.id].orEmpty().size).put("talk", talkOf(t.id) ?: "")) }
         }).toString()
 }

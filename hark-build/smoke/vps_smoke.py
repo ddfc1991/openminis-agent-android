@@ -7453,11 +7453,13 @@ def b3914(res):
     step("task", task)
 
     def open_chip():
-        r = dump(); p = find(r, "Zeabur 注册，完成") or find(r, "Zeabur 注册 ·")
-        if not p: fail("chip not found to tap"); return
+        # [38.9.14.3] the row's chevron opens the task's OWN new conversation (original message + record); tapping the row folds
+        r = dump(); p = find(r, "打开任务对话 Zeabur 注册")
+        if not p: fail("chevron 「打开任务对话 Zeabur 注册」 not found to tap"); return
         sh(f"input tap {p[0]} {p[1]}"); time.sleep(4)
         r = shot("task-page"); t = _txt(r); o["task_page"] = t[:400]
-        if "帮我注册 zeabur" not in t: fail("tapping the chip did not open the task conversation")
+        if "帮我注册 zeabur" not in t: fail("the chevron did not open a conversation that starts with the original message")
+        if "任务记录" not in alltxt(r): fail("the task's own conversation has no 任务记录 row")
         back(1); time.sleep(2)
         r = dump()
         if r is None or "Zeabur 注册" not in alltxt(r): fail("back from the task conversation did not return to 聊天")
@@ -7564,10 +7566,12 @@ def b3914(res):
         o["netdrop_drop"] = drops[-1]
         if not drops[-1].get("state"): fail("netdrop: drop logged without the device state (screen / app / net / idle)")
         to_bottom()
+        # [38.9.14.3] a 聊天 row now folds/unfolds on tap; the run itself (where the wait line shows) is opened directly
         r = dump(); p = find(r, "断网测试")
-        opened = bool(p)
-        if p: sh(f"input tap {p[0]} {p[1]}"); time.sleep(2.5)
-        else: fail("netdrop: chip 「已建任务 断网测试」 not found")
+        if not p: fail("netdrop: row 「断网测试」 not found in 聊天")
+        nd = [x for x in (state().get("tasks") or []) if x.get("name") == "断网测试"]
+        opened = bool(nd)
+        if nd: result_json("group", "i3914 open " + nd[-1].get("sid", ""), timeout=20); time.sleep(2.5)
         r = shot("netdrop-wait"); t = _txt(r); o["netdrop_wait_txt"] = t[-300:]
         if "网络断了" not in t:
             # [38.9.14.1 smoke] the emulator's network is up, so the wait is one 2 s back-off (MinesNet "resume waited=0s"); by the
@@ -7624,6 +7628,72 @@ def b3914(res):
         r = shot("fold-open")
         one_bar("fold-open")
     step("fold", fold)
+
+    def taskfold():
+        # [38.9.14.3] user 2026-10-26 06:38: task rows in 聊天 are ONE compact row each, collapsed by default; tap = open/close the
+        # details inline; the chevron / 打开 = the task's own new conversation seeded with the original message + its record;
+        # back returns to 聊天; the 任务 tab row opens the same conversation; the idle tool strip no longer covers the rows.
+        tap_dock("聊天"); time.sleep(1); to_bottom()
+        r = shot("tf-collapsed"); t = _txt(r)
+        rows = [d for _, d, *_ in nodes(r) if (d or "").startswith("账号关联测试，")]
+        o["tf_rows"] = rows
+        if len(rows) != 1: fail(f"taskfold: {len(rows)} rows for the task (want exactly 1)")
+        elif not rows[0].endswith("点按展开"): fail(f"taskfold: row not collapsed by default: {rows[0]}")
+        if "原始请求" in alltxt(r) or "Software caused connection abort" in t: fail("taskfold: details visible while collapsed")
+        p = find(r, rows[0]) if rows else None
+        if not p: return
+        sh(f"input tap {p[0]} {p[1]}"); time.sleep(1.5)
+        r = shot("tf-open"); a = alltxt(r)
+        if "原始请求" not in a or "那么账号关联这里有没有办法解决" not in a: fail("taskfold: tap did not open the details inline (原始请求 missing)")
+        if "已重试" not in a: fail("taskfold: open row has no retry count")
+        if not any((d or "").startswith("账号关联测试，") and (d or "").endswith("点按收起") for _, d, *_ in nodes(r)): fail("taskfold: open row does not say 点按收起")
+        p2 = find(r, "点按收起") or p
+        sh(f"input tap {p2[0]} {p2[1]}"); time.sleep(1.2)
+        r = dump()
+        if "原始请求" in alltxt(r): fail("taskfold: second tap did not fold the row again")
+        # the task's own conversation
+        r = dump(); p = find(r, "打开任务对话 账号关联测试")
+        if not p: fail("taskfold: chevron 「打开任务对话」 not found"); return
+        sh(f"input tap {p[0]} {p[1]}"); time.sleep(4)
+        r = shot("tf-talk"); a = alltxt(r)
+        o["tf_talk_txt"] = a[:500]
+        s = state(); tk = [x for x in (s.get("tasks") or []) if x.get("id") == "fold3914"]
+        talk = tk[0].get("talk") if tk else ""
+        o["tf_talk"] = talk
+        if not talk: fail("taskfold: no conversation recorded for the task")
+        if talk and talk == s.get("main"): fail("taskfold: opened 聊天 itself instead of a new conversation")
+        if "那么账号关联这里有没有办法解决" not in a: fail("taskfold: the new conversation does not start with the original message")
+        if "任务记录" not in a: fail("taskfold: the new conversation has no 任务记录")
+        if talk:
+            rr = result_json("group", "i3914 rows " + talk, timeout=20) or {}
+            rows2 = rr.get("rows") or [] if isinstance(rr, dict) else []
+            o["tf_talk_rows"] = [(x.get("role"), (x.get("text") or "")[:80]) for x in rows2[:3]]
+            if not rows2 or rows2[0].get("role") != "user" or "那么账号关联" not in rows2[0].get("text", ""): fail(f"taskfold: first row is not the user's original message {o['tf_talk_rows']}")
+            if len(rows2) < 2 or "时间线" not in rows2[1].get("text", "") or "已重试" not in rows2[1].get("text", ""): fail("taskfold: record row lacks 时间线 / 已重试")
+        back(1); time.sleep(2)
+        r = one_bar("tf-back")
+        if "账号关联测试" not in alltxt(r): fail("taskfold: back did not return to 聊天")
+        # 任务 tab → the same conversation
+        if tap_dock("任务"):
+            r = dump(); p = find(r, "账号关联测试")
+            for _ in range(3):
+                if p: break
+                scroll_down(); r = dump(); p = find(r, "账号关联测试")
+            if p:
+                sh(f"input tap {p[0]} {p[1]}"); time.sleep(4)
+                r = shot("tf-tasks-open"); a = alltxt(r)
+                if "任务记录" not in a: fail("taskfold: 任务 tab row did not open the task's own conversation")
+                tk2 = [x for x in (state().get("tasks") or []) if x.get("id") == "fold3914"]
+                if tk2 and talk and tk2[0].get("talk") != talk: fail("taskfold: 任务 tab made a second conversation for the same task")
+                back(1); time.sleep(2)
+            else: fail("taskfold: task not listed on 任务")
+            tap_dock("聊天"); time.sleep(1.5)
+        # the idle tool strip (「读今日记忆日志 16/16」 + file tile) must not sit on the rows
+        rr = result_json("group", "i3914 rows " + (state().get("main") or ""), timeout=20) or {}
+        o["tf_bar_idle"] = rr.get("barIdle") if isinstance(rr, dict) else None
+        if isinstance(rr, dict) and rr.get("barIdle") is not True: fail(f"taskfold: floating tool bar not idle-hidden on 聊天 ({rr.get('barIdle')})")
+        shot("tf-final")
+    step("taskfold", taskfold)
 
     def nocall():
         # [38.9.14.1] the 来电 (MinesCallActivity) feature is removed: no 提醒/来电 rows on 应用, no activity in the manifest, no crash

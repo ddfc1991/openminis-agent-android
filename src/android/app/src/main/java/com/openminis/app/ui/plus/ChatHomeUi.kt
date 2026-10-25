@@ -83,45 +83,89 @@ private fun hm(at: Long): String = if (at <= 0) "" else java.text.SimpleDateForm
 
 // ───────────────────────────── 聊天: chip + notices ─────────────────────────────
 
-/** one task row written into 聊天: CREATED = chip + 「已创建任务」 line; 等你 / 出错 / 完成 = a card naming the task */
+/** [38.9.14.3] which task rows in 聊天 are open (collapsed by default; kept while the list scrolls) */
+object TaskFoldState {
+    val open = androidx.compose.runtime.mutableStateMapOf<String, Boolean>()
+}
+
+private fun mdhm(at: Long): String = if (at <= 0) "—" else java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.CHINA).format(java.util.Date(at))
+
+/** open the task's own conversation (made once, seeded with the original message + the task's record) */
+fun openTaskTalk(ctx: android.content.Context, taskId: String, retries: Int = 0) {
+    ChatHome.openTalkAsync(ctx, taskId, retries) { sid -> PlusNav.go(TaskRoutes.chat(sid)) }
+}
+
+/**
+ * One task row in 聊天. [Mines-38.9.14.3] user 2026-10-26 06:38 「首页的对话任务，我希望应该是折叠的，点击可以打开查看」:
+ * ONE compact row per task (title · state · time), collapsed by default; tapping the row opens / closes its details inline
+ * (original request, now / result / error, progress + retries, times, the last record lines); 「打开」 or the chevron opens
+ * the task's own NEW conversation, seeded with the message it came from and its full record (back returns to 聊天).
+ */
 @Composable
 fun MinesTaskNotice(tag: ChatHomeCore.Tag, fold: ChatHomeCore.Fold? = null) {
     if (fold?.show == false) return   // [38.9.14.1] folded into this task's newest card
     val m = mines()
+    val ctx = LocalContext.current
     val tasks by ChatHome.tasks.collectAsState()
+    val logs by ChatHome.logs.collectAsState()
     val t = tasks.firstOrNull { it.id == tag.taskId }
-    val open: () -> Unit = { t?.let { PlusNav.go(TaskRoutes.chat(it.sid)) } }
-    // [Mines-38.9.14.2] user 2026-10-25 20:16 「首页这样多少有点乱」: every task notice (已建 / 等你 / 出错 / 完成) is ONE small
-    // chip line 「Zeabur 注册 · 完成 ›」 that opens the task; the body text and the retry history live in the task itself.
-    // 已建: the task's live state while it runs; once it has finished / stopped, the later notice chip carries the state.
     val name = t?.name ?: "任务"
     val (state, tone) = when (tag.kind) {
         ChatHomeCore.Kind.CREATED -> {
             val chip = t?.let { ChatHomeCore.chip(it) }
             val live = t != null && (t.st == ChatHomeCore.St.RUNNING || t.st == ChatHomeCore.St.QUEUED)
             if (live && chip != null) (chip.state + (if (chip.progress.isNotEmpty()) " " + chip.progress else "")) to chip.tone
-            else "已建任务" to ChatHomeCore.Tone.IDLE
+            else (t?.let { com.openminis.app.plus.TaskRecordCore.stateWord(it) } ?: "已建任务") to (t?.let { ChatHomeCore.chip(it).tone } ?: ChatHomeCore.Tone.IDLE)
         }
-        ChatHomeCore.Kind.ASK -> "等你处理" to ChatHomeCore.Tone.WAIT
+        ChatHomeCore.Kind.ASK -> "等你" to ChatHomeCore.Tone.WAIT
         ChatHomeCore.Kind.ERROR -> "出错" to ChatHomeCore.Tone.ERR
         ChatHomeCore.Kind.DONE -> "完成" to ChatHomeCore.Tone.DONE
     }
     val c = toneColor(tone)
-    val retry = fold?.retryLine.orEmpty()
-    val a11y = (if (tag.kind == ChatHomeCore.Kind.CREATED) "已建任务 " else "") + "$name，$state" +
-        (if (tag.body.isNotBlank() && tag.kind != ChatHomeCore.Kind.CREATED) "：" + tag.body.trimEnd('。') else "") +
-        (if (retry.isNotEmpty()) "，$retry" else "") + "。点按打开任务"
-    Row(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
-        Row(Modifier.widthIn(max = 300.dp).clip(RoundedCornerShape(50)).background(minesGlassFill()).border(1.dp, m.glassBorder, RoundedCornerShape(50))
-            .clickable(enabled = t != null, onClick = open).heightIn(min = 34.dp).padding(horizontal = 12.dp)
-            .semantics(mergeDescendants = true) { contentDescription = a11y; role = Role.Button },
-            verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(7.dp).clip(CircleShape).background(c))
-            Spacer(Modifier.width(8.dp))
-            Text("$name · ", fontSize = MT.Caption, fontWeight = FontWeight.Medium, color = m.ink,
-                maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
-            Text(state, fontSize = MT.Caption, fontWeight = FontWeight.SemiBold, color = c, maxLines = 1, softWrap = false)
-            MinesIcon(icH("chevron-right"), null, tint = m.ink2, modifier = Modifier.padding(start = 2.dp).size(14.dp))
+    val log = logs[tag.taskId].orEmpty()
+    val retries = com.openminis.app.plus.TaskRecordCore.retries(log, fold?.retries ?: 0)
+    val key = tag.taskId + ":" + tag.kind.name
+    val open = TaskFoldState.open[key] == true
+    val time = hm(t?.let { it.updatedAt.coerceAtLeast(it.createdAt) } ?: 0L)
+    val a11y = (if (tag.kind == ChatHomeCore.Kind.CREATED) "已建任务 " else "") + "$name，$state" + (if (time.isNotEmpty()) "，$time" else "") +
+        (if (retries > 0) "，已重试 $retries 次" else "") + if (open) "。点按收起" else "。点按展开"
+    val shape = RoundedCornerShape(if (open) 18.dp else 50.dp)
+    Column(Modifier.fillMaxWidth().padding(vertical = 3.dp).clip(shape).background(minesGlassFill()).border(1.dp, m.glassBorder, shape)) {
+        Row(Modifier.fillMaxWidth().heightIn(min = 38.dp).padding(start = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Row(Modifier.weight(1f).heightIn(min = 38.dp).clickable { TaskFoldState.open[key] = !open }
+                .semantics(mergeDescendants = true) { contentDescription = a11y; role = Role.Button }, verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.size(7.dp).clip(CircleShape).background(c))
+                Spacer(Modifier.width(8.dp))
+                Text("$name · ", fontSize = MT.Caption, fontWeight = FontWeight.Medium, color = m.ink,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                Text(state, fontSize = MT.Meta, fontWeight = FontWeight.SemiBold, color = c, maxLines = 1, softWrap = false,
+                    modifier = Modifier.clip(RoundedCornerShape(50)).background(c.copy(alpha = 0.13f)).padding(horizontal = 7.dp, vertical = 1.dp))
+                if (time.isNotEmpty()) Text(time, fontSize = MT.Meta, color = m.ink2, maxLines = 1, softWrap = false, modifier = Modifier.padding(start = 8.dp))
+                Spacer(Modifier.weight(0.01f))
+                MinesIcon(icH(if (open) "chevron-up" else "chevron-down"), null, tint = m.ink3, modifier = Modifier.padding(start = 4.dp).size(14.dp))
+            }
+            Box(Modifier.size(38.dp).clip(CircleShape).clickable(enabled = t != null) { openTaskTalk(ctx, tag.taskId, retries) }
+                .semantics { contentDescription = "打开任务对话 $name"; role = Role.Button }, contentAlignment = Alignment.Center) {
+                MinesIcon(icH("chevron-right"), null, tint = m.ink2, modifier = Modifier.size(16.dp))
+            }
+        }
+        if (open && t != null) {
+            Column(Modifier.fillMaxWidth().padding(start = 14.dp, end = 14.dp, bottom = 10.dp)) {
+                com.openminis.app.plus.TaskRecordCore.details(t, log, retries, ::mdhm).forEach { (k, v) ->
+                    Row(Modifier.fillMaxWidth().padding(top = 4.dp)) {
+                        Text(k, fontSize = MT.Meta, color = m.ink2, modifier = Modifier.width(72.dp), maxLines = 1)
+                        Text(v, fontSize = MT.Meta, color = m.ink, maxLines = 3, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                    }
+                }
+                Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("打开", fontSize = MT.Caption, fontWeight = FontWeight.SemiBold, color = Color.White,
+                        modifier = Modifier.clip(RoundedCornerShape(50)).background(m.primary).clickable { openTaskTalk(ctx, tag.taskId, retries) }
+                            .semantics { contentDescription = "打开 $name 的任务对话"; role = Role.Button }.padding(horizontal = 14.dp, vertical = 6.dp))
+                    if (t.sid.isNotBlank()) Text("执行过程", fontSize = MT.Caption, color = m.ink,
+                        modifier = Modifier.clip(RoundedCornerShape(50)).border(1.dp, m.glassBorder, RoundedCornerShape(50)).clickable { PlusNav.go(TaskRoutes.chat(t.sid)) }
+                            .semantics { contentDescription = "查看 $name 的执行过程"; role = Role.Button }.padding(horizontal = 14.dp, vertical = 6.dp))
+                }
+            }
         }
     }
 }
@@ -254,7 +298,8 @@ private fun TaskGroup(list: List<ChatHomeCore.AutoTask>, go: (String) -> Unit) {
             if (i > 0) WarmDivider(start = 16.dp)
             val chip = ChatHomeCore.chip(t)
             val tone = toneColor(chip.tone)
-            Row(Modifier.fillMaxWidth().clickable { go(TaskRoutes.chat(t.sid)) }.heightIn(min = 60.dp).padding(horizontal = 16.dp, vertical = 10.dp)
+            val ctx = LocalContext.current
+            Row(Modifier.fillMaxWidth().clickable { openTaskTalk(ctx, t.id) }.heightIn(min = 60.dp).padding(horizontal = 16.dp, vertical = 10.dp)
                 .semantics(mergeDescendants = true) { contentDescription = "${t.name}，${chip.state}。${t.line.ifBlank { t.goal }}" },
                 verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.size(8.dp).clip(CircleShape).background(tone))

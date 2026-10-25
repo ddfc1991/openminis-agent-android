@@ -866,6 +866,12 @@ object GroupSelfTest {
             // [Mines-38.9.14 chat_home] smoke: 'i3914 main' = open 聊天 (main conversation); 'i3914 say <text>' = type <text> into it
             // through the normal send (router decides); 'i3914 state' = flag, main sid, tasks, last decision, main rows (role + tag)
             "i3914" -> {
+                fun rowsOf(a: com.openminis.app.MinisApp, sid: String): JSONArray = JSONArray().apply {
+                    kotlinx.coroutines.runBlocking { a.chatRepository.dao.loadMessages(sid) }.takeLast(12).forEach { m ->
+                        val t = runCatching { JSONArray(m.partsJson).optJSONObject(0)?.optString("value").orEmpty() }.getOrDefault("")
+                        put(JSONObject().put("role", m.role).put("text", t.take(400)))
+                    }
+                }
                 val sub = rest.substringBefore(' ').trim(); val text = rest.substringAfter(' ', "").trim()
                 val app = context.applicationContext as com.openminis.app.MinisApp
                 val main = kotlinx.coroutines.Dispatchers.Main
@@ -905,6 +911,13 @@ object GroupSelfTest {
                         for ((k, b) in listOf(com.openminis.app.plus.ChatHomeCore.Kind.ERROR to "没完成：Software caused connection abort", com.openminis.app.plus.ChatHomeCore.Kind.ASK to "Software caused connection abort",
                                 com.openminis.app.plus.ChatHomeCore.Kind.ERROR to "没完成：Software caused connection abort", com.openminis.app.plus.ChatHomeCore.Kind.DONE to "完成 · 6/6 步"))
                             H.appendToMain(listOf("assistant" to com.openminis.app.plus.ChatHomeCore.tagText(t.id, k, b)))
+                        // [38.9.14.3] its record, like a real run would have written it
+                        fun E(a: Long, st: com.openminis.app.plus.ChatHomeCore.St, x: String) = com.openminis.app.plus.TaskRecordCore.Ev(a, st, x)
+                        val Q = com.openminis.app.plus.ChatHomeCore.St.QUEUED; val ER = com.openminis.app.plus.ChatHomeCore.St.ERROR
+                        val W = com.openminis.app.plus.ChatHomeCore.St.WAITING; val RN = com.openminis.app.plus.ChatHomeCore.St.RUNNING; val DN = com.openminis.app.plus.ChatHomeCore.St.DONE
+                        H.seedLogForTest(t.id, listOf(E(now - 60_000, Q, "建立任务：账号关联测试"), E(now - 50_000, ER, "出错：Software caused connection abort"),
+                            E(now - 40_000, W, "等你：Software caused connection abort"), E(now - 30_000, ER, "出错：Software caused connection abort"),
+                            E(now - 20_000, RN, "重新开始"), E(now - 1_000, DN, "完成：完成 · 6/6 步")))
                         JSONObject().put("seeded", t.id).toString()
                     }
                     // [38.9.14.2] trip every crash / hang breaker the way the realme did (hang count 3, crash force-home window,
@@ -928,7 +941,18 @@ object GroupSelfTest {
                         .put("crash", com.openminis.app.crash.CrashFrequencyDetector.shouldForceHomeOnLaunch(context))
                         .put("beacon", com.openminis.app.diagnostics.LaunchCycleBeacon.shouldForceHomeOnLaunch())
                         .put("safeLaunch", H.safeLaunch).toString()
-                    else -> "i3914 main | say <text> | state | foldseed | trip | breakers"
+                    // [38.9.14.3] 'i3914 talk <taskId>' = the task's own conversation (made once) → its rows; 'i3914 open <sid>' = show a
+                    // conversation (e.g. a task's run); 'i3914 rows <sid>' = a conversation's rows
+                    "talk" -> {
+                        val sid = H.openTalk(context, text) ?: return@runBlocking JSONObject().put("err", "no task $text").toString()
+                        JSONObject().put("sid", sid).put("rows", rowsOf(app, sid)).toString()
+                    }
+                    "open" -> {
+                        kotlinx.coroutines.withContext(main) { com.openminis.app.ui.plus.PlusNav.navigate?.invoke(com.openminis.app.ui.navigation.Routes.chat(text)) }
+                        JSONObject().put("sid", text).toString()
+                    }
+                    "rows" -> JSONObject().put("sid", text).put("rows", rowsOf(app, text)).put("barIdle", com.openminis.app.ui.chat.MinesBarProbe.idle).toString()
+                    else -> "i3914 main | say <text> | state | foldseed | trip | breakers | talk <taskId> | open <sid> | rows <sid>"
                 }
             }
             "i39113" -> {

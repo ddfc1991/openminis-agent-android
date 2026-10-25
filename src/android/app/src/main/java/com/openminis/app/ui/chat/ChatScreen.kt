@@ -3692,8 +3692,16 @@ fun ChatScreen(
                 // was not part of the report; keep its +14 buffer.
                 // [Mines-38.9.14.2] user 2026-10-25 19:07: the status strip sat on the last message (深度思考 card cut). Reserve
                 // what the floating bar really measures (tile overhang + strip + its 6 dp margin) plus the gap, never less.
+                // [Mines-38.9.14.3] user 2026-10-26 06:36 screenshot: on 聊天 the finished strip 「读今日记忆日志 16/16」 + its file
+                // tile stayed on top of the task rows. On 聊天主页 the floating bar only shows while a tool is still working.
+                val minesBarIdle = minesHomeGlass && !isStreaming && remember(messages, streamingById) {
+                    val merged = if (streamingById.isEmpty()) messages else mergeStreamingOverlay(messages, streamingById)
+                    merged.none { msg -> msg.role == "assistant" && msg.toolBlocks.any { tb -> tb.kind != "thinking" && tb.kind != "info" &&
+                        (tb.toolStatus == ToolBlockStatus.RUNNING || tb.toolStatus == ToolBlockStatus.PENDING || tb.toolStatus == ToolBlockStatus.STREAMING) } }
+                }
+                MinesBarProbe.idle = minesBarIdle
                 val bottomReserve =
-                    if (hasFloatingTools && !stepFoldHidesBar) maxOf(visualOverlayHeight + 14.dp, toolBarHeightDp + 12.dp) else 20.dp
+                    if (hasFloatingTools && !stepFoldHidesBar && !minesBarIdle) maxOf(visualOverlayHeight + 14.dp, toolBarHeightDp + 12.dp) else 20.dp
                 // T174: when bottomReserve changes (toolbar appearing /
                 // disappearing or thumbnail height shift), re-pin to bottom
                 // if we are currently following. Without this, the new
@@ -4223,9 +4231,10 @@ fun ChatScreen(
                 // [Mines-38.9.14.1] one card per task: fold retries / repeated state cards of the same task root into the newest one
                 val minesTasksNow by com.openminis.app.plus.ChatHome.tasks.collectAsState()
                 val minesFold = remember(flatItems, minesTasksNow) {
+                    // [38.9.14.3] 聊天: one row per task (已建任务 folds into the task's state row)
                     com.openminis.app.plus.ChatHomeCore.foldNotices(flatItems.mapNotNull { (it as? FlatChatItem.MinesTaskItem)?.let { t ->
-                        com.openminis.app.plus.ChatHomeCore.NoticeRef(t.key, t.tag.taskId, t.tag.kind, t.tag.body) } }) { id ->
-                        com.openminis.app.plus.ChatHomeCore.rootKey(minesTasksNow.firstOrNull { it.id == id }, id) }
+                        com.openminis.app.plus.ChatHomeCore.NoticeRef(t.key, t.tag.taskId, t.tag.kind, t.tag.body) } }, { id ->
+                        com.openminis.app.plus.ChatHomeCore.rootKey(minesTasksNow.firstOrNull { it.id == id }, id) }, oneRow = minesHomeGlass)
                 }
                 // [Mines-38.9.14.2 step_fold] one task row per reply's thinking + tool steps (collapsed by default)
                 val stepOpen = remember(sessionId) { androidx.compose.runtime.mutableStateMapOf<String, Boolean>() }
@@ -5108,7 +5117,7 @@ fun ChatScreen(
                 // [Mines-38.9.14.2 step_fold] the strip is a second copy of the folded row's current step: hidden then
                 val barDup = lastToolBlocks.lastOrNull()?.id?.let { it in minesStepBlockIds } == true
                 SideEffect { stepFoldHidesBar = barDup }
-                if (lastToolBlocks.isNotEmpty() && !barDup) {
+                if (lastToolBlocks.isNotEmpty() && !barDup && !minesBarIdle) {
                     Box(
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
@@ -8191,4 +8200,5 @@ private fun ThinkingLevelSheet(
     }
 }
 
-
+/** [Mines-38.9.14.3] smoke / 自检: whether 聊天主页 hid the idle floating tool bar on the last composition */
+object MinesBarProbe { @Volatile var idle: Boolean = false }
