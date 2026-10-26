@@ -7659,7 +7659,9 @@ def bregauto(res):
         route("plus_register_ledger", 4)
         r = shot("captcha-ask")
         if not find(r, "一键注册 · 等你"): fail("folded row not 等你")
-        if not tap_text("注册 · 等你", wait=3): fail("waiting item not tappable"); route("plus_register_takeover", 4)
+        # the item row (「SmokeCloud 注册 · 等你」), not the folded run row 「一键注册 · 等你」 (smoke 40246959806 tapped that one)
+        nm = its[0].get("name") or "SmokeCloud"
+        if not tap_text(nm + " 注册 · 等你", wait=3): fail("waiting item not tappable"); route("plus_register_takeover", 4)
         r = shot("captcha-takeover")
         if not find(r, "好了，继续") or not find(r, "跳过这个平台"): fail("takeover screen buttons missing")
         if not find(r, "完成人机验证"): fail("takeover screen has no line for the step")
