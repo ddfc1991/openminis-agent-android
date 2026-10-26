@@ -143,6 +143,7 @@ object TaskProgressCore {
         Regex("\\[(\\d{3})\\] (.*[\\u4e00-\\u9fff].*)").find(raw)?.groupValues?.get(2)?.trim()?.takeIf { it.isNotEmpty() }?.let { return it.take(160) }
         return when {
             com.openminis.app.provider.openai.ConnRetry.isDroppedText(raw) && !t.contains("stream") -> com.openminis.app.provider.openai.ConnRetry.zhText(raw)
+            t.contains("software caused connection abort") || t.contains("econnaborted") -> "网络断了（手机这边断开了连接）"   // [38.9.14.1 net_drop]
             code == "502" || t.contains("bad gateway") -> "服务器暂无响应（502）"
             code == "503" || t.contains("service unavailable") || t.contains("overloaded") -> "服务器忙（503）"
             code == "504" || t.contains("gateway timeout") -> "服务器超时（504）"

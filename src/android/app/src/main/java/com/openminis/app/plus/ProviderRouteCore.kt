@@ -183,7 +183,7 @@ object ProviderRouteCore {
                 Regex("\\b401\\b").containsMatchIn(s) && ("key" in s || "auth" in s) ->
                 "$who 的密钥无效" + (if (switched) "，已换下一个" else "（401）：在 服务商 里点「测试全部密钥」换一个能用的")
             "unexpected end of stream" in s || "connection reset" in s || "stream was reset" in s || "streamresetexception" in s ||
-                "connection closed" in s || "broken pipe" in s || "socket closed" in s || "中途断开" in s || "没回完就断开" in s ->
+                "connection closed" in s || "connection abort" in s || "broken pipe" in s || "socket closed" in s || "中途断开" in s || "没回完就断开" in s ->
                 "$who 中途断开，已自动重试" + (if (switched) "，换了下一个" else "，仍不行：稍后再试或换个服务商")
             "rate limited" in s || "429" in s || "too many requests" in s -> "$who 限流（429）$tail"
             "没有任何回应" in s || "首字超时" in s -> null   // already Chinese

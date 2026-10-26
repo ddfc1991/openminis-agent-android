@@ -3334,7 +3334,7 @@ def main():
         elif I396: fns = ((b396x,) if I396X else ()) + ((b396m,) if I396M else ()) + (b396,) + (tuple(fns) if I395 else ())   # [38.9.6 i12] glass / auto progress / archive shots first, then the full i395 pass + 自检
         elif H3894: fns = (b3894_h,) + tuple(fns)   # [38.9.4 h] SkillHub market, Memoh, a11y wording, 账号 entries, glass / opaque reading, g2 defects first
         if I3915: fns = (b3914, b3915)   # [38.9.15] 38.9.14.1 chat-home gate (single bottom bar on every tab, back on 聊天) + 伪人核心 / sign-in / slider
-        if IREG: fns = (bregauto,)   # [38.9.15 register_auto] own short gate
+        if IREG: fns = ((b3914, b3915) if I3915 else ()) + (bregauto,)   # [38.9.15 register_auto] own short gate; [38.9.15 release] after the chat-home + 伪人核心 gates when both modes are on
         for fn in fns:
             try:
                 fn(res)
@@ -5934,7 +5934,7 @@ def b399(res):
             x, y = (b[0] + b[2]) // 2, (b[1] + b[3]) // 2
             sh(f"input swipe {x} {y} {x} {y} 900"); time.sleep(2)
             r = shot("chat-longpress"); t = _txt(r); o["longpress"] = t[:300]
-            if "复制全文" not in t: selftest_fail.append(f"i399 long-press did not open the one sheet ({t[:100]})")
+            if "选择文字" not in t or "复制全文" in t: selftest_fail.append(f"i399 long-press did not open the one sheet ({t[:100]})")
             if tap_text("选择文字", exact=True, wait=2): time.sleep(1.5); shot("chat-select-all")
             back(1); time.sleep(1)
         else: page_missing.append("i399 chat: reply text not found for long-press")
@@ -7861,8 +7861,21 @@ def b3914(res):
         if dock and len(new) < 4: fail(f"{name}: 4-tab dock missing ({sorted(new)})")
         if not dock and new and len(new) >= 3: fail(f"{name}: unexpected dock here ({sorted(new)})")
         return r
+    def to_bottom():
+        # new 聊天 rows written by ChatHome while the list is scrolled up show 「回到底部」: go down first
+        r = dump(); p = find(r, "回到底部")
+        if p: sh(f"input tap {p[0]} {p[1]}"); time.sleep(1.5)
     def top_act():
         return sh("dumpsys activity activities | grep -E 'topResumedActivity|mResumedActivity' | head -2")
+    def alltxt(r):
+        # [38.9.14.2] text AND content-desc of every node (one-line task chips carry their full words in the description)
+        return " ".join((t or "") + " " + (d or "") for t, d, *_ in nodes(r)) if r is not None else ""
+    def bounds_of(r, desc):
+        for t, d, x, y, n in nodes(r) if r is not None else []:
+            if (d or "") == desc:
+                b = list(map(int, re.findall(r"\d+", n.get("bounds", ""))))
+                if len(b) == 4: return b
+        return None
 
     set_zh(); o["seedmodel"] = seed_model()
     try: result_json("group", "wallpaper off")
@@ -7872,14 +7885,8 @@ def b3914(res):
         sh(f"am force-stop {PKG}"); time.sleep(2)
         sh(f"am start -W -n {PKG}/com.openminis.app.MainActivity", timeout=90); time.sleep(10); dismiss_dialogs()
         r = shot("launch"); t = _txt(r); o["launch_txt"] = t[:300]
-        # [38.9.15 smoke] the upstream crash/hang breaker (LaunchCycleBeacon: an emulator 3 s cold-start stall log after
-        # several force-stops → effectiveMode=3) forces the old home on purpose; record it and relaunch once (a clean cycle resets it)
-        lm = sh("logcat -d | grep 'launch/mode' | tail -1")
-        if "最近对话" in t and "effectiveMode=3" in lm and "rawMode=3" not in lm:
-            o["breaker"] = lm.strip()[-160:]; print("I3914 NOTE launch hit the crash/hang breaker (old home on purpose); relaunching once", flush=True)
-            sh(f"am force-stop {PKG}"); time.sleep(2)
-            sh(f"am start -W -n {PKG}/com.openminis.app.MainActivity", timeout=90); time.sleep(10); dismiss_dialogs()
-            r = shot("launch"); t = _txt(r); o["launch_txt"] = t[:300]
+        # [38.9.14.2] no relaunch: 聊天主页 must win on the FIRST cold start even when a crash / hang breaker tripped
+        o["launch_mode"] = sh("logcat -d | grep 'launch/mode' | tail -1").strip()[-200:]
         s = state(); o["state0"] = s
         if not s.get("on"): fail(f"flag chat_home not on by default: {s}")
         if not s.get("main"): fail("no main conversation after launch")
@@ -7888,6 +7895,41 @@ def b3914(res):
         if "最近对话" in t: fail("launch: old conversation list shown instead of 聊天")
         one_bar("launch")
     step("launch", launch)
+
+    def breaker():
+        # [38.9.14.2] the realme case (2026-10-25 19:53): breakers tripped (hang count, crash window, stall log + launches with no
+        # clean exit), 3 force-kills, then a REAL 3.5 s main-thread stall on a cold start → every cold start must still be 聊天
+        # with the dock (安全模式 at most), never the old home. FAIL otherwise.
+        o["trip"] = result_json("group", "i3914 trip", timeout=20)
+        o["breakers_after_trip"] = result_json("group", "i3914 breakers", timeout=20)
+        bad = []
+        for i in range(4):
+            sh(f"am force-stop {PKG}"); time.sleep(2)
+            sh(f"am start -W -n {PKG}/com.openminis.app.MainActivity", timeout=90); time.sleep(9 if i == 0 else 7); dismiss_dialogs()
+            r = shot(f"breaker-{i}"); t = _txt(r)
+            old, new = bars(r)
+            ok = all(w in t for w in ("聊天", "任务", "消息", "应用")) and "最近对话" not in t and not old
+            o.setdefault("breaker_runs", []).append({"i": i, "ok": ok, "mode": sh("logcat -d | grep 'launch/mode' | tail -1").strip()[-160:]})
+            if not ok: bad.append(i)
+        o["breakers_end"] = result_json("group", "i3914 breakers", timeout=20)
+        o["stall_seen"] = sh("logcat -d | grep -c 'hang detected'").strip()
+        if bad: fail(f"breaker: cold start {bad} not on 聊天 + dock after 3 kills + a slow start (old home?)")
+        if "safe=true" not in json.dumps(o["breaker_runs"], ensure_ascii=False): fail("breaker: no launch went through 聊天主页 安全模式 (breaker not tripped?)")
+        one_bar("breaker-end")
+    step("breaker", breaker)
+
+    def netkeep():
+        # [38.9.14.1 net_drop] the one-tap 「任务在后台不断网」 card shows on 聊天 while Mines is not battery-exempt; after the
+        # exemption (here: deviceidle whitelist = what the system 「允许」 does) it is gone on resume (emulator is not realme → no step 2)
+        r = shot("netkeep-card"); t = _txt(r); o["netkeep_txt"] = t[:200]
+        if "任务在后台不断网" not in t: fail("netkeep: 「任务在后台不断网」 card not shown on 聊天 before the exemption")
+        one_bar("netkeep-card")
+        sh(f"cmd deviceidle whitelist +{PKG}"); time.sleep(1)
+        sh("input keyevent KEYCODE_HOME"); time.sleep(2)
+        sh(f"am start -n {PKG}/com.openminis.app.MainActivity"); time.sleep(5)
+        r = shot("netkeep-gone"); t = _txt(r)
+        if "任务在后台不断网" in t or "还差一步" in t: fail("netkeep: card still shown after the battery exemption")
+    step("netkeep", netkeep)
 
     def back_root():
         # [38.9.14.1] back on 聊天 (root) → Mines goes to the background (launcher); never the old list / old bar
@@ -7917,7 +7959,7 @@ def b3914(res):
         if "Zeabur" not in t.get("name", ""): fail(f"task name not the project: {t.get('name')}")
         if not str(s.get("last", "")).startswith("TASK"): fail(f"router decision not TASK: {s.get('last')}")
         time.sleep(2); r = shot("chip-running"); txt = _txt(r)
-        if "已建任务" not in txt: fail("chip 已建任务 not shown in 聊天")
+        if "Zeabur 注册 ·" not in alltxt(r) or "已建任务" not in alltxt(r): fail("one-line chip 「Zeabur 注册 · …」 not shown in 聊天")
         o["chip_running_state"] = t.get("st")
         if t.get("st") not in ("queued", "running"): print(f"I3914 note: task already {t.get('st')} at first look", flush=True)
         rows = s.get("rows") or []
@@ -7929,19 +7971,22 @@ def b3914(res):
         o["task_done"] = d[-1]
         time.sleep(3); r = shot("chip-done"); txt = _txt(r)
         if not any(x.get("tag", "").startswith("DONE") for x in (s2.get("rows") or [])): fail("no DONE notice row in 聊天")
-        if "回复你" not in txt: fail("完成 notice card (「… · 回复你 HH:mm 的消息」) not visible in 聊天 after the task finished")
+        if "Zeabur 注册，完成" not in alltxt(r): fail("完成 chip 「Zeabur 注册 · 完成 ›」 not visible in 聊天 after the task finished")
+        if "回复你" in txt: fail("old big notice card (「… · 回复你 HH:mm 的消息」) still shown")
         if (fake().get("task_posts") or 0) < 1: fail("the task conversation never called the model")
     step("task", task)
 
     def open_chip():
-        r = dump(); p = find(r, "已建任务")
-        if not p: fail("chip not found to tap"); return
+        # [38.9.14.3] the row's chevron opens the task's OWN new conversation (original message + record); tapping the row folds
+        r = dump(); p = find(r, "打开任务对话 Zeabur 注册")
+        if not p: fail("chevron 「打开任务对话 Zeabur 注册」 not found to tap"); return
         sh(f"input tap {p[0]} {p[1]}"); time.sleep(4)
         r = shot("task-page"); t = _txt(r); o["task_page"] = t[:400]
-        if "帮我注册 zeabur" not in t: fail("tapping the chip did not open the task conversation")
+        if "帮我注册 zeabur" not in t: fail("the chevron did not open a conversation that starts with the original message")
+        if "任务记录" not in alltxt(r): fail("the task's own conversation has no 任务记录 row")
         back(1); time.sleep(2)
         r = dump()
-        if r is None or "已建任务" not in _txt(r): fail("back from the task conversation did not return to 聊天")
+        if r is None or "Zeabur 注册" not in alltxt(r): fail("back from the task conversation did not return to 聊天")
         one_bar("chip-back")
     step("open_chip", open_chip)
 
@@ -8014,7 +8059,7 @@ def b3914(res):
         elif t.find("知识库") > t.find("浏览器") >= 0: fail("应用: 知识库 not first")
         if not tap_dock("聊天"): fail("dock 聊天 not found"); return
         r = shot("tab-chat")
-        if "已建任务" not in _txt(r): fail("dock 聊天 did not return to the main conversation")
+        if "Zeabur 注册" not in alltxt(r): fail("dock 聊天 did not return to the main conversation")
         one_bar("tab-chat")
         back(1); time.sleep(2.5)   # [38.9.14.1] back on 聊天 reached via the dock: still never the old list
         top = top_act(); r = dump(); t = _txt(r) if PKG in top else ""
@@ -8031,6 +8076,230 @@ def b3914(res):
         except Exception as e: print("I3914 dark error", e, flush=True)
     step("dark", dark)
 
+    def netdrop():
+        # [38.9.14.1 net_drop] a task whose model stream is cut mid-reply (TCP RST after 2 chunks, like the phone's
+        # 「Software caused connection abort」): logged as a drop with its cause, 「网络断了，等网络恢复后继续」 shown, the SAME turn
+        # resumes on the same model and the task finishes (完成) without the user doing anything
+        tap_dock("聊天"); time.sleep(1)
+        t0 = time.time()
+        result_json("group", "i3914 say 帮我部署 断网测试 NETDROPONCE", timeout=40)
+        s = wait_state(lambda s: any(x.get("kind") == "drop" for x in (s.get("netdrops") or [])), 60)
+        o["netdrop_drop_s"] = int(time.time() - t0)
+        drops = [x for x in (s.get("netdrops") or []) if x.get("kind") == "drop"]
+        if not drops: fail(f"netdrop: no drop logged within 60 s: {(s.get('netdrops') or [])[-4:]}"); return
+        o["netdrop_drop"] = drops[-1]
+        if not drops[-1].get("state"): fail("netdrop: drop logged without the device state (screen / app / net / idle)")
+        to_bottom()
+        # [38.9.14.3] a 聊天 row now folds/unfolds on tap; the run itself (where the wait line shows) is opened directly
+        r = dump(); p = find(r, "断网测试")
+        if not p: fail("netdrop: row 「断网测试」 not found in 聊天")
+        nd = [x for x in (state().get("tasks") or []) if x.get("name") == "断网测试"]
+        opened = bool(nd)
+        if nd: result_json("group", "i3914 open " + nd[-1].get("sid", ""), timeout=20); time.sleep(2.5)
+        r = shot("netdrop-wait"); t = _txt(r); o["netdrop_wait_txt"] = t[-300:]
+        if "网络断了" not in t:
+            # [38.9.14.1 smoke] the emulator's network is up, so the wait is one 2 s back-off (MinesNet "resume waited=0s"); by the
+            # time the chip is opened the turn has usually resumed. Only a failure when it has NOT resumed yet and no line shows.
+            s2 = state(); res = [x for x in (s2.get("netdrops") or []) if x.get("kind") == "resume"]
+            o["netdrop_wait_missed"] = {"resumed": bool(res), "reply": "断网后已继续" in t}
+            if not res and "断网后已继续" not in t: fail("netdrop: 「网络断了，等网络恢复后继续」 line not shown in the task while it waits")
+            else: print("I3914 NOTE netdrop wait line already gone (resumed within the 2 s back-off)", flush=True)
+        s = wait_state(lambda s: any(x.get("name") == "断网测试" and x.get("st") == "done" for x in (s.get("tasks") or [])), 100)
+        dt = int(time.time() - t0); o["netdrop_done_s"] = dt; o["netdrop_log"] = (s.get("netdrops") or [])[-6:]
+        f = fake(); o["netdrop_posts"] = f.get("netdrop_posts")
+        if not any(x.get("name") == "断网测试" and x.get("st") == "done" for x in (s.get("tasks") or [])):
+            fail(f"netdrop: task did not finish after the drop ({dt} s): {[(x.get('name'), x.get('st'), x.get('line')) for x in (s.get('tasks') or [])]}")
+        if not any(x.get("kind") == "resume" for x in (s.get("netdrops") or [])): fail("netdrop: no resume logged")
+        if (f.get("netdrop_posts") or 0) < 2: fail(f"netdrop: model not called again after the drop ({f.get('netdrop_posts')})")
+        time.sleep(2); r = shot("netdrop-done"); t = _txt(r); o["netdrop_done_txt"] = t[-300:]
+        if "断网后已继续" not in t: fail("netdrop: resumed reply not visible in the task conversation")
+        if "网络断了" in t: fail("netdrop: wait line still shown after the reply")
+        # [38.9.14.1] long-press menu on a reply (user 17:56): 选择文字 / 回复 / 引用 / 复制 first, no 「复制全文」; 回复 → reply bar
+        b = node_bounds(r, lambda n: "断网后已继续" in (n.get("text") or ""))
+        if b:
+            x, y = (b[0] + b[2]) // 2, (b[1] + b[3]) // 2
+            sh(f"input swipe {x} {y} {x} {y} 900"); time.sleep(2)
+            r = shot("msg-menu"); tl = texts(r); o["msg_menu"] = [x for x in tl if x in ("选择文字", "回复", "引用", "复制", "复制为 Markdown", "朗读", "复制全文")]
+            want = ["选择文字", "回复", "引用", "复制"]
+            got = [x for x in o["msg_menu"] if x in want]
+            if got[:4] != want: fail(f"msgmenu: front rows {got} (want {want})")
+            if "复制全文" in tl: fail("msgmenu: 「复制全文」 still shown")
+            if o["msg_menu"] and o["msg_menu"][0] != "选择文字": fail(f"msgmenu: first row is {o['msg_menu'][0]}")
+            if tap_text("回复", exact=True, wait=2):
+                time.sleep(1); r = shot("msg-reply"); t2 = _txt(r); o["msg_reply_txt"] = t2[-200:]
+                if "回复 Mines：" not in t2: fail("msgmenu: 回复 did not put the 「回复 Mines：…」 bar above the input")
+                p2 = find(r, "取消回复")
+                if p2: sh(f"input tap {p2[0]} {p2[1]}"); time.sleep(1)
+                if "mInputShown=true" in sh("dumpsys input_method | grep -o 'mInputShown=[a-z]*'"): sh("input keyevent KEYCODE_BACK"); time.sleep(0.8)   # hide the keyboard only
+            else: fail("msgmenu: 回复 row not tappable")
+        else: fail("msgmenu: reply text not found for the long-press")
+        if opened: back(1); time.sleep(2.5)
+        to_bottom(); r = shot("netdrop-chat"); one_bar("netdrop-chat")
+    step("netdrop", netdrop)
+
+    def fold():
+        # [38.9.14.1] one card per task: 出错 → 等你 → 出错 → 完成 of one task show as ONE 完成 card with 「已重试 2 次 · 历史尝试 3 ›」;
+        # tapping it expands the older attempts
+        tap_dock("聊天"); time.sleep(1)
+        o["fold_seed"] = result_json("group", "i3914 foldseed", timeout=30); time.sleep(4); to_bottom()
+        r = shot("fold"); t = _txt(r); o["fold_txt"] = t[-400:]
+        # [38.9.14.2] notices are one-line chips: one chip for the folded notices of the task, carrying 完成 + the retry line
+        cards = [d for t, d, *_ in nodes(r) if "账号关联测试，" in (d or "") and not (d or "").startswith("已建任务")]
+        o["fold_cards"] = cards
+        if len(cards) != 1: fail(f"fold: {len(cards)} notice chips for one task (want 1)")
+        elif "完成" not in cards[0] or "已重试 2 次" not in cards[0]: fail(f"fold: chip does not carry 完成 + 已重试 2 次: {cards[0]}")
+        if "Software caused connection abort" in _txt(r): fail("fold: notice body text shown in 聊天 (want the chip only)")
+        r = shot("fold-open")
+        one_bar("fold-open")
+    step("fold", fold)
+
+    def taskfold():
+        # [38.9.14.3] user 2026-10-26 06:38: task rows in 聊天 are ONE compact row each, collapsed by default; tap = open/close the
+        # details inline; the chevron / 打开 = the task's own new conversation seeded with the original message + its record;
+        # back returns to 聊天; the 任务 tab row opens the same conversation; the idle tool strip no longer covers the rows.
+        tap_dock("聊天"); time.sleep(1); to_bottom()
+        r = shot("tf-collapsed"); t = _txt(r)
+        rows = [d for _, d, *_ in nodes(r) if (d or "").startswith("账号关联测试，")]
+        o["tf_rows"] = rows
+        if len(rows) != 1: fail(f"taskfold: {len(rows)} rows for the task (want exactly 1)")
+        elif not rows[0].endswith("点按展开"): fail(f"taskfold: row not collapsed by default: {rows[0]}")
+        if "原始请求" in alltxt(r) or "Software caused connection abort" in t: fail("taskfold: details visible while collapsed")
+        p = find(r, rows[0]) if rows else None
+        if not p: return
+        sh(f"input tap {p[0]} {p[1]}"); time.sleep(1.5)
+        r = shot("tf-open"); a = alltxt(r)
+        if "原始请求" not in a or "那么账号关联这里有没有办法解决" not in a: fail("taskfold: tap did not open the details inline (原始请求 missing)")
+        if "已重试" not in a: fail("taskfold: open row has no retry count")
+        if not any((d or "").startswith("账号关联测试，") and (d or "").endswith("点按收起") for _, d, *_ in nodes(r)): fail("taskfold: open row does not say 点按收起")
+        p2 = find(r, "点按收起") or p
+        sh(f"input tap {p2[0]} {p2[1]}"); time.sleep(1.2)
+        r = dump()
+        if "原始请求" in alltxt(r): fail("taskfold: second tap did not fold the row again")
+        # the task's own conversation
+        r = dump(); p = find(r, "打开任务对话 账号关联测试")
+        if not p: fail("taskfold: chevron 「打开任务对话」 not found"); return
+        sh(f"input tap {p[0]} {p[1]}"); time.sleep(4)
+        r = shot("tf-talk"); a = alltxt(r)
+        o["tf_talk_txt"] = a[:500]
+        s = state(); tk = [x for x in (s.get("tasks") or []) if x.get("id") == "fold3914"]
+        talk = tk[0].get("talk") if tk else ""
+        o["tf_talk"] = talk
+        if not talk: fail("taskfold: no conversation recorded for the task")
+        if talk and talk == s.get("main"): fail("taskfold: opened 聊天 itself instead of a new conversation")
+        if "那么账号关联这里有没有办法解决" not in a: fail("taskfold: the new conversation does not start with the original message")
+        if "任务记录" not in a: fail("taskfold: the new conversation has no 任务记录")
+        if talk:
+            rr = result_json("group", "i3914 rows " + talk, timeout=20) or {}
+            rows2 = rr.get("rows") or [] if isinstance(rr, dict) else []
+            o["tf_talk_rows"] = [(x.get("role"), (x.get("text") or "")[:80]) for x in rows2[:3]]
+            if not rows2 or rows2[0].get("role") != "user" or "那么账号关联" not in rows2[0].get("text", ""): fail(f"taskfold: first row is not the user's original message {o['tf_talk_rows']}")
+            if len(rows2) < 2 or "时间线" not in rows2[1].get("text", "") or "已重试" not in rows2[1].get("text", ""): fail("taskfold: record row lacks 时间线 / 已重试")
+        back(1); time.sleep(2)
+        r = one_bar("tf-back")
+        if "账号关联测试" not in alltxt(r): fail("taskfold: back did not return to 聊天")
+        # 任务 tab → the same conversation
+        if tap_dock("任务"):
+            r = dump(); p = find(r, "账号关联测试")
+            for _ in range(3):
+                if p: break
+                scroll_down(); r = dump(); p = find(r, "账号关联测试")
+            if p:
+                sh(f"input tap {p[0]} {p[1]}"); time.sleep(4)
+                r = shot("tf-tasks-open"); a = alltxt(r)
+                if "任务记录" not in a: fail("taskfold: 任务 tab row did not open the task's own conversation")
+                tk2 = [x for x in (state().get("tasks") or []) if x.get("id") == "fold3914"]
+                if tk2 and talk and tk2[0].get("talk") != talk: fail("taskfold: 任务 tab made a second conversation for the same task")
+                back(1); time.sleep(2)
+            else: fail("taskfold: task not listed on 任务")
+            tap_dock("聊天"); time.sleep(1.5)
+        # the idle tool strip (「读今日记忆日志 16/16」 + file tile) must not sit on the rows
+        rr = result_json("group", "i3914 rows " + (state().get("main") or ""), timeout=20) or {}
+        o["tf_bar_idle"] = rr.get("barIdle") if isinstance(rr, dict) else None
+        if isinstance(rr, dict) and rr.get("barIdle") is not True: fail(f"taskfold: floating tool bar not idle-hidden on 聊天 ({rr.get('barIdle')})")
+        shot("tf-final")
+    step("taskfold", taskfold)
+
+    def nocall():
+        # [38.9.14.1] the 来电 (MinesCallActivity) feature is removed: no 提醒/来电 rows on 应用, no activity in the manifest, no crash
+        if not tap_dock("应用"): fail("nocall: dock 应用 not found"); return
+        seen = set()
+        for _ in range(8):
+            r = dump(); seen |= set(texts(r)); scroll_down()
+        time.sleep(1); r = shot("apps-nocall"); seen |= set(texts(r))
+        bad = [x for x in seen if "来电" in x]
+        o["nocall_rows"] = bad[:5]
+        if bad: fail(f"nocall: 来电 entry still shown {bad[:3]}")
+        o["nocall_selftest"] = result_json("group", "i3912 call", timeout=15)
+        act = sh(f"dumpsys package {PKG} | grep -c MinesCallActivity").strip()
+        o["nocall_manifest"] = act
+        if act not in ("", "0"): fail(f"nocall: MinesCallActivity still in the manifest ({act})")
+        if not alive(): fail("nocall: Mines died"); crashed.append("i3914 nocall"); recover("i3914 nocall")
+        tap_dock("聊天")
+    step("nocall", nocall)
+
+    def pip():
+        # [38.9.14.2] user 2026-10-25 19:07: the black preview tile covered the left half of the status strip 「全盘搜索构建依赖 13/13」
+        # and the strip covered the last message. While a shell step runs: tile and strip bounds must not intersect, and the
+        # last message must end above the strip (bottom ≤ strip top).
+        o["pip_chat"] = result_json("group", "i3913 chat PIPTEST 全盘搜索构建依赖", timeout=40)
+        tile = strip = None; r = None
+        for _ in range(12):
+            time.sleep(2.5); r = dump(); tile = bounds_of(r, "工具预览"); strip = bounds_of(r, "工具状态条")
+            if strip: break
+        r = shot("pip"); tile = bounds_of(r, "工具预览") or tile; strip = bounds_of(r, "工具状态条") or strip
+        o["pip_tile"] = tile; o["pip_strip"] = strip
+        if not strip: fail("pip: status strip (工具状态条) not shown while the shell step runs"); return
+        if tile and not (tile[2] <= strip[0] or strip[2] <= tile[0] or tile[3] <= strip[1] or strip[3] <= tile[1]):
+            fail(f"pip: preview tile {tile} intersects the status strip {strip}")
+        # last message = the lowest text node above the composer that is not part of the strip / tile
+        low = None; low_t = ""
+        for t, d, x, y, n in nodes(r):
+            if not t or t.startswith("发消息"): continue
+            b = list(map(int, re.findall(r"\d+", n.get("bounds", ""))))
+            if len(b) != 4 or b[1] >= strip[1] - 2: continue
+            # [smoke 40198408547] the tile's terminal text measures wider / taller than the tile (clipped): its centre fell
+            # outside the tile and it was taken for the last message (bottom 2112 > strip top). Skip any node touching the tile.
+            if tile and not (b[2] <= tile[0] or tile[2] <= b[0] or b[3] <= tile[1] or tile[3] <= b[1]): continue
+            # [smoke 40202885854] the strip's own label (bounds [434,1982,1016,2112], 13 px taller than the strip) is not a message
+            if strip[0] <= x <= strip[2] and strip[1] <= y <= strip[3]: continue
+            if low is None or b[3] > low[3]: low = b; low_t = t
+        o["pip_last"] = low; o["pip_last_text"] = low_t[:60] if low else None
+        if low is None: fail("pip: no message found above the strip")
+        elif low[3] > strip[1]: fail(f"pip: last message bottom {low[3]} > strip top {strip[1]} (covered)")
+        hidden = [t for t, d, x, y, n in nodes(r) if t and "PIPTEST" in t]
+        if not hidden: fail("pip: the user message is not visible above the strip")
+    step("pip", pip)
+
+    def stepfold():
+        # [38.9.14.2 step_fold] user 20:57 「对话要会伸缩进一个任务项，就是聚合」: a 13-step reply (7 深度思考 + 6 tools) shows as ONE
+        # task row (no 深度思考 card visible while folded); tapping opens the steps; tapping again closes them
+        o["stepfold_chat"] = result_json("group", "i3913 chat STEPFOLD 聚合测试", timeout=40)
+        r = None; t = ""
+        for _ in range(36):
+            time.sleep(2.5); r = dump(); t = alltxt(r)
+            if "STEPFOLD 完成" in t: break
+        time.sleep(2); r = shot("stepfold-folded"); t = alltxt(r)
+        rows = [d for _t, d, *_ in nodes(r) if (d or "").startswith("步骤：")]
+        o["stepfold_rows"] = rows; o["stepfold_posts"] = fake().get("stepfold_posts")
+        if "STEPFOLD 完成" not in t: fail("stepfold: the 13-step reply did not finish / final answer not visible")
+        if len(rows) != 1: fail(f"stepfold: {len(rows)} task rows for one reply (want 1): {rows}")
+        elif "13 步" not in rows[0]: fail(f"stepfold: task row does not say 13 步: {rows[0]}")
+        if "深度思考" in _txt(r): fail("stepfold: a 深度思考 card is visible while folded")
+        if bounds_of(r, "工具状态条"): fail("stepfold: the floating status strip duplicates the folded row")
+        if not rows: return
+        p = find(r, "步骤：")
+        sh(f"input tap {p[0]} {p[1]}"); time.sleep(2.5)
+        r = shot("stepfold-open"); t = _txt(r)
+        o["stepfold_open_txt"] = t[-400:]
+        if "深度思考" not in t and "列出源码结构" not in t and "全盘搜索构建依赖" not in t: fail("stepfold: opening the row did not show the steps")
+        p = find(r, "步骤：")
+        if p:
+            sh(f"input tap {p[0]} {p[1]}"); time.sleep(2)
+            r = dump(); t2 = _txt(r)
+            o["stepfold_refold_txt"] = t2[-300:]
+            if "深度思考" in t2 or "列出源码结构" in t2: fail("stepfold: tapping again did not fold the steps")
+    step("stepfold", stepfold)
+
     def experiments():
         route("settings", 3); tap_text("测试与上报", wait=3)
         seen = set()
@@ -8042,6 +8311,8 @@ def b3914(res):
         back(2)
     step("experiments", experiments)
     print("I3914 RESULT " + json.dumps(o, ensure_ascii=False)[:6000], flush=True)
+    print("I3914 KEYS " + json.dumps({k: o.get(k) for k in ("breaker_runs", "breakers_end", "pip_tile", "pip_strip", "pip_last", "pip_last_text",
+                                                            "stepfold_rows", "stepfold_posts", "stepfold_refold_txt")}, ensure_ascii=False)[:4000], flush=True)
 
 
 def b3913(res):

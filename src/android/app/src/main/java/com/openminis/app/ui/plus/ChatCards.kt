@@ -20,12 +20,14 @@ import androidx.compose.ui.unit.dp
  * layout change is a fixed inner padding (12 dp sides, 10 dp at the card's top / bottom).
  */
 @Composable
-fun ReplyCardSlice(seg: Int, content: @Composable () -> Unit) {
+fun ReplyCardSlice(seg: Int, soft: Boolean = false, content: @Composable () -> Unit) {
     val m = mines()
     val first = seg and 1 != 0
     val last = seg and 2 != 0
-    val fill = minesGlassFill(strong = true)
-    val line = m.glassBorder
+    // [Mines-38.9.14.2] soft (聊天主页): the plain card glass (the most transparent tint that keeps ink2 ≥ 4.5:1 when 自动),
+    // no hairline — a faint frosted panel instead of a framed box under every reply
+    val fill = minesGlassFill(strong = !soft)
+    val line = if (soft) androidx.compose.ui.graphics.Color.Transparent else m.glassBorder
     Box(
         Modifier.fillMaxWidth()
             .drawBehind {

@@ -166,6 +166,12 @@ object CrashFrequencyDetector {
      * so the user's "Launch Session" preference reasserts itself
      * automatically.
      */
+    /** [Mines-38.9.14.2] a new app version clears the force-home grace window of the old one */
+    @JvmStatic
+    fun clearForceHome(context: Context) {
+        runCatching { context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(KEY_FORCE_HOME_UNTIL).apply() }
+    }
+
     @JvmStatic
     fun shouldForceHomeOnLaunch(context: Context): Boolean {
         val until = try {

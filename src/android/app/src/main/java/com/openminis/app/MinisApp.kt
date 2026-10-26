@@ -250,6 +250,9 @@ class MinisApp : Application(), ImageLoaderFactory {
         // — this guard sits above every Mines init (the old :acra early-return further down came after SplitProxy).
         if (com.openminis.app.plus.ProcessGuard.secondary(this)) return
         // [Mines-38.9.11.2] kill-safe 无痕: leftovers of a session the system killed are wiped once the app is idle
+        // [Mines-38.9.14.2] open the Keystore-backed stores that start-up reads FIRST, on a background thread, before any
+        // main-thread init can reach them (plus_vault_secrets via SplitProxy, env_var_values via MuseHub)
+        runCatching { com.openminis.app.util.EncryptedPrefsFactory.prewarm(this, "plus_vault_secrets", "env_var_values") }
         runCatching { com.openminis.app.browser.ConvProfiles.init(this) }
         runCatching { android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
             runCatching { com.openminis.app.browser.Incognito.sweepOnLaunch(this) }
@@ -480,6 +483,16 @@ class MinisApp : Application(), ImageLoaderFactory {
         // [com.openminis.app.diagnostics.LaunchCycleBeacon].
         try {
             com.openminis.app.diagnostics.LaunchCycleBeacon.recordLaunch(this)
+            // [Mines-38.9.14.2] first launch of a new versionCode: every crash / hang breaker counter starts from zero
+            val bp = getSharedPreferences("mines_breaker", MODE_PRIVATE)
+            val vc = BuildConfig.VERSION_CODE
+            if (bp.getInt("vc", -1) != vc) {
+                com.openminis.app.diagnostics.LaunchCycleBeacon.resetForUpgrade(this)
+                com.openminis.app.diagnostics.HangDetector.resetHangCount(this)
+                com.openminis.app.crash.CrashFrequencyDetector.clearForceHome(this)
+                bp.edit().putInt("vc", vc).apply()
+                Log.i("MinisApp", "breaker counters cleared for versionCode $vc")
+            }
         } catch (t: Throwable) {
             Log.w("MinisApp", "LaunchCycleBeacon.recordLaunch failed: ${t.message}")
         }
@@ -744,7 +757,10 @@ class MinisApp : Application(), ImageLoaderFactory {
         // [Mines] minis-connect: connected accounts + per-capability permission check (approval card for "询问").
         NativeOffloadServer.register("minis-connect", com.openminis.app.plus.ConnectOffloadHandler(this))
         runCatching { com.openminis.app.plus.PlusConnect.rearm(this) }
-        runCatching { com.openminis.app.hub.MuseHubClient.start(this) }
+        // [Mines-38.9.14.2] off the main thread: connect() reads MUSE_HUB_URL / KEY from env_var_values, whose first open
+        // decrypts through the Android Keystore (seconds on the realme RMX5062) — it was the cold-start main-thread open
+        runCatching { val app0 = this; Thread({ runCatching { com.openminis.app.hub.MuseHubClient.start(app0) }
+            .onFailure { com.openminis.app.logging.AppLogger.warning("MuseHub", "start failed: ${it.message}") } }, "mines-musehub-start").apply { isDaemon = true }.start() }
             .onFailure { com.openminis.app.logging.AppLogger.warning("MuseHub", "start failed: ${it.message}") }
         // T188: minis-sessions-cli — agent-side query of chat history.
         // Registers next to the other minis-* tools so PRootKernel.
@@ -828,7 +844,7 @@ class MinisApp : Application(), ImageLoaderFactory {
         // when a chat turn started, so after any restart home showed 「都在正常跑」 and no pills although chats had progress)
         kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
             runCatching { com.openminis.app.plus.TaskProgress.init(this@MinisApp) }
-            runCatching { com.openminis.app.plus.TaskProjects.init(this@MinisApp); com.openminis.app.plus.ChatHome.init(this@MinisApp); com.openminis.app.plus.StallWatch.init(this@MinisApp) }   // [Mines-38.9.14 chat_home] queued tasks resume
+            runCatching { com.openminis.app.plus.TaskProjects.init(this@MinisApp); com.openminis.app.plus.ChatHome.init(this@MinisApp); com.openminis.app.plus.StallWatch.init(this@MinisApp); com.openminis.app.plus.NetDrop.init(this@MinisApp); com.openminis.app.plus.MinesCall.retire(this@MinisApp) }   // [Mines-38.9.14 chat_home] queued tasks resume
         }
         kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
             runCatching { com.openminis.app.plus.PartnerGateway.startAtLaunch(this@MinisApp) }

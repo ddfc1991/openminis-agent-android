@@ -104,18 +104,7 @@ fun AppsHubScreen(onBack: () -> Unit, go: (String) -> Unit) {
             WarmDivider()
             PlusRow(ic("stethoscope"), "诊断", "测试与上报", onClick = { go(PlusRoutes.REPORT) })
         }
-        var callOn by remember { mutableStateOf(com.openminis.app.plus.MinesCall.enabled(ctx)) }
-        PlusSection("提醒", footer = "Mines 在后台完成任务、出错或需要你处理（登录、验证）时，像来电一样响铃，可接听语音对话、转文字或挂断。只用手机本地通知，不产生通话费用。") {
-            SwitchRow("任务完成来电提醒", "应用内来电 · 免费", callOn) { callOn = it; com.openminis.app.plus.MinesCall.setEnabled(ctx, it) }
-            WarmDivider(16.dp)
-            var attnOn by remember { mutableStateOf(com.openminis.app.plus.MinesCall.attention(ctx)) }
-            SwitchRow("需要你处理时也来电", "登录、人机验证等待你时", attnOn && callOn) { attnOn = it; com.openminis.app.plus.MinesCall.setAttention(ctx, it) }
-            WarmDivider(16.dp)
-            PlusRow(ic("phone"), "试一下来电", onClick = {
-                ctx.startActivity(android.content.Intent(ctx, MinesCallActivity::class.java).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                    .putExtra("title", "测试来电").putExtra("body", "你好，我是 Mines。接听后我先把这句话念给你，然后你可以直接和我说话。"))   // [38.9.12.1] no 「示例」
-            })
-        }
+        // [Mines-38.9.14.1] 「提醒 · 任务完成来电」 section removed with the 来电 feature
         if (com.openminis.app.plus.ChatHome.enabled()) Spacer(Modifier.size(84.dp))   // [Mines-38.9.14 chat_home] room for the dock
     }
 }

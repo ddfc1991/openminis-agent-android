@@ -200,6 +200,45 @@ object ChatHomeCore {
         return Tag(m.groupValues[1], k, s.substring(m.range.last + 1).trim())
     }
 
+    // ── [Mines-38.9.14.1] one card per task in 聊天 (user 2026-10-25 screenshot: 4 cards 出错/等你/出错/完成 for one question) ──
+
+    /** a task row in 聊天, in chat order (oldest first): [id] = the list key, [taskId] = the tag's task */
+    data class NoticeRef(val id: String, val taskId: String, val kind: Kind, val body: String)
+
+    /** what a row shows: [show] false = folded into a later card; for the shown card [history] = older attempts (oldest first) */
+    data class Fold(val show: Boolean, val history: List<NoticeRef> = emptyList(), val retries: Int = 0) {
+        val retryLine: String get() = if (retries > 0) "已重试 $retries 次" else ""
+    }
+
+    /** the task root: tasks started from the same message (same goal, else same name) are one card; unknown task = its own id */
+    fun rootKey(t: AutoTask?, taskId: String): String =
+        t?.let { (it.goal.ifBlank { it.name }).trim().lowercase().ifBlank { null } }?.let { "g:$it" } ?: "id:$taskId"
+
+    /**
+     * Per row id: state cards (等你 / 出错 / 完成) of one root fold into the NEWEST one (latest state wins, so 出错 then 完成 shows
+     * 完成 only), with the older ones as its expandable history and 「已重试 N 次」 = earlier failed attempts. The 已建任务
+     * chip is kept once per root (the first); later chips of the same root are folded (a retry / auto-resume adds no new card).
+     */
+    fun foldNotices(rows: List<NoticeRef>, keyOf: (String) -> String, oneRow: Boolean = false): Map<String, Fold> {
+        val out = HashMap<String, Fold>()
+        val byKey = LinkedHashMap<String, MutableList<NoticeRef>>()
+        val chipSeen = HashSet<String>()
+        for (r in rows) {
+            val k = keyOf(r.taskId)
+            if (r.kind == Kind.CREATED) { out[r.id] = Fold(show = chipSeen.add(k)); continue }
+            byKey.getOrPut(k) { mutableListOf() }.add(r)
+        }
+        for ((_, l) in byKey) {
+            val last = l.last()
+            val hist = l.dropLast(1)
+            hist.forEach { out[it.id] = Fold(show = false) }
+            out[last.id] = Fold(show = true, history = hist, retries = hist.count { it.kind == Kind.ERROR })
+        }
+        // [38.9.14.3] ONE row per task: once a task has a state row (等你 / 出错 / 完成), its 已建任务 row folds into it
+        if (oneRow) for (r in rows) if (r.kind == Kind.CREATED && byKey.containsKey(keyOf(r.taskId))) out[r.id] = Fold(show = false)
+        return out
+    }
+
     fun createdLine(name: String): String = "已创建任务：$name。在后台运行，完成或需要你处理时会在这里告诉你。"
 
     fun noticeOf(t: AutoTask): Pair<Kind, String>? = when (t.st) {

@@ -94,6 +94,8 @@ I3913_SCRIPTS = {
     "GECKOREAD": [("browser_use", {"tool_title": "用 Mines 浏览器打开", "action": "navigate", "engine": "gecko", "url": GK}),
                   ("browser_use", {"tool_title": "读页面文字", "action": "get_text", "engine": "gecko"}),
                   ("browser_use", {"tool_title": "把页面给用户看", "action": "wait_for_human", "engine": "gecko"})],
+    # [38.9.14.2] a long shell step so the floating status strip + preview tile stay up while the smoke measures them
+    "PIPTEST": [("shell_execute", {"tool_title": "全盘搜索构建依赖", "command": "echo '=== 全盘找 hark apk ==='; echo '=== 找 baksmali 全盘 ==='; sleep 50; echo done"})],
     "OAUTHTEST": [("browser_use", {"tool_title": "打开 Google 登录", "action": "navigate", "url": "https://accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Fzeabur.com"})],
     # [38.9.15 伪人核心] the agent tries to send a mail as the user from a mailbox that is NOT allow-listed → 限制层 refuses → 等你处理
     "SENDMAILTEST": [("persona", {"tool_title": "发邮件给老板", "action": "send_email", "who": "boss@example.com", "from": "smoke@163.com",
@@ -340,7 +342,9 @@ fetch('/linkfake/send?'+k+'='+encodeURIComponent(v));document.getElementById('fc
         if "MINES_ROUTER" in ut0:   # [38.9.14 chat_home] router: registrations / deployments are tasks, the rest quick
             q = ut0.split("用户：", 1)[-1]
             STATS.setdefault("router", []).append(q[:40])
-            text = json.dumps({"mode": "task", "name": "发周报"} if "SENDMAILTEST" in q else {"mode": "task", "name": "Zeabur 注册"} if ("注册" in q or "部署" in q) else {"mode": "quick"}, ensure_ascii=False)
+            text = json.dumps({"mode": "task", "name": "发周报"} if "SENDMAILTEST" in q else
+                              {"mode": "task", "name": "断网测试"} if "NETDROP" in q else
+                              {"mode": "task", "name": "Zeabur 注册"} if ("注册" in q or "部署" in q) else {"mode": "quick"}, ensure_ascii=False)
         elif "今天几号" in ut0:
             STATS["quick_posts"] = STATS.get("quick_posts", 0) + 1
             text = "今天是 10 月 25 日，星期日。"
@@ -361,6 +365,26 @@ fetch('/linkfake/send?'+k+'='+encodeURIComponent(v));document.getElementById('fc
             STATS["stall_retry_at"] = time.time()
             time.sleep(8)
             text = "卡住后已恢复，这是重试后的回答。"
+        # [38.9.14.1 net_drop] the first streamed turn for NETDROPONCE sends two chunks, then the TCP connection is reset (RST,
+        # like the phone's ECONNABORTED); the resumed turn is slow to start (10 s) so 「网络断了，等网络恢复后继续」 can be seen
+        if "NETDROPONCE" in ut0 and "MINES_ROUTER" not in ut0 and body.get("stream"):
+            STATS["netdrop_posts"] = STATS.get("netdrop_posts", 0) + 1
+            if STATS["netdrop_posts"] == 1:
+                import socket as _so, struct as _st
+                self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+                for piece in ("好的，", "我开始部署"):
+                    d = {"id": "x", "object": "chat.completion.chunk", "created": int(time.time()), "model": "smoke-model",
+                         "choices": [{"index": 0, "delta": {"role": "assistant", "content": piece}, "finish_reason": None}]}
+                    self.wfile.write(b"data: " + json.dumps(d, ensure_ascii=False).encode() + b"\n\n"); self.wfile.flush(); time.sleep(0.5)
+                time.sleep(1)
+                try:
+                    self.connection.setsockopt(_so.SOL_SOCKET, _so.SO_LINGER, _st.pack("ii", 1, 0))
+                    self.connection.close()
+                except Exception: pass
+                self.close_connection = True
+                return
+            time.sleep(10)
+            text = "断网后已继续，这是恢复后的回答：部署完成。"
         if "MULTIPART" in last_user_text(msgs):
             STATS["multipart"] = STATS.get("multipart", 0) + 1
             text = MULTIPART
@@ -418,6 +442,31 @@ fetch('/linkfake/send?'+k+'='+encodeURIComponent(v));document.getElementById('fc
                 emit({"tool_calls": [{"index": i, "id": f"call_zh_{i}", "type": "function", "function": {"name": nm, "arguments": json.dumps(a, ensure_ascii=False)}}
                                      for i, (nm, a) in enumerate(calls)]})
                 emit({}, "tool_calls")
+            self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
+            return
+        if "STEPFOLD" in last_user_text(msgs) and body.get("stream"):
+            # [38.9.14.2 step_fold] one reply with 13 steps: 7 深度思考 (reasoning_content) + 6 tool calls, then the answer
+            n = 0
+            for m in reversed(msgs):
+                if m.get("role") == "user": break
+                if m.get("role") == "tool": n += 1
+            names = [t.get("function", {}).get("name") for t in body.get("tools") or []]
+            STATS["stepfold_posts"] = STATS.get("stepfold_posts", 0) + 1
+            self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+            def emit(delta, fin=None):
+                d = {"id": "x", "object": "chat.completion.chunk", "created": int(time.time()), "model": "smoke-model",
+                     "choices": [{"index": 0, "delta": delta, "finish_reason": fin}]}
+                self.wfile.write(b"data: " + json.dumps(d, ensure_ascii=False).encode() + b"\n\n"); self.wfile.flush()
+            emit({"role": "assistant", "reasoning_content": f"第 {n + 1} 步：先看看构建脚本和依赖，再决定下一步。"})
+            time.sleep(0.3)
+            tool = "memory" if "memory" in names else (pick_tool(body.get("tools"))[0])
+            if n < 6:
+                titles = ["解压并查看压缩包内容", "读取 BUILD.md 了解项目", "列出源码结构", "查看最新增量类与构建脚本", "查记忆", "全盘搜索构建依赖"]
+                a = {"tool_title": titles[n], "action": "find", "query": f"STEPFOLD-{n}"} if tool == "memory" else pick_tool(body.get("tools"))[1]
+                emit({"tool_calls": [{"index": 0, "id": f"call_sf_{n}", "type": "function", "function": {"name": tool, "arguments": json.dumps(a, ensure_ascii=False)}}]})
+                emit({}, "tool_calls")
+            else:
+                emit({"content": "STEPFOLD 完成：构建依赖都找到了，可以开始打包。"}); emit({}, "stop")
             self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
             return
         if "LOOPTEST" in last_user_text(msgs) and body.get("stream"):

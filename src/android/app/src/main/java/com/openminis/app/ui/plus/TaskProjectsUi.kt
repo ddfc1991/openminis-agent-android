@@ -228,7 +228,9 @@ private fun ProjectCard(p: TaskProjectsCore.Project, tasks: Map<String, TaskProg
         }
         p.attempts.sortedByDescending { it.n }.take(3).forEach { a ->
             WarmDivider(start = 16.dp)
-            AttemptRow(p, a, tasks[a.sid], compact = true) { go(TaskRoutes.chat(a.sid)) }
+            val ctxA = androidx.compose.ui.platform.LocalContext.current
+            // [38.9.14.3] a 聊天 task opens its own conversation (original message + record); other attempts their run as before
+            AttemptRow(p, a, tasks[a.sid], compact = true) { com.openminis.app.plus.ChatHome.taskOf(a.sid)?.let { openTaskTalk(ctxA, it.id) } ?: go(TaskRoutes.chat(a.sid)) }
         }
     }
 }

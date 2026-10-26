@@ -906,7 +906,30 @@ class AgentForegroundService : Service() {
         }
     }
 
+    /** [Mines-38.9.14.1 net_drop] Wi-Fi lock next to the CPU wake lock: with the screen off Wi-Fi must not drop to a
+     *  power-save state that lets the provider stream die (user 2026-10-25: tasks aborted with 「Software caused connection abort」) */
+    @Suppress("DEPRECATION")
+    private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null
+
+    @Suppress("DEPRECATION")
+    private fun acquireWifiLock() {
+        if (wifiLock != null) return
+        runCatching {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
+            wifiLock = wm.createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF, "minis:inference-wifi").apply {
+                setReferenceCounted(false); acquire()
+            }
+            Log.d(TAG, "WifiLock acquired")
+        }.onFailure { Log.w(TAG, "WifiLock acquire failed: ${it.message}") }
+    }
+
+    private fun releaseWifiLock() {
+        runCatching { wifiLock?.let { if (it.isHeld) it.release() } }
+        wifiLock = null
+    }
+
     private fun acquireWakeLock() {
+        acquireWifiLock()
         if (wakeLock != null) return
         try {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -926,6 +949,7 @@ class AgentForegroundService : Service() {
     }
 
     private fun releaseWakeLock() {
+        releaseWifiLock()
         try {
             wakeLock?.let {
                 if (it.isHeld) {

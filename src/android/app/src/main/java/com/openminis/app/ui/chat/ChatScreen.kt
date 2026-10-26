@@ -2789,6 +2789,9 @@ fun ChatScreen(
     // [Mines] Full-screen chat wallpaper: bars and composer go translucent so it shows through.
     val minesWallpaper = com.openminis.app.ui.plus.wallpaperOn()
     val minesChatSky = com.openminis.app.ui.plus.chatSkyOn()
+    // [Mines-38.9.14.2] 聊天主页 (user 2026-10-25 20:14 「首页白底去掉」, 20:16 「有点乱」): the sky shows through the title bar,
+    // replies and composer (the old home's frosted glass, light and dark), no 「模型 · 复制」 footer, task notices as one-line chips
+    val minesHomeGlass = com.openminis.app.plus.ChatHome.isMain(sessionId)
     val minesBasePalette = com.openminis.app.ui.theme.LocalChatPalette.current
     val minesPalette = if (minesWallpaper) minesBasePalette.copy(inputBg = minesBasePalette.inputBg.copy(alpha = 0.82f)) else minesBasePalette
     CompositionLocalProvider(
@@ -3530,8 +3533,8 @@ fun ChatScreen(
                 },
                 windowInsets = WindowInsets.statusBars,
                 colors = androidx.compose.material3.TopAppBarDefaults.topAppBarColors(
-                    containerColor = ChatColors.background.copy(alpha = if (minesWallpaper) 0.55f else 0.92f),
-                    scrolledContainerColor = ChatColors.background.copy(alpha = if (minesWallpaper) 0.55f else 0.92f),
+                    containerColor = if (minesHomeGlass) com.openminis.app.ui.plus.minesGlassFill() else ChatColors.background.copy(alpha = if (minesWallpaper) 0.55f else 0.92f),
+                    scrolledContainerColor = if (minesHomeGlass) com.openminis.app.ui.plus.minesGlassFill() else ChatColors.background.copy(alpha = if (minesWallpaper) 0.55f else 0.92f),
                 ),
                 // [T-android-topbar-shrink] 76dp → 68dp. The earlier
                 // T-topbar-model-row-clip fix bumped 60dp → 76dp to give the
@@ -3591,6 +3594,9 @@ fun ChatScreen(
             // Messages + scroll-to-bottom button
             Box(modifier = Modifier.weight(1f)) {
                 var toolBarHeightPx by remember { mutableStateOf(0) }
+                // [Mines-38.9.14.2 step_fold] the floating status strip duplicates a folded step row → hidden (set below)
+                var stepFoldHidesBar by remember { mutableStateOf(false) }
+                var minesStepBlockIds by remember { mutableStateOf<Set<String>>(emptySet()) }
                 // [T-p2-agent-callback] Synthetic delegate block behind a tapped
                 // callback card; hosted at this stable scope so the sheet survives
                 // LazyColumn item disposal.
@@ -3684,8 +3690,18 @@ fun ChatScreen(
                 // (user reported "the bottom of the text is slightly clipped"). The floating-tools branch
                 // already reserves visualOverlayHeight (65dp) + buffer and
                 // was not part of the report; keep its +14 buffer.
+                // [Mines-38.9.14.2] user 2026-10-25 19:07: the status strip sat on the last message (深度思考 card cut). Reserve
+                // what the floating bar really measures (tile overhang + strip + its 6 dp margin) plus the gap, never less.
+                // [Mines-38.9.14.3] user 2026-10-26 06:36 screenshot: on 聊天 the finished strip 「读今日记忆日志 16/16」 + its file
+                // tile stayed on top of the task rows. On 聊天主页 the floating bar only shows while a tool is still working.
+                val minesBarIdle = minesHomeGlass && !isStreaming && remember(messages, streamingById) {
+                    val merged = if (streamingById.isEmpty()) messages else mergeStreamingOverlay(messages, streamingById)
+                    merged.none { msg -> msg.role == "assistant" && msg.toolBlocks.any { tb -> tb.kind != "thinking" && tb.kind != "info" &&
+                        (tb.toolStatus == ToolBlockStatus.RUNNING || tb.toolStatus == ToolBlockStatus.PENDING || tb.toolStatus == ToolBlockStatus.STREAMING) } }
+                }
+                MinesBarProbe.idle = minesBarIdle
                 val bottomReserve =
-                    if (hasFloatingTools) visualOverlayHeight + 14.dp else 20.dp
+                    if (hasFloatingTools && !stepFoldHidesBar && !minesBarIdle) maxOf(visualOverlayHeight + 14.dp, toolBarHeightDp + 12.dp) else 20.dp
                 // T174: when bottomReserve changes (toolbar appearing /
                 // disappearing or thumbnail height shift), re-pin to bottom
                 // if we are currently following. Without this, the new
@@ -4212,6 +4228,34 @@ fun ChatScreen(
                 val perfFirstLayoutFired = remember(sessionId) { java.util.concurrent.atomic.AtomicBoolean(false) }
                 Box {
                 AlwaysStretchOverscrollBox { sharedEffect ->
+                // [Mines-38.9.14.1] one card per task: fold retries / repeated state cards of the same task root into the newest one
+                val minesTasksNow by com.openminis.app.plus.ChatHome.tasks.collectAsState()
+                val minesFold = remember(flatItems, minesTasksNow) {
+                    // [38.9.14.3] 聊天: one row per task (已建任务 folds into the task's state row)
+                    com.openminis.app.plus.ChatHomeCore.foldNotices(flatItems.mapNotNull { (it as? FlatChatItem.MinesTaskItem)?.let { t ->
+                        com.openminis.app.plus.ChatHomeCore.NoticeRef(t.key, t.tag.taskId, t.tag.kind, t.tag.body) } }, { id ->
+                        com.openminis.app.plus.ChatHomeCore.rootKey(minesTasksNow.firstOrNull { it.id == id }, id) }, oneRow = minesHomeGlass)
+                }
+                // [Mines-38.9.14.2 step_fold] one task row per reply's thinking + tool steps (collapsed by default)
+                val stepOpen = remember(sessionId) { androidx.compose.runtime.mutableStateMapOf<String, Boolean>() }
+                val stepWasRunning = remember(sessionId) { HashSet<String>() }
+                val minesSteps = remember(flatItems) { StepFold.groups(flatItems) }
+                LaunchedEffect(minesSteps) {
+                    for (g in minesSteps.values) {
+                        if (g.running) stepWasRunning += g.id
+                        else if (stepWasRunning.remove(g.id)) stepOpen.remove(g.id)   // finished → closes by itself
+                    }
+                }
+                val stepOpenKeys = stepOpen.filterValues { it }.keys.toSet()
+                val shownItems = remember(flatItems, minesSteps, stepOpenKeys) { StepFold.visible(flatItems, minesSteps) { it in stepOpenKeys } }
+                // the FAB jump map must count the rows actually in the list
+                val shownIndex = remember(shownItems) { if (shownItems === flatItems) null else buildMap<String, Int> { shownItems.forEachIndexed { idx, row -> put(row.key, idx) } } }
+                val stepBlockIds = remember(minesSteps) { minesSteps.values.flatMapTo(HashSet()) { it.blockIds } }
+                SideEffect {
+                    if (shownIndex != null) { if (flatRowIndexByKey.value !== shownIndex) flatRowIndexByKey.value = shownIndex }
+                    else if (flatRowIndexByKey.value.size != flatItems.size) flatRowIndexByKey.value = buildMap { flatItems.forEachIndexed { idx, row -> put(row.key, idx) } }
+                    if (minesStepBlockIds != stepBlockIds) minesStepBlockIds = stepBlockIds
+                }
                 LazyColumn(
                     state = listState,
                     reverseLayout = true,
@@ -4370,14 +4414,14 @@ fun ChatScreen(
                     // markdown block; each block draws its own slice of the card (first = rounded top, last = rounded
                     // bottom, middle = straight edges) so selection and per-item measuring are untouched.
                     val minesCardSeg = HashMap<String, Int>()
-                    for (ci in flatItems.indices) {
-                        val cur = flatItems[ci] as? FlatChatItem.AssistantMarkdownBlock ?: continue
-                        val prev = (flatItems.getOrNull(ci - 1) as? FlatChatItem.AssistantMarkdownBlock)?.takeIf { it.rawText.isNotBlank() }
-                        val next = (flatItems.getOrNull(ci + 1) as? FlatChatItem.AssistantMarkdownBlock)?.takeIf { it.rawText.isNotBlank() }
+                    for (ci in shownItems.indices) {
+                        val cur = shownItems[ci] as? FlatChatItem.AssistantMarkdownBlock ?: continue
+                        val prev = (shownItems.getOrNull(ci - 1) as? FlatChatItem.AssistantMarkdownBlock)?.takeIf { it.rawText.isNotBlank() }
+                        val next = (shownItems.getOrNull(ci + 1) as? FlatChatItem.AssistantMarkdownBlock)?.takeIf { it.rawText.isNotBlank() }
                         minesCardSeg[cur.key] = (if (prev?.messageId == cur.messageId) 0 else 1) or (if (next?.messageId == cur.messageId) 0 else 2)
                     }
                     items(
-                        items = flatItems.asReversed(),
+                        items = shownItems.asReversed(),
                         key = { it.key },
                         contentType = { it.contentType },
                     ) { item ->
@@ -4440,6 +4484,13 @@ fun ChatScreen(
                             }
                         }
                         val isNewestItem = item == flatItems.lastOrNull()
+                        val stepGrp = minesSteps[item.key]
+                        androidx.compose.foundation.layout.Column(Modifier.fillMaxWidth()) {
+                        if (stepGrp != null) {
+                            val opened = stepOpen[stepGrp.id] == true
+                            StepFoldRow(stepGrp, opened) { if (opened) stepOpen.remove(stepGrp.id) else stepOpen[stepGrp.id] = true }
+                            if (!opened) return@items
+                        }
                         Box(
                             modifier = Modifier
                                 .alpha(rowAlpha)
@@ -4612,7 +4663,7 @@ fun ChatScreen(
                                 }
                             }
                             // [38.9.11 i32] a blank block (whitespace between tool calls) drew an empty card with ‹ › edges
-                            is FlatChatItem.AssistantMarkdownBlock -> if (item.rawText.isBlank()) androidx.compose.foundation.layout.Spacer(Modifier.height(0.dp)) else com.openminis.app.ui.plus.ReplyCardSlice(minesCardSeg[item.key] ?: 3) { BoundsTrackedBlock(
+                            is FlatChatItem.AssistantMarkdownBlock -> if (item.rawText.isBlank()) androidx.compose.foundation.layout.Spacer(Modifier.height(0.dp)) else com.openminis.app.ui.plus.ReplyCardSlice(minesCardSeg[item.key] ?: 3, soft = minesHomeGlass) { BoundsTrackedBlock(
                                 messageId = item.messageId,
                                 slotKey = "mdblock:${item.parentBlockId}:${item.blockIndex}",
                                 markdown = item.messageMarkdown,
@@ -4675,7 +4726,7 @@ fun ChatScreen(
                             // [T-p2-delegate-render] A helper block gets its
                             // own card; everything else keeps the pill.
                             // [Mines-38.9.14 chat_home] 已建任务 chip / task notice
-                            is FlatChatItem.MinesTaskItem -> com.openminis.app.ui.plus.MinesTaskNotice(item.tag)
+                            is FlatChatItem.MinesTaskItem -> com.openminis.app.ui.plus.MinesTaskNotice(item.tag, minesFold[item.key])
                             is FlatChatItem.AgentCallbackCard -> AgentCallbackCard(
                                 callback = item.callback,
                                 onTap = { callbackDetailBlock = item.callback.syntheticBlock() },
@@ -4860,7 +4911,7 @@ fun ChatScreen(
                                     }
                                     // [Mines-38.9.1] small 「model · account」 tag under every finished reply (hidden while the capsule shows)
                                     // [Mines-38.9.9] footer row: 「model · account」 + a one-tap 复制 (whole reply, plain text)
-                                    if (!shown) Row(
+                                    if (!shown && !minesHomeGlass) Row(   // [38.9.14.2] none on 聊天主页 (复制 is in the long-press menu)
                                         modifier = Modifier.fillMaxWidth(),
                                         verticalAlignment = Alignment.CenterVertically,
                                     ) {
@@ -4909,6 +4960,7 @@ fun ChatScreen(
                             }
                         }
                         } // Box (alpha wrapper)
+                        } // Column (step_fold row + item)
                     }
                     // [T-android-larky-longsession-followup] "Load older
                     // messages" header — placed AFTER items() so under
@@ -4999,6 +5051,12 @@ fun ChatScreen(
                             try { inputFocusRequester.requestFocus() } catch (_: IllegalStateException) {}
                             keyboardController?.show()
                         },
+                        // [Mines-38.9.14.1] 回复: the long-pressed reply becomes the reply target, input focused
+                        onReply = { snippet ->
+                            viewModel.setReplyDraft("Mines", snippet)
+                            try { inputFocusRequester.requestFocus() } catch (_: IllegalStateException) {}
+                            keyboardController?.show()
+                        },
                         // [T-android-selection-readaloud] Speak the selection
                         // through the same screen-scoped lazy player the
                         // Compose-SelectionContainer toolbar uses.
@@ -5056,7 +5114,10 @@ fun ChatScreen(
                 // [T-p2-agent-series] The agent block is just another entry of
                 // the floating tool bar (its background block stays RUNNING);
                 // the standalone capsule is gone.
-                if (lastToolBlocks.isNotEmpty()) {
+                // [Mines-38.9.14.2 step_fold] the strip is a second copy of the folded row's current step: hidden then
+                val barDup = lastToolBlocks.lastOrNull()?.id?.let { it in minesStepBlockIds } == true
+                SideEffect { stepFoldHidesBar = barDup }
+                if (lastToolBlocks.isNotEmpty() && !barDup && !minesBarIdle) {
                     Box(
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
@@ -5914,7 +5975,7 @@ fun ChatScreen(
                         .fillMaxWidth()
                         // [Mines-38.9.6 i12] the composer is the shared input glass (was an opaque card with no rim: 「看不清」):
                         // dense tint (≥ 90 %, it sits over sharp chat text with no blur), soft visible rim, halo outside only
-                        .glassInput(RoundedCornerShape(20.dp), com.openminis.app.ui.plus.glassInputFill(field = true), ChatColors.isDark)
+                        .glassInput(RoundedCornerShape(20.dp), if (minesHomeGlass) com.openminis.app.ui.plus.minesGlassFill(strong = true) else com.openminis.app.ui.plus.glassInputFill(field = true), ChatColors.isDark)
                         // [T-android-context-usage-hint] Ambient inner glow
                         // along the card's inside edge once the context window
                         // is under pressure. Applied to the composer CARD (not
@@ -6249,6 +6310,8 @@ fun ChatScreen(
                     run {
                         val minesQuote by viewModel.quoteDraft.collectAsState()
                         minesQuote?.let { q -> com.openminis.app.ui.plus.QuoteDraftBlock(q) { viewModel.setQuoteDraft(null) } }
+                        val minesReply by viewModel.replyDraft.collectAsState()
+                        minesReply?.let { (who, t) -> com.openminis.app.ui.plus.ReplyDraftBlock(who, t) { viewModel.clearReplyDraft() } }
                     }
                     val recSttState by com.openminis.app.speech.SpeechRecognitionManager
                         .state.collectAsState()
@@ -7650,7 +7713,7 @@ fun ChatScreen(
                 .background(
                     androidx.compose.ui.graphics.Brush.verticalGradient(
                         colors = listOf(
-                            ChatColors.background,
+                            if (minesHomeGlass) androidx.compose.ui.graphics.Color.Transparent else ChatColors.background,
                             ChatColors.background.copy(alpha = 0f),
                         ),
                     )
@@ -8137,4 +8200,5 @@ private fun ThinkingLevelSheet(
     }
 }
 
-
+/** [Mines-38.9.14.3] smoke / 自检: whether 聊天主页 hid the idle floating tool bar on the last composition */
+object MinesBarProbe { @Volatile var idle: Boolean = false }

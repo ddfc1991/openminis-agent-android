@@ -48,7 +48,7 @@ object EncryptedPrefsFactory {
     fun safeCreate(context: Context, fileName: String): SharedPreferences {
         cache.peek(fileName)?.let { return it }
         if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper())
-            Log.w(TAG, "first open of $fileName on the main thread (Keystore; may block)")
+            Log.w(TAG, "first open of $fileName on the main thread (Keystore; may block)", Throwable("main-thread open of $fileName"))   // [38.9.14.2] who
         return cache.get(fileName) { createUncached(context.applicationContext ?: context, fileName) }
     }
 

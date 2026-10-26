@@ -3,6 +3,7 @@ package com.openminis.app.plus
 import com.openminis.app.ui.chat.minesStallWatchdog
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
@@ -53,6 +54,16 @@ class StallWatchCoreTest {
         try { flow { emit(1); emit(2); delay(5_000); emit(3) }.minesStallWatchdog(150).collect { got.add(it) }; fail("no stall") }
         catch (e: com.openminis.app.data.model.LLMError.TransientError) { assertTrue(e.detail.contains("没有新输出")) }
         assertEquals(listOf(1, 2), got)
+    }
+
+    /** [38.9.14.1] smoke 40172410482: a producer stuck in a blocking read (ignores cancellation) must not hold the stall error */
+    @Test fun blockedProducerDoesNotDelayTheStall() = runBlocking {
+        val t0 = System.currentTimeMillis()
+        try {
+            flow { emit(1); Thread.sleep(4_000); emit(2) }.flowOn(kotlinx.coroutines.Dispatchers.IO).minesStallWatchdog(200).toList(); fail("no stall")
+        } catch (e: com.openminis.app.data.model.LLMError.TransientError) { assertTrue(e.detail.contains("没有新输出")) }
+        val dt = System.currentTimeMillis() - t0
+        assertTrue("stall took $dt ms", dt < 2_000)
     }
 
     @Test fun upstreamErrorPassesThrough() = runBlocking {
