@@ -7736,7 +7736,9 @@ fun ChatScreen(
                 .background(
                     androidx.compose.ui.graphics.Brush.verticalGradient(
                         colors = listOf(
-                            if (minesHomeGlass) androidx.compose.ui.graphics.Color.Transparent else ChatColors.background,
+                            // [Mines-38.9.15.1] task chats too: over the sky / wallpaper this opaque 6 dp fade drew a hard line
+                            // under the clear header (smoke 40331094776 i39151-task-page) → same as 聊天主页, nothing there
+                            if (minesHomeGlass || minesChatSky || minesWallpaper) androidx.compose.ui.graphics.Color.Transparent else ChatColors.background,
                             ChatColors.background.copy(alpha = 0f),
                         ),
                     )
