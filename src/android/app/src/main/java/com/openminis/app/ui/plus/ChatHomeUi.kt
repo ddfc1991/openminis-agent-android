@@ -202,7 +202,7 @@ fun ChatHomeRoutingPill(modifier: Modifier = Modifier) {
 fun ChatHomeDock(current: Int, onChat: () -> Unit, onTasks: () -> Unit, onMessages: () -> Unit, onApps: () -> Unit, modifier: Modifier = Modifier) {
     val m = mines()
     val tasks by ChatHome.tasks.collectAsState()
-    val waiting = tasks.count { it.st == ChatHomeCore.St.WAITING || it.st == ChatHomeCore.St.ERROR }
+    val waiting = ChatHomeCore.groups(tasks).first.size   // [38.9.15.1] same count as 任务 → 需要你 (archived tasks no longer counted)
     val shape = RoundedCornerShape(30.dp)
     val items = listOf(
         WarmNavItem("聊天", icH("messages-square"), onClick = onChat),
@@ -538,7 +538,7 @@ fun AllChatsSearch(query: String, resultCount: Int, onQuery: (String) -> Unit, o
 @Composable
 fun NeedYouChip(onOpen: () -> Unit, modifier: Modifier = Modifier) {
     val tasks by ChatHome.tasks.collectAsState()
-    val n = tasks.count { !it.archived && it.st == ChatHomeCore.St.WAITING }
+    val n = ChatHomeCore.groups(tasks).first.size   // [38.9.15.1] same number as the 任务 dock badge and the 需要你 tab
     if (n <= 0) return
     val m = mines()
     Row(modifier.clip(RoundedCornerShape(50)).background(minesGlassFill(strong = true)).border(1.dp, m.glassBorder, RoundedCornerShape(50))

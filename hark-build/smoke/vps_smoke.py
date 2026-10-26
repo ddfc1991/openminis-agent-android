@@ -7594,7 +7594,12 @@ def b39151(res):
         result_json("group", "i3914 main", timeout=20); time.sleep(3)
         r = shot("chat"); t = alltxt(r); o["chat_txt"] = t[:400]
         if old_home(r) or not docked(r): fail("launch: not on 聊天 with the dock")
-        if "需要你 2" not in t and "需要你2" not in t: fail("聊天: no 「需要你 2」 chip")
+        # [smoke fix] earlier gates seed more 等你 tasks than these 2: 「需要你 N」 with N = the 任务 需要你 group (等你 + 出错, not archived)
+        import re as _re
+        mm = _re.search(r"需要你 ?(\d+)", t); w = st().get("need")
+        o["need_chip"] = mm.group(0) if mm else None; o["waiting"] = w
+        if not mm: fail("聊天: no 「需要你 N」 chip")
+        elif isinstance(w, int) and int(mm.group(1)) != w: fail(f"聊天: chip says {mm.group(0)} but {w} tasks wait")
         if "短信验证码已发到" in t: fail("聊天: a task question is shown as a row in 聊天")
         if "在等你" in t: fail("聊天: 「在等你」 bar still shown")
         no_popup("chat")
@@ -8096,7 +8101,9 @@ def b3914(res):
         # [38.9.14.1 net_drop] the one-tap 「任务在后台不断网」 card shows on 聊天 while Mines is not battery-exempt; after the
         # exemption (here: deviceidle whitelist = what the system 「允许」 does) it is gone on resume (emulator is not realme → no step 2)
         r = shot("netkeep-card"); t = _txt(r); o["netkeep_txt"] = t[:200]
-        if "任务在后台不断网" not in t: fail("netkeep: 「任务在后台不断网」 card not shown on 聊天 before the exemption")
+        if I39151:   # [38.9.15.1 quiet] the card is no longer laid over 聊天 (only on 任务, with ✕ 不再提示)
+            if "任务在后台不断网" in t: fail("netkeep: card still laid over 聊天 (38.9.15.1 keeps 聊天 quiet)")
+        elif "任务在后台不断网" not in t: fail("netkeep: 「任务在后台不断网」 card not shown on 聊天 before the exemption")
         one_bar("netkeep-card")
         sh(f"cmd deviceidle whitelist +{PKG}"); time.sleep(1)
         sh("input keyevent KEYCODE_HOME"); time.sleep(2)
@@ -8209,7 +8216,7 @@ def b3914(res):
         else:
             sh(f"input tap {p[0]} {p[1]}"); time.sleep(4)
             r = shot("history"); o["history_txt"] = _txt(r)[:300]
-            one_bar("history", dock=False)
+            one_bar("history", dock=I39151)   # [38.9.15.1] 全部对话 keeps the 4-tab dock (old home never returns)
             back(1); time.sleep(3)
             r = shot("history-back"); t2 = _txt(r); o["history_back_txt"] = t2[:200]
             if "需要你" not in t2 and "等你处理" not in t2: fail("back from 全部对话 did not return to 任务")
@@ -8510,7 +8517,11 @@ def b3914(res):
         r = shot("arch-menu"); m = find(r, "归档", exact=True)
         if not m: fail("archive: long-press shows no 归档 menu"); return
         sh(f"input tap {m[0]} {m[1]}"); time.sleep(0.8)
-        r = shot("arch-undo"); t = tk("arch4"); o["arch_lp"] = t
+        r = shot("arch-undo")
+        for _ in range(4):   # [38.9.15.1 smoke] the 撤销 bar can land just after the first dump (smoke 40311523406: on screen, not in the dump)
+            if find(r, "撤销", exact=True): break
+            time.sleep(0.7); r = dump()
+        t = tk("arch4"); o["arch_lp"] = t
         if not t.get("arch"): fail(f"archive: long-press 归档 did not archive the task {t}")
         if t.get("st") != "error": fail(f"archive: archived 等你 task not stopped (st={t.get('st')})")
         if find(r, "Qq 注册，"): fail("archive: archived task still listed under 等你处理")

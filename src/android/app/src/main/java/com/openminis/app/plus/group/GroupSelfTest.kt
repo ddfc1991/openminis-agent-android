@@ -886,6 +886,7 @@ object GroupSelfTest {
                         .put("tasks", H.tasks.value.size)
                         .put("ids", JSONArray(H.tasks.value.map { it.id }))
                         .put("waiting", H.tasks.value.count { !it.archived && it.st == com.openminis.app.plus.ChatHomeCore.St.WAITING })
+                        .put("need", com.openminis.app.plus.ChatHomeCore.groups(H.tasks.value).first.size)
                         .put("modelLine", com.openminis.app.ui.plus.ChatHomeNav.modelLine.value)
                         .put("loginCard", com.openminis.app.plus.LoginCard.pending.value != null)
                         .put("loginCardOpened", com.openminis.app.plus.LoginCard.opened.value != 0L)
