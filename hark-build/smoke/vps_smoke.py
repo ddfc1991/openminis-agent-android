@@ -8318,7 +8318,16 @@ def b3914(res):
         # swipe left → 归档 (stops the 等你 task), 已归档 lists it with 恢复, the task's own chat ⋮ → 归档任务
         def tk(i): return next((x for x in (state().get("tasks") or []) if x.get("id") == i), {})
         o["arch_seed"] = result_json("group", "i3914 archseed", timeout=30)
-        if not tap_dock("任务"): fail("archive: dock 任务 not found"); return
+        # [38.9.15 smoke fix] experiments() leaves the app on 设置 (route + back(2) can exit to the launcher): bring 聊天 back first
+        ok = tap_dock("任务")
+        if not ok:
+            sh(f"am start -n {PKG}/com.openminis.app.MainActivity"); time.sleep(6); dismiss_dialogs(); ok = tap_dock("任务")
+        if not ok:
+            back(1); time.sleep(2); sh(f"am start -n {PKG}/com.openminis.app.MainActivity"); time.sleep(6); dismiss_dialogs(); ok = tap_dock("任务")
+        if not ok:
+            sh(f"am force-stop {PKG}"); time.sleep(2)
+            sh(f"am start -W -n {PKG}/com.openminis.app.MainActivity", timeout=90); time.sleep(10); dismiss_dialogs(); ok = tap_dock("任务")
+        if not ok: fail("archive: dock 任务 not found"); return
         time.sleep(1.5)
         r = shot("arch-before")
         p = find(r, "Qq 注册")
