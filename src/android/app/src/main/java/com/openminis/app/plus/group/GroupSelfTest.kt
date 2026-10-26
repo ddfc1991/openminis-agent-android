@@ -943,7 +943,7 @@ object GroupSelfTest {
                         H.appendToMain(listOf("user" to g, "assistant" to com.openminis.app.plus.ChatHomeCore.tagText(t.id, com.openminis.app.plus.ChatHomeCore.Kind.CREATED, com.openminis.app.plus.ChatHomeCore.createdLine(t.name))))
                         for ((k, b) in listOf(com.openminis.app.plus.ChatHomeCore.Kind.ERROR to "没完成：Software caused connection abort", com.openminis.app.plus.ChatHomeCore.Kind.ASK to "Software caused connection abort",
                                 com.openminis.app.plus.ChatHomeCore.Kind.ERROR to "没完成：Software caused connection abort", com.openminis.app.plus.ChatHomeCore.Kind.DONE to "完成 · 6/6 步"))
-                            H.appendToMain(listOf("assistant" to com.openminis.app.plus.ChatHomeCore.tagText(t.id, k, b)))
+                        { kotlinx.coroutines.delay(15); H.appendToMain(listOf("assistant" to com.openminis.app.plus.ChatHomeCore.tagText(t.id, k, b))) }   // [38.9.15.1 smoke] distinct timestamps: rows written in the same ms could sort 出错 after 完成 (smoke 40322161537)
                         // [38.9.14.3] its record, like a real run would have written it
                         fun E(a: Long, st: com.openminis.app.plus.ChatHomeCore.St, x: String) = com.openminis.app.plus.TaskRecordCore.Ev(a, st, x)
                         val Q = com.openminis.app.plus.ChatHomeCore.St.QUEUED; val ER = com.openminis.app.plus.ChatHomeCore.St.ERROR

@@ -127,9 +127,18 @@ fun MinesTaskNotice(tag: ChatHomeCore.Tag, fold: ChatHomeCore.Fold? = null) {
             if (live && chip != null) (chip.state + (if (chip.progress.isNotEmpty()) " " + chip.progress else "")) to chip.tone
             else (t?.let { com.openminis.app.plus.TaskRecordCore.stateWord(it) } ?: "已建任务") to (t?.let { ChatHomeCore.chip(it).tone } ?: ChatHomeCore.Tone.IDLE)
         }
-        ChatHomeCore.Kind.ASK -> "等你" to ChatHomeCore.Tone.WAIT
-        ChatHomeCore.Kind.ERROR -> "出错" to ChatHomeCore.Tone.ERR
-        ChatHomeCore.Kind.DONE -> "完成" to ChatHomeCore.Tone.DONE
+        // [38.9.15.1] a state row shows the task's CURRENT state when it has settled (等你 / 出错 / 完成): the folded row no longer
+        // depends on which notice landed last in the chat (smoke 40322161537: 出错 shown for a task that is 完成)
+        else -> when (t?.st) {
+            ChatHomeCore.St.WAITING -> "等你" to ChatHomeCore.Tone.WAIT
+            ChatHomeCore.St.ERROR -> "出错" to ChatHomeCore.Tone.ERR
+            ChatHomeCore.St.DONE -> "完成" to ChatHomeCore.Tone.DONE
+            else -> when (tag.kind) {
+                ChatHomeCore.Kind.ASK -> "等你" to ChatHomeCore.Tone.WAIT
+                ChatHomeCore.Kind.ERROR -> "出错" to ChatHomeCore.Tone.ERR
+                else -> "完成" to ChatHomeCore.Tone.DONE
+            }
+        }
     }
     val c = toneColor(tone)
     val log = logs[tag.taskId].orEmpty()
