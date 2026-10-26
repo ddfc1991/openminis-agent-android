@@ -657,35 +657,9 @@ fun KeychainHost() {
     val ctx = LocalContext.current
     androidx.compose.runtime.remember { Keychain.init(ctx); 0 }
     val alerts by Keychain.alerts.collectAsState()
-    val pending = alerts.firstOrNull { it.second == "new" }?.first
-    var dismissed by remember { mutableStateOf(setOf<String>()) }
     var guide by remember { mutableStateOf<KeychainCore.Alert?>(null) }
     val m = mines()
     // [38.9.15.1] no new-device pop-up sheet (user 2026-10-26: only payment-type confirmations pop): the alert stays in 「消息」
-    if (false && pending != null && pending.key !in dismissed) MinesSheet({ dismissed = dismissed + pending.key }) {
-        Row(Modifier.fillMaxWidth().padding(horizontal = 22.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(42.dp).clip(CircleShape).background(Color(0xFFFCE2DE)), contentAlignment = Alignment.Center) {
-                MinesIcon(ic("shield-alert"), null, tint = Color(0xFFD4382C), modifier = Modifier.size(22.dp))
-            }
-            Spacer(Modifier.width(12.dp))
-            Column {
-                Text("${pending.site} 有新设备登录", fontSize = MT.PageTitle, fontWeight = FontWeight.SemiBold, color = m.ink)
-                Text(listOf(pending.place, fmtTime(pending.at)).filter { it.isNotBlank() }.joinToString(" · "), fontSize = MT.Meta, fontWeight = FontWeight.Medium, color = Color(0xFFD4382C))
-            }
-        }
-        MinesCard(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 10.dp)) {
-            PlusRow(ic("mail"), "账号", value = KeychainCore.maskAccount(pending.account).ifBlank { "—" }, chevron = false)
-            PlusRow(ic("laptop"), "设备", value = pending.device.ifBlank { "没写" }, chevron = false)
-            PlusRow(ic("map-pin"), "位置", value = pending.place.ifBlank { "没写" }, chevron = false)
-        }
-        Text("选「不是我」：我打开它的安全设置页，按步骤改密码、退出这台设备（由你自己点，Mines 不会替你改）。",
-            fontSize = MT.Caption, lineHeight = MT.CaptionLH, color = m.ink2, modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp))
-        Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 12.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            GlassSecondaryPill("是我", Modifier.weight(0.4f)) { Keychain.confirmMe(ctx, pending) }
-            GlassPill("不是我，帮我处理", danger = true, modifier = Modifier.weight(0.6f)) { guide = pending; Keychain.notMe(ctx, pending) }
-        }
-        Text("也在「消息」里留了一条", fontSize = MT.Caption, color = m.ink3, modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
-    }
     guide?.let { g ->
         MinesDialog("${g.site}：按这几步来", { guide = null }, confirm = "打开安全设置", onConfirm = {
             PlusNav.web(KeychainCore.securityUrl(g.host)); guide = null

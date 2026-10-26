@@ -870,23 +870,22 @@ object GroupSelfTest {
             "i39151" -> {
                 val sub = rest.substringBefore(' ').trim()
                 val H = com.openminis.app.plus.ChatHome; H.init(context)
-                val CH = com.openminis.app.plus.ChatHomeCore
                 when (sub) {
                     "needseed" -> {
                         if (H.mainSid.isBlank()) H.ensureMain(context)
                         val now = System.currentTimeMillis()
-                        H.seedForTest(CH.AutoTask("need1", "", "阿里云 QwenPaw 登录", "帮我登录阿里云 QwenPaw", CH.St.WAITING, 3, 6,
+                        H.seedForTest(com.openminis.app.plus.ChatHomeCore.AutoTask("need1", "", "阿里云 QwenPaw 登录", "帮我登录阿里云 QwenPaw", com.openminis.app.plus.ChatHomeCore.St.WAITING, 3, 6,
                             "短信验证码已发到你手机 138****8658，收到发我", now - 240_000, now - 180_000, "waiting"))
-                        H.seedForTest(CH.AutoTask("need2", "", "Railway 注册", "帮我注册 railway.com", CH.St.WAITING, 2, 5,
+                        H.seedForTest(com.openminis.app.plus.ChatHomeCore.AutoTask("need2", "", "Railway 注册", "帮我注册 railway.com", com.openminis.app.plus.ChatHomeCore.St.WAITING, 2, 5,
                             "验证码页要你点一下「我不是机器人」", now - 1_500_000, now - 1_400_000, "waiting"))
-                        H.seedForTest(CH.AutoTask("done1", "", "siyun 内存检查", "看看 siyun 内存", CH.St.DONE, 4, 4,
+                        H.seedForTest(com.openminis.app.plus.ChatHomeCore.AutoTask("done1", "", "siyun 内存检查", "看看 siyun 内存", com.openminis.app.plus.ChatHomeCore.St.DONE, 4, 4,
                             "完成 · 4/4 步", now - 4_000_000, now - 3_900_000, "done"))
                         JSONObject().put("seeded", 3).toString()
                     }
                     "state" -> JSONObject()
                         .put("tasks", H.tasks.value.size)
                         .put("ids", JSONArray(H.tasks.value.map { it.id }))
-                        .put("waiting", H.tasks.value.count { !it.archived && it.st == CH.St.WAITING })
+                        .put("waiting", H.tasks.value.count { !it.archived && it.st == com.openminis.app.plus.ChatHomeCore.St.WAITING })
                         .put("modelLine", com.openminis.app.ui.plus.ChatHomeNav.modelLine.value)
                         .put("loginCard", com.openminis.app.plus.LoginCard.pending.value != null)
                         .put("loginCardOpened", com.openminis.app.plus.LoginCard.opened.value != 0L)
