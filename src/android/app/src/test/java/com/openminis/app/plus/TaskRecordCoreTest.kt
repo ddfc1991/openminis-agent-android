@@ -31,8 +31,8 @@ class TaskRecordCoreTest {
         log = R.append(log, R.diff(err, again, 140))
         val done = again.copy(st = St.DONE, line = "完成 · 5/5 步")
         log = R.append(log, R.diff(again, done, 150))
-        assertEquals(listOf("建立任务：Zeabur 注册", "开始运行", "出错：请求太频繁（429）", "重新开始", "完成：完成 · 5/5 步"), log.map { it.text })
-        assertEquals(log, R.append(log, Ev(160, St.DONE, "完成：完成 · 5/5 步")))   // exact repeat dropped
+        assertEquals(listOf("建立任务：Zeabur 注册", "开始运行", "出错：请求太频繁（429）", "重新开始", "完成：5/5 步"), log.map { it.text })
+        assertEquals(log, R.append(log, Ev(160, St.DONE, "完成：5/5 步")))   // exact repeat dropped
         assertEquals(1, R.retries(log))
         assertEquals(2, R.retries(log, folded = 2))
     }
@@ -69,6 +69,8 @@ class TaskRecordCoreTest {
         assertEquals("assistant", rows[1].first)
         val b = rows[1].second
         listOf("任务记录 · Zeabur 注册", "状态：完成", "进度：2/2 步", "已重试 1 次", "1. ✓ 打开注册页", "时间线", "t200 出错：x").forEach { assertTrue(it, b.contains(it)) }
+        // [38.9.15] the state word shows once (was 「状态：完成 — 完成 · 2/2 步」)
+        assertFalse(b, b.contains("完成 — 完成")); assertFalse(b, b.contains("状态：完成 —"))
         assertNull(R.update(log, 300, fmt))
         assertNotNull(R.update(log + Ev(400, St.RUNNING, "重新开始"), 300, fmt))
     }
@@ -87,5 +89,17 @@ class TaskRecordCoreTest {
         assertFalse(f["c"]!!.show); assertFalse(f["e"]!!.show); assertTrue(f["d"]!!.show)   // task a = its 完成 row only
         assertTrue(f["c2"]!!.show)                                                       // task b still running = its 已建任务 row
         assertTrue(ChatHomeCore.foldNotices(rows, key)["c"]!!.show)                       // other conversations unchanged
+    }
+
+    @Test fun stateWordShownOnce() {
+        val d = base.copy(st = St.DONE, line = "完成 · 6/6 步", step = 6, total = 6)
+        assertEquals("", R.lineOnce(d))
+        assertEquals("已部署到 zeabur.app", R.lineOnce(d.copy(line = "完成 · 已部署到 zeabur.app")))
+        assertEquals("请求太频繁（429）", R.lineOnce(base.copy(st = St.ERROR, line = "没完成：请求太频繁（429）")))
+        assertEquals("需要手机号收短信", R.lineOnce(base.copy(st = St.WAITING, line = "需要手机号收短信")))
+        val b = R.seed(d, emptyList(), emptyList(), 0, fmt)[1].second
+        assertTrue(b, b.contains("- 状态：完成\n")); assertFalse(b, b.contains("完成 — 完成"))
+        assertEquals("已完成", R.details(d, emptyList(), 0, fmt).toMap()["结果"])
+        assertEquals("完成", R.diff(d.copy(st = St.RUNNING), d, 5)!!.text)
     }
 }

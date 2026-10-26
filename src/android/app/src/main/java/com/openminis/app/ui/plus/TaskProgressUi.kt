@@ -341,10 +341,10 @@ fun ArchiveUndoHost() {
     val o by com.openminis.app.plus.ArchiveUndo.offer.collectAsState()
     val cur = o ?: return
     val ctx = androidx.compose.ui.platform.LocalContext.current
-    LaunchedEffect(cur) { kotlinx.coroutines.delay(4000); com.openminis.app.plus.ArchiveUndo.clear(cur) }
+    LaunchedEffect(cur) { kotlinx.coroutines.delay(if (cur.undo != null) 6000 else 4000); com.openminis.app.plus.ArchiveUndo.clear(cur) }
     Box(Modifier.fillMaxSize().navigationBarsPadding().padding(bottom = 72.dp), contentAlignment = Alignment.BottomCenter) {
-        UndoBar("已归档这个对话", onAction = {
-            com.openminis.app.plus.ChatOrganizer.restore(ctx, cur.id); com.openminis.app.plus.ArchiveUndo.clear(cur)
+        UndoBar(cur.label, onAction = {
+            cur.undo?.invoke() ?: com.openminis.app.plus.ChatOrganizer.restore(ctx, cur.id); com.openminis.app.plus.ArchiveUndo.clear(cur)
         })
     }
 }

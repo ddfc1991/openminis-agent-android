@@ -1,8 +1,10 @@
+@file:OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 package com.openminis.app.ui.plus
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -299,7 +301,10 @@ private fun TaskGroup(list: List<ChatHomeCore.AutoTask>, go: (String) -> Unit) {
             val chip = ChatHomeCore.chip(t)
             val tone = toneColor(chip.tone)
             val ctx = LocalContext.current
-            Row(Modifier.fillMaxWidth().clickable { openTaskTalk(ctx, t.id) }.heightIn(min = 60.dp).padding(horizontal = 16.dp, vertical = 10.dp)
+            // [38.9.15 task_archive] swipe left → 归档, long-press → 归档 (a 等你 / 进行中 task is stopped); 撤销 at the bottom
+            ArchiveSwipe(onArchive = { ChatHome.archiveTask(ctx, t.id) }) { longPress ->
+            Row(Modifier.fillMaxWidth().combinedClickable(onClick = { openTaskTalk(ctx, t.id) }, onLongClick = longPress, onLongClickLabel = "归档")
+                .heightIn(min = 60.dp).padding(horizontal = 16.dp, vertical = 10.dp)
                 .semantics(mergeDescendants = true) { contentDescription = "${t.name}，${chip.state}。${t.line.ifBlank { t.goal }}" },
                 verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.size(8.dp).clip(CircleShape).background(tone))
@@ -315,6 +320,29 @@ private fun TaskGroup(list: List<ChatHomeCore.AutoTask>, go: (String) -> Unit) {
                     Text(hm(t.updatedAt.coerceAtLeast(t.createdAt)), fontSize = MT.Meta, color = m.ink2, maxLines = 1, modifier = Modifier.padding(top = 3.dp))
                 }
             }
+            }
+        }
+    }
+}
+
+/** [38.9.15 task_archive] archived 聊天 tasks inside 任务 → 已归档: tap opens its own conversation, 恢复 brings it back */
+@Composable
+fun ArchivedTaskRows(list: List<ChatHomeCore.AutoTask>) {
+    val m = mines()
+    val ctx = LocalContext.current
+    list.forEach { t ->
+        WarmDivider(start = 16.dp)
+        Row(Modifier.fillMaxWidth().clickable { openTaskTalk(ctx, t.id) }.heightIn(min = 60.dp).padding(horizontal = 16.dp, vertical = 10.dp)
+            .semantics(mergeDescendants = true) { contentDescription = "已归档任务 ${t.name}" }, verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(8.dp).clip(CircleShape).background(m.ink3))
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(t.name, fontSize = MT.Body, fontWeight = FontWeight.Medium, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text("任务 · 归档于 " + hm(t.archivedAt), fontSize = MT.Caption, color = m.ink2, maxLines = 1)
+            }
+            Text("恢复", fontSize = MT.Meta, fontWeight = FontWeight.SemiBold, color = m.primaryText, maxLines = 1, softWrap = false,
+                modifier = Modifier.clip(RoundedCornerShape(50)).clickable { ChatHome.restoreTask(ctx, t.id) }
+                    .semantics { contentDescription = "恢复 ${t.name}" }.background(m.primary.copy(alpha = 0.12f)).padding(horizontal = 12.dp, vertical = 6.dp))
         }
     }
 }

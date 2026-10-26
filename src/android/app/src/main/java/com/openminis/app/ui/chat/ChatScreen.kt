@@ -3289,7 +3289,18 @@ fun ChatScreen(
                                     onClick = { showChatMenu = false; minesProgressOpen = true },
                                     leadingIcon = { MenuItemIcon(com.openminis.app.ui.plus.WarmIcons.of("list-checks") ?: com.openminis.app.ui.plus.WarmIcons.of("check")!!) },
                                 )
-                                DropdownMenuItem(
+                                // [38.9.15 task_archive] in a task's own conversation (or its run) the item archives the TASK: off the 任务
+                                // lists, a waiting / running task stopped, 撤销 at the bottom; 取消归档 brings it back
+                                val minesTaskMenu = com.openminis.app.plus.ChatHome.taskOfChat(minesSidMenu)
+                                if (minesTaskMenu != null) DropdownMenuItem(
+                                    text = { Text(if (minesTaskMenu.archived) "取消归档任务" else "归档任务") },
+                                    onClick = {
+                                        showChatMenu = false
+                                        if (minesTaskMenu.archived) com.openminis.app.plus.ChatHome.restoreTask(minesCtxMenu, minesTaskMenu.id)
+                                        else com.openminis.app.plus.ChatHome.archiveTask(minesCtxMenu, minesTaskMenu.id)
+                                    },
+                                    leadingIcon = { MenuItemIcon(com.openminis.app.ui.plus.WarmIcons.of("archive")!!) },
+                                ) else DropdownMenuItem(
                                     text = { Text(if (com.openminis.app.plus.ChatOrganizer.isManual(minesSidMenu)) "取消归档" else "归档") },
                                     onClick = {
                                         showChatMenu = false

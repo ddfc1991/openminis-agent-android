@@ -191,6 +191,51 @@ object ChatHome {
         s.id
     }
 
+    // ── [38.9.15 task_archive] manual 归档 (任务 page long-press / swipe, the task's own chat ⋮) with 撤销 ──
+
+    /** the task whose own conversation (「打开」) or run conversation is [sid] */
+    fun taskOfChat(sid: String?): AutoTask? {
+        if (sid.isNullOrBlank()) return null
+        val byTalk = synchronized(talks) { talks.entries.firstOrNull { it.value.first == sid }?.key }
+        return byTalk?.let { task(it) } ?: taskOf(sid)
+    }
+
+    /**
+     * 归档 a task: off 等你处理 / 进行中 / 已完成, into 已归档 (任务 page) and 全部对话 → 已归档 (its conversations). A waiting /
+     * running task is stopped. 撤销 (4 s bar) puts it back exactly as it was. Returns false when the task is unknown.
+     */
+    fun archiveTask(c: Context, id: String, offerUndo: Boolean = true): Boolean {
+        init(c)
+        val before = task(id) ?: return false
+        if (before.archived) return true
+        val now = System.currentTimeMillis()
+        update(id) { ChatHomeCore.archive(it, now) }
+        // a run still going is cancelled; a 等你 task has no loop running (its question waits in its conversation), so its
+        // progress row is left alone and 撤销 brings back the same 等你
+        if (before.st == St.RUNNING || before.st == St.QUEUED) {
+            inRunner.remove(id)
+            if (!isExternal(before.sid) && before.sid.isNotBlank()) scope.launch {
+                runCatching { com.openminis.app.debug.HeadlessChatRunner.cancel(c, before.sid) }
+                runCatching { TaskProgress.stop(before.sid) }
+            }
+        }
+        val sids = listOfNotNull(before.sid.takeIf { it.isNotBlank() && !isExternal(it) }, talkOf(id))
+        sids.forEach { ChatOrganizer.archive(c, it, offerUndo = false) }
+        if (offerUndo) ArchiveUndo.offer(id, "已归档任务「${before.name}」") { restoreTask(c, id, before) }
+        return true
+    }
+
+    /** 撤销 / 恢复: [before] = the snapshot taken at 归档 (null = 恢复 from 已归档 later; a stopped task stays stopped) */
+    fun restoreTask(c: Context, id: String, before: AutoTask? = null): Boolean {
+        init(c)
+        val cur = task(id) ?: return false
+        val now = System.currentTimeMillis()
+        update(id) { ChatHomeCore.unarchive(it, before, now) }
+        listOfNotNull(cur.sid.takeIf { it.isNotBlank() && !isExternal(it) }, talkOf(id)).forEach { ChatOrganizer.restore(c, it) }
+        pump()
+        return true
+    }
+
     // ── [Mines-38.9.15 register_auto] tasks run by Mines itself (no conversation): one row, notices like any task ──
 
     fun isExternal(sid: String?): Boolean = sid?.startsWith(RegisterAuto.SID_PREFIX) == true
@@ -346,6 +391,7 @@ object ChatHome {
                 synchronized(this@ChatHome) {
                     _tasks.value = _tasks.value.map { t ->
                         if (isExternal(t.sid)) return@map t   // [38.9.15 register_auto] its state comes from RegisterAuto only
+                        if (t.archived) return@map t   // [38.9.15 task_archive] stopped by 归档; 撤销 / 恢复 brings it back
                         val live = t.sid in running || t.id in inRunner
                         var n = ChatHomeCore.onProgress(t, p[t.sid], live, now)
                         // the user went on inside a finished / waiting task: running again, its next end is told again
@@ -418,7 +464,7 @@ object ChatHome {
         .put("last", lastDecision?.let { "${it.route.name}:${it.name}:${if (it.byModel) "model" else "rule"}" } ?: "")
         .put("tasks", JSONArray().apply {
             _tasks.value.forEach { t -> put(JSONObject().put("id", t.id).put("sid", t.sid).put("name", t.name).put("st", t.st.id)
-                .put("step", t.step).put("total", t.total).put("line", t.line).put("told", t.told)
+                .put("step", t.step).put("total", t.total).put("line", t.line).put("told", t.told).put("arch", t.archivedAt)
                 .put("log", _logs.value[t.id].orEmpty().size).put("talk", talkOf(t.id) ?: "")) }
         }).toString()
 }

@@ -37,11 +37,31 @@ object TaskProjects {
             _on.value = p.getBoolean("on", true)
             _projects.value = TaskProjectsCore.fromJson(p.getString("projects", "[]"))
             declined = p.getStringSet("declined", emptySet()).orEmpty().toSet()
+            _archived.value = runCatching { val o = org.json.JSONObject(p.getString("archived", "{}") ?: "{}"); o.keys().asSequence().associateWith { o.optLong(it) } }.getOrDefault(emptyMap())
             app = c.applicationContext
         }
     }
 
     private fun prefs() = app?.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+
+    // [38.9.15 task_archive] projects never auto-archive, but the user can archive one by hand (任务 page long-press / swipe)
+    private val _archived = MutableStateFlow<Map<String, Long>>(emptyMap())
+    val archived: StateFlow<Map<String, Long>> = _archived.asStateFlow()
+    fun isArchived(id: String): Boolean = _archived.value.containsKey(id)
+    private fun saveArchived() { prefs()?.edit()?.putString("archived", org.json.JSONObject(_archived.value as Map<*, *>).toString())?.apply() }
+    fun archive(c: Context, id: String) {
+        init(c)
+        val p = _projects.value.firstOrNull { it.id == id } ?: return
+        _archived.value = _archived.value + (id to System.currentTimeMillis()); saveArchived()
+        p.attempts.forEach { ChatOrganizer.archive(c, it.sid, offerUndo = false) }
+        ArchiveUndo.offer(id, "已归档项目「${p.name}」") { restore(c, id) }
+    }
+    fun restore(c: Context, id: String) {
+        init(c)
+        if (!_archived.value.containsKey(id)) return
+        _archived.value = _archived.value - id; saveArchived()
+        _projects.value.firstOrNull { it.id == id }?.attempts?.let { a -> ChatOrganizer.restoreAll(c, a.map { it.sid }) }
+    }
     private fun save() { prefs()?.edit()?.putString("projects", TaskProjectsCore.toJson(_projects.value))?.apply() }
 
     fun setOn(c: Context, v: Boolean) { init(c); _on.value = v; prefs()?.edit()?.putBoolean("on", v)?.apply(); if (!v) _proposal.value = null }

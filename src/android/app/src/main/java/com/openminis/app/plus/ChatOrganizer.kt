@@ -99,11 +99,11 @@ object ChatOrganizer {
     }
 
     /** [Mines-38.9.6 i12] one-tap archive (progress card, row long-press, chat menu). */
-    fun archive(context: Context, id: String) {
+    fun archive(context: Context, id: String, offerUndo: Boolean = true) {
         init(context)
         _manual.value = _manual.value + (id to System.currentTimeMillis())
         saveManual()
-        ArchiveUndo.offer(id)
+        if (offerUndo) ArchiveUndo.offer(id)
     }
 
     fun isManual(id: String): Boolean = _manual.value.containsKey(id)
@@ -160,9 +160,11 @@ object ChatOrganizer {
 
 /** [Mines-38.9.6 i12] 「已归档 · 撤销」 for ~4 s after a one-tap archive (shown by ArchiveUndoHost at the activity root). */
 object ArchiveUndo {
-    data class Offer(val id: String, val at: Long)
+    /** [38.9.15 task_archive] [label] = the bar's text; [undo] = what 撤销 does (null = restore conversation [id]) */
+    data class Offer(val id: String, val at: Long, val label: String = "已归档这个对话", val undo: (() -> Unit)? = null)
     private val _offer = MutableStateFlow<Offer?>(null)
     val offer: StateFlow<Offer?> = _offer.asStateFlow()
     fun offer(id: String) { _offer.value = Offer(id, System.currentTimeMillis()) }
+    fun offer(id: String, label: String, undo: () -> Unit) { _offer.value = Offer(id, System.currentTimeMillis(), label, undo) }
     fun clear(o: Offer) { if (_offer.value == o) _offer.value = null }
 }

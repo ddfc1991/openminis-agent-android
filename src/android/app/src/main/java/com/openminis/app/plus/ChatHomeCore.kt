@@ -97,7 +97,11 @@ object ChatHomeCore {
         val createdAt: Long = 0L, val updatedAt: Long = 0L,
         /** the state whose notice was already posted into 聊天 ("" = none yet) */
         val told: String = "",
-    )
+        /** [38.9.15 task_archive] when the user archived it by hand (0 = not archived) */
+        val archivedAt: Long = 0L,
+    ) {
+        val archived: Boolean get() = archivedAt > 0L
+    }
 
     /** a task the gate let start */
     fun started(t: AutoTask, now: Long): AutoTask = t.copy(st = St.RUNNING, updatedAt = now)
@@ -142,7 +146,7 @@ object ChatHomeCore {
     fun resumed(t: AutoTask, now: Long): AutoTask = if (t.st == St.QUEUED) t else t.copy(st = St.RUNNING, told = "", updatedAt = now)
 
     /** a notice goes into 聊天 once per 等你 / 出错 / 完成 */
-    fun needsNotice(t: AutoTask): Boolean = t.st in setOf(St.WAITING, St.ERROR, St.DONE) && t.told != t.st.id
+    fun needsNotice(t: AutoTask): Boolean = !t.archived && t.st in setOf(St.WAITING, St.ERROR, St.DONE) && t.told != t.st.id
 
     /** first 160 characters of a reply without markdown noise */
     fun summary(reply: String): String = reply.lineSequence().map { it.trim().trimStart('#', '>', '-', '*', ' ') }.filter { it.isNotEmpty() && !it.startsWith("```") }
@@ -160,7 +164,7 @@ object ChatHomeCore {
         !heapCritical && autoRunning < AUTO_CAP && allRunning < maxAll - 1
 
     /** oldest queued first */
-    fun nextQueued(tasks: List<AutoTask>): AutoTask? = tasks.filter { it.st == St.QUEUED }.minByOrNull { it.createdAt }
+    fun nextQueued(tasks: List<AutoTask>): AutoTask? = tasks.filter { it.st == St.QUEUED && !it.archived }.minByOrNull { it.createdAt }
 
     // ── chip ──
 
@@ -177,9 +181,38 @@ object ChatHomeCore {
 
     /** 任务 page groups: 等你处理 (等你 + 出错) / 进行中 (进行中 + 排队) / 已完成, newest first */
     fun groups(tasks: List<AutoTask>): Triple<List<AutoTask>, List<AutoTask>, List<AutoTask>> {
-        val s = tasks.sortedByDescending { it.updatedAt.coerceAtLeast(it.createdAt) }
+        val s = tasks.filter { !it.archived }.sortedByDescending { it.updatedAt.coerceAtLeast(it.createdAt) }
         return Triple(s.filter { it.st == St.WAITING || it.st == St.ERROR }, s.filter { it.st == St.RUNNING || it.st == St.QUEUED }, s.filter { it.st == St.DONE })
     }
+
+    // ── [38.9.15 task_archive] manual archive (user 2026-10-26 10:14 「这个页面没办法手动归档」) ──
+
+    const val ARCHIVED_LINE = "已归档，任务已停止"
+
+    /** the task is still going / waiting: archiving it also stops it */
+    fun live(t: AutoTask): Boolean = t.st == St.WAITING || t.st == St.RUNNING || t.st == St.QUEUED
+
+    /**
+     * 归档: off the 任务 lists (等你处理 / 进行中 / 已完成), into 已归档. A 等你 / 进行中 / 排队 task is stopped too (出错 with
+     * [ARCHIVED_LINE]); no notice is posted for it (told = its new state).
+     */
+    fun archive(t: AutoTask, now: Long): AutoTask =
+        if (live(t)) t.copy(st = St.ERROR, line = ARCHIVED_LINE, told = St.ERROR.id, archivedAt = now, updatedAt = now)
+        else t.copy(archivedAt = now, told = t.st.id)
+
+    /**
+     * 撤销 / 恢复: [before] = the task as it was right before 归档 (the undo snapshot), null when unknown (恢复 later). A task
+     * that was running goes back to 排队 so it runs again; 等你 stays 等你 (its question is still in its conversation).
+     */
+    fun unarchive(cur: AutoTask, before: AutoTask?, now: Long): AutoTask {
+        val b = before?.takeIf { it.id == cur.id }
+        if (b == null) return cur.copy(archivedAt = 0L)
+        val st = if (b.st == St.RUNNING) St.QUEUED else b.st
+        return b.copy(st = st, archivedAt = 0L, updatedAt = now, told = if (st == b.st) b.told else "")
+    }
+
+    /** 已归档 list, newest archive first */
+    fun archivedList(tasks: List<AutoTask>): List<AutoTask> = tasks.filter { it.archived }.sortedByDescending { it.archivedAt }
 
     // ── what the main chat stores (assistant rows, no model turn) ──
 
@@ -253,7 +286,7 @@ object ChatHomeCore {
     fun toJson(l: List<AutoTask>): String = JSONArray().apply {
         l.forEach { t ->
             put(JSONObject().put("id", t.id).put("sid", t.sid).put("n", t.name).put("g", t.goal).put("st", t.st.id).put("s", t.step)
-                .put("t", t.total).put("l", t.line).put("c", t.createdAt).put("u", t.updatedAt).put("told", t.told))
+                .put("t", t.total).put("l", t.line).put("c", t.createdAt).put("u", t.updatedAt).put("told", t.told).put("a", t.archivedAt))
         }
     }.toString()
 
@@ -262,7 +295,7 @@ object ChatHomeCore {
         (0 until a.length()).map { i ->
             val o = a.getJSONObject(i)
             AutoTask(o.optString("id"), o.optString("sid"), o.optString("n"), o.optString("g"), St.of(o.optString("st")),
-                o.optInt("s"), o.optInt("t"), o.optString("l"), o.optLong("c"), o.optLong("u"), o.optString("told"))
+                o.optInt("s"), o.optInt("t"), o.optString("l"), o.optLong("c"), o.optLong("u"), o.optString("told"), o.optLong("a"))
         }
     }.getOrDefault(emptyList())
 }

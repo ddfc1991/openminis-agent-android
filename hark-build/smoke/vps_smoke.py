@@ -7534,6 +7534,7 @@ def b3915(res):
         if not any("伪人核心" in x for x in seen): fail("实验功能: 伪人核心 row missing")
         back(2)
     step("experiments", experiments)
+
     print("I3915 RESULT " + json.dumps(o, ensure_ascii=False)[:6000], flush=True)
 
 
@@ -8219,6 +8220,7 @@ def b3914(res):
         shot("tf-final")
     step("taskfold", taskfold)
 
+
     def nocall():
         # [38.9.14.1] the 来电 (MinesCallActivity) feature is removed: no 提醒/来电 rows on 应用, no activity in the manifest, no crash
         if not tap_dock("应用"): fail("nocall: dock 应用 not found"); return
@@ -8310,6 +8312,84 @@ def b3914(res):
         if not any("聊天主页" in x for x in seen): fail("实验功能: 聊天主页 row missing")
         back(2)
     step("experiments", experiments)
+
+    def archive():
+        # [38.9.15 task_archive] user 2026-10-26 10:14 「这个页面没办法手动归档」 (their 任务 page: 5 等你 tasks): long-press → 归档 + 撤销,
+        # swipe left → 归档 (stops the 等你 task), 已归档 lists it with 恢复, the task's own chat ⋮ → 归档任务
+        def tk(i): return next((x for x in (state().get("tasks") or []) if x.get("id") == i), {})
+        o["arch_seed"] = result_json("group", "i3914 archseed", timeout=30)
+        if not tap_dock("任务"): fail("archive: dock 任务 not found"); return
+        time.sleep(1.5)
+        r = shot("arch-before")
+        p = find(r, "Qq 注册")
+        if not p: fail("archive: seeded 等你 task Qq 注册 not on 任务"); return
+        # long-press → menu 归档
+        sh(f"input swipe {p[0]} {p[1]} {p[0]} {p[1]} 1000"); time.sleep(1.2)
+        r = shot("arch-menu"); m = find(r, "归档", exact=True)
+        if not m: fail("archive: long-press shows no 归档 menu"); return
+        sh(f"input tap {m[0]} {m[1]}"); time.sleep(0.8)
+        r = shot("arch-undo"); t = tk("arch4"); o["arch_lp"] = t
+        if not t.get("arch"): fail(f"archive: long-press 归档 did not archive the task {t}")
+        if t.get("st") != "error": fail(f"archive: archived 等你 task not stopped (st={t.get('st')})")
+        if find(r, "Qq 注册，"): fail("archive: archived task still listed under 等你处理")
+        u = find(r, "撤销", exact=True)
+        if not u: fail("archive: no 撤销 bar after 归档")
+        else:
+            sh(f"input tap {u[0]} {u[1]}"); time.sleep(1.5)
+            t = tk("arch4"); o["arch_undo"] = t
+            if t.get("arch") or t.get("st") != "waiting": fail(f"archive: 撤销 did not bring the task back as 等你 {t}")
+            if not find(dump(), "Qq 注册"): fail("archive: task not back on 任务 after 撤销")
+        time.sleep(6.5)   # let the bar go
+        # swipe left → 归档 button
+        r = dump(); p = find(r, "Doroai 注册")
+        if not p: fail("archive: Doroai 注册 not on 任务"); return
+        sh(f"input swipe {int(SCREEN[0] * 0.85)} {p[1]} {int(SCREEN[0] * 0.25)} {p[1]} 350"); time.sleep(1.2)
+        r = shot("arch-swipe"); b = find(r, "归档", exact=True)
+        if not b: fail("archive: swipe left shows no 归档 button"); return
+        sh(f"input tap {b[0]} {b[1]}"); time.sleep(1.2)
+        t = tk("arch5"); o["arch_swipe"] = t
+        if not t.get("arch") or t.get("st") != "error": fail(f"archive: swipe 归档 did not archive + stop the task {t}")
+        r = shot("arch-after")
+        if find(r, "Doroai 注册，"): fail("archive: swiped task still listed")
+        # 已归档 lists it with 恢复
+        q = None
+        for _ in range(6):
+            r = dump(); q = find(r, "已归档 ")
+            if q: break
+            scroll_down()
+        if not q: fail("archive: 已归档 card not found"); return
+        sh(f"input tap {q[0]} {q[1]}"); time.sleep(1.5)
+        for _ in range(3):
+            r = dump()
+            if find(r, "已归档任务 Doroai 注册"): break
+            scroll_down()
+        r = shot("arch-list")
+        if not find(r, "已归档任务 Doroai 注册"): fail("archive: 已归档 does not list the archived task")
+        rv = find(r, "恢复 Doroai 注册")
+        if rv:
+            sh(f"input tap {rv[0]} {rv[1]}"); time.sleep(1.5)
+            t = tk("arch5"); o["arch_restore"] = t
+            if t.get("arch"): fail(f"archive: 恢复 did not un-archive {t}")
+        else: fail("archive: no 恢复 on the archived task")
+        # the task's own conversation: ⋮ → 归档任务
+        tv = result_json("group", "i3914 talk arch3", timeout=30) or {}
+        sid = tv.get("sid") if isinstance(tv, dict) else None
+        if not sid: fail(f"archive: no conversation for arch3 {tv}"); return
+        result_json("group", "i3914 open " + sid, timeout=15); time.sleep(3)
+        r = dump(); mm = find(r, "更多", exact=True)
+        if not mm: fail("archive: ⋮ 更多 not found in the task chat"); return
+        sh(f"input tap {mm[0]} {mm[1]}"); time.sleep(1.2)
+        r = shot("arch-talk-menu"); it = find(r, "归档任务", exact=True)
+        if not it: fail("archive: task chat ⋮ has no 归档任务"); back(1); return
+        sh(f"input tap {it[0]} {it[1]}"); time.sleep(1.2)
+        t = tk("arch3"); o["arch_talk"] = t
+        if not t.get("arch"): fail(f"archive: ⋮ 归档任务 did not archive {t}")
+        back(1); time.sleep(2)
+        if tap_dock("任务"):
+            time.sleep(1); r = shot("arch-final")
+            if find(r, "做一个反代，"): fail("archive: task archived from its chat still on 任务")
+        tap_dock("聊天"); time.sleep(1)
+    step("archive", archive)
     print("I3914 RESULT " + json.dumps(o, ensure_ascii=False)[:6000], flush=True)
     print("I3914 KEYS " + json.dumps({k: o.get(k) for k in ("breaker_runs", "breakers_end", "pip_tile", "pip_strip", "pip_last", "pip_last_text",
                                                             "stepfold_rows", "stepfold_posts", "stepfold_refold_txt")}, ensure_ascii=False)[:4000], flush=True)

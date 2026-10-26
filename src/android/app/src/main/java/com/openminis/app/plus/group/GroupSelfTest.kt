@@ -922,6 +922,19 @@ object GroupSelfTest {
                             E(now - 20_000, RN, "重新开始"), E(now - 1_000, DN, "完成：完成 · 6/6 步")))
                         JSONObject().put("seeded", t.id).toString()
                     }
+                    // [38.9.15 task_archive] the user's 任务 page of 2026-10-26 10:13: five 等你 tasks (two of them sign-ups) + one done,
+                    // for 归档 by long-press / swipe / the task chat's ⋮ and 撤销
+                    "archseed" -> {
+                        if (H.mainSid.isBlank()) H.ensureMain(context)
+                        val now = System.currentTimeMillis()
+                        val W = com.openminis.app.plus.ChatHomeCore.St.WAITING
+                        listOf(Triple("arch1", "那么账号关联这里有没有办法解决…", "等你回复"), Triple("arch2", "Moli还是太强了，路很狠：不需", "等你回复"),
+                            Triple("arch3", "做一个反代，反代hark你试下", "模型没响应（40 秒没有新输出）"), Triple("arch4", "Qq 注册", "需要手机号收短信，卡在 movil-registro"),
+                            Triple("arch5", "Doroai 注册", "等你回复")).forEachIndexed { i, (id, n, l) ->
+                            H.seedForTest(com.openminis.app.plus.ChatHomeCore.AutoTask(id, "", n, n, W, i % 3, 5, l, now - 600_000L * (i + 1), now - 60_000L * (i + 1), "waiting"))
+                        }
+                        JSONObject().put("seeded", 5).toString()
+                    }
                     // [38.9.14.2] trip every crash / hang breaker the way the realme did (hang count 3, crash force-home window,
                     // a stall log + several launches without a clean exit) and make the NEXT cold start stall 3.5 s on the
                     // main thread; 'i3914 breakers' reports what they say now
@@ -954,7 +967,7 @@ object GroupSelfTest {
                         JSONObject().put("sid", text).toString()
                     }
                     "rows" -> JSONObject().put("sid", text).put("rows", rowsOf(app, text)).put("barIdle", com.openminis.app.ui.chat.MinesBarProbe.idle).toString()
-                    else -> "i3914 main | say <text> | state | foldseed | trip | breakers | talk <taskId> | open <sid> | rows <sid>"
+                    else -> "i3914 main | say <text> | state | foldseed | archseed | trip | breakers | talk <taskId> | open <sid> | rows <sid>"
                 }
             }
             "i39113" -> {

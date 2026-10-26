@@ -1,8 +1,10 @@
+@file:OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 package com.openminis.app.ui.plus
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -134,7 +136,13 @@ fun TasksScreen(onBack: () -> Unit, go: (String) -> Unit) {
     val projSids = projects.flatMap { p -> p.attempts.map { it.sid } }.toSet()
     // [Mines-38.9.14 chat_home] 聊天 itself and its auto tasks are not 小任务 (auto tasks are listed in AutoTasksSection)
     val chatHome = com.openminis.app.plus.ChatHome.enabled()
-    val autoSids = if (chatHome) com.openminis.app.plus.ChatHome.tasks.collectAsState().value.map { it.sid }.toSet() else emptySet()
+    val autoAll = if (chatHome) com.openminis.app.plus.ChatHome.tasks.collectAsState().value else emptyList()
+    val autoSids = autoAll.map { it.sid }.toSet()
+    // [38.9.15 task_archive] hand-archived 聊天 tasks and projects go to 已归档 (with 恢复)
+    val archProj by TaskProjects.archived.collectAsState()
+    val archivedTasks = com.openminis.app.plus.ChatHomeCore.archivedList(autoAll)
+    val liveProjects = projects.filter { it.id !in archProj }
+    val archivedProjects = projects.filter { it.id in archProj }
     val small = sessions.filter { it.id !in projSids && (!chatHome || (it.id != com.openminis.app.plus.ChatHome.mainSid && it.id !in autoSids)) }
     val (archived, live) = small.partition { ChatOrganizer.isArchived(it, now) }
 
@@ -164,9 +172,9 @@ fun TasksScreen(onBack: () -> Unit, go: (String) -> Unit) {
         }
 
         AutoTasksSection(go, projSids)   // [Mines-38.9.14 chat_home] 等你处理 / 进行中 / 已完成 (nothing while the flag is off)
-        WarmGroupLabel("项目  ${projects.size} 个 · 不自动归档", "注册台账 ›") { go(Routes3912.REGISTER) }
-        if (projects.isEmpty()) InfoLine("还没有项目。小任务变成注册 / 开通账号时，会问你要不要立项。")
-        projects.sortedByDescending { p -> p.attempts.maxOfOrNull { tasks[it.sid]?.updatedAt ?: it.at } ?: p.createdAt }.forEach { p ->
+        WarmGroupLabel("项目  ${liveProjects.size} 个 · 不自动归档", "注册台账 ›") { go(Routes3912.REGISTER) }
+        if (liveProjects.isEmpty()) InfoLine(if (archivedProjects.isNotEmpty()) "其余项目在下面「已归档」里。" else "还没有项目。小任务变成注册 / 开通账号时，会问你要不要立项。")
+        liveProjects.sortedByDescending { p -> p.attempts.maxOfOrNull { tasks[it.sid]?.updatedAt ?: it.at } ?: p.createdAt }.forEach { p ->
             ProjectCard(p, tasks, go)
         }
 
@@ -179,16 +187,30 @@ fun TasksScreen(onBack: () -> Unit, go: (String) -> Unit) {
             }
         }
 
+        val archTotal = archived.size + archivedTasks.size + archivedProjects.size
         MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp), onClick = { openArchive = !openArchive }) {
             Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).padding(horizontal = 16.dp).semantics(mergeDescendants = true) {
-                contentDescription = "已归档 ${archived.size} 个，" + if (openArchive) "点一下收起" else "点一下展开" }, verticalAlignment = Alignment.CenterVertically) {
+                contentDescription = "已归档 $archTotal 个，" + if (openArchive) "点一下收起" else "点一下展开" }, verticalAlignment = Alignment.CenterVertically) {
                 MinesIcon(icT("archive"), null, tint = m.ink2, modifier = Modifier.size(22.dp))
                 Spacer(Modifier.width(12.dp))
-                Text("已归档 (${archived.size})", fontSize = MT.Body, fontWeight = FontWeight.SemiBold, color = m.ink)
+                Text("已归档 ($archTotal)", fontSize = MT.Body, fontWeight = FontWeight.SemiBold, color = m.ink)
                 Spacer(Modifier.width(10.dp))
                 Text("可搜回、可恢复", fontSize = MT.Sub, color = m.ink2, modifier = Modifier.weight(1f), maxLines = 1)
                 MinesIcon(icT(if (openArchive) "chevron-up" else "chevron-down"), null, tint = m.ink2, modifier = Modifier.size(20.dp))
             }
+            if (openArchive) archivedProjects.forEach { p ->
+                WarmDivider(start = 16.dp)
+                Row(Modifier.fillMaxWidth().heightIn(min = 60.dp).clickable { go(TaskRoutes.project(p.id)) }.padding(horizontal = 16.dp, vertical = 10.dp)
+                    .semantics(mergeDescendants = true) { contentDescription = "已归档项目 ${p.name}" }, verticalAlignment = Alignment.CenterVertically) {
+                    Avatar(TaskProjectsCore.brand(p.site), p.site, 34)
+                    Column(Modifier.weight(1f).padding(start = 12.dp)) {
+                        Text(p.name, fontSize = MT.Body, fontWeight = FontWeight.Medium, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text("项目 · 共 ${p.attempts.size} 次", fontSize = MT.Sub, color = m.ink2, maxLines = 1)
+                    }
+                    SmallPill("恢复") { TaskProjects.restore(ctx, p.id) }
+                }
+            }
+            if (openArchive) ArchivedTaskRows(archivedTasks.take(60))
             if (openArchive) archived.take(60).forEach { s ->
                 WarmDivider(start = 16.dp)
                 SmallRow(s, true, now, go)
@@ -213,8 +235,13 @@ private fun ProjectCard(p: TaskProjectsCore.Project, tasks: Map<String, TaskProg
     val m = mines()
     val latest = p.attempts.maxByOrNull { it.n }
     val st = latest?.let { tasks[it.sid]?.st }
-    MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp), onClick = { go(TaskRoutes.project(p.id)) }) {
-        Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+    val ctxP = LocalContext.current
+    MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp)) {
+        // [38.9.15 task_archive] swipe left / long-press on the project's head row → 归档 (撤销 at the bottom)
+        ArchiveSwipe(onArchive = { TaskProjects.archive(ctxP, p.id) }) { longPress ->
+        Row(Modifier.fillMaxWidth().combinedClickable(onClick = { go(TaskRoutes.project(p.id)) }, onLongClick = longPress, onLongClickLabel = "归档")
+            .semantics(mergeDescendants = true) { contentDescription = "项目 ${p.name}" }
+            .padding(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
             Avatar(TaskProjectsCore.brand(p.site), p.site)
             Column(Modifier.weight(1f).padding(start = 12.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -225,6 +252,7 @@ private fun ProjectCard(p: TaskProjectsCore.Project, tasks: Map<String, TaskProg
                 Text("$chip · 共 ${p.attempts.size} 次", fontSize = MT.Sub, color = m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 3.dp))
             }
             if (latest != null) WordPill(stWord(st), stColor(st))
+        }
         }
         p.attempts.sortedByDescending { it.n }.take(3).forEach { a ->
             WarmDivider(start = 16.dp)
@@ -261,10 +289,13 @@ private fun SmallRow(s: ChatSessionEntity, archived: Boolean, now: Long, go: (St
     val kind = TaskProjectsCore.kindOf(s.title.orEmpty(), s.lastMessage.orEmpty())
     val title = TaskProjectsCore.titleFor(TaskProjects.projects.value, s.id)
         ?: TaskProjectsCore.smallTitle(s.title.orEmpty().ifBlank { "新对话" }, kind)
-    Row(Modifier.fillMaxWidth().heightIn(min = 60.dp).clickable {
+    // [38.9.15 task_archive] a live 小任务 row: swipe left / long-press → 归档 (撤销 at the bottom); archived rows keep 恢复
+    val row: @Composable (() -> Unit) -> Unit = { longPress ->
+    Row(Modifier.fillMaxWidth().heightIn(min = 60.dp).combinedClickable(onClick = {
             if (archived) ChatOrganizer.restore(ctx, s.id)
             go(TaskRoutes.chat(s.id))
-        }.padding(horizontal = 16.dp, vertical = 10.dp).semantics(mergeDescendants = true) { contentDescription = title },
+        }, onLongClick = if (archived) null else longPress, onLongClickLabel = if (archived) null else "归档")
+        .padding(horizontal = 16.dp, vertical = 10.dp).semantics(mergeDescendants = true) { contentDescription = title },
         verticalAlignment = Alignment.CenterVertically) {
         MinesIcon(icT(when { proj != null -> "user"; kind == TaskProjectsCore.Kind.ARTICLE -> "file-text"; kind == TaskProjectsCore.Kind.QUESTION -> "info"; else -> "messages-square" }),
             null, tint = m.ink2, modifier = Modifier.size(22.dp))
@@ -279,6 +310,8 @@ private fun SmallRow(s: ChatSessionEntity, archived: Boolean, now: Long, go: (St
                 ?.takeIf { s.pinnedAt == null }?.let { WordPill(it, m.ink2) }
         }
     }
+    }
+    if (archived) row {} else ArchiveSwipe(onArchive = { ChatOrganizer.archive(ctx, s.id) }) { lp -> row(lp) }
 }
 
 // ───────────────────────────── 项目详情 ─────────────────────────────

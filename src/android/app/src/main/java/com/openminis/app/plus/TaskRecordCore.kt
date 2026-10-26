@@ -32,7 +32,7 @@ object TaskRecordCore {
             St.RUNNING -> if (prev.st == St.ERROR || prev.st == St.WAITING || prev.st == St.DONE) "重新开始" else "开始运行"
             St.WAITING -> "等你：" + next.line.ifBlank { "需要你回复" }
             St.ERROR -> "出错：" + next.line.removePrefix("没完成：").ifBlank { "出错了" }
-            St.DONE -> "完成：" + next.line.ifBlank { "已完成" }
+            St.DONE -> lineOnce(next).let { if (it.isBlank()) "完成" else "完成：$it" }
         }
         return Ev(now, next.st, t)
     }
@@ -50,6 +50,18 @@ object TaskRecordCore {
         val errs = log.count { it.st == St.ERROR }
         val endsInError = log.lastOrNull()?.st == St.ERROR
         return maxOf(folded, if (endsInError) errs - 1 else errs).coerceAtLeast(0)
+    }
+
+    /**
+     * [38.9.15] the line without the state word it repeats: 「完成 · 6/6 步」 under 状态：完成 showed 「完成 — 完成 · 6/6 步」.
+     * Drops a leading state word (+ separators) and a remainder that only repeats the step count shown on its own line.
+     */
+    fun lineOnce(t: AutoTask): String {
+        var l = t.line.trim().removePrefix("没完成：").trim()
+        val words = listOf(stateWord(t), t.st.label, "已完成", "完成", "出错", "等你")
+        for (w in words) if (l.startsWith(w)) { l = l.removePrefix(w).trimStart(' ', '·', '—', '-', '：', ':', '，', ','); break }
+        if (t.total > 0 && l.matches(Regex("""\d+\s*/\s*\d+\s*步"""))) l = ""
+        return l.trim()
     }
 
     fun stateWord(t: AutoTask): String = when (t.st) {
@@ -72,8 +84,8 @@ object TaskRecordCore {
         out += "原始请求" to t.goal.trim().ifBlank { t.name }
         val now = when (t.st) {
             St.WAITING -> t.line.ifBlank { "需要你回复" }
-            St.ERROR -> t.line.removePrefix("没完成：").ifBlank { "出错了" }
-            St.DONE -> t.line.ifBlank { "已完成" }
+            St.ERROR -> lineOnce(t).ifBlank { "出错了" }
+            St.DONE -> lineOnce(t).ifBlank { "已完成" }
             St.RUNNING -> if (t.total > 0) "第 ${t.step.coerceAtMost(t.total)}/${t.total} 步" else "正在运行"
             St.QUEUED -> "排队等待"
         }
@@ -93,7 +105,7 @@ object TaskRecordCore {
         val b = StringBuilder()
         b.append("**任务记录 · ").append(t.name).append("**\n\n")
         b.append("- 状态：").append(stateWord(t))
-        t.line.takeIf { it.isNotBlank() }?.let { b.append(" — ").append(it.removePrefix("没完成：")) }
+        lineOnce(t).takeIf { it.isNotBlank() }?.let { b.append(" — ").append(it) }
         b.append('\n')
         if (t.total > 0) b.append("- 进度：").append(t.step.coerceAtMost(t.total)).append('/').append(t.total).append(" 步\n")
         if (retries > 0) b.append("- 已重试 ").append(retries).append(" 次\n")
