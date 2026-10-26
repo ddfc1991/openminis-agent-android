@@ -874,7 +874,8 @@ internal fun buildFlatChatItems(
                             )))
                             return@forEachIndexed
                         }
-                        val rawFragments = splitMarkdownIntoBlockTexts(block.content)
+                        // [Mines-38.9.15.1] a finished reply drops gratuitous emoji / stray 「**」 (code untouched; stored text unchanged)
+                        val rawFragments = splitMarkdownIntoBlockTexts(if (blockIsStreaming) block.content else com.openminis.app.plus.ReplyTidy.tidy(block.content))
                         // [T-android-stream-end-reflow-flicker-v18] Preserve
                         // per-fragment FlatChatItem keys across the
                         // streaming→idle boundary. Previously the trailing

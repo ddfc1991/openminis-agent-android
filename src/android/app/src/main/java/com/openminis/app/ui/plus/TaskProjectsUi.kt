@@ -146,7 +146,7 @@ fun TasksScreen(onBack: () -> Unit, go: (String) -> Unit) {
     val small = sessions.filter { it.id !in projSids && (!chatHome || (it.id != com.openminis.app.plus.ChatHome.mainSid && it.id !in autoSids)) }
     val (archived, live) = small.partition { ChatOrganizer.isArchived(it, now) }
 
-    PlusPage("任务", onBack, actions = {
+    PlusPage("任务", onBack, clearHeader = true, actions = {
         Box(Modifier.size(44.dp).clip(CircleShape).clickable { searching = !searching; if (!searching) q = "" }
             .semantics { contentDescription = if (searching) "关闭搜索" else "搜索任务" }, contentAlignment = Alignment.Center) {
             MinesIcon(icT(if (searching) "x" else "search"), null, tint = m.ink, modifier = Modifier.size(22.dp))

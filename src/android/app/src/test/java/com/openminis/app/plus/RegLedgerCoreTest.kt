@@ -145,4 +145,19 @@ class RegLedgerCoreTest {
     @Test fun renewScriptNeverPays() {
         assertTrue(RegLedgerCore.RENEW_JS.contains("付款")); assertTrue(RegLedgerCore.RENEW_JS.contains("renew"))
     }
+
+    // [38.9.15.1] the 台账 account's own temp box is where its sign-in code is read
+    @Test fun boxesForSiteNewestFirst() {
+        val recs = listOf(
+            Rec("old@dcpa.net", "zeabur.com", createdAt = 1L, updatedAt = 1L),
+            Rec("new@dcpa.net", "dash.zeabur.com", createdAt = 5L, updatedAt = 9L),
+            Rec("shared@dcpa.net", "railway.com", createdAt = 2L),
+            Rec("shared@dcpa.net", "zeabur.com", createdAt = 3L),
+            Rec("ip@dcpa.net", "1.2.3.4", url = "https://panel.zeabur.com/login", createdAt = 4L))
+        assertEquals(listOf("new@dcpa.net", "ip@dcpa.net", "shared@dcpa.net", "old@dcpa.net"), RegLedgerCore.boxesFor(recs, "https://www.zeabur.com/login"))
+        assertTrue(RegLedgerCore.boxesFor(recs, "github.com").isEmpty())
+        assertTrue(RegLedgerCore.boxOnlyFor(recs, "old@dcpa.net", "zeabur.com"))
+        assertFalse(RegLedgerCore.boxOnlyFor(recs, "shared@dcpa.net", "zeabur.com"))
+    }
+
 }

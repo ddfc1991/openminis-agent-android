@@ -858,15 +858,40 @@ fun ChatSplitScaffoldRoute(
     skillRepository: com.openminis.app.data.repository.SkillRepository?,
     mcpRepository: com.openminis.app.data.repository.MCPRepository?,
 ) {
+    // [Mines-38.9.15.1 chat_home] user 2026-10-26 13:43 「这个页面按道理应该不会再出现才对」: every CHAT entry builds a list/detail
+    // pane pair, and back in the pane (top arrow or system back) showed its LIST pane = the old home (avatar, greeting,
+    // 最近对话, no dock). 38.9.14.2 only guarded the main conversation's entry; a chat opened from a notice / deep link /
+    // launch auto-resume (back stack [SESSION_LIST, chat/x]) or a chat switched in-pane from 聊天 still fell through.
+    // With 聊天主页 on (phone), a CHAT entry never shows the list pane, and 全部对话 (SESSION_LIST) is the restyled list.
+    val chCtx = androidx.compose.ui.platform.LocalContext.current
+    com.openminis.app.plus.ChatHome.init(chCtx)
+    val chOn by com.openminis.app.plus.ChatHome.on.collectAsState()
+    val homeOn = chOn && com.openminis.app.plus.ChatHome.loaded && !shouldUseTwoPane()
+    val chScope = androidx.compose.runtime.rememberCoroutineScope()
+    // 聊天 (the main conversation) as the only entry above the list; [then] = a dock page to open on top (任务 for 全部对话 back)
+    val goMain: (String?) -> Unit = { then ->
+        chScope.launch {
+            val main = com.openminis.app.plus.ChatHome.existingMain(chCtx) ?: com.openminis.app.plus.ChatHome.ensureMain(chCtx) ?: return@launch
+            runCatching {
+                navController.navigate(Routes.chat(main)) { popUpTo(Routes.SESSION_LIST) { inclusive = false } }
+                if (then != null) navController.navigate(then) { launchSingleTop = true }
+            }
+        }
+    }
     ChatSplitScaffold(
         initialSessionId = initialSessionId,
         listPane = { selectedSessionId, draftPlaceholderId, onSessionSelected ->
-            // [Mines-38.9.14.1 chat_home] 聊天 (the main conversation's CHAT entry) never shows the old list pane on a phone —
-            // not after back, not after a state restore: it goes straight back to the main conversation.
-            if (initialSessionId != null && com.openminis.app.plus.ChatHome.isMain(initialSessionId) && !shouldUseTwoPane()) {
-                androidx.compose.runtime.LaunchedEffect(initialSessionId) { onSessionSelected(initialSessionId) }
+            // [Mines-38.9.14.1 / 38.9.15.1 chat_home] a CHAT entry never shows the old list pane on a phone — not after back,
+            // not after a state restore: 聊天 goes back to itself, any other chat goes to 聊天.
+            if (homeOn && initialSessionId != null) {
+                androidx.compose.runtime.LaunchedEffect(initialSessionId) {
+                    if (com.openminis.app.plus.ChatHome.isMain(initialSessionId)) onSessionSelected(initialSessionId) else goMain(null)
+                }
                 androidx.compose.foundation.layout.Box(Modifier.fillMaxSize())
             } else com.openminis.app.ui.sessions.SessionListScreen(
+                // [38.9.15.1] 全部对话: no avatar / greeting / 最近对话 header, a 全部对话 title bar + the 4-tab dock
+                chatHomeAll = homeOn,
+                onAllBack = { goMain(com.openminis.app.ui.plus.TaskRoutes.TASKS) },
                 chatRepository = chatRepository,
                 providerRepository = providerRepository,
                 // Selecting a session drives the PANE navigator, not the
@@ -895,14 +920,23 @@ fun ChatSplitScaffoldRoute(
         detailPane = { sessionId, onBackInPane, onNewChatInPane, onMoveToInPane,
             onToggleSidebar, sidebarCollapsed ->
             // [Mines-38.9.14 chat_home] a task chat opened from 聊天 / 任务 goes back there, not to this entry's old list pane
-            val chatHomeBack = com.openminis.app.plus.ChatHome.enabled() && !com.openminis.app.plus.ChatHome.isMain(sessionId) &&
-                navController.previousBackStackEntry?.destination?.route.let { it != null && it != Routes.SESSION_LIST }
-            androidx.activity.compose.BackHandler(enabled = chatHomeBack) { navController.safePopBackStack() }
+            val prevRoute = navController.previousBackStackEntry?.destination?.route
+            val isMainNow = com.openminis.app.plus.ChatHome.isMain(sessionId)
+            val inChatEntry = homeOn && initialSessionId != null
+            // [38.9.15.1] a chat switched in-pane from 聊天 (new chat / task chip): back = 聊天 again, not the list pane
+            val inPaneFromMain = inChatEntry && !isMainNow && com.openminis.app.plus.ChatHome.isMain(initialSessionId)
+            val chatHomeBack = inChatEntry && !isMainNow && !inPaneFromMain && prevRoute != null && prevRoute != Routes.SESSION_LIST
+            // [38.9.15.1] a chat whose entry sits right on the list (notice / deep link / launch resume): back = 聊天
+            val chatHomeToMain = inChatEntry && !isMainNow && !inPaneFromMain && !chatHomeBack
             // [Mines-38.9.14.1 chat_home] 聊天 is the root: back sends Mines to the background (launcher), never to the old list
-            val chatHomeRoot = initialSessionId != null && com.openminis.app.plus.ChatHome.isMain(initialSessionId) &&
-                com.openminis.app.plus.ChatHome.isMain(sessionId) && !shouldUseTwoPane()
+            val chatHomeRoot = inChatEntry && isMainNow
             val rootCtx = androidx.compose.ui.platform.LocalContext.current
             val toLauncher: () -> Unit = { rootCtx.findActivity()?.moveTaskToBack(true) }
+            val backToMainPane: () -> Unit = { initialSessionId?.let { onMoveToInPane(it) } }
+            val backToMain: () -> Unit = { goMain(null) }
+            androidx.activity.compose.BackHandler(enabled = chatHomeBack) { navController.safePopBackStack() }
+            androidx.activity.compose.BackHandler(enabled = inPaneFromMain) { backToMainPane() }
+            androidx.activity.compose.BackHandler(enabled = chatHomeToMain) { backToMain() }
             androidx.activity.compose.BackHandler(enabled = chatHomeRoot) { toLauncher() }
             com.openminis.app.ui.chat.ChatScreen(
                 // The pane navigator's contentKey IS the session id, so a
@@ -918,7 +952,9 @@ fun ChatSplitScaffoldRoute(
                 // whether that means "hide the detail" or "pop to the list").
                 onBack = when {
                     chatHomeRoot -> toLauncher
+                    inPaneFromMain -> backToMainPane
                     chatHomeBack -> ({ navController.safePopBackStack(); Unit })
+                    chatHomeToMain -> backToMain
                     else -> onBackInPane
                 },
                 hideBack = chatHomeRoot,

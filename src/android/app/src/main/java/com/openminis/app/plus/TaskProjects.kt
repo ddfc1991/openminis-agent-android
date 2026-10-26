@@ -93,11 +93,21 @@ object TaskProjects {
         if (sid !in declined) propose(sid, site, "注册", contact)
     }
 
+    /**
+     * [38.9.15.1] 立项 is silent (user 2026-10-26 14:12 「现在动不动就弹窗，我受不了了」, 14:16 「弹窗弹的全部东西要我填，我真不知道」): no
+     * sheet. The project is filed at once from what Mines already knows — the site from the message / the page / the 台账, the
+     * account from the 台账 when it holds exactly one for that site, today's date. Unknown fields stay empty; nothing is asked.
+     * With no site yet the conversation waits quietly until the agent's register_pick / register_done names one.
+     */
     private fun propose(sid: String, site: String, verb: String, contact: String) {
         if (ChatHome.isMain(sid)) return   // [Mines-38.9.14 chat_home] 聊天 itself is never a project (its background tasks are)
-        val cur = _proposal.value
-        if (cur != null && cur.sid == sid && cur.site.isNotBlank()) return
-        _proposal.value = Proposal(sid, TaskProjectsCore.hostOf(site), verb, contact.ifBlank { cur?.contact.orEmpty() })
+        val c = app ?: return
+        val host = TaskProjectsCore.hostOf(site)
+        if (host.isBlank()) return
+        val acct = contact.ifBlank {
+            runCatching { Ledger.cands(c, host).map { it.account }.distinct().singleOrNull() }.getOrNull().orEmpty()
+        }
+        confirm(c, sid, host, verb, "", acct, today())
     }
 
     fun decline(sid: String) {
@@ -154,6 +164,24 @@ object TaskProjects {
         return _projects.value.flatMap { p -> p.accounts.filter { it.contact.isNotBlank() }.map { p to it } }
             .filter { (p, a) -> have.none { LedgerCore.sameSite(it.host, p.site) && it.account.equals(a.contact, true) } }
             .map { (p, a) -> Inbox3912Core.RegRow(p.site, a.contact, "立项 ${a.date} · ${p.name} · 密码在手机自动填充", Inbox3912Core.RegSt.SAVED) }
+    }
+
+    /** [38.9.15.1] once per day at most: older tasks without a project get their 台账 account (silent, no sheet) */
+    fun backfill(c: Context, tasks: List<ChatHomeCore.AutoTask>) {
+        init(c)
+        if (!enabled()) return
+        val p = prefs() ?: return
+        val now = System.currentTimeMillis()
+        if (now - p.getLong("backfill_at", 0L) < 86_400_000L) return
+        p.edit().putLong("backfill_at", now).apply()
+        val ledger = runCatching {
+            RegLedger.recs.value.sortedByDescending { maxOf(it.updatedAt, it.createdAt) }.map { it.host to it.box } +
+                SavedLogins.all(c).map { Keychain.hostOf(it.url).ifBlank { it.name } to it.user }
+        }.getOrDefault(emptyList())
+        val plan = TaskProjectsCore.backfillPlan(_projects.value,
+            tasks.filter { !ChatHome.isExternal(it.sid) }.map { Triple(it.sid, it.name + "\n" + it.goal, it.createdAt) }, ledger, now)
+        plan.forEach { b -> runCatching { confirm(c, b.sid, b.host, "注册", "", b.account, today()) } }
+        if (plan.isNotEmpty()) com.openminis.app.logging.AppLogger.info("TaskProjects", "backfill linked ${plan.size} task(s)")
     }
 
     fun today(): String = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date())

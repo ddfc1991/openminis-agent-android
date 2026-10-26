@@ -645,11 +645,11 @@ class MainActivity : ComponentActivity() {
                 // [Mines-38.9.5 i] secure login card (first sign-in / refused password / code that never came)
                 com.openminis.app.ui.plus.LoginCardHost()
                 // [Mines-38.9.15] 「选一个 X 账号」 card: several saved accounts, none linked → the user picks (never auto)
-                com.openminis.app.ui.plus.AccountPickHost()
+                // [38.9.15.1] removed: Mines picks a recorded account itself (SignIn.run) — no 选账号 card
                 // [Mines-38.9.13 handoff_v2] 「{任务} · 需要你…」 popup + bar with 去那个页面 / 继续接管 (any conversation)
                 com.openminis.app.ui.plus.HandoffHost()
                 // [Mines-38.9.11.3] 「已用 台账：邮箱」 · 换一个 · 设为默认 (non-blocking)
-                com.openminis.app.ui.plus.LedgerChipHost()
+                // [38.9.15.1] removed: no 「已用 台账 · 换一个 · 设为默认」 prompt chip (quiet by default; 账号台账 still switches)
                 // [Mines-38.9.11.3] 「复制崩溃日志」 after a crash / ANR (redacted)
                 com.openminis.app.ui.plus.CrashCardHost()
                 // [Mines-38.9.11.3] 远程诊断: 「来自诊断：…」 banner + 「允许发送截图？」
@@ -657,7 +657,7 @@ class MainActivity : ComponentActivity() {
                 // [Mines-38.9.6 i12] 「已归档 · 撤销」 after a one-tap archive
                 com.openminis.app.ui.plus.ArchiveUndoHost()
                 // [Mines-38.9.13 task_projects] 「这个任务已变成注册 → 立项」 sheet
-                com.openminis.app.ui.plus.TaskProjectSheetHost()
+                // [38.9.15.1] no 立项 sheet any more: 立项 is filed silently (TaskProjects.propose)
                 // [Mines-38.7] blurred copy of the app under glass dialogs / sheets (replaces FLAG_BLUR_BEHIND)
                 com.openminis.app.ui.plus.GlassBackdropLayer()
             }

@@ -67,8 +67,13 @@ internal class FreshProcessShell(
         val token = java.util.UUID.randomUUID().toString()
         val statusFile = File(exitDir, token)
         statusHandle = statusFile
+        // [Mines-38.9.15.1] a long script / heredoc goes through a file, not one argv string (E2BIG at 128 KiB)
+        val scriptFile = if (LongCommand.needsFile(command)) File(exitDir, "$token.sh").takeIf { f ->
+            runCatching { f.writeText(LongCommand.fileText(command), Charsets.UTF_8); true }.getOrDefault(false)
+        } else null
+        val runCommand = if (scriptFile != null) LongCommand.runner("/$EXIT_DIR_NAME/${scriptFile.name}") else command
         val process = try {
-            spawn(command, envVars, "/$EXIT_DIR_NAME/$token")
+            spawn(runCommand, envVars, "/$EXIT_DIR_NAME/$token")
         } catch (e: Exception) {
             Log.e(TAG, "[$sessionId] spawn failed: ${e.message}")
             return@withContext Pair("$SPAWN_FAILED_PREFIX ${e.message}]", -1)
@@ -224,6 +229,7 @@ internal class FreshProcessShell(
         statusHandle = null
         runCatching { statusFile.delete() }
         runCatching { File(statusFile.path + ".pid").delete() }
+        runCatching { File(statusFile.path + ".sh").delete() }   // [38.9.15.1] LongCommand script
 
         if (stopped) {
             // A user-initiated Stop is not a timeout: it must not be reported

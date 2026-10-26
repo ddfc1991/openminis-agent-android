@@ -91,13 +91,60 @@ object ModelScoreCore {
         val fails = calls.filter { it.failed }
         val sameTwice = fails.groupBy { it.tool + "|" + it.sig }.values.any { it.size >= 2 }
         val unsure = Regex("不确定|不太清楚|可能是|也许|i'm not sure|not sure|unclear").containsMatchIn(lastText.lowercase())
+        // [38.9.15.1] 「问题我看它都不会切」: also the last 3 calls failed in a row, or the model keeps saying it is redoing things
+        val lastThreeFailed = calls.size >= 3 && calls.takeLast(3).all { it.failed }
+        val redo = redoLines(lastText)
         return when {
-            sameTwice -> "这步卡了两次，换了更强的模型"
-            fails.size >= 3 -> "连续出错 ${fails.size} 次，换了更强的模型"
-            kind == Kind.PLAN && unsure && fails.isNotEmpty() -> "模型拿不准，换了更强的模型来判断"
+            sameTwice -> "同一步失败了两次"
+            lastThreeFailed -> "连续 3 步失败"
+            fails.size >= 3 -> "出错 ${fails.size} 次"
+            redo >= 3 -> "反复重做同一件事"
+            kind == Kind.PLAN && unsure && fails.isNotEmpty() -> "模型拿不准"
             else -> null
         }
     }
+
+    /**
+     * [38.9.15.1] lines where the model narrates a redo / work-around (「命令有点乱。重发干净版。」「heredoc 被工具搞坏了。写到文件再跑。」
+     * 「没输出，先验证…」): 3 of them in one run = a retry loop even when every tool call technically "succeeded".
+     */
+    private val redoRe = Regex("重发|重跑|再跑|重新跑|再试|重试|改用|换个办法|换种|搞坏|损坏|截断|没输出|没有输出|又失败|还是失败|还是不行|不行，|报错了|重来|又报错|try again|retry|corrupt|truncat")
+    fun redoLines(text: String): Int = text.lines().count { it.isNotBlank() && redoRe.containsMatchIn(it.lowercase()) }
+
+    /** [38.9.15.1] model family by id (DeepSeek / MiMo / Qwen / GLM …): a stuck run switches FAMILY, not just account */
+    fun family(modelId: String): String {
+        val s = modelId.lowercase().substringAfterLast('/')
+        listOf("deepseek", "mimo", "qwen", "qwq", "glm", "kimi", "moonshot", "gemini", "gemma", "claude", "gpt", "o1", "o3", "o4", "grok",
+            "llama", "mistral", "minimax", "abab", "doubao", "hunyuan", "ernie", "yi-", "baichuan", "step", "internlm", "intern", "phi", "nova", "command")
+            .firstOrNull { s.contains(it) }?.let { return if (it == "qwq") "qwen" else if (it == "moonshot") "kimi" else if (it == "abab") "minimax" else it.trimEnd('-') }
+        return s.substringBefore('-').substringBefore(':').ifBlank { s }
+    }
+
+    data class Member(val member: String, val key: String, val modelId: String)
+    data class Pick(val target: Member?, val why: String)
+
+    /**
+     * [38.9.15.1] where a stuck run goes (user 15:02 「模型就这些模型基本都是flash」):
+     *  1. a really stronger model (tier above the current one) — only if one is configured;
+     *  2. else another FAMILY (MiMo ↔ DeepSeek …), best score, not cooling / recently bad;
+     *  3. else another model of the same family; 4. else the same model on another account.
+     * The caller also raises 思考 one level ([boostLevel]) and hands over a compact summary instead of the noisy transcript.
+     */
+    fun pickEscalation(cands: List<Member>, cur: Member, stats: (String) -> Stats?, cooling: (Member) -> Boolean, now: Long,
+                       webBusy: Boolean = false): Pick {
+        val ok = cands.filter { it.member != cur.member && !cooling(it) && !recentBad(stats(it.key), now) && !(webBusy && webMember(it.modelId)) }
+        val curTier = tier(cur.modelId)
+        fun best(l: List<Member>) = l.maxByOrNull { score(it.modelId, stats(it.key), now) }
+        best(ok.filter { tier(it.modelId) > curTier })?.let { return Pick(it, "换更强的模型") }
+        val fam = family(cur.modelId)
+        best(ok.filter { family(it.modelId) != fam })?.let { return Pick(it, "换另一家模型") }
+        best(ok.filter { it.modelId != cur.modelId })?.let { return Pick(it, "换同家另一个模型") }
+        ok.firstOrNull { it.modelId == cur.modelId }?.let { return Pick(it, "换账号重来") }
+        return Pick(null, "只提高思考强度")
+    }
+
+    /** [38.9.15.1] 思考 one step up (高 → 极高), capped at what the model supports; null = no change possible */
+    fun <L : Comparable<L>> boostLevel(cur: L, supported: List<L>): L? = supported.sorted().firstOrNull { it > cur }
 
     data class Cand(val key: String, val modelId: String)
 
@@ -110,12 +157,33 @@ object ModelScoreCore {
             ?.takeIf { score(it.modelId, stats(it.key), now) > curScore + 0.25 }
     }
 
-    /** next fallback after a 429 / 5xx: the same model on another account first, then the best working one (never a web member) */
-    fun <T> nextFallback(list: List<T>, curModelId: String, modelOf: (T) -> String, keyOf: (T) -> String, stats: (String) -> Stats?, now: Long): T? {
+    /**
+     * next fallback after a 429 / 5xx / stall: the same model on another account first, then the best working one (never a web
+     * member). [38.9.15.1] 「同模型先轮换账号再降级」: the same-model step looks only at the ACCOUNT's own cool-down ([cooling], keyed
+     * per group member). The score key is provider-type|model, shared by all 14 AMD accounts, so one account's time-out used to
+     * mark every AMD account of that model bad and the turn dropped straight to a weaker model.
+     */
+    fun <T> nextFallback(list: List<T>, curModelId: String, modelOf: (T) -> String, keyOf: (T) -> String, stats: (String) -> Stats?, now: Long,
+                         cooling: (T) -> Boolean = { false }): T? {
         val usable = list.filter { !webMember(modelOf(it)) }.ifEmpty { list }
-        usable.firstOrNull { modelOf(it) == curModelId && !recentBad(stats(keyOf(it)), now) }?.let { return it }
-        return usable.filter { !recentBad(stats(keyOf(it)), now) }.maxByOrNull { score(modelOf(it), stats(keyOf(it)), now) } ?: list.firstOrNull()
+        val fresh = usable.filter { !cooling(it) }
+        fresh.firstOrNull { modelOf(it) == curModelId }?.let { return it }
+        val pool = fresh.ifEmpty { usable }
+        return pool.filter { !recentBad(stats(keyOf(it)), now) }.maxByOrNull { score(modelOf(it), stats(keyOf(it)), now) } ?: pool.firstOrNull()
     }
+
+    /** [38.9.15.1] per-account (group member) cool-down after a stall / 429 / 5xx / time-out; cleared by the member's next answer */
+    class AccountCool(private val ms: Long = COOL_MS) {
+        private val until = HashMap<String, Long>()
+        @Synchronized fun mark(member: String, now: Long) { if (member.isNotBlank()) until[member] = now + ms }
+        @Synchronized fun clear(member: String) { until.remove(member) }
+        @Synchronized fun cooling(member: String, now: Long): Boolean = (until[member] ?: 0L) > now
+    }
+
+    /** [38.9.15.1] a stall: retry the same member only when no other account of the same model is free (else rotate at once) */
+    fun <T> stallRotateNow(cands: List<T>, curMember: String, curModelId: String, memberOf: (T) -> String, modelOf: (T) -> String,
+                           cooling: (T) -> Boolean): Boolean =
+        cands.any { memberOf(it) != curMember && modelOf(it) == curModelId && !cooling(it) }
 
     /** compact hand-over for the stronger model: the task, what was tried, what failed */
     fun summary(task: String, calls: List<Call>, briefs: List<String>): String {

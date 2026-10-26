@@ -199,12 +199,13 @@ object SignIn {
         val root = Keychain.root(site).ifBlank { site }
         val ways = waysFor(c, root)
         if (SignInCore.needsPick(ways, effectiveLink(c, sid, root), named)) {
-            runCatching { TaskProgress.onWaiting(sid, "等你选 $root 用哪个账号") }
-            val ans = AccountPick.ask(c, AccountPick.Req(root, task, SignInCore.pickChoices(ways)))
-                ?: return Outcome.NoPick("$root 有好几个账号，用户还没选用哪个。不要自己挑，也不要换别的账号试；等用户在「选账号」卡片上点一个（任务已标成等你处理）。")
-            val l = SignInCore.Link(ans.way.group, ans.way.account, byUser = true)
-            if (ans.remember) { taskChoice.remove(sid + "|" + root); setLink(c, root, l) } else taskChoice[sid + "|" + root] = l
-            runCatching { TaskProgress.onTurnStart(sid) }
+            // [38.9.15.1] no 「选账号」 card any more (user 2026-10-26 14:18 「记录在案的他就可以调用，不是查看」, 14:16 「动不动就弹，显得
+            // 它没脑记忆」 — replaces the 2026-10-25 「Mines 不替你挑」 rule): Mines picks a recorded account itself — the one this task's
+            // project used, else the first saved one — and remembers it as the site's link, so it is never asked again
+            val choices = SignInCore.pickChoices(ways)
+            val projAcct = runCatching { TaskProjects.projectOf(sid)?.accounts?.lastOrNull { it.contact.isNotBlank() }?.contact }.getOrNull()
+            val pick = choices.firstOrNull { projAcct != null && it.account.equals(projAcct, true) } ?: choices.firstOrNull()
+            if (pick != null) setLink(c, root, SignInCore.Link(pick.group, pick.account))
         }
         val p = plan(c, sid, root, named)
         if (p is Plan.Handoff) { notifyUser(c, sid, root, p.line); return Outcome.Handoff(p.line) }

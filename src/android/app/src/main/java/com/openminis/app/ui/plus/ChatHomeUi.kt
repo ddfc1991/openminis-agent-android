@@ -14,6 +14,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -63,8 +65,14 @@ object ChatHomeNav {
     val launchResolved = kotlinx.coroutines.flow.MutableStateFlow(false)
     /** [38.9.14.2] the list was opened on purpose (全部对话 / in-app browser); cleared when it leaves the screen */
     @Volatile var listAllowed = false
+    /** [38.9.15.1] the 全部对话 list pane is on screen (the dock shows over it) */
+    val allShowing = kotlinx.coroutines.flow.MutableStateFlow(false)
     /** [38.9.14.2] no main conversation could be opened (no session, no provider): show the old list as before */
     val gateFailed = kotlinx.coroutines.flow.MutableStateFlow(false)
+    /** [38.9.15.1] 「模型」 box on 应用: the main chat publishes 「组 · 模型 · 思考」, the box shows it */
+    val modelLine = kotlinx.coroutines.flow.MutableStateFlow("")
+    /** [38.9.15.1] the 「模型」 box asked for the full model picker; the chat screen that comes back on top opens it once */
+    val openModelPicker = kotlinx.coroutines.flow.MutableStateFlow(false)
 }
 
 private fun icH(n: String) = WarmIcons.of(n)!!
@@ -268,11 +276,11 @@ fun AutoTasksSection(go: (String) -> Unit, inProjects: Set<String> = emptySet())
     val (wait, run, done) = ChatHomeCore.groups(tasks)
     Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         TabPill("全部 ${tasks.size}", !onlyWaiting) { onlyWaiting = false }
-        TabPill("等你 ${wait.size}", onlyWaiting) { onlyWaiting = true }
+        TabPill("需要你 ${wait.size}", onlyWaiting) { onlyWaiting = true }
         TabPill("定时 ›", false) { go("scheduled_tasks") }
     }
-    WarmGroupLabel("等你处理")
-    if (wait.isEmpty()) InfoLine("没有等你处理的任务。")
+    WarmGroupLabel("需要你")   // [38.9.15.1] mock 3915-1b ②
+    if (wait.isEmpty()) InfoLine("没有需要你处理的任务。")
     else TaskGroup(wait, go)
     if (onlyWaiting) return
     WarmGroupLabel("进行中")
@@ -465,5 +473,80 @@ fun NetKeepCard(modifier: Modifier = Modifier) {
         Text(text, fontSize = MT.Caption, color = m.ink, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
         Box(Modifier.size(40.dp).clip(CircleShape).clickable { NetKeep.set(ctx, "closed"); tick++ }.semantics { contentDescription = "不再提示" },
             contentAlignment = Alignment.Center) { Text("✕", fontSize = MT.Caption, color = m.ink2) }
+    }
+}
+
+// ───────────────────────────── [38.9.15.1] 全部对话 (the list under 聊天主页) ─────────────────────────────
+
+/**
+ * [Mines-38.9.15.1 chat_home] 全部对话 title bar: ← · 「全部对话」 · 搜索. Replaces the old home header (character face, greeting,
+ * 进行中 / 等你 / 完成 line, weather, 「最近对话 全部 ›」) on this page — user 2026-10-26 13:43 「这个页面按道理应该不会再出现才对」.
+ */
+@Composable
+fun AllChatsTopBar(count: Int, searching: Boolean, onBack: () -> Unit, onSearch: () -> Unit) {
+    val m = mines()
+    androidx.compose.runtime.DisposableEffect(Unit) {
+        ChatHomeNav.allShowing.value = true
+        onDispose { ChatHomeNav.allShowing.value = false }
+    }
+    androidx.activity.compose.BackHandler(onBack = onBack)
+    Row(Modifier.fillMaxWidth().background(HeaderFade.brush()).statusBarsPadding()
+        .padding(horizontal = 12.dp, vertical = 8.dp).semantics { contentDescription = "全部对话页" },
+        verticalAlignment = Alignment.CenterVertically) {
+        WarmRoundButton(com.openminis.app.ui.brand.MinesIcons.named("arrow-left")!!,
+            "返回", size = 40.dp, onClick = onBack)
+        Spacer(Modifier.width(10.dp))
+        Text("全部对话", fontSize = MT.PageTitle, fontWeight = FontWeight.SemiBold, color = m.ink, maxLines = 1, modifier = Modifier.weight(1f))
+        if (count > 0) { Text("$count 个", fontSize = MT.Caption, color = m.ink2, maxLines = 1); Spacer(Modifier.width(8.dp)) }
+        WarmRoundButton(com.openminis.app.ui.brand.MinesIcons.named(if (searching) "x" else "search")!!,
+            if (searching) "关闭搜索" else "搜索对话", size = 40.dp, onClick = onSearch)
+    }
+}
+
+/** [38.9.15.1] the search field under the 全部对话 title bar (only while searching) */
+@Composable
+fun AllChatsSearch(query: String, resultCount: Int, onQuery: (String) -> Unit, onClose: () -> Unit) {
+    val m = mines()
+    val focus = remember { androidx.compose.ui.focus.FocusRequester() }
+    androidx.compose.runtime.LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
+    var tfv by remember { mutableStateOf(androidx.compose.ui.text.input.TextFieldValue(query, androidx.compose.ui.text.TextRange(query.length))) }
+    androidx.compose.runtime.LaunchedEffect(query) { if (query.isEmpty() && tfv.text.isNotEmpty()) tfv = androidx.compose.ui.text.input.TextFieldValue("") }
+    val shape = RoundedCornerShape(24.dp)
+    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
+        Row(Modifier.fillMaxWidth().heightIn(min = 46.dp).clip(shape).background(minesGlassFill(strong = true)).border(1.dp, m.glassBorder, shape)
+            .padding(start = 14.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            MinesIcon(com.openminis.app.ui.brand.MinesIcons.named("search")!!, null, tint = m.ink2, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Box(Modifier.weight(1f)) {
+                if (tfv.text.isEmpty()) Text("搜索对话…", fontSize = MT.Body, color = m.ink3, maxLines = 1)
+                androidx.compose.foundation.text.BasicTextField(tfv, { v -> tfv = v; if (v.text != query) onQuery(v.text) }, singleLine = true,
+                    textStyle = androidx.compose.ui.text.TextStyle(fontSize = MT.Body, color = m.ink),
+                    cursorBrush = androidx.compose.ui.graphics.SolidColor(m.primary),
+                    modifier = Modifier.fillMaxWidth().focusRequester(focus).semantics { contentDescription = "搜索对话" })
+            }
+            Text("取消", fontSize = MT.Body, fontWeight = FontWeight.Medium, color = m.primaryText, maxLines = 1, softWrap = false,
+                modifier = Modifier.clip(RoundedCornerShape(50)).clickable(onClick = onClose).padding(horizontal = 12.dp, vertical = 10.dp))
+        }
+        if (query.isNotBlank()) Text("找到 $resultCount 个对话", fontSize = MT.Caption, color = m.ink2, modifier = Modifier.padding(start = 8.dp, top = 6.dp))
+    }
+}
+
+/**
+ * [38.9.15.1] 聊天 shows at most ONE compact chip for what tasks need from the user: 「需要你 N」 → 任务 (等你处理 first; each row
+ * opens its task's own conversation). Questions never become rows in 聊天 any more (user 2026-10-26 14:24).
+ */
+@Composable
+fun NeedYouChip(onOpen: () -> Unit, modifier: Modifier = Modifier) {
+    val tasks by ChatHome.tasks.collectAsState()
+    val n = tasks.count { !it.archived && it.st == ChatHomeCore.St.WAITING }
+    if (n <= 0) return
+    val m = mines()
+    Row(modifier.clip(RoundedCornerShape(50)).background(minesGlassFill(strong = true)).border(1.dp, m.glassBorder, RoundedCornerShape(50))
+        .clickable(onClick = onOpen).heightIn(min = 32.dp).padding(horizontal = 12.dp)
+        .semantics(mergeDescendants = true) { contentDescription = "需要你 $n，点按查看"; role = Role.Button },
+        verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.size(7.dp).clip(CircleShape).background(toneColor(ChatHomeCore.Tone.WAIT)))
+        Spacer(Modifier.width(6.dp))
+        Text("需要你 $n", fontSize = MT.Caption, fontWeight = FontWeight.Medium, color = m.ink, maxLines = 1)
     }
 }

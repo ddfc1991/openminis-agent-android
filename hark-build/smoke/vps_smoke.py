@@ -157,6 +157,10 @@ try:
 except Exception:
     I3915 = False
 try:
+    I39151 = "i39151" in open("hark-build/smoke/target").read().splitlines()[1:2][0].split()   # [38.9.15.1] subtraction release
+except Exception:
+    I39151 = False
+try:
     IREG = "iregauto" in open("hark-build/smoke/target").read().splitlines()[1:2][0].split()   # [38.9.15 register_auto] 一键注册 runs by itself
 except Exception:
     IREG = False
@@ -3335,6 +3339,7 @@ def main():
         elif H3894: fns = (b3894_h,) + tuple(fns)   # [38.9.4 h] SkillHub market, Memoh, a11y wording, 账号 entries, glass / opaque reading, g2 defects first
         if I3915: fns = (b3914, b3915)   # [38.9.15] 38.9.14.1 chat-home gate (single bottom bar on every tab, back on 聊天) + 伪人核心 / sign-in / slider
         if IREG: fns = ((b3914, b3915) if I3915 else ()) + (bregauto,)   # [38.9.15 register_auto] own short gate; [38.9.15 release] after the chat-home + 伪人核心 gates when both modes are on
+        if I39151: fns = tuple(fns) + (b39151,)   # [38.9.15.1] last: old-home return paths, process restore, reply ≠ task, silent login, 应用 模型
         for fn in fns:
             try:
                 fn(res)
@@ -7379,7 +7384,7 @@ def b3915(res):
         if not any(e.get("act") == "send" and not e.get("ok") and e.get("why") == "NOT_ALLOWED" for e in (ps.get("log") or [])): fail("audit log has no refused send")
         if not tap_dock("任务"): fail("dock 任务 not found")
         r = shot("tasks-waiting"); tx = _txt(r)
-        if "等你处理" not in tx: fail("任务 page has no 等你处理")
+        if "需要你" not in tx and "等你处理" not in tx: fail("任务 page has no 需要你")
         if "发周报" not in tx: fail("send task not listed on 任务")
         tap_dock("聊天"); shot("chat-notice")
     step("agent_send", agent_send)
@@ -7463,39 +7468,26 @@ def b3915(res):
         sh(f"am start -n {PKG}/com.openminis.app.MainActivity"); time.sleep(2)
         tap_dock("聊天"); time.sleep(1)
         result_json("group", "i3915 pickrun a", timeout=20)
+        # [38.9.15.1] no 选账号 card any more: Mines picks a recorded account itself, remembers it, ≤ 2 tries, then 等你处理
         s = {}; t0 = time.time()
-        while time.time() - t0 < 20:
+        while time.time() - t0 < 40:
             s = pst("a")
             if s.get("card"): break
-            time.sleep(1.5)
-        o["pick_card"] = s.get("card")
-        if not s.get("card"): fail(f"no 选账号 card for two unlinked accounts (auto-picked?): {s}"); return
-        if s.get("outcomes"): fail(f"a sign-in ran before the user picked: {s.get('outcomes')}")
-        time.sleep(1.5)
-        r = shot("pick-card"); t = _txt(r); o["pick_txt"] = t[:300]
-        for w in ("选一个 cloudflare.com 账号", "Google 登录", "邮箱+密码", "记住"):
-            if w not in t: fail(f"pick card missing {w}")
-        tgt = None
-        for tx, d, x, y, n in nodes(r) if r is not None else []:
-            if (d or "").startswith("选 邮箱+密码"): tgt = (x, y)
-        if not tgt:
-            p = find(r, "邮箱+密码"); tgt = p
-        if not tgt: fail("pick row 邮箱+密码 not found"); return
-        sh(f"input tap {tgt[0]} {tgt[1]}")
-        t0 = time.time()
-        while time.time() - t0 < 30:
-            s = pst("a")
             if len(s.get("outcomes") or []) >= 3 or any(x.get("k") != "tried" for x in (s.get("outcomes") or [])): break
             time.sleep(1.5)
         o["pick_a"] = s
-        if s.get("answer") != "email_pw:smoke.b@163.com:true": fail(f"picked answer wrong (记住 should default on): {s.get('answer')}")
-        if s.get("link") != "email_pw:smoke.b@163.com:true": fail(f"pick not remembered as the site's link: {s.get('link')}")
+        if s.get("card"): fail(f"选账号 card still shown (should pick silently): {s.get('card')}"); shot("pick-card")
+        link = s.get("link") or ""
+        if not link: fail(f"silent pick not remembered as the site's link: {s}")
         oc = s.get("outcomes") or []
         tried = [x for x in oc if x.get("k") == "tried"]
         if len(tried) != 2: fail(f"expected exactly 2 automatic tries, got {oc}")
-        if any(x.get("acct") != "smoke.b@163.com" for x in tried): fail(f"a try drifted to another account: {tried}")
+        accts = {x.get("acct") for x in tried}
+        if len(accts) != 1: fail(f"a try drifted to another account: {tried}")
+        elif link and (list(accts)[0] or "") not in link: fail(f"tries did not use the remembered account: {tried} link {link}")
         if not oc or oc[-1].get("k") != "handoff": fail(f"no 等你处理 after 2 failures: {oc}")
         if s.get("progress") != "waiting": fail(f"task not 等你处理 after the failures: {s.get('progress')} {s.get('reason')}")
+        o["silent_login"] = {"link": link, "tries": len(tried)}
         shown_a = s.get("shownId")
         # linked to the Google account (user-set) → no card, both tries with it, then 等你处理
         result_json("group", "i3915 pickrun b linked", timeout=20)
@@ -7536,6 +7528,187 @@ def b3915(res):
     step("experiments", experiments)
 
     print("I3915 RESULT " + json.dumps(o, ensure_ascii=False)[:6000], flush=True)
+
+
+def b39151(res):
+    """[38.9.15.1] subtraction release: the old home never comes back (back from a task page / a deep-linked chat / 全部对话,
+    and after the process is killed in the background), 聊天 shows only 「需要你 N」 (no question rows), a reply to Mines never
+    becomes a new task, sign-in picks a recorded account silently (no 选账号 card), 应用 has the 「模型」 box under the grid.
+    Shots i39151-chat / -tasks-need / -task-page / -apps-model are the release comparison screenshots."""
+    o = res.setdefault("i39151", {})
+    def shot(name):
+        r = snap("i39151-" + name)
+        subprocess.run(f"cp {OUT}/{step_no:02d}-i39151-{name}.png {OUT}/i39151-{name}.png", shell=True)
+        return r
+    def fail(m): selftest_fail.append("i39151 " + m); print("I39151 FAIL " + m, flush=True)
+    def st():
+        s = result_json("group", "i39151 state", timeout=20)
+        return s if isinstance(s, dict) else {}
+    def hs():
+        s = result_json("group", "i3914 state", timeout=20)
+        return s if isinstance(s, dict) else {}
+    def step(name, f):
+        t0 = time.time()
+        try: f()
+        except Exception as e:
+            import traceback; traceback.print_exc(); fail(f"{name} error {e}")
+        print(f"I39151 STEP {name} {int(time.time() - t0)} s", flush=True)
+        if not alive(): crashed.append(f"i39151 {name}"); recover(f"i39151 {name}")
+    def alltxt(r): return " ".join((t or "") + " " + (d or "") for t, d, *_ in nodes(r)) if r is not None else ""
+    def docked(r):
+        labs = set()
+        for t, d, x, y, n in nodes(r) if r is not None else []:
+            if y > SCREEN[1] * 0.8:
+                for lab in (t, (d or "").split("，")[0]):
+                    if lab in ("聊天", "任务", "消息", "应用"): labs.add(lab)
+        return len(labs) >= 4
+    def old_home(r):
+        t = alltxt(r)
+        return ("最近对话" in t) or (("对话" in t and "知识库" in t) and not docked(r))
+    def tap_dock(label):
+        r = dump(); best = None
+        for t, d, x, y, n in nodes(r) if r is not None else []:
+            if (t == label or d == label or (d or "").startswith(label + "，")) and y > SCREEN[1] * 0.8: best = (x, y)
+        if best: sh(f"input tap {best[0]} {best[1]}"); time.sleep(3); return True
+        return False
+    def no_popup(tag):
+        r = dump(); t = alltxt(r)
+        for w in ("稍后", "选一个", "有新设备登录", "从旧版迁移", "登记并关联账号", "需要你点一下验证\n"):
+            if w.strip() in t and w.strip() != "": fail(f"{tag}: pop-up seen ({w.strip()})")
+        return r
+    def back_ok(tag, want=("聊天", "任务")):
+        back(1); time.sleep(2)
+        r = shot(tag)
+        if old_home(r): fail(f"{tag}: old home shown after back")
+        elif not docked(r): fail(f"{tag}: no dock after back")
+        return r
+
+    set_zh()
+    try: result_json("group", "wallpaper off")
+    except Exception: pass
+
+    def launch():
+        sh(f"am force-stop {PKG}"); time.sleep(2)
+        sh(f"am start -W -n {PKG}/com.openminis.app.MainActivity", timeout=90); time.sleep(10); dismiss_dialogs()
+        o["seed"] = result_json("group", "i39151 needseed", timeout=20)
+        result_json("group", "i3914 main", timeout=20); time.sleep(3)
+        r = shot("chat"); t = alltxt(r); o["chat_txt"] = t[:400]
+        if old_home(r) or not docked(r): fail("launch: not on 聊天 with the dock")
+        if "需要你 2" not in t and "需要你2" not in t: fail("聊天: no 「需要你 2」 chip")
+        if "短信验证码已发到" in t: fail("聊天: a task question is shown as a row in 聊天")
+        if "在等你" in t: fail("聊天: 「在等你」 bar still shown")
+        no_popup("chat")
+    step("launch", launch)
+
+    def need():
+        r = dump(); p = find(r, "需要你 2") or find(r, "需要你")
+        if not p: fail("需要你 chip not found"); tap_dock("任务")
+        else: sh(f"input tap {p[0]} {p[1]}"); time.sleep(3)
+        r = shot("tasks-need"); t = alltxt(r); o["tasks_txt"] = t[:500]
+        for w in ("需要你", "阿里云 QwenPaw 登录", "Railway 注册"):
+            if w not in t: fail(f"任务: missing {w}")
+        if not docked(r): fail("任务: no dock")
+        no_popup("tasks")
+    step("need", need)
+
+    def task_page():
+        r = dump(); p = find(r, "阿里云 QwenPaw 登录")
+        if not p: fail("任务: row 阿里云 QwenPaw 登录 not found"); return
+        sh(f"input tap {p[0]} {p[1]}"); time.sleep(4)
+        r = dump(); t = alltxt(r)
+        # a task row may expand first: tap its 打开 / chevron
+        if "最近对话" not in t and "发消息" not in t:
+            q = find(r, "打开") or find(r, "打开任务对话")
+            if q: sh(f"input tap {q[0]} {q[1]}"); time.sleep(4)
+        r = shot("task-page"); t = alltxt(r); o["task_txt"] = t[:400]
+        if old_home(r): fail("task page: old home shown")
+        if "阿里云" not in t: fail("task page: not the task's own conversation")
+        back_ok("task-back")
+    step("task_page", task_page)
+
+    def return_paths():
+        # deep-linked task conversation (like a notification) → back = 聊天 / 任务 with the dock
+        tk = result_json("group", "i3914 talk need2", timeout=30); o["talk"] = tk
+        sid = (tk or {}).get("sid") if isinstance(tk, dict) else None
+        if not sid: fail(f"no task conversation for need2: {tk}"); return
+        result_json("group", "i3914 open " + sid, timeout=20); time.sleep(4)
+        shot("deeplink")
+        back_ok("deeplink-back")
+        # 全部对话: its own title bar, never the old home header; back returns with the dock
+        tap_dock("任务"); r = dump(); p = find(r, "全部对话 ›") or find(r, "全部对话")
+        if p:
+            sh(f"input tap {p[0]} {p[1]}"); time.sleep(3)
+            r = shot("all-chats"); t = alltxt(r)
+            if "最近对话" in t: fail("全部对话: old home header shown")
+            back_ok("all-back")
+        else: fail("任务: 全部对话 link not found")
+        o["return_paths"] = "ok"
+    step("return_paths", return_paths)
+
+    def restore():
+        # process killed in the background while a task conversation is open → relaunch never lands on the old home
+        sid = ((result_json("group", "i3914 talk need1", timeout=30) or {}) if True else {}).get("sid")
+        if sid: result_json("group", "i3914 open " + sid, timeout=20); time.sleep(3)
+        sh("input keyevent KEYCODE_HOME"); time.sleep(2)
+        sh(f"am kill {PKG}"); time.sleep(2)
+        o["pid_after_kill"] = sh(f"pidof {PKG}").strip()
+        sh(f"am start -W -n {PKG}/com.openminis.app.MainActivity", timeout=90); time.sleep(9); dismiss_dialogs()
+        r = shot("restore"); t = alltxt(r); o["restore_txt"] = t[:300]
+        if old_home(r): fail("process restore: old home shown")
+        r2 = back_ok("restore-back")
+        o["restore"] = "ok"
+    step("restore", restore)
+
+    def reply():
+        s0 = st(); ids0 = set(s0.get("ids") or [])
+        result_json("group", "i3914 main", timeout=20); time.sleep(2)
+        result_json("group", "i3914 say （回复 Mines：「短信验证码已发到你手机 138****8658，收到发我」）你去登录就知道了，有账号", timeout=30)
+        time.sleep(18)
+        s1 = st(); ids1 = set(s1.get("ids") or [])
+        o["reply_new"] = sorted(ids1 - ids0); o["reply_last"] = s1.get("last")
+        if ids1 - ids0: fail(f"a reply to Mines created a new task: {sorted(ids1 - ids0)}")
+        shot("reply")
+    step("reply", reply)
+
+    def silent_login():
+        seed = result_json("group", "i3915 pickseed", timeout=20); o["pick_seed"] = seed
+        result_json("group", "i3915 pickrun s39151", timeout=20)
+        s = {}; t0 = time.time()
+        while time.time() - t0 < 40:
+            s = result_json("group", "i3915 pickstate s39151", timeout=20); s = s if isinstance(s, dict) else {}
+            if s.get("card") or len(s.get("outcomes") or []) >= 3 or any(x.get("k") != "tried" for x in (s.get("outcomes") or [])): break
+            time.sleep(1.5)
+        o["silent"] = {k: s.get(k) for k in ("card", "link", "outcomes")}
+        if s.get("card"): fail("silent login: 选账号 card shown")
+        if not s.get("link"): fail("silent login: no account remembered")
+        tried = [x for x in (s.get("outcomes") or []) if x.get("k") == "tried"]
+        if not tried: fail("silent login: no sign-in attempt ran")
+        if len({x.get("acct") for x in tried}) > 1: fail(f"silent login: drifted between accounts {tried}")
+        if st().get("accountPick"): fail("silent login: AccountPick pending")
+        no_popup("silent")
+    step("silent_login", silent_login)
+
+    def apps_model():
+        result_json("group", "i3914 main", timeout=20); time.sleep(3)
+        if not tap_dock("应用"): fail("dock 应用 not found"); return
+        time.sleep(1)
+        r = shot("apps-model"); t = alltxt(r); o["apps_txt"] = t[:400]
+        if "模型" not in t: fail("应用: no 「模型」 box")
+        ml = st().get("modelLine") or ""; o["modelLine"] = ml
+        if not ml: fail("应用: 模型 line empty (main chat did not publish 组 · 模型 · 思考)")
+        elif ml not in t and ml.split(" · ")[0] not in t: fail(f"应用: 模型 box does not show {ml!r}")
+        if not docked(r): fail("应用: no dock")
+        p = None
+        for tx, d, x, y, n in nodes(r) if r is not None else []:
+            if tx == "模型" or (d or "").startswith("模型"): p = (x, y)
+        if p:
+            sh(f"input tap {p[0]} {p[1]}"); time.sleep(4)
+            r2 = shot("apps-model-picker"); t2 = alltxt(r2)
+            if not any(w in t2 for w in ("选择模型", "自动", "思考")): fail("模型 box did not open the model picker")
+            back(1); time.sleep(1.5)
+    step("apps_model", apps_model)
+
+    print("I39151 RESULT " + json.dumps(o, ensure_ascii=False)[:6000], flush=True)
 
 
 def bregauto(res):
@@ -8024,7 +8197,7 @@ def b3914(res):
     def tabs():
         if not tap_dock("任务"): fail("dock 任务 not found"); return
         r = shot("tab-tasks"); t = _txt(r); o["tab_tasks"] = t[:500]
-        for w in ("等你处理", "进行中", "已完成", "Zeabur"):
+        for w in ("需要你", "进行中", "已完成", "Zeabur"):
             if w not in t: fail(f"任务 page missing {w}")
         # [38.9.14.1] the finished register task is listed once (its 项目 card), not again under 已完成
         a, b = t.find("已完成"), t.find("项目  ")
@@ -8039,7 +8212,7 @@ def b3914(res):
             one_bar("history", dock=False)
             back(1); time.sleep(3)
             r = shot("history-back"); t2 = _txt(r); o["history_back_txt"] = t2[:200]
-            if "等你处理" not in t2: fail("back from 全部对话 did not return to 任务")
+            if "需要你" not in t2 and "等你处理" not in t2: fail("back from 全部对话 did not return to 任务")
             one_bar("history-back")
         # [38.9.14.1] 任务 scrolled to the bottom: the last item sits above the frosted dock (bottom contentPadding)
         for _ in range(6): scroll_down()
@@ -8544,8 +8717,9 @@ def b3913(res):
         if not hs: fail(f"no OAUTH_EXTERNAL handoff: {s}"); return
         lab = hs[-1].get("label") or ""
         if "Zeabur" not in lab and "zeabur" not in lab: fail(f"handoff label not the project name: {lab!r} (taskName {s.get('taskName')!r})")
-        if r is None or not find(r, "需要你"): fail("handoff popup not seen")
-        tap_text("稍后", exact=True, wait=2.5)
+        # [38.9.15.1] no popup any more (only payment-type confirmations pop): the non-modal bar carries 需要你 + 继续接管
+        if r is None or not find(r, "需要你"): fail("handoff bar/popup not seen")
+        if r is not None and find(r, "稍后"): fail("handoff still pops a dialog (稍后)"); tap_text("稍后", exact=True, wait=2.5)
         r = shot("handoff-bar")
         if r is None or not find(r, "继续接管"): fail("glass bar with 继续接管 not seen"); return
         tap_text("继续接管", exact=True, wait=4)

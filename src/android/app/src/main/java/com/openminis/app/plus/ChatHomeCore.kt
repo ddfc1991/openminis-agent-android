@@ -80,7 +80,34 @@ object ChatHomeCore {
         return cleanName(t.lineSequence().firstOrNull().orEmpty()).ifBlank { "新任务" }
     }
 
-    fun cleanName(s: String): String = s.trim().trim('「', '」', '"', '“', '”').replace(Regex("""\s+"""), " ").take(16)
+    fun cleanName(s: String): String = QuoteReply.plain(replyBody(s)).trim().trim('「', '」', '"', '“', '”', '（', '）', '(', ')')
+        .replace(Regex("""\s+"""), " ").take(16)
+
+    // ── [38.9.15.1] replies: an answer to Mines is never a new task ──
+
+    private val REPLY_HEAD = Regex("""^（回复 [^：]{1,20}：「([\s\S]*?)」）\s*""")
+
+    /** 「（回复 Mines：「…」）…」 = the user answered a message (QuoteReply.composeReply) */
+    fun isReply(text: String): Boolean = REPLY_HEAD.containsMatchIn(text.trimStart())
+    /** the quoted preview inside the reply head ("" when not a reply) */
+    fun replyQuote(text: String): String = REPLY_HEAD.find(text.trimStart())?.groupValues?.get(1).orEmpty()
+    /** the user's own words after the reply head */
+    fun replyBody(text: String): String = text.trimStart().replace(REPLY_HEAD, "").trim()
+
+    /**
+     * the waiting / erred task a reply answers: its ask (line) or its name appears in the quote. Several waiting and nothing
+     * matches → null (the reply stays in 聊天 as an ordinary message, never a new task).
+     */
+    fun replyTarget(tasks: List<AutoTask>, text: String): AutoTask? {
+        val q = QuoteReply.plain(replyQuote(text)).replace(Regex("""\s+"""), "").removeSuffix("…")
+        if (q.isBlank()) return null
+        val open = tasks.filter { !it.archived && (it.st == St.WAITING || it.st == St.ERROR) }
+        fun norm(x: String) = QuoteReply.plain(x).replace(Regex("""\s+"""), "")
+        return open.lastOrNull { t ->
+            val l = norm(t.line); val n = norm(t.name)
+            (l.length >= 6 && (l.startsWith(q.take(20)) || q.contains(l.take(20)))) || (n.length >= 3 && q.contains(n))
+        }
+    }
 
     // ── task state machine ──
 

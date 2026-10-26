@@ -147,7 +147,7 @@ object AgentTools {
             "automatic SMS/e-mail code fill via wait_for_otp and human-check hand-off via wait_for_human). If the same command fails the same way twice, change approach or tell the user.",
         parameters = mapOf(
             "tool_title" to AgentToolParam("string", "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Install Python data analysis packages', 'List files in home directory'). Use the same language as the user."),
-            "command" to AgentToolParam("string", "The shell command to execute. Supports multi-line commands directly — no special escaping needed. Keep under 1000 chars; for longer scripts, write to a file with file_write first, then run it."),
+            "command" to AgentToolParam("string", "The shell command to execute. Supports multi-line commands, long scripts and heredocs directly — sent intact, no escaping, base64 or splitting needed (also through `minis-vps run`, which forwards a heredoc / piped stdin to the server). `pkill -f`/`pgrep -f` patterns are made safe automatically (they never match this shell itself)."),
             // [T-android-parity-fixes] State the ceiling. It used to say only "use
             // a larger value" while values above 900 were silently cut to 900.
             "timeout" to AgentToolParam("integer", "Timeout in seconds (default: 900, maximum: 3600 — larger values are capped at 3600). Use a larger value for long-running commands like package installs."),

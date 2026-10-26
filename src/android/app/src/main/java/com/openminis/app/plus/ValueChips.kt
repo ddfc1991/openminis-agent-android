@@ -175,9 +175,12 @@ object ValueChips {
 object QuoteReply {
     const val MAX_QUOTE = 2000
 
+    /** [38.9.15.1] markdown marks out of a one-line preview / title (「**阿里云 QwenPaw**」 → 「阿里云 QwenPaw」) */
+    fun plain(q: String): String = q.replace(Regex("\\*\\*|__|`+"), "").replace(Regex("(?m)^\\s*(#{1,6}|>)\\s*"), "")
+
     /** One-line preview for the collapsed block. */
     fun preview(q: String, max: Int = 60): String {
-        val one = q.trim().replace(Regex("\\s+"), " ")
+        val one = plain(q).trim().replace(Regex("\\s+"), " ")
         return if (one.length <= max) one else one.take(max - 1) + "…"
     }
 

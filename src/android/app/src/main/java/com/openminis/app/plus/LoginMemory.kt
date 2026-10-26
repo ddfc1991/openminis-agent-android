@@ -147,6 +147,12 @@ object LoginCard {
     private val _pending = MutableStateFlow<Req?>(null)
     val pending: StateFlow<Req?> = _pending.asStateFlow()
     private var waiter: CompletableDeferred<Answer?>? = null
+    /**
+     * [38.9.15.1] the card no longer pops up by itself (user 2026-10-26 14:16 「动不动就弹…弹窗弹的全部东西要我填」): a waiting
+     * request shows one small non-modal line 「需要你登录 X · 填写」; the sheet opens only when the user taps it ([open]).
+     */
+    val opened = MutableStateFlow(0L)
+    fun open(r: Req) { opened.value = r.id }
 
     /** Shows the card and waits for the user (null = closed). One card at a time. */
     suspend fun ask(r: Req, ctx: Context? = null): Answer? {
@@ -191,6 +197,8 @@ object LoginCard {
         val ask = if (refused) LoginMemoryCore.Ask(listOf(LoginMemoryCore.Field.EMAIL, LoginMemoryCore.Field.PASSWORD), "密码不对，重新输入", true)
             else LoginMemoryCore.Ask(listOf(LoginMemoryCore.Field.EMAIL, LoginMemoryCore.Field.PASSWORD, LoginMemoryCore.Field.CODE), "登录 Notion", false)
         waiter?.complete(null); waiter = CompletableDeferred()
-        _pending.value = Req("notion.so", "Notion", ask, "smoke@example.com", "上次用 sm***@example.com 登录 · 密码")
+        val r = Req("notion.so", "Notion", ask, "smoke@example.com", "上次用 sm***@example.com 登录 · 密码")
+        opened.value = r.id   // the smoke screenshots the sheet itself
+        _pending.value = r
     }
 }

@@ -308,6 +308,7 @@ fun MinesBackdrop(modifier: Modifier = Modifier) {
 fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, actions: (@Composable () -> Unit)? = null,
              backdrop: (@Composable () -> Unit)? = null,   // [Mines-38.8 v5] 知识库 脑图 draws its own deep-space page
              bottomBar: (@Composable () -> Unit)? = null,  // [Mines-38.9.1] fixed glass bar (账号详情 打开网站 / 改密码, mockup kc-04)
+             clearHeader: Boolean = false,                 // [Mines-38.9.15.1] 任务 / 应用: transparent header, only HeaderFade (mock 3915-1b)
              content: @Composable ColumnScope.() -> Unit) {
     // [Mines-design-34] 「暖瓷 · 毛玻璃」: backdrop, 60 dp bar with back + 22 sp bold title, glass sections.
     val m = mines()
@@ -325,6 +326,7 @@ fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, action
                         }
                     },
                     actions = { actions?.invoke() },
+                    modifier = if (clearHeader) Modifier.background(HeaderFade.brush()) else Modifier,
                     colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent, scrolledContainerColor = Color.Transparent),
                 )
             },
@@ -360,7 +362,8 @@ fun PlusPage(title: String, onBack: () -> Unit, subtitle: String? = null, action
                     content()
                 }
                 if (backdrop == null) {
-                    EdgeFade(top = true, modifier = Modifier.align(Alignment.TopCenter))
+                    // [Mines-38.9.15.1] the opaque porcelain top fade read as a beige band under a clear header → skipped there
+                    if (!clearHeader) EdgeFade(top = true, modifier = Modifier.align(Alignment.TopCenter))
                     EdgeFade(top = false, modifier = Modifier.align(Alignment.BottomCenter))
                 }
             }

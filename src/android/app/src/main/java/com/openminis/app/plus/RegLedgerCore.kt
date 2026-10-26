@@ -234,4 +234,25 @@ if(!t)return 'R:none';t.click();return 'R:clicked';
     fun trashJson(l: List<Trashed>): String = JSONArray().apply { l.forEach { t -> put(JSONObject().put("id", t.id).put("r", recJson(t.rec)).put("h", t.host).put("a", t.account).put("n", t.name).put("at", t.at)) } }.toString()
     fun trashOf(s: String?): List<Trashed> = runCatching { JSONArray(s ?: "[]").let { a -> (0 until a.length()).map { i -> a.getJSONObject(i).let { o ->
         Trashed(o.getString("id"), recOf(o.getJSONObject("r")), o.optString("h"), o.optString("a"), o.optString("n"), o.optLong("at")) } } } }.getOrDefault(emptyList())
+
+    // ── [38.9.15.1] sign-in codes from the account's own temp box ──
+
+    /**
+     * The temp boxes recorded for [site] (newest first), for a sign-in that waits on a mail code: the 台账 account IS that
+     * box, so its code is read there (user 2026-10-26 14:18 「记录在案的他就可以调用」 — no copying codes by hand).
+     */
+    fun boxesFor(recs: List<Rec>, site: String): List<String> {
+        val s = site.lowercase().substringAfter("://").substringBefore('/').removePrefix("www.").trim('.')
+        if (s.isBlank()) return emptyList()
+        fun same(h: String): Boolean { val x = h.lowercase().removePrefix("www.").trim('.'); return x.isNotBlank() && (x == s || x.endsWith(".$s") || s.endsWith(".$x")) }
+        return recs.filter { same(it.host) || (it.url.isNotBlank() && same(it.url.substringAfter("://").substringBefore('/'))) }
+            .sortedByDescending { maxOf(it.updatedAt, it.createdAt) }.map { it.box }.distinctBy { it.lowercase() }
+    }
+
+    /** a box used for this one site only: any fresh code in it belongs to the sign-in (senders like sendgrid never say the site) */
+    fun boxOnlyFor(recs: List<Rec>, box: String, site: String): Boolean {
+        val mine = recs.filter { it.box.equals(box, true) }
+        return mine.isNotEmpty() && mine.all { boxesFor(listOf(it), site).isNotEmpty() }
+    }
+
 }

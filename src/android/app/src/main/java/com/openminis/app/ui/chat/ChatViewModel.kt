@@ -5636,6 +5636,8 @@ class ChatViewModel(
      * Bounds compact-thrash within a single turn; the MAX_AGENT_TURNS ceiling is
      * never reset by compaction, so this is a second, tighter backstop.
      */
+    /** [38.9.15.1] set by a loop switch / the periodic check of a long run: compact at the next iteration even under the threshold */
+    @Volatile private var forceLoopCompact = false
     private val maxInLoopCompactions = 6 // [Mines-ctx-34] long runs (1000+ steps) need more than 3
 
     /**
@@ -5661,7 +5663,11 @@ class ChatViewModel(
         if (tokens <= 0) return InLoopContextAction.PROCEED
         // [T-ctx-user-cap] Same resolution as the pre-send check.
         val (policy, window) = currentContextPolicy() ?: return InLoopContextAction.PROCEED
-        val verdict = policy.check(tokens, window)
+        val verdict0 = policy.check(tokens, window)
+        // [38.9.15.1] periodic compaction on long tasks: a forced pass only when the request already fills ≥ 30 % of the window
+        val verdict = if (verdict0 == ContextPolicy.CheckResult.OK && forceLoopCompact && policy.compactThreshold > 0 && tokens >= window * 0.30)
+            ContextPolicy.CheckResult.NEEDS_COMPACT else verdict0
+        forceLoopCompact = false
         logContextDecision("in-loop", m, policy.compactThreshold, window, verdict.name)
         return when (verdict) {
             ContextPolicy.CheckResult.OK -> InLoopContextAction.PROCEED
@@ -5682,7 +5688,7 @@ class ChatViewModel(
                         "(autoCompactPref=${com.openminis.app.data.AutoCompactPrefs.isEnabled()}, not a gate here)",
                 )
                 appendSystemInfo(
-                    text = "Context is filling up ($tokens / $window tokens) — compacting to continue.",
+                    text = "整理上下文后继续（$tokens / $window）",
                     iconKind = "compact",
                 )
                 val ok = awaitCompaction()
@@ -5874,6 +5880,10 @@ class ChatViewModel(
 
     // [Mines-38.9.5 i] the id the home list uses for this conversation + the card's 重试 / 停止
     private fun minesSid(): String = realSessionId.ifEmpty { sessionId }
+    /** [38.9.15.1] the step the running agent is on, for the instant reply to a message sent mid-run */
+    @Volatile private var minesStepNow: String = ""
+    @Volatile private var minesStepCount = 0
+    @Volatile private var minesRunStartedAt = 0L
     private val minesProgressActions = com.openminis.app.plus.TaskProgress.Actions(retry = { minesProgressRetry() }, stop = { cancelStream() })
     /**
      * [Mines-38.9.6 i14] the card's 重试 (user: 「点了不能继续重试」): works in every state, any number of times. A running turn is
@@ -8777,6 +8787,15 @@ class ChatViewModel(
             }
         }
         _promptQueue.value = _promptQueue.value + prompt
+        // [38.9.15.1] user 14:53: 「? ?」「到底行不行？」 sat as dashed bubbles until the whole run ended. A message sent mid-run
+        // gets a one-line status at once (from the app, no model call: where the run is), then the running agent answers it
+        // after the current step and carries on.
+        if (origin == QueuedPromptOrigin.USER) viewModelScope.launch {
+            kotlinx.coroutines.delay(1200)
+            if (_promptQueue.value.none { it.id == prompt.id } || !_isStreaming.value) return@launch
+            appendSystemInfo(com.openminis.app.plus.QueuedAck.line(minesStepNow, minesStepCount,
+                if (minesRunStartedAt > 0) System.currentTimeMillis() - minesRunStartedAt else 0L), "info")
+        }
 
         val attachmentNames = pendingAttachments.map { it.fileName }
         val imageUris = pendingAttachments.filter { it.isImage }.map { it.uri }
@@ -10961,6 +10980,10 @@ class ChatViewModel(
         val failGuard = com.openminis.app.agent.FailurePatternGuard()
         var weakModelHinted = false
         var escalatedFrom: LLMProvider? = null   // [Mines-38.9.9] 自动调度: model this run escalated from
+        var lastCompactCalls = 0
+        minesStepNow = ""; minesStepCount = 0; minesRunStartedAt = System.currentTimeMillis()
+        var escCount = 0; var escBase = 0; var escTextBase = 0   // [38.9.15.1] switches this run; calls / text since the last one
+        var runThinkingBoost: ThinkingLevel? = null   // [38.9.15.1] 思考 raised by a loop switch, for the rest of the run
         // [Mines-38.9] 经验库: what this run did (for the self-check + record at the end) and the request it serves
         val expCalls = ArrayList<com.openminis.app.agent.ExperienceCore.Call>()
         val expTask = agentHistory.lastOrNull { it.role == LLMMessage.Role.USER && it.content.isNotBlank() }?.content.orEmpty()
@@ -11562,7 +11585,7 @@ class ChatViewModel(
                             // currentModel mid-turn while the turn keeps its local
                             // provider, so reading the class-level model would send the
                             // NEW model's reasoning decision to the OLD model.
-                            thinkingLevel = if (currentProvider.model.supportsReasoning == true) (turnThinkingOverride ?: _thinkingLevel.value) else ThinkingLevel.OFF,
+                            thinkingLevel = if (currentProvider.model.supportsReasoning == true) (turnThinkingOverride ?: runThinkingBoost ?: _thinkingLevel.value) else ThinkingLevel.OFF,
                         )
                     }
                     // [Mines-38.9.1] user 2026-10-17: after a 429 the next member never answered and the turn sat on
@@ -12144,7 +12167,15 @@ class ChatViewModel(
                     val isStall = com.openminis.app.plus.StallWatch.isStall(actual)
                     if (isStall) com.openminis.app.plus.StallWatch.log(if (stallRetries == 0) "retry" else "fallback",
                         currentProvider.model.displayName, actual.message ?: "")
-                    val stallGiveUp = isStall && stallRetries >= 1
+                    // [38.9.15.1] 「同模型先轮换账号再降级」: a stalled account is not waited on again when another account of the same
+                    // model is free in the group (AMD × 14) — rotate at once; the same-account retry stays only for a lone account
+                    val stallRotate = isStall && stallRetries == 0 && runCatching {
+                        val now0 = System.currentTimeMillis()
+                        com.openminis.app.agent.ModelScoreCore.stallRotateNow(remainingFallbacks.ifEmpty { buildFallbackProviders(currentProvider) },
+                            _activeEntryId.value.orEmpty(), currentProvider.model.id, { it.entryId }, { it.provider.model.id },
+                            { com.openminis.app.agent.ModelScore.cool.cooling(it.entryId, now0) })
+                    }.getOrDefault(false)
+                    val stallGiveUp = isStall && (stallRetries >= 1 || stallRotate)
                     if (isStall && !stallGiveUp) stallRetries++
                     val isTransient = (actual is com.openminis.app.data.model.LLMError.NetworkError ||
                         actual is com.openminis.app.data.model.LLMError.TransientError) && !stallGiveUp
@@ -12400,6 +12431,8 @@ class ChatViewModel(
                         null
                     } else {
                         _activeEntryId.value?.let { triedEntryIds.add(it) }
+                        // [38.9.15.1] this account (group member) rests 10 min on stall / 429 / 5xx; other accounts of the same model stay usable
+                        if (isStall || isRateLimit || is5xx || stallGiveUp) _activeEntryId.value?.let { com.openminis.app.agent.ModelScore.cool.mark(it, System.currentTimeMillis()) }
                         // [Mines-38.9.9] 自动调度: remember the failure; on 429 / 5xx try the same model on another account first
                         // (AMD × 14), skip members that failed in the last 10 min, never send bulk steps to a web member
                         runCatching { com.openminis.app.agent.ModelScore.fail(context, currentProvider.model,
@@ -12409,7 +12442,8 @@ class ChatViewModel(
                         (if (com.openminis.app.agent.ModelScore.enabled(context))
                             com.openminis.app.agent.ModelScoreCore.nextFallback(remainingFallbacks, currentProvider.model.id, { it.provider.model.id },
                                 { com.openminis.app.agent.ModelScore.key(it.provider.model) }, { com.openminis.app.agent.ModelScore.stats(context, it) },
-                                System.currentTimeMillis())?.also { remainingFallbacks.remove(it) }
+                                System.currentTimeMillis(), { com.openminis.app.agent.ModelScore.cool.cooling(it.entryId, System.currentTimeMillis()) })
+                                ?.also { remainingFallbacks.remove(it) }
                         else remainingFallbacks.removeFirstOrNull())
                             ?.also { triedEntryIds.add(it.entryId) }
                             ?: buildFallbackProviders(currentProvider)
@@ -12637,6 +12671,7 @@ class ChatViewModel(
                 val blockMeta = allToolBlocks.filter { it.kind == "tool_use" }.associateBy { it.id }
                 persistAssistantTurn(turnParts, lastUsage, turnReasoningContent, blockMeta, uiAssistantId = assistantId, streamMs = turnStreamMs)
                 runCatching { com.openminis.app.agent.ModelScore.ok(context, currentProvider.model, turnStreamMs, done = accumulatedText.isNotBlank()) }
+                _activeEntryId.value?.let { com.openminis.app.agent.ModelScore.cool.clear(it) }   // [38.9.15.1]
                 if (escalatedFrom != null && com.openminis.app.agent.ModelScoreCore.webMember(currentProvider.model.id)) com.openminis.app.agent.ModelScore.webBusy = false
                 // [Mines-38.9] plan → execute → self-check → record: a run that went well becomes a 做法 (no question asked)
                 if (helperConfig == null && expCalls.size >= 3 && accumulatedText.isNotBlank()) {
@@ -13125,7 +13160,7 @@ class ChatViewModel(
                         // [Mines-38.9.6 i12] each tool = one short step on the conversation's progress card (auto tables only)
                         val minesToolTitle = if (name == com.openminis.app.plus.TaskProgress.TOOL_NAME) null
                             else runCatching { JSONObject(argsStr).optString("tool_title") }.getOrNull()?.ifBlank { null } ?: name
-                        if (minesToolTitle != null) runCatching { minesProgressFollowSid(); com.openminis.app.plus.TaskProgress.onToolStart(minesSid(), minesToolTitle) }
+                        if (minesToolTitle != null) runCatching { minesStepNow = minesToolTitle; minesStepCount++; minesProgressFollowSid(); com.openminis.app.plus.TaskProgress.onToolStart(minesSid(), minesToolTitle) }
                         // [Mines-38.9.14.1 stall_watch] a tool past its limit is cancelled and the model gets an error result
                         val result = minesToolWatchdog(name, argsStr) { executeTool(name, argsStr, id, allToolBlocks, assistantId, accumulatedText) }
                         if (minesToolTitle != null) runCatching { com.openminis.app.plus.TaskProgress.onToolEnd(minesSid(), minesToolTitle, result.success) }
@@ -13270,35 +13305,54 @@ class ChatViewModel(
                     expCalls += com.openminis.app.agent.ExperienceCore.Call(r.name, com.openminis.app.plus.Experience.brief(argsById[r.id] ?: ""), sig.isNotEmpty(), sig)
                 }
             }
-            // [Mines-38.9.9] 自动调度: the same step failed twice / several errors → the strongest model the group has for the rest
-            // of this run, with a compact hand-over; the session's own model is untouched (next message starts cheap again)
-            if (helperConfig == null && escalatedFrom == null && com.openminis.app.agent.ModelScore.enabled(context)) runCatching {
-                val calls = expCalls.map { com.openminis.app.agent.ModelScoreCore.Call(it.tool, it.failed, it.error) }
-                val why = com.openminis.app.agent.ModelScoreCore.escalation(calls, com.openminis.app.agent.ModelScoreCore.classify(expTask), accumulatedText)
+            if (expCalls.size - lastCompactCalls >= 40) { lastCompactCalls = expCalls.size; forceLoopCompact = true }   // [38.9.15.1] periodic
+            // [Mines-38.9.9 → 38.9.15.1] 自动调度 on a retry loop (user 15:00 「问题我看它都不会切」, 15:02 「模型就这些模型基本都是flash」):
+            // the same step failed twice / 3 failed steps in a row / the model narrating redo after redo → for the rest of this run:
+            // a really stronger model if one is configured, else ANOTHER FAMILY (MiMo ↔ DeepSeek), else another account; 思考 one
+            // level up; a compact hand-over (goal, what failed, don't repeat it) instead of the noisy transcript. Up to 3 times a run,
+            // each time judged only on what happened since the last switch. The session's own model is untouched.
+            if (helperConfig == null && escCount < 3 && com.openminis.app.agent.ModelScore.enabled(context)) runCatching {
+                val since = expCalls.drop(escBase)
+                val calls = since.map { com.openminis.app.agent.ModelScoreCore.Call(it.tool, it.failed, it.error) }
+                val textSince = accumulatedText.drop(escTextBase.coerceAtMost(accumulatedText.length))
+                val why = com.openminis.app.agent.ModelScoreCore.escalation(calls, com.openminis.app.agent.ModelScoreCore.classify(expTask), textSince)
                 if (why != null) {
                     val pool = withContext(Dispatchers.Main) { buildFallbackProviders(currentProvider) }
                     val now = System.currentTimeMillis()
-                    val curKey = com.openminis.app.agent.ModelScore.key(currentProvider.model)
-                    val cands = pool.map { com.openminis.app.agent.ModelScoreCore.Cand(com.openminis.app.agent.ModelScore.key(it.provider.model), it.provider.model.id) }
-                    val best = com.openminis.app.agent.ModelScoreCore.strongest(cands, curKey, { com.openminis.app.agent.ModelScore.stats(context, it) }, now,
+                    fun mem(entryId: String, pr: LLMProvider) = com.openminis.app.agent.ModelScoreCore.Member(entryId, com.openminis.app.agent.ModelScore.key(pr.model), pr.model.id)
+                    val cur = mem(_activeEntryId.value.orEmpty(), currentProvider)
+                    val pick = com.openminis.app.agent.ModelScoreCore.pickEscalation(pool.map { mem(it.entryId, it.provider) }, cur,
+                        { com.openminis.app.agent.ModelScore.stats(context, it) }, { com.openminis.app.agent.ModelScore.cool.cooling(it.member, now) }, now,
                         com.openminis.app.agent.ModelScore.webBusy)
-                    val pick = best?.let { b -> pool.firstOrNull { com.openminis.app.agent.ModelScore.key(it.provider.model) == b.key } }
-                    if (pick != null) {
-                        escalatedFrom = currentProvider
-                        val from = currentProvider.model.displayName
-                        currentProvider = pick.provider
-                        triedEntryIds.add(pick.entryId)
-                        if (com.openminis.app.agent.ModelScoreCore.webMember(pick.provider.model.id)) com.openminis.app.agent.ModelScore.webBusy = true
+                    val target = pick.target?.let { t -> pool.firstOrNull { it.entryId == t.member } }
+                    val from = currentProvider.model.displayName
+                    if (target != null) {
+                        if (escalatedFrom == null) escalatedFrom = currentProvider
+                        currentProvider = target.provider
+                        triedEntryIds.add(target.entryId)
+                        if (com.openminis.app.agent.ModelScoreCore.webMember(target.provider.model.id)) com.openminis.app.agent.ModelScore.webBusy = true
+                    }
+                    // 思考 one level up (高 → 极高) when the model answering now can think
+                    val lvlNow = runThinkingBoost ?: _thinkingLevel.value
+                    val boosted = if (currentProvider.model.supportsReasoning == true)
+                        com.openminis.app.agent.ModelScoreCore.boostLevel(lvlNow, availableThinkingLevels.filter { it.isEnabled }) else null
+                    if (boosted != null) runThinkingBoost = boosted
+                    if (target != null || boosted != null) {
                         val li = resultParts.indexOfLast { it is AgentContentPart.ToolResult }
                         if (li >= 0) {
                             val tr = resultParts[li] as AgentContentPart.ToolResult
-                            resultParts[li] = tr.copy(content = tr.content + "\n\n" + com.openminis.app.agent.ModelScoreCore.summary(expTask, calls, expCalls.map { it.brief }))
+                            resultParts[li] = tr.copy(content = tr.content + "\n\n" + com.openminis.app.agent.ModelScoreCore.summary(expTask, calls, since.map { it.brief }) +
+                                "\n[换方法] 上面失败过的做法不要再重复；换一种完全不同的方法。命令和脚本可以直接长段/heredoc 发（工具会原样送达），不用 base64 或拆分。")
                         }
-                        val line = "$why：$from → ${pick.provider.model.displayName}"
-                        AppLogger.warning(TAG_STREAM, "[AutoSched] $line")
+                        if (expCalls.size >= 12) forceLoopCompact = true   // long run: the next iteration compacts the noisy context
+                        escCount++; escBase = expCalls.size; escTextBase = accumulatedText.length
+                        val line = why + "：" + (if (target != null) "$from → ${target.provider.model.displayName}" else from) +
+                            (boosted?.let { " · 思考 " + com.openminis.app.ui.plus.ModelLine.levelZh(lvlNow) + "→" + com.openminis.app.ui.plus.ModelLine.levelZh(it) } ?: "")
+                        AppLogger.warning(TAG_STREAM, "[AutoSched] ${pick.why} | $line")
                         com.openminis.app.plus.TaskProgress.onToolStart(minesSid(), line)
                         com.openminis.app.plus.TaskProgress.onToolEnd(minesSid(), line, true)
-                        withContext(Dispatchers.Main) { appendSystemInfo("已换难题模型 · $line", "info") }
+                        // [38.9.15.1] the note lives in the reply's folded step row only (no separate system row in the chat)
+                        StepFold.noteSwitch(assistantId, "已切换 · $line")
                     }
                 }
             }
@@ -13317,14 +13371,7 @@ class ChatViewModel(
                 com.openminis.app.plus.Experience.recordLesson(context, expTask, failGuard.lastTool, failGuard.lastSignature,
                     "别再用同样的方法重试；" + failGuard.nextStep().removeSuffix("吗？").removeSuffix("？"))
             }
-            // [Mines-loop-34] weak / flash model on a long tool run → one gentle hint to switch in 模型路由
-            if (!weakModelHinted && helperConfig == null && runGuard.toolCalls >= 15 &&
-                com.openminis.app.plus.ModelHealth.isWeak(currentProvider.model.id, currentProvider.model.displayName)) {
-                weakModelHinted = true
-                withContext(Dispatchers.Main) {
-                    appendSystemInfo("当前模型「${currentProvider.model.displayName}」偏轻量，长任务容易绕圈。复杂的事建议在 设置 → 模型路由 换成更强的模型（如 DeepSeek、GLM、Claude）。", "info")
-                }
-            }
+            // [38.9.15.1] the 「当前模型偏轻量…去模型路由换」 hint is gone: a retry loop now switches by itself (above)
             if (guardVerdict == com.openminis.app.agent.RunLoopGuard.Verdict.WARN) {
                 val li = resultParts.indexOfLast { it is AgentContentPart.ToolResult }
                 if (li >= 0) {
@@ -14799,6 +14846,13 @@ class ChatViewModel(
 
             if (command.isBlank()) {
                 return ToolExecutionResult("Error: 'command' is required", false, toolTitle = toolTitle)
+            }
+            // [38.9.15.1] pkill -f self-kill guard: bracket the pattern so it never matches this shell's own command line;
+            // refuse kills that can only hit the agent's own shell / proot
+            run {
+                val pg = com.openminis.app.agent.shell.PkillGuard.check(command)
+                if (pg.refused != null) return ToolExecutionResult("Error: " + pg.refused, false, toolTitle = toolTitle)
+                if (pg.patched) { AppLogger.info(TAG, "[PkillGuard] patched -f pattern"); command = pg.command }
             }
 
             // [T-android-overlay-finalize item 1] Removed the

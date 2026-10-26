@@ -264,7 +264,7 @@ return JSON.stringify({kind:kind,otp:cands.length>0,split:single.length>=4,otpEm
     private fun startMailWatch() {
         val ctx = appCtx ?: return
         if (watching || !_settings.value.otpAutofill) return
-        if (!runCatching { MailSources.available(ctx) || AgentMailbox.boxes().isNotEmpty() }.getOrDefault(false)) return
+        if (!runCatching { MailSources.available(ctx) || AgentMailbox.boxes().isNotEmpty() || RegLedgerCore.boxesFor(RegLedger.recs.value, expectSite).isNotEmpty() }.getOrDefault(false)) return
         watching = true
         val since = armedAt - EARLY_MS
         watchScope.launch {

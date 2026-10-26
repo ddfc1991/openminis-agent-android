@@ -157,7 +157,21 @@ script() {
 # [Mines-38.9.6 i17] remote jobs: rg falls back to grep where ripgrep is missing (a job printed 'rg: not found')
 RG_SHIM='command -v rg >/dev/null 2>&1 || rg() { [ $# -le 1 ] && set -- "$@" .; grep -rnE --color=never --exclude-dir=.git --exclude-dir=node_modules "$@"; }
 '
-rscript() { printf '%s' "$RG_SHIM"; script "$@"; }
+# [Mines-38.9.15.1] a heredoc / pipe given to `minis-vps run|bg` used to stay on the phone (the job ran with no stdin, so
+# `minis-vps run python3 - <<'EOF'` printed nothing and the model kept rewriting it as base64 / file_write workarounds).
+# Now the local stdin is read once and shipped with the script (base64 inside the job), so it reaches the command intact.
+STDIN_B64=""
+grab_stdin() { [ -t 0 ] && return 0; STDIN_B64=$(timeout 3 cat 2>/dev/null | base64 | tr -d '\n') || STDIN_B64=""; return 0; }
+rscript() {
+    printf '%s' "$RG_SHIM"
+    if [ -n "$STDIN_B64" ]; then
+        printf '__mi=$(mktemp 2>/dev/null || echo /tmp/mines-in.$$); echo %s | base64 -d > "$__mi"\n(\n' "$STDIN_B64"
+        script "$@"
+        printf '\n) < "$__mi"; __rc=$?; rm -f "$__mi"; exit $__rc\n'
+    else
+        script "$@"
+    fi
+}
 
 # [Mines-38.9.6 i17] probe <host> <port>: one line per path + a verdict. Never calls a server down from one path.
 probe1() {
@@ -283,6 +297,7 @@ relay_guard() {
     MINIS_VPS_SERVERS="$app"; export MINIS_VPS_SERVERS
     return 1
 }
+case "$cmd" in run|bg) grab_stdin ;; esac
 case "$cmd" in run|bg|status|shell|attach|jobs|logs)
     if ! relay_guard "$1" && [ "$1" = "--direct" ]; then shift; fi ;;
 esac

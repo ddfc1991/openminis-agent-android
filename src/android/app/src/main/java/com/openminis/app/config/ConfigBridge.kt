@@ -546,6 +546,10 @@ object ConfigBridge {
         //    (see [skipConfirmation] doc).
         val outcome: ConfirmOutcome = if (skipConfirmation) {
             ConfirmOutcome.Approved(resolvedItems)
+        } else if (resolvedItems.isNotEmpty() && resolvedItems.none { it.risk == ConfigRisk.DESTRUCTIVE }) {
+            // [Mines-38.9.15.1] no config-confirm pop-up for ordinary / sensitive app settings (user 2026-10-26 14:16: only
+            // payment-type confirmations may pop up). The change is applied and audited as before; destructive ones still ask.
+            ConfirmOutcome.Approved(resolvedItems)
         } else {
             val pending = PendingConfigChange(items = resolvedItems, caption = caption)
             ConfigConfirmationGate.requestConfirmation(pending)

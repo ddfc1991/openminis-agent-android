@@ -251,6 +251,22 @@ var code=!!document.querySelector('input[autocomplete="one-time-code"],input[nam
 var pw=!!document.querySelector('input[type="password"]');
 return JSON.stringify({captcha:cap,code:code,pw:pw,ready:document.readyState==='complete',url:location.host});}catch(e){return '{}';}})()"""
 
+    /**
+     * [38.9.15.1] a site Mines has no built-in entry for (most 注册台账 sites): with a recorded account the agent signs in in its own
+     * browser — the 登录页 is filled from the 台账 (password) and a mail code is read from the account's temp box by itself —
+     * never 「请用户关联」 for an account Mines already holds.
+     */
+    private fun noEntry(c: Context, root: String): Res {
+        val acct = runCatching { Ledger.cands(c, root).firstOrNull()?.account }.getOrNull()
+        val recs = runCatching { RegLedger.recs.value }.getOrDefault(emptyList())
+        val box = RegLedgerCore.boxesFor(recs, root).firstOrNull()
+        val url = recs.firstOrNull { it.box.equals(box ?: "", true) && it.url.isNotBlank() && RegLedgerCore.boxesFor(listOf(it), root).isNotEmpty() }?.url
+        if (acct == null && box == null) return Res(false, "Mines 没有 $root 的登录入口，台账里也没有这个网站的账号")
+        val who = AccountsCore.maskPhone(acct ?: box!!)
+        return Res(false, "台账里有 $root 的账号 $who：用 browser 打开 " + (url ?: "https://$root/") + " 的登录页，账号密码会自动填好" +
+            (if (box != null) "，邮件验证码 Mines 会自己从这个账号的临时邮箱取来填上" else "") + "，不用问用户；不要再调用 accounts(action=login)。")
+    }
+
     /** The sign-in page of [root]'s platform, or null when Mines has none. */
     private fun loginUrl(pid: String): String? {
         LinkAll.connKind(pid)?.let { k -> return k.loginUrl ?: k.site ?: k.panelUrl }
@@ -263,7 +279,7 @@ return JSON.stringify({captcha:cap,code:code,pw:pw,ready:document.readyState==='
      */
     @SuppressLint("SetJavaScriptEnabled")
     suspend fun hiddenLogin(c: Context, root: String): Res {
-        val pid = runCatching { LinkAll.platformFor(root) }.getOrNull() ?: return Res(false, "Mines 没有 $root 的登录入口：请用户在「账号」里关联一次")
+        val pid = runCatching { LinkAll.platformFor(root) }.getOrNull() ?: return noEntry(c, root)
         val url = loginUrl(pid) ?: return Res(false, "$root 没有登录页地址")
         val k = LinkAll.connKind(pid)
         var wv: WebView? = null

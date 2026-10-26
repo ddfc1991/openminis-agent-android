@@ -865,6 +865,37 @@ object GroupSelfTest {
             }
             // [Mines-38.9.14 chat_home] smoke: 'i3914 main' = open 聊天 (main conversation); 'i3914 say <text>' = type <text> into it
             // through the normal send (router decides); 'i3914 state' = flag, main sid, tasks, last decision, main rows (role + tag)
+            // [Mines-38.9.15.1] smoke: 'i39151 needseed' = the mock's 任务 page (two 需要你 + one done); 'i39151 state' = tasks count,
+            // the 应用 「模型」 line, the LoginCard / AccountPick / handoff pop-up state, the list-pane flags
+            "i39151" -> {
+                val sub = rest.substringBefore(' ').trim()
+                val H = com.openminis.app.plus.ChatHome; H.init(context)
+                val CH = com.openminis.app.plus.ChatHomeCore
+                when (sub) {
+                    "needseed" -> {
+                        if (H.mainSid.isBlank()) H.ensureMain(context)
+                        val now = System.currentTimeMillis()
+                        H.seedForTest(CH.AutoTask("need1", "", "阿里云 QwenPaw 登录", "帮我登录阿里云 QwenPaw", CH.St.WAITING, 3, 6,
+                            "短信验证码已发到你手机 138****8658，收到发我", now - 240_000, now - 180_000, "waiting"))
+                        H.seedForTest(CH.AutoTask("need2", "", "Railway 注册", "帮我注册 railway.com", CH.St.WAITING, 2, 5,
+                            "验证码页要你点一下「我不是机器人」", now - 1_500_000, now - 1_400_000, "waiting"))
+                        H.seedForTest(CH.AutoTask("done1", "", "siyun 内存检查", "看看 siyun 内存", CH.St.DONE, 4, 4,
+                            "完成 · 4/4 步", now - 4_000_000, now - 3_900_000, "done"))
+                        JSONObject().put("seeded", 3).toString()
+                    }
+                    "state" -> JSONObject()
+                        .put("tasks", H.tasks.value.size)
+                        .put("ids", JSONArray(H.tasks.value.map { it.id }))
+                        .put("waiting", H.tasks.value.count { !it.archived && it.st == CH.St.WAITING })
+                        .put("modelLine", com.openminis.app.ui.plus.ChatHomeNav.modelLine.value)
+                        .put("loginCard", com.openminis.app.plus.LoginCard.pending.value != null)
+                        .put("loginCardOpened", com.openminis.app.plus.LoginCard.opened.value != 0L)
+                        .put("accountPick", com.openminis.app.plus.AccountPick.pending.value != null)
+                        .put("allShowing", com.openminis.app.ui.plus.ChatHomeNav.allShowing.value)
+                        .put("last", H.stateJson().let { runCatching { JSONObject(it).optString("last") }.getOrDefault("") }).toString()
+                    else -> "i39151 needseed | state"
+                }
+            }
             "i3915" -> com.openminis.app.persona.PersonaSmoke.handle(context, rest)   // [Mines-38.9.15 伪人核心] smoke hooks
             "ira" -> com.openminis.app.plus.RegisterAutoSmoke.handle(context, rest)   // [Mines-38.9.15 register_auto] 一键注册 smoke hooks
             "i3914" -> {

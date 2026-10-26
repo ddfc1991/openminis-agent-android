@@ -233,6 +233,7 @@ import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.outlined.Public
@@ -299,6 +300,12 @@ internal fun ModelPickerSheet(
     /** [T-android-picker-provider-edit] Edit button on each provider section
      *  header — opens that provider instance's settings. Null hides it. */
     onEditProvider: ((instanceId: String) -> Unit)? = null,
+    /** [38.9.15.1] the member answering right now (账号 · 模型), shown under the title */
+    liveLine: String = "",
+    /** [38.9.15.1] 思考强度 row (null = hidden) */
+    thinkingLevel: com.openminis.app.data.model.ThinkingLevel? = null,
+    thinkingLevels: List<com.openminis.app.data.model.ThinkingLevel> = emptyList(),
+    onThinking: ((com.openminis.app.data.model.ThinkingLevel) -> Unit)? = null,
 ) {
     val openTime = remember { System.nanoTime() }
 
@@ -457,6 +464,27 @@ internal fun ModelPickerSheet(
                 Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.CenterEnd) {
                     MinisTextButton(onClick = onDismiss) {
                         Text(stringResource(R.string.model_picker_done))
+                    }
+                }
+            }
+
+            // [38.9.15.1] live member + 思考强度 (moved here from the header line)
+            if (liveLine.isNotBlank()) Text("正在用：$liveLine", style = MaterialTheme.typography.bodySmall,
+                color = ChatColors.secondaryText, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 2.dp))
+            if (thinkingLevel != null && onThinking != null && thinkingLevels.isNotEmpty()) {
+                Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    Text("思考", style = MaterialTheme.typography.bodySmall, color = ChatColors.secondaryText, modifier = Modifier.padding(end = 8.dp))
+                    (listOf(com.openminis.app.data.model.ThinkingLevel.OFF) + thinkingLevels.filter { it.isEnabled }).distinct().forEach { lv ->
+                        val on = lv == thinkingLevel
+                        Text(com.openminis.app.ui.plus.ModelLine.levelZh(lv), style = MaterialTheme.typography.bodySmall,
+                            fontWeight = if (on) FontWeight.SemiBold else FontWeight.Normal,
+                            color = if (on) MaterialTheme.colorScheme.primary else ChatColors.primaryText,
+                            modifier = Modifier.padding(end = 6.dp).clip(RoundedCornerShape(50))
+                                .background(if (on) MaterialTheme.colorScheme.primary.copy(alpha = 0.12f) else ChatColors.secondaryText.copy(alpha = 0.08f))
+                                .clickable { onThinking(lv) }.padding(horizontal = 12.dp, vertical = 6.dp)
+                                .semantics { contentDescription = "思考强度 " + com.openminis.app.ui.plus.ModelLine.levelZh(lv) })
                     }
                 }
             }

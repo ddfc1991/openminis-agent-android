@@ -49,11 +49,24 @@ object CodeSources {
         val mails = runCatching { MailSources.recent(c, 0L) }.getOrDefault(emptyList()).filter { it.source !in off } +
             runCatching { AgentMailbox.recent(c) }.getOrDefault(emptyList()).filter { it.source !in off }
         val now = System.currentTimeMillis()
-        val f = if (site.isBlank()) MailParse.codeFrom(mails, sinceMs)?.let { (code, m) -> CodeSourcesCore.Found(code, null, m.from, m.at) }
+        var f = if (site.isBlank()) MailParse.codeFrom(mails, sinceMs)?.let { (code, m) -> CodeSourcesCore.Found(code, null, m.from, m.at) }
             else CodeSourcesCore.find(mails, site, sinceMs, now)
-        if (f != null) lastVia = mails.firstOrNull { it.at == f.at && it.from == f.from }?.source.orEmpty()
-        f?.code?.let { code -> _seen.value = (listOf(Seen(site.ifBlank { CodeSourcesCore.senderDomain(f.from) }, CodeSourcesCore.mask(code), f.from.substringBefore('<').trim().take(20), now)) + _seen.value).take(5) }
-        f
+        // [38.9.15.1] the 台账 account's own temp box (Mail.tm, password in the vault): read it too, so a password + mail-code
+        // sign-in with a recorded account finishes by itself
+        lastVia = ""
+        if (f == null && site.isNotBlank()) runCatching {
+            val recs = RegLedger.recs.value
+            for (box in RegLedgerCore.boxesFor(recs, site).take(3)) {
+                val got = RegLedger.read(box, 6).orEmpty().mapIndexed { i, m -> MailParse.Mail("reg:$box:$i", "临时邮箱", m.from, m.subject, m.text, m.at) }
+                f = CodeSourcesCore.find(got, site, sinceMs, now)
+                    ?: if (RegLedgerCore.boxOnlyFor(recs, box, site)) MailParse.codeFrom(got.filter { it.at == 0L || it.at >= sinceMs }, sinceMs)?.let { (code, m) -> CodeSourcesCore.Found(code, null, m.from, m.at) } else null
+                if (f != null) { lastVia = "临时邮箱"; break }
+            }
+        }
+        val ff = f
+        if (ff != null && lastVia != "临时邮箱") lastVia = mails.firstOrNull { it.at == ff.at && it.from == ff.from }?.source.orEmpty()
+        ff?.code?.let { code -> _seen.value = (listOf(Seen(site.ifBlank { CodeSourcesCore.senderDomain(ff.from) }, CodeSourcesCore.mask(code), ff.from.substringBefore('<').trim().take(20), now)) + _seen.value).take(5) }
+        ff
     }
 }
 

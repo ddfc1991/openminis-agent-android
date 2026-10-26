@@ -661,7 +661,8 @@ fun KeychainHost() {
     var dismissed by remember { mutableStateOf(setOf<String>()) }
     var guide by remember { mutableStateOf<KeychainCore.Alert?>(null) }
     val m = mines()
-    if (pending != null && pending.key !in dismissed) MinesSheet({ dismissed = dismissed + pending.key }) {
+    // [38.9.15.1] no new-device pop-up sheet (user 2026-10-26: only payment-type confirmations pop): the alert stays in 「消息」
+    if (false && pending != null && pending.key !in dismissed) MinesSheet({ dismissed = dismissed + pending.key }) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 22.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.size(42.dp).clip(CircleShape).background(Color(0xFFFCE2DE)), contentAlignment = Alignment.Center) {
                 MinesIcon(ic("shield-alert"), null, tint = Color(0xFFD4382C), modifier = Modifier.size(22.dp))

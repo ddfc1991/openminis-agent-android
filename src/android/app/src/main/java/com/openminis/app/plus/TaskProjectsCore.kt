@@ -186,4 +186,31 @@ object TaskProjectsCore {
                 (0 until tr.length()).map { j -> tr.getJSONObject(j).let { Attempt(it.optString("s"), it.optInt("n"), it.optInt("a"), it.optLong("t")) } })
         }
     }.getOrDefault(emptyList())
+
+    // ── [38.9.15.1] silent back-fill: older tasks get their 台账 account linked ──
+
+    data class Backfill(val sid: String, val host: String, val account: String)
+
+    /**
+     * Tasks from before silent 立项 (e.g. yesterday's 「Zeabur 注册」) that never became a project: when the task's name/goal names a
+     * site the 台账 holds an account for, file it silently with that account (user 2026-10-26 14:18 「记录在案的他就可以调用」).
+     * [tasks] = (sid, name + goal, createdAt); [ledger] = (host, account); only tasks newer than [now] − [windowMs], one per sid,
+     * never a sid already in a project; with several accounts for one site the newest record wins (the list order).
+     */
+    fun backfillPlan(projects: List<Project>, tasks: List<Triple<String, String, Long>>, ledger: List<Pair<String, String>>,
+                     now: Long, windowMs: Long = 3 * 86_400_000L): List<Backfill> {
+        val out = ArrayList<Backfill>()
+        for ((sid, text, at) in tasks) {
+            if (sid.isBlank() || at < now - windowMs || projectOf(projects, sid) != null || out.any { it.sid == sid }) continue
+            val low = text.lowercase()
+            val hit = ledger.firstOrNull { (h, a) ->
+                val host = hostOf(h); if (host.isBlank() || a.isBlank()) return@firstOrNull false
+                val parts = host.split('.'); val label = if (parts.size >= 2) parts[parts.size - 2] else host   // dash.zeabur.com → zeabur
+                low.contains(host) || (label.length >= 3 && Regex("(?<![a-z0-9])" + Regex.escape(label) + "(?![a-z0-9])").containsMatchIn(low))
+            } ?: continue
+            out += Backfill(sid, hostOf(hit.first), hit.second)
+        }
+        return out
+    }
+
 }

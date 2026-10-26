@@ -3028,6 +3028,12 @@ fun ChatScreen(
                                         // keeps a visible, tappable label.
                                         stringResource(R.string.model_picker_no_model_selected)
                                     }
+                                    // [38.9.15.1] the 「模型」 box on 应用 shows what this chat runs on
+                                    if (minesHomeGlass) {
+                                        val lvlForLine by viewModel.thinkingLevel.collectAsState()
+                                        val lineNow = com.openminis.app.ui.plus.ModelLine.line(groupNameDisplay, modelName, lvlForLine)
+                                        LaunchedEffect(lineNow) { com.openminis.app.ui.plus.ChatHomeNav.modelLine.value = lineNow }
+                                    }
                                     if (groupNameDisplay.isNotEmpty()) {
                                         // [T-android-topbar-manual-entry-name]
                                         // Row 1 now names a model as readily as
@@ -3087,7 +3093,9 @@ fun ChatScreen(
                                 // [Mines-38.5] had hidden this line (`if (false && …)`) when the character's face moved into the bar.
                                 // [Mines-38.9.1] user 2026-10-17 「模型都不出现了」「我都不知道用的哪个」: back — 「账号 · 模型 💡思考」 under the
                                 // group, updated live by the 429 rotation (it writes _providerName / _modelName).
-                                if (providerName.isNotEmpty() || modelName.isNotEmpty()) {
+                                // [38.9.15.1] 聊天主页 header = name + the one model-group chip (user 2026-10-26 14:34 「页面看起来比较杂乱」):
+                                // the 「账号 · 模型 · 思考」 line is not drawn here; the picker behind the chip shows the live member
+                                if (!minesHomeGlass && (providerName.isNotEmpty() || modelName.isNotEmpty())) {
                                     val thinkingLevelBadgeState by viewModel.thinkingLevel.collectAsState()
                                     Row(
                                         verticalAlignment = Alignment.CenterVertically,
@@ -3543,9 +3551,13 @@ fun ChatScreen(
                     }
                 },
                 windowInsets = WindowInsets.statusBars,
+                // [Mines-38.9.15.1] 「头顶那片就不能透明？」: over the weather sky / wallpaper the header is
+                // transparent (no beige band, same for 聊天主页 and task pages); only a very light top fade
+                // keeps the status bar + title legible. Plain theme keeps the old opaque bar.
+                modifier = if (minesChatSky || minesWallpaper) Modifier.background(com.openminis.app.ui.plus.HeaderFade.brush()) else Modifier,
                 colors = androidx.compose.material3.TopAppBarDefaults.topAppBarColors(
-                    containerColor = if (minesHomeGlass) com.openminis.app.ui.plus.minesGlassFill() else ChatColors.background.copy(alpha = if (minesWallpaper) 0.55f else 0.92f),
-                    scrolledContainerColor = if (minesHomeGlass) com.openminis.app.ui.plus.minesGlassFill() else ChatColors.background.copy(alpha = if (minesWallpaper) 0.55f else 0.92f),
+                    containerColor = if (minesChatSky || minesWallpaper) Color.Transparent else if (minesHomeGlass) com.openminis.app.ui.plus.minesGlassFill() else ChatColors.background.copy(alpha = 0.92f),
+                    scrolledContainerColor = if (minesChatSky || minesWallpaper) Color.Transparent else if (minesHomeGlass) com.openminis.app.ui.plus.minesGlassFill() else ChatColors.background.copy(alpha = 0.92f),
                 ),
                 // [T-android-topbar-shrink] 76dp → 68dp. The earlier
                 // T-topbar-model-row-clip fix bumped 60dp → 76dp to give the
@@ -7738,25 +7750,21 @@ fun ChatScreen(
     var minesVerifyShownFor by remember { mutableStateOf(0L) }
     minesVerify?.let { pv ->
         if (minesVerifyShownFor != pv.since && !showBrowserSheet) {
-            com.openminis.app.ui.glass.AlertDialog(
-                onDismissRequest = { minesVerifyShownFor = pv.since },
-                title = { Text("需要你点一下验证") },
-                text = {
-                    Text(
-                        "${pv.host.ifBlank { "网页" }} 弹出了${pv.kind}。点「去验证」打开这个网页，按提示点一下或拖一下滑块；完成后 Mines 会自动继续。",
-                        style = MaterialTheme.typography.bodyLarge,
-                    )
-                },
-                confirmButton = {
-                    androidx.compose.material3.Button(onClick = {
-                        minesVerifyShownFor = pv.since
-                        viewModel.openBrowserSheetForUrl(pv.url)
-                    }) { Text("去验证") }
-                },
-                dismissButton = {
-                    androidx.compose.material3.TextButton(onClick = { minesVerifyShownFor = pv.since }) { Text("稍后") }
-                },
-            )
+            // [38.9.15.1] no dialog any more (only payment-type confirmations pop): one small non-modal line at the top,
+            // 「需要你点一下验证 · 去验证」; the task also waits under 任务 → 需要你
+            androidx.compose.ui.window.Popup(alignment = Alignment.TopCenter, offset = androidx.compose.ui.unit.IntOffset(0, 220),
+                properties = androidx.compose.ui.window.PopupProperties(focusable = false)) {
+                com.openminis.app.ui.plus.GlassToast(Modifier.padding(horizontal = 12.dp), shape = androidx.compose.foundation.shape.RoundedCornerShape(22.dp)) {
+                    Row(Modifier.padding(start = 14.dp, end = 6.dp, top = 4.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text("需要你点一下验证 · " + pv.host.ifBlank { "网页" }, style = MaterialTheme.typography.bodyMedium, maxLines = 1)
+                        Spacer(Modifier.width(8.dp))
+                        com.openminis.app.ui.plus.GlassPill("去验证") {
+                            minesVerifyShownFor = pv.since
+                            viewModel.openBrowserSheetForUrl(pv.url)
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -7821,6 +7829,11 @@ fun ChatScreen(
         )
     }
 
+    // [38.9.15.1] 应用 → 「模型」 box: open the full picker here once
+    val openPickerReq by com.openminis.app.ui.plus.ChatHomeNav.openModelPicker.collectAsState()
+    LaunchedEffect(openPickerReq) {
+        if (openPickerReq) { com.openminis.app.ui.plus.ChatHomeNav.openModelPicker.value = false; showModelPicker = true }
+    }
     // Model Picker bottom sheet
     if (showModelPicker) {
         val config by providerRepository.config.collectAsState()
@@ -7914,6 +7927,11 @@ fun ChatScreen(
                 reopenModelPickerOnResume()
                 onEditProviderClick(instanceId)
             },
+            // [38.9.15.1] 思考强度 lives in the chip's picker (the header's 「账号 · 模型 · 思考」 line is gone on 聊天主页)
+            liveLine = listOf(providerName, modelName).filter { it.isNotBlank() }.joinToString(" · "),
+            thinkingLevel = viewModel.thinkingLevel.collectAsState().value,
+            thinkingLevels = viewModel.availableThinkingLevels,
+            onThinking = { viewModel.setThinkingLevel(it) },
         )
 
         pendingNonTextSelection?.let { pending ->

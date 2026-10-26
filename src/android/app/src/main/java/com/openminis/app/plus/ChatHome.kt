@@ -86,6 +86,8 @@ object ChatHome {
             initAt = android.os.SystemClock.uptimeMillis()
         }
         observe(); pump()
+        // [38.9.15.1] older tasks → their 台账 account, silently (TaskProjects.backfill)
+        scope.launch { kotlinx.coroutines.delay(8_000L); runCatching { app?.let { TaskProjects.backfill(it, _tasks.value) } } }
     }
 
     private fun prefs() = app?.getSharedPreferences(FILE, Context.MODE_PRIVATE)
@@ -267,6 +269,15 @@ object ChatHome {
      */
     fun intercept(sid: String, text: String, hasAttachments: Boolean, send: (String) -> Unit): Boolean {
         if (!isMain(sid) || hasAttachments || text.isBlank() || text.trimStart().startsWith("/")) return false
+        // [38.9.15.1] user 2026-10-26 14:24 「这种询问的他都不会单开页面，看起来很凌乱」: a reply to Mines is never a new task — it goes
+        // to the waiting task it answers (that task's own conversation continues), else it stays an ordinary message in 聊天
+        if (ChatHomeCore.isReply(text)) {
+            val target = ChatHomeCore.replyTarget(_tasks.value, text)
+            lastDecision = ChatHomeCore.Decision(ChatHomeCore.Route.QUICK, target?.name.orEmpty())
+            if (target == null || target.sid.isBlank() || isExternal(target.sid)) return false
+            scope.launch { runCatching { answerTask(target, text) }.onFailure { withContext(Dispatchers.Main) { send(text) } } }
+            return true
+        }
         if (ChatHomeCore.obviousQuick(text)) { lastDecision = ChatHomeCore.Decision(ChatHomeCore.Route.QUICK); return false }
         _routing.value = text
         scope.launch {
@@ -364,10 +375,19 @@ object ChatHome {
         }
     }
 
-    private suspend fun run(t: AutoTask) {
+    /** [38.9.15.1] the user's answer goes into the task's own conversation and the task runs on from there (no new row) */
+    private suspend fun answerTask(t: AutoTask, text: String) {
+        appendToMain(listOf("user" to text))
+        if (t.archived) restoreTask(app ?: return, t.id)
+        inRunner += t.id
+        update(t.id) { ChatHomeCore.started(it, System.currentTimeMillis()).copy(told = "") }
+        scope.launch { run(t, text) }
+    }
+
+    private suspend fun run(t: AutoTask, text: String = t.goal) {
         val c = app ?: return
         val res = runCatching {
-            com.openminis.app.debug.HeadlessChatRunner.prompt(c, t.sid, t.goal, wait = true, timeoutMs = 45 * 60_000L)
+            com.openminis.app.debug.HeadlessChatRunner.prompt(c, t.sid, text, wait = true, timeoutMs = 45 * 60_000L)
         }
         inRunner.remove(t.id)
         val now = System.currentTimeMillis()
@@ -413,7 +433,8 @@ object ChatHome {
                     if (!ChatHomeCore.needsNotice(t) || (t.id in inRunner && t.st != St.WAITING)) continue
                     val (kind, body) = ChatHomeCore.noticeOf(t) ?: continue
                     update(t.id) { it.copy(told = t.st.id) }
-                    runCatching { appendToMain(listOf("assistant" to ChatHomeCore.tagText(t.id, kind, body))) }
+                    // [38.9.15.1] a task's question stays in its own conversation (+ the 「需要你 N」 chip on 聊天), not a row in 聊天
+                    if (kind != ChatHomeCore.Kind.ASK) runCatching { appendToMain(listOf("assistant" to ChatHomeCore.tagText(t.id, kind, body))) }
                     runCatching { notify(t, body) }
                 }
             }

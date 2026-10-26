@@ -66,7 +66,9 @@ fun HandoffHost() {
     val h = list.filter { it.open || it.state == HandoffCore.State.EXPIRED }.maxByOrNull { it.createdAt } ?: return
     var seenSeq by remember(h.id) { mutableIntStateOf(0) }
     // the login card is its own sheet; a LOGIN popup only when the sign-in was not confirmed (hint)
-    val popup = h.open && seenSeq < h.showSeq && (h.kind != Kind.LOGIN || h.hint.isNotBlank())
+    // [38.9.15.1] only a confirmation step (payment-type) may still pop up; captcha / code / login / takeover steps show the
+    // non-modal bar only (user 2026-10-26 14:16 「付款这些弹我理解，这些都弹就不应该了」)
+    val popup = h.open && seenSeq < h.showSeq && h.kind == Kind.CONFIRM
     if (popup) HandoffDialog(h) { seenSeq = h.showSeq }
     else if (card == null) HandoffBar(h)
 }

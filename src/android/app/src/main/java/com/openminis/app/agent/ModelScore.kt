@@ -24,6 +24,9 @@ object ModelScore {
 
     fun stats(c: Context, key: String): ModelScoreCore.Stats? = load(c)[key]
 
+    /** [38.9.15.1] per group-member (account) cool-down, in memory for this process */
+    val cool = ModelScoreCore.AccountCool()
+
     @Synchronized fun ok(c: Context, m: LLMModel, ms: Long, done: Boolean = false) {
         val k = key(m); load(c)[k] = ModelScoreCore.onOk(load(c)[k], ms, System.currentTimeMillis(), done); save(c)
     }

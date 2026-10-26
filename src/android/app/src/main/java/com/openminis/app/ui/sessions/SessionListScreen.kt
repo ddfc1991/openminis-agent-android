@@ -507,6 +507,9 @@ private fun relativeDate(context: Context, timestamp: Long): String {
 @Composable
 fun SessionListScreen(
     chatRepository: ChatRepository,
+    /** [Mines-38.9.15.1 chat_home] 全部对话 under 聊天主页: no old-home header (avatar, greeting, 最近对话), a plain title bar + dock */
+    chatHomeAll: Boolean = false,
+    onAllBack: () -> Unit = {},
     providerRepository: ProviderRepository,
     onSessionClick: (String) -> Unit,
     onNewChat: (String) -> Unit,
@@ -946,7 +949,17 @@ fun SessionListScreen(
             // [Mines-38.6] user 2026-10-15 「头像不够上，再上一点，得接近两侧边的两个图标高度」: on the home list the
             // character face sits in the top bar itself, centred between ☰ and ⚙ with its upper half level with
             // them (face top right under the status bar); the name/status line and everything below move up with it.
-            if (!isSelecting && isInitialLoadComplete && minesHomeShown) {
+            if (chatHomeAll && !isSelecting) {
+                com.openminis.app.ui.plus.AllChatsTopBar(
+                    count = minesAllSessions.size,
+                    searching = isSearchActive,
+                    onBack = onAllBack,
+                    onSearch = {
+                        if (isSearchActive) { viewModel.searchQuery.value = ""; viewModel.isSearchActive.value = false }
+                        else viewModel.isSearchActive.value = true
+                    },
+                )
+            } else if (!isSelecting && isInitialLoadComplete && minesHomeShown) {
                 // [Mines-38.7] weather line above the face (hidden when there is no weather); ☰ / face / ⚙ keep their row
                 Column(Modifier.fillMaxWidth().windowInsetsPadding(androidx.compose.material3.TopAppBarDefaults.windowInsets),
                     horizontalAlignment = Alignment.CenterHorizontally) {
@@ -1088,7 +1101,16 @@ fun SessionListScreen(
                     androidx.compose.runtime.LaunchedEffect(minesHeaderH) {
                         if (listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset > 0) listState.scrollToItem(0)
                     }
-                    if (!isSelecting) androidx.compose.foundation.layout.Column(
+                    if (!isSelecting && chatHomeAll) androidx.compose.foundation.layout.Column(
+                        Modifier.fillMaxWidth().onSizeChanged { minesHeaderH = it.height },
+                    ) {
+                        // [38.9.15.1] 全部对话: only the search field (when searching) — no greeting, stats, weather, cards
+                        if (isSearchActive) com.openminis.app.ui.plus.AllChatsSearch(
+                            query = searchQuery, resultCount = sessions.size,
+                            onQuery = { viewModel.searchQuery.value = it },
+                            onClose = { viewModel.searchQuery.value = ""; viewModel.isSearchActive.value = false },
+                        )
+                    } else if (!isSelecting) androidx.compose.foundation.layout.Column(
                         Modifier.fillMaxWidth().onSizeChanged { minesHeaderH = it.height },
                     ) {
                         com.openminis.app.ui.plus.TodayCard(

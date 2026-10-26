@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
@@ -57,6 +58,8 @@ fun LoginCardHost() {
     val req by LoginCard.pending.collectAsState()
     val r = req ?: return
     val m = mines()
+    val openedId by LoginCard.opened.collectAsState()
+    if (openedId != r.id) { LoginCardLine(r); return }
     val values = remember(r.id) { mutableStateMapOf<Field, String>().apply {
         r.ask.fields.firstOrNull { it == Field.ACCOUNT || it == Field.EMAIL || it == Field.PHONE }?.let { put(it, r.account) }
     } }
@@ -119,6 +122,28 @@ fun LoginCardHost() {
             GlassPill(if (r.ask.fields == listOf(Field.CODE)) "确定" else "提交", enabled = ready, modifier = Modifier.fillMaxWidth()) {
                 val acct = r.ask.fields.firstOrNull { it == Field.ACCOUNT || it == Field.EMAIL || it == Field.PHONE }?.let { values[it] }?.trim() ?: r.account
                 LoginCard.answer(LoginCard.Answer(acct, values[Field.PASSWORD].orEmpty(), values[Field.CODE].orEmpty().trim(), save))
+            }
+        }
+    }
+}
+
+
+/**
+ * [38.9.15.1] what replaces the pop-up: one small glass line under the status bar, 「需要你登录 X · 填写」. Nothing opens until the
+ * user taps 填写; the task keeps waiting (it is also under 任务 → 需要你).
+ */
+@Composable
+private fun LoginCardLine(r: LoginCard.Req) {
+    val m = mines()
+    Box(Modifier.fillMaxWidth().statusBarsPadding().padding(top = 60.dp),
+        contentAlignment = Alignment.TopCenter) {
+        GlassToast(Modifier.padding(horizontal = 12.dp), shape = RoundedCornerShape(22.dp)) {
+            Row(Modifier.padding(start = 14.dp, end = 6.dp, top = 4.dp, bottom = 4.dp).semantics { contentDescription = "需要你登录 ${r.name}" },
+                verticalAlignment = Alignment.CenterVertically) {
+                Text((if (r.ask.refused) "密码不对 · " else "需要你登录 ") + r.name, fontSize = MT.Body, color = m.ink, maxLines = 1,
+                    overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                Spacer(Modifier.width(8.dp))
+                GlassPill("填写") { LoginCard.open(r) }
             }
         }
     }

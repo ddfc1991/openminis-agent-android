@@ -79,7 +79,7 @@ fun AppsHubScreen(onBack: () -> Unit, go: (String) -> Unit) {
         HubTile("快速连接", "terminal", Color(0xFF35607F), Routes3912.CONNECT),
         HubTile("伪人核心", "shield-check", Color(0xFF5E6B7E), PersonaRoutes.PAGE),   // [Mines-38.9.15 伪人核心]
     )
-    PlusPage("应用", onBack) {
+    PlusPage("应用", onBack, clearHeader = true) {
         MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp)) {
             tiles.chunked(4).forEach { row ->
                 Row(Modifier.fillMaxWidth().padding(vertical = 10.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
@@ -95,6 +95,15 @@ fun AppsHubScreen(onBack: () -> Unit, go: (String) -> Unit) {
                     }
                 }
             }
+        }
+        // [38.9.15.1] user 15:30 「放在应用在那里啊，下面插入一个框框吧」: one 「模型」 box under the grid — current group · model · 思考,
+        // tap = the full model picker (all groups / models / accounts + 思考强度) of the chat
+        val modelLine by ChatHomeNav.modelLine.collectAsState()
+        MinesCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp)) {
+            PlusRow(ic("layers"), "模型", modelLine.ifBlank { "选择模型组、模型和思考强度" }, onClick = {
+                ChatHomeNav.openModelPicker.value = true
+                onBack()
+            })
         }
         PlusSection("已连接", action = "管理 ›", onAction = { go(PlusRoutes.CONNECTIONS) }) {
             PlusRow(ic("users"), "账号与服务", "AI 服务、登录与密钥", onClick = { go(PlusRoutes.CONNECTIONS) })

@@ -42,6 +42,7 @@ class ConvProfilesCoreTest {
         assertTrue(src("ui/chat/ChatViewModel.kt").contains("ConvProfiles.rename(sessionId, session.id)"))
         // [38.9.11.3] 台账 accounts fill in any conversation (LedgerCore ranking), then bind to it
         assertTrue(src("plus/AgentLogin.kt").contains("Ledger.choose(ctx, host, sessionId") && src("plus/AgentLogin.kt").contains("ConvProfiles.bind(sessionId"))
-        assertTrue(src("MainActivity.kt").contains("LedgerChipHost()") && src("plus/AccountsTool.kt").contains("\"ledger\" ->"))
+        // [38.9.15.1] the 「已用 台账」 prompt chip is gone (quiet by default); the ledger tool stays
+        assertTrue(!src("MainActivity.kt").contains("LedgerChipHost()") && src("plus/AccountsTool.kt").contains("\"ledger\" ->"))
     }
 }

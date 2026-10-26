@@ -111,4 +111,21 @@ class TaskProjectsCoreTest {
         assertTrue(C.fromJson("garbage").isEmpty())
         assertTrue(C.fromJson(null).isEmpty())
     }
+
+    // [38.9.15.1] yesterday's tasks get their 台账 account silently
+    @Test fun backfillLinksOldTasksToLedger() {
+        val now = 10 * 86_400_000L
+        val tasks = listOf(
+            Triple("s1", "Zeabur 注册\n帮我注册 zeabur", now - 86_400_000L),
+            Triple("s2", "今天天气", now - 3_600_000L),
+            Triple("s3", "Railway 注册", now - 9 * 86_400_000L),            // too old
+            Triple("s4", "看看 zeaburx 的价格", now - 3_600_000L))          // not the same word
+        val ledger = listOf("dash.zeabur.com" to "mine1@dcpa.net", "railway.com" to "r@x.com", "zeabur.com" to "older@x.com")
+        val plan = C.backfillPlan(emptyList(), tasks, ledger, now)
+        assertEquals(listOf(TaskProjectsCore.Backfill("s1", "dash.zeabur.com", "mine1@dcpa.net")), plan)
+        // a task already in a project is left alone
+        val proj = C.register(emptyList(), "s1", "zeabur.com", "注册", "", "", "2026-10-25", now)
+        assertTrue(C.backfillPlan(proj, tasks, ledger, now).isEmpty())
+    }
+
 }

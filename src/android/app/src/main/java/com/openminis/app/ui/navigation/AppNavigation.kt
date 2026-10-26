@@ -409,6 +409,13 @@ fun AppNavigation(
         // saveConfig. If the load never completes (unreadable store), fall
         // through after the bound and read what is published, as before.
         kotlinx.coroutines.withTimeoutOrNull(2_000) { providerRepository.awaitConfigLoaded() }
+        // [38.9.15.1] under 聊天主页 a slow provider load must not fall through to the old auto-resume (a plain chat whose back
+        // showed the old home): wait up to 20 s more for the providers before deciding
+        if (com.openminis.app.plus.ChatHome.enabled() && !hasPendingShare && providerRepository.instances.isEmpty())
+            kotlinx.coroutines.withTimeoutOrNull(20_000) {
+                providerRepository.awaitConfigLoaded()
+                while (providerRepository.instances.isEmpty() && hasAnySession) kotlinx.coroutines.delay(500)
+            }
         val hasAnyProvider = providerRepository.instances.isNotEmpty()
         // [XSessionDiag] Hypothesis 1 context: which launch mode actually applied.
         // rawMode is the user's preference (0 = auto, the default); mode is what
@@ -593,9 +600,7 @@ fun AppNavigation(
     // [Mines-crash-28] Offer the last crash record once after it happened.
     // [Mines-38.9.11.3] the blocking crash dialog is replaced by the small CrashCardHost card (JVM crash + ANR + native, redacted)
     // Mines: one-time offer to pull data from the earlier Mines install.
-    com.openminis.app.ui.plus.MinesMigrationPrompt(
-        onOpen = { navController.safeNavigate(com.openminis.app.ui.plus.PlusRoutes.MIGRATE) },
-    )
+    // [38.9.15.1] no first-launch 「从旧版迁移？」 pop-up (only payment-type confirmations pop); 设置 → Mines → 从旧版迁移 stays
     // [Mines-38.1] one porcelain backdrop (blurred + masked wallpaper) behind every screen; pages are transparent.
     androidx.compose.foundation.layout.Box(Modifier.fillMaxSize()) {
     com.openminis.app.ui.plus.MinesBackdrop(Modifier.fillMaxSize())
@@ -695,7 +700,15 @@ fun AppNavigation(
                     if (!resolved) return@LaunchedEffect
                     kotlinx.coroutines.delay(150)
                     if (navController.currentDestination?.route != Routes.SESSION_LIST) return@LaunchedEffect
-                    val main = com.openminis.app.plus.ChatHome.existingMain(histCtx) ?: com.openminis.app.plus.ChatHome.ensureMain(histCtx)
+                    // [38.9.15.1] the realme's Keystore can keep the provider list unloaded for 5–12 s: keep trying (≤ 20 s) before
+                    // giving up to the old list (only a device with no conversation and no provider at all ends up there)
+                    var main: String? = null
+                    for (i in 0 until 20) {
+                        main = com.openminis.app.plus.ChatHome.existingMain(histCtx) ?: com.openminis.app.plus.ChatHome.ensureMain(histCtx)
+                        if (main != null || navController.currentDestination?.route != Routes.SESSION_LIST) break
+                        kotlinx.coroutines.delay(1_000)
+                    }
+                    if (navController.currentDestination?.route != Routes.SESSION_LIST) return@LaunchedEffect
                     if (main != null) navController.navigate(Routes.chat(main)) { popUpTo(Routes.SESSION_LIST) { inclusive = false }; launchSingleTop = true }
                     else com.openminis.app.ui.plus.ChatHomeNav.gateFailed.value = true
                 }
@@ -1866,7 +1879,11 @@ private fun androidx.compose.foundation.layout.BoxScope.ChatHomeOverlay(navContr
     val entry by navController.currentBackStackEntryAsState()
     val route = entry?.destination?.route
     val sid = entry?.arguments?.getString("sessionId")
+    // [38.9.15.1] 全部对话 (the restyled list pane) carries the dock too; it belongs to 任务
+    val allShowing by com.openminis.app.ui.plus.ChatHomeNav.allShowing.collectAsState()
+    val fromList = route == Routes.SESSION_LIST && allShowing
     val tab = when {
+        fromList -> 1
         route == Routes.CHAT && com.openminis.app.plus.ChatHome.isMain(sid) -> 0
         route == com.openminis.app.ui.plus.TaskRoutes.TASKS -> 1
         route == com.openminis.app.ui.plus.PlusRoutes.DIGEST -> 2
@@ -1877,12 +1894,23 @@ private fun androidx.compose.foundation.layout.BoxScope.ChatHomeOverlay(navContr
     val context = LocalContext.current
     val scope = androidx.compose.runtime.rememberCoroutineScope()
     fun go(target: String) {
+        if (fromList) {
+            // 全部对话 sits on the list entry: put 聊天 back above it first, then the page (never pop the list itself)
+            scope.launch {
+                val main = com.openminis.app.plus.ChatHome.existingMain(context) ?: com.openminis.app.plus.ChatHome.ensureMain(context) ?: return@launch
+                navController.navigate(Routes.chat(main)) { popUpTo(Routes.SESSION_LIST) { inclusive = false } }
+                navController.navigate(target) { launchSingleTop = true }
+            }
+            return
+        }
         if (tab == 0) navController.navigate(target) { launchSingleTop = true }
         else navController.navigate(target) { route?.let { popUpTo(it) { inclusive = true } }; launchSingleTop = true }
     }
     // [38.9.14.1 net_drop] one-tap 「后台不断网」 guide (battery exemption, then realme/OPPO background) on 聊天 / 任务
-    if (tab == 0) com.openminis.app.ui.plus.NetKeepCard(Modifier.align(androidx.compose.ui.Alignment.TopCenter).statusBarsPadding().padding(top = 60.dp))
-    if (tab == 1) com.openminis.app.ui.plus.NetKeepCard(Modifier.align(androidx.compose.ui.Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 92.dp))
+    // [38.9.15.1 quiet] not over 聊天 any more (user 2026-10-26 14:14 「以前没那么烦」): only on 任务, with its ✕ 不再提示
+    if (tab == 1 && !fromList) com.openminis.app.ui.plus.NetKeepCard(Modifier.align(androidx.compose.ui.Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 92.dp))
+    if (tab == 0) com.openminis.app.ui.plus.NeedYouChip(onOpen = { go(com.openminis.app.ui.plus.TaskRoutes.TASKS) },
+        modifier = Modifier.align(androidx.compose.ui.Alignment.TopEnd).statusBarsPadding().padding(top = 128.dp, end = 14.dp))
     if (tab == 0) com.openminis.app.ui.plus.ChatHomeRoutingPill(Modifier.align(androidx.compose.ui.Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 150.dp))
     com.openminis.app.ui.plus.ChatHomeDock(
         current = tab,
@@ -1892,7 +1920,7 @@ private fun androidx.compose.foundation.layout.BoxScope.ChatHomeOverlay(navContr
                 navController.navigate(Routes.chat(main)) { popUpTo(Routes.SESSION_LIST) { inclusive = false }; launchSingleTop = true }
             }
         },
-        onTasks = { if (tab != 1) go(com.openminis.app.ui.plus.TaskRoutes.TASKS) },
+        onTasks = { if (tab != 1 || fromList) go(com.openminis.app.ui.plus.TaskRoutes.TASKS) },
         onMessages = { if (tab != 2) go(com.openminis.app.ui.plus.PlusRoutes.DIGEST) },
         onApps = { if (tab != 3) go(com.openminis.app.ui.plus.Routes3912.APPS) },
         modifier = Modifier.align(androidx.compose.ui.Alignment.BottomCenter),

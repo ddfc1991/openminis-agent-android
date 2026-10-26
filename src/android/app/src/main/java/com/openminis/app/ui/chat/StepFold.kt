@@ -21,6 +21,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.remember
@@ -62,20 +63,39 @@ internal object StepFold {
 
     private fun active(s: ToolBlockStatus?) = s == ToolBlockStatus.RUNNING || s == ToolBlockStatus.STREAMING || s == ToolBlockStatus.PENDING
 
-    /** anchor key → group, for every reply with ≥ [MIN_STEPS] thinking / tool rows */
+    /**
+     * [38.9.15.1] user 14:51 「还有它输出很😂」: the model's running commentary between steps (「命令有点乱。重发干净版。」
+     * 「heredoc 被工具搞坏了…」) is not the answer. Text rows that come BEFORE the reply's last thinking / tool row fold into the
+     * step row with the steps; only the text after the last step (the answer / current short status) stays in the bubble.
+     * [kinds] is the reply's rows in order, 's' = step, 't' = text; returns the indexes of the interim text rows.
+     */
+    fun interimTextIdx(kinds: List<Char>): Set<Int> {
+        val lastStep = kinds.lastIndexOf('s')
+        if (lastStep < 0) return emptySet()
+        return kinds.indices.filterTo(HashSet()) { it < lastStep && kinds[it] == 't' }
+    }
+
+    /** anchor key → group, for every reply with ≥ [MIN_STEPS] thinking / tool / interim-text rows (at least one step) */
     fun groups(items: List<FlatChatItem>): Map<String, Group> {
         val byMsg = LinkedHashMap<String, MutableList<FlatChatItem>>()
+        val textByMsg = LinkedHashMap<String, MutableList<Pair<Int, FlatChatItem>>>()
+        val kindsByMsg = LinkedHashMap<String, MutableList<Char>>()
         for (it in items) {
             val mid = when (it) {
                 is FlatChatItem.AssistantThinking -> it.messageId
                 is FlatChatItem.AssistantToolUse -> it.messageId
+                is FlatChatItem.AssistantText -> it.messageId.also { m -> val k = kindsByMsg.getOrPut(m) { ArrayList() }; textByMsg.getOrPut(m) { ArrayList() } += k.size to it; k += 't' }
+                is FlatChatItem.AssistantMarkdownBlock -> it.messageId.also { m -> val k = kindsByMsg.getOrPut(m) { ArrayList() }; textByMsg.getOrPut(m) { ArrayList() } += k.size to it; k += 't' }
                 else -> null
             } ?: continue
+            if (it is FlatChatItem.AssistantText || it is FlatChatItem.AssistantMarkdownBlock) continue
+            kindsByMsg.getOrPut(mid) { ArrayList() } += 's'
             byMsg.getOrPut(mid) { ArrayList() } += it
         }
         val out = LinkedHashMap<String, Group>()
         for ((mid, rows) in byMsg) {
-            if (rows.size < MIN_STEPS) continue
+            val interim = interimTextIdx(kindsByMsg[mid].orEmpty()).let { idx -> textByMsg[mid].orEmpty().filter { it.first in idx }.map { it.second.key } }
+            if (rows.size + interim.size < MIN_STEPS) continue
             val blocks = rows.map { r -> if (r is FlatChatItem.AssistantThinking) r.block else (r as FlatChatItem.AssistantToolUse).block }
             val running = rows.any { r ->
                 when (r) {
@@ -84,9 +104,19 @@ internal object StepFold {
                     else -> false
                 }
             }
-            out[rows.first().key] = Group(mid, rows.first().key, rows.mapTo(LinkedHashSet()) { it.key }, blocks, running)
+            out[rows.first().key] = Group(mid, rows.first().key, rows.mapTo(LinkedHashSet()) { it.key } + interim, blocks, running)
         }
         return out
+    }
+
+    /**
+     * [38.9.15.1] 「已切换 · 原因：A → B · 思考 高→极高」 belongs to the reply's step row (second line), not a system row of its own.
+     * Keyed by the assistant message id ( = [Group.id]); memory only, newest kept per message.
+     */
+    val switchNotes = kotlinx.coroutines.flow.MutableStateFlow<Map<String, String>>(emptyMap())
+    fun noteSwitch(messageId: String, note: String) {
+        if (messageId.isBlank() || note.isBlank()) return
+        switchNotes.value = (switchNotes.value - messageId + (messageId to note)).entries.toList().takeLast(50).associate { it.key to it.value }
     }
 
     /** the rows to render: members of a collapsed group (except its anchor) are left out */
@@ -142,7 +172,9 @@ internal fun StepFoldRow(g: StepFold.Group, open: Boolean, onToggle: () -> Unit)
     val took = StepFold.durationText(StepFold.elapsed(g, now))
     val meta = "${g.blocks.size} 步" + if (took.isNotEmpty()) " · $took" else ""
     val shape = RoundedCornerShape(14.dp)
-    val a11y = "步骤：${if (g.running) "正在" else "已完成"}$title，$meta。点按" + if (open) "收起" else "展开全部步骤"
+    val notes by StepFold.switchNotes.collectAsState()
+    val note = notes[g.id]
+    val a11y = "步骤：${if (g.running) "正在" else "已完成"}$title，$meta" + (note?.let { "，$it" } ?: "") + "。点按" + if (open) "收起" else "展开全部步骤"
     Row(
         Modifier.fillMaxWidth().padding(vertical = 3.dp)
             .clip(shape).background(com.openminis.app.ui.plus.minesGlassFill()).border(1.dp, m.glassBorder, shape)
@@ -157,8 +189,10 @@ internal fun StepFoldRow(g: StepFold.Group, open: Boolean, onToggle: () -> Unit)
             else -> Icon(Icons.Default.CheckCircle, contentDescription = null, tint = ToolCheckColor, modifier = Modifier.size(16.dp))
         }
         Spacer(Modifier.width(8.dp))
-        Text(title, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f))
+        androidx.compose.foundation.layout.Column(Modifier.weight(1f).padding(vertical = if (note != null) 4.dp else 0.dp)) {
+            Text(title, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = m.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (note != null) Text(note, fontSize = 12.sp, color = m.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
         Spacer(Modifier.width(8.dp))
         Text(meta, fontSize = 12.sp, color = m.ink2, maxLines = 1, softWrap = false)
         Icon(if (open) Icons.Default.KeyboardArrowDown else Icons.Default.ChevronRight, contentDescription = null,

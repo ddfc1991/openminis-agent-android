@@ -303,6 +303,8 @@ fun ChatProgressStatus(sid: String, streaming: Boolean) {
     val chips by com.openminis.app.plus.SkillMatch.chips.collectAsState()
     chips[sid]?.let { SkillChipLine(it) }
     if (streaming) return
+    // [38.9.15.1] no 「在等你：等你回复」 / status line over the composer on 聊天 (what tasks need is the 「需要你 N」 chip)
+    if (com.openminis.app.plus.ChatHome.isMain(sid)) return
     val all by TaskProgress.tasks.collectAsState()
     val t = all[sid] ?: return
     val div = TaskProgressCore.divider(t)
