@@ -140,6 +140,15 @@ object AutoRenew {
         }
     }
 
+    /** 单站点续期（minis-accounts login 用）。返回 null 表示没找到该站点 */
+    suspend fun renewSite(c: Context, host: String): SiteState? = withContext(Dispatchers.IO) {
+        load(c)
+        AutoAccounts.init(c)
+        val e = AutoAccounts.list.value.firstOrNull { it.host.equals(host, true) || it.site.equals(host, true) }
+        if (e == null) return@withContext null
+        runCatching { renewOne(c, e, System.currentTimeMillis()) }.getOrNull()
+    }
+
     /**
      * 单个站点：先探针，失效就把 cookie 快照写回去。
      *
