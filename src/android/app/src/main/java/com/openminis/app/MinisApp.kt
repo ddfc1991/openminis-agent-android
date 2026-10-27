@@ -241,6 +241,8 @@ class MinisApp : Application(), ImageLoaderFactory {
     @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
     override fun onCreate() {
         super.onCreate()
+        // [Mines-38.9.11.2] :incog process: set the WebView data dir suffix before any WebView exists, wipe leftovers, and skip normal start-up.
+        if (com.openminis.app.browser.IncognitoProcess.onAppCreate(this)) return
         // [Mines] Split proxy installs its ProxySelector before any HTTP client is built.
         runCatching { com.openminis.app.plus.SplitProxy.init(this) }
         runCatching { com.openminis.app.plus.HumanVerify.init(this) }
