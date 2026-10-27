@@ -434,14 +434,18 @@ object SplitProxy {
         return Health(false, null, System.currentTimeMillis(), SplitProxyCore.probeReason(last?.let { (it.javaClass.simpleName + ": " + (it.message ?: "")) }, 0))
     }
 
-    /** HTTPS GET /generate_204 to [host] through [u]; returns the HTTP status (blocking, ≤ ~8 s) */
+    /** HTTPS GET /generate_204 to [host] through [u]; returns the HTTP status (blocking, ≤ ~4 s) */
     private fun probe204(u: Upstream, host: String): Int {
-        val raw = viaUpstream(u, host, 443, tunnel = true, timeout = 5000)
+        // [Mines-proxy-2s] 探测超时 5s→2s（用户 2026-10-27 清单 ⑦）。
+        // 理由：一次健康检查要对每个上游做 TLS 握手，5 秒超时会让「代理挂了」的判定
+        // 拖延到一整轮检查之后才出来，用户体感是"点了没反应"。2 秒足够区分
+        // 真代理（通常 < 500ms）和死端口（直接 refused/超时）。
+        val raw = viaUpstream(u, host, 443, tunnel = true, timeout = 2000)
         raw.use { sock ->
-            sock.soTimeout = 6000
+            sock.soTimeout = 3000
             val ssl = (javax.net.ssl.SSLSocketFactory.getDefault() as javax.net.ssl.SSLSocketFactory).createSocket(sock, host, 443, true) as javax.net.ssl.SSLSocket
             ssl.use { t ->
-                t.soTimeout = 6000
+                t.soTimeout = 3000
                 t.startHandshake()
                 t.outputStream.apply {
                     write("GET /generate_204 HTTP/1.1\r\nHost: $host\r\nUser-Agent: Mines-proxy-check\r\nConnection: close\r\n\r\n".toByteArray(Charsets.ISO_8859_1)); flush()
@@ -747,7 +751,9 @@ object SplitProxy {
             return sock
         }
         val sock = Socket(Proxy.NO_PROXY).apply { tcpNoDelay = true; keepAlive = true; connect(InetSocketAddress(u.host, u.port), timeout) }
-        if (tunnel) sock.soTimeout = maxOf(timeout, 8_000)
+        // [Mines-proxy-2s] 原来是 maxOf(timeout, 8_000)，会把 2 秒的探测超时又抬回 8 秒。
+        // 现在按调用方给的值走，只有健康探测会传 2000；其他路径仍拿默认 6 秒。
+        if (tunnel) sock.soTimeout = timeout.coerceAtLeast(2_000)
         if (!tunnel) { tags[sock] = "http-proxy"; if (u.user.isNotEmpty()) auths[sock] = u.authHeader; return sock }
         val o = sock.getOutputStream()
         o.write("CONNECT $host:$port HTTP/1.1\r\nHost: $host:$port\r\n${u.authHeader}\r\n".toByteArray(Charsets.ISO_8859_1))
