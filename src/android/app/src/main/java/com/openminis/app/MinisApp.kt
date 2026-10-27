@@ -241,40 +241,9 @@ class MinisApp : Application(), ImageLoaderFactory {
     @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
     override fun onCreate() {
         super.onCreate()
-        // [Mines-38.9.11.2] the ":incog" process (无痕 browser without WebView profiles): own WebView data dir, nothing else
-        if (com.openminis.app.browser.IncognitoProcess.onAppCreate(this)) return
-        // [Mines-38.9.12.1] user's crash loop 2026-10-23 07:20 (LaunchBeacon restartCount=122): the ACRA reporter process
-        // ":acra", left alive after the OOM, ran this onCreate down to SplitProxy → WebProxy → ProxyController, so IT took the
-        // WebView data-dir lock and every new main process died at launch ("Using WebView from more than one process").
-        // Any process that is not the main one (and not :incog, handled above) gets its own WebView data dir and NO app init
-        // — this guard sits above every Mines init (the old :acra early-return further down came after SplitProxy).
-        if (com.openminis.app.plus.ProcessGuard.secondary(this)) return
-        // [Mines-38.9.11.2] kill-safe 无痕: leftovers of a session the system killed are wiped once the app is idle
-        // [Mines-38.9.14.2] open the Keystore-backed stores that start-up reads FIRST, on a background thread, before any
-        // main-thread init can reach them (plus_vault_secrets via SplitProxy, env_var_values via MuseHub)
-        runCatching { com.openminis.app.util.EncryptedPrefsFactory.prewarm(this, "plus_vault_secrets", "env_var_values") }
-        runCatching { com.openminis.app.browser.ConvProfiles.init(this) }
-        runCatching { android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-            runCatching { com.openminis.app.browser.Incognito.sweepOnLaunch(this) }
-            runCatching { com.openminis.app.browser.ConvProfiles.sweepOrphans(this) }
-        }, 6_000L) }
         // [Mines] Split proxy installs its ProxySelector before any HTTP client is built.
         runCatching { com.openminis.app.plus.SplitProxy.init(this) }
-        // [38.9.11.1] probe the local proxy ports (7890 / 7897 / 7899 / …) — only a port that passes is ever exported
-        runCatching { com.openminis.app.plus.LocalProxy.init(this) }
-        runCatching { com.openminis.app.util.EncryptedPrefsFactory.prewarm(this, *com.openminis.app.util.EncryptedPrefsFactory.UI_STORES) }   // [38.9.11.3.1] off the main thread
-        runCatching { com.openminis.app.plus.BadKeys.init(this) }   // [38.9.11.3] invalid-key marks (fingerprints), read off the main thread
-        // [Mines-38.9.12.1] after an OOM death: land on home, resume nothing, show the paused tasks (before any UI)
-        runCatching { com.openminis.app.plus.SafeStart.checkAtLaunch(this) }
-        // [Mines-38.9.10 i29] memory guard (heap watch + trim + OOM summary), wired as i28 designed
-        runCatching { com.openminis.app.plus.MemGuard.install(this) }
-        runCatching { com.openminis.app.plus.MemGuard.register("聊天缓存") { android.os.Handler(android.os.Looper.getMainLooper()).post { runCatching { com.openminis.app.ui.chat.ChatViewModelStore.handleMemoryPressure() } }; "释放不在用的对话" } }
-        // [Mines-38.9.6 i14] embedded Clash (mihomo) core, when switched on
-        runCatching { Thread({ runCatching { com.openminis.app.plus.ClashCore.init(this) } }, "mines-clash-init").start() }
         runCatching { com.openminis.app.plus.HumanVerify.init(this) }
-        runCatching { com.openminis.app.persona.Persona.init(this); com.openminis.app.persona.PersonaNotify.attach(this) }   // [38.9.15 伪人核心] flag + limits + 全部停止 notification
-        // [Mines-38.9.13 integ] handoff popups name the task project (「Railway 注册 · 第2次」); TaskName.of already carries 第N次
-        com.openminis.app.plus.HandoffBroker.projectNameOf = { sid -> com.openminis.app.plus.TaskName.of(sid)?.let { it to 1 } }
         // [Mines-38.9.4] endpoints that reject the `thinking` field (remembered across launches)
         runCatching {
             val sp = getSharedPreferences("mines_thinking_fb", MODE_PRIVATE)
@@ -452,8 +421,6 @@ class MinisApp : Application(), ImageLoaderFactory {
         // and running before it would delay that decision for no gain.
         Thread {
             com.openminis.app.crash.ExitInfoCollector.collect(this)
-            com.openminis.app.crash.CrashCard.check(this)   // [Mines-38.9.11.3] 「复制崩溃日志」 card on the launch after a crash / ANR
-            runCatching { com.openminis.app.plus.Diag.init(this) }   // [Mines-38.9.11.3] 远程诊断 (off by default; resumes only if the user left it on < 24 h ago)
         }.apply { isDaemon = true; name = "exit-info-collect" }.start()
 
         // Hard short-circuit: when checkAtLaunch flips safe-mode ON, skip
@@ -483,16 +450,6 @@ class MinisApp : Application(), ImageLoaderFactory {
         // [com.openminis.app.diagnostics.LaunchCycleBeacon].
         try {
             com.openminis.app.diagnostics.LaunchCycleBeacon.recordLaunch(this)
-            // [Mines-38.9.14.2] first launch of a new versionCode: every crash / hang breaker counter starts from zero
-            val bp = getSharedPreferences("mines_breaker", MODE_PRIVATE)
-            val vc = BuildConfig.VERSION_CODE
-            if (bp.getInt("vc", -1) != vc) {
-                com.openminis.app.diagnostics.LaunchCycleBeacon.resetForUpgrade(this)
-                com.openminis.app.diagnostics.HangDetector.resetHangCount(this)
-                com.openminis.app.crash.CrashFrequencyDetector.clearForceHome(this)
-                bp.edit().putInt("vc", vc).apply()
-                Log.i("MinisApp", "breaker counters cleared for versionCode $vc")
-            }
         } catch (t: Throwable) {
             Log.w("MinisApp", "LaunchCycleBeacon.recordLaunch failed: ${t.message}")
         }
@@ -751,16 +708,25 @@ class MinisApp : Application(), ImageLoaderFactory {
             com.openminis.app.sandbox.offload.ConfigOffloadHandler(),
         )
         NativeOffloadServer.register("minis-browser-use", BrowserUseOffloadHandler(this))
+        // [Mines-ledger] minis-accounts — 账号台账 CLI。毫秒级读台账，默认只报异常
+        // （--all 才全量），不再走 UI 渲染链，省 token。
+        NativeOffloadServer.register(
+            "minis-accounts",
+            com.openminis.app.plus.AccountLedgerOffloadHandler(this),
+        )
+        // [Mines-mail-ledger] minis-email — 临时邮箱台账 CLI。
+        // 临时邮箱（Mail.tm/Moakt）和 Gmail 别名分开记，不能混。
+        NativeOffloadServer.register(
+            "minis-email",
+            com.openminis.app.plus.MailLedgerOffloadHandler(this),
+        )
         // [T-muse-hub] Minis as a device on the nanoMuse hub: push-based
         // task exchange with Muse instead of a shared page + get_chat polling.
         NativeOffloadServer.register("minis-muse", com.openminis.app.hub.MuseHubOffloadHandler())
         // [Mines] minis-connect: connected accounts + per-capability permission check (approval card for "询问").
         NativeOffloadServer.register("minis-connect", com.openminis.app.plus.ConnectOffloadHandler(this))
         runCatching { com.openminis.app.plus.PlusConnect.rearm(this) }
-        // [Mines-38.9.14.2] off the main thread: connect() reads MUSE_HUB_URL / KEY from env_var_values, whose first open
-        // decrypts through the Android Keystore (seconds on the realme RMX5062) — it was the cold-start main-thread open
-        runCatching { val app0 = this; Thread({ runCatching { com.openminis.app.hub.MuseHubClient.start(app0) }
-            .onFailure { com.openminis.app.logging.AppLogger.warning("MuseHub", "start failed: ${it.message}") } }, "mines-musehub-start").apply { isDaemon = true }.start() }
+        runCatching { com.openminis.app.hub.MuseHubClient.start(this) }
             .onFailure { com.openminis.app.logging.AppLogger.warning("MuseHub", "start failed: ${it.message}") }
         // T188: minis-sessions-cli — agent-side query of chat history.
         // Registers next to the other minis-* tools so PRootKernel.
@@ -828,27 +794,11 @@ class MinisApp : Application(), ImageLoaderFactory {
         // repository is up, on IO, and only at cold start: a restore happens
         // within a single app run, so it can never straddle this.
         kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
-            // [Mines-38.9.11 c] once: workspaces whose chat row is already gone → shared/已归档/ (before the sweep)
-            runCatching { com.openminis.app.plus.SharedFiles.migrateOrphansOnce(this@MinisApp, chatRepository) }
             runCatching {
                 com.openminis.app.data.session.OrphanChildSweeper.sweep(this@MinisApp, chatRepository)
             }.onFailure {
                 com.openminis.app.logging.AppLogger.warning("OrphanSweep", "sweep threw: ${it.message}")
             }
-        }
-
-        // [Mines-38.9.5 i] 免登录 AI（Mines）: the local OpenAI-compatible gateway for the login-based routes (扣子 / Muse 中继 /
-        // Memoh / 网页版) starts with the app, so 模型组 can call them without opening 「AI 伙伴」 first. The provider row is
-        // added once when a login route exists; if the user deleted it, it is not added back by itself.
-        // [Mines-38.9.5 i11] the home 「⋯」 pills + summary line read the progress store: load it at launch (it was only loaded
-        // when a chat turn started, so after any restart home showed 「都在正常跑」 and no pills although chats had progress)
-        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
-            runCatching { com.openminis.app.plus.TaskProgress.init(this@MinisApp) }
-            runCatching { com.openminis.app.plus.TaskProjects.init(this@MinisApp); com.openminis.app.plus.ChatHome.init(this@MinisApp); com.openminis.app.plus.StallWatch.init(this@MinisApp); com.openminis.app.plus.NetDrop.init(this@MinisApp); com.openminis.app.plus.MinesCall.retire(this@MinisApp) }   // [Mines-38.9.14 chat_home] queued tasks resume
-        }
-        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
-            runCatching { com.openminis.app.plus.PartnerGateway.startAtLaunch(this@MinisApp) }
-                .onFailure { com.openminis.app.logging.AppLogger.warning("PartnerGateway", "start: ${it.message}") }
         }
 
         // T180-bg-notif: background-settings + task-completion notifier.
@@ -865,16 +815,6 @@ class MinisApp : Application(), ImageLoaderFactory {
         )
         SessionActivityTracker.setCompletionListener { sessionId, isError ->
             backgroundTaskNotifier.notifyTaskCompleted(sessionId, isError)
-            // [Mines-38.9.12] Mines 来电 (off by default): ring like a call when a task ends in the background
-            if (com.openminis.app.plus.MinesCall.enabled(this) && !isAppForeground()) {
-                val fg = isAppForeground()
-                kotlinx.coroutines.GlobalScope.launch(kotlinx.coroutines.Dispatchers.IO) {
-                    runCatching {
-                        val s = chatRepository.getSession(sessionId)
-                        if (s?.isChild != true) com.openminis.app.plus.MinesCall.onTaskFinished(this@MinisApp, sessionId, isError, fg, s?.title, null)
-                    }
-                }
-            }
         }
 
         // [T-android-config-confirm-timeout] Wire the config-confirm background
@@ -1157,7 +1097,6 @@ class MinisApp : Application(), ImageLoaderFactory {
      */
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
-        if (com.openminis.app.browser.IncognitoProcess.inProcess) return   // [38.9.11.2] ":incog" has none of the main caches
 
         val dropFormulaCaches = when (level) {
             TRIM_MEMORY_RUNNING_LOW,
