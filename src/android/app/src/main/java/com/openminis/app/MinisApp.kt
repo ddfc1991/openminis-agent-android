@@ -710,15 +710,19 @@ class MinisApp : Application(), ImageLoaderFactory {
         NativeOffloadServer.register("minis-browser-use", BrowserUseOffloadHandler(this))
         // [Mines-ledger] minis-accounts — 账号台账 CLI。毫秒级读台账，默认只报异常
         // （--all 才全量），不再走 UI 渲染链，省 token。
-        NativeOffloadServer.register(
-            "minis-accounts",
-            com.openminis.app.plus.AccountLedgerOffloadHandler(this),
-        )
+        val accountsCli = com.openminis.app.plus.AccountLedgerOffloadHandler(this)
+        NativeOffloadServer.register("minis-accounts", accountsCli)
         // [Mines-mail-ledger] minis-email — 临时邮箱台账 CLI。
         // 临时邮箱（Mail.tm/Moakt）和 Gmail 别名分开记，不能混。
+        val emailCli = com.openminis.app.plus.MailLedgerOffloadHandler(this)
+        NativeOffloadServer.register("minis-email", emailCli)
+        // [Mines-toolkit] mines-toolkit — 统一入口，转发到上面这些 CLI。
+        // ToolkitRegistry 记一份，转发时要拿到实例（NativeOffloadServer 没有查询接口）。
+        com.openminis.app.plus.ToolkitRegistry.put("minis-accounts", accountsCli)
+        com.openminis.app.plus.ToolkitRegistry.put("minis-email", emailCli)
         NativeOffloadServer.register(
-            "minis-email",
-            com.openminis.app.plus.MailLedgerOffloadHandler(this),
+            "mines-toolkit",
+            com.openminis.app.plus.ToolkitOffloadHandler(this),
         )
         // [T-muse-hub] Minis as a device on the nanoMuse hub: push-based
         // task exchange with Muse instead of a shared page + get_chat polling.

@@ -12,6 +12,11 @@ import android.content.Context
 import android.content.Intent
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -39,6 +44,9 @@ object AccountPatrol {
     private const val JOB_ID = 73101
     private const val CHANNEL = "mines_patrol"
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /** [Mines-patrol-parallel] 同时最多测几个账号。8 路够快，又不会把手机网络和上游 API 打爆。 */
+    private val patrolSem = Semaphore(8)
 
     private val _status = MutableStateFlow<Map<String, Status>>(emptyMap())
     val status: StateFlow<Map<String, Status>> = _status.asStateFlow()
@@ -136,20 +144,33 @@ object AccountPatrol {
             runCatching { ProviderKeys.adopt(context) }
             val now = System.currentTimeMillis()
             val out = HashMap<String, Status>()
-            for (e in PlusVault.entries.value.values) {
-                val secret = PlusVault.secret(e.kindId)
-                val base = PlusVault.baseId(e.kindId)
-                out[e.kindId] = if (secret != null && (e.via == "key" || e.via == "token" || e.via == "oauth" || e.via == "model" || base == "github")) {
-                    val r = KeyTester.test(base, secret)
-                    when {
-                        r.message.startsWith("测试时连不上") -> Status(Level.WARN, "这次没连上服务器，下次再试", now)
-                        !r.ok -> Status(Level.BAD, r.message, now, fix = if (KeyAgent.recipe(base) != null) "regen" else "relogin")
-                        r.needsCredit -> Status(Level.WARN, "余额不足，需要你自己充值", now)
-                        r.message.contains("限流") -> Status(Level.WARN, "最近被限流（429）", now)
-                        else -> Status(Level.OK, "密钥有效", now)
+            // [Mines-patrol-parallel] 巡视并发化（用户 2026-10-27 清单 ⑩）。
+            // 原来 for 循环串行测 92 个账号，每个一次网络请求，总耗时 = 所有请求之和；
+            // 现在并行（限 8 路，别把手机网络和上游 API 打爆），总耗时 ≈ 最慢那个。
+            val entries = PlusVault.entries.value.values.toList()
+            val tested = coroutineScope {
+                entries.map { e ->
+                    async(Dispatchers.IO) {
+                      patrolSem.withPermit {
+                        val secret = PlusVault.secret(e.kindId)
+                        val base = PlusVault.baseId(e.kindId)
+                        val st = if (secret != null && (e.via == "key" || e.via == "token" || e.via == "oauth" || e.via == "model" || base == "github")) {
+                            val r = KeyTester.test(base, secret)
+                            when {
+                                r.message.startsWith("测试时连不上") -> Status(Level.WARN, "这次没连上服务器，下次再试", now)
+                                !r.ok -> Status(Level.BAD, r.message, now, fix = if (KeyAgent.recipe(base) != null) "regen" else "relogin")
+                                r.needsCredit -> Status(Level.WARN, "余额不足，需要你自己充值", now)
+                                r.message.contains("限流") -> Status(Level.WARN, "最近被限流（429）", now)
+                                else -> Status(Level.OK, "密钥有效", now)
+                            }
+                        } else Status(Level.OK, if (e.via == "web") "网页登录（不自动检查）" else "已连接", now)
+                        e.kindId to st
+                      }
                     }
-                } else Status(Level.OK, if (e.via == "web") "网页登录（不自动检查）" else "已连接", now)
+                }.awaitAll()
             }
+            // 并发度受 Semaphore 控制，见下方 patrolSem
+            out.putAll(tested.toMap())
             // [Mines-apps-32] per-account balance (plain HTTP, no model) + expiry reminders
             for (e in PlusVault.entries.value.values) {
                 runCatching { KeyBalance.refresh(e.kindId) }
@@ -238,6 +259,9 @@ class AccountPatrolJob : JobService() {
     override fun onStartJob(params: JobParameters?): Boolean {
         scope.launch {
             runCatching { AccountPatrol.run(applicationContext) }
+            // [Mines-auto-renew] 巡视跑完接着做账号续期：复用同一个 ~4h 周期和
+            // 同一个 JobScheduler，不额外开常驻进程。续期失败不影响巡视结果。
+            runCatching { AutoRenew.run(applicationContext) }
             jobFinished(params, false)
         }
         return true
