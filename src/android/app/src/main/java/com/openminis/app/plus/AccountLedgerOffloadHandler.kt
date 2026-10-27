@@ -9,6 +9,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
+import kotlinx.coroutines.runBlocking
 import java.util.Locale
 
 /**
@@ -40,7 +41,7 @@ class AccountLedgerOffloadHandler(private val context: Context) : NativeOffloadH
                 "SUBCOMMANDS:\n" +
                 "  list [--all] [--json]     台账列表。默认只报异常，--all 全量\n" +
                 "  get <site>                单个站点详情\n" +
-                "  check [site]              验证状态（本地记录，不联网）\n" +
+                "  check [site]              验证状态（本地记录，不联网）\n  login <site>              触发该站点自动续期（复用 AutoRenew）\n" +
                 "  stats                     统计数字\n" +
                 "  --help                    这个帮助\n" +
                 "\n" +
@@ -67,6 +68,7 @@ class AccountLedgerOffloadHandler(private val context: Context) : NativeOffloadH
                 "list" -> cmdList(args)
                 "get" -> cmdGet(args)
                 "check" -> cmdCheck(args)
+                "login" -> cmdLogin(args)
                 "stats" -> cmdStats()
                 else -> NativeOffloadResult(
                     EXIT_INVALID_ARGS,
@@ -177,6 +179,21 @@ class AccountLedgerOffloadHandler(private val context: Context) : NativeOffloadH
         }
         sb.append("\n合计: ok=").append(ok).append(" 异常=").append(bad).append('\n')
         return NativeOffloadResult(EXIT_OK, sb.toString())
+    }
+
+    /** login：触发单站点自动续期（复用 AutoRenew） */
+    private fun cmdLogin(args: OffloadArgs): NativeOffloadResult {
+        val site = args.positional.getOrNull(1)
+            ?: return NativeOffloadResult(EXIT_INVALID_ARGS, "用法: minis-accounts login <site>\n")
+        val st = runBlocking { AutoRenew.renewSite(context, site) }
+            ?: return NativeOffloadResult(EXIT_OK, "没找到站点 '$site'\n")
+        val line = when (st.state) {
+            "ok" -> "OK 会话有效（" + st.host + "）"
+            "reused" -> "OK 已把保存的会话写回（" + st.host + "）"
+            "need_login" -> "需要人工登录（" + st.note + "）"
+            else -> "状态 " + st.state + "（" + st.note + "）"
+        }
+        return NativeOffloadResult(EXIT_OK, line + "\n")
     }
 
     /** stats：只要数字，最省 token */
