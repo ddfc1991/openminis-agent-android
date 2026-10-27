@@ -5,6 +5,8 @@ import com.openminis.app.sandbox.NativeOffloadHandler
 import com.openminis.app.sandbox.NativeOffloadRequest
 import com.openminis.app.sandbox.NativeOffloadResult
 import com.openminis.app.sandbox.offload.OffloadArgs
+import com.openminis.app.tools.ToolTier
+import com.openminis.app.tools.ToolTierStore
 
 /**
  * [Mines-toolkit] `mines-toolkit` — 统一 CLI 入口（用户清单 ⑪）。
