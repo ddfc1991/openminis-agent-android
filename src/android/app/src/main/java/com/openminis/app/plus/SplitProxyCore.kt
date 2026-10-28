@@ -84,7 +84,10 @@ object SplitProxyCore {
     fun endpoint(type: String, host: String, port: Int): String {
         // Host fields should be DNS/IP literals only. Drop URL/path/query/control syntax so a
         // malformed or credential-bearing value cannot leak tokens into a diagnostic label.
-        val safeHost = host.substringAfterLast('@').filter { it.isLetterOrDigit() || it in ".:-_[]" }.trim().removePrefix("[").removeSuffix("]")
+        val rawHost = host.trim()
+        val pathOrQuery = rawHost.indexOfAny(charArrayOf('/', '?', '#'))
+        val authority = (if (pathOrQuery >= 0) rawHost.substring(0, pathOrQuery) else rawHost).substringAfterLast('@')
+        val safeHost = authority.filter { it.isLetterOrDigit() || it in ".:-_[]" }.trim().removePrefix("[").removeSuffix("]")
         val shownHost = if (safeHost.contains(':')) "[$safeHost]" else safeHost
         val safeType = type.filter { it.isLetterOrDigit() || it == '-' || it == '_' }.take(16).ifBlank { "proxy" }
         return "$safeType://$shownHost:$port"

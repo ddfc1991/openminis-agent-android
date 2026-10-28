@@ -32,15 +32,21 @@ object CrashRedactCore {
         var r = pem.replace(s) { "-----PRIVATE KEY $MASK-----" }
         r = BrowserLogMask.mask(r)
         r = tokens.replace(r, MASK)
-        r = env.replace(r) { it.groupValues[1] + it.groupValues[2] + MASK }
+        r = env.replace(r) { match ->
+            val value = match.groupValues[3]
+            // A path assigned to a key-like variable is still useful diagnostic context.
+            // Preserve it, then let path-aware masking hide only sensitive components.
+            val safeValue = if (value.startsWith('/') && !value.startsWith("//")) redactPath(value) else MASK
+            match.groupValues[1] + match.groupValues[2] + safeValue
+        }
         r = phone.replace(r) { it.groupValues[1] + "****" + it.groupValues[2] }
         r = email.replace(r) { it.groupValues[1] + "***@" + it.groupValues[2] }
-        r = absolutePath.replace(r) { match ->
-            match.value.split('/').joinToString("/") { part ->
-                if (part.isNotEmpty() && sensitivePathPart.matches(part)) MASK else part
-            }
-        }
+        r = absolutePath.replace(r) { match -> redactPath(match.value) }
         return r
+    }
+
+    private fun redactPath(path: String): String = path.split('/').joinToString("/") { part ->
+        if (part.isNotEmpty() && sensitivePathPart.matches(part)) MASK else part
     }
 
     /** the text 「复制崩溃日志」 puts on the clipboard: redacted, newest report, capped (clipboard limit ~1 MB; keep it small) */

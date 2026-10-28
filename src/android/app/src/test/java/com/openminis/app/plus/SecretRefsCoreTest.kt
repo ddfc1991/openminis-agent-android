@@ -28,7 +28,7 @@ class SecretRefsCoreTest {
         assertEquals("export SSHPASS=\"" + '$' + "MINES_SECRET_SSH_1\"; sshpass -e ssh user@host", quoted)
         assertEquals("echo \"" + '$' + "MINES_SECRET_SSH_1\"", C.rewrite("echo \"{{secret:ssh_1}}\"", emptyMap()))
         assertEquals(
-            "curl -H 'Authorization: Bearer ''\"" + '$' + "MINES_SECRET_SSH_1\"'' https://example.test",
+            "curl -H 'Authorization: Bearer '\"" + '$' + "MINES_SECRET_SSH_1\"'' https://example.test",
             C.rewrite("curl -H 'Authorization: Bearer {{secret:ssh_1}}' https://example.test", emptyMap()),
         )
         assertEquals("echo ''", C.rewrite("echo {{user:missing}}", emptyMap()))

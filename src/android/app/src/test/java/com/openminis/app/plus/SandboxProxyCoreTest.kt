@@ -21,8 +21,11 @@ class SandboxProxyCoreTest {
 
     @Test fun probeIsRealOutboundAndWired() {
         fun src(rel: String) = listOf(File("src/main/java/com/openminis/app/$rel"), File("app/src/main/java/com/openminis/app/$rel")).first { it.exists() }.readText()
-        // a port that only listens never becomes "best": the probe fetches generate_204 THROUGH the port
-        assertTrue(src("plus/LocalProxy.kt").contains("generate_204\", 204"))
+        // A port is selected only when the real outbound check returns 204; any HTTP code still proves reachability.
+        val localProxy = src("plus/LocalProxy.kt")
+        assertTrue(localProxy.contains("connectivitycheck.gstatic.com/generate_204"))
+        assertTrue(localProxy.contains("c.responseCode.takeIf { it in 100..599 }"))
+        assertTrue(localProxy.contains("val ok = response == 204"))
         val net = src("plus/SandboxNet.kt")
         assertTrue(net.contains("SandboxProxyCore.choose(") && net.contains("SandboxProxyCore.BLOCK_URL") && net.contains("strict_proxy"))
     }
