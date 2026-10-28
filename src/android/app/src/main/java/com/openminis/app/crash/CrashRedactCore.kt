@@ -23,7 +23,7 @@ object CrashRedactCore {
     // URL schemes are excluded by the boundary so https:// links are not rewritten as filesystem paths.
     private val absolutePath = Regex("""(?<![A-Za-z0-9._~:/-])/(?:[A-Za-z0-9._~+@-]+/)*[A-Za-z0-9._~+@-]+""")
     private val sensitivePathPart = Regex(
-        """^(?:\.env(?:\..*)?|\.netrc|\.npmrc|\.pypirc|authorized_keys|.*(?:secret|credential|token|password|passwd|private[-_]?key|keychain|keystore|id_(?:rsa|ed25519|ecdsa|dsa)).*|.*\.(?:pem|key|p12|pfx|jks|keystore))$""",
+        """^(?:\.env(?:\..*)?|\.netrc|\.npmrc|\.pypirc|authorized_keys|.*(?:secret|credential|token|password|passwd|private[-_]?key|keychain|keystore|id_(?:rsa|ed25519|ecdsa|dsa)).*|.*[-_]key|.*\.(?:pem|key|p12|pfx|jks|keystore))$""",
         RegexOption.IGNORE_CASE,
     )
 
