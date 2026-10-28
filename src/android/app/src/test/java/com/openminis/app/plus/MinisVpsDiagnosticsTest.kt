@@ -23,12 +23,12 @@ class MinisVpsDiagnosticsTest {
                 dest=""
                 last=""
                 for arg do
-                    last="$arg"
-                    case "$arg" in *@*) dest="$arg";; esac
+                    last="${'$'}arg"
+                    case "${'$'}arg" in *@*) dest="${'$'}arg";; esac
                 done
-                case "$dest" in
+                case "${'$'}dest" in
                     root@bad) echo 'unreachable test host' >&2; exit 255 ;;
-                    root@good) [ "$last" = true ] || echo 'remote-test-output'; exit 0 ;;
+                    root@good) [ "${'$'}last" = true ] || echo 'remote-test-output'; exit 0 ;;
                     *) echo 'unexpected test target' >&2; exit 255 ;;
                 esac
             """.trimIndent() + "\n")
