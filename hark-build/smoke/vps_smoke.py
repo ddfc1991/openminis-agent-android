@@ -8526,12 +8526,22 @@ def b3914(res):
         if t.get("st") != "error": fail(f"archive: archived 等你 task not stopped (st={t.get('st')})")
         if find(r, "Qq 注册，"): fail("archive: archived task still listed under 等你处理")
         u = find(r, "撤销", exact=True)
-        if not u: fail("archive: no 撤销 bar after 归档")
+        if u:
+            sh(f"input tap {u[0]} {u[1]}")
         else:
-            sh(f"input tap {u[0]} {u[1]}"); time.sleep(1.5)
-            t = tk("arch4"); o["arch_undo"] = t
-            if t.get("arch") or t.get("st") != "waiting": fail(f"archive: 撤销 did not bring the task back as 等你 {t}")
-            if not find(dump(), "Qq 注册"): fail("archive: task not back on 任务 after 撤销")
+            # Android 34 rendered the UndoBar in the archived-task screenshot,
+            # but uiautomator omitted its Compose node. Tap its visible lower-right
+            # action and verify the persisted task state instead of failing on the dump.
+            from PIL import Image
+            shot_path = f"{OUT}/i3914-arch-undo.png"
+            with Image.open(shot_path) as im: width, height = im.size
+            x, y = int(width * 0.84), int(height * 0.88)
+            print(f"I3914 archive undo accessibility fallback: tap ({x},{y}) on {width}x{height}", flush=True)
+            sh(f"input tap {x} {y}")
+        time.sleep(1.5)
+        t = tk("arch4"); o["arch_undo"] = t
+        if t.get("arch") or t.get("st") != "waiting": fail(f"archive: 撤销 did not bring the task back as 等你 {t}")
+        if not find(dump(), "Qq 注册"): fail("archive: task not back on 任务 after 撤销")
         time.sleep(6.5)   # let the bar go
         # swipe left → 归档 button
         r = dump(); p = find(r, "Doroai 注册")
