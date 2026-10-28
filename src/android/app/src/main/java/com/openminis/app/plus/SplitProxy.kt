@@ -83,7 +83,7 @@ object SplitProxy {
     }
 
     /** Health of one upstream: latency in ms, or null when the check failed. */
-    data class Health(val ok: Boolean, val ms: Long?, val at: Long, val error: String? = null)
+    data class Health(val ok: Boolean, val ms: Long?, val at: Long, val error: String? = null, val httpStatus: Int? = null, val protocolOk: Boolean? = null, val reachable: Boolean = ok)
 
     data class Preset(val name: String, val mode: Mode, val domains: List<String>)
 
@@ -426,8 +426,11 @@ object SplitProxy {
             val r = runCatching { probe204(u, host) }
             r.getOrNull()?.let { code ->
                 val ms = System.currentTimeMillis() - t0
-                return if (code == 204) Health(true, ms, System.currentTimeMillis())
-                    else Health(false, null, System.currentTimeMillis(), SplitProxyCore.probeReason(null, code))
+                val outcome = SplitProxyCore.probeOutcome(code)
+                // Keep "reachable" separate from "usable": HTTP errors prove a peer answered,
+                // but this proxy still fails the expected captive-portal check and is not selected.
+                return Health(outcome.protocolOk, ms.takeIf { outcome.reachable }, System.currentTimeMillis(),
+                    outcome.detail, outcome.statusCode, outcome.protocolOk, outcome.reachable)
             }
             last = r.exceptionOrNull()
         }

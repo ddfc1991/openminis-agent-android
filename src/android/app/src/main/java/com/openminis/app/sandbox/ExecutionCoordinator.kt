@@ -283,6 +283,16 @@ object ExecutionCoordinator {
         // only; the value never appears in the command text, and output / live lines are masked.
         runCatching { com.openminis.app.plus.SecretRefs.init(appContext) }
         val secretEnv = com.openminis.app.plus.SecretRefs.envFor(command)
+        val missingSecretIds = com.openminis.app.plus.SecretRefsCore.missingSecretIds(command, secretEnv.keys)
+        if (missingSecretIds.isNotEmpty()) {
+            // Fail closed: never run an unresolved {{secret:…}} placeholder as shell text.
+            // Do not echo ids or values; the owner can restore the item via the secure login flow.
+            return CommandResult(
+                output = "Not run: a referenced secure credential is unavailable. Re-enter or save it through the protected login flow, then retry.",
+                exitCode = 126,
+                durationMs = 0L,
+            )
+        }
         val command = if (secretEnv.isEmpty()) command else com.openminis.app.plus.SecretRefs.rewrite(command)
         val lineCallback: ((String) -> Unit)? = if (secretEnv.isEmpty()) lineCallback else lineCallback?.let { cb -> { l: String -> cb(com.openminis.app.plus.SecretRefs.scrub(l)) } }
 

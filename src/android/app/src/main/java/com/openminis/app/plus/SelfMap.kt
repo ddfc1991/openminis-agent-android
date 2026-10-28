@@ -6,9 +6,6 @@ import com.openminis.app.data.model.AgentToolDefinition
 import com.openminis.app.data.model.AgentToolParam
 import com.openminis.app.tools.ToolExecutionResult
 import org.json.JSONObject
-import java.net.InetSocketAddress
-import java.net.Proxy
-import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -72,7 +69,7 @@ object SelfMap {
         val ports = SelfMapCore.portsFor(s.port, running, notes, extra)
         val futures = ports.map { p -> pool.submit<SelfMapCore.Port> {
             val t0 = System.currentTimeMillis()
-            val ok = runCatching { Socket(Proxy.NO_PROXY).use { it.connect(InetSocketAddress(s.host, p), 1500) }; true }.getOrDefault(false)
+            val ok = SelfMapCore.portReachable(s.host, p, 1500)
             SelfMapCore.Port(p, ok, if (ok) (System.currentTimeMillis() - t0).toInt() else -1, SelfMapCore.labelFor(p, running, notes))
         } }
         val out = futures.mapNotNull { f -> runCatching { f.get(4, TimeUnit.SECONDS) }.getOrNull() }

@@ -71,6 +71,25 @@ object SplitProxyCore {
     }
 
     // ── [Mines-38.9.10 i28] real proxy health check ──
+    data class ProbeOutcome(val reachable: Boolean, val protocolOk: Boolean, val statusCode: Int?, val detail: String?)
+
+    /** 204 is the expected payload. Any HTTP status proves a TCP/HTTP peer was reached. */
+    fun probeOutcome(code: Int): ProbeOutcome = when {
+        code == 204 -> ProbeOutcome(true, true, code, null)
+        code in 100..599 -> ProbeOutcome(true, false, code, "已连通，但探测端点返回 HTTP $code（预期 204）")
+        else -> ProbeOutcome(false, false, code, probeReason(null, code))
+    }
+
+    /** Host label for diagnostics; strip any accidental user-info and control characters. */
+    fun endpoint(type: String, host: String, port: Int): String {
+        // Host fields should be DNS/IP literals only. Drop URL/path/query/control syntax so a
+        // malformed or credential-bearing value cannot leak tokens into a diagnostic label.
+        val safeHost = host.substringAfterLast('@').filter { it.isLetterOrDigit() || it in ".:-_[]" }.trim().removePrefix("[").removeSuffix("]")
+        val shownHost = if (safeHost.contains(':')) "[$safeHost]" else safeHost
+        val safeType = type.filter { it.isLetterOrDigit() || it == '-' || it == '_' }.take(16).ifBlank { "proxy" }
+        return "$safeType://$shownHost:$port"
+    }
+
     /** "HTTP/1.1 204 No Content" → 204 */
     fun statusCode(line: String): Int? = Regex("""^HTTP/\d(?:\.\d)?\s+(\d{3})""").find(line.trim())?.groupValues?.get(1)?.toIntOrNull()
     /** dedupe key: the same proxy listed twice (localhost / 127.0.0.1, http / socks5 on one port) */
@@ -81,8 +100,9 @@ object SplitProxyCore {
     }
     /** a failed check → the raw reason kept for [plainProxyReason]-style display (Chinese first, technical tail) */
     fun probeReason(error: String?, code: Int): String = when {
-        code in 300..399 -> "被重定向（HTTP $code）：像是登录页 / 拦截页，不是真的通了"
-        code > 0 -> "外网回了 HTTP $code，不是 204：代理没把请求送到真正的网站"
+        code in 300..399 -> "被重定向（HTTP $code）：探测端点返回了重定向，不是预期的 204"
+        code == 400 -> "已连通，但探测端点返回 HTTP 400（预期 204）"
+        code > 0 -> "探测端点返回 HTTP $code（预期 204）"
         error == null -> "没有回应"
         error.contains("SSLHandshake", true) || error.contains("handshake", true) -> "加密握手失败：代理接受了连接，但没真正连到外网（$error）"
         error.contains("closed before", true) || error.contains("reset", true) || error.contains("EOF", true) -> "连上后被断开：代理自己的外网可能断了（$error）"

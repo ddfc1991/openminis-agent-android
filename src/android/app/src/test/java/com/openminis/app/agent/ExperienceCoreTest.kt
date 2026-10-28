@@ -58,6 +58,16 @@ class ExperienceCoreTest {
         assertEquals(2, l2.size)
     }
 
+    @Test fun successfulShellWithMergedStderrWarningDoesNotTriggerFailureOrEscalation() {
+        val output = "Failed to connect to new control master\n登录成功: ser152570142301\nactive"
+        val signature = FailurePatternGuard.signature(output, isError = false, tool = "shell_execute")
+        assertNull(signature)
+        val guard = FailurePatternGuard()
+        repeat(3) { assertNull(guard.onResult("shell_execute", isError = false, content = output)) }
+        val call = ModelScoreCore.Call("shell_execute", failed = signature != null, sig = signature.orEmpty())
+        assertNull(ModelScoreCore.escalation(listOf(call, call, call), ModelScoreCore.Kind.TOOL))
+    }
+
     @Test fun loopGuardConsultsAtSecondRepeatAndStopsAtThird() {
         val g = FailurePatternGuard()
         assertNull(g.onResult("shell_execute", true, "Error: connectOverCDP failed: session 4f1a2b limit"))

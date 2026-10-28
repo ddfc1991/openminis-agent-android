@@ -19,6 +19,13 @@ object CrashRedactCore {
     private val phone = Regex("""(?<![0-9])(1[3-9][0-9])[0-9]{4}([0-9]{4})(?![0-9])""")
     private val email = Regex("""\b([A-Za-z0-9._%+\-])[A-Za-z0-9._%+\-]*@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})\b""")
     private val pem = Regex("""-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----""")
+    // Preserve ordinary platform/source paths in diagnostics, but hide sensitive path components.
+    // URL schemes are excluded by the boundary so https:// links are not rewritten as filesystem paths.
+    private val absolutePath = Regex("""(?<![A-Za-z0-9._~:/-])/(?:[A-Za-z0-9._~+@-]+/)*[A-Za-z0-9._~+@-]+""")
+    private val sensitivePathPart = Regex(
+        """^(?:\.env(?:\..*)?|\.netrc|\.npmrc|\.pypirc|authorized_keys|.*(?:secret|credential|token|password|passwd|private[-_]?key|keychain|keystore|id_(?:rsa|ed25519|ecdsa|dsa)).*|.*\.(?:pem|key|p12|pfx|jks|keystore))$""",
+        RegexOption.IGNORE_CASE,
+    )
 
     fun redact(s: String?): String {
         if (s.isNullOrEmpty()) return s.orEmpty()
@@ -28,6 +35,11 @@ object CrashRedactCore {
         r = env.replace(r) { it.groupValues[1] + it.groupValues[2] + MASK }
         r = phone.replace(r) { it.groupValues[1] + "****" + it.groupValues[2] }
         r = email.replace(r) { it.groupValues[1] + "***@" + it.groupValues[2] }
+        r = absolutePath.replace(r) { match ->
+            match.value.split('/').joinToString("/") { part ->
+                if (part.isNotEmpty() && sensitivePathPart.matches(part)) MASK else part
+            }
+        }
         return r
     }
 

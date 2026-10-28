@@ -67,6 +67,16 @@ set_target() {
     [ "$VPS_PORT" = "$ent" ] && VPS_PORT=22
     return 0
 }
+# Keep run diagnostics tied to the actual SSH target; never include relay URLs or credentials.
+endpoint_label() {
+    case "$VPS_TARGET" in
+        *@*) endpoint_user="${VPS_TARGET%@*}"; endpoint_host="${VPS_TARGET##*@}" ;;
+        *) endpoint_user=""; endpoint_host="$VPS_TARGET" ;;
+    esac
+    endpoint_user=$(printf '%s' "$endpoint_user" | tr -cd 'A-Za-z0-9._-')
+    endpoint_host=$(printf '%s' "$endpoint_host" | tr -cd 'A-Za-z0-9.:-[]_')
+    printf '%s%s:%s' "${endpoint_user:+$endpoint_user@}" "$endpoint_host" "$VPS_PORT"
+}
 load() {
     SERVERS=""
     if [ -n "$MINIS_VPS_SERVERS" ] && [ "$MINIS_VPS_SERVERS" != none ]; then
@@ -116,12 +126,20 @@ ssh1() {
 # a fresh direct connection (a stale shared one after a network change), then
 # the relay. Sets HOW to what worked. Exit 255 only when nothing connected.
 s1() {
+    first_failed=""
     for how in direct nomux relay; do
         [ "$how" = relay ] && [ -z "$RELAY" ] && continue
         [ -n "$RELAY_ONLY" ] && [ "$how" != relay ] && continue
         [ "$how" = nomux ] && ssh -o ControlPath="$HOME/.ssh/cm-%C" -p "$VPS_PORT" -O exit "$VPS_TARGET" >/dev/null 2>&1
-        if ssh1 "$how" "$@"; then HOW=$how; return 0; else rc=$?; fi
+        if ssh1 "$how" "$@"; then
+            HOW=$how
+            if [ -n "$first_failed" ]; then
+                echo "[fallback] $(endpoint_label) SSH path $first_failed -> $how" >&2
+            fi
+            return 0
+        else rc=$?; fi
         [ "$rc" -ne 255 ] && { HOW=$how; return "$rc"; }
+        [ -n "$first_failed" ] || first_failed="$how"
     done
     return 255
 }
@@ -129,12 +147,21 @@ s1() {
 # pick: choose the first server that answers, retrying with backoff until
 # MINIS_VPS_CONNECT_SECS runs out. Sets VPS_TARGET/VPS_PORT/RELAY/CUR.
 pick() {
-    budget="${MINIS_VPS_CONNECT_SECS:-90}"; t0=$(date +%s); delay=2; round=0
+    budget="${MINIS_VPS_CONNECT_SECS:-90}"; t0=$(date +%s); delay=2; round=0; previous_endpoint=""
     while :; do
         for srv in $SERVERS; do
             set_target "$srv"
-            if s1 true 2>/dev/null; then CUR="$srv"; return 0; fi
-            echo "minis-vps: $VPS_TARGET:$VPS_PORT 连不上${RELAY:+（直连和中转都试过）}" >&2
+            current_endpoint=$(endpoint_label)
+            if [ -n "$previous_endpoint" ] && [ "$previous_endpoint" != "$current_endpoint" ]; then
+                echo "[fallback] $previous_endpoint -> $current_endpoint" >&2
+            fi
+            if s1 true 2>/dev/null; then
+                CUR="$srv"
+                echo "[connected] $(endpoint_label) via ${HOW:-unknown}" >&2
+                return 0
+            fi
+            echo "minis-vps: $current_endpoint 连不上${RELAY:+（直连和中转都试过）}" >&2
+            previous_endpoint="$current_endpoint"
         done
         round=$((round + 1))
         now=$(date +%s); [ $((now - t0 + delay)) -gt "$budget" ] && break
@@ -304,6 +331,7 @@ esac
 case "$cmd" in
 run|bg|attach|jobs|logs|status)
     if [ "$1" != "--direct" ] && link_ok; then
+        echo "[connected] app-link 127.0.0.1:${MINIS_LINK_PORT:-8792} (远端主机由 link 服务端决定，当前命令不经过 SSH 选服)" >&2
         case "$cmd" in
         run)    name="run-$(date +%s)-$$"; rscript "$@" | link_stream "$LP/run?name=$name"; exit $? ;;
         bg)     name="$1"; shift; valid_name "$name"; rscript "$@" | lcurl -X POST --data-binary @- "$LP/start?name=$name"; exit 0 ;;
@@ -312,6 +340,9 @@ run|bg|attach|jobs|logs|status)
         logs)   valid_name "$1"; printf 'tail -n %s ~/.mines-link/jobs/%s/out 2>/dev/null || tail -n %s ~/minis-jobs/%s.log' "${2:-100}" "$1" "${2:-100}" "$1" | link_stream "$LP/exec?t=30"; exit $? ;;
         status) printf '%s' 'uptime; free -m | sed -n 2p; df -h / | tail -1; curl -s --max-time 5 https://ipinfo.io/ip; echo' | link_stream "$LP/exec?t=30"; exit $? ;;
         esac
+    fi
+    if [ "$cmd" = run ] && [ "$1" != "--direct" ] && [ -n "$MINIS_LINK_TOKEN" ] && [ "${MINIS_VPS_NO_LINK:-}" != 1 ]; then
+        echo "[fallback] app-link unavailable -> SSH server selection" >&2
     fi
     ;;
 esac

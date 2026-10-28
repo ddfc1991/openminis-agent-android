@@ -15,7 +15,10 @@ object LocalProxyCore {
     const val FAIL_GAP_MS = 15_000L
 
     enum class Result { DOWN, FAIL, OK }
-    data class Probe(val port: Int, val result: Result, val ms: Long = 0L)
+    data class Probe(val port: Int, val result: Result, val ms: Long = 0L, val httpStatus: Int? = null, val reachable: Boolean = result == Result.OK)
+
+    /** Any received HTTP status proves the TCP/proxy path reached an HTTP peer; 204 is only the expected payload. */
+    fun reachableStatus(code: Int?): Boolean = code in 100..599
 
     /** candidate ports; the built-in mihomo's port only while its listener is up */
     fun candidates(builtinPort: Int?, builtinUp: Boolean): List<Int> =
@@ -61,6 +64,12 @@ object LocalProxyCore {
         val seen = probes.filter { it.result != Result.DOWN }
         val head = chosen?.let { "用 127.0.0.1:$it" } ?: "没有能用的本机代理 → 直连"
         if (seen.isEmpty()) return "$head（本机代理端口都没在监听）"
-        return head + "（" + seen.joinToString(" · ") { "${it.port} " + if (it.result == Result.OK) "✓ ${it.ms}ms" else "✗" } + "）"
+        return head + "（" + seen.joinToString(" · ") { probe ->
+            "${probe.port} " + when {
+                probe.result == Result.OK -> "✓ ${probe.ms}ms"
+                probe.reachable && probe.httpStatus != null -> "⚠ 可达 · HTTP ${probe.httpStatus}（探测未通过）"
+                else -> "✗"
+            }
+        } + "）"
     }
 }

@@ -3,6 +3,9 @@ package com.openminis.app.plus
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import java.net.ServerSocket
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import org.junit.Test
 
 /** [Mines-38.9.8] 自我地图: ports from the server's own notes, compact prompt, tool detail; demo addresses only (public repo). */
@@ -29,6 +32,25 @@ class SelfMapCoreTest {
         val d = SelfMapCore.detail(s, "servers", now)
         assertTrue(d.contains("8794 通")); assertFalse(d.contains("百炼"))
         assertTrue(SelfMapCore.detail(s, "nope", now).startsWith("没有这一项"))
+    }
+
+    @Test fun appSelfPortProbeIsRawTcpAndDoesNotClassifyHttp400AsClosed() {
+        ServerSocket(0).use { listener ->
+            val server = Executors.newSingleThreadExecutor()
+            try {
+                val response = server.submit {
+                    listener.accept().use { peer ->
+                        peer.getOutputStream().write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n".toByteArray())
+                        peer.getOutputStream().flush()
+                    }
+                }
+                assertTrue(SelfMapCore.portReachable("127.0.0.1", listener.localPort, 1000))
+                response.get(2, TimeUnit.SECONDS)
+            } finally {
+                server.shutdownNow()
+            }
+        }
+        assertFalse(SelfMapCore.portReachable("127.0.0.1", 0, 100))
     }
 
     @Test fun neverProbed() {

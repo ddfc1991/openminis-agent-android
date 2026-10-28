@@ -26,6 +26,18 @@ class CrashRedactCoreTest {
         assertEquals(st, CrashRedactCore.redact(st))
     }
 
+    @Test fun pathAwareRedactionKeepsSafeSystemPathsAndMasksSensitiveNames() {
+        val raw = "system=/apex/libc.so source=/system/lib64/libart.so user=/home/alice/.ssh/id_rsa systemKey=/root/.ssh/minis_vps_app_key env=/home/alice/project/.env.production key=/tmp/service_private-key.pem"
+        val redacted = CrashRedactCore.redact(raw)
+        assertTrue(redacted.contains("/apex/libc.so"))
+        assertTrue(redacted.contains("/system/lib64/libart.so"))
+        assertFalse(redacted.contains("id_rsa"))
+        assertFalse(redacted.contains(".env.production"))
+        assertFalse(redacted.contains("service_private-key.pem"))
+        assertTrue(redacted.contains("/home/alice/.ssh/***"))
+        assertTrue(redacted.contains("/root/.ssh/***"))
+    }
+
     @Test fun clipboardAndTitle() {
         assertTrue(CrashRedactCore.forClipboard("x".repeat(100), 10).contains("已截断"))
         assertTrue(CrashRedactCore.title("Reason: ANR\n").contains("ANR"))

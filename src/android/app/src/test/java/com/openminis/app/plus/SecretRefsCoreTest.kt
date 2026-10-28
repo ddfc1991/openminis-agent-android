@@ -21,10 +21,25 @@ class SecretRefsCoreTest {
         assertEquals(setOf("ssh_1", "other"), C.secretIds(cmd))
         assertEquals(setOf("ssh_1"), C.userIds(cmd))
         val out = C.rewrite(cmd, mapOf("ssh_1" to "ro'ot"))
-        assertEquals("sshpass -p \"\$MINES_SECRET_SSH_1\" ssh 'ro'\\''ot'@1.2.3.4 && echo \"\$MINES_SECRET_OTHER\"", out)
+        val expected = "sshpass -p \"" + '$' + "MINES_SECRET_SSH_1\" ssh 'ro'\\''ot'@1.2.3.4 && echo \"" + '$' + "MINES_SECRET_OTHER\""
+        assertEquals(expected, out)
         assertFalse(out.contains("{{"))
+        val quoted = C.rewrite("export SSHPASS='{{secret:ssh_1}}'; sshpass -e ssh user@host", emptyMap())
+        assertEquals("export SSHPASS=\"" + '$' + "MINES_SECRET_SSH_1\"; sshpass -e ssh user@host", quoted)
+        assertEquals("echo \"" + '$' + "MINES_SECRET_SSH_1\"", C.rewrite("echo \"{{secret:ssh_1}}\"", emptyMap()))
+        assertEquals(
+            "curl -H 'Authorization: Bearer ''\"" + '$' + "MINES_SECRET_SSH_1\"'' https://example.test",
+            C.rewrite("curl -H 'Authorization: Bearer {{secret:ssh_1}}' https://example.test", emptyMap()),
+        )
         assertEquals("echo ''", C.rewrite("echo {{user:missing}}", emptyMap()))
         assertTrue(C.secretIds("no refs {{secret:bad id}}").isEmpty())
+    }
+
+    @Test fun unresolvedSecretNeverAppearsAsRunnableShellReference() {
+        val command = "curl -H 'Authorization: Bearer {{secret:api_main}}' https://example.test"
+        assertEquals(emptySet<String>(), C.missingSecretIds(command, setOf(C.envName("api_main"))))
+        assertEquals(setOf("api_main"), C.missingSecretIds(command, emptySet()))
+        assertEquals(emptySet<String>(), C.missingSecretIds("echo safe", emptySet()))
     }
 
     @Test fun scrubMasksLongestFirstAndSkipsShort() {

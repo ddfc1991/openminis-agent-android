@@ -1,5 +1,9 @@
 package com.openminis.app.plus
 
+import java.net.InetSocketAddress
+import java.net.Proxy
+import java.net.Socket
+
 /**
  * [Mines-38.9.8] 自我地图 (user 2026-10-19 00:01): the agent did not know its own app — which features and settings exist,
  * which providers / 模型组 / agent-loop groups the user configured, and which ports on the user's own servers (工作位置)
@@ -27,6 +31,18 @@ object SelfMapCore {
      * (「nginx :8090」, 「:8794 Memoh API」, 「0.0.0.0:7860」) and any the user / agent asked for. Sorted, ≤ [max].
      */
     private val IPV4 = Regex("(?:[0-9]{1,3}\\.){3}[0-9]{1,3}")
+
+    /** TCP reachability only: HTTP response codes belong to a higher-level protocol probe. */
+    fun portReachable(host: String, port: Int, timeoutMs: Int = 1500): Boolean {
+        if (host.isBlank() || port !in 1..65535 || timeoutMs <= 0) return false
+        return runCatching {
+            Socket(Proxy.NO_PROXY).use { socket ->
+                socket.connect(InetSocketAddress(host, port), timeoutMs)
+                socket.soTimeout = timeoutMs
+                socket.getInputStream().read() >= 0
+            }
+        }.getOrDefault(false)
+    }
 
     fun portsFor(sshPort: Int, running: List<String>, notes: List<String>, extra: List<Int> = emptyList(), max: Int = 12): List<Int> {
         val out = LinkedHashSet<Int>()

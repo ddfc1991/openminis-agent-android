@@ -118,17 +118,56 @@ object SandboxNet {
         runCatching { LocalProxy.ensureFresh(3000L) }
         SplitProxy.sandboxEnv()?.let { env ->
             proxySource = "split"
-            val up = SplitProxy.settings.value.hasUpstream
-            _status.value = if (up) "走分流代理 127.0.0.1:${SplitProxy.PORT}（国内源直连，境外源走你的代理；代理坏了自动直连）"
-            else "走分流代理 127.0.0.1:${SplitProxy.PORT}，但没填代理服务器：境外源会直连"
+            val settings = SplitProxy.settings.value
+            val active = SplitProxy.activeUpstreamNow()
+            val activeHealth = active?.let { SplitProxy.health.value[it.key] }
+            val healthText = when {
+                activeHealth == null -> "尚无健康检查结果"
+                activeHealth.reachable && activeHealth.protocolOk == false -> "已连通但不可用，HTTP ${activeHealth.httpStatus}（探测预期204）"
+                activeHealth.ok -> "最近探测通过"
+                else -> "最近探测失败"
+            }
+            fun endpointStatus(u: SplitProxy.Upstream): String {
+                val health = SplitProxy.health.value[u.key]
+                val state = when {
+                    health == null -> "未检测"
+                    health.reachable && health.protocolOk == false -> "可达但不可用，HTTP ${health.httpStatus}（预期204）"
+                    health.ok -> "连通"
+                    else -> "检测失败"
+                }
+                return "${SplitProxyCore.endpoint(u.type, u.host, u.port)}（$state）"
+            }
+            val alternatives = settings.all.filter { it.key != active?.key }.map(::endpointStatus)
+            _status.value = SandboxNetCore.splitStatus(
+                SplitProxy.PORT,
+                settings.hasUpstream,
+                active?.let { SplitProxyCore.endpoint(it.type, it.host, it.port) },
+                active?.let { healthText },
+                alternatives,
+            )
             return env + ("MINES_PROXY_SOURCE" to proxySource) + ("no_proxy" to noProxy()) + ("NO_PROXY" to noProxy())
         }
-        val splitOn = SplitProxy.settings.value.enabled && SplitProxy.settings.value.forSandbox
+        val splitSettings = SplitProxy.settings.value
+        val splitOn = splitSettings.enabled && splitSettings.forSandbox
+        val splitFallback = if (splitOn) {
+            val activeKey = SplitProxy.activeUpstreamNow()?.key
+            val candidates = splitSettings.all.map { u ->
+                val health = SplitProxy.health.value[u.key]
+                val state = when {
+                    health == null -> "未检测"
+                    health.reachable && health.protocolOk == false -> "可达但不可用，HTTP ${health.httpStatus}（预期204）"
+                    health.ok -> "连通"
+                    else -> "检测失败"
+                }
+                "${SplitProxyCore.endpoint(u.type, u.host, u.port)}（${if (u.key == activeKey) "当前" else "候选"}，$state）"
+            }
+            SandboxNetCore.splitFallbackStatus(SplitProxy.PORT, candidates)
+        } else ""
         if (splitOn && !SplitProxy.running.value) Log.w(TAG, "split proxy is on but not listening — not exporting it")
         // [38.9.11.2] a local proxy that passed a real outbound check (Clash app 7890 / Mines' own 7898 …) is used ALWAYS,
         // not only when 分流代理 is on (user 自检 2026-10-21: sandbox left through the phone's own IP)
         val alt = LocalProxy.best
-        val hp = systemProxyUri.substringAfter("://").substringAfter('@').substringBefore('/')
+        val hp = SandboxNetCore.safeAuthority(systemProxyUri)
         val sysOk = systemProxyUri.isNotEmpty() && alt == null && run {
             val host = hp.substringBeforeLast(':').removePrefix("[").removeSuffix("]")
             reachable(host, hp.substringAfterLast(':').toIntOrNull() ?: 80)
@@ -136,12 +175,12 @@ object SandboxNet {
         when (SandboxProxyCore.choose(false, alt, systemProxyUri.isNotEmpty(), sysOk, strict)) {
             SandboxProxyCore.Way.LOCAL -> {
                 proxySource = "local:$alt"
-                _status.value = (if (splitOn) "分流代理 127.0.0.1:${SplitProxy.PORT} 不通，" else "") + "走本机代理 127.0.0.1:$alt（国内源直连）"
+                _status.value = SandboxNetCore.selectedLocalStatus(alt!!, LocalProxy.summary(), splitUnavailable = splitOn) + splitFallback
                 return block(LocalProxyCore.url(alt!!)) + runCatching { ClashCore.agentEnv(context) }.getOrDefault(emptyMap())
             }
-            SandboxProxyCore.Way.SYSTEM -> { proxySource = "system"; _status.value = "走系统代理 $hp（国内源直连）"; return block(systemProxyUri) }
+            SandboxProxyCore.Way.SYSTEM -> { proxySource = "system"; _status.value = SandboxNetCore.systemStatus(hp, LocalProxy.summary()) + splitFallback; return block(systemProxyUri) }
             SandboxProxyCore.Way.BLOCK -> {
-                proxySource = "blocked"; _status.value = SandboxProxyCore.BLOCK_MSG
+                proxySource = "blocked"; _status.value = SandboxNetCore.directStatus(SandboxProxyCore.BLOCK_MSG, LocalProxy.summary(), splitFallback)
                 Log.w(TAG, "strict proxy: nothing passed (${LocalProxy.summary()}) — sandbox network blocked")
                 val np = listOf("localhost", "127.0.0.1", "::1").joinToString(",")
                 return block(SandboxProxyCore.BLOCK_URL) + ("no_proxy" to np) + ("NO_PROXY" to np) + ("MINES_NET_BLOCKED" to SandboxProxyCore.BLOCK_MSG)
@@ -149,11 +188,11 @@ object SandboxNet {
             else -> {}
         }
         if (systemProxyUri.isNotEmpty()) {
-            proxySource = "system-dead"; _status.value = "系统代理 $hp 连不上，沙箱已改为直连"
+            proxySource = "system-dead"; _status.value = SandboxNetCore.directStatus("系统代理 $hp 连不上，沙箱已改为直连", LocalProxy.summary(), splitFallback)
             Log.w(TAG, "system proxy $hp unreachable — sandbox goes direct")
             return block("")
         }
-        proxySource = "none"; _status.value = "直连（没有可用的代理；软件源自动选最快的）"
+        proxySource = "none"; _status.value = SandboxNetCore.directStatus("直连（没有可用的代理；软件源自动选最快的）", LocalProxy.summary(), splitFallback)
         return block("")
     }
 

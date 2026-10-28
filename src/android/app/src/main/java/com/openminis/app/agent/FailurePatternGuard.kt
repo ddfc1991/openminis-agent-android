@@ -84,6 +84,11 @@ class FailurePatternGuard(private val limit: Int = 3) {
         /** Normalized signature of the first error-looking line, or null when [content] doesn't look like a failure. */
         fun signature(content: String, isError: Boolean, tool: String = ""): String? {
             if (!isError && isReader(tool)) return null
+            // shell_execute's success flag is the child's actual exit status. In release builds
+            // stdout and stderr are merged, so a benign stderr warning (for example OpenSSH's
+            // "Failed to connect to new control master") can appear before successful stdout.
+            // Never reinterpret successful shell output as a failed tool or auto-schedule signal.
+            if (!isError && tool == "shell_execute") return null
             val head = content.take(4000)
             val line = (if (isError) head.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() && errWords.containsMatchIn(it) }
                 else head.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() && errHeader.containsMatchIn(it) })

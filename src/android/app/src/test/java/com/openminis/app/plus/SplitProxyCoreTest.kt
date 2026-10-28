@@ -30,6 +30,30 @@ class SplitProxyCoreTest {
         assertNull(SplitProxyCore.parse("h.test")); assertNull(SplitProxyCore.parse(""))
     }
 
+    @Test fun http400IsReachableButProtocolMismatch() {
+        val ok = SplitProxyCore.probeOutcome(204)
+        assertTrue(ok.reachable); assertTrue(ok.protocolOk); assertEquals(204, ok.statusCode)
+        val badProtocol = SplitProxyCore.probeOutcome(400)
+        assertTrue(badProtocol.reachable); assertFalse(badProtocol.protocolOk)
+        assertEquals(400, badProtocol.statusCode)
+        assertTrue(badProtocol.detail!!.contains("已连通"))
+        assertTrue(badProtocol.detail.contains("HTTP 400"))
+        // Reachability is diagnostic only: non-204 HTTP responses must not be healthy/selectable.
+        assertFalse(badProtocol.protocolOk)
+        assertTrue(SplitProxyCore.probeOutcome(503).reachable)
+        assertFalse(SplitProxyCore.probeOutcome(503).protocolOk)
+        assertTrue(SplitProxyCore.probeReason(null, 400).contains("已连通"))
+    }
+
+    @Test fun diagnosticEndpointNeverShowsUserInfo() {
+        assertEquals("http://proxy.example:8080", SplitProxyCore.endpoint("http", "alice:topsecret@proxy.example", 8080))
+        assertFalse(SplitProxyCore.endpoint("socks5", "user:pass@2001:db8::1", 1080).contains("pass"))
+        assertEquals("socks5://[2001:db8::1]:1080", SplitProxyCore.endpoint("socks5", "user:pass@2001:db8::1", 1080))
+        val malformed = SplitProxyCore.endpoint("http", "proxy.example/path?token=not-for-logs", 8080)
+        assertEquals("http://proxy.example:8080", malformed)
+        assertFalse(malformed.contains("token"))
+    }
+
     // [Mines-38.9.6 i14] short growing pause after a failure, then retried; Google never direct
     @Test fun backoffAndGoogle() {
         assertEquals(0L, SplitProxyCore.backoffMs(0)); assertEquals(5_000L, SplitProxyCore.backoffMs(1))

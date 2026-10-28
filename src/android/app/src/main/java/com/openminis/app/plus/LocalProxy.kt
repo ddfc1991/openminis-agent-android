@@ -72,18 +72,28 @@ object LocalProxy {
         Socket(Proxy.NO_PROXY).use { it.connect(InetSocketAddress("127.0.0.1", port), 300) }; true
     }.getOrDefault(false)
 
-    private fun through(port: Int, url: String, expect: Int): Boolean = runCatching {
+    private fun through(port: Int, url: String): Int? = runCatching {
         val c = URL(url).openConnection(Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", port))) as HttpURLConnection
         c.connectTimeout = 2500; c.readTimeout = 2500; c.instanceFollowRedirects = false; c.useCaches = false
-        try { c.responseCode == expect } finally { c.disconnect() }
-    }.getOrDefault(false)
+        try { c.responseCode.takeIf { it in 100..599 } } finally { c.disconnect() }
+    }.getOrNull()
 
     private fun probeOne(port: Int): LocalProxyCore.Probe {
         if (!listening(port)) return LocalProxyCore.Probe(port, LocalProxyCore.Result.DOWN)
         val t0 = System.currentTimeMillis()
-        // HTTP forward first; HTTPS (= CONNECT) second
-        val ok = through(port, "http://connectivitycheck.gstatic.com/generate_204", 204) || through(port, "https://www.google.com/generate_204", 204)
-        return LocalProxyCore.Probe(port, if (ok) LocalProxyCore.Result.OK else LocalProxyCore.Result.FAIL, System.currentTimeMillis() - t0)
+        // 204 is required for a working proxy. Other HTTP codes prove an HTTP peer
+        // replied, but must not make a proxy operational; try the HTTPS fallback first.
+        val http = through(port, "http://connectivitycheck.gstatic.com/generate_204")
+        val https = if (http == 204) null else through(port, "https://www.google.com/generate_204")
+        val response = when {
+            https == 204 -> https
+            http != null -> http
+            else -> https
+        }
+        val reachable = LocalProxyCore.reachableStatus(response)
+        val ok = response == 204
+        return LocalProxyCore.Probe(port, if (ok) LocalProxyCore.Result.OK else LocalProxyCore.Result.FAIL,
+            System.currentTimeMillis() - t0, response, reachable)
     }
 
     fun probeNow(why: String) {

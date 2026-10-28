@@ -45,6 +45,22 @@ class LocalProxyCoreTest {
         assertEquals(7897, LocalProxyCore.select(listOf(Probe(7899, Result.OK), Probe(7897, Result.OK)), order))
     }
 
+    @Test fun http400MeansReachableButKeepsProtocolStatus() {
+        assertTrue(LocalProxyCore.reachableStatus(204))
+        assertTrue(LocalProxyCore.reachableStatus(400))
+        assertTrue(LocalProxyCore.reachableStatus(500))
+        assertFalse(LocalProxyCore.reachableStatus(null))
+        // A 400 proves that an HTTP peer answered, but it must not make the proxy selectable.
+        val failed = Probe(7890, Result.FAIL, 12, 400, reachable = true)
+        assertFalse(LocalProxyCore.usable(listOf(failed), 7890, probedOnce = true))
+        assertNull(LocalProxyCore.select(listOf(failed), listOf(7890)))
+        val summary = LocalProxyCore.summary(listOf(failed), null)
+        assertTrue(summary.contains("直连"))
+        assertTrue(summary.contains("可达"))
+        assertTrue(summary.contains("HTTP 400"))
+        assertTrue(summary.contains("探测未通过"))
+    }
+
     @Test fun unknownBeforeFirstProbeIsAllowed() {
         assertTrue(LocalProxyCore.usable(emptyList(), 7899, probedOnce = false))
         assertFalse(LocalProxyCore.usable(emptyList(), 7899, probedOnce = true))
