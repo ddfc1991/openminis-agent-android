@@ -7374,6 +7374,14 @@ def b3915(res):
             time.sleep(3)
         ts = (st.get("tasks") or [])[n0:]; o["tasks"] = ts
         if not ts: fail(f"no task for the send: {st.get('last')}"); return
+        # Fail diagnostically if the fake provider was not reached or the task
+        # request omitted the guarded persona tool. Do not accept a scripted
+        # text-only/0-step completion as proof that the limit layer ran.
+        fs = fake_stats(); rec = (fs.get("i3913") or {}).get("SENDMAILTEST") or {}
+        o["agent_model"] = {"tools": rec.get("tools", []), "missing_tool": rec.get("missing_tool"), "results": rec.get("results", [])}
+        if not rec: fail(f"SENDMAILTEST task never reached fake model; stats={fs}")
+        elif "persona" not in (rec.get("tools") or []): fail(f"SENDMAILTEST task model was not given persona safety tool: {rec}")
+        elif rec.get("missing_tool"): fail(f"SENDMAILTEST fake model reports missing tool: {rec.get('missing_tool')}")
         t = ts[-1]
         if t.get("st") != "waiting": fail(f"send task not 等你处理: {t}")
         if "限制层" not in (t.get("line") or ""): fail(f"task line does not say 限制层: {t.get('line')}")

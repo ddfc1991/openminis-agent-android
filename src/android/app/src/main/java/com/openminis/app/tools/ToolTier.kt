@@ -11,7 +11,7 @@ import android.content.Context
  * 让模型选错。小任务（改个文件）不需要 25 个工具，弱设备也扛不住。
  *
  * 档位含义：
- *  - LITE   10 个核心：读写文件、跑命令、记忆、看图片。什么设备都能跑，最省 token。
+ *  - LITE   10 个核心：读写文件、跑命令、记忆、账号/任务工具；启用时优先保留 persona 限制层。
  *  - MEDIUM 15 个：+ 浏览器、知识库、子代理、MCP。默认档。
  *  - HEAVY  25 个：全开。
  *
@@ -37,7 +37,7 @@ enum class ToolTier(val id: String, val label: String, val maxTools: Int) {
         /** Exact names emitted by AgentTools; old phantom names silently made this tier ineffective. */
         val LITE_TOOLS = linkedSetOf(
             "shell_execute", "file_read", "file_write", "file_edit", "read_image",
-            "memory_write", "memory_get", "memory", "accounts", "app_self", "task_progress",
+            "memory_write", "memory_get", "memory", "accounts", "app_self", "task_progress", "persona",
         )
 
         val MEDIUM_TOOLS = LITE_TOOLS + linkedSetOf(
@@ -51,7 +51,10 @@ enum class ToolTier(val id: String, val label: String, val maxTools: Int) {
             val allowed = if (tier == LITE) LITE_TOOLS else MEDIUM_TOOLS
             // Select required tools first, then fill the remaining slots in provider order.
             // Index-based selection preserves duplicate tool definitions without indexOf ambiguity.
-            val priority = listOf("shell_execute", "file_read", "file_write", "file_edit", "memory_write", "memory_get", "memory", "accounts", "app_self", "task_progress", "read_image")
+            // Safety-gated actions must remain callable even on the light tier: the tool
+            // enforces the persona limit before any side effect. Under the 10-tool cap,
+            // persona takes precedence over the generic memory alias and optional image reader.
+            val priority = listOf("shell_execute", "file_read", "file_write", "file_edit", "memory_write", "memory_get", "accounts", "app_self", "task_progress", "persona", "memory", "read_image")
             val rankedIndices = priority.flatMap { required -> tools.indices.filter { name(tools[it]) == required && name(tools[it]) in allowed } } +
                 tools.indices.filter { name(tools[it]) in allowed && name(tools[it]) !in priority }
             return rankedIndices.distinct().take(tier.maxTools).map { tools[it] }
