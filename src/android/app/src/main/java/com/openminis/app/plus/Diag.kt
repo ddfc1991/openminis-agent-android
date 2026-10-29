@@ -36,7 +36,7 @@ object Diag {
     private const val TAG = "MinesDiag"
     private const val PREFS = "mines_diag"
     /** built-in 诊断码: 梦云 relay (wss, self-signed cert pinned by SHA-256). The connect token is public by design. */
-    const val DEFAULT_CODE_JSON = """{"t":"mdk_7iFFyujXMaewn7Tk7jdc4ldCbFniaTLw","e":[["wss://38.76.209.77:2083/mdiag/dev","daa65e9f5997a31e5ebb52db0a2d3aa68432b204fb4077a3c89e0d9aab100dab"]]}"""
+    // No embedded diagnostic credentials; configuration must be explicitly supplied by the user.
     const val STALL_MS = 200L
 
     private lateinit var app: Context
@@ -114,7 +114,7 @@ object Diag {
 
     private fun config(): DiagCore.Config? {
         prefs().getString("code", null)?.let { DiagCore.parseCode(it) }?.let { return it }
-        return DiagCore.parseCode("mdiag1:" + java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(DEFAULT_CODE_JSON.toByteArray()))
+        return null
     }
 
     private fun restartIfOn() { if (_on.value) { stop(null); start() } }

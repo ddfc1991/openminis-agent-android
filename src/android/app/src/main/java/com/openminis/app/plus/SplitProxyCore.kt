@@ -73,6 +73,27 @@ object SplitProxyCore {
     // ── [Mines-38.9.10 i28] real proxy health check ──
     data class ProbeOutcome(val reachable: Boolean, val protocolOk: Boolean, val statusCode: Int?, val detail: String?)
 
+    /** Build a bounded HTTP CONNECT request. Host/port are destination inputs, never proxy credentials. */
+    fun httpConnectRequest(host: String, port: Int, authLine: String = ""): String {
+        require(ProxyEndpointCore.validHost(host) && validDestination(host, port)) { "invalid destination" }
+        require(authLine.isEmpty() || Regex("^Proxy-Authorization: Basic [A-Za-z0-9+/=]*\\r\\n$").matches(authLine)) { "invalid auth header" }
+        val authority = if (host.contains(':')) "[$host]:$port" else "$host:$port"
+        return "CONNECT $authority HTTP/1.1\r\nHost: $authority\r\n${authLine}\r\n"
+    }
+
+    /** A SOCKS connect target stays unresolved locally so DNS is performed by the SOCKS proxy. */
+    fun socksAddress(host: String, port: Int): java.net.InetSocketAddress {
+        require(ProxyEndpointCore.validHost(host) && validDestination(host, port)) { "invalid destination" }
+        return java.net.InetSocketAddress.createUnresolved(host, port)
+    }
+
+    fun httpConnectAccepted(statusLine: String): Boolean =
+        statusCode(statusLine) == 200
+
+    private fun validDestination(host: String, port: Int): Boolean =
+        host.isNotBlank() && host.length <= 253 && host.none { it.isWhitespace() || it in "/\\?#@" } && port in 1..65535
+
+
     /** 204 is the expected payload. Any HTTP status proves a TCP/HTTP peer was reached. */
     fun probeOutcome(code: Int): ProbeOutcome = when {
         code == 204 -> ProbeOutcome(true, true, code, null)

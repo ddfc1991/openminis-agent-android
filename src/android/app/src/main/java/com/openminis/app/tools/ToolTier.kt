@@ -34,41 +34,28 @@ enum class ToolTier(val id: String, val label: String, val maxTools: Int) {
         const val KEY = "agent.tools.tier"
         const val AUTO = "auto"
 
-        /** 各档允许的工具名。没列出的 = 该档不带。 */
-        val LITE_TOOLS = setOf(
-            "shell_execute",
-            "file_read",
-            "file_write",
-            "file_edit",
-            "read_image",
-            "memory_write",
-            "memory_get",
-            "todo_write",
-            "ask_user",
-            "finish",
+        /** Exact names emitted by AgentTools; old phantom names silently made this tier ineffective. */
+        val LITE_TOOLS = linkedSetOf(
+            "shell_execute", "file_read", "file_write", "file_edit", "read_image",
+            "memory_write", "memory_get", "memory", "accounts", "app_self", "task_progress",
         )
 
-        val MEDIUM_TOOLS = LITE_TOOLS + setOf(
-            "browser_use",
-            "search_knowledge",
-            "subagent_task",
-            "delegate_task",
-            "agent_status",
-            "minis_config",
+        val MEDIUM_TOOLS = LITE_TOOLS + linkedSetOf(
+            "browser_use", "search_knowledge", "subagent_task", "mines_selfcheck",
+            "app_settings", "workspace_register", "cloudflare", "persona", "app_agent",
         )
 
-        val HEAVY_TOOLS = MEDIUM_TOOLS + setOf(
-            "web_search",
-            "web_fetch",
-            "image_generate",
-            "speech_to_text",
-            "text_to_speech",
-            "mcp_call",
-            "mcp_list",
-            "plugin_call",
-            "persona",
-            "scheduled_task",
-        )
+        /** Preserve AgentTools order, but expose at most the selected tier's cap. */
+        fun <T> filter(tools: List<T>, tier: ToolTier, name: (T) -> String): List<T> {
+            if (tier == HEAVY) return tools.take(HEAVY.maxTools)
+            val allowed = if (tier == LITE) LITE_TOOLS else MEDIUM_TOOLS
+            // Select required tools first, then fill the remaining slots in provider order.
+            // Index-based selection preserves duplicate tool definitions without indexOf ambiguity.
+            val priority = listOf("shell_execute", "file_read", "file_write", "file_edit", "memory_write", "memory_get", "memory", "accounts", "app_self", "task_progress", "read_image")
+            val rankedIndices = priority.flatMap { required -> tools.indices.filter { name(tools[it]) == required && name(tools[it]) in allowed } } +
+                tools.indices.filter { name(tools[it]) in allowed && name(tools[it]) !in priority }
+            return rankedIndices.distinct().take(tier.maxTools).map { tools[it] }
+        }
 
         fun forName(n: String): ToolTier? = entries.firstOrNull { it.id.equals(n, true) }
     }
@@ -77,7 +64,7 @@ enum class ToolTier(val id: String, val label: String, val maxTools: Int) {
     fun allows(toolName: String): Boolean = when (this) {
         LITE -> toolName in LITE_TOOLS
         MEDIUM -> toolName in MEDIUM_TOOLS
-        HEAVY -> true   // 全开，不拦
+        HEAVY -> true
     }
 }
 

@@ -750,7 +750,8 @@ object SplitProxy {
     private fun viaUpstream(u: Upstream, host: String, port: Int, tunnel: Boolean, timeout: Int = 6_000): Socket {
         if (u.type == "socks5") {
             val sock = Socket(Proxy(Proxy.Type.SOCKS, InetSocketAddress(u.host, u.port)))
-            sock.connect(InetSocketAddress.createUnresolved(host, port), timeout)
+            // Keep target unresolved: SOCKS5 must resolve the destination on the proxy side.
+            sock.connect(SplitProxyCore.socksAddress(host, port), timeout)
             return sock
         }
         val sock = Socket(Proxy.NO_PROXY).apply { tcpNoDelay = true; keepAlive = true; connect(InetSocketAddress(u.host, u.port), timeout) }
@@ -759,11 +760,11 @@ object SplitProxy {
         if (tunnel) sock.soTimeout = timeout.coerceAtLeast(2_000)
         if (!tunnel) { tags[sock] = "http-proxy"; if (u.user.isNotEmpty()) auths[sock] = u.authHeader; return sock }
         val o = sock.getOutputStream()
-        o.write("CONNECT $host:$port HTTP/1.1\r\nHost: $host:$port\r\n${u.authHeader}\r\n".toByteArray(Charsets.ISO_8859_1))
+        o.write(SplitProxyCore.httpConnectRequest(host, port, u.authHeader).toByteArray(Charsets.ISO_8859_1))
         o.flush()
         val head = readHead(sock.getInputStream()) ?: throw IOException("upstream closed")
         val status = String(head, Charsets.ISO_8859_1).substringBefore("\r\n")
-        if (!status.contains(" 200")) { sock.close(); throw IOException("upstream refused: $status") }
+        if (!SplitProxyCore.httpConnectAccepted(status)) { sock.close(); throw IOException("upstream refused: $status") }
         sock.soTimeout = 0
         return sock
     }

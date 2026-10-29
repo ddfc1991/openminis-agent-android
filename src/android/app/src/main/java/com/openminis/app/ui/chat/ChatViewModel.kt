@@ -1993,7 +1993,8 @@ class ChatViewModel(
      * fixed list of definition objects, no I/O.
      */
     private val agentTools: List<AgentToolDefinition>
-        get() = AgentTools.makeAgentTools(
+        get() {
+            val built = AgentTools.makeAgentTools(
             // [T-android-vision-group / GH#182] The main model's own vision
             // capability. When false but a Vision Group is configured, read_image
             // is still exposed and routes through the group (see
@@ -2017,7 +2018,12 @@ class ChatViewModel(
             rosterNames = providerRepository.subAgents.map { it.name },
             knowledgeTool = com.openminis.app.plus.KnowledgeBase.toolDefinition(context, sessionId),
             memoryV2 = com.openminis.app.plus.MemoryV2.isOn(context),  // [Mines-38.9.13 memory_v2]
-        )
+            )
+            return com.openminis.app.tools.ToolTier.filter(
+                built,
+                com.openminis.app.tools.ToolTierStore.effective(context),
+            ) { it.name }
+        }
 
     /**
      * [T-sub-agents-resume] Restart sub agent runs the app lost when it was

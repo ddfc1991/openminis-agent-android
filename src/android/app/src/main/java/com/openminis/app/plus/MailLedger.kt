@@ -9,7 +9,7 @@ import org.json.JSONObject
  *
  * 用户 2026-10-27 明确要求：**两类必须分清，不能混**
  *  - TEMP   临时邮箱（Mail.tm / Moakt）—— 一次性，可能随时失效
- *  - ALIAS  Gmail 别名（deningyang+ai@gmail.com）—— 永久有效
+ *  - ALIAS  Gmail 别名（<gmail-alias>）—— 永久有效
  *
  * 台账每条记录：
  *  - kind        来源类别 TEMP / ALIAS
@@ -32,9 +32,9 @@ object MailLedger {
 
     /** 已知临时邮箱可选域名（用户要的 14 个选择器，可在设置里扩展）。 */
     val TEMP_DOMAINS = listOf(
-        "drmail.in", "teml.net", "mailto.plus", "fexpost.com", "fexbox.org",
-        "cggup.com", "uuf.me", "smncloud.com", "nriza.com", "thestar.com",
-        "dpdns.org", "yzcalo.com", "binkmail.com", "mailsac.com",
+        "drmail.in", "teml.net", "tmpeml.com", "tmpbox.net", "moakt.cc",
+        "disbox.net", "tmpmail.org", "tmpmail.net", "tmails.net", "disbox.org",
+        "moakt.co", "moakt.ws", "tmail.ws", "bareed.ws",
     )
 
     data class Site(val site: String, val verified: Boolean, val at: Long)
@@ -53,6 +53,7 @@ object MailLedger {
         val keepAliveAt: Long,
         val note: String,
         val at: Long,
+        val lastUsedAt: Long = 0L,
     )
 
     @Volatile private var loaded = false
@@ -94,6 +95,7 @@ object MailLedger {
                         keepAliveAt = o.optLong("keepAliveAt"),
                         note = o.optString("note"),
                         at = o.optLong("at"),
+                        lastUsedAt = o.optLong("lastUsedAt"),
                     ),
                 )
             }
@@ -126,11 +128,23 @@ object MailLedger {
                     .put("keepAliveH", e.keepAliveH)
                     .put("keepAliveAt", e.keepAliveAt)
                     .put("note", e.note)
-                    .put("at", e.at),
+                    .put("at", e.at)
+                    .put("lastUsedAt", e.lastUsedAt),
             )
         }
         c.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putString(KEY, arr.toString()).apply()
+    }
+
+    /** Replace an existing exact address record after an explicit CLI state change. */
+    @Synchronized
+    fun replace(c: Context, e: Entry): Entry? {
+        init(c)
+        val matches = cache.indices.filter { cache[it].address.equals(e.address, true) }
+        if (matches.size != 1) return null
+        cache[matches.single()] = e
+        save(c)
+        return e
     }
 
     /** 新增或更新一条。同地址视为同一条，合并 sites。 */
@@ -152,6 +166,8 @@ object MailLedger {
                 lastCodeAt = if (e.lastCode.isNotBlank()) e.lastCodeAt else old.lastCodeAt,
                 keepAliveOn = e.keepAliveOn || old.keepAliveOn,
                 keepAliveH = if (e.keepAliveH > 0) e.keepAliveH else old.keepAliveH,
+                keepAliveAt = maxOf(e.keepAliveAt, old.keepAliveAt),
+                lastUsedAt = maxOf(e.lastUsedAt, old.lastUsedAt),
                 note = e.note.ifBlank { old.note },
             ).also { cache[idx] = it }
         } else {
@@ -164,19 +180,26 @@ object MailLedger {
     @Synchronized
     fun remove(c: Context, addressOrId: String): Boolean {
         init(c)
-        val n = cache.size
-        cache.removeAll { it.id == addressOrId || it.address.equals(addressOrId, true) }
-        if (cache.size != n) { save(c); return true }
-        return false
+        val matches = cache.indices.filter {
+            cache[it].address.equals(addressOrId, true) || cache[it].id == addressOrId
+        }
+        if (matches.size != 1) return false
+        cache.removeAt(matches.single())
+        save(c)
+        return true
     }
 
     /** 记一条验证码 */
     @Synchronized
     fun recordCode(c: Context, addressOrId: String, code: String): Entry? {
         init(c)
-        val idx = cache.indexOfFirst { it.id == addressOrId || it.address.equals(addressOrId, true) }
-        if (idx < 0) return null
-        val e = cache[idx].copy(lastCode = code, lastCodeAt = System.currentTimeMillis())
+        val matches = cache.indices.filter {
+            cache[it].address.equals(addressOrId, true) || cache[it].id == addressOrId
+        }
+        if (matches.size != 1) return null
+        val idx = matches.single()
+        val now = System.currentTimeMillis()
+        val e = cache[idx].copy(lastCode = code, lastCodeAt = now, lastUsedAt = now)
         cache[idx] = e
         save(c)
         return e
@@ -186,13 +209,17 @@ object MailLedger {
     @Synchronized
     fun markSite(c: Context, addressOrId: String, site: String, verified: Boolean): Entry? {
         init(c)
-        val idx = cache.indexOfFirst { it.id == addressOrId || it.address.equals(addressOrId, true) }
-        if (idx < 0) return null
+        val matches = cache.indices.filter {
+            cache[it].address.equals(addressOrId, true) || cache[it].id == addressOrId
+        }
+        if (matches.size != 1) return null
+        val idx = matches.single()
         val e = cache[idx]
         val m = LinkedHashMap<String, Site>()
         e.sites.forEach { m[it.site.lowercase()] = it }
         m[site.lowercase()] = Site(site, verified, System.currentTimeMillis())
-        val ne = e.copy(sites = m.values.toList())
+        val now = System.currentTimeMillis()
+        val ne = e.copy(sites = m.values.toList(), lastUsedAt = now)
         cache[idx] = ne
         save(c)
         return ne

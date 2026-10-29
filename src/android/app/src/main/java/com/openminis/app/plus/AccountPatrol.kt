@@ -10,13 +10,9 @@ import android.app.job.JobService
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -24,6 +20,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * [Mines-patrol-31] 账号巡查: a battery-friendly background check of every
@@ -46,7 +43,9 @@ object AccountPatrol {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /** [Mines-patrol-parallel] 同时最多测几个账号。8 路够快，又不会把手机网络和上游 API 打爆。 */
-    private val patrolSem = Semaphore(8)
+    private const val PATROL_PARALLELISM = 8
+    // StateFlow is not a mutual-exclusion primitive; CAS prevents overlapping JobScheduler/manual runs.
+    private val runGate = AtomicBoolean(false)
 
     private val _status = MutableStateFlow<Map<String, Status>>(emptyMap())
     val status: StateFlow<Map<String, Status>> = _status.asStateFlow()
@@ -134,7 +133,7 @@ object AccountPatrol {
     }
 
     suspend fun run(context: Context) = withContext(Dispatchers.IO) {
-        if (_running.value) return@withContext
+        if (!runGate.compareAndSet(false, true)) return@withContext
         _running.value = true
         try {
             load(context)
@@ -143,42 +142,64 @@ object AccountPatrol {
             // [Mines-apps-32] keys already in the 模型组 count as connected accounts
             runCatching { ProviderKeys.adopt(context) }
             val now = System.currentTimeMillis()
-            val out = HashMap<String, Status>()
+            // Stable key order makes snapshots and summaries deterministic.
+            val out = LinkedHashMap<String, Status>()
             // [Mines-patrol-parallel] 巡视并发化（用户 2026-10-27 清单 ⑩）。
             // 原来 for 循环串行测 92 个账号，每个一次网络请求，总耗时 = 所有请求之和；
             // 现在并行（限 8 路，别把手机网络和上游 API 打爆），总耗时 ≈ 最慢那个。
-            val entries = PlusVault.entries.value.values.toList()
-            val tested = coroutineScope {
-                entries.map { e ->
-                    async(Dispatchers.IO) {
-                      patrolSem.withPermit {
-                        val secret = PlusVault.secret(e.kindId)
-                        val base = PlusVault.baseId(e.kindId)
-                        val st = if (secret != null && (e.via == "key" || e.via == "token" || e.via == "oauth" || e.via == "model" || base == "github")) {
-                            val r = KeyTester.test(base, secret)
-                            when {
-                                r.message.startsWith("测试时连不上") -> Status(Level.WARN, "这次没连上服务器，下次再试", now)
-                                !r.ok -> Status(Level.BAD, r.message, now, fix = if (KeyAgent.recipe(base) != null) "regen" else "relogin")
-                                r.needsCredit -> Status(Level.WARN, "余额不足，需要你自己充值", now)
-                                r.message.contains("限流") -> Status(Level.WARN, "最近被限流（429）", now)
-                                else -> Status(Level.OK, "密钥有效", now)
-                            }
-                        } else Status(Level.OK, if (e.via == "web") "网页登录（不自动检查）" else "已连接", now)
-                        e.kindId to st
-                      }
-                    }
-                }.awaitAll()
+            // Take one stable snapshot so additions/removals during the run cannot be lost or reorder results.
+            val entries = PlusVault.entries.value.toSortedMap().values.toList()
+            val tested = boundedOrderedMap(entries, PATROL_PARALLELISM) { e ->
+                val secret = PlusVault.secret(e.kindId)
+                val base = PlusVault.baseId(e.kindId)
+                val st = runCatching {
+                    if (secret != null && (e.via == "key" || e.via == "token" || e.via == "oauth" || e.via == "model" || base == "github")) {
+                        val r = KeyTester.test(base, secret)
+                        when {
+                            r.message.startsWith("测试时连不上") -> Status(Level.WARN, "这次没连上服务器，下次再试", now)
+                            !r.ok -> Status(Level.BAD, r.message, now, fix = if (KeyAgent.recipe(base) != null) "regen" else "relogin")
+                            r.needsCredit -> Status(Level.WARN, "余额不足，需要你自己充值", now)
+                            r.message.contains("限流") -> Status(Level.WARN, "最近被限流（429）", now)
+                            else -> Status(Level.OK, "密钥有效", now)
+                        }
+                    } else Status(Level.OK, if (e.via == "web") "网页登录（不自动检查）" else "已连接", now)
+                }.onFailure { if (it is CancellationException) throw it }.getOrElse {
+                    // A provider/plugin failure must not cancel the other accounts' checks.
+                    Status(Level.WARN, "本账号巡查失败，稍后重试", now)
+                }
+                e.kindId to st
+            }.mapIndexed { index, result ->
+                result.getOrElse { entries[index].kindId to Status(Level.WARN, "本账号巡查失败，稍后重试", now) }
             }
             // 并发度受 Semaphore 控制，见下方 patrolSem
-            out.putAll(tested.toMap())
-            // [Mines-apps-32] per-account balance (plain HTTP, no model) + expiry reminders
-            for (e in PlusVault.entries.value.values) {
-                runCatching { KeyBalance.refresh(e.kindId) }
-                if (KeyBalance.low(e.kindId) && out[e.kindId]?.level == Level.OK) out[e.kindId] = Status(Level.WARN, (KeyBalance.text(e.kindId) ?: "").let { t -> if (t.startsWith("欠费")) "已$t" else "余额低：$t" }, now)
-                Expiry.check(e.kindId, now)?.let { st -> if ((out[e.kindId]?.level ?: Level.OK).ordinal <= st.level.ordinal) out[e.kindId] = st }
+            tested.forEach { (id, status) -> out[id] = status }
+            // Balance refresh used to be a second serial pass after the 8-way key checks.
+            // Reuse the same fixed snapshot and semaphore; collect per-account before mutating `out`.
+            val balances = boundedOrderedMap(entries, PATROL_PARALLELISM) { e ->
+                e.kindId to runCatching {
+                    KeyBalance.refresh(e.kindId)
+                    val low = KeyBalance.low(e.kindId)
+                    val text = KeyBalance.text(e.kindId)
+                    val expiry = Expiry.check(e.kindId, now)
+                    Triple(low, text, expiry)
+                }.onFailure { if (it is CancellationException) throw it }
+            }.mapIndexed { index, result ->
+                result.getOrElse { entries[index].kindId to Result.failure(it) }
+            }
+            balances.forEach { (id, result) ->
+                result.fold(
+                    onSuccess = { (low, text, expiry) ->
+                        if (low && out[id]?.level == Level.OK) out[id] = Status(Level.WARN, (text ?: "").let { t -> if (t.startsWith("欠费")) "已$t" else "余额低：$t" }, now)
+                        expiry?.let { st -> if ((out[id]?.level ?: Level.OK).ordinal <= st.level.ordinal) out[id] = st }
+                    },
+                    onFailure = {
+                        if (KeyBalance.hasApi(PlusVault.baseId(id)) && PlusVault.secret(id) != null && out[id]?.level == Level.OK)
+                            out[id] = Status(Level.WARN, "余额巡查失败，稍后重试", now)
+                    },
+                )
             }
             // balances that are low
-            runCatching { Balances.refresh(context, 0) }.getOrNull()?.filter { it.low }?.forEach { b ->
+            runCatching { Balances.refresh(context, 0) }.onFailure { if (it is CancellationException) throw it }.getOrNull()?.filter { it.low }?.forEach { b ->
                 val id = PlusVault.entries.value.keys.firstOrNull { PlusVault.kind(it)?.name?.let { n -> b.name.contains(n) || n.contains(b.name) } == true }
                 if (id != null && out[id]?.level != Level.BAD) out[id] = Status(Level.WARN, if (b.text.startsWith("欠费")) "已${b.text}" else "余额低：${b.text}", now)
             }
@@ -194,7 +215,7 @@ object AccountPatrol {
             notifyNew(context, before, out)
             // [Mines-offers-32] free-credit offers: JSON + rules, no model call
             runCatching { FreeOffers.load(context); FreeOffers.notifyNew(context) }
-        } finally { _running.value = false }
+        } finally { _running.value = false; runGate.set(false) }
     }
 
     private fun notifyNew(context: Context, before: Map<String, Status>, now: Map<String, Status>) {

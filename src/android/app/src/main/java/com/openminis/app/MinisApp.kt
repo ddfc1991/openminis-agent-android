@@ -710,6 +710,8 @@ class MinisApp : Application(), ImageLoaderFactory {
             com.openminis.app.sandbox.offload.ConfigOffloadHandler(),
         )
         NativeOffloadServer.register("minis-browser-use", BrowserUseOffloadHandler(this))
+        // Sandbox-only proxy endpoint/routing CLI; does not alter Android UI or remote servers.
+        NativeOffloadServer.register("minis-proxy", com.openminis.app.plus.ProxyOffloadHandler(this))
         // [Mines-ledger] minis-accounts — 账号台账 CLI。毫秒级读台账，默认只报异常
         // （--all 才全量），不再走 UI 渲染链，省 token。
         val accountsCli = com.openminis.app.plus.AccountLedgerOffloadHandler(this)
