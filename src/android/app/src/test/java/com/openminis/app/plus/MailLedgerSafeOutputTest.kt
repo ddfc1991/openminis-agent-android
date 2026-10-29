@@ -67,8 +67,10 @@ class MailLedgerSafeOutputTest {
         assertTrue(byId.ambiguous)
         val failure = byId.failureResult()
         assertEquals(1, failure.exitCode)
-        assertTrue(failure.output.contains("one@example.test"))
-        assertTrue(failure.output.contains("two@example.test"))
+        assertTrue(failure.output.contains("o***@example.test"))
+        assertTrue(failure.output.contains("t***@example.test"))
+        assertFalse(failure.output.contains("one@example.test"))
+        assertFalse(failure.output.contains("two@example.test"))
         assertTrue(failure.output.contains("未擅自选择"))
     }
 

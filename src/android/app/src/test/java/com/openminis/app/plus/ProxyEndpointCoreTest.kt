@@ -58,14 +58,18 @@ class ProxyEndpointCoreTest {
     @Test fun javaSocksClientPerformsRemoteDnsDomainHandshakeAgainstLocalMock() {
         ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress()).use { server ->
             val requested = AtomicReference<String>()
+            val serverFailure = AtomicReference<Throwable?>()
             val worker = Thread {
-                server.accept().use { peer ->
+                try {
+                    server.accept().use { peer ->
                     peer.soTimeout = 2000
                     val input = BufferedInputStream(peer.getInputStream())
                     val greeting = ByteArray(2); readFully(input, greeting)
-                    assertArrayEquals(byteArrayOf(5, 1), greeting)
-                    val method = ByteArray(1); readFully(input, method)
-                    assertEquals(0, method[0].toInt())
+                    assertEquals(5, greeting[0].toInt())
+                    val methodCount = greeting[1].toInt() and 0xff
+                    assertTrue("SOCKS client must offer at least one auth method", methodCount > 0)
+                    val methods = ByteArray(methodCount); readFully(input, methods)
+                    assertTrue("SOCKS client must offer no-auth", methods.any { it.toInt() == 0 })
                     peer.getOutputStream().write(byteArrayOf(5, 0)); peer.getOutputStream().flush()
                     val head = ByteArray(4); readFully(input, head)
                     assertEquals(5, head[0].toInt()); assertEquals(1, head[1].toInt()); assertEquals(3, head[3].toInt())
@@ -74,12 +78,17 @@ class ProxyEndpointCoreTest {
                     val port = ByteArray(2); readFully(input, port)
                     requested.set(String(host, Charsets.US_ASCII) + ":" + (((port[0].toInt() and 0xff) shl 8) or (port[1].toInt() and 0xff)))
                     peer.getOutputStream().write(byteArrayOf(5, 0, 0, 1, 127, 0, 0, 1, 0, 80)); peer.getOutputStream().flush()
+                    }
+                } catch (t: Throwable) {
+                    serverFailure.set(t)
                 }
             }.apply { isDaemon = true; start() }
             Socket(Proxy(Proxy.Type.SOCKS, InetSocketAddress(java.net.InetAddress.getLoopbackAddress(), server.localPort))).use { client ->
                 client.connect(SplitProxyCore.socksAddress("dns-only.example", 443), 1000)
             }
             worker.join(2000)
+            assertFalse("SOCKS mock must finish its handshake", worker.isAlive)
+            serverFailure.get()?.let { throw AssertionError("SOCKS mock handshake failed", it) }
             assertEquals("dns-only.example:443", requested.get())
             assertTrue(SplitProxyCore.socksAddress("dns-only.example", 443).isUnresolved)
         }
