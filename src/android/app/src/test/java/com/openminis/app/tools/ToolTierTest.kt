@@ -31,8 +31,10 @@ class ToolTierTest {
         assertFalse("optional image reading is displaced by persona and the prioritized memory alias", lite.any { it.name == "read_image" })
         assertFalse(lite.any { it.name == "browser_use" })
         assertTrue(medium.any { it.name == "browser_use" })
-        assertTrue(medium.any { it.name == "app_settings" })
+        assertTrue(medium.any { it.name == "search_knowledge" })
+        assertTrue(medium.any { it.name == "subagent_task" })
         assertTrue(medium.any { it.name == "mines_selfcheck" })
+        assertTrue(medium.any { it.name == "app_settings" })
     }
 
     @Test fun duplicateDefinitionsKeepOriginalOrderAfterRequiredTools() {

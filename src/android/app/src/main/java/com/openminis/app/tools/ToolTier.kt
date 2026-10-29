@@ -54,7 +54,15 @@ enum class ToolTier(val id: String, val label: String, val maxTools: Int) {
             // Safety-gated actions must remain callable even on the light tier: the tool
             // enforces the persona limit before any side effect. Under the 10-tool cap,
             // persona takes precedence over the generic memory alias and optional image reader.
-            val priority = listOf("shell_execute", "file_read", "file_write", "file_edit", "memory_write", "memory_get", "accounts", "app_self", "task_progress", "persona", "memory", "read_image")
+            // Keep the nine core/safety tools first, then one modern memory API if present,
+            // then MEDIUM's five defining tools. The legacy memory alias and image reader are
+            // fallbacks: they must not consume slots needed by MEDIUM's advertised capabilities.
+            val priority = listOf(
+                "shell_execute", "file_read", "file_write", "file_edit", "memory_write",
+                "accounts", "app_self", "task_progress", "persona", "memory_get",
+                "browser_use", "search_knowledge", "subagent_task", "mines_selfcheck", "app_settings",
+                "memory", "workspace_register", "cloudflare", "app_agent", "read_image",
+            )
             val rankedIndices = priority.flatMap { required -> tools.indices.filter { name(tools[it]) == required && name(tools[it]) in allowed } } +
                 tools.indices.filter { name(tools[it]) in allowed && name(tools[it]) !in priority }
             return rankedIndices.distinct().take(tier.maxTools).map { tools[it] }
