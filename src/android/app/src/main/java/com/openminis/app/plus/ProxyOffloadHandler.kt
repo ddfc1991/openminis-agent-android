@@ -46,21 +46,23 @@ class ProxyOffloadHandler(private val context: Context) : NativeOffloadHandler {
         return ok("沙箱主代理已设置为 ${ProxyEndpointCore.label(ep)}；没有发起外网请求。可用 `minis-proxy probe ${ep.host} ${ep.port}` 做 TCP 可达性检查。")
     }
 
-    private fun backup(p: List<String>): NativeOffloadResult = when (p.getOrNull(1)?.lowercase()) {
-        "add" -> {
-            if (p.size != 5) return invalid("用法：minis-proxy backup add <http|socks5> <host> <port>")
-            val ep = ProxyEndpointCore.parse(p[2], p[3], p[4]) ?: return invalid("备用端点格式无效。")
-            SplitProxy.update(context) { s ->
-                val next = (s.backups.filterNot { SplitProxyCore.sameProxyKey(it.host, it.port) == SplitProxyCore.sameProxyKey(ep.host, ep.port) } + SplitProxy.Upstream(ep.type, ep.host, ep.port, "CLI备用"))
-                s.copy(enabled = true, forSandbox = true, backups = next)
+    private fun backup(p: List<String>): NativeOffloadResult {
+        return when (p.getOrNull(1)?.lowercase()) {
+            "add" -> {
+                if (p.size != 5) return invalid("用法：minis-proxy backup add <http|socks5> <host> <port>")
+                val ep = ProxyEndpointCore.parse(p[2], p[3], p[4]) ?: return invalid("备用端点格式无效。")
+                SplitProxy.update(context) { s ->
+                    val next = (s.backups.filterNot { SplitProxyCore.sameProxyKey(it.host, it.port) == SplitProxyCore.sameProxyKey(ep.host, ep.port) } + SplitProxy.Upstream(ep.type, ep.host, ep.port, "CLI备用"))
+                    s.copy(enabled = true, forSandbox = true, backups = next)
+                }
+                ok("沙箱备用端点已加入：${ProxyEndpointCore.label(ep)}；没有发起外网请求。")
             }
-            ok("沙箱备用端点已加入：${ProxyEndpointCore.label(ep)}；没有发起外网请求。")
+            "clear" -> {
+                SplitProxy.update(context) { it.copy(backups = emptyList()) }
+                ok("备用端点已清空。")
+            }
+            else -> invalid("用法：minis-proxy backup add|clear …")
         }
-        "clear" -> {
-            SplitProxy.update(context) { it.copy(backups = emptyList()) }
-            ok("备用端点已清空。")
-        }
-        else -> invalid("用法：minis-proxy backup add|clear …")
     }
 
     private fun route(p: List<String>): NativeOffloadResult {
@@ -74,22 +76,24 @@ class ProxyOffloadHandler(private val context: Context) : NativeOffloadHandler {
         return ok("沙箱默认路由已设为 ${mode.name.lowercase()}。不会修改 App 单独的路由开关。")
     }
 
-    private fun rule(p: List<String>): NativeOffloadResult = when (p.getOrNull(1)?.lowercase()) {
-        "list" -> ok(SplitProxy.settings.value.rules.mapNotNull { r -> safePattern(r.pattern)?.let { "$it → ${r.mode.name.lowercase()}" } }.joinToString("\n").ifBlank { "暂无有效规则。" })
-        "add" -> {
-            val pattern = p.getOrNull(2)?.trim()?.removePrefix("*")
-            val mode = when (p.getOrNull(3)?.lowercase()) { "proxy" -> SplitProxy.Mode.PROXY; "direct" -> SplitProxy.Mode.DIRECT; else -> null }
-            if (pattern.isNullOrBlank() || !ProxyEndpointCore.validHost(pattern.removePrefix(".")) || mode == null)
-                return invalid("用法：minis-proxy rule add <domain|.suffix> <proxy|direct>")
-            SplitProxy.update(context) { s -> s.copy(forSandbox = true, rules = (s.rules.filterNot { it.pattern == pattern } + SplitProxy.Rule(pattern, mode))) }
-            ok("沙箱分流规则已保存：$pattern → ${mode.name.lowercase()}。")
+    private fun rule(p: List<String>): NativeOffloadResult {
+        return when (p.getOrNull(1)?.lowercase()) {
+            "list" -> ok(SplitProxy.settings.value.rules.mapNotNull { r -> safePattern(r.pattern)?.let { "$it → ${r.mode.name.lowercase()}" } }.joinToString("\n").ifBlank { "暂无有效规则。" })
+            "add" -> {
+                val pattern = p.getOrNull(2)?.trim()?.removePrefix("*")
+                val mode = when (p.getOrNull(3)?.lowercase()) { "proxy" -> SplitProxy.Mode.PROXY; "direct" -> SplitProxy.Mode.DIRECT; else -> null }
+                if (pattern.isNullOrBlank() || !ProxyEndpointCore.validHost(pattern.removePrefix(".")) || mode == null)
+                    return invalid("用法：minis-proxy rule add <domain|.suffix> <proxy|direct>")
+                SplitProxy.update(context) { s -> s.copy(forSandbox = true, rules = (s.rules.filterNot { it.pattern == pattern } + SplitProxy.Rule(pattern, mode))) }
+                ok("沙箱分流规则已保存：$pattern → ${mode.name.lowercase()}。")
+            }
+            "remove" -> {
+                val pattern = p.getOrNull(2)?.let(::safePattern) ?: return invalid("规则格式无效。")
+                SplitProxy.update(context) { s -> s.copy(rules = s.rules.filterNot { it.pattern == pattern }) }
+                ok("已移除匹配规则：$pattern")
+            }
+            else -> invalid("用法：minis-proxy rule list|add|remove …")
         }
-        "remove" -> {
-            val pattern = p.getOrNull(2)?.let(::safePattern) ?: return invalid("规则格式无效。")
-            SplitProxy.update(context) { s -> s.copy(rules = s.rules.filterNot { it.pattern == pattern }) }
-            ok("已移除匹配规则：$pattern")
-        }
-        else -> invalid("用法：minis-proxy rule list|add|remove …")
     }
 
     /** This intentionally checks only TCP connect; no CONNECT, SOCKS handshake, DNS query or target-service access. */
