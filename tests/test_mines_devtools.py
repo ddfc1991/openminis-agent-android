@@ -19,6 +19,31 @@ class GraphTest(unittest.TestCase):
    (root/'c.kt').write_text('package demo.ui\nimport demo.core.*\nclass C')
    g=cg.graph(root); ui=next(x for x in g['files'] if x['path']=='c.kt')
    self.assertEqual(ui['depends_on'],['a.kt','b.kt'])
+ def test_transitive_impact_and_partial_unresolved_targets(self):
+  with tempfile.TemporaryDirectory() as td0:
+   root=Path(td0)
+   (root/'a.kt').write_text('package demo.core\nclass CoreThing {}\n')
+   (root/'b.kt').write_text('package demo.api\nimport demo.core.CoreThing\nclass ApiThing {}\n')
+   (root/'c.kt').write_text('package demo.ui\nimport demo.api.ApiThing\nclass UiThing {}\n')
+   impact=cg.impact(cg.graph(root),['CoreThing','Absent'])
+   self.assertEqual(impact['targets'],['a.kt'])
+   self.assertEqual(impact['direct_importers'],['b.kt'])
+   self.assertEqual(impact['indirect_importers'],['c.kt'])
+   self.assertEqual(impact['unresolved_targets'],['Absent'])
+ def test_changed_paths_are_relative_to_scanned_source_root(self):
+  with tempfile.TemporaryDirectory() as td0:
+   repo=Path(td0); source=repo/'src'/'main'/'java'; (source/'demo').mkdir(parents=True)
+   target=source/'demo'/'Core.kt'; target.write_text('package demo\nclass Core\n')
+   outside=repo/'README.md'; outside.write_text('before\n')
+   import subprocess
+   subprocess.run(['git','init','-q',str(repo)],check=True)
+   subprocess.run(['git','-C',str(repo),'config','user.email','test@example.invalid'],check=True)
+   subprocess.run(['git','-C',str(repo),'config','user.name','Test'],check=True)
+   subprocess.run(['git','-C',str(repo),'add','.'],check=True)
+   subprocess.run(['git','-C',str(repo),'commit','-qm','base'],check=True)
+   target.write_text('package demo\nclass Core { fun updated() = true }\n')
+   outside.write_text('after\n')
+   self.assertEqual(cg.changed_paths('HEAD',source),['demo/Core.kt'])
  def test_no_unrelated_target_guess(self):
   with tempfile.TemporaryDirectory() as td0:
    root=Path(td0); (root/'a.kt').write_text('package demo\nclass A')

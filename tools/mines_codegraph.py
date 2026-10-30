@@ -38,27 +38,77 @@ def graph(root: Path) -> dict:
     return {'schema': 'mines-codegraph.v1', 'root_name': root.name, 'parser': 'static Kotlin package/import approximation; not compiler call graph', 'files': nodes}
 
 def changed_paths(base: str, root: Path) -> list[str]:
-    result = subprocess.run(['git', '-C', str(root), 'diff', '--name-only', base, '--'], text=True, capture_output=True, check=True)
-    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    """Return tracked changes relative to the scanned source root, not the repo root."""
+    root = root.resolve()
+    repo = subprocess.run(
+        ['git', '-C', str(root), 'rev-parse', '--show-toplevel'],
+        text=True, capture_output=True, check=True,
+    )
+    repo_root = Path(repo.stdout.strip()).resolve()
+    prefix = root.relative_to(repo_root).as_posix()
+    command = ['git', '-C', str(repo_root), 'diff', '--name-only', '-z', base, '--']
+    if prefix not in ('', '.'):
+        command.append(prefix)
+    result = subprocess.run(command, text=True, capture_output=True, check=True)
+    paths = [path for path in result.stdout.split('\0') if path]
+    if prefix not in ('', '.'):
+        marker = prefix.rstrip('/') + '/'
+        paths = [path[len(marker):] for path in paths if path.startswith(marker)]
+    return paths
 
 def impact(g: dict, targets: list[str]) -> dict:
     files = g['files']
     by_path = {x['path']: x for x in files}
-    target_set = set()
-    declarations = {}
+    basenames: dict[str, list[str]] = {}
+    declarations: dict[str, list[str]] = {}
     for rel, item in by_path.items():
+        basenames.setdefault(Path(rel).name, []).append(rel)
         for declaration in item['declarations']:
             declarations.setdefault(declaration, []).append(rel)
-    for t in targets:
-        p = Path(t)
-        if t in by_path:
-            target_set.add(t)
-        elif p.name in {Path(rel).name for rel in by_path}:
-            target_set.update(rel for rel in by_path if Path(rel).name == p.name)
+
+    target_set = set()
+    unresolved = []
+    for target in targets:
+        path = Path(target)
+        if target in by_path:
+            matches = [target]
+        elif path.name in basenames:
+            matches = basenames[path.name]
         else:
-            target_set.update(declarations.get(p.stem, ()))
-    impacted = sorted(x['path'] for x in files if target_set.intersection(x['depends_on']))
-    return {'targets': sorted(target_set), 'direct_importers': impacted, 'unresolved_targets': sorted(targets) if not target_set else []}
+            matches = declarations.get(path.stem, [])
+        if matches:
+            target_set.update(matches)
+        else:
+            unresolved.append(target)
+
+    reverse: dict[str, set[str]] = {}
+    for item in files:
+        for dependency in item.get('depends_on', []):
+            reverse.setdefault(dependency, set()).add(item['path'])
+
+    direct = set()
+    indirect = set()
+    visited = set(target_set)
+    frontier = set(target_set)
+    depth = 0
+    while frontier:
+        next_frontier = set().union(*(reverse.get(path, set()) for path in frontier)) - visited
+        if not next_frontier:
+            break
+        depth += 1
+        if depth == 1:
+            direct = next_frontier
+        else:
+            indirect.update(next_frontier)
+        visited.update(next_frontier)
+        frontier = next_frontier
+
+    return {
+        'targets': sorted(target_set),
+        'direct_importers': sorted(direct),
+        'indirect_importers': sorted(indirect),
+        'unresolved_targets': sorted(set(unresolved)),
+    }
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
@@ -71,7 +121,7 @@ def main():
     targets = list(args.target)
     if args.changed_from:
         targets.extend(changed_paths(args.changed_from, args.source_root))
-    g['impact'] = impact(g, targets) if targets else {'targets': [], 'direct_importers': [], 'unresolved_targets': []}
+    g['impact'] = impact(g, targets) if targets else {'targets': [], 'direct_importers': [], 'indirect_importers': [], 'unresolved_targets': []}
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(g, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     print(f"Wrote offline graph for {len(g['files'])} Kotlin files to {args.out}; direct import edges are approximate.")
