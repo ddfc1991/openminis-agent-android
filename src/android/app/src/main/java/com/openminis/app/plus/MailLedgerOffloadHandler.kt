@@ -20,7 +20,7 @@ import java.util.UUID
  *   ALIAS Gmail 别名（永久有效）
  *
  * Subcommands:
- *   list [--kind temp|alias] [--provider mail.tm|moakt|gmail] [--domain 域名] [--json]   台账列表
+ *   list [--kind temp|alias] [--provider mail.tm|moakt|gmail] [--domain 域名] [--site 平台] [--json]   台账列表
  *   get <地址|id>                        详情（含已注册平台、验证码记录状态、保活）
  *   add <地址> --kind temp|alias [opts]  新增
  *   register <地址|id> <平台>            记一条"已注册某平台"
@@ -45,7 +45,7 @@ class MailLedgerOffloadHandler(private val context: Context) : NativeOffloadHand
                 "  minis-email <subcommand> [args]\n" +
                 "\n" +
                 "SUBCOMMANDS:\n" +
-                "  list [--kind temp|alias] [--provider mail.tm|moakt|gmail] [--domain 域名] [--json]   台账列表\n" +
+                "  list [--kind temp|alias] [--provider mail.tm|moakt|gmail] [--domain 域名] [--site 平台] [--json]   台账列表\n" +
                 "  get <地址|id>                        详情\n" +
                 "  add <地址> --kind temp|alias [--provider mail.tm|moakt|gmail|manual] [--domain 域名]\n" +
                 "  register <地址|id> <平台>            仅记入本地平台关联（不代注册网站）\n" +
@@ -59,6 +59,7 @@ class MailLedgerOffloadHandler(private val context: Context) : NativeOffloadHand
                 "EXAMPLES:\n" +
                 "  minis-email list                     全部\n" +
                 "  minis-email list --kind temp         只看临时邮箱\n" +
+                "  minis-email list --site GitHub        只看已关联该平台的邮箱（精确匹配）\n" +
                 "  minis-email add <邮箱> --kind temp --provider mail.tm --domain <域名>\n" +
                 "  minis-email register <邮箱或id> <平台>\n" +
                 "  minis-email keepalive                哪些该保活了\n"
@@ -99,11 +100,15 @@ class MailLedgerOffloadHandler(private val context: Context) : NativeOffloadHand
         val domain = args.get("domain", "d")?.trim()?.lowercase(Locale.ROOT)
         val provider = args.get("provider", "p")?.trim()?.let(::safeProvider)?.lowercase(Locale.ROOT)
         if (args.get("provider", "p") != null && provider == null) return NativeOffloadResult(EXIT_INVALID_ARGS, "来源仅支持 mail.tm、moakt、gmail、manual。\n")
+        val siteInput = args.get("site")
+        val site = siteInput?.let(MailLedgerSafeOutput::cleanLabel)
+        if (siteInput != null && site == null) return NativeOffloadResult(EXIT_INVALID_ARGS, "平台名格式无效。\n")
         val all = MailLedger.all(context)
         val shown = MailLedgerSafeOutput.stableSort(all.filter {
             (kind.isNullOrBlank() || it.kind == kind) &&
                 (provider.isNullOrBlank() || safeProvider(it.provider)?.lowercase(Locale.ROOT) == provider) &&
-                (domain.isNullOrBlank() || it.domain.equals(domain, true) || it.address.substringAfterLast("@", "").equals(domain, true))
+                (domain.isNullOrBlank() || it.domain.equals(domain, true) || it.address.substringAfterLast("@", "").equals(domain, true)) &&
+                MailLedgerSafeOutput.matchesSite(it, site)
         })
 
         if (asJson) {
@@ -333,6 +338,10 @@ internal object MailLedgerSafeOutput {
             else -> Lookup(null, ambiguous = true, candidates = byId)
         }
     }
+
+    /** Exact platform match for `list --site`; malformed legacy labels never match. */
+    fun matchesSite(entry: MailLedger.Entry, site: String?): Boolean =
+        site.isNullOrBlank() || entry.sites.any { cleanLabel(it.site)?.equals(site, ignoreCase = true) == true }
 
     /** Stable list order independent of the insertion/update order in SharedPreferences. */
     fun stableSort(entries: List<MailLedger.Entry>): List<MailLedger.Entry> = entries.sortedWith(

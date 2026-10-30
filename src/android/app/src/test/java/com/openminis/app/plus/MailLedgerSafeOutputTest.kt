@@ -90,6 +90,22 @@ class MailLedgerSafeOutputTest {
         assertEquals(MailLedgerSafeOutput.stableSort(listOf(a, b, c)), MailLedgerSafeOutput.stableSort(listOf(c, a, b)))
     }
 
+    @Test fun siteFilterUsesExactCaseInsensitiveLabelsAndIgnoresMalformedLegacyLabels() {
+        fun entry(id: String, sites: List<MailLedger.Site>) = MailLedger.Entry(
+            id = id, kind = MailLedger.TEMP, provider = "manual", address = "$id@example.test",
+            domain = "example.test", sites = sites, lastCode = "", lastCodeAt = 0L,
+            keepAliveOn = false, keepAliveH = 6, keepAliveAt = 0L, note = "", at = 1L,
+        )
+        val github = entry("github", listOf(MailLedger.Site("GitHub", true, 1L)))
+        val githubMirror = entry("mirror", listOf(MailLedger.Site("GitHub mirror", false, 2L)))
+        val malformed = entry("legacy", listOf(MailLedger.Site("GitHub\nOTP 123456", true, 3L)))
+
+        assertTrue(MailLedgerSafeOutput.matchesSite(github, "github"))
+        assertFalse(MailLedgerSafeOutput.matchesSite(githubMirror, "GitHub"))
+        assertFalse(MailLedgerSafeOutput.matchesSite(malformed, "GitHub"))
+        assertTrue(MailLedgerSafeOutput.matchesSite(githubMirror, null))
+    }
+
     @Test fun emptyOtpHasNoLabelAndNoTimestamp() {
         assertFalse(MailLedgerSafeOutput.hasRecentCode(""))
         assertEquals(null, MailLedgerSafeOutput.codeLabel(""))
