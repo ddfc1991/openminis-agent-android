@@ -506,7 +506,12 @@ fetch('/linkfake/send?'+k+'='+encodeURIComponent(v));document.getElementById('fc
                 if m.get("role") == "tool":
                     c = m.get("content"); res.insert(0, c if isinstance(c, str) else json.dumps(c, ensure_ascii=False))
             names = [t.get("function", {}).get("name") for t in body.get("tools") or []]
-            rec = STATS.setdefault("i3913", {}).setdefault(trig, {}); rec["tools"] = names; rec["results"] = [r[:1500] for r in res]
+            rec = STATS.setdefault("i3913", {}).setdefault(trig, {})
+            # A retry can first observe an incomplete tool set, then receive the
+            # requested tool on a later model call. Do not let that earlier
+            # observation poison the final smoke result after a valid tool run.
+            rec.pop("missing_tool", None)
+            rec["tools"] = names; rec["results"] = [r[:1500] for r in res]
             script = I3913_SCRIPTS[trig]
             self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
             def emit(delta, fin=None):
