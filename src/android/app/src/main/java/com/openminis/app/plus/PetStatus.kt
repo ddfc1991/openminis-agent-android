@@ -1,6 +1,7 @@
 package com.openminis.app.plus
 
 import android.content.Context
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.withContext
@@ -77,44 +78,56 @@ object Balances {
         return JSONObject(body)
     }
 
-    /** Fetches every configured balance; failures show as "读取失败" rather than vanish. */
+    private data class Endpoint(
+        val kind: String,
+        val name: String,
+        val url: String,
+        val decode: (JSONObject) -> Item,
+    )
+
+    /** Fetches configured balances concurrently (max 4), preserving provider order and isolated failures. */
     suspend fun refresh(context: Context, maxAgeMs: Long = 5 * 60_000L): List<Item> = withContext(Dispatchers.IO) {
         if (System.currentTimeMillis() - lastAt < maxAgeMs && last.isNotEmpty()) return@withContext last
         PlusVault.init(context)
-        val out = ArrayList<Item>()
-        key("deepseek")?.let { k ->
-            out += runCatching {
+        val endpoints = listOf(
+            Endpoint("deepseek", "DeepSeek", "https://api.deepseek.com/user/balance") { j ->
                 // https://api-docs.deepseek.com/api/get-user-balance
-                val j = get("https://api.deepseek.com/user/balance", k)
                 val b = j.optJSONArray("balance_infos")?.optJSONObject(0)
                 val total = b?.optString("total_balance") ?: "?"
                 val cur = if (b?.optString("currency") == "USD") "$" else "¥"
                 Item("DeepSeek", "$cur$total", low = (total.toDoubleOrNull() ?: 99.0) < 2.0 || !j.optBoolean("is_available", true))
-            }.getOrElse { Item("DeepSeek", "读取失败（${it.message}）") }
-        }
-        key("siliconflow")?.let { k ->
-            out += runCatching {
+            },
+            Endpoint("siliconflow", "硅基流动", "https://api.siliconflow.cn/v1/user/info") { j ->
                 // https://docs.siliconflow.cn/cn/api-reference/userinfo/get-user-info
-                val d = get("https://api.siliconflow.cn/v1/user/info", k).optJSONObject("data")
+                val d = j.optJSONObject("data")
                 val total = d?.optString("totalBalance") ?: "?"
                 Item("硅基流动", "¥$total", low = (total.toDoubleOrNull() ?: 99.0) < 2.0)
-            }.getOrElse { Item("硅基流动", "读取失败（${it.message}）") }
-        }
-        key("kimi")?.let { k ->
-            out += runCatching {
+            },
+            Endpoint("kimi", "Kimi", "https://api.moonshot.cn/v1/users/me/balance") { j ->
                 // https://platform.moonshot.cn/docs/api/misc#查询余额
-                val d = get("https://api.moonshot.cn/v1/users/me/balance", k).optJSONObject("data")
+                val d = j.optJSONObject("data")
                 val v = d?.optDouble("available_balance") ?: Double.NaN
                 Item("Kimi", "¥" + "%.2f".format(v), low = v < 2.0)
-            }.getOrElse { Item("Kimi", "读取失败（${it.message}）") }
-        }
-        key("openrouter")?.let { k ->
-            out += runCatching {
+            },
+            Endpoint("openrouter", "OpenRouter", "https://openrouter.ai/api/v1/credits") { j ->
                 // https://openrouter.ai/docs/api-reference/get-credits
-                val d = get("https://openrouter.ai/api/v1/credits", k).optJSONObject("data")
+                val d = j.optJSONObject("data")
                 val left = (d?.optDouble("total_credits") ?: 0.0) - (d?.optDouble("total_usage") ?: 0.0)
                 Item("OpenRouter", if (left < 0) "欠费 $" + "%.2f".format(-left) else "$" + "%.2f".format(left), low = left < 1.0)   // [i] was 「$-0.11」
-            }.getOrElse { Item("OpenRouter", "读取失败（${it.message}）") }
+            },
+        )
+        val requests = endpoints.mapNotNull { endpoint -> key(endpoint.kind)?.let { endpoint to it } }
+        val results = boundedOrderedMap(requests, parallelism = 4) { (endpoint, apiKey) ->
+            try {
+                endpoint.decode(get(endpoint.url, apiKey))
+            } catch (cancel: CancellationException) {
+                throw cancel
+            } catch (failure: Exception) {
+                Item(endpoint.name, "读取失败（${failure.message}）")
+            }
+        }
+        val out = results.mapIndexed { index, result ->
+            result.getOrElse { Item(requests[index].first.name, "读取失败") }
         }
         last = out; lastAt = System.currentTimeMillis()
         out
