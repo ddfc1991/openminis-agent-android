@@ -341,8 +341,10 @@ internal object MailLedgerSafeOutput {
     )
 
     fun maskEmail(address: String): String {
-        val at = address.lastIndexOf('@')
-        if (at <= 0 || at == address.lastIndex) return "***"
+        // Old/imported records can predate current validation. Never echo malformed values
+        // (including embedded @, whitespace, or control characters) through a masked output.
+        if (!validEmail(address)) return "***"
+        val at = address.indexOf('@')
         val local = address.substring(0, at)
         val domain = address.substring(at + 1)
         return local.take(1) + "***@" + domain

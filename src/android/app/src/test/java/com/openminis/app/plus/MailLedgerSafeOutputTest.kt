@@ -18,6 +18,8 @@ class MailLedgerSafeOutputTest {
         assertEquals("s***@mail.example", MailLedgerSafeOutput.maskEmail("sample@mail.example"))
         assertEquals("***", MailLedgerSafeOutput.maskEmail("not-an-email"))
         assertEquals("***", MailLedgerSafeOutput.maskEmail("@example.test"))
+        assertEquals("***", MailLedgerSafeOutput.maskEmail("part@leaked@example.test"))
+        assertEquals("***", MailLedgerSafeOutput.maskEmail("user@example.test\nOTP: 123456"))
     }
 
     @Test fun jsonProjectionNeverContainsOtpOrFreeformNoteAndMasksEmail() {
