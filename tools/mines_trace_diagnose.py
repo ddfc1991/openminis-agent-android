@@ -20,11 +20,21 @@ def summarize(path: Path) -> dict:
             raw_outcome = row.get('outcome') if isinstance(row.get('outcome'), str) else ''
             outcome = raw_outcome.lower() if raw_outcome.lower() in ('ok', 'success', 'completed', 'failed', 'error', 'timeout', 'cancelled') else 'unknown'
             ms = row.get('duration_ms')
-            ms = ms if isinstance(ms, (int, float)) and not isinstance(ms, bool) and math.isfinite(ms) and 0 <= ms <= 86_400_000 else 0
+            if isinstance(ms, bool):
+                ms = 0
+            elif isinstance(ms, int):
+                ms = ms if 0 <= ms <= 86_400_000 else 0
+            elif isinstance(ms, float):
+                ms = ms if math.isfinite(ms) and 0 <= ms <= 86_400_000 else 0
+            else:
+                ms = 0
             counts[tool] += 1; duration[tool] += ms
             if outcome not in ('ok', 'success', 'completed'): failures[tool] += 1
+    ranked = sorted(counts.items(), key=lambda item: (-duration[item[0]], -failures[item[0]], item[0]))
     return {'schema':'mines-trace-summary.v1','records':sum(counts.values()),'malformed_lines':malformed,
-            'tools':[{'tool':k,'calls':v,'avg_duration_ms':round(duration[k]/v,1),'non_success':failures[k]} for k,v in sorted(counts.items())]}
+            'tools':[{'tool':k,'calls':v,'total_duration_ms':round(duration[k],1),
+                      'avg_duration_ms':round(duration[k]/v,1),'non_success':failures[k]}
+                     for k,v in ranked]}
 
 def main():
     ap=argparse.ArgumentParser(description=__doc__); ap.add_argument('input',type=Path); ap.add_argument('--out',type=Path)

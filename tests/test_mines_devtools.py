@@ -61,8 +61,22 @@ class TraceTest(unittest.TestCase):
   with tempfile.TemporaryDirectory() as td0:
    p=Path(td0)/'trace.jsonl'; p.write_text('\n'.join([json.dumps({'tool':'shell_execute','duration_ms':12,'outcome':'success','arguments':'SUPERSECRET'}),json.dumps({'tool':'shell_execute','duration_ms':18,'outcome':'timeout','result':'TOKENXYZ'}),'not-json']))
    result=td.summarize(p); self.assertEqual(result['records'],2); self.assertEqual(result['malformed_lines'],1)
-   self.assertEqual(result['tools'][0]['avg_duration_ms'],15.0); self.assertEqual(result['tools'][0]['non_success'],1)
+   self.assertEqual(result['tools'][0]['avg_duration_ms'],15.0); self.assertEqual(result['tools'][0]['total_duration_ms'],30.0); self.assertEqual(result['tools'][0]['non_success'],1)
    self.assertNotIn('SUPERSECRET',json.dumps(result)); self.assertNotIn('TOKENXYZ',json.dumps(result))
+ def test_ranks_by_cumulative_duration_and_handles_oversized_integer(self):
+  with tempfile.TemporaryDirectory() as td0:
+   p=Path(td0)/'trace.jsonl'
+   rows=[
+    {'tool':'frequent','duration_ms':60,'outcome':'success'},
+    {'tool':'frequent','duration_ms':60,'outcome':'success'},
+    {'tool':'slow_once','duration_ms':100,'outcome':'success'},
+    {'tool':'bad_duration','duration_ms':10**1000,'outcome':'success'},
+   ]
+   p.write_text('\n'.join(json.dumps(row) for row in rows))
+   result=td.summarize(p)
+   self.assertEqual([row['tool'] for row in result['tools']],['frequent','slow_once','bad_duration'])
+   self.assertEqual(result['tools'][0]['total_duration_ms'],120.0)
+   self.assertEqual(result['tools'][-1]['total_duration_ms'],0)
  def test_arbitrary_identifiers_and_nonfinite_durations_are_not_echoed(self):
   with tempfile.TemporaryDirectory() as td0:
    p=Path(td0)/'trace.jsonl'; p.write_text(json.dumps({'tool':'api_key=SECRET_VALUE','duration_ms':float('nan'),'outcome':'SUCCESS'})+'\n')
