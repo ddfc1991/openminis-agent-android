@@ -8525,10 +8525,9 @@ def b3914(res):
         r = shot("arch-menu"); m = find(r, "归档", exact=True)
         if not m: fail("archive: long-press shows no 归档 menu"); return
         sh(f"input tap {m[0]} {m[1]}"); time.sleep(0.8)
-        r = shot("arch-undo")
-        for _ in range(4):   # [38.9.15.1 smoke] the 撤销 bar can land just after the first dump (smoke 40311523406: on screen, not in the dump)
-            if find(r, "撤销", exact=True): break
-            time.sleep(0.7); r = dump()
+        # The UndoBar expires after 6 s. Do not take a screenshot before tapping:
+        # screencap + uiautomator capture can consume nearly the whole window.
+        r = dump()
         t = tk("arch4"); o["arch_lp"] = t
         if not t.get("arch"): fail(f"archive: long-press 归档 did not archive the task {t}")
         if t.get("st") != "error": fail(f"archive: archived 等你 task not stopped (st={t.get('st')})")
@@ -8537,19 +8536,17 @@ def b3914(res):
         if u:
             sh(f"input tap {u[0]} {u[1]}")
         else:
-            # Android 34 rendered the UndoBar in the archived-task screenshot,
-            # but uiautomator omitted its Compose node. Tap its visible lower-right
-            # action and verify the persisted task state instead of failing on the dump.
-            from PIL import Image
-            shot_path = f"{OUT}/i3914-arch-undo.png"
-            with Image.open(shot_path) as im: width, height = im.size
-            x, y = int(width * 0.84), int(height * 0.88)
-            print(f"I3914 archive undo accessibility fallback: tap ({x},{y}) on {width}x{height}", flush=True)
+            # Compose may omit the accessibility node; tap the visible lower-right
+            # action directly, without spending the UndoBar's short lifetime on a screenshot.
+            x, y = int(SCREEN[0] * 0.84), int(SCREEN[1] * 0.88)
+            print(f"I3914 archive undo fallback: tap ({x},{y}) on {SCREEN[0]}x{SCREEN[1]}", flush=True)
             sh(f"input tap {x} {y}")
         time.sleep(1.5)
         t = tk("arch4"); o["arch_undo"] = t
         if t.get("arch") or t.get("st") != "waiting": fail(f"archive: 撤销 did not bring the task back as 等你 {t}")
-        if not find(dump(), "Qq 注册"): fail("archive: task not back on 任务 after 撤销")
+        r = dump()
+        if not find(r, "Qq 注册"): fail("archive: task not back on 任务 after 撤销")
+        shot("arch-undo")
         time.sleep(6.5)   # let the bar go
         # swipe left → 归档 button
         r = dump(); p = find(r, "Doroai 注册")
