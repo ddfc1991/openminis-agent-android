@@ -514,6 +514,9 @@ fetch('/linkfake/send?'+k+'='+encodeURIComponent(v));document.getElementById('fc
                      "choices": [{"index": 0, "delta": delta, "finish_reason": fin}]}
                 self.wfile.write(b"data: " + json.dumps(d, ensure_ascii=False).encode() + b"\n\n"); self.wfile.flush()
             if len(res) < len(script) and script[len(res)][0] in names:
+                # The task can make an earlier model request before the guarded
+                # tool is exposed. Keep missing_tool scoped to the latest request.
+                rec.pop("missing_tool", None)
                 nm, a = script[len(res)]
                 emit({"role": "assistant", "content": ""})
                 emit({"tool_calls": [{"index": 0, "id": f"call_{trig}_{len(res)}", "type": "function", "function": {"name": nm, "arguments": json.dumps(a, ensure_ascii=False)}}]})
