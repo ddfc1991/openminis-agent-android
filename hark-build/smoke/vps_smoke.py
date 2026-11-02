@@ -7946,8 +7946,10 @@ def bregauto(res):
         subprocess.run(f"curl -s -XPOST {HB}/seed -d '{{\"address\":\"{box}\",\"password\":\"SeedBox-1\"}}'", shell=True, timeout=10)
         o["seed"] = result_json("group", f"ira seedtidy {box} SeedBox-1", timeout=30)
         f0 = (fake().get("count") or {})
+        # seedtidy resets the one-time flag; entering the ledger starts the
+        # automatic tidy. Do not tap the menu too: that races the automatic run
+        # and a second no-op tidy can replace the changed-result summary.
         route("plus_register_ledger", 4)
-        if not tap_text("整理临时邮箱账号", wait=2): fail("no 整理临时邮箱账号 in the menu")
         t0 = time.time(); l = {}
         while time.time() - t0 < 90:
             l = led()
