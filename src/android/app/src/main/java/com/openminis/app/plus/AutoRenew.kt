@@ -140,13 +140,22 @@ object AutoRenew {
         }
     }
 
-    /** 单站点续期（minis-accounts login 用）。返回 null 表示没找到该站点 */
+    /** 单站点续期。只有精确匹配唯一时才运行；模糊或多账号匹配都不选首条。 */
     suspend fun renewSite(c: Context, host: String): SiteState? = withContext(Dispatchers.IO) {
         load(c)
         AutoAccounts.init(c)
-        val e = AutoAccounts.list.value.firstOrNull { it.host.equals(host, true) || it.site.equals(host, true) }
-        if (e == null) return@withContext null
-        runCatching { renewOne(c, e, System.currentTimeMillis()) }.getOrNull()
+        val matches = AutoAccounts.list.value.filter { it.host.equals(host, true) || it.site.equals(host, true) }
+        if (matches.size != 1) return@withContext null
+        runCatching { renewOne(c, matches.single(), System.currentTimeMillis()) }.getOrNull()
+    }
+
+    /** Renew the exact ledger row selected by the caller; no site-level first-match fallback. */
+    suspend fun renewEntry(c: Context, entry: AutoAccounts.Entry): SiteState? = withContext(Dispatchers.IO) {
+        load(c)
+        AutoAccounts.init(c)
+        val current = AutoAccounts.list.value.firstOrNull { it == entry }
+            ?: return@withContext null
+        runCatching { renewOne(c, current, System.currentTimeMillis()) }.getOrNull()
     }
 
     /**

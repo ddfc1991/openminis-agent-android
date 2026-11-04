@@ -20,7 +20,7 @@ import java.util.Locale
  * 默认增量：只报异常（要重登/失效），`--all` 才全量。
  *
  * Subcommands:
- *   list [--all] [--json]      台账列表。默认只报异常
+ *   list [--all] [--json] [--site <site>] 精确筛选站点；默认只报异常
  *   get <site>                 单个站点详情
  *   check [site]               验证状态（读本地记录 + 密码是否在保管库，不联网）
  *   stats                      统计：总数/正常/要重登/身份数（最省 token）
@@ -39,15 +39,16 @@ class AccountLedgerOffloadHandler(private val context: Context) : NativeOffloadH
                 "  minis-accounts <subcommand> [args]\n" +
                 "\n" +
                 "SUBCOMMANDS:\n" +
-                "  list [--all] [--json]     台账列表。默认只报异常，--all 全量\n" +
+                "  list [--all] [--json] [--site <site>]  台账列表；--site 精确筛选\n" +
                 "  get <site>                单个站点详情\n" +
-                "  check [site]              验证状态（本地记录，不联网）\n  login <site>              触发该站点自动续期（复用 AutoRenew）\n" +
+                "  check [site]              验证状态（本地记录，不联网）\n  login <site> [--account <identity>]  续期唯一匹配账号；不明确时列候选\n" +
                 "  stats                     统计数字\n" +
                 "  --help                    这个帮助\n" +
                 "\n" +
                 "EXAMPLES:\n" +
                 "  minis-accounts list              只报要重登的\n" +
                 "  minis-accounts list --all        全部\n" +
+                "  minis-accounts list --site github.com  精确筛选\n" +
                 "  minis-accounts get github        看 github 详情\n" +
                 "  minis-accounts stats             92 正常 / 3 要重登\n"
 
@@ -85,7 +86,11 @@ class AccountLedgerOffloadHandler(private val context: Context) : NativeOffloadH
         val all = args.hasFlag("all", "a")
         val asJson = args.hasFlag("json", "j")
         val entries = AutoAccounts.list.value
-        val shown = if (all) entries else entries.filter { isAbnormal(it.status) }
+        val site = args.get("site")?.trim()?.takeIf { it.isNotEmpty() }
+        val scoped = if (site == null) entries else entries.filter {
+            it.site.equals(site, true) || it.host.equals(site, true)
+        }
+        val shown = if (all) scoped else scoped.filter { isAbnormal(it.status) }
 
         if (asJson) {
             val arr = JSONArray()
@@ -105,7 +110,12 @@ class AccountLedgerOffloadHandler(private val context: Context) : NativeOffloadH
         }
 
         if (shown.isEmpty()) {
-            val msg = if (all) "台账为空\n" else "没有异常账号（${entries.size} 个全部正常）\n"
+            val msg = when {
+                site != null && scoped.isEmpty() -> "没有站点 '$site' 的精确匹配记录\n"
+                site != null -> "站点 '$site' 没有异常账号（${scoped.size} 条全部正常）\n"
+                all -> "台账为空\n"
+                else -> "没有异常账号（${entries.size} 个全部正常）\n"
+            }
             return NativeOffloadResult(EXIT_OK, msg)
         }
 
@@ -130,14 +140,12 @@ class AccountLedgerOffloadHandler(private val context: Context) : NativeOffloadH
     private fun cmdGet(args: OffloadArgs): NativeOffloadResult {
         val site = args.positional.getOrNull(1)
             ?: return NativeOffloadResult(EXIT_INVALID_ARGS, "用法: minis-accounts get <site>\n")
-        val hit = AutoAccounts.list.value.filter {
-            it.site.equals(site, true) ||
-                it.host.equals(site, true) ||
-                it.host.contains(site, true)
-        }
+        val match = AccountLedgerLookupCore.find(AutoAccounts.list.value, site)
+        val hit = match.entries
         if (hit.isEmpty()) {
             return NativeOffloadResult(EXIT_OK, "没找到站点 '$site'\n")
         }
+        if (!match.exact && hit.size > 1) return ambiguous(site, hit)
         val sb = StringBuilder()
         hit.forEach { e ->
             sb.append("站点:   ").append(e.site).append('\n')
@@ -156,12 +164,13 @@ class AccountLedgerOffloadHandler(private val context: Context) : NativeOffloadH
     /** check：读本地记录判断状态，不联网 */
     private fun cmdCheck(args: OffloadArgs): NativeOffloadResult {
         val site = args.positional.getOrNull(1)
-        val entries = AutoAccounts.list.value.filter {
-            site == null || it.site.equals(site, true) || it.host.contains(site, true)
-        }
+        val match = if (site == null) AccountLedgerLookupCore.Result(AutoAccounts.list.value, exact = true)
+            else AccountLedgerLookupCore.find(AutoAccounts.list.value, site)
+        val entries = match.entries
         if (entries.isEmpty()) {
             return NativeOffloadResult(EXIT_OK, "没有匹配的站点\n")
         }
+        if (site != null && !match.exact && entries.size > 1) return ambiguous(site, entries)
         var ok = 0
         var bad = 0
         val sb = StringBuilder()
@@ -185,8 +194,17 @@ class AccountLedgerOffloadHandler(private val context: Context) : NativeOffloadH
     private fun cmdLogin(args: OffloadArgs): NativeOffloadResult {
         val site = args.positional.getOrNull(1)
             ?: return NativeOffloadResult(EXIT_INVALID_ARGS, "用法: minis-accounts login <site>\n")
-        val st = runBlocking { AutoRenew.renewSite(context, site) }
-            ?: return NativeOffloadResult(EXIT_OK, "没找到站点 '$site'\n")
+        val exact = AutoAccounts.list.value.filter {
+            it.site.equals(site, true) || it.host.equals(site, true)
+        }
+        val account = args.get("account")?.trim()?.takeIf { it.isNotEmpty() }
+        val candidates = if (account == null) exact else exact.filter { it.account.equals(account, true) }
+        if (candidates.isEmpty()) {
+            return NativeOffloadResult(EXIT_OK, "没有 '$site' 的精确匹配账号\n")
+        }
+        if (candidates.size > 1) return ambiguous(site, candidates)
+        val st = runBlocking { AutoRenew.renewEntry(context, candidates.single()) }
+            ?: return NativeOffloadResult(EXIT_OK, "账号记录已变化，请重新查询后再试\n")
         val line = when (st.state) {
             "ok" -> "OK 会话有效（" + st.host + "）"
             "reused" -> "OK 已把保存的会话写回（" + st.host + "）"
@@ -194,6 +212,16 @@ class AccountLedgerOffloadHandler(private val context: Context) : NativeOffloadH
             else -> "状态 " + st.state + "（" + st.note + "）"
         }
         return NativeOffloadResult(EXIT_OK, line + "\n")
+    }
+
+    private fun ambiguous(query: String, entries: List<AutoAccounts.Entry>): NativeOffloadResult {
+        val choices = entries.joinToString("\n") { e ->
+            "- ${e.site} | ${e.host} | ${KeychainCore.maskAccount(e.account).ifBlank { "(无账号)" }}"
+        }
+        return NativeOffloadResult(
+            EXIT_INVALID_ARGS,
+            "'$query' 匹配多个账号；请用精确站点/域名，或 login 时加 --account <identity>：\n$choices\n",
+        )
     }
 
     /** stats：只要数字，最省 token */
