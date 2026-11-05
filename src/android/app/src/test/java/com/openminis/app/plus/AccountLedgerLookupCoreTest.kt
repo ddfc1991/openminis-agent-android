@@ -30,7 +30,9 @@ class AccountLedgerLookupCoreTest {
         val a = row("GitHub Beta", "a.example", "a")
         val result = AccountLedgerLookupCore.find(listOf(b, a), "github")
         assertFalse(result.exact)
-        assertEquals(listOf(a, b), result.entries)
+        assertEquals(listOf(b, a), result.entries) // stable site ordering
+        val reversedInput = AccountLedgerLookupCore.find(listOf(a, b), "github")
+        assertEquals(result.entries, reversedInput.entries)
         assertTrue(result.entries.size > 1)
     }
 
